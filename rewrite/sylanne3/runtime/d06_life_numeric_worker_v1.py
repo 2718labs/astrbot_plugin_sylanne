@@ -234,7 +234,8 @@ def stage_acquire_life_numeric_in_transaction_v1(db, *, frame, request, installe
     validate_life_numeric_acquisition_proposal_v1(primary.proposals[0], frame.snapshot, b)
     result = LifeNumericAcquisitionStageV1(primary, p, frozen, job, model, frame, b, issued)
     identity = id(result)
-    _STAGES[identity] = (weakref.ref(result, lambda _: _STAGES.pop(identity, None)), db)
+    _STAGES[identity] = (weakref.ref(result, lambda _: _STAGES.pop(identity, None)), db,
+        context, bundle, frozen.digest, installed_readers.issuer, installed_readers.resource_issuer, db.total_changes)
     return result
 
 
@@ -267,8 +268,13 @@ def verify_life_numeric_acquisition_in_transaction_v1(db, staged, readers):
         raise ValueError('Life numeric acquisition lacks exact private issuance')
     require_installed_life_numeric_worker_v1(staged.issuance, staged.frame)
     p = staged.prepared
-    bundle, _, _, frozen = _current(db, staged.frame,
-        AcquireInternalLifeNumericRequestV1(p.frozen.identity.episode_ref, p.causal_operation_id), readers)
+    if (db.total_changes != entry[7] or readers.life_numeric_bundle is not entry[3]
+            or readers.issuer is not entry[5] or readers.resource_issuer is not entry[6]
+            or staged.frozen.digest != entry[4]):
+        raise ValueError('Life numeric acquisition qualification changed before CAS')
+    from .d06_life_numeric_context_v1 import require_current_life_numeric_context_v1
+    require_current_life_numeric_context_v1(entry[2], db=db, frame=staged.frame)
+    bundle, frozen = entry[3], staged.frozen
     if (bundle is not staged.issuance.bundle or frozen != staged.frozen
             or get_job(db, p.job_id) != staged.job
             or read_life_numeric_prepared_v1(db, namespace=p.namespace, issuer=readers.issuer, job_id=p.job_id) != p
@@ -312,7 +318,7 @@ def record_life_numeric_acquisition_after_cas_v1(db, *, staged, issuer, receipt)
     return b.digest
 
 
-def read_committed_life_numeric_request_v1(db, *, namespace, issuer, job_id):
+def _read_committed_life_numeric_request_originals_v1(db, *, namespace, issuer, job_id):
     from .natural_reply_job_v2 import _request_from_wire
     from .d04_root_original_store_v1 import _receipt
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1, _receipt_wire
@@ -350,4 +356,12 @@ def read_committed_life_numeric_request_v1(db, *, namespace, issuer, job_id):
             or json.loads(history[0]).get('work_kind') != WORK_KIND
             or json.loads(history[0]).get('fence') != 1):
         raise ValueError('Life numeric signed request/binding/actual receipt differs')
-    return p, b, model
+    return p, b, model, adopted
+
+
+def read_committed_life_numeric_request_v1(db, *, namespace, issuer, job_id):
+    # Public ABI stays the exact three originals. The private same-call reader
+    # also returns the acquisition it already fully verified in this SQL read.
+    prepared, binding, request, _ = _read_committed_life_numeric_request_originals_v1(
+        db, namespace=namespace, issuer=issuer, job_id=job_id)
+    return prepared, binding, request

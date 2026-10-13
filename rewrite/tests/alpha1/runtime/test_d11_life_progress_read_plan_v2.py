@@ -71,3 +71,44 @@ def test_untyped_request_cannot_select_installed_v2_planner(case):
     from types import SimpleNamespace
     with pytest.raises(ValueError):read(case,SimpleNamespace(project_ref=case.prepared.plan.project.ref,activity_outcome_ref='fake'))
     case.db.rollback()
+
+
+def test_exact_external_original_reader_sqlite_transaction_and_foreign_type(tmp_path):
+    """Source-seam signing/typing regression; no Native or Authority qualification."""
+    import json
+    import secrets
+    import sqlite3
+    from sylanne3.runtime_contracts import NamespaceId, canonical_digest, canonical_serialize
+    from sylanne3.runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+    from sylanne3.runtime.d05_production_operations_v1 import InstalledD05ProductionReadersV1
+    from sylanne3.runtime.domain_production_contracts_v1 import ProductionOriginalRefV1, ProductionReadPlanV1
+    from sylanne3.runtime.domain_production_read_plans_v1 import read_current_domain_original_refs_v1
+
+    issuer = D11BudgetJobIssuer(D02ResourceIssuer(secrets.token_bytes(32)), secrets.token_bytes(32))
+    readers = InstalledD05ProductionReadersV1(issuer=issuer)
+    namespace = NamespaceId("reader-source-bot", "reader-source-persona")
+    # This is a declared local signing fixture. It makes no trusted-time or
+    # independent Authority claim; authentication here is the actual D11 signer.
+    payload = canonical_serialize({"schema": "fixture.d11.external-reader-original.v1",
+        "namespace": namespace.as_tuple, "original_ref": "fixture:external-reader:one"})
+    signing_domain = "fixture.d11.external-reader-original.v1"
+    signature = issuer._signer.sign(signing_domain, payload)
+    with sqlite3.connect(tmp_path / "external-original-reader.sqlite") as db:
+        db.execute("CREATE TABLE fixture_external_original (original_ref TEXT PRIMARY KEY, payload_json TEXT NOT NULL, signature TEXT NOT NULL)")
+        db.execute("INSERT INTO fixture_external_original VALUES(?,?,?)", ("fixture:external-reader:one", payload, signature))
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            ref, encoded, saved_signature = db.execute("SELECT original_ref,payload_json,signature FROM fixture_external_original").fetchone()
+            issuer._signer.verify(signing_domain, encoded, saved_signature)
+            original = ProductionOriginalRefV1("d11.clock_sample", ref, canonical_digest(json.loads(encoded)))
+            plan = ProductionReadPlanV1((), (), (), ())
+            actual = read_current_domain_original_refs_v1(db, namespace=namespace, plan=plan,
+                installed_readers=readers, authenticated_external_originals=(original,))
+            assert actual == (original,)
+            with pytest.raises(TypeError, match="outside-transaction originals"):
+                read_current_domain_original_refs_v1(db, namespace=namespace, plan=plan, installed_readers=readers,
+                    authenticated_external_originals=({"kind": original.kind, "original_ref": original.original_ref,
+                        "original_digest": original.original_digest, "read_versions": ()},))
+        finally:
+            db.rollback()

@@ -256,6 +256,9 @@ def read_original_context_reply_call_binding_v2(
 
     if not db.in_transaction or type(saved) is not SavedContextReplyPreparationV2:
         raise ContextReplyJobHold("original V2 call needs current graph tx")
+    from ..authority_service.current_authority_graph_read_v3 import require_authority_context_call_binding_v3
+    handled,binding=require_authority_context_call_binding_v3(db,saved)
+    if handled:return binding
     seal = saved.seal
     row = db.execute(
         "SELECT acquire_operation_id,call_id,worker_fence,original_seal_digest,"
@@ -527,6 +530,10 @@ def read_original_context_reply_preparation_v2(
     """Recompute the original seal from W01's durable row inside a graph tx."""
     if not db.in_transaction:
         raise ContextReplyJobHold("current graph read transaction required")
+    from ..authority_service.current_authority_graph_read_v3 import require_authority_context_reply_preparation_v3
+    handled,saved=require_authority_context_reply_preparation_v3(db,namespace,c02_operation_id,source_ref)
+    if handled:return saved
+
     row = db.execute(
         "SELECT seal_json,frozen_request_json,read_versions_json,"
         "query_epoch_json,graph_epoch,access_epoch,delete_epoch,state "

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import json
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion
 from ..runtime_contracts import QueryEpoch, canonical_digest, canonical_serialize
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1
@@ -87,8 +88,7 @@ def _require(witness, db):
         if event != (proof[2], epoch.revision):
             raise ValueError('Contact projection actual event identity differs')
         for version in receipt.revisions:
-            row = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
-                (version.key.token, version.revision)).fetchone()
+            row = read_graph_row_v3(db, columns=('event_id', 'value', 'valid'), where='token=? AND revision=?', parameters=(version.key.token, version.revision), history=True)
             actual = next(w for _,w in m.provisional_writes if w.key == version.key)
             if row is None or row[0] != proof[1] or row[2] != 1 or canonical_serialize(json.loads(row[1])) != canonical_serialize(actual.value):
                 raise ValueError('Contact projection actual member history differs')
@@ -109,8 +109,7 @@ def _actual_frame(witness, db):
             return
         if len(atoms) >= limits.max_graph_heads:
             raise MissingProductionOriginalV1('bounded_complete_contact_projection')
-        row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
-            (key.token, *ns.as_tuple)).fetchone()
+        row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(key.token, *ns.as_tuple))
         atoms[key] = GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])) if row else GraphAtom(key, 0, {}, False)
     pages = []
     for page in original.query_coverage:

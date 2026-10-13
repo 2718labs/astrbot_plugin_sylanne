@@ -80,9 +80,8 @@ def contact_result_to_wire_v2(value):
     if type(value) is not ContactModelResultReadV2:
         raise TypeError("closed contact result DTO required")
     data = plain_v1(value)
-    # Observations have a separate closed contract; the passive model wire
-    # deliberately does not issue or decode Authority observation DTOs.
-    data["observation"] = plain_v1(value.observation)
+    from .v2_model_egress_contract import model_observation_to_wire_v1
+    data["observation"] = model_observation_to_wire_v1(value.observation)
     data["terminal_receipt"] = model_wire(value.terminal_receipt)
     return data
 
@@ -95,19 +94,8 @@ def contact_result_from_wire_v2(raw, kind):
         data["namespace"] = NamespaceId(**data["namespace"])
     else:
         data["request"] = contact_result_from_wire_v2(data["request"], ContactModelResultReadRequestV2)
-        observation = data["observation"]
-        if (type(observation) is not dict
-                or set(observation) != {f.name for f in fields(ModelEgressObservationV1)}):
-            raise ValueError("contact observation exact fields differ")
-        observation = dict(observation)
-        for name in ("usage", "cost"):
-            pairs = observation[name]
-            if (type(pairs) is not list
-                    or any(type(pair) is not list or len(pair) != 2
-                           or type(pair[0]) is not str or type(pair[1]) is not int for pair in pairs)):
-                raise ValueError("contact observation amount pairs differ")
-            observation[name] = tuple(tuple(pair) for pair in pairs)
-        data["observation"] = ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data["observation"] = model_observation_from_wire_v1(data["observation"])
         data["terminal_receipt"] = model_unwire(data["terminal_receipt"], ModelTerminalReceiptV2)
     result = kind(**data)
     if canonical_digest(contact_result_to_wire_v2(result)) != canonical_digest(raw):

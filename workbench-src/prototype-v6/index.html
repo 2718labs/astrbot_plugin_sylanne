@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- Runs before app/CSS download: no light frame for a saved or system dark theme. -->
+    <script>
+      (function () {
+        var preference = 'system';
+        try { var saved = localStorage.getItem('2718lab.theme'); if (saved === 'light' || saved === 'dark') preference = saved; } catch (_) {}
+        var dark = preference === 'dark' || (preference === 'system' && typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches);
+        var root = document.documentElement;
+        root.dataset.theme = dark ? 'dark' : 'light';
+        root.dataset.themePreference = preference;
+        root.style.colorScheme = dark ? 'dark' : 'light';
+        root.style.backgroundColor = dark ? '#151c20' : '#f2f5f5';
+      })();
+    </script>
+    <title>2718lab · 光学档案工作台</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

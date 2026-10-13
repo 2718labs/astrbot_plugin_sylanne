@@ -1,8 +1,11 @@
 """Shared values and explicit failure types for the foundation milestone."""
 from dataclasses import dataclass
+from contextvars import ContextVar
 import hashlib
 import json
 import math
+
+_CANONICAL_OUTPUT_METER = ContextVar('sylanne-canonical-output-meter', default=None)
 
 class EventConflict(RuntimeError):
     pass
@@ -43,7 +46,11 @@ def canonical_json(value):
         finally:
             active.remove(id(item))
     check(value)
-    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
+    text = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
+    meter = _CANONICAL_OUTPUT_METER.get()
+    if meter is not None:
+        meter.charge_encode(len(text))
+    return text
 
 def json_object(value):
     if type(value) is not dict:

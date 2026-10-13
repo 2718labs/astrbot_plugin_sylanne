@@ -3,6 +3,7 @@
 The wire value is evidence, not an admission. Only the concrete installed
 service can reread its journal, current Owner, and frozen Graph to issue it.
 """
+from ..runtime.d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
 from dataclasses import asdict, dataclass, fields
 import json
 import sqlite3
@@ -20,6 +21,8 @@ from .d12_target_owner_admission_v1 import (
 from .v2_contract import FencePermitV2, from_wire as fence_from_wire, to_wire as fence_to_wire
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest, canonical_serialize, SnapshotRequirementsV2
+from ..runtime.d11_life_contract_v1 import D11DraftExecutionBindingV1,D11DraftTerminalV1
+from .v2_self_identity_contract import AuthorityCurrentSelfIdentityV1,from_wire as self_from_wire,to_wire as self_to_wire
 
 
 _LOCATION_FIELDS = ("authority_id", "namespace", "activation_generation", "revocation_epoch",
@@ -86,12 +89,13 @@ class D11LifeAdoptionBridgeV1:
 
 
 def life_bridge_to_wire_v1(value):
-    if type(value) is not D11LifeAdoptionBridgeV1:
+    if type(value) not in {D11LifeAdoptionBridgeV1,D11DraftSelfAdoptionBridgeV2}:
         raise TypeError("exact life bridge required")
     raw = asdict(value)
     raw["binding"] = life_to_wire_v1(value.binding)
     raw["terminal"] = life_to_wire_v1(value.terminal)
     raw["owner_authority"] = current_owner_authority_to_wire_v1(value.owner_authority)
+    if type(value) is D11DraftSelfAdoptionBridgeV2:raw["current_self"]=self_to_wire(value.current_self)
     raw["permit"] = fence_to_wire(value.permit)
     return raw
 
@@ -103,19 +107,108 @@ def bridge_digest_v1(value):
 
 
 def life_bridge_from_wire_v1(raw):
-    if type(raw) is not dict or set(raw) != {field.name for field in fields(D11LifeAdoptionBridgeV1)}:
+    kind=D11DraftSelfAdoptionBridgeV2 if type(raw) is dict and raw.get("schema")=="d11.draft-self-adoption-bridge.v2" else D11LifeAdoptionBridgeV1
+    if type(raw) is not dict or set(raw) != {field.name for field in fields(kind)}:
         raise ValueError("life bridge wire fields differ")
     values = dict(raw)
     values["binding"] = life_from_wire_v1(values["binding"], D11LifeExecutionBindingV1)
     values["terminal"] = life_from_wire_v1(values["terminal"], D11LifeTerminalV1)
     values["owner_authority"] = current_owner_authority_from_wire_v1(values["owner_authority"])
+    if kind is D11DraftSelfAdoptionBridgeV2:values["current_self"]=self_from_wire(values["current_self"],AuthorityCurrentSelfIdentityV1)
     values["permit"] = fence_from_wire(values["permit"])
     for name in ("before_anchor", "after_anchor"):
         values[name] = RestoreAnchor(**values[name])
-    value = D11LifeAdoptionBridgeV1(**values)
+    value = kind(**values)
     if life_bridge_to_wire_v1(value) != raw:
         raise ValueError("life bridge wire is noncanonical")
     return value
+
+
+@dataclass(frozen=True,slots=True)
+class D11DraftSelfAdoptionBridgeV2:
+    binding:D11DraftExecutionBindingV1
+    terminal:D11DraftTerminalV1
+    owner_authority:D12CurrentOwnerAuthorityV1
+    current_self:AuthorityCurrentSelfIdentityV1
+    activity_scope_ref:str
+    activity_scope_digest:str
+    prepared_digest:str
+    before_requirements_json:str
+    before_graph_revision:int
+    before_graph_epoch:int
+    before_anchor:RestoreAnchor
+    after_anchor:RestoreAnchor
+    permit:FencePermitV2
+    qualification_digest:str
+    schema:str="d11.draft-self-adoption-bridge.v2"
+
+    def __post_init__(self):
+        from ..runtime.d10_offline_tick_execution_v1 import _decode_json
+        if (self.schema!="d11.draft-self-adoption-bridge.v2" or type(self.binding) is not D11DraftExecutionBindingV1
+                or type(self.terminal) is not D11DraftTerminalV1 or self.terminal.binding!=self.binding
+                or type(self.owner_authority) is not D12CurrentOwnerAuthorityV1 or type(self.current_self) is not AuthorityCurrentSelfIdentityV1
+                or type(self.permit) is not FencePermitV2 or self.permit.operation!="write"
+                or self.permit.pinned_anchor!=self.after_anchor or self.current_self.permit!=self.permit
+                or (self.current_self.namespace,self.current_self.installation_id,self.current_self.manifest_digest,
+                    self.current_self.graph_revision,self.current_self.graph_epoch)!=(self.binding.namespace,self.binding.installation_id,
+                    self.binding.manifest_digest,self.before_graph_revision,self.before_graph_epoch)
+                or (self.activity_scope_ref,self.activity_scope_digest)!=(self.binding.activity_scope_ref,self.binding.activity_scope_digest)
+                or not _same_location(self.before_anchor,self.after_anchor)
+                or self.terminal.claim.claim_sequence!=self.before_anchor.execution_seq+1
+                or self.terminal.terminal_sequence!=self.terminal.claim.claim_sequence+1
+                or (self.after_anchor.execution_seq,self.after_anchor.execution_digest)!=(self.terminal.terminal_sequence,self.terminal.terminal_digest)
+                or self.prepared_digest!=self.terminal.payload.prepared_digest):
+            raise ValueError("draft self bridge is not its exact original current-self/own-effect interval")
+        requirements=_decode_json(self.before_requirements_json,SnapshotRequirementsV2)
+        if not _requirements_match(requirements,self.before_anchor) or self.qualification_digest!=bridge_digest_v1(self):
+            raise ValueError("draft self bridge original requirements/commitment differs")
+
+
+def _draft_current_self(service,binding,permit,before,owner):
+    """Actual Self service and private exact own interval; no caller anchor API."""
+    from .v2_self_identity_service import AuthorityV2SelfIdentityService
+    from .v2_self_identity_contract import SelfIdentityCurrentRequestV1
+    actual=service.draft_self_identity
+    if (type(actual) is not AuthorityV2SelfIdentityService or actual._core is not service.bridge.core
+            or actual._fences is not service.fences or actual._source_location is not service.current_source_location
+            or actual._graph._path!=service.graph_path or actual._installation_id!=service.installation_id):
+        raise AuthorityUnavailable("actual same-installation draft current-self service absent")
+    actual._core._require(service.draft_self_read_credential,"self_identity_read",binding.authority_namespace,actual._holder)
+    location=service.current_source_location.observe_d11_life_interval_for_fence_v1(
+        credential=service.credential,subject=service._subject,permit=permit,service=service,binding=binding)
+    request=SelfIdentityCurrentRequestV1(binding.authority_id,binding.authority_namespace,binding.namespace,
+        binding.installation_id,binding.manifest_digest,permit.operation_id,permit)
+    with service._frozen() as (db,deletion,execution,history):
+        if _originals_locked(service,db,binding,execution)[0]!=before:raise AuthorityUnavailable("draft self original interval changed")
+        observed=actual._read_locked(db,deletion,execution,history,service.draft_self_read_credential,service._subject,request,location)
+    if observed is None:raise AuthorityUnavailable("actual draft self registration revoked or absent")
+    head,guard,anchor,_=observed
+    if guard!=owner.guard:raise AuthorityUnavailable("draft current self and actual upstream Owner guards differ")
+    db=sqlite3.connect(service.graph_path.as_uri()+"?mode=ro",uri=True,isolation_level=None)
+    try:
+        db.execute("PRAGMA query_only=ON");db.execute("BEGIN")
+        service.current_source_location.require_graph_snapshot_v1(db,location)
+        from ..runtime.d11_life_preparation_v1 import _read
+        from ..runtime.d11_artifact_draft_contract_v1 import DraftActivityScopeV1,draft_from_wire_v1
+        raw=_read(db,issuer=service.issuer,namespace=binding.namespace,kind="activity_scope",ref=binding.activity_scope_ref)
+        scope=draft_from_wire_v1(raw[0],DraftActivityScopeV1) if raw else None
+        if (scope is None or scope.actor_ref!=head[4] or canonical_digest(raw[0])!=binding.activity_scope_digest):
+            raise AuthorityUnavailable("draft scope is not the actual pinned current self original")
+        graph=actual._graph._check(db,binding.namespace,before,binding.installation_id,guard,
+            location_observation=location,storage_admission=owner.storage_admission,holder=permit.holder)
+    finally:db.close()
+    if graph is None:raise AuthorityUnavailable("draft self actual D01 role/Owner/Graph proof unavailable")
+    with service._frozen() as (db,deletion,execution,history):
+        if actual._read_locked(db,deletion,execution,history,service.credential,service._subject,request,location)!=observed:
+            raise AuthorityUnavailable("draft current self changed during independent exact interval read")
+    incarnation,role,revision,epoch=graph
+    admission=owner.storage_admission
+    return AuthorityCurrentSelfIdentityV1(binding.namespace,binding.authority_namespace,binding.authority_id,
+        binding.installation_id,binding.manifest_digest,binding.activation_generation,incarnation,role,revision,epoch,
+        "persona:"+binding.namespace.persona_id,head[4],head[3],head[5],head[6],head[8],head[9],
+        guard.authorization_revision,guard.authorization_head,guard.minimum_revocation_revision,guard.minimum_revocation_epoch,
+        permit.operation_id,permit,origin_graph_incarnation=None if admission is None else admission.source_graph_incarnation,
+        storage_admission_digest=None if admission is None else admission.original_digest)
 
 
 def _make_bridge(**values):
@@ -207,6 +300,7 @@ def _observe_bridge(service, binding, permit):
     if prepared.digest != terminal.payload.prepared_digest:
         raise AuthorityUnavailable("life terminal preparation commitment changed")
     owner, actor_id = _owner_observation(service, binding, permit, before)
+    current_self=_draft_current_self(service,binding,permit,before,owner) if type(binding) is D11DraftExecutionBindingV1 else None
     with service._frozen() as (db, deletion, execution, _):
         current, _ = service._current(db, deletion, execution)
         actual_before, _, actual_terminal = _originals_locked(service, db, binding, execution)
@@ -214,6 +308,18 @@ def _observe_bridge(service, binding, permit):
         if (current, actual_before, actual_terminal) != (after, before, terminal):
             raise AuthorityUnavailable("life terminal interval changed after outside-SQL read")
         service._owner_current(db, binding, prepared, owner)
+    if current_self is not None:
+        values=dict(binding=binding,terminal=terminal,owner_authority=owner,current_self=current_self,
+            activity_scope_ref=binding.activity_scope_ref,activity_scope_digest=binding.activity_scope_digest,
+            prepared_digest=prepared.digest,before_requirements_json=prepared.requirements_json,
+            before_graph_revision=prepared.graph_revision,before_graph_epoch=prepared.graph_epoch,
+            before_anchor=before,after_anchor=after,permit=permit)
+        raw=dict(values,schema="d11.draft-self-adoption-bridge.v2")
+        raw["binding"]=life_to_wire_v1(binding);raw["terminal"]=life_to_wire_v1(terminal)
+        raw["owner_authority"]=current_owner_authority_to_wire_v1(owner)
+        raw["current_self"]=self_to_wire(current_self);raw["permit"]=fence_to_wire(permit)
+        raw["before_anchor"]=asdict(before);raw["after_anchor"]=asdict(after)
+        return D11DraftSelfAdoptionBridgeV2(**values,qualification_digest=canonical_digest(raw))
     return _make_bridge(binding=binding, terminal=terminal, owner_authority=owner, owner_actor_id=actor_id,
         prepared_digest=prepared.digest, before_requirements_json=prepared.requirements_json,
         before_graph_revision=prepared.graph_revision, before_graph_epoch=prepared.graph_epoch,
@@ -231,7 +337,7 @@ def operate_life_adoption_bridge_v1(service, binding, action, gate=None, outcome
         service._binding(binding)
     service.bridge.core._require(service.credential, "current", service.bridge.namespace)
     operation_id = service._gate_id(binding, "adoption")
-    if action != "begin" and (type(gate) is not D11LifeAdoptionBridgeV1
+    if action != "begin" and (type(gate) not in {D11LifeAdoptionBridgeV1,D11DraftSelfAdoptionBridgeV2}
             or gate.binding != binding or gate.permit.operation_id != operation_id):
         raise AuthorityUnavailable("life exact original bridge required")
     if action in {"finish", "status"}:

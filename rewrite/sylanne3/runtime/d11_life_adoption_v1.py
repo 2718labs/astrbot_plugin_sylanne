@@ -9,7 +9,7 @@ import json
 import time
 
 from ..authority_service.d11_life_bridge_v1 import (
-    D11LifeAdoptionBridgeV1, life_bridge_from_wire_v1, life_bridge_to_wire_v1,
+    D11LifeAdoptionBridgeV1,D11DraftSelfAdoptionBridgeV2, life_bridge_from_wire_v1, life_bridge_to_wire_v1,
 )
 from ..authority_service.v2_contract import to_wire
 from ..domains.d01.production_operations_v1 import plain_v1
@@ -29,6 +29,8 @@ from .d11_life_terminal_v1 import (
     record_life_terminal_after_cas_v1, read_adopted_life_original_v1,
 )
 from .d11_life_preparation_v1 import TABLE, SIGN_KIND, read_prepared_life_by_ref_v1
+from .d11_life_preparation_v1 import life_read_matches_v1
+from .d11_life_contract_v1 import D11DraftExecutionBindingV1, D11DraftTerminalV1
 from .d10_offline_tick_execution_v1 import _decode_json
 from .domain_production_contracts_v1 import CurrentOperationFrameV1, ProductionOwnerGuardV1
 from .d11_types import cost_settlement_from_runtime, cost_settlement_graph_write, job_graph_write, reconcile_runtime_write
@@ -74,7 +76,7 @@ def _bundle(staged):
 @dataclass(frozen=True, slots=True)
 class _LifeCommitWitnessV1:
     graph: object
-    bridge: D11LifeAdoptionBridgeV1
+    bridge: D11LifeAdoptionBridgeV1 | D11DraftSelfAdoptionBridgeV2
     frame: CurrentOperationFrameV1
     staged: LifeTerminalBundleV1
     bundle: DomainBundle
@@ -119,6 +121,42 @@ class D11LifeAdoptionReceiptV1:
                 raise ValueError("life adoption receipt contains another source type")
 
 
+@dataclass(frozen=True, slots=True)
+class D11DraftAdoptionReceiptV1(D11LifeAdoptionReceiptV1):
+    def __post_init__(self):
+        if self.schema != "d11.draft-tick-adoption-receipt.v1":
+            raise ValueError("exact draft adoption receipt required")
+        values = {name: getattr(self, name) for name in self.__dataclass_fields__}
+        values["schema"] = "d11.life-tick-adoption-receipt.v1"
+        if self.status == "unknown" and self.actual_cpu_ms is not None:
+            values["status"] = "failed"
+        D11LifeAdoptionReceiptV1(**values)
+
+
+def life_adoption_receipt_from_wire_v1(raw):
+    cls = D11DraftAdoptionReceiptV1 if raw.get("schema") == "d11.draft-tick-adoption-receipt.v1" else D11LifeAdoptionReceiptV1
+    return cls(**{**raw, "source_refs": tuple(raw["source_refs"])})
+
+
+def require_draft_terminal_readback_v1(*, prepared, terminal):
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3, DraftFileReadbackV1
+    if (type(prepared.plan) is not RegisteredDraftFilePlanV3 or type(terminal) is not D11DraftTerminalV1
+            or terminal.status != "completed" or terminal.binding != prepared.binding
+            or terminal.payload.prepared_digest != prepared.digest or type(terminal.payload.readback) is not DraftFileReadbackV1):
+        raise ValueError("draft completion requires its actual signed prepared terminal and file witness")
+    plan, witness = prepared.plan, terminal.payload.readback
+    if (witness.plan_digest != plan.digest or witness.target_scope_digest != plan.target.digest
+            or witness.version != plan.target.expected_prior_version + 1 or witness.filename != plan.target.filename
+            or (witness.content_digest, witness.content_length) != (plan.content.content_digest, plan.content.content_length)):
+        raise ValueError("draft terminal readback crossed actual frozen bytes/version/filename")
+    expected = canonical_digest(("d11.artifact-draft-effect.v1", terminal.binding.namespace,
+        plan.effect_id, plan.execution_call_id, plan.digest, plan.target.digest, witness.version,
+        witness.file_identity, plan.content.content_digest))
+    if witness.effect_marker != expected:
+        raise ValueError("another same-name/hash file cannot substitute for the actual original draft effect")
+    return witness
+
+
 def require_life_commit_v1(witness, graph, db, bundle, v2_write):
     from .d01_production_operations_v1 import CurrentDomainReadV1
     from .budget import _settlement_binding
@@ -137,7 +175,7 @@ def require_life_commit_v1(witness, graph, db, bundle, v2_write):
         raise ValueError("life installed atomic commit witness differs")
     CurrentDomainReadV1(witness.frame).check(db)
     binding, terminal = witness.bridge.binding, witness.bridge.terminal
-    actual = None if terminal.status == "unknown" else {"thread_cpu_ms": terminal.actual_cpu_ms}
+    actual = None if terminal.actual_cpu_ms is None else {"thread_cpu_ms": terminal.actual_cpu_ms}
     row = db.execute("SELECT digest,lease_id,resolution_binding_json FROM runtime_budget_operations "
         "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
         (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone()
@@ -194,25 +232,43 @@ def _frame(graph, db, bridge, prepared, scope, authority, owner, observation, no
         "AND ref='current' AND kind IN ('scheme','operator','policy')", binding.namespace.as_tuple))
     if set(versions) != {"scheme", "operator", "policy"}:
         raise ValueError("life current installation policy heads are incomplete")
-    if (authority.actor != bridge.owner_actor_id or authority.purpose not in owner.purposes
-            or not set(authority.audience) <= owner.audiences
-            or owner.authorization_head != bridge.owner_authority.guard.authorization_head
-            or owner.authorization_revision != bridge.owner_authority.guard.authorization_revision):
-        raise ValueError("life current independently observed Owner does not admit this source")
+    if type(bridge) is D11DraftSelfAdoptionBridgeV2:
+        from ..graph_types import validate_owner_grant_v1
+        grant_atom=snapshot.get(AtomKey.from_token(binding.owner_grant_ref))
+        if grant_atom is None or not grant_atom.valid:raise ValueError("draft self frame actual upstream Owner grant absent")
+        grant=grant_atom.value;validate_owner_grant_v1(grant)
+        if (authority.actor!=bridge.current_self.self_entity_ref or authority.purpose not in grant["purposes"]
+                or not set(authority.audience)<=set(grant["audiences"])
+                or (grant_atom.revision,canonical_digest(grant))!=(binding.owner_grant_revision,binding.owner_grant_digest)):
+            raise ValueError("draft self frame cannot exceed its real upstream Owner/source scope")
+        rights=db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",binding.namespace.as_tuple).fetchone()
+        owner_guard=ProductionOwnerGuardV1(binding.owner_grant_ref,grant_atom.revision,canonical_digest(grant),
+            bridge.owner_authority.guard.authorization_head.removeprefix("sha256:"))
+        deadline=min(_decode_json(prepared.signed_grant_json,__import__("sylanne3.runtime.issuers",fromlist=["BudgetLeaseGrant"]).BudgetLeaseGrant).valid_until_utc,
+            __import__("sylanne3.runtime.d11_offline_originals_v1",fromlist=["_utc"])._utc(prepared.plan.deadline_utc).timestamp())
+    else:
+        if (authority.actor != bridge.owner_actor_id or authority.purpose not in owner.purposes
+                or not set(authority.audience) <= owner.audiences
+                or owner.authorization_head != bridge.owner_authority.guard.authorization_head
+                or owner.authorization_revision != bridge.owner_authority.guard.authorization_revision):
+            raise ValueError("life current independently observed Owner does not admit this source")
+        rights=owner.access_epoch,owner.delete_epoch
+        owner_guard=ProductionOwnerGuardV1(binding.owner_grant_ref,owner.grant_revision,
+            owner.grant_digest.removeprefix("sha256:"),owner.authorization_head.removeprefix("sha256:"))
+        deadline=now+60
     inputs = (binding.prepared_original_ref, observation.original.original_ref)
     envelope = CommandEnvelope(RUNTIME_SCHEMA,
         OperationIdentity(activity_id=binding.activity_id, effect_id=binding.effect_id, attempt_id=binding.attempt_id,
             phase="adopt_life", operation_id=life_adoption_operation_id_v1(binding),
             canonical_input_digest=canonical_digest({"input_refs": list(inputs)})), authority,
         VersionGuard(snapshot.versions, (QueryEpoch(binding.namespace, "namespace", scope.graph_epoch.revision),),
-            owner.access_epoch, owner.delete_epoch, graph._GraphCoordinator__store._registry.catalogue_hash,
+            *rights, graph._GraphCoordinator__store._registry.catalogue_hash,
             versions["scheme"], versions["operator"], versions["policy"], (), (), ()),
         SourceQualification((), "derived", None, now, "inference", "ineligible", None, "not_applicable"),
-        inputs, binding.parent_budget_lease_ref, now + 60, time.monotonic() + 60,
+        inputs, binding.parent_budget_lease_ref, deadline, time.monotonic() + deadline-now,
         "life-terminal:" + binding.execution_id, ())
     frame = CurrentOperationFrameV1(envelope, snapshot, now,
-        ProductionOwnerGuardV1(binding.owner_grant_ref, owner.grant_revision,
-            owner.grant_digest.removeprefix("sha256:"), owner.authorization_head.removeprefix("sha256:")),
+        owner_guard,
         binding.activation_generation, (), (), (observation.original,))
     from .d08_life_admission_v1 import enrich_life_adoption_frame_v1
     return enrich_life_adoption_frame_v1(db,frame=frame,prepared=prepared,issuer=graph._GraphCoordinator__d11_issuer), request
@@ -252,6 +308,8 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
             if _read_signed(store._db, namespace, "adoption_receipt", binding.execution_id, issuer) is not None:
                 raise ValueError("life committed receipt lacks its original bridge")
     if gate is not None:
+        if type(gate) is D11DraftSelfAdoptionBridgeV2:
+            return _recover_draft_self_adoption_v2(graph,bootstrap,life_port,gate,prepared_original_ref)
         # Only the original durable composite is recovered. Current generation,
         # frozen ancestors and result heads must still match; no new work is issued.
         pairing = port.current_owner_actor_binding(namespace=namespace,
@@ -280,6 +338,8 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
         life_port.life_adoption_bridge_v1(binding=binding, action="finish", gate=gate, outcome="committed")
         return saved
     gate = life_port.life_adoption_bridge_v1(binding=binding, action="begin")
+    if type(gate) is D11DraftSelfAdoptionBridgeV2:
+        return _adopt_draft_self_v2(graph,bootstrap,life_port,gate,prepared)
     local_lease = None
     committed = False
     witness = None
@@ -348,7 +408,7 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
                     v2_write=(before, epoch, finish_id, finish_digest, canonical_serialize(to_wire(gate.permit))),
                     domain_production_issuance_v1=witness)
                 original = record_life_terminal_after_cas_v1(db, issuer=issuer, staged=staged, graph_receipt=receipt)
-                result = {"schema": "d11.life-tick-adoption-receipt.v1", "operation_id": receipt.operation_id,
+                result = {"schema": "d11.draft-tick-adoption-receipt.v1" if type(binding) is D11DraftExecutionBindingV1 else "d11.life-tick-adoption-receipt.v1", "operation_id": receipt.operation_id,
                     "binding_digest": binding.digest, "terminal_digest": canonical_digest(plain_v1(gate.terminal)),
                     "bridge_digest": gate.qualification_digest, "original_ref": original.original_ref,
                     "original_digest": original.original_digest, "graph_receipt_digest": canonical_digest(receipt),
@@ -373,6 +433,108 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
             _ACTIVE.pop(id(witness), None)
         if local_lease is not None:
             graph.release_authority_lease(bootstrap, local_lease)
+
+
+def _recover_draft_self_adoption_v2(graph,bootstrap,life_port,gate,prepared_original_ref):
+    """Current self/Source metadata read; never a second file observation."""
+    b=gate.binding;store=graph._GraphCoordinator__store;port=graph._GraphCoordinator__content_fence_v2
+    issuer=graph._GraphCoordinator__d11_issuer;resources=graph._GraphCoordinator__d02_issuer
+    lease,capability=graph.grant(bootstrap,actor=gate.current_self.self_entity_ref,issuer_domain="d10",
+        namespace=b.namespace,domains=("d08","d10","d11"),activation_generation=b.activation_generation,
+        operation_id=life_adoption_operation_id_v1(b))
+    try:
+        authority=AuthorityContext(gate.current_self.self_entity_ref,"d10",capability,b.namespace,
+            tuple(sorted(graph._GraphCoordinator__leases[lease][5])),"consolidation",(),"historical-life-receipt",b.activation_generation)
+        def observe(scope):
+            self_port=graph._GraphCoordinator__self_identity_port
+            current=self_port.current_self_identity(namespace=b.namespace,authority_namespace=b.authority_namespace,
+                request_operation_id=scope.operation_id,permit=scope.permit)
+            if current is None or (current.self_entity_ref,current.mapping_revision,current.registration_digest)!= (
+                    gate.current_self.self_entity_ref,gate.current_self.mapping_revision,gate.current_self.registration_digest):
+                raise ValueError("draft ACK recovery actual registered self changed")
+            return current
+        def read():
+            db=store._db;db.execute("BEGIN")
+            try:
+                prepared=read_prepared_life_by_ref_v1(db,namespace=b.namespace,prepared_original_ref=prepared_original_ref,issuer=issuer)
+                from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+                _source_family_current_sql_v1(db,namespace=b.namespace,roots=tuple(dict.fromkeys(
+                    (prepared.plan.input_source.ref,*prepared.plan.content.source_refs))),purpose="consolidation",audiences=prepared.plan.audiences)
+                validate_life_ack_recovery_v1(db,gate=gate,issuer=issuer)
+                return verify_life_adoption_commit_v1(db,gate=gate,issuer=issuer,resource_issuer=resources,require_current_metadata=False)
+            finally:db.rollback()
+        saved=graph._read_v2(authority,read,fence_observer=observe)
+        life_port.life_adoption_bridge_v1(binding=b,action="finish",gate=gate,outcome="committed")
+        return saved
+    finally:graph.release_authority_lease(bootstrap,lease)
+
+
+def _adopt_draft_self_v2(graph,bootstrap,life_port,gate,prepared):
+    """One exact own-effect CAS with actual self actor and upstream Owner guard."""
+    b=gate.binding;store=graph._GraphCoordinator__store;port=graph._GraphCoordinator__content_fence_v2
+    issuer=graph._GraphCoordinator__d11_issuer;resources=graph._GraphCoordinator__d02_issuer
+    lease=witness=None;committed=False
+    try:
+        observation=observe_current_life_terminal_v1(life_port,prepared)
+        if observation.terminal!=gate.terminal:raise ValueError("draft self bridge actual terminal changed")
+        life_port.life_adoption_bridge_v1(binding=b,action="validate",gate=gate)
+        now=trusted_upper(port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+        inventory=life_port.read_d11_life_execution_inventory_v1(namespace=b.authority_namespace,permit=gate.permit)
+        lease,capability=graph.grant(bootstrap,actor=gate.current_self.self_entity_ref,issuer_domain="d10",namespace=b.namespace,
+            domains=("d08","d10","d11"),activation_generation=b.activation_generation,operation_id=life_adoption_operation_id_v1(b))
+        with store._lock:
+            db=store._db;db.execute("BEGIN IMMEDIATE")
+            try:
+                current=read_current_prepared_life_v1(db,binding=b,issuer=issuer,resource_issuer=resources,now_utc=now,for_execution=False)
+                if current!=prepared:raise ValueError("draft self exact current preparation changed")
+                before,epoch=graph._v2_graph_stamp(b.namespace)
+                from ..runtime_contracts import SnapshotRequirementsV2
+                if (before.requirements,before.graph_revision,epoch.revision)!= (
+                        _decode_json(gate.before_requirements_json,SnapshotRequirementsV2),gate.before_graph_revision,gate.before_graph_epoch):
+                    raise ValueError("draft self frozen business interval changed")
+                scope=FenceScope(b.namespace,b.authority_namespace,b.activation_generation,"write",gate.permit.operation_id,
+                    gate.permit,gate.after_anchor,epoch,before.graph_revision)
+                target=replace(before.requirements,execution_seq=gate.after_anchor.execution_seq,execution_digest=gate.after_anchor.execution_digest)
+                authority=AuthorityContext(gate.current_self.self_entity_ref,"d10",capability,b.namespace,
+                    tuple(sorted(graph._GraphCoordinator__leases[lease][5])),"consolidation",prepared.plan.audiences,
+                    _decode_json(prepared.signed_grant_json,__import__("sylanne3.runtime.issuers",fromlist=["BudgetLeaseGrant"]).BudgetLeaseGrant).policy_ref,
+                    b.activation_generation)
+                frame,request=_frame(graph,db,gate,prepared,scope,authority,None,observation,now)
+                from .d08_life_admission_v1 import InstalledLifeAdmissionReaderV1,require_current_life_action_admission_v1
+                admission=InstalledLifeAdmissionReaderV1(issuer=issuer,resource_issuer=resources,
+                    body_quote_authority=graph._GraphCoordinator__body_quote_authority,execution_inventory=inventory,scope=scope)
+                require_current_life_action_admission_v1(db,prepared=prepared,reader=admission,now_utc=now,frame=frame)
+                readers=InstalledLifeTerminalReadersV1(issuer=issuer,observation=observation,admission_reader=admission)
+                staged=stage_current_life_terminal_in_transaction_v1(db,frame=frame,request=request,installed_readers=readers)
+                bundle=_bundle(staged)
+                for proposal in staged.runtime_stage.proposals:
+                    for write in proposal.typed_writes:
+                        if write.key.type_name.startswith("runtime."):reconcile_runtime_write(db,write)
+                witness=_LifeCommitWitnessV1(graph,gate,frame,staged,bundle,before,epoch,target);_ACTIVE[id(witness)]=witness
+                finish_id=gate.permit.operation_id+":committed"
+                finish_digest="sha256:"+canonical_digest((gate.qualification_digest,"committed"))
+                receipt=graph._commit_domain_bundle_fenced(bundle,lease,in_transaction=True,now_utc=now,
+                    v2_write=(before,epoch,finish_id,finish_digest,canonical_serialize(to_wire(gate.permit))),domain_production_issuance_v1=witness)
+                original=record_life_terminal_after_cas_v1(db,issuer=issuer,staged=staged,graph_receipt=receipt)
+                result={"schema":"d11.draft-tick-adoption-receipt.v1","operation_id":receipt.operation_id,
+                    "binding_digest":b.digest,"terminal_digest":canonical_digest(plain_v1(gate.terminal)),
+                    "bridge_digest":gate.qualification_digest,"original_ref":original.original_ref,"original_digest":original.original_digest,
+                    "graph_receipt_digest":canonical_digest(receipt),"status":gate.terminal.status,"source_refs":list(staged.source_refs),
+                    "actual_cpu_ms":gate.terminal.actual_cpu_ms}
+                _record_signed(db,b,"adoption_bridge",life_bridge_to_wire_v1(gate),issuer)
+                _record_signed(db,b,"adoption_receipt",result,issuer)
+                db.commit();committed=True
+            except BaseException:
+                if db.in_transaction:db.rollback()
+                raise
+        life_port.life_adoption_bridge_v1(binding=b,action="finish",gate=gate,outcome="committed")
+        return result
+    except BaseException:
+        if not committed:life_port.life_adoption_bridge_v1(binding=b,action="finish",gate=gate,outcome="abandoned")
+        raise
+    finally:
+        if witness is not None:_ACTIVE.pop(id(witness),None)
+        if lease is not None:graph.release_authority_lease(bootstrap,lease)
 
 
 def validate_life_recovery_heads_v1(db, *, binding, prepared_digest, prepared, adopted):
@@ -400,7 +562,7 @@ def validate_life_recovery_heads_v1(db, *, binding, prepared_digest, prepared, a
             raise ValueError("life recovery ancestor namespace differs")
         row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
             (frozen.ref, *binding.namespace.as_tuple)).fetchone()
-        if row != (frozen.revision, frozen.value_json, int(frozen.valid)) and not (frozen.revision == 0 and row is None):
+        if not life_read_matches_v1(frozen, row):
             raise ValueError("life recovery frozen Source/access/Owner ancestor changed or deleted")
     for member in adopted["write_commitments"]:
         row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
@@ -413,16 +575,22 @@ def validate_life_recovery_heads_v1(db, *, binding, prepared_digest, prepared, a
     if terminal.binding != binding:
         raise ValueError("life recovery terminal binding differs")
     if terminal.status == "completed":
-        import hashlib
-        row = db.execute("SELECT binding_digest,artifact_ref,artifact_bytes,artifact_digest,artifact_length,adopted_operation_id "
-            "FROM graph_d11_life_artifact_stage_v1 WHERE bot=? AND persona=? AND execution_id=?",
-            (*binding.namespace.as_tuple,binding.execution_id)).fetchone()
-        payload = terminal.payload
-        if (row is None or row[0] != binding.digest or row[1] != binding.artifact_ref
-                or type(row[2]) is not bytes or hashlib.sha256(row[2]).hexdigest() != payload.artifact_digest
-                or (row[3],row[4],len(row[2]),row[5]) != (payload.artifact_digest,payload.artifact_length,
-                    payload.artifact_length,life_adoption_operation_id_v1(binding))):
-            raise ValueError("life recovery durable artifact bytes/original adoption identity differs")
+        if type(binding) is D11DraftExecutionBindingV1:
+            witness = require_draft_terminal_readback_v1(prepared=prepared, terminal=terminal)
+            row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (binding.artifact_ref,)).fetchone()
+            if row is None or row[1] != 1 or json.loads(row[0])["readback"] != plain_v1(witness):
+                raise ValueError("draft ACK recovery lost its actual adopted signed file witness")
+        else:
+            import hashlib
+            row = db.execute("SELECT binding_digest,artifact_ref,artifact_bytes,artifact_digest,artifact_length,adopted_operation_id "
+                "FROM graph_d11_life_artifact_stage_v1 WHERE bot=? AND persona=? AND execution_id=?",
+                (*binding.namespace.as_tuple,binding.execution_id)).fetchone()
+            payload = terminal.payload
+            if (row is None or row[0] != binding.digest or row[1] != binding.artifact_ref
+                    or type(row[2]) is not bytes or hashlib.sha256(row[2]).hexdigest() != payload.artifact_digest
+                    or (row[3],row[4],len(row[2]),row[5]) != (payload.artifact_digest,payload.artifact_length,
+                        payload.artifact_length,life_adoption_operation_id_v1(binding))):
+                raise ValueError("life recovery durable artifact bytes/original adoption identity differs")
         job,_ = read_current_life_job_result_v1(db, job_id=binding.job_id, adopted=adopted)
     else:
         from .jobs import get_job, JobConflict
@@ -455,14 +623,10 @@ def validate_life_ack_recovery_v1(db, *, gate, issuer):
         prepared=prepared, adopted=adopted)
 
 
-def verify_life_adoption_commit_v1(db, *, gate, issuer, resource_issuer, require_current_metadata=True):
+def _verify_life_adoption_commit_and_original_v1(db, *, gate, issuer, resource_issuer, require_current_metadata=True):
     """Independent read-only verification before the Authority finishes its gate."""
     from .d11_life_accounting_v1 import read_life_accounting_prepared_v1
-    from .budget import _settlement_binding
-    from ..runtime_contracts import CommitReceipt, SnapshotRequirementsV2
-    from ..graph_store import GraphStore
-    from ..graph_types import NamespaceEpoch
-    binding, terminal = gate.binding, gate.terminal
+    binding = gate.binding
     namespace = binding.namespace
     operation_id = life_adoption_operation_id_v1(binding)
     saved = _read_signed(db, namespace, "adoption_bridge", binding.execution_id, issuer)
@@ -475,8 +639,17 @@ def verify_life_adoption_commit_v1(db, *, gate, issuer, resource_issuer, require
         raise ValueError("life final lost the actual signed quote and reserved contract")
     ids = life_ids_from_binding_v1(binding)
     adopted = read_adopted_life_original_v1(db, namespace=namespace, result_ref=ids["result"], issuer=issuer)
-    return validate_life_adoption_composite_v1(db, gate=gate, result=result[1], adopted=adopted,
+    receipt = validate_life_adoption_composite_v1(db, gate=gate, result=result[1], adopted=adopted,
         require_current_metadata=require_current_metadata)
+    return receipt, adopted
+
+
+def verify_life_adoption_commit_v1(db, *, gate, issuer, resource_issuer, require_current_metadata=True):
+    """Independent read-only verification before the Authority finishes its gate."""
+    receipt, _ = _verify_life_adoption_commit_and_original_v1(db, gate=gate,
+        issuer=issuer, resource_issuer=resource_issuer,
+        require_current_metadata=require_current_metadata)
+    return receipt
 
 
 def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_current_metadata=False):
@@ -515,7 +688,7 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
                 gate.before_graph_revision + 1, gate.before_graph_epoch + 1, gate.permit.operation_id + ":committed",
                 "sha256:" + canonical_digest((gate.qualification_digest, "committed")))):
         raise ValueError("life final actual event/fence is not the exact atomic bridge")
-    actual = None if terminal.status == "unknown" else {"thread_cpu_ms": terminal.actual_cpu_ms}
+    actual = None if terminal.actual_cpu_ms is None else {"thread_cpu_ms": terminal.actual_cpu_ms}
     settle = db.execute("SELECT digest,lease_id,resolution_binding_json FROM runtime_budget_operations "
         "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
         (*namespace.as_tuple, binding.reservation_operation_id)).fetchone()
@@ -532,12 +705,12 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
         (cost_write.key.token, revisions.get(cost_write.key.token))).fetchone()
     if row != (canonical_serialize(cost_write.value), 1, operation_id):
         raise ValueError("life actual full cost is absent from its composite event")
-    expected = {"schema": "d11.life-tick-adoption-receipt.v1", "operation_id": operation_id,
+    expected = {"schema": "d11.draft-tick-adoption-receipt.v1" if type(binding) is D11DraftExecutionBindingV1 else "d11.life-tick-adoption-receipt.v1", "operation_id": operation_id,
         "binding_digest": binding.digest, "terminal_digest": canonical_digest(plain_v1(terminal)),
         "bridge_digest": gate.qualification_digest, "original_ref": adopted["result_ref"],
         "original_digest": canonical_digest(plain_v1(adopted)), "graph_receipt_digest": canonical_digest(receipt),
         "status": terminal.status, "source_refs": list(tuple(adopted["source_refs"])), "actual_cpu_ms": terminal.actual_cpu_ms}
-    _decode_json(canonical_serialize(result), D11LifeAdoptionReceiptV1)
+    life_adoption_receipt_from_wire_v1(result)
     if canonical_serialize(result) != canonical_serialize(expected):
         raise ValueError("life actual composite receipt commitments differ")
     metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
@@ -547,3 +720,184 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
             or metadata[1] != gate.before_graph_revision + 1):
         raise ValueError("life committed Graph has not reached its exact authenticated current head")
     return expected
+
+
+def _selected_predecessor_work_locators_v1(db, *, namespace, prepared):
+    """Read-plan locators only; the effect reader authenticates every original."""
+    from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+    from .artifact_continuation_originals_v1 import read_selected_artifact_continuation_request_v1
+    from ..domains.d10.project_checkpoint_v1 import project_work_version_key_v1
+    if prepared.plan.target.mode != "replace":
+        return None
+    row = db.execute("SELECT payload_json FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='activity_scope' AND original_ref=?",
+        (*namespace.as_tuple, prepared.plan.activity_scope_ref)).fetchone()
+    if row is None:
+        from .d01_production_operations_v1 import MissingProductionOriginalV1
+        raise MissingProductionOriginalV1("actual_replacement_activity_scope")
+    scope = json.loads(row[0])
+    selector = artifact_draft_task_selector_v1(namespace,
+        c02_operation_id=scope["c02_original_ref"],
+        root_registration_ref=prepared.plan.target.root_registration_ref)
+    selected = read_selected_artifact_continuation_request_v1(db, namespace=namespace, selector=selector)
+    if selected is None:
+        from .d01_production_operations_v1 import MissingProductionOriginalV1
+        raise MissingProductionOriginalV1("actual_replacement_selected_predecessor")
+    request, original = selected
+    basis = original["payload"]["provenance"]["basis"]
+    key = project_work_version_key_v1(namespace, request.project_ref, basis["predecessor_effect_id"])
+    return scope, request, original, key
+
+
+def _inherited_artifact_work_ref_v1(db, *, frame, prepared, issuer):
+    from .d01_production_operations_v1 import CurrentDomainReadV1
+    from .d11_life_preparation_v1 import _read
+    from .artifact_continuation_originals_v1 import (
+        read_artifact_control_history_v1, read_completed_draft_predecessor_v1,
+    )
+    from ..domains.d10.project_checkpoint_v1 import WORK_TYPE, decode_project_checkpoint_type_v1
+    ns = frame.envelope.authority.namespace
+    scope, request, selection, key = _selected_predecessor_work_locators_v1(
+        db, namespace=ns, prepared=prepared)
+    signed_scope = _read(db, issuer=issuer, namespace=ns, kind="activity_scope",
+        ref=prepared.plan.activity_scope_ref)
+    if (signed_scope is None or signed_scope[0] != scope
+            or canonical_digest(scope) != prepared.plan.activity_scope_digest
+            or scope["root_registration_ref"] != prepared.plan.target.root_registration_ref):
+        raise ValueError("replacement work lost its actual signed activity scope")
+    provenance = selection["payload"]["provenance"]
+    if (request.project_ref != prepared.plan.project.ref
+            or provenance["replacement_target"] != plain_v1(prepared.plan.target)
+            or provenance["basis"]["predecessor_result_ref"] != request.predecessor_result_ref):
+        raise ValueError("replacement work differs from its adopted selected predecessor")
+    previous, terminal, adopted, witness = read_completed_draft_predecessor_v1(
+        db, frame=frame, result_ref=request.predecessor_result_ref, issuer=issuer)
+    atom, _, original = read_artifact_control_history_v1(db, frame=frame, ref=key.token)
+    work = decode_project_checkpoint_type_v1(WORK_TYPE, atom.value)
+    target = prepared.plan.target
+    if (original["operation_kind"] != "settle_project_checkpoint"
+            or original["payload"]["provenance"]["work_version"] != atom.value
+            or (work.project_ref, work.artifact_ref, work.effect_id, work.attempt_id,
+                work.activity_id, work.terminal_ref, work.artifact_digest, work.artifact_length, work.version) !=
+               (prepared.plan.project.ref, request.predecessor_result_ref, terminal.binding.effect_id,
+                terminal.binding.attempt_id, terminal.binding.activity_id, terminal.original_ref,
+                witness.content_digest, witness.content_length, witness.version)
+            or (target.expected_prior_version, target.expected_prior_digest,
+                target.expected_prior_identity, target.expected_prior_effect_marker) !=
+               (witness.version, witness.content_digest, witness.file_identity, witness.effect_marker)
+            or (previous.plan.target.root_resource_id, previous.plan.target.root_identity, previous.plan.target.filename) !=
+               (target.root_resource_id, target.root_identity, target.filename)
+            or provenance["basis"]["predecessor_prepared_digest"] != previous.digest
+            or provenance["basis"]["predecessor_adopted_digest"] != canonical_digest(adopted)):
+        raise ValueError("replacement work identity does not join its actual immutable predecessor")
+    CurrentDomainReadV1(frame).original(prepared.plan.activity_scope_ref)
+    return work.work_ref
+
+
+def artifact_draft_project_effect_read_inputs_v1(db, *, namespace, progress_ref):
+    from ..graph_types import AtomKey
+    from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
+    row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+        (progress_ref, *namespace.as_tuple)).fetchone()
+    if row is None or row[1] != 1:
+        return (), (), ()
+    progress = json.loads(row[0])
+    if progress.get("step") != "artifact_draft_v1":
+        return (), (), ()
+    adopted_row = db.execute("SELECT payload_json FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",
+        (*namespace.as_tuple, progress["artifact_ref"])).fetchone()
+    if adopted_row is None:
+        return (), (), (progress["terminal_ref"],)
+    from .d11_life_contract_v1 import life_from_wire_v1, D11LifeTerminalV1
+    terminal = life_from_wire_v1(json.loads(adopted_row[0])["terminal"], D11LifeTerminalV1)
+    if type(terminal) is not D11DraftTerminalV1 or terminal.binding.namespace != namespace:
+        raise ValueError("draft project selector found another original kind or namespace")
+    b = terminal.binding
+    prepared_row = db.execute("SELECT payload_json FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
+        (*namespace.as_tuple, b.prepared_original_ref)).fetchone()
+    if prepared_row is None:
+        return (), (), (b.prepared_original_ref, terminal.original_ref)
+    from .d11_life_preparation_v1 import life_prepared_from_wire_v1
+    prepared = life_prepared_from_wire_v1(json.loads(prepared_row[0]))
+    keys = [AtomKey.from_token(progress_ref), AtomKey.from_token(b.artifact_ref),
+        AtomKey.from_token(prepared.plan.action_intent.ref), *life_outcome_read_keys_v1(b, prepared.plan.action_intent.ref)]
+    keys.extend(AtomKey.from_token(row.ref) for row in prepared.read_rows)
+    roots = tuple(dict.fromkeys((prepared.plan.input_source.ref, *prepared.plan.content.source_refs)))
+    originals = (b.plan_original_ref, b.prepared_original_ref, b.artifact_ref, terminal.original_ref,
+        *progress["receipt_refs"])
+    predecessor = _selected_predecessor_work_locators_v1(db, namespace=namespace, prepared=prepared)
+    if predecessor is not None:
+        _, request, selection, work_key = predecessor
+        keys.append(work_key)
+        originals += (prepared.plan.activity_scope_ref, request.predecessor_result_ref,
+            selection["receipt"].operation_id)
+        prior = db.execute("SELECT payload_json FROM " + TABLE +
+            " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",
+            (*namespace.as_tuple, request.predecessor_result_ref)).fetchone()
+        if prior is not None:
+            prior_terminal = life_from_wire_v1(json.loads(prior[0])["terminal"], D11LifeTerminalV1)
+            originals += (prior_terminal.binding.prepared_original_ref, prior_terminal.original_ref)
+    return tuple(dict.fromkeys(keys)), roots, tuple(dict.fromkeys(originals))
+
+
+def read_adopted_artifact_draft_for_project_v1(db, *, frame, progress, issuer):
+    from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1
+    from .d10_project_checkpoint_v1 import VerifiedProjectEffectV1
+    from ..domains.d10.production_operations_v1 import LifeProgressHeadV1
+    from ..domains.d08.execution import _decode_intent, _decode
+    from ..graph_types import Owner
+    from ..runtime_contracts import VersionedRef
+    from .d11_life_outcome_provenance_v1 import life_outcome_key_v1
+    from .d10_life_progress_provenance_v1 import validate_life_progress_provenance_history_v1
+    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+    read = CurrentDomainReadV1(frame); read.check(db)
+    if type(progress) is not LifeProgressHeadV1 or progress.step != "artifact_draft_v1" or progress.artifact_ref is None:
+        raise ValueError("draft project reader requires its actual adopted complete progress")
+    ns = frame.envelope.authority.namespace
+    adopted = read_adopted_life_original_v1(db, namespace=ns, result_ref=progress.artifact_ref, issuer=issuer)
+    if adopted is None:
+        raise MissingProductionOriginalV1("actual_signed_adopted_draft_terminal")
+    from .d11_life_contract_v1 import life_from_wire_v1, D11LifeTerminalV1
+    terminal = life_from_wire_v1(adopted["terminal"], D11LifeTerminalV1)
+    if type(terminal) is not D11DraftTerminalV1:
+        raise ValueError("draft reader cannot substitute a source-note original")
+    b = terminal.binding
+    prepared = read_prepared_life_v1(db, binding=b, issuer=issuer)
+    if prepared is None:
+        raise MissingProductionOriginalV1("actual_signed_draft_preparation")
+    witness = require_draft_terminal_readback_v1(prepared=prepared, terminal=terminal)
+    if ((prepared.plan.project.ref, prepared.plan.recipe.ref, b.activity_id, b.effect_id, b.artifact_ref, terminal.original_ref) !=
+            (progress.project_ref, progress.recipe_ref, progress.activity_id, progress.effect_id, progress.artifact_ref, progress.terminal_ref)):
+        raise ValueError("draft signed file original belongs to another project/progress")
+    progress_ref = AtomKey(Owner("activity", *ns.as_tuple, b.activity_id), "d10.life_progress.v1", b.effect_id).token
+    atom = read.head(db, progress_ref, required=True)
+    if atom.value != plain_v1(progress):
+        raise ValueError("draft progress differs from its actual current head")
+    history = db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=?", (progress_ref, atom.revision)).fetchone()
+    production = None if history is None else read_adopted_domain_operation_v1(db, ns, history[0])
+    if production is None:
+        raise MissingProductionOriginalV1("actual_adopted_draft_progress_operation")
+    validate_life_progress_provenance_history_v1(db, prepared=prepared, terminal=terminal, progress=progress, production=production)
+    action_ref = prepared.plan.action_intent
+    action_row = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?", (action_ref.ref, action_ref.revision)).fetchone()
+    if action_row is None or action_row[1] != 1 or canonical_digest(json.loads(action_row[0])) != action_ref.digest:
+        raise ValueError("draft historical Action lost its precise committed parameters")
+    action = _decode_intent(json.loads(action_row[0]))
+    outcome_key = life_outcome_key_v1(b, action_ref.ref)
+    outcome = _decode("d08.action_outcome.v1", read.head(db, outcome_key, required=True).value)
+    if (outcome.action_id != action.action_id or outcome.effect_id != b.effect_id or outcome.attempt_id != b.attempt_id
+            or outcome.result_level != "completed_verified" or outcome.completed_effects != (b.effect_id,)
+            or outcome.unknown_effects or outcome.observation_refs != (terminal.original_ref,)):
+        raise MissingProductionOriginalV1("actual_verified_draft_action_postcondition")
+    roots = tuple(dict.fromkeys((prepared.plan.input_source.ref, *prepared.plan.content.source_refs)))
+    read.source_family(db, roots)
+    versions = tuple(VersionedRef(row.ref, row.revision) for row in prepared.read_rows if row.ref in roots)
+    work = (_inherited_artifact_work_ref_v1(db, frame=frame, prepared=prepared, issuer=issuer)
+        if prepared.plan.target.mode == "replace" else
+        "work:draft:" + canonical_digest((prepared.plan.target.root_registration_digest, prepared.plan.target.filename)))
+    return VerifiedProjectEffectV1(progress.project_ref, progress_ref, progress.recipe_ref, action_ref.ref,
+        action_ref.revision, action.goal_ref, action.action_kind, action.success_predicate, b.artifact_ref,
+        witness.content_digest, witness.content_length, work, witness.version, terminal.original_ref, outcome_key.token,
+        roots, versions, b.activity_id, b.effect_id, b.attempt_id, True)

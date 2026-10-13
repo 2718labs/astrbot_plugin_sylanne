@@ -166,7 +166,9 @@ def prepare_current_root_execution_v3(graph, authority, lease, *, operation_id, 
         return {"operation_id": prepare_operation, "root_operation_id": operation_id,
             "status": "root_cpu_prepared", "prepared_digest": prepared.digest, "binding_digest": binding.digest}
     graph._owner_domain_write_v3(authority, lease, operation_id=prepare_operation, request_digest=request_digest,
-        domains=("d04", "d11", "d12"), capability="workbench.activate", commit=commit)
+        domains=("d04", "d11", "d12"), capability="workbench.activate", commit=commit,
+        new_work_admission=lambda db: graph.local_module_admission.require_v1(
+            ("d04", "d11", "d12"), "d04-root:prepare"))
     with graph._GraphCoordinator__store._lock:
         prepared = read_root_prepared_v3(graph._GraphCoordinator__store._db, namespace, operation_id)
     if prepared is None:
@@ -319,6 +321,7 @@ def execute_current_root_execution_v3(graph, authority, lease, *, operation_id,
         _pending_root_measurements_v3(graph)[binding.digest] = live
         return _flush_root_measurement_v3(graph, *live)
 
+    graph.local_module_admission.require_v1(("d04", "d11", "d12"), "d04-root:first_execution")
     # Load and verify the selected package before consuming a once-only claim.
     installed = read_installed_d04_root_identity_v3(assembly.package_root, binding.native_manifest_sha256)
     if installed != raw["installed_identity"]:

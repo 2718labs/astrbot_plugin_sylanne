@@ -885,6 +885,8 @@ class D06DomainProvider:
         specs.extend(life_numeric_trace_type_specs_v1())
         from ...runtime.d06_internal_life_trace_v3 import internal_life_trace_type_spec_v3
         specs.append(internal_life_trace_type_spec_v3())
+        from ...runtime.artifact_task_amendment_v1 import amendment_type_spec_v1
+        specs.append(amendment_type_spec_v1())
         return tuple(sorted(specs, key=lambda item: item.name))
 
     def register_types(self) -> tuple[str, ...]:

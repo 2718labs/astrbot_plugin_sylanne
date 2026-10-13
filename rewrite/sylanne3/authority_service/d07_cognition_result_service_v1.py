@@ -30,7 +30,7 @@ class AuthorityD07CognitionResultServiceV1(AuthorityV2NaturalGenerationOutputSer
     superclass's private terminal reader only verifies the shared C02 ledger.
     """
     def __init__(self, *, store, fences, graph_db_path, d11_issuer, installation_id,
-                 read_subject, holder, trusted_now_utc):
+                 read_subject, holder, trusted_now_utc, installed_bundle=None):
         if (type(store) is not AuthorityV2ModelEgressStore or type(fences) is not AuthorityV2FenceService
                 or store._db is not fences.core._db or store._lock is not fences.core._lock
                 or type(d11_issuer) is not D11BudgetJobIssuer or not callable(trusted_now_utc)):
@@ -38,6 +38,12 @@ class AuthorityD07CognitionResultServiceV1(AuthorityV2NaturalGenerationOutputSer
         self._store, self._fences, self._issuer = store, fences, d11_issuer
         self._path = Path(graph_db_path).resolve(strict=True)
         self._installation_id, self._read_subject, self._holder = installation_id, read_subject, holder
+        if installed_bundle is not None:
+            from ..host.authority_profile import AdminInstallationBundle
+            if (type(installed_bundle) is not AdminInstallationBundle
+                    or installed_bundle.installation_policy.installation_id != installation_id):
+                raise AuthorityUnavailable("D07 result reader needs its actual installed bundle")
+        self._installed_bundle = installed_bundle
         self._clock = trusted_now_utc
         self._delivery_lock, self._inflight_deliveries = threading.RLock(), {}
 
@@ -55,12 +61,19 @@ class AuthorityD07CognitionResultServiceV1(AuthorityV2NaturalGenerationOutputSer
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
             try:
-                original, job, frozen = read_current_d07_execution_graph_v1(db, intent, self._issuer, now, allow_accounted_result=True)
+                original, job, frozen = read_current_d07_execution_graph_v1(db, intent, self._issuer, now, allow_accounted_result=True, installed_bundle=self._installed_bundle)
                 if ((request.namespace, request.job_id, request.original_operation_id, request.call_id,
                      request.binding_digest, request.model_request_digest, request.acquire_operation_id) !=
                     (original.namespace, original.job_id, original.operation_id, original.call_id,
                      original.digest, intent.request_digest, intent.acquire_operation_id)):
                     raise AuthorityUnavailable("D07 selector differs from actual original")
+                from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1
+                if type(original) is D07IngressRecallPreparedV1:
+                    expected_attempt = "d07-result-read:" + canonical_digest((
+                        original.namespace, original.job_id, original.digest, intent.request_digest))[:48]
+                    if (request.consumer_operation_id != original.adoption_operation_id
+                            or request.read_attempt_id != expected_attempt):
+                        raise AuthorityUnavailable("Self C3 result changed its exact adoption/read attempt identity")
                 return original, job, frozen
             finally:
                 db.rollback()

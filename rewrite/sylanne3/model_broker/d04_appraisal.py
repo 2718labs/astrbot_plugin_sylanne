@@ -28,8 +28,8 @@ from ..runtime_contracts import (
 
 INPUT_SCHEMA = "sylanne.d04.appraisal_input.v1"
 OUTPUT_SCHEMA = "sylanne.d04.appraisal_suggestions.v1"
-TEMPLATE_VERSION = "sylanne.d04.appraisal_template.v1"
-WORK_KIND = "d04.appraisal"
+from ..runtime_contracts import D04_APPRAISAL_TEMPLATE_V1 as TEMPLATE_VERSION
+from ..runtime_contracts import D04_APPRAISAL_WORK_KIND as WORK_KIND
 MAX_INPUT_BYTES = 16_384
 MAX_OUTPUT_BYTES = 16_384
 MAX_SOURCES = 4

@@ -32,3 +32,15 @@ def astrbot_namespace(
         "persona_id": selected_persona_id,
     })
     return NamespaceId(bot_id, persona_id)
+
+
+def astrbot_namespace_from_configuration_v1(value) -> NamespaceId:
+    """Exact initial configuration; actual SDK/Host observation remains independent."""
+    if (type(value) is not dict or set(value) != {
+            "schema", "platform_id", "self_id", "selected_persona_id"}
+            or value["schema"] != "sylanne.astrbot.installed-namespace.v1"):
+        raise ValueError("exact configured AstrBot namespace identity required")
+    for name in ("platform_id", "self_id", "selected_persona_id"):
+        if type(value[name]) is not str:
+            raise ValueError("configured AstrBot identity values must be strings")
+    return astrbot_namespace(value["platform_id"], value["self_id"], value["selected_persona_id"])

@@ -7,6 +7,7 @@ rights and graph heads after execution and independent cost settlement.
 
 from __future__ import annotations
 
+
 from dataclasses import asdict
 import json
 import sqlite3
@@ -26,7 +27,18 @@ from .c04_v3_contracts import AssociationWorkInputV3
 from .d04_joint_output_original_store_v1 import read_d04_joint_output_original_v1
 
 
-def _transaction(db: sqlite3.Connection) -> None:
+def _transaction(db: sqlite3.Connection, *, original_read=False) -> None:
+    if original_read and type(db) is not sqlite3.Connection:
+        from ..authority_service.c09_paged_recovery_facts_v2 import _BoundedReadConnectionV2,_C09ReadonlyPointMeterV3
+        from .c09_paged_sql_v2 import current_c09_sql_meter_v2,C09SqlByteMeterV2
+        if type(db) is not _BoundedReadConnectionV2 or type(db.db) is not sqlite3.Connection or not db.db.in_transaction:
+            raise RuntimeError("actual bounded C09 original read transaction required")
+        actual=current_c09_sql_meter_v2()
+        borrowed=db.meter.parent if type(db.meter) is _C09ReadonlyPointMeterV3 else db.meter
+        if type(actual) is not C09SqlByteMeterV2 or borrowed is not actual:
+            raise RuntimeError("C09 original read must borrow the actual active caller quantum")
+        borrowed.require_available(0)
+        return
     if type(db) is not sqlite3.Connection or not db.in_transaction:
         raise RuntimeError("C04 frozen input needs a caller-owned graph transaction")
 
@@ -60,6 +72,11 @@ def verify_current_association_input_heads_v3(
     _transaction(db)
     if type(work) is not AssociationWorkInputV3:
         raise TypeError("typed C04 V3 work required")
+    _verify_current_association_input_heads_common_v3(db, work)
+
+
+def _verify_current_association_input_heads_common_v3(db, work):
+    _transaction(db)
     work.validate_closure()
     namespace = work.namespace
     for read in work.reads:
@@ -161,6 +178,21 @@ def record_c04_frozen_association_original_v3(
             type(asset) is not D04LoadedTanhReadoutAsset or
             type(policy) is not D04IntervalProjectionPolicyV2):
         raise TypeError("typed C04 V3 namespace, binding and input required")
+    return _record_checked_c04_frozen_work_v3(db, namespace, binding, work, asset=asset, policy=policy)
+
+
+def record_c04_frozen_association_original_v4(db, namespace, binding, work, *, asset, policy):
+    from .c04_direct_seed_v4 import AssociationWorkInputV4
+    _transaction(db)
+    if (type(namespace) is not NamespaceId or type(binding) is not InternalWorkBindingV1
+            or type(work) is not AssociationWorkInputV4 or type(asset) is not D04LoadedTanhReadoutAsset
+            or type(policy) is not D04IntervalProjectionPolicyV2):
+        raise TypeError("exact Self C04 V4 namespace/binding/work and installed D04 providers required")
+    work.validate_closure()
+    return _record_checked_c04_frozen_work_v3(db, namespace, binding, work, asset=asset, policy=policy)
+
+
+def _record_checked_c04_frozen_work_v3(db, namespace, binding, work, *, asset, policy):
     _identity(namespace, binding, work)
     prepared = read_c04_internal_work_prepared_v1(db, namespace,
                                                   binding.operation_id)
@@ -175,7 +207,7 @@ def record_c04_frozen_association_original_v3(
     if (work.access_epoch, work.delete_epoch) != (prepared.access_epoch,
                                                   prepared.delete_epoch):
         raise ValueError("C04 V3 rights epoch differs from W01 preparation")
-    verify_current_association_input_heads_v3(db, work)
+    _verify_current_association_input_heads_common_v3(db, work)
     for target in work.targets:
         baseline = read_c04_encoding_baseline_v3(
             db, namespace=namespace,
@@ -225,7 +257,7 @@ def read_c04_frozen_association_original_v3(
     binding: InternalWorkBindingV1,
 ) -> AssociationWorkInputV3 | None:
     """Read immutable W01 bytes for Authority's one-time execution."""
-    _transaction(db)
+    _transaction(db, original_read=True)
     if type(namespace) is not NamespaceId or type(binding) is not InternalWorkBindingV1:
         raise TypeError("typed C04 V3 namespace and binding required")
     row = db.execute(
@@ -237,6 +269,26 @@ def read_c04_frozen_association_original_v3(
     if row is None:
         return None
     work = AssociationWorkInputV3.from_json(row[3])
+    return _read_checked_c04_frozen_work_v3(db, namespace, binding, row, work)
+
+
+def read_c04_frozen_association_original_v4(db, namespace, binding):
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    from .c04_direct_seed_v4 import AssociationWorkInputV4, ALGORITHM_ID_V4
+    _transaction(db, original_read=True)
+    if (type(namespace) is not NamespaceId or type(binding) is not InternalWorkBindingV1
+            or binding.algorithm_ref != ALGORITHM_ID_V4):
+        raise TypeError("exact Self C04 V4 namespace/binding required")
+    row = _producer_original_point_v3(db, table='graph_c04_association_inputs_v3', columns=('binding_digest', 'input_digest', 'algorithm_build_digest', 'work_json'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, binding.operation_id)), legacy_reader=lambda: db.execute("SELECT binding_digest,input_digest,algorithm_build_digest,work_json "
+        "FROM graph_c04_association_inputs_v3 WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, binding.operation_id)).fetchone())
+    if row is None:
+        return None
+    work = AssociationWorkInputV4.from_json(row[3])
+    return _read_checked_c04_frozen_work_v3(db, namespace, binding, row, work)
+
+
+def _read_checked_c04_frozen_work_v3(db, namespace, binding, row, work):
     prepared = read_c04_internal_work_prepared_v1(db, namespace,
                                                   binding.operation_id)
     _identity(namespace, binding, work)
@@ -259,5 +311,7 @@ __all__ = [
     "install_c04_frozen_association_original_v3",
     "record_c04_frozen_association_original_v3",
     "read_c04_frozen_association_original_v3",
+    "record_c04_frozen_association_original_v4",
+    "read_c04_frozen_association_original_v4",
     "verify_current_association_input_heads_v3",
 ]

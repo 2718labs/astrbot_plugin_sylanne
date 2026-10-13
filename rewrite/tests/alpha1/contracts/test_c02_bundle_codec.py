@@ -101,3 +101,48 @@ def test_c02_bundle_rejects_noncanonical_text_and_other_bundle_shapes():
     with pytest.raises(ValueError, match="fields"):
         c02_bundle_from_wire(text.replace('"product_advance":null',
                                           '"product_advance":null,"root_adoption":null'))
+
+
+def _mechanical_reader(bundle):
+    from types import SimpleNamespace
+    from sylanne3.runtime.c02_bundle_mechanical_read_v3 import C02BundleMechanicalReadV3
+    from sylanne3.runtime.c09_paged_sql_v2 import C09BatchBudgetV2,C09SqlByteMeterV2
+    # Data-only codec resource accounting; this is no installed Work or issuer.
+    retained=[]
+    operation=SimpleNamespace(retain=retained.append)
+    identity=bundle.envelope.identity
+    reader=C02BundleMechanicalReadV3(namespace=bundle.envelope.authority.namespace,
+        operation_id=identity.operation_id,archive_schema='sylanne.first-ingress-c02-candidate.v2',
+        archive_digest=bundle.digest,business=(bundle.digest,identity.activity_id,identity.effect_id,1),
+        event=('d'*64,4),operation=operation)
+    meter=C09SqlByteMeterV2(C09BatchBudgetV2(100,262144,25000000,250000000,2097152))
+    return reader,meter
+
+
+def test_c02_mechanical_metadata_keeps_envelope_and_full_body_commitment():
+    from hashlib import sha256
+    bundle=_bundle()
+    text=c02_bundle_to_wire(bundle)
+    wire=text.encode()
+    reader,meter=_mechanical_reader(bundle)
+    for start in range(0,len(wire),127):
+        reader.feed_v3(wire[start:start+127],meter)
+    assert reader.finish_v3(sha256=sha256(wire).hexdigest(),byte_count=len(wire))==bundle.envelope
+    assert reader.bundle_digest==c02_bundle_from_wire(text).digest
+    assert reader.complete and reader.raw is None and not reader.nodes
+    assert tuple(reader.proposal_fingerprints)==tuple(
+        canonical_digest(proposal)for proposal in json.loads(text)['proposals'])
+
+
+def test_c02_mechanical_metadata_rejects_changed_body_under_original_commitment():
+    from hashlib import sha256
+    bundle=_bundle()
+    raw=json.loads(c02_bundle_to_wire(bundle))
+    raw['proposals'][0]['typed_writes'][0]['value']['episode_id']='changed-original'
+    wire=canonical_serialize(raw).encode()
+    reader,meter=_mechanical_reader(bundle)
+    for start in range(0,len(wire),127):
+        reader.feed_v3(wire[start:start+127],meter)
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    with pytest.raises(AuthorityUnavailable,match='legacy bundle digest'):
+        reader.finish_v3(sha256=sha256(wire).hexdigest(),byte_count=len(wire))

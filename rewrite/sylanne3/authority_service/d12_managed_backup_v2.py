@@ -245,13 +245,13 @@ class InstalledD12ManagedBackupV2:
     def __init__(self,*,package_files,supervisor_journal,host_supervisor,authority_supervisor,storage_reader,inventory_manifest,maximum_file_bytes):
         from .d12_package_files_v2 import InstalledPackageSelectionFilesV2
         from .d12_package_supervisor_journal_v2 import InstalledPackageSupervisorJournalV2
-        from .d12_installed_supervisor_v1 import InstalledD12SystemdSupervisorV1
+        from .d12_installed_supervisor_v1 import is_installed_supervisor_v1,supervisor_identity_v1
         from ..runtime.c09_installation_inventory_v2 import InstallationFilesystemManifestV2
         if (type(package_files) is not InstalledPackageSelectionFilesV2 or type(supervisor_journal) is not InstalledPackageSupervisorJournalV2
-                or any(type(s) is not InstalledD12SystemdSupervisorV1 for s in (host_supervisor,authority_supervisor))
+                or any(not is_installed_supervisor_v1(s) for s in (host_supervisor,authority_supervisor))
                 or not isinstance(storage_reader,InstalledC09StorageReaderV1) or type(inventory_manifest) is not InstallationFilesystemManifestV2
                 or type(maximum_file_bytes) is not int or not 1<=maximum_file_bytes<=8*1024**3):raise TypeError('actual protected supervisor/storage/backup composition required')
-        if host_supervisor.config.unit_name==authority_supervisor.config.unit_name:raise AuthorityUnavailable('independent Host and Authority units required')
+        if supervisor_identity_v1(host_supervisor.config)==supervisor_identity_v1(authority_supervisor.config):raise AuthorityUnavailable('independent Host and Authority supervisors required')
         self.files=package_files;self.journal=supervisor_journal;self.host=host_supervisor;self.authority=authority_supervisor
         self.reader=storage_reader;self.inventory=inventory_manifest;self.maximum_file_bytes=maximum_file_bytes
         roots=[r for r in inventory_manifest.resources if r.kind=='controlled_backup' and 'controlled_backups' in r.content_coverage]
@@ -335,8 +335,18 @@ class InstalledD12ManagedBackupV2:
             before=[o for ref,o in observations.items() if ref in before_refs and o.kind=='process' and o.body['service_role']==role]
             stopped=[o for ref,o in observations.items() if ref in retired_refs and o.kind=='process' and o.body['service_role']==role and o.body['process_original'] is None]
             if len(before)!=1 or len(stopped)!=1 or not current.stopped_and_drained:raise AuthorityUnavailable('actual original unit retirement differs')
-            original=before[0].body['systemd'];observed=stopped[0].body['systemd']
-            if any(original[k]!=asdict(current)[k] for k in ('unit_name','control_group','unit_fragment_sha256')) or observed!=json.loads(canonical_serialize(asdict(current))):raise AuthorityUnavailable('actual retired systemd identity differs')
+            from .d12_installed_supervisor_v1 import process_observation_state_v1,D12SupervisorObservationV1
+            original=process_observation_state_v1(before[0].body);observed=process_observation_state_v1(stopped[0].body)
+            if type(current) is D12SupervisorObservationV1:
+                if any(original[k]!=asdict(current)[k] for k in ('unit_name','control_group','unit_fragment_sha256')) or observed!=json.loads(canonical_serialize(asdict(current))):raise AuthorityUnavailable('actual retired systemd identity differs')
+            else:
+                fixed=('provider_kind','supervisor_id','spec_digest','service_role','installed_code_digest',
+                       'invocation_id','launcher_process_original','pid_namespace_identity','mount_namespace_identity')
+                if (not current.stopped_and_drained or observed['main_pid']!=0 or observed['process_ids']
+                        or observed['state'] not in {'stopped','failed'}
+                        or any(original[k]!=observed[k] or observed[k]!=asdict(current)[k] for k in fixed)
+                        or current.observation_sequence<observed['observation_sequence']):
+                    raise AuthorityUnavailable('actual retired process-provider identity differs')
             prior_process=before[0].body['process_original']
             if prior_process is not None:require_process_retired_v1(prior_process)
             elif (original['active_state'] not in {'inactive','failed'} or original['main_pid']!=0 or original['process_ids']):

@@ -28,6 +28,9 @@ from .dispatch_action_job_binding import (
 from .dispatch_admission import load_admission
 from .jobs import JobConflict, PersistentJob, get_job
 from .dispatch_source_correction_barrier import read_source_correction_barrier
+from .dispatch_current_projection import _bound_dispatch_projection_v3
+from .current_graph_full_read_v3 import require_bound_graph_full_atom_rows_v3,require_bound_graph_full_atom_v3
+from ..runtime_storage_v3 import read_graph_history_v3
 
 
 _TYPES = (
@@ -109,13 +112,14 @@ def _map_current_d08_check_versions(
     its revision, not that D08 designated it as a criterion.
     """
     if (not db.in_transaction or type(namespace) is not NamespaceId
-            or type(snapshot) is not GraphSnapshot or type(query) is not QueryEpoch
+            or type(query) is not QueryEpoch
             or type(intent) is not ActionIntent or type(spec) is not RequiredCheckSpec
             or type(receipt) is not CheckReceipt
             or type(observed) is not CurrentD08ObservedVersionsV1
             or type(now_utc) not in (int, float)
             or not math.isfinite(now_utc)):
         raise ValueError("D08 check version mapping needs current typed inputs")
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot)
     if (len(snapshot.epochs) != 1
             or query != QueryEpoch(namespace, "all", snapshot.epochs[0].revision)
             or observed.query_epoch != query
@@ -140,14 +144,18 @@ def _map_current_d08_check_versions(
     if (criteria_key.owner.bot, criteria_key.owner.persona) != namespace.as_tuple:
         raise ValueError("D08 criteria crosses namespace")
     criteria = snapshot.get(criteria_key)
-    criteria_row = db.execute(
-        "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
-        "AND bot=? AND persona=?",
-        (criteria_key.token, *namespace.as_tuple),
-    ).fetchone()
+    if fixed is not None:
+        actual_criteria = require_bound_graph_full_atom_v3(db,namespace,query,criteria_key)
+        criteria_row = None if actual_criteria is None else (actual_criteria.revision,actual_criteria.value,int(actual_criteria.valid))
+    else:
+        criteria_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
+            "AND bot=? AND persona=?",
+            (criteria_key.token, *namespace.as_tuple),
+        ).fetchone()
     if (criteria is None or not criteria.valid or criteria_row is None
             or criteria_row[2] != 1 or criteria.revision != criteria_row[0]
-            or criteria.value != json.loads(criteria_row[1])):
+            or criteria.value != (json.loads(criteria_row[1]) if fixed is None else criteria_row[1])):
         raise ValueError("D08 criteria is not a current graph atom")
     if (observed.goal_version.ref != intent.goal_ref
             or tuple(item.ref for item in observed.commitment_versions)
@@ -195,6 +203,7 @@ def read_current_d08_check_versions(
     witness: OwnerDispatchWitnessV1,
     authority_snapshot: AuthorityDispatchSnapshotV1,
     effect: CurrentEffectReadV2, *, now_utc: float,
+    prepared_inventory=None,
 ) -> tuple[VersionedRef, ...]:
     """Read D08 pins, then HOLD until criteria and conflict policy are issued.
 
@@ -205,7 +214,7 @@ def read_current_d08_check_versions(
     """
     observed = read_current_d08_observed_versions(
         db, namespace, snapshot, query, action_id, context, witness,
-        authority_snapshot, effect)
+        authority_snapshot, effect, prepared_inventory=prepared_inventory)
     _map_current_d08_check_versions(
         db, namespace, snapshot, query, intent, spec, receipt, observed,
         now_utc=now_utc)
@@ -218,6 +227,7 @@ def read_current_d08_observed_versions(
     witness: OwnerDispatchWitnessV1,
     authority_snapshot: AuthorityDispatchSnapshotV1,
     effect: CurrentEffectReadV2,
+    *, prepared_inventory=None,
 ) -> CurrentD08ObservedVersionsV1:
     """Correlate graph goal/action/job heads with the complete P2 effect set.
 
@@ -228,12 +238,13 @@ def read_current_d08_observed_versions(
     synthetic cancellation/query epoch refs still needs a shared contract.
     """
     if (not db.in_transaction or type(namespace) is not NamespaceId
-            or type(snapshot) is not GraphSnapshot or type(query) is not QueryEpoch
+            or type(query) is not QueryEpoch
             or type(context) is not DispatchHandoffContextV1
             or type(witness) is not OwnerDispatchWitnessV1
             or type(authority_snapshot) is not AuthorityDispatchSnapshotV1
             or type(effect) is not CurrentEffectReadV2):
         raise ValueError("current D08 observation requires typed graph transaction inputs")
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
     require_exact_authority_snapshot(context, witness, authority_snapshot)
     from ..graph_coordinator import namespace_ref
 
@@ -253,9 +264,9 @@ def read_current_d08_observed_versions(
             != (authority_snapshot.anchor.execution_seq,
                 authority_snapshot.anchor.execution_digest)):
         raise ValueError("D08 observation does not match claimed P2 effect")
-    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query)
+    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query, prepared_inventory=prepared_inventory)
     action = read_current_d08_action_conflict_evidence(
-        db, namespace, snapshot, query, action_id, context.permit, effect)
+        db, namespace, snapshot, query, action_id, context.permit, effect, prepared_inventory=prepared_inventory)
     if (action.effect_state != "unresolved"
             or action.action_cancellation_state != "clear"
             or action.job_cancellation_state != "clear"
@@ -268,11 +279,12 @@ def read_current_d08_observed_versions(
     if len(intents) != 1:
         raise ValueError("D08 current action is not unique")
     intent = intents[0]
-    goal_rows = db.execute(
+    goal_rows = (db.execute(
         "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
         "AND type_name='d08.goal.v1' AND name=?",
         namespace.as_tuple + (intent.goal_ref,),
     ).fetchall()
+        if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,('d08.goal.v1',),('token','revision','value','valid'),valid_only=False,name=intent.goal_ref))
     if len(goal_rows) != 1:
         raise ValueError("D08 current goal is absent or ambiguous")
     token, revision, encoded, valid = goal_rows[0]
@@ -280,9 +292,9 @@ def read_current_d08_observed_versions(
     goal_atom = snapshot.get(goal_key)
     goal_spec = next(spec for spec in GoalExecutionProvider().register_types()
                      if spec.name == "d08.goal.v1")
-    goal = goal_spec.validator(json.loads(encoded))
+    goal = goal_spec.validator((json.loads(encoded) if fixed is None else encoded))
     if (valid != 1 or goal_atom is None or not goal_atom.valid
-            or goal_atom.revision != revision or goal_atom.value != json.loads(encoded)
+            or goal_atom.revision != revision or goal_atom.value != (json.loads(encoded) if fixed is None else encoded)
             or goal.goal_id != intent.goal_ref or goal.revision != revision):
         raise ValueError("D08 current goal changed")
     by_id = {item.commitment_id: item for item in facts.commitments}
@@ -307,8 +319,10 @@ def read_current_d08_observed_versions(
 def _current_action_cancellation(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
     intent: ActionIntent, binding,
+    *, prepared_inventory=None,
 ) -> tuple[str, GraphVersion | None, tuple[str, ...]]:
     """Read one stable D08 head and its admission origin under the graph fence."""
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
     missing = ("current_action_cancellation_read",)
     if binding is None or "graph_history" not in {
             row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -321,21 +335,24 @@ def _current_action_cancellation(
     key = AtomKey(owner, "d08.action_cancellation.v1", intent.action_id)
     # A full query epoch makes every competing same-name head visible. A
     # missing initial head is never evidence that the action is uncancelled.
-    rows = db.execute(
+    rows = (db.execute(
         "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
         "AND type_name='d08.action_cancellation.v1'",
         namespace.as_tuple,
     ).fetchall()
+        if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,('d08.action_cancellation.v1',),('token','revision','value','valid'),valid_only=False))
     relevant = tuple(row for row in rows if AtomKey.from_token(row[0]).name == intent.action_id)
     if len(relevant) != 1 or relevant[0][0] != key.token:
         return "unknown", None, missing
     token, revision, encoded, valid = relevant[0]
-    matching_atoms = tuple(item for item in snapshot.atoms if item.key == key)
+    matching_atoms = tuple(item for item in
+        (snapshot.atoms if fixed is None else fixed.atoms_for_types_v3(('d08.action_cancellation.v1',)))
+        if item.key == key)
     if len(matching_atoms) != 1:
         return "unknown", None, missing
     atom = matching_atoms[0]
     if (not atom.valid or atom.revision != revision
-            or atom.value != json.loads(encoded) or valid != 1
+            or atom.value != (json.loads(encoded) if fixed is None else encoded) or valid != 1
             or type(revision) is not int or revision not in {1, 2}):
         return "unknown", None, missing
     try:
@@ -359,11 +376,14 @@ def _current_action_cancellation(
         return "unknown", None, missing
 
     def historical(version: int):
-        row = db.execute(
-            "SELECT value,valid,event_bot,event_persona,event_session,event_id "
-            "FROM graph_history WHERE token=? AND revision=?",
-            (token, version),
-        ).fetchone()
+        if fixed is not None:
+            row = read_graph_history_v3(db,token,version,columns=('value','valid','event_bot','event_persona','event_session','event_id'))
+        else:
+            row = db.execute(
+                "SELECT value,valid,event_bot,event_persona,event_session,event_id "
+                "FROM graph_history WHERE token=? AND revision=?",
+                (token, version),
+            ).fetchone()
         if row is None or row[1:5] != (1, *namespace.as_tuple, state.activity_id):
             return None
         event = db.execute(
@@ -390,6 +410,7 @@ def _current_action_cancellation(
             return None
         return row
 
+    encoded_history = encoded if fixed is None else canonical_json(encoded)
     first = historical(1)
     if first is None or first[5] != binding.operation_id:
         return "unknown", None, missing
@@ -406,11 +427,11 @@ def _current_action_cancellation(
                 initial.activity_id, initial.attempt_id, initial.effect_id) != expected):
         return "unknown", None, missing
     if revision == 1:
-        if state != initial or encoded != first[0]:
+        if state != initial or encoded_history != first[0]:
             return "unknown", None, missing
         return "clear", GraphVersion(key, revision), ()
     second = historical(2)
-    if (second is None or second[0] != encoded or second[5] != state.operation_id
+    if (second is None or second[0] != encoded_history or second[5] != state.operation_id
             or state.state != "cancelled" or state.cancel_epoch != 1
             or (state.action_id, state.action_revision, state.action_digest,
                 state.activity_id, state.attempt_id, state.effect_id) != expected):
@@ -532,6 +553,7 @@ def read_current_job_cancellation(
 
 def read_current_d08_conflict_facts(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
+    *, prepared_inventory=None,
 ) -> CurrentD08ConflictFactsV1:
     """Verify every current D08 conflict graph row in the graph write transaction.
 
@@ -551,18 +573,21 @@ def read_current_d08_conflict_facts(
     if (row[0] if row else 0) != query.revision:
         raise ValueError("D08 conflict graph epoch changed")
 
-    atoms = tuple(atom for atom in snapshot.atoms
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
+    projected_atoms = snapshot.atoms if fixed is None else fixed.atoms_for_types_v3(_TYPES)
+    atoms = tuple(atom for atom in projected_atoms
                   if atom.valid and atom.key.type_name in _TYPES)
     by_token = {atom.key.token: atom for atom in atoms}
     if len(by_token) != len(atoms):
         raise ValueError("D08 conflict snapshot repeats a graph key")
-    rows = db.execute(
+    rows = (db.execute(
         "SELECT token,revision,value,type_name FROM graph_atoms "
         "WHERE bot=? AND persona=? AND type_name IN "
         "('d08.commitment.v1','d08.action_intent.v1','d08.action_outcome.v1') "
         "AND valid=1 ORDER BY token",
         namespace.as_tuple,
     ).fetchall()
+        if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,_TYPES,('token','revision','value','type_name')))
     if len(rows) != len(atoms):
         raise ValueError("D08 conflict snapshot omits or invents a current row")
 
@@ -574,7 +599,7 @@ def read_current_d08_conflict_facts(
         atom = by_token.get(token)
         if (atom is None or atom.key != AtomKey.from_token(token)
                 or atom.key.type_name != type_name or atom.revision != revision
-                or atom.value != json.loads(encoded)):
+                or atom.value != (json.loads(encoded) if fixed is None else encoded)):
             raise ValueError("D08 conflict graph row changed")
         owner = atom.key.owner
         spec = specs[type_name]
@@ -610,7 +635,7 @@ def read_current_d08_conflict_facts(
             missing.append(f"action_source_refs_unavailable:{atom.key.token}")
             continue
         barrier = read_source_correction_barrier(
-            db, namespace, query, tuple(refs), dependent_ref=atom.key.token,
+            db, namespace, query, tuple(refs), dependent_ref=atom.key.token, prepared_inventory=prepared_inventory,
         )
         missing.extend(barrier.missing_sources)
     return CurrentD08ConflictFactsV1(
@@ -625,6 +650,7 @@ def read_current_d08_conflict_facts(
 def read_current_d08_action_conflict_evidence(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
     action_id: str, p2: FencePermitV2, effect: CurrentEffectReadV2,
+    *, prepared_inventory=None,
 ) -> CurrentD08ActionConflictEvidenceV1:
     """Correlate one graph action with a pre-read Authority effect and job rows.
 
@@ -632,7 +658,7 @@ def read_current_d08_action_conflict_evidence(
     happened before this callback; the caller's later Authority P2 CAS must
     still reject any execution-head movement. This read never grants dispatch.
     """
-    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query)
+    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query, prepared_inventory=prepared_inventory)
     if type(p2) is not FencePermitV2 or type(effect) is not CurrentEffectReadV2:
         raise TypeError("D08 execution evidence requires typed P2 and Authority read")
     matches = tuple(intent for intent in facts.action_intents
@@ -706,7 +732,7 @@ def read_current_d08_action_conflict_evidence(
                 blockers.append("current_action_job_binding_stale")
 
     action_cancellation_state, action_cancellation_version, cancellation_missing = (
-        _current_action_cancellation(db, namespace, snapshot, query, intent, binding))
+        _current_action_cancellation(db, namespace, snapshot, query, intent, binding, prepared_inventory=prepared_inventory))
     if action_cancellation_state != "unknown":
         blockers = [item for item in blockers
                     if item != "current_action_cancellation_read"]
@@ -742,11 +768,16 @@ def read_current_d08_action_conflict_evidence(
             blockers.append("matching_job_cancelled")
         if binding is not None and admission is not None:
             projected = job_graph_write(job)
-            graph_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
-                "AND bot=? AND persona=? AND type_name='runtime.job'",
-                (projected.key.token, *namespace.as_tuple),
-            ).fetchone()
+            fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
+            if fixed is not None:
+                actual_job = require_bound_graph_full_atom_v3(db,namespace,query,projected.key)
+                graph_row = None if actual_job is None else (actual_job.revision,canonical_json(actual_job.value),int(actual_job.valid))
+            else:
+                graph_row = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
+                    "AND bot=? AND persona=? AND type_name='runtime.job'",
+                    (projected.key.token, *namespace.as_tuple),
+                ).fetchone()
             if (binding.job_id != job.job_id
                     or not (job.work_kind == "dispatch"
                             or _is_post_c02_reply_waiting_job(

@@ -190,6 +190,14 @@ def read_current_d04_numeric_prepared_v3(db, binding, resource_issuer, now_utc, 
             "output_policy_digest")):
         raise ValueError("D04 numeric frozen installed identity/Owner/native differs")
     selectors,projection=read_numeric_policy_owner_selectors_v3(db,binding,budget_issuer,frozen,now_utc=now_utc)
+    from ..runtime.d06_life_numeric_joint_v1 import read_life_joint_signed_lineage_v1
+    lineage = read_life_joint_signed_lineage_v1(db, prepared, issuer=budget_issuer,
+        resource_issuer=resource_issuer, now_utc=now_utc)
+    if lineage is not None:
+        context = lineage[1]
+        if any(selector['owner_guard']['authorization_head'].removeprefix('sha256:') != context.owner_head_digest
+                for selector in selectors):
+            raise ValueError('Life numerical continuation differs from its actual accepting Owner')
     return D04NumericPreparedReadV3(binding, prepared.original_ref, prepared.digest,
         job.phase, job.fence, job.lease_holder, binding.reservation_operation_id,
         binding.reservation_digest, binding.quote_digest, canonical_serialize(anchor), prepared.input_payload_json,

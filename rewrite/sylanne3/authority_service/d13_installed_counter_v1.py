@@ -36,10 +36,25 @@ class InstalledD13CounterCommandV1:
             raise ValueError("protected D13 counter executable pin required")
 
     def count_outside_graph_transaction_v1(self, *, db, policy, request):
-        if db.in_transaction or type(policy) is not InstalledD13WirePolicyV1:
+        if type(policy) is not InstalledD13WirePolicyV1:
+            raise ValueError("D13 V1 counter requires its exact installed V1 policy")
+        return self._count_installed_complete_wire(db=db, policy=policy, request=request,
+            request_schema="sylanne3.d13.full-wire-count-request.v1", request_limit=16 * 1024 * 1024,
+            verify_envelope=verify_signed_d13_wire_envelope_v1)
+
+    def count_outside_graph_transaction_v6(self, *, db, policy, request):
+        from .d13_wire_evidence_v6 import InstalledD13WirePolicyV6, verify_signed_d13_wire_envelope_v6
+        if type(policy) is not InstalledD13WirePolicyV6:
+            raise ValueError("D13 V6 counter requires its exact installed V6 policy")
+        return self._count_installed_complete_wire(db=db, policy=policy, request=request,
+            request_schema="sylanne3.d13.full-wire-count-request.v6", request_limit=16 * 1024 * 1024,
+            verify_envelope=verify_signed_d13_wire_envelope_v6)
+
+    def _count_installed_complete_wire(self, *, db, policy, request, request_schema, request_limit, verify_envelope):
+        if db.in_transaction:
             raise ValueError("D13 provider counting is forbidden inside a Graph transaction")
         if (type(request) is not dict or set(request) != {"schema", "original", "policy", "raw_wire", "compressed_wire"}
-                or request["schema"] != "sylanne3.d13.full-wire-count-request.v1"
+                or request["schema"] != request_schema
                 or canonical_serialize(request["policy"]) != canonical_serialize(asdict(policy))
                 or request["original"].get("policy_digest") != policy.policy_digest
                 or any(type(request[k]) is not str for k in ("raw_wire", "compressed_wire"))
@@ -47,7 +62,7 @@ class InstalledD13CounterCommandV1:
                 or hashlib.sha256(request["compressed_wire"].encode()).hexdigest() != request["original"].get("compressed_request_digest")):
             raise ValueError("D13 counter request must bind both actual complete wires")
         encoded = canonical_serialize(request).encode()
-        if len(encoded) > 16 * 1024 * 1024:
+        if len(encoded) > request_limit:
             raise ValueError("D13 full-wire counting request exceeds installed safety limit")
         with opened_installed_file_v1(self.executable) as fd:
             with os.fdopen(os.dup(fd), "rb") as stream:
@@ -98,7 +113,7 @@ class InstalledD13CounterCommandV1:
                 result[key] = value
             return result
         envelope = json.loads(value, object_pairs_hook=unique)
-        payload = verify_signed_d13_wire_envelope_v1(policy, envelope)
+        payload = verify_envelope(policy, envelope)
         if any(payload.get(k) != v for k, v in request["original"].items()):
             raise ValueError("D13 counter signed a different original wire pair")
         return envelope

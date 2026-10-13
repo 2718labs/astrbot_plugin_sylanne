@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 import json
 import math
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..domains.d03.context import ContextProvider, RoleBindingRequest
 from ..domains.d05.relationship import RelationshipProvider
 from ..domains.d08 import ActionIntent, ActionSchema, ActionSchemaRecord
@@ -33,7 +34,7 @@ def verify_current_social_checks(
     intent: ActionIntent, schema: ActionSchemaRecord,
     role_receipt: CheckReceipt, boundary_receipt: CheckReceipt, *,
     context: ContextProvider, scene_ref: str, audience_scope: str,
-    now_utc: float, current_catalogue_confirmed: bool = False,
+    now_utc: float, current_catalogue_confirmed: bool = False, prepared_inventory=None,
 ) -> CurrentSocialChecksV1:
     """Compare D03/D05 provider results with receipts pinned to this action.
 
@@ -72,7 +73,7 @@ def verify_current_social_checks(
     try:
         current = read_current_dispatch_projection(
             db, namespace, snapshot,
-            QueryEpoch(namespace, "all", projection.graph_epoch),
+            QueryEpoch(namespace, "all", projection.graph_epoch), prepared_inventory=prepared_inventory,
         )
         if current != projection:
             return hold("current_social_projection_changed")
@@ -81,7 +82,7 @@ def verify_current_social_checks(
             scene_ref, intent.action_kind, intent.purpose, now_utc, True,
         )
         role_read, boundary_read = derive_current_domain_reads(
-            db, current, request, context,
+            db, current, request, context, prepared_inventory=prepared_inventory,
         )
         role_spec = next(item for item in schema.required_checks
                          if item.check_kind == "role_binding")
@@ -93,11 +94,7 @@ def verify_current_social_checks(
         for spec in (role_spec, boundary_spec):
             key = AtomKey.from_token(spec.criteria_version)
             atom = snapshot.get(key)
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
-                "AND bot=? AND persona=?",
-                (key.token, *namespace.as_tuple),
-            ).fetchone()
+            row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(key.token, *namespace.as_tuple))
             expected = next(item.version for item in spec.required_input_versions
                             if item.ref == spec.criteria_version)
             if (atom is None or row is None or not atom.valid

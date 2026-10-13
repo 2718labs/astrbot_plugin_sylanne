@@ -46,7 +46,17 @@ class CurrentReplyEntityRouteBindingV2:
     binding_digest: str
 
 
-def _current_atom(db, key: AtomKey) -> tuple[GraphVersion, dict]:
+def _current_atom(db, key: AtomKey, *, prepared_inventory=None) -> tuple[GraphVersion, dict]:
+    if prepared_inventory is not None:
+        proof=prepared_inventory
+        proof.require_current(db,proof.namespace,proof.query)
+        if key.type_name=='memory.source':
+            source=proof.source_metadata(db,proof.namespace,proof.query,key,require_grant=False)
+            return GraphVersion(key,source.revision),source.metadata
+        atom=proof.projection.get(key)
+        if atom is None or atom.revision<1 or not atom.valid:
+            raise ReplyEntityRouteHold('original reply account graph atom is absent')
+        return GraphVersion(key,atom.revision),atom.value
     row = db.execute(
         "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,),
     ).fetchone()
@@ -63,7 +73,7 @@ def _current_atom(db, key: AtomKey) -> tuple[GraphVersion, dict]:
 
 def read_current_reply_entity_route_binding_v2(
     db, namespace: NamespaceId, route: CurrentReplyRouteManifestV2,
-    query: QueryEpoch, *, now_utc: float,
+    query: QueryEpoch, *, now_utc: float, prepared_inventory=None,
 ) -> CurrentReplyEntityRouteBindingV2:
     """Join a settled C02 route to one current D03 account, with full scan."""
     if (not db.in_transaction or type(namespace) is not NamespaceId
@@ -122,10 +132,11 @@ def read_current_reply_entity_route_binding_v2(
                 or arrival != (source_id, arrival_operation[0])):
             raise ReplyEntityRouteHold("original D03 arrival seal is absent")
         source_version, source_value = _current_atom(
-            db, source_key(*namespace.as_tuple, source_id))
+            db, source_key(*namespace.as_tuple, source_id), prepared_inventory=prepared_inventory)
         access_version, access_value = _current_atom(
-            db, access_key(*namespace.as_tuple, source_id))
-        source = SourceRecord.from_dict(source_value)
+            db, access_key(*namespace.as_tuple, source_id), prepared_inventory=prepared_inventory)
+        source = (SourceRecord.from_dict(source_value)if prepared_inventory is None else
+            prepared_inventory.source_metadata(db,namespace,query,source_key(*namespace.as_tuple,source_id),require_grant=False))
         validate_access(access_value)
         if (source.source_id != source_id or source.speaker_id != sender_ref
                 or source.source_kind != "reported"
@@ -146,10 +157,10 @@ def read_current_reply_entity_route_binding_v2(
         account_id = "account:v1:" + suffix
         anchor_version, anchor_value = _current_atom(
             db, AtomKey(Owner("persona", *namespace.as_tuple),
-                        "d03.entity_anchor", target_entity_ref))
+                        "d03.entity_anchor", target_entity_ref), prepared_inventory=prepared_inventory)
         binding_version, binding_value = _current_atom(
             db, AtomKey(Owner("persona", *namespace.as_tuple),
-                        "d03.account_binding", account_id))
+                        "d03.account_binding", account_id), prepared_inventory=prepared_inventory)
         anchor = EntityAnchor(**{
             **anchor_value,
             "creation_evidence_refs": tuple(anchor_value["creation_evidence_refs"]),
@@ -178,7 +189,7 @@ def read_current_reply_entity_route_binding_v2(
             "d03.world_event", "current",
         )
         arrival_event_version, arrival_event_value = _current_atom(
-            db, arrival_event_key)
+            db, arrival_event_key, prepared_inventory=prepared_inventory)
         arrival_event = WorldEvent(**{
             **arrival_event_value,
             "participant_roles": tuple(tuple(role) for role in
@@ -200,7 +211,7 @@ def read_current_reply_entity_route_binding_v2(
                 or (evidence_key.owner.bot, evidence_key.owner.persona)
                    != namespace.as_tuple):
             raise ReplyEntityRouteHold("D03 binding evidence crosses namespace")
-        evidence_version, evidence_value = _current_atom(db, evidence_key)
+        evidence_version, evidence_value = _current_atom(db, evidence_key, prepared_inventory=prepared_inventory)
         evidence = WorldEvent(**{
             **evidence_value,
             "participant_roles": tuple(tuple(role) for role in
@@ -213,16 +224,17 @@ def read_current_reply_entity_route_binding_v2(
                     (target_entity_ref, "sender_account"),)
                 or evidence.learned_at != binding.valid_from):
             raise ReplyEntityRouteHold("D03 binding verification event differs")
-        rows = db.execute(
+        rows = (db.execute(
             "SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
             "AND type_name='d03.account_binding' AND valid=1 ORDER BY token",
             namespace.as_tuple,
         ).fetchall()
+            if prepared_inventory is None else prepared_inventory.atom_rows(db,namespace,query,('d03.account_binding',),('token','revision','value')))
         scan = []
         matches = []
         for token, revision, raw in rows:
             key = AtomKey.from_token(token)
-            value = AccountBinding(**json.loads(raw))
+            value = AccountBinding(**(json.loads(raw)if prepared_inventory is None else raw))
             scan.append(GraphVersion(key, revision))
             if (value.platform_namespace == platform_ref
                     and value.platform_identifier == sender_ref

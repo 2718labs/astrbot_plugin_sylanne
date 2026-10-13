@@ -7,22 +7,16 @@ they are never copied from an AstrBot setting or an Authority request.
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import asdict, fields, replace
 import hashlib
 import json
-from pathlib import Path
 import re
-import secrets
-import ssl
-import time
-from typing import Mapping
 
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit, identifier
 from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    AuthorityCurrentEffectSnapshotV2, ExecutionBindingV1, ExecutionBindingV2,
+    AuthorityCurrentEffectSnapshotV2,NaturalFinalEffectObservationReadV4, ExecutionBindingV1, ExecutionBindingV2,
     FencePermitV2, FenceNeverBegunReceiptV2, MutationReceiptV2,
     DeletionMutationReceiptV1,
     PlatformObservationV2,
@@ -31,11 +25,10 @@ from ..authority_service.v2_contract import (
 )
 from ..authority_service.current_accepted_erasure_read import CurrentAcceptedErasureV1
 from ..authority_service.current_accepted_erasure_wire import accepted_from_wire
-from ..authority_service.v2_migration_rpc import response_from_wire as migration_response_from_wire
 from ..authority_service.internal_work_contract import (
     InternalWorkBindingV1, InternalWorkTerminalProofV1,
 )
-from ..authority_service.internal_work_service import (
+from ..authority_service.internal_work_contract import (
     AuthorityInternalWorkVerifiedReceiptV1, InternalWorkJournalInspectionV1,
 )
 from ..authority_service.internal_work_rpc_wire import (
@@ -57,7 +50,7 @@ from ..authority_service.v2_owner_session import (
     OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1,
     from_wire as session_from_wire, to_wire as session_to_wire,
 )
-from ..authority_service.v2_execution_bridge import CurrentEffectReadV2, HandoffStartV2
+from ..authority_service.v2_contract import CurrentEffectReadV2, HandoffStartV2
 from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
@@ -130,187 +123,30 @@ from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime.c02_cost_settlement import C02OriginalIntentLookupV1
+
 from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from ..runtime_contracts import (
     InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
     canonical_digest as runtime_canonical_digest,
 )
-from .authority_client import (
-    AUTHORITY_PROTOCOL,
-    AuthorityCapabilityGrant,
-    AuthorityEnrollmentGrant,
-    AuthorityHandshake,
-    AuthorityProvisioningRequest,
+from .authority_transport_contract import (
+    AUTHORITY_PROTOCOL, AuthorityTlsProfile, AuthorityCapabilityGrant,
+    AuthorityEnrollmentGrant, AuthorityHandshake, AuthorityProvisioningRequest,
+)
+from .mtls_channel import (
+    MtlsAuthorityChannel, AuthorityChannelUnavailable, V2OwnerAuthorizationBarrier,
+    V2PlatformObservationVerifierUnavailable, _Session, _canonical,
+    _request_payload, _terminal_c02_observation,
 )
 
 
-_PROFILE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}\Z")
-_AUTHORITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _V2_CONTENT_OPERATIONS = CONTENT_OPERATIONS - {"dispatch"}
 
 
-def _canonical(value: object) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
-
-
-def _terminal_c02_observation(raw: object) -> ModelEgressObservationV1:
-    if type(raw) is not dict or set(raw) != {
-            item.name for item in fields(ModelEgressObservationV1)}:
-        raise RuntimeError("terminal C02 observation fields differ")
-    data = dict(raw)
-    for name in ("usage", "cost"):
-        pairs = data[name]
-        if type(pairs) is not list or any(
-                type(pair) is not list or len(pair) != 2 for pair in pairs):
-            raise RuntimeError("terminal C02 observation accounting differs")
-        data[name] = tuple(tuple(pair) for pair in pairs)
-    try:
-        observation = ModelEgressObservationV1(**data)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("terminal C02 observation is invalid") from exc
-    if json.loads(_canonical(asdict(observation))) != raw:
-        raise RuntimeError("terminal C02 observation is noncanonical")
-    return observation
-
-
-def _request_payload(request: AuthorityProvisioningRequest) -> dict[str, str]:
-    """Return the content-free subset allowed onto the authority wire."""
-    return {
-        "protocol": request.protocol,
-        "profile_id": request.profile_id,
-        "plugin_name": request.plugin_name,
-        "host_api_version": request.host_api_version,
-        "manifest_sha256": request.publisher_package.manifest_sha256,
-    }
-
-
-class AuthorityChannelUnavailable(RuntimeError):
-    """Transport lost before a trustworthy response; original outcome is unknown."""
-
-
-class V2OwnerAuthorizationBarrier(RuntimeError):
-    """The paired Authority confirmed a current Owner revoke barrier."""
-
-
-class V2PlatformObservationVerifierUnavailable(RuntimeError):
-    """The paired Authority cannot persist a V2 platform observation."""
-
-
-@dataclass(frozen=True)
-class AuthorityTlsProfile:
-    """Installation-owned connection material; no key bytes are retained here."""
-
-    profile_id: str
-    host: str
-    port: int
-    server_name: str
-    expected_authority_id: str
-    trust_root: Path
-    client_certificate: Path
-    client_private_key: Path
-    timeout_seconds: float = 5.0
-    max_message_bytes: int = 65_536
-    prepared_ssl_context: ssl.SSLContext | None = field(default=None, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if not _PROFILE.fullmatch(self.profile_id):
-            raise ValueError("invalid authority profile")
-        if (not isinstance(self.host, str) or not self.host or len(self.host) > 255
-                or not isinstance(self.server_name, str) or not self.server_name):
-            raise ValueError("authority endpoint is invalid")
-        if not isinstance(self.expected_authority_id, str) or not _AUTHORITY_ID.fullmatch(
-            self.expected_authority_id
-        ):
-            raise ValueError("authority identity is invalid")
-        if type(self.port) is not int or not 1 <= self.port <= 65535:
-            raise ValueError("authority port is invalid")
-        if (not isinstance(self.timeout_seconds, (int, float))
-                or not 0 < self.timeout_seconds <= 30):
-            raise ValueError("authority timeout is invalid")
-        if type(self.max_message_bytes) is not int or not 512 <= self.max_message_bytes <= 1_048_576:
-            raise ValueError("authority message limit is invalid")
-        for name in ("trust_root", "client_certificate", "client_private_key"):
-            value = Path(getattr(self, name))
-            if not value.is_absolute():
-                raise ValueError(f"{name} must be an absolute administrator path")
-            object.__setattr__(self, name, value)
-
-    def ssl_context(self) -> ssl.SSLContext:
-        """Use the verified context; direct profiles retain a test-only path seam.
-
-        build_admin_authority_transport prepares the context from pinned file
-        descriptors before creating this profile. Its production path cannot
-        reach the pathname fallback below.
-        """
-        if self.prepared_ssl_context is not None:
-            return self.prepared_ssl_context
-        for path in (self.trust_root, self.client_certificate, self.client_private_key):
-            if not path.is_file() or path.is_symlink():
-                raise FileNotFoundError("administrator TLS material is unavailable or unsafe")
-        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(self.trust_root))
-        context.check_hostname = True
-        context.verify_mode = ssl.CERT_REQUIRED
-        context.load_cert_chain(str(self.client_certificate), str(self.client_private_key))
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        return context
-
-
-@dataclass
-class _Session:
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    binding: str
-    request_digest: str
-    handshake_started_at: float = 0.0
-
-
-class MtlsAuthorityTransport:
+class MtlsAuthorityTransport(MtlsAuthorityChannel):
     """A single live mTLS channel binds handshake and capability grant."""
 
-    def __init__(self, profiles: Mapping[str, AuthorityTlsProfile]) -> None:
-        copied = dict(profiles)
-        if not copied or any(key != value.profile_id for key, value in copied.items()):
-            raise ValueError("administrator authority profiles are invalid")
-        if any(not isinstance(value, AuthorityTlsProfile) for value in copied.values()):
-            raise TypeError("authority profiles must be AuthorityTlsProfile")
-        self._profiles = copied
-        self._sessions: dict[str, _Session] = {}
-        self._owner_loop: asyncio.AbstractEventLoop | None = None
-        self._operation_lock = asyncio.Lock()
-
-    def _require_owner_loop(self) -> None:
-        loop = asyncio.get_running_loop()
-        if self._owner_loop is None:
-            self._owner_loop = loop
-        elif self._owner_loop is not loop:
-            raise RuntimeError("authority transport belongs to another event loop")
-
-    async def _discard(self, session: _Session, timeout_seconds: float) -> None:
-        for profile_id, current in tuple(self._sessions.items()):
-            if current is session:
-                del self._sessions[profile_id]
-        session.writer.close()
-        try:
-            await asyncio.wait_for(session.writer.wait_closed(), timeout_seconds)
-        except (OSError, RuntimeError, TimeoutError):
-            pass
-
-    async def close(self) -> None:
-        """Close every session on the event loop that owns its streams."""
-        self._require_owner_loop()
-        async with self._operation_lock:
-            sessions = tuple(self._sessions.items())
-            self._sessions.clear()
-            for profile_id, session in sessions:
-                await self._discard(session, self._profiles[profile_id].timeout_seconds)
-
-    def profile_for(self, profile_id: str) -> AuthorityTlsProfile:
-        if not isinstance(profile_id, str) or profile_id not in self._profiles:
-            raise ValueError("authority profile is not installed by an administrator")
-        return self._profiles[profile_id]
 
     async def read_final_handoff_pairing_v1(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
@@ -339,302 +175,6 @@ class MtlsAuthorityTransport:
             raise RuntimeError("Authority final handoff pairing identity differs")
         return pairing
 
-    @staticmethod
-    def _channel_binding(writer: asyncio.StreamWriter) -> bytes:
-        ssl_object = writer.get_extra_info("ssl_object")
-        if ssl_object is None:
-            raise RuntimeError("authority TLS channel is absent")
-        binding = ssl_object.get_channel_binding("tls-unique")
-        if not binding:
-            raise RuntimeError("authority TLS channel binding is unavailable")
-        return binding
-
-    async def _rpc(
-        self,
-        session: _Session,
-        profile: AuthorityTlsProfile,
-        method: str,
-        request: dict[str, str],
-        handshake_binding: str | None = None,
-        command: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        # Authority expires its paired-channel registration after 30 seconds.
-        # Renew on this same TLS channel before sending a business command;
-        # an uncertain business response is never retried here.
-        if method != "handshake" and time.monotonic() - session.handshake_started_at >= 20.0:
-            renewed = await self._rpc(session, profile, "handshake", request)
-            if (renewed.get("state") != "paired"
-                    or renewed.get("publisher_trusted") is not True
-                    or renewed.get("installation_authority_id") != profile.expected_authority_id
-                    or renewed.get("channel_binding_sha256") != session.binding):
-                await self._discard(session, profile.timeout_seconds)
-                raise AuthorityChannelUnavailable("authority channel renewal differs")
-        handshake_started_at = time.monotonic() if method == "handshake" else None
-        message: dict[str, object] = {
-            "protocol": request["protocol"],
-            "request_id": secrets.token_hex(16),
-            "method": method,
-            "request": request,
-        }
-        if handshake_binding is not None:
-            message["handshake_binding_sha256"] = handshake_binding
-        if command is not None:
-            message["command"] = command
-        encoded = _canonical(message)
-        if len(encoded) + 1 > profile.max_message_bytes:
-            raise RuntimeError("authority request exceeds configured limit")
-        try:
-            session.writer.write(encoded + b"\n")
-            await asyncio.wait_for(session.writer.drain(), profile.timeout_seconds)
-            line = await asyncio.wait_for(
-                session.reader.readuntil(b"\n"), profile.timeout_seconds
-            )
-        except BaseException as exc:
-            await self._discard(session, profile.timeout_seconds)
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise AuthorityChannelUnavailable("authority transport unavailable") from exc
-        if not line or len(line) > profile.max_message_bytes:
-            await self._discard(session, profile.timeout_seconds)
-            raise RuntimeError("authority response is invalid")
-        try:
-            response = json.loads(line)
-        except (TypeError, ValueError) as exc:
-            await self._discard(session, profile.timeout_seconds)
-            raise RuntimeError("authority response is invalid") from exc
-        if not isinstance(response, dict) or response.get("request_id") != message["request_id"]:
-            await self._discard(session, profile.timeout_seconds)
-            raise RuntimeError("authority response is invalid")
-        if (method == "execution_begin_handoff_v2"
-                and response == {"request_id": message["request_id"], "ok": False,
-                                 "error": "owner_authorization_barrier"}):
-            raise V2OwnerAuthorizationBarrier("current Owner authorization bars handoff")
-        if (method == "execution_begin_handoff_v2"
-                and response == {"request_id": message["request_id"], "ok": False,
-                                 "error": "platform_observation_verifier_unavailable"}):
-            raise V2PlatformObservationVerifierUnavailable(
-                "installed platform observation verifier is unavailable")
-        if response.get("ok") is not True or not isinstance(response.get("result"), dict):
-            raise RuntimeError("authority service unavailable")
-        if handshake_started_at is not None:
-            session.handshake_started_at = handshake_started_at
-        if method == "terminal_c02_recovery_read_v1":
-            try:
-                if command is None or set(command) != {"namespace", "read_request"}:
-                    raise RuntimeError("terminal C02 read command differs")
-                read_request = terminal_c02_from_wire(
-                    command["read_request"], TerminalRecoveryReadRequestV1)
-                result = response["result"]
-                if (set(result) != {"result", "channel_binding_sha256"}
-                        or result["channel_binding_sha256"] != session.binding
-                        or type(result["result"]) is not dict
-                        or set(result["result"]) != {"request", "observation"}):
-                    raise RuntimeError("terminal C02 response fields differ")
-                delivered = terminal_c02_from_wire(
-                    result["result"]["request"], TerminalRecoveryReadRequestV1)
-                observation = _terminal_c02_observation(result["result"]["observation"])
-                key = read_request.original_key
-                if (delivered != read_request or observation.status != "completed"
-                        or (observation.authority_id, observation.namespace,
-                            observation.operation_id, observation.call_id,
-                            observation.request_digest, observation.digest) !=
-                           (key.authority_id, key.authority_namespace,
-                            key.original_model_operation_id, key.call_id,
-                            key.model_request_digest, key.observation_digest)):
-                    raise RuntimeError("terminal C02 original result differs")
-                ack = {
-                    "kind": "terminal_c02_recovery_drain_ack_v1",
-                    "request_id": message["request_id"],
-                    "channel_binding_sha256": session.binding,
-                    "response_digest": hashlib.sha256(line[:-1]).hexdigest(),
-                    "original_key_digest": key.digest,
-                    "read_request_digest": read_request.digest,
-                }
-                session.writer.write(_canonical(ack) + b"\n")
-                await asyncio.wait_for(session.writer.drain(), profile.timeout_seconds)
-                final_line = await asyncio.wait_for(
-                    session.reader.readuntil(b"\n"), profile.timeout_seconds)
-                if not final_line or len(final_line) > profile.max_message_bytes:
-                    raise RuntimeError("terminal C02 fact response is invalid")
-                final = json.loads(final_line)
-                if (type(final) is not dict or final.get("request_id") != message["request_id"]
-                        or final.get("ok") is not True or type(final.get("result")) is not dict
-                        or set(final["result"]) != {"read_fact", "channel_binding_sha256"}
-                        or final["result"]["channel_binding_sha256"] != session.binding):
-                    raise RuntimeError("terminal C02 fact response differs")
-                fact = terminal_c02_from_wire(
-                    final["result"]["read_fact"], TerminalRecoveryReadFactV1)
-                if (fact.request != read_request
-                        or fact.handoff_digest != runtime_canonical_digest({
-                            "request": asdict(read_request),
-                            "observation": asdict(observation)})):
-                    raise RuntimeError("terminal C02 handoff fact differs")
-                return {"observation": json.loads(_canonical(asdict(observation))),
-                        "read_fact": terminal_c02_to_wire(fact),
-                        "channel_binding_sha256": session.binding}
-            except BaseException:
-                await self._discard(session, profile.timeout_seconds)
-                raise
-        return response["result"]
-
-    @staticmethod
-    def _require_string(value: object, field: str, *, nullable: bool = False) -> str | None:
-        if nullable and value is None:
-            return None
-        if not isinstance(value, str) or not value:
-            raise RuntimeError(f"authority {field} is invalid")
-        return value
-
-    @staticmethod
-    def _require_nonnegative_int(value: object, field: str) -> int:
-        if type(value) is not int or value < 0:
-            raise RuntimeError(f"authority {field} is invalid")
-        return value
-
-    async def _content_rpc(
-        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
-        method: str, command: dict[str, object], *, protocol: str = AUTHORITY_PROTOCOL,
-    ) -> dict[str, object]:
-        self._require_owner_loop()
-        profile = self.profile_for(request.profile_id)
-        wire_request = _request_payload(request)
-        wire_request["protocol"] = protocol
-        digest = hashlib.sha256(_canonical(wire_request)).hexdigest()
-        async with self._operation_lock:
-            session = self._sessions.get(request.profile_id)
-            if session is not None and session.writer.is_closing():
-                await self._discard(session, profile.timeout_seconds)
-                session = None
-            if (session is None or session.binding != handshake.channel_binding_sha256
-                    or session.request_digest != digest):
-                raise AuthorityChannelUnavailable("authority handshake channel is unavailable")
-            response = await self._rpc(
-                session, profile, method, wire_request,
-                handshake_binding=session.binding, command=command,
-            )
-            if response.get("channel_binding_sha256") != session.binding:
-                await self._discard(session, profile.timeout_seconds)
-                raise RuntimeError("authority response binding mismatch")
-            return response
-
-    async def handshake(self, request: AuthorityProvisioningRequest, *,
-                        protocol: str = AUTHORITY_PROTOCOL) -> AuthorityHandshake:
-        if protocol not in (AUTHORITY_PROTOCOL, AUTHORITY_V2_PROTOCOL):
-            raise ValueError("unknown authority protocol")
-        self._require_owner_loop()
-        profile = self.profile_for(request.profile_id)
-        async with self._operation_lock:
-            context = profile.ssl_context()
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        profile.host, profile.port, ssl=context,
-                        server_hostname=profile.server_name, limit=profile.max_message_bytes,
-                    ),
-                    profile.timeout_seconds,
-                )
-            except Exception as exc:
-                raise AuthorityChannelUnavailable("authority transport unavailable") from exc
-            wire_request = _request_payload(request)
-            wire_request["protocol"] = protocol
-            session = _Session(
-                reader, writer, "", hashlib.sha256(_canonical(wire_request)).hexdigest()
-            )
-            try:
-                response = await self._rpc(session, profile, "handshake", wire_request)
-                expected = hashlib.sha256(
-                    self._channel_binding(writer) + bytes.fromhex(session.request_digest)
-                ).hexdigest()
-                binding = response.get("channel_binding_sha256")
-                if not isinstance(binding, str) or not _SHA256.fullmatch(binding) or binding != expected:
-                    raise RuntimeError("authority channel binding mismatch")
-                handshake = AuthorityHandshake(
-                    state=response.get("state", ""),
-                    installation_authority_id=response.get("installation_authority_id", ""),
-                    installation_identity_ref=response.get("installation_identity_ref", ""),
-                    channel_binding_sha256=binding,
-                    publisher_trusted=response.get("publisher_trusted") is True,
-                )
-                if not handshake.valid_pairing():
-                    raise RuntimeError("authority pairing unavailable")
-                if handshake.installation_authority_id != profile.expected_authority_id:
-                    raise RuntimeError("authority identity does not match administrator pin")
-            except BaseException:
-                await self._discard(session, profile.timeout_seconds)
-                raise
-            session.binding = binding
-            prior = self._sessions.pop(request.profile_id, None)
-            if prior is not None:
-                await self._discard(prior, profile.timeout_seconds)
-            self._sessions[request.profile_id] = session
-            return handshake
-
-    async def capability_grant(
-        self,
-        request: AuthorityProvisioningRequest,
-        handshake: AuthorityHandshake,
-    ) -> AuthorityEnrollmentGrant | AuthorityCapabilityGrant:
-        self._require_owner_loop()
-        profile = self.profile_for(request.profile_id)
-        wire_request = _request_payload(request)
-        digest = hashlib.sha256(_canonical(wire_request)).hexdigest()
-        async with self._operation_lock:
-            session = self._sessions.get(request.profile_id)
-            if session is not None and session.writer.is_closing():
-                await self._discard(session, profile.timeout_seconds)
-                session = None
-            if (session is None or session.binding != handshake.channel_binding_sha256
-                    or session.request_digest != digest):
-                raise AuthorityChannelUnavailable("authority handshake channel is unavailable")
-            response = await self._rpc(
-                session, profile, "capability_grant", wire_request, session.binding
-            )
-            if response.get("channel_binding_sha256") != session.binding:
-                await self._discard(session, profile.timeout_seconds)
-                raise RuntimeError("authority grant binding mismatch")
-        capabilities = response.get("capabilities")
-        if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
-            raise RuntimeError("authority grant is invalid")
-        if tuple(capabilities) == ("enrollment",):
-            return AuthorityEnrollmentGrant(
-                grant_id=response.get("grant_id", ""),
-                authority_id=response.get("authority_id", ""),
-                installation_identity_ref=response.get("installation_identity_ref", ""),
-                capabilities=("enrollment",),
-            )
-        return AuthorityCapabilityGrant(
-            grant_id=response.get("grant_id", ""),
-            authority_id=response.get("authority_id", ""),
-            installation_identity_ref=response.get("installation_identity_ref", ""),
-            activation_generation=response.get("activation_generation", -1),
-            revocation_epoch=response.get("revocation_epoch", -1),
-            capabilities=tuple(capabilities),
-        )
-
-    async def installation_grant_v2(
-        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
-    ) -> InstallationGrantV2:
-        """Read installation facts only from the paired v2 TLS session."""
-        if not handshake.valid_pairing():
-            raise RuntimeError("authority v2 pairing is invalid")
-        response = await self._content_rpc(
-            request, handshake, "installation_grant_v2", {},
-            protocol=AUTHORITY_V2_PROTOCOL,
-        )
-        if set(response) != set(InstallationGrantV2.__dataclass_fields__):
-            raise RuntimeError("authority v2 installation grant is invalid")
-        try:
-            grant = InstallationGrantV2(**response)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("authority v2 installation grant is invalid") from exc
-        profile = self.profile_for(request.profile_id)
-        if (grant.authority_id != profile.expected_authority_id
-                or grant.authority_id != handshake.installation_authority_id
-                or grant.subject != handshake.installation_identity_ref
-                or grant.manifest_digest != request.publisher_package.manifest_sha256
-                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
-            raise RuntimeError("authority v2 installation grant binding is invalid")
-        return grant
 
     @staticmethod
     def _model_identity(
@@ -684,10 +224,65 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority model response binding is invalid")
         return record, permit
 
+    async def model_capacity_reconcile_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        expected_anchor: RestoreAnchor, draft: ModelEgressDraftV1 | None = None,
+        close_prepared: bool = False,
+    ) -> dict[str, object]:
+        if (type(grant) is not InstallationGrantV2 or not handshake.valid_pairing()
+                or grant.authority_id != handshake.installation_authority_id
+                or grant.subject != handshake.installation_identity_ref
+                or grant.manifest_digest != request.publisher_package.manifest_sha256
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256
+                or grant.administrator_holder != holder
+                or type(expected_anchor) is not RestoreAnchor
+                or (expected_anchor.authority_id, expected_anchor.namespace) !=
+                   (grant.authority_id, namespace)
+                or type(close_prepared) is not bool
+                or close_prepared and draft is None):
+            raise RuntimeError("MODEL_CAPACITY_REQUEST_BINDING")
+        if draft is not None:
+            if type(draft) is not ModelEgressDraftV1:
+                raise RuntimeError("MODEL_CAPACITY_DRAFT_TYPE")
+            self._model_identity(request, handshake, grant, namespace, holder, draft)
+        response = await self._content_rpc(
+            request, handshake, "model_capacity_reconcile_v1",
+            {"namespace": namespace, "holder": holder,
+             "expected_anchor": asdict(expected_anchor),
+             "draft": None if draft is None else model_to_wire(draft),
+             "close_prepared": close_prepared}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"fact", "channel_binding_sha256"}:
+            raise RuntimeError("MODEL_CAPACITY_RESPONSE_FIELDS")
+        fact = response["fact"]
+        fields = {"status", "global_count", "namespace_count", "background_count",
+                  "namespace_background_count", "capacity_available", "call_id",
+                  "request_digest", "authority_id", "namespace", "subject",
+                  "installation_id", "current_anchor_digest", "draft_digest"}
+        if (type(fact) is not dict or set(fact) != fields
+                or fact["status"] not in {"census", "absent", "prepared",
+                    "not_dispatched", "unresolved", "terminal", "retained", "never_begun"}
+                or type(fact["capacity_available"]) is not bool
+                or any(type(fact[key]) is not int or not 0 <= fact[key] <= 512
+                       for key in ("global_count", "namespace_count", "background_count",
+                                   "namespace_background_count"))
+                or (fact["authority_id"], fact["namespace"], fact["subject"],
+                    fact["installation_id"], fact["current_anchor_digest"],
+                    fact["draft_digest"], fact["call_id"], fact["request_digest"]) !=
+                   (grant.authority_id, namespace, grant.subject, grant.installation_id,
+                    runtime_canonical_digest(asdict(expected_anchor)),
+                    None if draft is None else runtime_canonical_digest(asdict(draft)),
+                    None if draft is None else draft.call_id,
+                    None if draft is None else draft.request_digest)
+                or (draft is None) != (fact["status"] == "census")
+                ):
+            raise RuntimeError("MODEL_CAPACITY_RESPONSE_BINDING")
+        return fact
+
     async def model_prepare_fenced_v1(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         grant: InstallationGrantV2, *, namespace: str, holder: str,
-        draft: ModelEgressDraftV1, expected_anchor: RestoreAnchor,
+        draft: ModelEgressDraftV1, expected_anchor: RestoreAnchor, _on_dispatch=None,
     ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
         self._model_identity(request, handshake, grant, namespace, holder, draft)
         if (type(expected_anchor) is not RestoreAnchor
@@ -698,7 +293,7 @@ class MtlsAuthorityTransport:
             request, handshake, "model_prepare_fenced_v1",
             {"namespace": namespace, "holder": holder, "draft": model_to_wire(draft),
              "expected_anchor": asdict(expected_anchor)},
-            protocol=AUTHORITY_V2_PROTOCOL)
+            protocol=AUTHORITY_V2_PROTOCOL, _on_dispatch=_on_dispatch)
         record, permit = self._model_response(response, grant, draft, "prepared")
         if permit.pinned_anchor != expected_anchor:
             raise RuntimeError("authority model anchor binding is invalid")
@@ -769,7 +364,7 @@ class MtlsAuthorityTransport:
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         grant: InstallationGrantV2, *, namespace: str, holder: str,
         intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,
-        model_request: ModelCallRequest, host_incarnation: str,
+        model_request: ModelCallRequest, host_incarnation: str, _on_dispatch=None,
     ) -> tuple[ModelEgressRecoveryV1, FencePermitV2, ModelAdmissionV2]:
         self._model_identity(request, handshake, grant, namespace, holder, intent)
         if (type(model_request) is not ModelCallRequest
@@ -792,7 +387,7 @@ class MtlsAuthorityTransport:
              "expected_anchor": asdict(expected_anchor),
              "request": model_to_wire(model_request),
              "host_incarnation": host_incarnation},
-            protocol=AUTHORITY_V2_PROTOCOL)
+            protocol=AUTHORITY_V2_PROTOCOL, _on_dispatch=_on_dispatch)
         if set(response) != {"record", "permit", "admission", "channel_binding_sha256"}:
             raise RuntimeError("authority model admission response is invalid")
         record, permit = self._model_response(
@@ -903,6 +498,7 @@ class MtlsAuthorityTransport:
         grant: InstallationGrantV2, *, lookup: C02OriginalIntentLookupV1, historical_accounting=False,
     ) -> ModelEgressIntentV1:
         """Read only the original terminal intent from the designated observer."""
+        from ..runtime.c02_cost_settlement import C02OriginalIntentLookupV1
         if (type(lookup) is not C02OriginalIntentLookupV1
                 or (lookup.authority_id, lookup.installation_id)
                    != (grant.authority_id, grant.installation_id)):
@@ -1211,6 +807,38 @@ class MtlsAuthorityTransport:
         if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
             raise RuntimeError("contact result recovery is unresolved")
         return True
+
+    async def artifact_draft_model_result_read_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.d11_artifact_draft_model_v1 import (ArtifactDraftModelResultReadRequestV1,
+            ArtifactDraftModelResultReadV1, artifact_draft_model_result_to_wire_v1, artifact_draft_model_result_from_wire_v1)
+        if (type(read_request) is not ArtifactDraftModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("artifact draft result installation differs")
+        response = await self._content_rpc(request, handshake, "artifact_draft_model_result_read_v1",
+            {"namespace": namespace, "read_request": artifact_draft_model_result_to_wire_v1(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("artifact draft result response fields differ")
+        result = artifact_draft_model_result_from_wire_v1(response["result"], ArtifactDraftModelResultReadV1)
+        if result.request != read_request:
+            raise RuntimeError("artifact draft result original differs")
+        return result
+
+    async def artifact_draft_model_result_read_v2(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.d11_artifact_draft_model_v1 import (ArtifactDraftModelResultReadRequestV2,
+            ArtifactDraftModelResultReadV2, artifact_draft_model_result_to_wire_v2, artifact_draft_model_result_from_wire_v2)
+        if (type(read_request) is not ArtifactDraftModelResultReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("artifact draft result installation differs")
+        response = await self._content_rpc(request, handshake, "artifact_draft_model_result_read_v2",
+            {"namespace": namespace, "read_request": artifact_draft_model_result_to_wire_v2(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("artifact draft result response fields differ")
+        result = artifact_draft_model_result_from_wire_v2(response["result"], ArtifactDraftModelResultReadV2)
+        if result.request != read_request:
+            raise RuntimeError("artifact draft result original differs")
+        return result
 
     async def internal_life_model_result_read_v2(self, request, handshake, grant, *, namespace, read_request):
         from ..authority_service.internal_life_model_result_contract_v2 import InternalLifeModelResultReadRequestV2, InternalLifeModelResultReadV2, internal_life_result_to_wire_v2, internal_life_result_from_wire_v2
@@ -1830,6 +1458,7 @@ class MtlsAuthorityTransport:
         handshake: AuthorityHandshake, command: dict[str, object],
     ) -> object:
         """Return only a strictly decoded response from the paired TLS session."""
+        from ..authority_service.v2_migration_rpc import response_from_wire as migration_response_from_wire
         if (not handshake.valid_pairing() or type(command) is not dict
                 or type(command.get("operation")) is not str):
             raise RuntimeError("authority migration command is invalid")
@@ -2174,6 +1803,37 @@ class MtlsAuthorityTransport:
                 or permit.subject != handshake.installation_identity_ref):
             raise RuntimeError("authority v2 dispatch permit binding is invalid")
         return permit
+
+    async def v2_c09_storage_maintenance_v1(self,request:AuthorityProvisioningRequest,
+            handshake:AuthorityHandshake,*,action:str,operation_id:str):
+        from .authority_transport_contract import C09MaintenanceStatusReadV3
+        identifier(operation_id,"operation_id")
+        if action not in {"status","resume"}:raise ValueError("registered maintenance status/resume action required")
+        response=await self._content_rpc(request,handshake,"c09_storage_maintenance_v1",
+            {"action":action,"operation_id":operation_id},protocol=AUTHORITY_V2_PROTOCOL)
+        result=C09MaintenanceStatusReadV3.from_wire(response)
+        if result.operation_id!=operation_id or result.channel_binding_sha256!=handshake.channel_binding_sha256:
+            raise RuntimeError("maintenance status crossed actual operation/channel pairing")
+        return result
+
+    async def v2_execution_read_natural_final_effect_observation_v4(self,
+            request:AuthorityProvisioningRequest,handshake:AuthorityHandshake,*,permit:FencePermitV2,effect_id:str
+            )->NaturalFinalEffectObservationReadV4:
+        identifier(effect_id,"effect_id")
+        if type(permit) is not FencePermitV2 or permit.operation!="write":
+            raise ValueError("natural final observation requires ordinary write permit")
+        response=await self._content_rpc(request,handshake,"execution_read_natural_final_effect_observation_v4",
+            {"permit":to_wire(permit),"effect_id":effect_id},protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response)!={"observation","channel_binding_sha256"}
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("natural final observation response is invalid")
+        observed=from_wire(response["observation"])
+        if (type(observed) is not NaturalFinalEffectObservationReadV4
+                or observed.observation.authority_id!=handshake.installation_authority_id
+                or observed.observation.authority_namespace!=permit.namespace
+                or observed.observation.permit!=permit or observed.observation.target_effect_id!=effect_id):
+            raise RuntimeError("natural final observation response crossed actual permit/target/Authority")
+        return observed
 
     async def v2_execution_read_current_effect_snapshot_for_write_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
@@ -2716,6 +2376,22 @@ class MtlsAuthorityTransport:
             raise RuntimeError("Authority Owner session challenge binding differs")
         return challenge
 
+    async def v2_installation_management(self, request, handshake, *, namespace,
+                                         operation, owner_token, payload):
+        result = await self._content_rpc(request, handshake, "installation_management_v1",
+            {"namespace": namespace, "operation": operation, "owner_token": owner_token,
+             "payload": payload}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(result) != {"http_status", "json", "channel_binding_sha256"}:
+            raise RuntimeError("installation management response differs")
+        return {"http_status": result["http_status"], "json": result["json"]}
+
+    async def v2_installation_management_startup(self, request, handshake, *, namespace):
+        result = await self._content_rpc(request, handshake, "installation_management_startup_v1",
+            {"namespace": namespace}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(result) != {"settings", "channel_binding_sha256"}:
+            raise RuntimeError("installation startup settings response differs")
+        return result["settings"]
+
     async def v2_accept_owner_session(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, challenge: OwnerSessionLoginChallengeV1, signature: bytes,
@@ -3135,6 +2811,8 @@ class MtlsAuthorityTransport:
             "c04_inspect_v2": "d06.association_activation.v2",
             "c04_execute_v3": "d06.association_activation.v3",
             "c04_inspect_v3": "d06.association_activation.v3",
+            "c04_execute_v4": "d06.association_activation.direct_seed.v4",
+            "c04_inspect_v4": "d06.association_activation.direct_seed.v4",
         }
         if (method not in algorithms
                 or type(binding) is not InternalWorkBindingV1
@@ -3195,6 +2873,14 @@ class MtlsAuthorityTransport:
         return await self._c04_work(
             request, handshake, grant, namespace=namespace, binding=binding,
             method="c04_inspect_v3")
+
+    async def c04_execute_v4(self, request, handshake, grant, *, namespace, binding):
+        return await self._c04_work(request, handshake, grant, namespace=namespace,
+            binding=binding, method="c04_execute_v4")
+
+    async def c04_inspect_v4(self, request, handshake, grant, *, namespace, binding):
+        return await self._c04_work(request, handshake, grant, namespace=namespace,
+            binding=binding, method="c04_inspect_v4")
 
     async def d04_root_v3(self,request,handshake,grant,*,namespace,binding,method,
             claim=None,measurement=None,executor_incarnation=None,gate=None,outcome=None,action=None):
@@ -3543,6 +3229,31 @@ class MtlsAuthorityTransport:
             raise RuntimeError("C04 terminal original identity differs")
         return verified
 
+    async def v3_observe_paid_owner_guard_for_fence(
+            self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+            *, namespace: str, permit: FencePermitV2, business_operation_id: str,
+            request_digest: str, phase: str):
+        from ..authority_service.v3_owner_paid_guard_observation import owner_paid_guard_observation_from_wire_v3
+        if (type(permit) is not FencePermitV2 or permit.operation!="write"
+                or permit.namespace!=namespace or permit.subject!=handshake.installation_identity_ref
+                or permit.authority_id!=handshake.installation_authority_id
+                or phase not in {"schedule","acquire"}):
+            raise RuntimeError("paid Owner observation requires this actual installation write fence")
+        response=await self._content_rpc(request,handshake,"observe_paid_owner_guard_for_fence_v3",
+            {"namespace":namespace,"permit":to_wire(permit),"business_operation_id":business_operation_id,
+                "request_digest":request_digest,"phase":phase},protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response)!={"observation","observation_digest","permit","channel_binding_sha256"}
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("paid Owner observation response fields or channel differ")
+        current=from_wire(response["permit"])
+        original=owner_paid_guard_observation_from_wire_v3(response["observation"])
+        if (current!=permit or original.permit!=permit or original.digest!=response["observation_digest"]
+                or original.business_operation_id!=business_operation_id or original.request_digest!=request_digest
+                or original.phase!=phase or original.authority_namespace!=namespace
+                or original.guard.authority_id!=handshake.installation_authority_id):
+            raise RuntimeError("paid Owner observation response crossed its actual original")
+        return original,current
+
     async def v2_get_current_owner_guard_for_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, permit: FencePermitV2,
@@ -3647,6 +3358,21 @@ class MtlsAuthorityTransport:
                 or receipt.operation.authority_id != handshake.installation_authority_id):
             raise RuntimeError("authority owner graph read response is invalid")
         return receipt
+
+    async def v2_observe_content_write_attempt_v1(self, request, handshake, *, namespace, holder, operation_id, expected_anchor):
+        from ..authority_service.v2_contract import ContentWriteAttemptObservationV1
+        response = await self._content_rpc(request, handshake, "observe_content_write_attempt_v1",
+            {"namespace": namespace, "holder": holder, "operation_id": operation_id,
+                "expected_anchor": asdict(expected_anchor)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"observation", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority write attempt observation response differs")
+        observed = from_wire(response["observation"])
+        if (type(observed) is not ContentWriteAttemptObservationV1 or observed.current_anchor != expected_anchor
+                or (observed.authority_id, observed.namespace, observed.subject, observed.holder, observed.operation_id) != (
+                    handshake.installation_authority_id, namespace, handshake.installation_identity_ref, holder, operation_id)):
+            raise RuntimeError("authority write attempt observation binding differs")
+        return observed
 
     async def v2_get_content_fence_operation(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

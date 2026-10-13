@@ -234,7 +234,7 @@ async def run_installed_post_c02_natural_review_v2(
             admin_model=workflow, installation_bundle=bundle)
         executor = HostModelEgressExecutor(
             authority=client, bundle=bundle, grant=client_grant,
-            adapter=adapter)
+            adapter=adapter, local_module_admission=runtime.local_module_admission)
         egress = await executor.execute_frozen_natural_once(
             original=original, draft=draft, expected_anchor=anchor)
         if (type(egress) is not FrozenNaturalEgressResultV2

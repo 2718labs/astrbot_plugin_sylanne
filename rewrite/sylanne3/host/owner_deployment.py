@@ -209,6 +209,7 @@ def compose_owner_deployment(
     model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
+    create_self_identity_schema: bool = False,
     owner_sessions: AuthorityV2OwnerSessionStore | None = None,
 ) -> AuthorityRpcServer:
     """Compose the existing graph verifier, proof store and mTLS RPC server.
@@ -255,6 +256,7 @@ def compose_owner_deployment(
         host_onebot_observations_v2=host_onebot_observations_v2,
         model_result_source_purposes=model_result_source_purposes,
         clock_provider=clock_provider, create_owner_schema=create_owner_schema,
+        create_self_identity_schema=create_self_identity_schema,
     )
 
 

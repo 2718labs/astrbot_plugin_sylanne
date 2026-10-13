@@ -37,9 +37,11 @@ def candidate_set_from_c04_result_v3(
         if (ranked.score > 1 or work.purpose not in source.purposes
                 or work.audience not in source.audiences):
             raise ValueError("ranked C04 source lacks bounded current eligibility")
+        from .c04_direct_seed_v4 import AssociationWorkInputV4, c04_candidate_origin_v4
+        origin = c04_candidate_origin_v4(work, ranked.source_ref) if type(work) is AssociationWorkInputV4 else "c04_current_association_v3"
         items.append(CandidateItem(
             source.source_id, source.source_id, source.provenance_root,
-            "c04_current_association_v3", (work.purpose,), ranked.score,
+            origin, (work.purpose,), ranked.score,
             "subjective_association_only",
         ))
     return CandidateSet(

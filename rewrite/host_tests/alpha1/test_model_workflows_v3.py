@@ -14,6 +14,9 @@ from sylanne3.model_broker.contact_expression_v2 import (
     GENERATION_TEMPLATE_VERSION, REVIEW_TEMPLATE_VERSION,
 )
 from sylanne3.domains.d01.production_operations_v1 import plain_v1
+from sylanne3.model_broker.internal_life_numeric_v1 import (
+    WORK_KIND as LIFE_NUMERIC_WORK_KIND, TEMPLATE_VERSION as LIFE_NUMERIC_TEMPLATE_VERSION,
+)
 
 
 def profile():
@@ -32,6 +35,7 @@ def test_profile_v3_contact_pair_and_independent_life_slot():
     parsed = authority_profile._model_workflows_from_payload(raw)
     assert type(parsed) is AdminModelWorkflowsV3
     assert parsed.life_content is None
+    assert parsed.life_numeric is None
     raw["model_workflows"]["life_content"] = _model_workflow_payload(
         LIFE_CONTENT_WORK_KIND, "consolidation", LIFE_CONTENT_TEMPLATE_VERSION)
     life = raw["model_workflows"]["life_content"]
@@ -92,3 +96,49 @@ def test_version2_wire_fields_stay_independent():
     authority_profile._model_workflows_from_payload(profile())
     assert plain_v1(authority_profile._model_workflows_from_payload(saved)) == before
     assert "life_content" not in before
+    assert "life_numeric" not in before
+
+
+def _numeric_profile():
+    raw = profile()
+    numeric = _model_workflow_payload(
+        LIFE_NUMERIC_WORK_KIND, "consolidation", LIFE_NUMERIC_TEMPLATE_VERSION)
+    numeric["model_id"] = "independent-numeric-model"
+    numeric["provider_config_ref"] = authority_profile.installed_model_config_ref(
+        numeric["provider_id"], numeric["model_id"], numeric["provider_config_digest"])
+    raw["model_workflows"]["life_numeric"] = numeric
+    raw["installation_policy"]["root_grant"]["allowed_work_kinds"].append(LIFE_NUMERIC_WORK_KIND)
+    return raw
+
+
+def test_profile_v3_numeric_has_its_formal_independent_slot():
+    raw = _numeric_profile()
+    authority_profile._policy_from_payload(raw)
+    parsed = authority_profile._model_workflows_from_payload(raw)
+    assert type(parsed) is AdminModelWorkflowsV3
+    assert parsed.life_content is None
+    assert type(parsed.life_numeric) is authority_profile.AdminModelWorkflowV2
+    assert parsed.life_numeric.model_id == "independent-numeric-model"
+    assert parsed.life_numeric.model_id != parsed.contact_generation.model_id
+    assert plain_v1(parsed.life_numeric) == raw["model_workflows"]["life_numeric"]
+    assert "life_numeric" in {field.name for field in fields(parsed)}
+
+
+@pytest.mark.parametrize("change, reason", (
+    (lambda p: p["model_workflows"]["life_numeric"].update(work_kind="d06.encode_internal_life_content"),
+        "exact installed workflow"),
+    (lambda p: p["model_workflows"]["life_numeric"].update(purpose="proposal"),
+        "exact installed workflow"),
+    (lambda p: p["model_workflows"]["life_numeric"].update(template_version="sylanne.d06.internal_life_numeric.v2"),
+        "exact installed workflow"),
+    (lambda p: p["installation_policy"]["root_grant"]["allowed_work_kinds"].remove(LIFE_NUMERIC_WORK_KIND),
+        "own root grant"),
+    (lambda p: p["model_workflows"]["life_numeric"].update(quote_ceiling={"output_tokens": 65}),
+        "quote exceeds root budget"),
+))
+def test_profile_v3_numeric_rejects_wrong_contract_or_missing_budget(change, reason):
+    raw = _numeric_profile()
+    authority_profile._policy_from_payload(raw)
+    change(raw)
+    with pytest.raises(ValueError, match=reason):
+        authority_profile._policy_from_payload(raw)

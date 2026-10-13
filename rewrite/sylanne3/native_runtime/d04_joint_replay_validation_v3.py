@@ -32,6 +32,7 @@ from ..memory_types import SourceRecord
 from ..runtime.d04_joint_product_assembly_v3 import D04InstalledJointProductV3
 from ..runtime.d04_numeric_artifact_v3 import (
     D04NumericArtifactHold, decode_d04_numeric_prepared_input_v3, verify_d04_numeric_artifact_commitments_v3,
+    numeric_artifact_payload_v3,
 )
 from ..runtime.d04_semantic_mapping_v3 import evidence_payload_v3
 from ..runtime_contracts import NamespaceId, canonical_digest
@@ -311,7 +312,9 @@ def revalidate_d04_numeric_artifact_v3(prepared, terminal, raw, installation):
     expected = D04JointProductMathCandidate(component.candidate_digest, refs, step, result.initial_error,
         full.transcript_sha256, tuple((family, branch.transcript_sha256) for family, branch in branches),
         tuple(members), math_digest, full_transcript=full, family_transcript_originals=branches)
-    if not _same(result, expected):
+    # Both sides retain the fully verified fixed-model chains. Compare their
+    # formal compact codec instead of expanding every shared matrix per step.
+    if numeric_artifact_payload_v3(result) != numeric_artifact_payload_v3(expected):
         raise D04NumericArtifactHold("cold deterministic full/LOO readouts or effects differ")
     candidate = compile_joint_numeric_receipt_candidate_v1(component=component, math_result=expected,
         drives=current.drives, families=current.families, operator_version=scheme.operator_version,

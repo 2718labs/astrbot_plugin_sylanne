@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+import json
 import sys
 import time
 
@@ -273,6 +274,13 @@ def test_paid_natural_final_stages_current_five_checks(
                             query=_query, projection=_projection,
                             now_utc=now)
                         insert_admission(_db, admission, dispatch)
+                        from sylanne3.runtime.natural_final_authorization_original_v3 import _capture_natural_final_authorization_original_v3
+                        original=_capture_natural_final_authorization_original_v3(
+                            coordinator=graph,db=_db,bundle=bound,evidence=recovered,graph_receipt=receipt,
+                            scope=scope,clock_reading=clock,clock_policy=clock_policy,owner_guard=owner_guard,
+                            current_effect=current_effect,effect_snapshot=effect_snapshot,
+                            route=_binding,snapshot=_snapshot,query=_query,projection=_projection,
+                            checks=checks,now_utc=now,admission=admission,request=dispatch)
                         source_id = AtomKey.from_token(
                             material.source_ref.ref).owner.subject
                         access = access_key(*namespace.as_tuple, source_id)
@@ -292,17 +300,31 @@ def test_paid_natural_final_stages_current_five_checks(
                                 provisional_checks=checks,
                                 projected_check_versions=projected,
                                 now_utc=now)
-                        return admission, dispatch
+                        return admission, dispatch, original
 
+                    from sylanne3.contracts import canonical_json
+                    from sylanne3.authority_service.v2_contract import to_wire
                     graph._commit_domain_bundle_fenced(
                         bound, lease, in_transaction=True,
                         v2_write=(metadata, epoch, "finish:" + attempt_id,
                                   "sha256:" + canonical_digest({
                                       "test": "natural-final-stage",
                                       "attempt_id": attempt_id}),
-                                  canonical_digest(permit)),
+                                  canonical_json(to_wire(permit))),
                         now_utc=now,
                         natural_final_admission=after_graph_write)
+                    from dataclasses import asdict
+                    actual_original=json.loads(db.execute(
+                        "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+                        (*namespace.as_tuple,material.final_operation_id)).fetchone()[0])["natural_final_authorization_original"]
+                    assert actual_original["schema"]=="sylanne.natural_final_authorization_original.v3"
+                    payload=actual_original["payload"]
+                    assert actual_original["original_digest"]==canonical_digest(payload)
+                    assert payload["owner_guard"]==asdict(owner_guard)
+                    assert payload["scope"]["permit"]==to_wire(permit)
+                    assert payload["identity"]["operation_id"]==material.final_operation_id
+                    assert payload["scope"]["operation_id"]==attempt_id
+                    assert payload["scope"]["graph_epoch"]["revision"]+1==payload["query"]["revision"]
                 finally:
                     db.execute("ROLLBACK")
         finally:

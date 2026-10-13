@@ -92,3 +92,62 @@ def test_natural_batch_rejects_payload_change_and_collapsed_paid_ids():
         key: part for key, part in value.items() if key != "batch_digest"})
     with pytest.raises(ValueError, match="distinct paid originals"):
         validate_natural_verified_batch_value_v2(value)
+
+
+def test_semantic_bubbles_preserve_paid_originals_and_have_distinct_stable_effects():
+    from sylanne3.domains.d09.natural_reply import (
+        NATURAL_REPLY_OUTPUT_SCHEMA_V3, select_natural_final_segment_v3,
+    )
+    from sylanne3.domains.d09.natural_batch import (
+        NATURAL_BATCH_SCHEMA_V3, prepare_natural_verified_batch_proposal_v3,
+        validate_natural_verified_batch_value_v3,
+    )
+    from rewrite.tests.alpha1.d09.test_natural_reply import _case as expression_case
+    final, grant = _case()
+    plan, _, _ = expression_case()
+    plan = replace(plan, final_operation_id=final.material.final_operation_id,
+                   final_effect_id=final.material.final_effect_id)
+    body = "Hello. Good day."
+    spans = ((0, 6), (7, 16))
+    output = {"schema": NATURAL_REPLY_OUTPUT_SCHEMA_V3, "body": body,
+              "units": [{"start": start, "end": end, "kind": "rhetoric",
+                         "basis_ids": ["basis:hello"], "speech_act": "paraphrase",
+                         "promise_grant_id": None, "slot_ids": ["reply"]}
+                        for start, end in spans],
+              "semantic_segments": [{"start": 0, "end": 7}, {"start": 7, "end": 16}]}
+    claims = tuple(ExpressionClaim("natural-unit:" + canonical_digest({
+        "output": canonical_digest(output), "index": index, "basis": ["basis:hello"]}),
+        body[start:end], ClaimKind.RHETORIC, (), (final.material.audience_id,),
+        ("expression",), final.material.source_ref.ref)
+        for index, (start, end) in enumerate(spans))
+    uses = tuple(ClaimUse(claim.claim_id, start, end, claim.kind)
+                 for claim, (start, end) in zip(claims, spans))
+    material = replace(final.material, claims=claims,
+                       segment=replace(final.material.segment, body=body, claim_uses=uses),
+                       paid_receipt=replace(final.material.paid_receipt,
+                                            generation_output_digest=canonical_digest(output)))
+    full = replace(final, material=material)
+    values = []
+    for index in range(2):
+        selected = select_natural_final_segment_v3(full, plan=plan,
+                                                  generation_output=output, segment_index=index)
+        segment = selected.material.segment
+        scoped_grant = replace(grant, segment_grants=(replace(
+            grant.segment_grants[0], segment_id=segment.segment_id, effect_id=segment.effect_id,
+            payload_digest=selected.material.payload_digest, max_chars=len(segment.body)),))
+        proposal = prepare_natural_verified_batch_proposal_v3(
+            selected, scoped_grant, plan=plan, generation_output=output, segment_index=index)
+        assert proposal.write.key.type_name == NATURAL_BATCH_SCHEMA_V3
+        value = proposal.write.value
+        assert value["paid_review"]["generation_original_operation_id"] == "original:gen"
+        assert value["segment"]["position"] == 0
+        assert value["semantic_manifest"]["selected_index"] == index
+        assert value["semantic_manifest"]["generation_output"] == output
+        validate_natural_verified_batch_value_v3(value)
+        values.append(value)
+    assert values[0]["effect_id"] != values[1]["effect_id"]
+    assert values[0]["operation_id"] != values[1]["operation_id"]
+    changed = {**values[1], "segment": {**values[1]["segment"], "body": "Changed."}}
+    changed["batch_digest"] = canonical_digest({key: part for key, part in changed.items() if key != "batch_digest"})
+    with pytest.raises(ValueError, match="selected semantic bubble"):
+        validate_natural_verified_batch_value_v3(changed)

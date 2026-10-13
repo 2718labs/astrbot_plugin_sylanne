@@ -321,13 +321,15 @@ class D13ShortContextProvider:
 
     @staticmethod
     def register_types() -> tuple[TypeSpec, ...]:
+        from .derived_block_metadata_v1 import derived_block_type_specs_v1
+        from .derived_block_metadata_v2 import derived_block_type_specs_v2
         return (TypeSpec(
             name=_BLOCK_TYPE, owner_kinds=("persona",), storage_role="cache",
             validator=validate_block_graph_value, immutable=False,
             schema_version=2, writer_domain="d13",
             schema_hash=schema_hash({"domain": "d13", "type": _BLOCK_TYPE,
                                      "owner": "persona", "storage": "cache", "version": 2}),
-        ),)
+        ),) + derived_block_type_specs_v1() + derived_block_type_specs_v2()
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if type(proposal) is not DomainProposal or (

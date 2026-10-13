@@ -23,15 +23,17 @@ _PEER = CONTENT_OPERATIONS | frozenset({
     "migration_recover", "execution_redaction_install", "d12_operation_status",
     "d12_lifecycle_control", "d12_lifecycle_bootstrap",
     "d12_package_control", "d12_package_supervisor", "d12_package_bootstrap", "d12_package_activate",
+    "installation_management", "installation_management_startup",
 })
 _LOCAL = frozenset({
     "install", "seal_v2_only", "activate", "recover", "transfer", "revoke",
     "owner_identity_pair", "owner_identity_revoke", "self_identity_mutate",
     "migration_pair_install", "migration_pair_register", "migration_pair_revoke",
     "migrate_deletion", "erasure_closure_install", "execution_redaction_install",
-    "c04_execute", "c09_maintenance", "d12_operation_install", "d12_target_install",
+    "c04_execute", "c04_self_identity_read", "c09_maintenance", "d12_operation_install", "d12_target_install",
     "d12_target_register", "d12_target_owner_install", "d12_lifecycle_install",
     "d12_package_install",
+    "installation_management_install", "installation_management_grant", "installation_management_revoke",
 })
 _C09 = frozenset({"current", "read", "write", "delete", "deletion", "execution",
     "recover", "erasure_closure_install", "execution_redaction_install"})
@@ -80,6 +82,7 @@ class InstalledAuthorityPolicyV2:
         if type(credential) is _LocalAdministratorCredential:
             permitted = (credential.action == action
                 or credential.action == "c04_execute" and action in {"execution", "current"}
+                or credential.action == "c04_self_identity_read" and action == "self_identity_read"
                 or credential.action == "c09_maintenance" and action in _C09)
             return (credential._issuer is self._issuer and credential.namespace == namespace
                     and permitted and self._local_identity())

@@ -76,8 +76,13 @@ def validate_d07_behavior_provenance_v1(kind, raw):
             ConcernServiceChoiceV1(**behavior["choice"])
         if "semantic_question" in behavior:
             q = behavior["semantic_question"]
-            _fields(q, D07SemanticQuestionV1)
-            question = D07SemanticQuestionV1(**{**q, "target_ref": VersionedRef(**q["target_ref"]), "source_refs": tuple(q["source_refs"])})
+            from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
+            from .domain_production_erasure_v1 import decode_typed_production_value_v1
+            from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
+            kind = (D07MethodGrowthSemanticQuestionV2 if q.get("schema") == "d07.method-growth-semantic-question.v2" else
+                D07RelationshipSemanticQuestionV2 if q.get("schema") == "d07.relationship-semantic-question.v2" else D07SemanticQuestionV1)
+            _fields(q, kind)
+            question = decode_typed_production_value_v1(q, kind)
             refs.update(question.source_refs)
             from .domain_production_erasure_v1 import decode_typed_production_value_v1
             import json

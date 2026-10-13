@@ -28,6 +28,8 @@ from .c09_erasure_barrier_store_v1 import (
 )
 from .c09_erasure_plan_original_v1 import read_c09_erasure_plan_original_v1
 from .graph_migration_snapshot_v1 import _KNOWN as _INSTALLED_TABLES
+from .c09_foreground_attempt_v1 import (TABLE as _FOREGROUND_ATTEMPT_TABLE,
+    verify_foreground_attempts_from_selected_core_v1)
 from .c09_d04_originals_v3 import (
     TABLE as _D04_TABLE, COLUMNS as _D04_COLUMNS,
     D04ErasureInventoryHold, read_d04_inventory_row_v3,
@@ -42,6 +44,10 @@ from .domain_production_original_codec_v1 import (
     decode_domain_production_original_row_v1, decode_domain_production_outbox_row_v1,
 )
 from .c09_budget_rows_v1 import TABLES as _BUDGET_TABLES, validate_c09_budget_row_v1, validate_c09_budget_schema_v1
+from .graph_catalogue_upgrade_v1 import (
+    COLUMNS as _CATALOGUE_COLUMNS, validate_catalogue_upgrade_schema_v1,
+    validate_catalogue_upgrade_row_v1, catalogue_upgrade_c09_rows_v1,
+)
 from .c09_d07_execution_v1 import (
     TABLE as _D07_TABLE, STAGE_TABLE as _D07_STAGE_TABLE, ACCOUNTING_TABLE as _D07_ACCOUNTING_TABLE,
     COLUMNS as _D07_COLUMNS, validate_d07_schema_v1, read_d07_inventory_row_v1, d07_original_dispositions_v1,
@@ -105,6 +111,15 @@ def _row_digest(value: tuple) -> str:
     return canonical_digest(tuple(
         {"blob_sha256": hashlib.sha256(item).hexdigest(), "size": len(item)}
         if type(item) is bytes else item for item in value))
+
+
+def _stream_file_sha256_v1(path: Path) -> str:
+    """Hash the complete file with a fixed 64 KiB read workspace."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def graph_source_files_fingerprint_v1(source_path: Path) -> str:
@@ -364,6 +379,24 @@ def _dependency_closure(db: sqlite3.Connection, affected: set[str]) -> set[str]:
                 raise GraphRebaseHold(
                     f"unparseable Graph nested original: {table} token {token}") from exc
             values.append((token, key.type_name, decoded))
+            if key.type_name == "d09.natural_batch_disposition.v1":
+                from ..domains.d09.natural_disposition_v1 import natural_disposition_from_wire_v1
+                try:
+                    disposition = natural_disposition_from_wire_v1(decoded)
+                    if (disposition.namespace != NamespaceId.from_key(key) or key.owner.kind != "activity"
+                            or key.owner.subject != disposition.activity_id):
+                        raise ValueError("natural disposition metadata changed its actual owner identity")
+                    for version in disposition.dependency_refs:
+                        dependency = AtomKey.from_token(version.ref)
+                        if (NamespaceId.from_key(dependency) != disposition.namespace
+                                or dependency.type_name not in {"memory.source", "memory.access", "d06.source_correction_head.v1"}):
+                            raise ValueError("natural disposition source qualification closure differs")
+                except (ValueError, TypeError, KeyError) as exc:
+                    raise GraphRebaseHold("natural disposition exact Source-bearing metadata differs; HOLD") from exc
+                # No metadata exemption: the normal nested-reference closure below
+                # retires current/history roster bodies when a qualification ref
+                # is erased. Core admission/unknown/cost originals keep their
+                # independently registered fact retention and cannot be cleared.
             from .internal_life_content_adoption_v1 import (
                 PROVENANCE as LCP, decode_content_v1, content_keys_v1)
             if key.type_name == LCP:
@@ -682,13 +715,18 @@ def _validate_c04_baseline_inventory_v3(db):
 
 def _cold_graph_data_root(path: Path, namespace: NamespaceId,
                           affected: set[str], incarnation: str,
-                          cumulative: tuple[str, ...], *, candidate_connection=None, registry=None) -> tuple[str, str]:
+                          cumulative: tuple[str, ...], *, candidate_connection=None, registry=None,
+                          completion_control=None, operation_id=None, qualified_retention_manifests=None) -> tuple[str, str]:
     if candidate_connection is None and any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
         raise GraphRebaseHold("cold closed Graph candidate has sidecars")
     manager = nullcontext(candidate_connection) if candidate_connection is not None else closing(
         sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True))
     with manager as db:
+        if not db.in_transaction:
+            db.execute("BEGIN")
+        verify_foreground_attempts_from_selected_core_v1(db, control=completion_control, operation_id=operation_id)
         validate_domain_production_schema_v1(db)
+        validate_catalogue_upgrade_schema_v1(db)
         validate_c09_budget_schema_v1(db)
         validate_d07_schema_v1(db)
         validate_contact_schema_v1(db)
@@ -714,6 +752,7 @@ def _cold_graph_data_root(path: Path, namespace: NamespaceId,
         source_ids = {AtomKey.from_token(token).owner.subject for token in affected
                       if AtomKey.from_token(token).type_name == "memory.source"}
         operations = _affected_operations(db, affected)
+        catalogue_rows = catalogue_upgrade_c09_rows_v1(db, affected=affected, affected_operations=operations)
         for token in sorted(affected):
             row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
                              (token,)).fetchone()
@@ -743,6 +782,10 @@ def _cold_graph_data_root(path: Path, namespace: NamespaceId,
             if table in _COMMITMENT_TABLES | _REBASE_TABLES | _EDGE_TABLES:
                 continue
             columns, pk, rows = _table_rows(db, table)
+            if table in catalogue_rows:
+                if any(old != updated for old, updated, _ in catalogue_rows[table]):
+                    raise GraphRebaseHold('cold catalogue metadata still contains affected source references')
+                continue
             if table in _BUDGET_TABLES:
                 for row in rows:
                     validate_c09_budget_row_v1(table, columns, row)
@@ -794,7 +837,8 @@ def _cold_graph_data_root(path: Path, namespace: NamespaceId,
             if table in _DOMAIN_COLUMNS:
                 dispositions = domain_production_original_dispositions_v1(table, columns, rows,
                     affected=affected, affected_operations=operations, nested_hits=_nested_hits,
-                    source_ids=source_ids, authority_namespace=json.loads(recovery[0])["authority_namespace"])
+                    source_ids=source_ids, authority_namespace=json.loads(recovery[0])["authority_namespace"], db=db,
+                    qualified_retention_manifests=qualified_retention_manifests, qualified_retention_operation_id=operation_id)
                 if "derived_removed" in dispositions:
                     raise GraphRebaseHold("cold domain body survives its erased closure")
                 continue
@@ -896,6 +940,7 @@ def _build_graph_rebase_candidate_v1(
             raise GraphRebaseHold("unclassified Graph view exists")
         descriptions = {}
         validate_domain_production_schema_v1(db)
+        validate_catalogue_upgrade_schema_v1(db)
         validate_c09_budget_schema_v1(db)
         validate_d07_schema_v1(db)
         validate_contact_schema_v1(db)
@@ -904,6 +949,9 @@ def _build_graph_rebase_candidate_v1(
             columns, pk, rows = _table_rows(db, table)
             if table not in _KNOWN:
                 raise GraphRebaseHold(f"unclassified installed Graph table: {table}")
+            if table in _CATALOGUE_COLUMNS:
+                for row in rows:
+                    validate_catalogue_upgrade_row_v1(table, columns, row)
             if table == 'graph_contact_owner_invocations_v3':
                 from .c09_contact_owner_invocation_v3 import (
                     require_contact_owner_invocation_schema_v3, validate_contact_owner_inventory_row_v3,
@@ -985,6 +1033,8 @@ def _build_graph_rebase_candidate_v1(
                 for row in rows:
                     validator(columns, row)
             descriptions[table] = (columns, pk, rows)
+        foreground_attempts = verify_foreground_attempts_from_selected_core_v1(
+            db, control=completion_control, operation_id=request.operation_id)
         _validate_internal_life_episode_history_inventory_v2(db)
         affected = _installed_closure(db, request)
         affected_operations = _affected_operations(db, affected)
@@ -1049,6 +1099,7 @@ def _build_graph_rebase_candidate_v1(
         cumulative_erased = tuple(sorted(prior_erased | newly_erased))
         source_ids = {AtomKey.from_token(token).owner.subject
                       for token in request.affected_source_refs}
+        catalogue_rows = catalogue_upgrade_c09_rows_v1(db, affected=affected, affected_operations=affected_operations)
         d04_dispositions = ()
         if _D04_TABLE in descriptions:
             columns, _, rows = descriptions[_D04_TABLE]
@@ -1093,10 +1144,20 @@ def _build_graph_rebase_candidate_v1(
             elif table in _DOMAIN_COLUMNS:
                 domain_dispositions[table] = domain_production_original_dispositions_v1(table, columns, rows,
                     affected=affected, affected_operations=affected_operations, nested_hits=_nested_hits,
-                    source_ids=source_ids, authority_namespace=recovery_requirements["authority_namespace"])
+                    source_ids=source_ids, authority_namespace=recovery_requirements["authority_namespace"], db=db)
             elif table in {_SHARED_ORIGINAL_TABLE, _SHARED_OUTBOX_TABLE}:
                 domain_dispositions[table] = _shared_domain_dispositions_v1(db, table, columns, rows, registry=registry,
                     affected=affected, affected_operations=affected_operations, source_ids=source_ids)
+        foreground_dispositions = {}
+        if foreground_attempts:
+            original_rows = descriptions[_SHARED_ORIGINAL_TABLE][2]
+            original_dispositions = dict(zip((row[:3] for row in original_rows),
+                domain_dispositions[_SHARED_ORIGINAL_TABLE], strict=True))
+            for original in foreground_attempts.values():
+                disposition = original_dispositions[original.row[:3]]
+                if disposition not in {"preserved_exact", "derived_removed"}:
+                    raise GraphRebaseHold("foreground adopted original has no closed body disposition")
+                foreground_dispositions[original.attempt_id] = disposition
         available = set()
         for table in _BODY_TABLES:
             columns, _, rows = descriptions[table]
@@ -1148,7 +1209,15 @@ def _build_graph_rebase_candidate_v1(
                     updated = list(old)
                     disposition = "preserved_exact"
                     row_key = key_digest[:16]
-                    if table == _D04_TABLE:
+                    if table in catalogue_rows:
+                        original, retained, disposition = catalogue_rows[table][row_index]
+                        if original != old:
+                            raise GraphRebaseHold('catalogue row inventory changed during rebase')
+                        updated = list(retained)
+                    elif table == _FOREGROUND_ATTEMPT_TABLE and old[4] in foreground_dispositions:
+                        # The exact shared original codec supplies the full Source/job closure.
+                        disposition = foreground_dispositions[old[4]]
+                    elif table == _D04_TABLE:
                         disposition = d04_dispositions[row_index]
                     elif table in _BUDGET_TABLES:
                         # Only strictly decoded fixed financial rows are
@@ -1236,9 +1305,13 @@ def _build_graph_rebase_candidate_v1(
                 from ..authority_service.c09_build_originals_v1 import verify_recomputed_candidate_v1
                 verify_recomputed_candidate_v1(new, target)
                 expected_root = _cold_graph_data_root(target, request.namespace, affected,
-                    new_incarnation, cumulative_erased, candidate_connection=new, registry=registry)
+                    new_incarnation, cumulative_erased, candidate_connection=new, registry=registry,
+                    completion_control=completion_control, operation_id=request.operation_id,
+                    qualified_retention_manifests=tuple(manifests))
                 if expected_root != _cold_graph_data_root(target, request.namespace, affected,
-                        new_incarnation, cumulative_erased, registry=registry):
+                        new_incarnation, cumulative_erased, registry=registry,
+                        completion_control=completion_control, operation_id=request.operation_id,
+                        qualified_retention_manifests=tuple(manifests)):
                     raise GraphRebaseHold("existing Graph candidate closure differs")
         except Exception:
             new.rollback()
@@ -1255,10 +1328,12 @@ def _build_graph_rebase_candidate_v1(
                 raise GraphRebaseHold("Graph candidate checkpoint remains busy")
         if graph_source_files_fingerprint_v1(source) != request.source_files_fingerprint:
             raise GraphRebaseHold("closed Graph source changed during rebase")
-        file_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        file_hash = _stream_file_sha256_v1(target)
         data_root, cold_read = _cold_graph_data_root(
             target, request.namespace, affected, new_incarnation,
-            cumulative_erased, registry=registry)
+            cumulative_erased, registry=registry,
+            completion_control=completion_control, operation_id=request.operation_id,
+            qualified_retention_manifests=tuple(manifests))
         manifests = tuple(sorted(manifests, key=lambda item: item.table_name))
         removed = tuple((manifest.table_name, row.row_key_digest,
                          row.old_commitment) for manifest in manifests
@@ -1510,9 +1585,10 @@ def install_graph_rebase_certificate_connection_v1(
             root, cold = _cold_graph_data_root(
                 target, candidate.namespace, set(candidate.affected_atom_refs),
                 candidate.new_incarnation, candidate.cumulative_erased_key_digests,
-                candidate_connection=db, registry=registry)
+                candidate_connection=db, registry=registry,
+                completion_control=completion_control, operation_id=candidate.operation_id)
             actual = GraphRebaseMirrorV1(certificate, issued.issue_digest,
-                hashlib.sha256(target.read_bytes()).hexdigest(), _file_identity(target), root, cold)
+                _stream_file_sha256_v1(target), _file_identity(target), root, cold)
             saved = decode_installed_build_original_v1(completed["details"]["mirror"], GraphRebaseMirrorV1)
             if (actual != saved or canonical_serialize(completed["details"]) != canonical_serialize({
                     "candidate_digest": candidate.candidate_digest, "mirror": asdict(saved)})
@@ -1525,7 +1601,7 @@ def install_graph_rebase_certificate_connection_v1(
                 or _file_identity(target) != candidate.target_identity
                 or graph_source_files_fingerprint_v1(source)
                    != candidate.source_files_fingerprint
-                or hashlib.sha256(target.read_bytes()).hexdigest()
+                or _stream_file_sha256_v1(target)
                    != candidate.new_file_sha256):
             raise GraphRebaseHold("Graph candidate file identity changed before mirror")
         db.execute("INSERT INTO graph_c09_rebase_certificates_v1 "
@@ -1545,12 +1621,13 @@ def install_graph_rebase_certificate_connection_v1(
         db.close()
     root, cold = _cold_graph_data_root(
         target, candidate.namespace, set(candidate.affected_atom_refs),
-        candidate.new_incarnation, candidate.cumulative_erased_key_digests, registry=registry)
+        candidate.new_incarnation, candidate.cumulative_erased_key_digests, registry=registry,
+        completion_control=completion_control, operation_id=candidate.operation_id)
     if (root, cold) != (certificate.new_data_root, certificate.cold_read_digest):
         raise GraphRebaseHold("mirrored Graph data root differs")
     mirror = GraphRebaseMirrorV1(
         certificate, issued.issue_digest,
-        hashlib.sha256(target.read_bytes()).hexdigest(),
+        _stream_file_sha256_v1(target),
         _file_identity(target), root, cold)
     completion_control.record_build_original_v1(operation_id=candidate.operation_id,
         kind="graph_mirror", details={"candidate_digest": candidate.candidate_digest, "mirror": asdict(mirror)})

@@ -191,3 +191,41 @@ def test_v2_port_and_store_close_when_coordinator_factory_fails():
         assert len({thread for _, thread in trace}) == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ("moved", "abandoned", "cleanup_error"))
+def test_owned_storage_payload_cleanup_keeps_same_lease(mode):
+    """Actual retention ownership; this test issues no Graph/Owner permission."""
+    from types import SimpleNamespace
+    from sylanne3.graph_worker import OwnedGraphStorageResultV3, _RESULT_ISSUER_V3
+    from sylanne3.runtime_storage_v3 import RuntimeStorageOperationV3, _RuntimeResourcePoolV3, _INSTALLED
+
+    pool = _RuntimeResourcePoolV3()
+    baseline = pool.used
+    handle = SimpleNamespace(pool=pool, selection_digest="ownership-unit")
+    lease = RuntimeStorageOperationV3(_INSTALLED, handle, "ownership-unit", None)
+    lease.retain(1024)
+    released = []
+    def cleanup():
+        released.append((lease.closed, pool.used))
+        if mode == "cleanup_error":
+            raise ValueError("fixture payload cleanup failure")
+    payload = {"retained": "value"}
+    owned = OwnedGraphStorageResultV3(_RESULT_ISSUER_V3, payload, lease, cleanup)
+    if mode == "abandoned":
+        owned.release_v3()
+    else:
+        value, actual_lease = owned.take_value_v3()
+        assert value is payload and actual_lease is lease
+        owned.release_v3()
+        assert released == [] and not lease.closed
+        if mode == "cleanup_error":
+            with pytest.raises(ValueError, match="fixture payload cleanup failure"):
+                actual_lease.release()
+        else:
+            actual_lease.release()
+    assert released == [(mode != "abandoned", baseline + 1024)]
+    assert lease.closed and pool.used == baseline
+    lease.release()
+    owned.release_v3()
+    assert len(released) == 1 and pool.used == baseline

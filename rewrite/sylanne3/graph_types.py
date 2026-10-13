@@ -1,6 +1,6 @@
 """Typed graph values and registry for the phase 5b graph contract."""
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import hashlib
 import json
 import re
@@ -201,6 +201,15 @@ class TypeRegistry:
         spec = self.spec(key.type_name)
         if key.owner.kind not in spec.owner_kinds:
             raise ValueError(f"type {spec.name!r} does not support owner kind {key.owner.kind!r}")
+        if key.type_name == "memory.source":
+            from .runtime.owner_material_source_storage_v3 import sealed_source_value_v3
+            sealed = sealed_source_value_v3(key, value)
+            if sealed is not None:
+                from .memory_types import _SOURCE_SCHEMA_HASH, _validate_source
+                if (spec.validator is not _validate_source or spec.schema_hash != _SOURCE_SCHEMA_HASH
+                        or not spec.immutable or spec.writer_domain != "d06"):
+                    raise ValueError("sealed Source requires the exact registered SourceRecord schema")
+                return sealed
         detached = json_object(value)
         spec.validator(json_object(detached))
         return detached
@@ -240,12 +249,36 @@ class GraphAtom:
     revision: int
     value: dict
     valid: bool = True
+    _canonical_original: InitVar[object | None] = None
 
-    def __post_init__(self):
+    def __post_init__(self, _canonical_original):
         GraphVersion(self.key, self.revision)
         if type(self.valid) is not bool:
             raise TypeError("valid must be bool")
-        object.__setattr__(self, "value", json_object(self.value))
+        if _canonical_original is None:
+            value = json_object(self.value)
+        else:
+            from .runtime.domain_background_read_v3 import (
+                BackgroundJSONColumnV3, require_background_graph_atom_json_v3)
+            if type(_canonical_original) is BackgroundJSONColumnV3:
+                value = require_background_graph_atom_json_v3(_canonical_original,
+                    key=self.key, revision=self.revision, value=self.value, valid=self.valid)
+            else:
+                from .runtime.current_method_learning_read_v3 import (
+                    MethodJSONColumnV3, require_method_graph_atom_json_v3)
+                if type(_canonical_original) is MethodJSONColumnV3:
+                    value = require_method_graph_atom_json_v3(_canonical_original,
+                        key=self.key, revision=self.revision, value=self.value, valid=self.valid)
+                else:
+                    from .authority_service.current_authority_graph_read_v3 import (
+                        PreparedAuthorityGraphValueOriginalV3, require_authority_graph_atom_json_v3)
+                    if type(_canonical_original) is not PreparedAuthorityGraphValueOriginalV3:
+                        raise TypeError("Graph atom requires an actual privately issued canonical original")
+                    value = require_authority_graph_atom_json_v3(_canonical_original,
+                        key=self.key, revision=self.revision, value=self.value, valid=self.valid)
+        if type(value) is not dict:
+            raise TypeError("Graph atom value requires an exact JSON object")
+        object.__setattr__(self, "value", value)
 
 
 @dataclass(frozen=True)
@@ -343,6 +376,16 @@ class GraphWrite:
         object.__setattr__(self, "dependencies", dependencies)
 
 
+def clone_graph_write_v3(write):
+    """Detach an ordinary value or retain the issued full Source seal."""
+    if write.key.type_name == "memory.source":
+        from .runtime.owner_material_source_storage_v3 import (
+            issued_sealed_source_graph_write_v3, clone_sealed_source_graph_write_v3)
+        if issued_sealed_source_graph_write_v3(write):
+            return clone_sealed_source_graph_write_v3(write)
+    return GraphWrite(write.key, write.value, write.dependencies)
+
+
 @dataclass(frozen=True)
 class GraphPage:
     snapshot: GraphSnapshot
@@ -376,7 +419,7 @@ class GraphCandidate:
             raise TypeError("epochs must contain NamespaceEpoch values")
         # Rebuild writes to detach mutable values from the caller at the candidate boundary.
         object.__setattr__(self, "reads", reads)
-        object.__setattr__(self, "writes", tuple(GraphWrite(w.key, w.value, w.dependencies) for w in writes))
+        object.__setattr__(self, "writes", tuple(clone_graph_write_v3(w) for w in writes))
         object.__setattr__(self, "epochs", epochs)
 
 

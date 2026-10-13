@@ -37,6 +37,7 @@ from ..contracts import canonical_json
 from ..runtime_contracts import canonical_digest
 from .contract import AuthorityUnavailable, JournalHead, identifier
 from .internal_work_contract import (
+    InternalWorkJournalAppendV1, InternalWorkJournalInspectionV1, AuthorityInternalWorkVerifiedReceiptV1,
     InternalWorkBindingV1, InternalWorkClaimV1,
     InternalWorkTerminalProofV1, InternalWorkTerminalV1, InternalWorkTerminalV2,
     claim_internal_work_v1, terminal_internal_work_v1,
@@ -45,52 +46,10 @@ from .internal_work_contract import (
 from .v2_execution_journal import AuthorityV2ExecutionJournal
 
 
-@dataclass(frozen=True, slots=True)
-class InternalWorkJournalAppendV1:
-    """One verified append identity returned by the installed journal only."""
-
-    namespace: str
-    journal_id: str
-    sequence: int
-    mutation_id: str
-    binding_digest: str
-    content_digest: str
-    chain_digest: str
-    receipt_ref: str
 
 
-@dataclass(frozen=True, slots=True)
-class InternalWorkJournalInspectionV1:
-    """Full-chain reread result; None terminal after claim means unknown."""
-
-    binding: InternalWorkBindingV1
-    claim: InternalWorkClaimV1 | None
-    terminal: InternalWorkTerminalV1 | InternalWorkTerminalV2 | None
-    claim_append: InternalWorkJournalAppendV1 | None
-    terminal_append: InternalWorkJournalAppendV1 | None
-    verified_head: JournalHead
 
 
-@dataclass(frozen=True, slots=True)
-class AuthorityInternalWorkVerifiedReceiptV1:
-    """Authority-origin reread result for D02, never a caller-created permit."""
-
-    proof_digest: str
-    namespace: str
-    activity_id: str
-    operation_id: str
-    execution_id: str
-    input_digest: str
-    resource_quote_ref: str
-    resource_quote_version: int
-    resource_quote_digest: str
-    terminal_receipt_ref: str
-    terminal_receipt_digest: str
-    terminal_sequence: int
-    journal_head: JournalHead
-    status: str
-    actual_cpu_ms: int | None
-    component_completed: bool
 
 
 class AuthorityInternalWorkService:
@@ -104,6 +63,7 @@ class AuthorityInternalWorkService:
                  component_signing_key: bytes | None = None,
                  installed_build_digest: str | None = None,
                  installed_build_attestation: dict | None = None,
+                 installed_build_attestations: tuple[dict, ...] = (),
                  trusted_manifest_sha256: str | None = None,
                  original_reconciler: Callable | None = None):
         if type(journal) is not AuthorityV2ExecutionJournal:
@@ -132,10 +92,16 @@ class AuthorityInternalWorkService:
         self.installed_runtime_verified = False
         self.installed_runtime_scope = None
         self.installed_algorithm_id = None
-        if installed_build_attestation is not None:
-            attestation = installed_build_attestation
-            from ..host.installed_d06_build import ALGORITHM_ID, ALGORITHM_ID_V3
-
+        self.installed_builds: dict[str, str] = {}
+        from ..host.installed_d06_build import (
+            ALGORITHM_ID, ALGORITHM_ID_V3, ALGORITHM_ID_V4,
+        )
+        if type(installed_build_attestations) is not tuple:
+            raise ValueError("installed D06 build attestation inventory differs")
+        attestations = ((installed_build_attestation,)
+                        if installed_build_attestation is not None else ())
+        attestations += installed_build_attestations
+        for attestation in attestations:
             if (type(attestation) is not dict or
                     type(trusted_manifest_sha256) is not str or
                     len(trusted_manifest_sha256) != 64 or
@@ -143,11 +109,17 @@ class AuthorityInternalWorkService:
                         for char in trusted_manifest_sha256) or
                     attestation.get("schema") != "sylanne.d06.algorithm-build.v1" or
                     attestation.get("algorithm_id") not in
-                    {ALGORITHM_ID, ALGORITHM_ID_V3} or
-                    attestation.get("manifest_sha256") != trusted_manifest_sha256 or
-                    attestation.get("build_digest") !=
-                    "sha256:" + str(installed_build_digest)):
+                    {ALGORITHM_ID, ALGORITHM_ID_V3, ALGORITHM_ID_V4} or
+                    attestation.get("manifest_sha256") != trusted_manifest_sha256):
                 raise ValueError("installed D06 build attestation differs")
+            digest = attestation.get("build_digest")
+            if (type(digest) is not str or len(digest) != 71 or
+                    not digest.startswith("sha256:") or
+                    any(char not in "0123456789abcdef" for char in digest[7:])):
+                raise ValueError("installed D06 build digest differs")
+            if (attestation is installed_build_attestation and
+                    digest != "sha256:" + str(installed_build_digest)):
+                raise ValueError("installed primary D06 build digest differs")
             formal = (attestation.get("package_mode") == "formal-alpha1"
                       and attestation.get("status") == "formal_package_bytes_only")
             candidate = (
@@ -155,13 +127,31 @@ class AuthorityInternalWorkService:
                 and attestation.get("status") == "backend_acceptance_package_bytes_only"
                 and attestation.get("runtime_scope") == "backend-production-acceptance"
             )
-            if not formal and not candidate:
+            local_alpha2 = (
+                attestation.get("package_mode") == "alpha2-candidate"
+                and attestation.get("status") == "local_alpha2_package_bytes_only"
+                and attestation.get("runtime_scope") == "backend-local-alpha2-acceptance"
+            )
+            if not formal and not candidate and not local_alpha2:
                 raise ValueError("D06 diagnostics cannot obtain production runtime attestation")
+            algorithm_id = attestation["algorithm_id"]
+            if algorithm_id in self.installed_builds:
+                raise ValueError("installed D06 algorithm attestation repeats")
+            runtime_scope = ("formal-alpha1" if formal else attestation["runtime_scope"])
+            if self.installed_runtime_verified and runtime_scope != self.installed_runtime_scope:
+                raise ValueError("installed D06 attestation scopes differ")
+            self.installed_builds[algorithm_id] = digest[7:]
             self.formal_build_verified = formal
             self.installed_runtime_verified = True
-            self.installed_runtime_scope = ("formal-alpha1" if formal
-                                            else "backend-production-acceptance")
-            self.installed_algorithm_id = attestation["algorithm_id"]
+            self.installed_runtime_scope = runtime_scope
+            if self.installed_algorithm_id is None:
+                self.installed_algorithm_id = algorithm_id
+
+    def accepts_installed_binding(self, binding: InternalWorkBindingV1) -> bool:
+        return (type(binding) is InternalWorkBindingV1 and
+                self.installed_runtime_verified and
+                self.installed_builds.get(binding.algorithm_ref) ==
+                binding.algorithm_build_digest)
 
     @staticmethod
     def _component_payload(binding: InternalWorkBindingV1,
@@ -197,8 +187,7 @@ class AuthorityInternalWorkService:
                 terminal.status != "completed" or
                 not self.installed_runtime_verified or
                 self._component_signing_key is None or
-                binding.algorithm_ref != self.installed_algorithm_id or
-                binding.algorithm_build_digest != self.installed_build_digest or
+                not self.accepts_installed_binding(binding) or
                 terminal.algorithm_id != binding.algorithm_ref or
                 terminal.build_fingerprint != binding.algorithm_build_digest or
                 terminal.input_digest != binding.input_digest or
@@ -229,8 +218,7 @@ class AuthorityInternalWorkService:
                 terminal.status == "unknown" or
                 not self.installed_runtime_verified or
                 self._component_signing_key is None or
-                binding.algorithm_ref != self.installed_algorithm_id or
-                binding.algorithm_build_digest != self.installed_build_digest or
+                not self.accepts_installed_binding(binding) or
                 claim != claim_internal_work_v1(binding) or
                 terminal.binding_digest != binding.binding_digest or
                 terminal.algorithm_id != binding.algorithm_ref or
@@ -241,11 +229,17 @@ class AuthorityInternalWorkService:
         if not hmac.compare_digest(expected, terminal.execution_signature):
             return False
         if (terminal.status == "completed" and
-                self.installed_algorithm_id == "d06.association_activation.v3"):
+                binding.algorithm_ref in {"d06.association_activation.v3",
+                                          "d06.association_activation.direct_seed.v4"}):
             try:
-                from .installed_c04_executor_v3 import decode_completed_c04_output_v3
+                from .installed_c04_executor_v3 import (
+                    decode_completed_c04_output_v3, decode_completed_c04_output_v4,
+                )
 
-                decode_completed_c04_output_v3(binding, terminal)
+                decoder = (decode_completed_c04_output_v4
+                           if binding.algorithm_ref == "d06.association_activation.direct_seed.v4"
+                           else decode_completed_c04_output_v3)
+                decoder(binding, terminal)
             except (AuthorityUnavailable, ImportError, TypeError, ValueError):
                 return False
         return (terminal.status == "failed" or
@@ -272,9 +266,7 @@ class AuthorityInternalWorkService:
                 not callable(self._claim_port) or
                 not callable(self._core_head_verifier)):
             raise AuthorityUnavailable("installed W01 preparation and Core-CAS claim port required")
-        if (not self.installed_runtime_verified or
-                binding.algorithm_ref != self.installed_algorithm_id or
-                binding.algorithm_build_digest != self.installed_build_digest):
+        if not self.accepts_installed_binding(binding):
             raise AuthorityUnavailable("installed fixed C04 algorithm is unavailable")
         from ..runtime.c04_internal_work_original_v1 import C04InternalWorkPreparedV1
 

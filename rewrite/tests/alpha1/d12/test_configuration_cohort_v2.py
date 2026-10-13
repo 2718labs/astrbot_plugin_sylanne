@@ -64,3 +64,34 @@ def test_cohort_digest_covers_exact_files_and_credential_root():
     changed=copy.deepcopy(raw); changed['files'][0]['sha256']='e'*64
     with pytest.raises(ValueError): decode_configuration_cohort_v2(changed)
     with pytest.raises(ValueError): ConfigurationFileV2('arbitrary','/etc/a','a'*64)
+
+
+def test_process_deployment_commits_static_spec_without_selection_cycle():
+    values = configuration()
+    spec = dict(schema='sylanne3.installed-process-supervisor.v2', provider_kind='root_supervised_process_v1',
+        supervisor_id='supervisor:host', installation_id='installation:test', authority_id='authority:test',
+        profile_id='profile', namespace_cohort=['ns:test'], service_role='host',
+        installed_spec_path='/etc/sylanne/host-supervisor.json', launcher_code_ref='/opt/sylanne/launcher.py',
+        launcher_build_digest='1'*64, fixed_executable_path='/opt/python/bin/python', executable_sha256='2'*64,
+        fixed_entry_ref='/opt/astrbot/main.py', entry_sha256='3'*64,
+        fixed_argv=['/opt/python/bin/python', '/opt/astrbot/main.py'], fixed_cwd='/opt/astrbot',
+        finite_environment_policy={}, expected_uid=1001, expected_gid=1001, supplementary_group_policy='drop_all',
+        bootstrap_package_ref='bootstrap:'+'4'*64, selection_control_directory='/etc/sylanne/maintenance',
+        control_socket_path='/run/sylanne/host.sock', protected_state_directory='/var/lib/sylanne/supervisor',
+        maximum_processes=8, start_timeout=30, drain_timeout=30)
+    values['deployment'].update(schema='sylanne3.authority.linux-deployment.v2',
+        inventory_path='/etc/sylanne/inventory.json', inventory_sha256='5'*64,
+        host_uid=1001, host_gid=1001, host_supervisor_provider=spec,
+        admission_socket='/run/sylanne/admission.sock', target_directory='/var/lib/sylanne/target',
+        provider_cache={}, host_observation={}, host_lifecycle=dict(supervisor=copy.deepcopy(spec), drain_timeout_seconds=300))
+    before = derive_cohort_identity_commitment_v2(**values)
+    changed = copy.deepcopy(values)
+    for item in (changed['deployment']['host_supervisor_provider'], changed['deployment']['host_lifecycle']['supervisor']):
+        item['maximum_processes'] = 9
+    assert derive_cohort_identity_commitment_v2(**changed) != before
+    changed['deployment']['host_lifecycle']['supervisor']['maximum_processes'] = 8
+    with pytest.raises(AuthorityUnavailable, match='binding'):
+        derive_cohort_identity_commitment_v2(**changed)
+    values['deployment']['host_supervisor_provider']['selected_cohort_digest'] = '6'*64
+    with pytest.raises(AuthorityUnavailable, match='binding'):
+        derive_cohort_identity_commitment_v2(**values)

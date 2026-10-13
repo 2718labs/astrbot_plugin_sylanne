@@ -10,6 +10,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, fields
 import json
+import logging
+import traceback
 from pathlib import Path
 import sqlite3
 import threading
@@ -23,7 +25,7 @@ from ..runtime_contracts import canonical_serialize
 from .contract import AuthorityUnavailable
 from .c09_process_identity_v1 import read_process_identity_v1, require_process_retired_v1
 from .c09_storage_control_v1 import C09StorageControlV1
-from .d12_installed_supervisor_v1 import InstalledD12SystemdSupervisorV1
+from .d12_installed_supervisor_v1 import is_installed_supervisor_v1
 from .d12_lifecycle_contract_v1 import D12InstallationControlIntentV1, D12InstallationLifecycleReceiptV1, lifecycle_receipt_from_wire_v1
 from .d12_lifecycle_gate_v1 import HEAD_DDL, read_lifecycle_head_in_tx_v1
 from .installed_migration_reconciliation_v1 import InstalledNamespaceExecutionReconciliationV1
@@ -39,7 +41,7 @@ class InstalledD12InstallationLifecycleV1:
                  expected_manifest_digest, peer_certificate_sha256, peer_profile_id,
                  model_store=None, drain_timeout_seconds=300):
         if (type(control) is not C09StorageControlV1
-                or type(supervisor) is not InstalledD12SystemdSupervisorV1
+                or not is_installed_supervisor_v1(supervisor)
                 or control.authority_id != status_service.fences.core._id(status_service.core._db)
                 or control.installation_id not in status_service._source_graphs):
             raise TypeError("actual same-installation Authority/control/supervisor services required")
@@ -209,6 +211,7 @@ class InstalledD12InstallationLifecycleV1:
             return head
 
     def submit_current_control_v1(self, *, credential, actor, session_token, session_request, original_ref):
+        from .graph_catalogue_upgrade_v1 import require_selected_catalogue_target_in_tx_v1
         self.core._require(credential, "d12_lifecycle_control", self.namespace)
         context, storage = self._storage()
         observed = self.supervisor.read_current_host_state_v1()
@@ -226,6 +229,8 @@ class InstalledD12InstallationLifecycleV1:
             intent = D12InstallationControlIntentV1(**plan["intent"])
             if intent.installation_id != self.installation_id:
                 raise AuthorityUnavailable("whole-Host control installation differs")
+            if intent.action == "resume":
+                require_selected_catalogue_target_in_tx_v1(db, self)
             prior = db.execute(f"SELECT source_original_ref FROM {OPS} WHERE namespace=? AND operation_id=?",
                                (self.namespace,original.operation_id)).fetchone()
             if prior is None:
@@ -273,6 +278,7 @@ class InstalledD12InstallationLifecycleV1:
             thread.start()
 
     def _run(self, operation_id):
+        from .graph_catalogue_upgrade_v1 import require_selected_catalogue_target_in_tx_v1
         deadline=time.monotonic()+self.drain_timeout_seconds
         try:
             while not self._closed.is_set() and time.monotonic()<deadline:
@@ -286,6 +292,8 @@ class InstalledD12InstallationLifecycleV1:
                         raise AuthorityUnavailable("lifecycle current four-file storage changed")
                     anchor=self.fences._current_locked(db,deletion,execution,require_no_pending=False)
                     stage=row[13]
+                    if stage in {"resuming", "start_intent", "ready"}:
+                        require_selected_catalogue_target_in_tx_v1(db, self)
                     if stage=="quiescing":
                         # RPC entry/exit is independent of Core SQL. Hold its
                         # same condition lock across the actual zero check and
@@ -353,8 +361,20 @@ class InstalledD12InstallationLifecycleV1:
                 raise AuthorityUnavailable("unsupported installed lifecycle stage")
             if not self._closed.is_set():
                 self._record_hold(operation_id, "original_stage_drain_or_bootstrap_incomplete")
-        except Exception:
-            # Do not persist exception text, paths, tokens or provider bodies.
+        except Exception as exc:
+            # Hold/wire fields stay fixed. Local diagnostics include only code
+            # locations and exception classes, never values, messages or locals.
+            diagnostic = traceback.TracebackException.from_exception(exc, capture_locals=False)
+            chain = []
+            while diagnostic is not None:
+                chain.append({"type": diagnostic.exc_type.__name__, "frames": [
+                    {"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                    for frame in diagnostic.stack]})
+                diagnostic = diagnostic.__cause__ or (
+                    None if diagnostic.__suppress_context__ else diagnostic.__context__)
+            logging.getLogger(__name__).error(
+                "Sylanne D12 lifecycle worker cause metadata: " +
+                json.dumps(chain, separators=(",", ":")))
             self._record_hold(operation_id, "original_stage_reconciliation_required")
             return
 
@@ -379,10 +399,12 @@ class InstalledD12InstallationLifecycleV1:
 
     def resume_paused_installation_v1(self, *, credential, actor, session_token, session_request,
                                      pause_operation_id, operation_id, expected_lifecycle_epoch):
+        from .graph_catalogue_upgrade_v1 import require_selected_catalogue_target_in_tx_v1
         self.core._require(credential,"d12_lifecycle_control",self.namespace)
         if str(UUID(operation_id))!=operation_id or UUID(operation_id).version!=4:
             raise ValueError("resume operation must be a canonical UUID4")
         with self.fences._frozen() as (db,deletion,execution,_):
+            require_selected_catalogue_target_in_tx_v1(db, self)
             paused=self._operation(db,pause_operation_id)
             source=db.execute("SELECT * FROM authority_d12_operation_originals_v1 WHERE original_ref=?",(paused[4],)).fetchone()
             original=self.status_service._authenticate_original_row_in_tx(db,source,actor=actor,token=session_token,request=session_request)

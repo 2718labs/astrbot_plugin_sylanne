@@ -62,3 +62,94 @@ def unlink_inventory_member_durably_v2(before):
         if descriptor is not None:
             os.close(descriptor)
         os.close(directory)
+
+
+class InstalledDurableUnlinkProgressV3:
+    """Keep one exact retired inode locked while its chunks share real quanta."""
+    def __init__(self, before):
+        if os.name != 'posix':
+            raise AuthorityUnavailable('installed durable disposal requires its real OS implementation')
+        import fcntl
+        self.before = dict(before)
+        self.path = Path(before['resolved_path'])
+        self.parent = _directory_path(self.path.parent)
+        self.directory = os.open(self.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.descriptor = None
+        self.hasher = hashlib.sha256()
+        self.offset = 0
+        self.last_chunk_digest = None
+        self.verified = False
+        self.absent = False
+        try:
+            actual, opened = os.stat(self.parent, follow_symlinks=False), os.fstat(self.directory)
+            if (actual.st_dev, actual.st_ino) != (opened.st_dev, opened.st_ino):
+                raise AuthorityUnavailable('actual disposal directory changed')
+            try:
+                self.descriptor = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.directory)
+            except FileNotFoundError:
+                # The caller has already authenticated the signed one-file plan.
+                os.fsync(self.directory)
+                self.absent = self.verified = True
+                return
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.initial = os.fstat(self.descriptor)
+            if (not stat.S_ISREG(self.initial.st_mode) or self.initial.st_nlink != 1
+                    or (self.initial.st_dev, self.initial.st_ino, self.initial.st_size, self.initial.st_mtime_ns) !=
+                       (before['device'], before['file_id'], before['prepared_size'], before['prepared_mtime_ns'])):
+                raise AuthorityUnavailable('actual disposal inode differs from authenticated plan')
+        except BaseException:
+            self.close()
+            raise
+
+    def _stable(self):
+        current = os.fstat(self.descriptor)
+        named = os.stat(self.path.name, dir_fd=self.directory, follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_nlink')
+        if (any(getattr(current, key) != getattr(self.initial, key) for key in fields)
+                or (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino)):
+            raise AuthorityUnavailable('actual retired inode changed during reserved disposal')
+
+    def advance(self, *, meter):
+        from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+        if meter is not current_c09_sql_meter_v2():
+            raise AuthorityUnavailable('actual installed disposal quantum required')
+        if self.verified:
+            return True
+        self._stable()
+        size = min(16384, self.initial.st_size - self.offset)
+        meter.require_available(size + 512)
+        data = os.read(self.descriptor, size)
+        meter.charge_read(len(data) + 64)
+        if len(data) != size:
+            raise AuthorityUnavailable('actual retired file ended before its authenticated boundary')
+        self.last_chunk_digest = hashlib.sha256(data).hexdigest()
+        self.hasher.update(data)
+        self.offset += len(data)
+        self._stable()
+        if self.offset == self.initial.st_size:
+            if os.read(self.descriptor, 1) or self.before['prepared_sha256'] is not None and self.hasher.hexdigest() != self.before['prepared_sha256']:
+                raise AuthorityUnavailable('actual retired content differs from signed plan')
+            self.verified = True
+        return self.verified
+
+    def finish(self, *, meter):
+        from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+        if meter is not current_c09_sql_meter_v2() or not self.verified:
+            raise AuthorityUnavailable('actual complete reserved disposal proof required')
+        if not self.absent:
+            self._stable()
+            meter.charge_write(128)
+            os.unlink(self.path.name, dir_fd=self.directory)
+            os.fsync(self.directory)
+            if os.fstat(self.descriptor).st_nlink != 0:
+                raise AuthorityUnavailable('actual disposed inode retains an unregistered hard link')
+        self.close()
+        return {'kind': 'removed_file', 'resolved_path': str(self.path), 'state': 'absent'}
+
+    def close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        if self.directory is not None:
+            os.close(self.directory)
+            self.directory = None

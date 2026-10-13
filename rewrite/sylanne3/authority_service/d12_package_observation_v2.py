@@ -12,17 +12,25 @@ SCHEMA='sylanne3.d12.supervisor-observation.v2'
 def _validate_body(kind,body):
     if type(body) is not dict:raise AuthorityUnavailable('fixed supervisor observation body required')
     if kind=='process':
-        if set(body)!={'service_role','systemd','process_original'} or body['service_role'] not in {'host','authority'}:
+        if body.get('service_role') not in {'host','authority'}:
             raise AuthorityUnavailable('process observation scope differs')
-        raw=body['systemd']
-        if type(raw) is not dict or set(raw)!=set(D12SupervisorObservationV1.__dataclass_fields__):
-            raise AuthorityUnavailable('actual systemd observation fields differ')
-        fields=dict(raw);fields['process_ids']=tuple(fields['process_ids']);observed=D12SupervisorObservationV1(**fields)
-        material=asdict(observed);material.pop('observation_digest')
-        if (observed.observation_digest!=prefixed_digest(material) or type(observed.main_pid) is not int or observed.main_pid<0
-                or any(type(pid) is not int or pid<1 for pid in observed.process_ids)
-                or observed.process_ids!=tuple(sorted(set(observed.process_ids)))):
-            raise AuthorityUnavailable('systemd observation commitment differs')
+        if set(body)=={'service_role','systemd','process_original'}:
+            raw=body['systemd']
+            if type(raw) is not dict or set(raw)!=set(D12SupervisorObservationV1.__dataclass_fields__):
+                raise AuthorityUnavailable('actual systemd observation fields differ')
+            fields=dict(raw);fields['process_ids']=tuple(fields['process_ids']);observed=D12SupervisorObservationV1(**fields)
+            material=asdict(observed);material.pop('observation_digest')
+            if (observed.observation_digest!=prefixed_digest(material) or type(observed.main_pid) is not int or observed.main_pid<0
+                    or any(type(pid) is not int or pid<1 for pid in observed.process_ids)
+                    or observed.process_ids!=tuple(sorted(set(observed.process_ids)))):
+                raise AuthorityUnavailable('systemd observation commitment differs')
+        elif set(body)=={'service_role','provider_kind','supervisor','process_original'}:
+            from .installed_process_supervisor_v1 import KIND,decode_process_supervisor_observation_v2
+            observed=decode_process_supervisor_observation_v2(body['supervisor'])
+            if body['provider_kind']!=KIND or observed.service_role!=body['service_role'] or body['process_original']!=observed.main_process_original:
+                raise AuthorityUnavailable('actual process provider role/birth differs')
+        else:
+            raise AuthorityUnavailable('closed concrete process observation fields differ')
         process=body['process_original']
         if observed.main_pid:
             if (type(process) is not dict or set(process)!={'pid','platform','birth'} or process['pid']!=observed.main_pid

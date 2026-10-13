@@ -6,6 +6,8 @@ against the installed key. No business backup may contain this journal or key.
 """
 from __future__ import annotations
 
+from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3
+
 from contextlib import contextmanager, closing
 from dataclasses import dataclass
 import hashlib
@@ -28,8 +30,13 @@ STAGES = ("INTENT", "PREPARED", "SWITCHED", "CLEANED", "RELEASED")
 
 
 def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+    from ..runtime_contracts import current_canonical_output_meter
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
+    meter = current_canonical_output_meter()
+    if meter is not None:
+        meter.charge_encode(len(text.encode('utf-8')))
+    return text
 
 
 def digest(value):
@@ -273,7 +280,59 @@ class InstalledC09StorageReaderV1:
         if not self._roots or any(self.path.is_relative_to(p) or self.key_path.is_relative_to(p) for p in self._roots):
             raise AuthorityUnavailable("protected control/key must be outside business resources")
         self._capability, self._lock = object(), threading.RLock()
+        self._resource_arena_v3 = threading.Lock()
+        from weakref import WeakSet
+        self._c09_retained_states_v3 = WeakSet()
+        from .c09_paged_capture_control_v2 import InstalledC09CaptureProfileV2
+        self._resource_profile_v3 = InstalledC09CaptureProfileV2()
         self._applied_reader = None
+
+    def install_selected_producer_config_v3(self,config):
+        from .deployment_config import AuthorityDeploymentConfig
+        if type(config) is not AuthorityDeploymentConfig:
+            raise AuthorityUnavailable('actual Root-installed deployment configuration required for readonly producers')
+        installation=config.c09_storage_v2 or config.c09_storage_v1
+        if (installation is None or (installation.installation_id,installation.authority_id,installation.control_store_id,installation.key_id)!=
+                (self.installation_id,self.authority_id,self.control_store_id,self.key_id)
+                or Path(installation.control_path).resolve()!=self.path or Path(installation.key_path).resolve()!=self.key_path):
+            raise AuthorityUnavailable('readonly producer configuration belongs to another installed Control')
+        prior=getattr(self,'_selected_producer_config_v3',None)
+        if prior is not None and prior is not config:
+            raise AuthorityUnavailable('actual readonly producer configuration is already bound')
+        self._selected_producer_config_v3=config
+
+    def read_selected_installed_d13_policy_v3(self,namespace,*,meter):
+        from .deployment_config import AuthorityDeploymentConfig,InstalledNaturalModelAuthorityV2
+        from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV1
+        from .d13_core_counter_contract_v1 import InstalledD13WirePolicyV7
+        from ..host.authority_profile import AdminInstallationBundle
+        from ..runtime_contracts import namespace_ref
+        config=getattr(self,'_selected_producer_config_v3',None)
+        if type(config) is not AuthorityDeploymentConfig:
+            raise AuthorityUnavailable('actual installed readonly D13 public policy source is unbound')
+        with self._db() as db:
+            current=self._c09_control_chain_proof_v2.require_current(db,meter)
+            from .c09_selected_history_v3 import _bounded
+            manifest=self._read_manifest(_bounded(db,meter),current['current_manifest_digest'])
+        if manifest['cohort_namespaces']!=[namespace]:
+            raise AuthorityUnavailable('actual selected D13 policy crosses namespace')
+        model=(config.natural_model_authorities_v2 or {}).get(namespace)
+        assets=(config.d13_counter_assets_v1 or {}).get(namespace)
+        if model is None and assets is None:return None
+        if type(model) is not InstalledNaturalModelAuthorityV2 or type(assets) is not InstalledD13CounterAssetsV1:
+            raise AuthorityUnavailable('actual selected D13 public policy installation is incomplete')
+        bundle=model.installation_bundle
+        if (type(bundle) is not AdminInstallationBundle or bundle.model_workflows is not model.workflows
+                or bundle.installation_policy.installation_id!=self.installation_id
+                or namespace_ref(bundle.installation_policy.namespace)!=namespace or assets.namespace!=bundle.installation_policy.namespace
+                or assets.installation_id!=self.installation_id):
+            raise AuthorityUnavailable('actual selected D13 policy bundle/assets scope differs')
+        policy=bundle.d13_wire_policy;workflow=model.workflows.natural_generation
+        if (type(policy) is not InstalledD13WirePolicyV7 or policy.installation.installation_id!=self.installation_id
+                or (policy.installation.provider_id,policy.installation.model_id,policy.installation.provider_config_digest)!=
+                    (workflow.provider_id,workflow.model_id,workflow.provider_config_digest)):
+            raise AuthorityUnavailable('actual selected D13 wire public policy differs from installed workflow')
+        return policy
 
     def install_applied_reader_v1(self, reader):
         if self._applied_reader is not None or not callable(getattr(reader, "read_storage_applied_original_v1", None)):
@@ -299,7 +358,13 @@ class InstalledC09StorageReaderV1:
             raise AuthorityUnavailable("C09 installed signature differs")
 
     def _manifest(self, manifest):
-        if set(manifest) != _MANIFEST_FIELDS or manifest["schema"] != "sylanne3.c09.storage_manifest.v1":
+        if manifest["schema"] == "sylanne3.c09.storage_manifest.v3":
+            from .c09_storage_manifest_v3 import require_manifest_provenance_shape_v3
+            require_manifest_provenance_shape_v3(manifest)
+        elif manifest["schema"] == "sylanne3.c09.storage_manifest.v2":
+            from .c09_storage_manifest_v2 import require_manifest_provenance_shape_v2
+            require_manifest_provenance_shape_v2(manifest)
+        elif set(manifest) != _MANIFEST_FIELDS or manifest["schema"] != "sylanne3.c09.storage_manifest.v1":
             raise AuthorityUnavailable("C09 manifest fields/schema differ")
         if (manifest["authority_id"], manifest["installation_id"]) != (self.authority_id, self.installation_id):
             raise AuthorityUnavailable("C09 manifest installation differs")
@@ -343,6 +408,9 @@ class InstalledC09StorageReaderV1:
                 db.execute("COMMIT")
             except BaseException:
                 db.execute("ROLLBACK")
+                if write or create:
+                    self._c09_control_chain_proof_v2 = None
+                    self._c09_control_chain_reader_v2 = None
                 raise
 
     def _validate(self, db):
@@ -356,6 +424,33 @@ class InstalledC09StorageReaderV1:
                     row = db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name + "_no_" + action.lower(),)).fetchone()
                     if row is None or row[0] != expected:
                         raise AuthorityUnavailable("C09 control immutable trigger differs")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_storage_operations_v2'").fetchone() is not None:
+            from .c09_prepared_storage_v2 import validate_prepared_schema_v2
+            validate_prepared_schema_v2(self, db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_storage_operations_v3'").fetchone() is not None:
+            from .c09_prepared_storage_v3 import validate_prepared_schema_v3
+            validate_prepared_schema_v3(self, db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_selected_history_checkpoints_v3'").fetchone() is not None:
+            from .c09_selected_history_v3 import require_selected_history_checkpoint_schema_v3
+            require_selected_history_checkpoint_schema_v3(self, db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_provider_cleanup_scopes_v3'").fetchone() is not None:
+            from .c09_provider_cache_v1 import require_provider_cleanup_schema_v3
+            require_provider_cleanup_schema_v3(self,db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_surface_file_plans_v3'").fetchone() is not None:
+            from .c09_surface_cleanup_v1 import require_surface_progress_schema_v3
+            require_surface_progress_schema_v3(self, db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_writer_peer_admissions_v3'").fetchone() is not None:
+            from .c09_writer_peer_originals_v3 import require_writer_peer_schema_v3
+            require_writer_peer_schema_v3(self, db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_maintenance_failures_v3'").fetchone() is not None:
+            from .c09_maintenance_actor_v3 import _require_failure_schema
+            _require_failure_schema(self, db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_physical_inventory_streams_v2'").fetchone() is not None:
+            from .c09_control_paged_schema_v2 import require_paged_control_schema_v2
+            require_paged_control_schema_v2(db)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_graph_closure_verification_runs_v2'").fetchone() is not None:
+            from .c09_control_paged_schema_v2 import require_closure_verification_control_schema_v2
+            require_closure_verification_control_schema_v2(db)
         meta = dict(db.execute("SELECT key,value FROM c09_storage_meta_v1"))
         if meta != {"schema_version":"1", "installation_id":self.installation_id,
                     "authority_id":self.authority_id, "control_store_id":self.control_store_id, "key_id":self.key_id}:
@@ -365,7 +460,143 @@ class InstalledC09StorageReaderV1:
     def _immutable_ddl(name, action):
         return f"CREATE TRIGGER {name}_no_{action.lower()} BEFORE {action} ON {name} BEGIN SELECT RAISE(ABORT,'C09 immutable original'); END"
 
+    def register_c09_retained_state_v3(self,state):
+        self.lease.require_held()
+        self._c09_retained_states_v3.add(state)
+        return state
+
+    def require_c09_retained_arena_v3(self,*,meter,additional_bytes=0):
+        from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3
+        if meter is not require_c09_reserved_meter_v3(meter.budget):
+            raise AuthorityUnavailable('actual root C09 retained workspace reservation required')
+        retained=sum(state._c09_retained_heap_bytes_v3() for state in self._c09_retained_states_v3)
+        if retained+additional_bytes>meter.budget.reserved_arena_bytes:
+            raise AuthorityUnavailable('actual shared installed C09 retained workspace exceeds its unchanged arena')
+        return retained
+
+    @contextmanager
+    def reserve_control_read_v3(self):
+        """Actual cold bootstrap resource admission; grants no business permission."""
+        from time import monotonic_ns
+        from ..runtime.c09_paged_sql_v2 import C09BatchBudgetV2
+        self.lease.require_held()
+        if not self._resource_arena_v3.acquire(blocking=False):
+            raise AuthorityUnavailable("actual installed C09 resource arena is occupied")
+        profile = self._resource_profile_v3
+        started = monotonic_ns()
+        try:
+            from ..runtime.c09_paged_sql_v2 import C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+            budget = C09BatchBudgetV2(profile.batch_records, profile.batch_bytes, profile.batch_local_ns,
+                profile.read_transaction_ns, profile.arena_bytes)
+            meter = C09SqlByteMeterV2(budget)
+            with c09_sql_meter_quantum_v2(meter):
+                self.require_c09_retained_arena_v3(meter=meter)
+                yield budget
+                self.require_c09_retained_arena_v3(meter=meter)
+                self.lease.require_held()
+            if monotonic_ns() - started > profile.batch_local_ns:
+                raise AuthorityUnavailable("actual installed C09 cold read exceeded its unchanged duration")
+        except BaseException:
+            self._c09_control_chain_reader_v2 = None
+            self._c09_control_chain_proof_v2 = None
+            raise
+        finally:
+            self._resource_arena_v3.release()
+
+    def retain_writer_peer_pending_start_v3(self,gate,*,supervisor,host_start_original,baseline,expected_prior_invocation_id):
+        from .c09_writer_peer_originals_v3 import retain_writer_peer_pending_start_v3
+        return retain_writer_peer_pending_start_v3(self,gate,supervisor=supervisor,host_start_original=host_start_original,
+            baseline=baseline,expected_prior_invocation_id=expected_prior_invocation_id)
+
+    def read_writer_peer_pending_start_completion_v3(self,gate,*,pending_start_original):
+        from .c09_writer_peer_originals_v3 import read_writer_peer_pending_start_completion_v3
+        return read_writer_peer_pending_start_completion_v3(self,gate,pending_start_original=pending_start_original)
+
+    def retain_writer_peer_old_root_retirement_v3(self,gate,*,retirement):
+        from .c09_writer_peer_originals_v3 import retain_writer_peer_old_root_retirement_v3
+        return retain_writer_peer_old_root_retirement_v3(self,gate,retirement=retirement)
+
+    def read_writer_peer_old_root_retirement_v3(self,gate,*,pending_start_original):
+        from .c09_writer_peer_originals_v3 import read_writer_peer_old_root_retirement_v3
+        return read_writer_peer_old_root_retirement_v3(self,gate,pending_start_original=pending_start_original)
+
+    def complete_writer_peer_pending_start_old_cohort_v3(self,gate,*,retirement):
+        from .c09_writer_peer_originals_v3 import complete_writer_peer_pending_start_old_cohort_v3
+        return complete_writer_peer_pending_start_old_cohort_v3(self,gate,retirement=retirement)
+
+    def complete_writer_peer_pending_start_v3(self,gate,*,observed_start):
+        from .c09_writer_peer_originals_v3 import complete_writer_peer_pending_start_v3
+        return complete_writer_peer_pending_start_v3(self,gate,observed_start=observed_start)
+
+    def advance_writer_peer_pending_start_coverage_v3(self,gate,*,operation_id,context):
+        from .c09_writer_peer_originals_v3 import advance_writer_peer_pending_start_coverage_v3
+        return advance_writer_peer_pending_start_coverage_v3(self,gate,operation_id=operation_id,context=context)
+
+    def read_writer_peer_registry_host_start_original_v3(self,gate,*,supervisor_spec_digest):
+        from .c09_writer_peer_originals_v3 import read_writer_peer_registry_host_start_original_v3
+        return read_writer_peer_registry_host_start_original_v3(self,gate,supervisor_spec_digest=supervisor_spec_digest)
+
+    def read_writer_peer_registry_activation_v3(self):
+        from .c09_writer_peer_originals_v3 import read_writer_peer_registry_activation_v3
+        return read_writer_peer_registry_activation_v3(self)
+
+    def retain_writer_peer_registry_activation_v3(self, gate, *, activation):
+        from .c09_writer_peer_originals_v3 import retain_writer_peer_registry_activation_v3
+        return retain_writer_peer_registry_activation_v3(self,gate,activation=activation)
+
+    def install_writer_peer_gate_v3(self, gate):
+        from .c09_writer_peer_originals_v3 import install_writer_peer_gate_v3
+        return install_writer_peer_gate_v3(self, gate)
+
+    def retain_writer_peer_admission_v3(self, gate, *, peer, process_incarnation, process_original, context):
+        from .c09_writer_peer_originals_v3 import retain_writer_peer_admission_v3
+        return retain_writer_peer_admission_v3(self, gate, peer=peer, process_incarnation=process_incarnation,
+            process_original=process_original, context=context)
+
+    def advance_writer_peer_retirement_coverage_v3(self, gate, *, operation_id):
+        from .c09_writer_peer_originals_v3 import advance_writer_peer_retirement_coverage_v3
+        return advance_writer_peer_retirement_coverage_v3(self, gate, operation_id=operation_id)
+
+    def read_writer_peer_retirement_coverage_for_prepared_v3(self, gate, *, operation_id, context):
+        from .c09_writer_peer_originals_v3 import read_writer_peer_retirement_coverage_for_prepared_v3
+        return read_writer_peer_retirement_coverage_for_prepared_v3(self, gate, operation_id=operation_id, context=context)
+
+    def advance_current_control_read_v3(self):
+        from ..runtime.c09_paged_sql_v2 import C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+        with self.reserve_control_read_v3() as budget:
+            meter = require_c09_reserved_meter_v3(budget)
+            with c09_sql_meter_quantum_v2(meter):
+                proof = self.advance_current_control_chain_v2(meter=meter)
+                if proof is None:
+                    reader = self._c09_control_chain_reader_v2
+                    return {"status": "progress", "phase": "control_event_chain",
+                        "verified_event_seq": reader.state["last"], "actual_meter_bytes": meter.consumed_bytes}
+                return {"status": "complete", "phase": "control_event_chain",
+                    "verified_event_seq": proof.current["last_event_seq"], "actual_meter_bytes": meter.consumed_bytes}
+
+    def advance_current_control_chain_v2(self, *, meter):
+        """Advance the installed canonical event proof inside a real reservation."""
+        from .c09_control_chain_read_v2 import InstalledC09ControlChainReaderV2
+        reader = getattr(self, "_c09_control_chain_reader_v2", None)
+        if reader is None:
+            reader = InstalledC09ControlChainReaderV2(self)
+            self._c09_control_chain_reader_v2 = reader
+        with self._db() as db:
+            proof = reader.advance(db, meter)
+        if proof is not None:
+            self._c09_control_chain_proof_v2 = proof
+        return proof
+
     def _current(self, db):
+        proof = getattr(self, "_c09_control_chain_proof_v2", None)
+        if proof is not None:
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2, C09PagedCaptureHold
+            try:
+                meter = current_c09_sql_meter_v2()
+            except C09PagedCaptureHold:
+                meter = None
+            if meter is not None:
+                return proof.require_current(db, meter)
         self._validate(db)
         row = db.execute("SELECT * FROM c09_storage_current_v1 WHERE installation_id=?", (self.installation_id,)).fetchone()
         if row is None:
@@ -400,41 +631,153 @@ class InstalledC09StorageReaderV1:
         return current
 
     def _read_manifest(self, db, manifest_digest):
-        row = db.execute("SELECT * FROM c09_storage_manifests_v1 WHERE manifest_digest=?", (manifest_digest,)).fetchone()
-        if row is None:
+        columns = ('manifest_digest', 'installation_id', 'generation', 'manifest_json', 'issuer_id', 'key_id', 'signature')
+        stored = db.execute("SELECT " + ','.join(columns) + " FROM c09_storage_manifests_v1 WHERE manifest_digest=?", (manifest_digest,)).fetchone()
+        if stored is None:
             raise AuthorityUnavailable("C09 selected manifest absent")
+        row = dict(zip(columns, stored))
         manifest = json.loads(row["manifest_json"])
         self._manifest(manifest)
-        signed = self.sign_original_v1("sylanne3.c09.manifest_signature.v1", dict(
-            schema="sylanne3.c09.manifest_signature.v1", manifest=manifest,
-            issuer_id=self.authority_id), "digest")
+        from .c09_storage_manifest_v2 import manifest_signature_domain
+        domain = manifest_signature_domain(manifest)
+        signed = self.sign_original_v1(domain, dict(
+            schema=domain, manifest=manifest, issuer_id=self.authority_id), "digest")
         if (row["signature"] != signed["signature"] or row["key_id"] != self.key_id
                 or row["issuer_id"] != self.authority_id or row["manifest_digest"] != manifest["manifest_digest"]
                 or row["installation_id"] != manifest["installation_id"] or row["generation"] != manifest["generation"]):
             raise AuthorityUnavailable("C09 manifest installed signature differs")
         return manifest
 
-    def read_verified_current_storage_v1(self, *, verify_files=True):
+    def read_verified_control_status_v3(self):
+        """EOF-authenticated status; selected generation remains unknown until qualified."""
+        from ..runtime.c09_paged_sql_v2 import C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+        from .c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+        with self.reserve_control_read_v3() as budget:
+            meter = require_c09_reserved_meter_v3(budget)
+            with c09_sql_meter_quantum_v2(meter):
+                proof = self.advance_current_control_chain_v2(meter=meter)
+                if proof is None:
+                    return dict(status="progress", phase="control_preflight", stage=None,
+                        pointer_version=None, current_manifest_digest=None, storage_generation=None)
+                with self._db() as db:
+                    current = proof.require_current(db, meter)
+                    from .c09_paged_recovery_facts_v2 import _BoundedReadConnectionV2
+                    manifest = self._read_manifest(_BoundedReadConnectionV2(db, meter), current["current_manifest_digest"])
+                view = getattr(self, "_selected_history_read_v3", None)
+                generation = None
+                if type(view) is VerifiedSelectedHistoryReadV3:
+                    view.require_current(meter=meter)
+                    generation = view.basis.manifest["generation"]
+                return dict(status="complete", phase="control_eof", stage=current["stage"],
+                    pointer_version=current["pointer_version"], current_manifest_digest=current["current_manifest_digest"],
+                    storage_generation=generation, active_operation_id=current["active_operation_id"],
+                    manifest_schema=manifest["schema"])
+
+    def advance_selected_history_read_v3(self):
+        from .c09_selected_history_v3 import advance_selected_history_read_v3
+        return advance_selected_history_read_v3(self)
+
+    def advance_selected_storage_applied_read_v3(self):
+        from .c09_close_apply_v1 import advance_selected_storage_applied_read_v3
+        with self.reserve_control_read_v3() as budget:
+            meter = require_c09_reserved_meter_v3(budget)
+            return advance_selected_storage_applied_read_v3(self, view=self._selected_history_read_v3, meter=meter)
+
+    def read_verified_current_storage_v3(self, *, meter=None, verify_files=True):
+        """Only a private complete selected history view may open V3 storage."""
+        from .c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+        from ..runtime.c09_paged_sql_v2 import C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+        if meter is None:
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2, C09PagedCaptureHold
+            try:
+                actual = current_c09_sql_meter_v2()
+            except C09PagedCaptureHold:
+                with self.reserve_control_read_v3() as budget:
+                    actual = require_c09_reserved_meter_v3(budget)
+                    with c09_sql_meter_quantum_v2(actual):
+                        return self.read_verified_current_storage_v3(meter=actual, verify_files=verify_files)
+            return self.read_verified_current_storage_v3(meter=actual, verify_files=verify_files)
+        view = getattr(self, "_selected_history_read_v3", None)
+        if type(view) is not VerifiedSelectedHistoryReadV3 or view.basis.control is not self:
+            raise AuthorityUnavailable("actual V3 selected history read is not complete")
+        current = view.basis.require_current(meter=meter)
+        manifest = view.basis.manifest
+        return VerifiedStorageOpenContextV1(str(self.path), current["pointer_version"],
+            manifest["manifest_digest"], manifest["generation"], current["stage"], manifest,
+            view.basis.prepared, self, self._capability)
+
+    def read_verified_current_storage_v2(self, *, meter, verify_files=True):
+        """Use only the actually streamed selected legacy header for V2 work."""
+        from .c09_prepared_storage_v2 import read_selected_prepared_v2
+        if getattr(self, '_selected_history_read_v3', None) is not None:
+            return self.read_verified_current_storage_v3(meter=meter, verify_files=verify_files)
         with self._db() as db:
             current = self._current(db)
             manifest = self._read_manifest(db, current["current_manifest_digest"])
+            if manifest['schema']=='sylanne3.c09.storage_manifest.v3':
+                raise AuthorityUnavailable('V3 selected storage requires actual segmented provenance and its registered opener')
             prepared = None
             if manifest["generation"] > 0:
-                row = db.execute("SELECT * FROM c09_storage_operations_v1 WHERE new_manifest_digest=?", (manifest["manifest_digest"],)).fetchone()
-                if row is None:
-                    raise AuthorityUnavailable("C09 current PREPARED original absent")
-                prepared = json.loads(row["prepared_original_json"])
-                self.verify_original_v1(prepared, "prepared_digest")
-                if set(prepared) != _PREPARED_FIELDS or prepared["prepared_digest"] != row["prepared_digest"] or prepared["signature"] != row["signature"]:
-                    raise AuthorityUnavailable("C09 prepared original fields/row differ")
-                if prepared["new_manifest_digest"] != manifest["manifest_digest"]:
-                    raise AuthorityUnavailable("C09 selected transition differs")
-                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_storage_build_originals_v1'").fetchone():
-                    from .current_filesystem_inventory_v3 import require_prepared_inventory_evidence_v3
-                    require_prepared_inventory_evidence_v3(self,db,prepared)
+                prepared = read_selected_prepared_v2(self, db, manifest)
+                if prepared is None:
+                    from .c09_paged_recovery_facts_v2 import C09VerifiedLegacyPreparedSummaryV2
+                    prepared = getattr(self, "_c09_selected_legacy_prepared_v2", None)
+                    if type(prepared) is not C09VerifiedLegacyPreparedSummaryV2 or prepared._control is not self:
+                        raise AuthorityUnavailable("C09 V2 selected legacy PREPARED requires actual streamed preflight")
+        if prepared is not None and type(prepared) is not dict:
+            prepared.require_current(meter=meter)
+            if prepared["new_manifest_digest"] != manifest["manifest_digest"]:
+                raise AuthorityUnavailable("C09 V2 streamed selected transition differs")
         if verify_files:
             for member in manifest["members"]:
                 self.verify_member_v1(member, prepared=False)
+                from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+                require_legacy_storage_file_v3(member['resolved_path'])
+        return VerifiedStorageOpenContextV1(str(self.path), current["pointer_version"],
+            manifest["manifest_digest"], manifest["generation"], current["stage"],
+            manifest, prepared, self, self._capability)
+
+    def read_verified_current_storage_v1(self, *, verify_files=True):
+        if getattr(self, "_selected_history_read_v3", None) is not None:
+            return self.read_verified_current_storage_v3(verify_files=verify_files)
+        from .c09_paged_recovery_facts_v2 import C09VerifiedLegacyPreparedSummaryV2
+        if type(getattr(self, '_c09_selected_legacy_prepared_v2', None)) is C09VerifiedLegacyPreparedSummaryV2:
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2, C09PagedCaptureHold, C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+            try:
+                meter = current_c09_sql_meter_v2()
+            except C09PagedCaptureHold:
+                with self.reserve_control_read_v3() as budget:
+                    meter = require_c09_reserved_meter_v3(budget)
+                    with c09_sql_meter_quantum_v2(meter):
+                        return self.read_verified_current_storage_v2(meter=meter, verify_files=verify_files)
+            return self.read_verified_current_storage_v2(meter=meter, verify_files=verify_files)
+        with self._db() as db:
+            current = self._current(db)
+            manifest = self._read_manifest(db, current["current_manifest_digest"])
+            if manifest['schema']=='sylanne3.c09.storage_manifest.v3':
+                raise AuthorityUnavailable('V3 selected storage requires actual segmented provenance and its registered opener')
+            prepared = None
+            if manifest["generation"] > 0:
+                from .c09_prepared_storage_v2 import read_selected_prepared_v2
+                prepared = read_selected_prepared_v2(self, db, manifest)
+                if prepared is None:
+                    row = db.execute("SELECT * FROM c09_storage_operations_v1 WHERE new_manifest_digest=?", (manifest["manifest_digest"],)).fetchone()
+                    if row is None:
+                        raise AuthorityUnavailable("C09 current PREPARED original absent")
+                    prepared = json.loads(row["prepared_original_json"])
+                    self.verify_original_v1(prepared, "prepared_digest")
+                    if set(prepared) != _PREPARED_FIELDS or prepared["prepared_digest"] != row["prepared_digest"] or prepared["signature"] != row["signature"]:
+                        raise AuthorityUnavailable("C09 prepared original fields/row differ")
+                    if prepared["new_manifest_digest"] != manifest["manifest_digest"]:
+                        raise AuthorityUnavailable("C09 selected transition differs")
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_storage_build_originals_v1'").fetchone():
+                        from .current_filesystem_inventory_v3 import require_prepared_inventory_evidence_v3
+                        require_prepared_inventory_evidence_v3(self,db,prepared)
+        if verify_files:
+            for member in manifest["members"]:
+                self.verify_member_v1(member, prepared=False)
+                from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+                require_legacy_storage_file_v3(member['resolved_path'])
         return VerifiedStorageOpenContextV1(str(self.path), current["pointer_version"],
             manifest["manifest_digest"], manifest["generation"], current["stage"],
             manifest, prepared, self, self._capability)
@@ -453,16 +796,40 @@ class InstalledC09StorageReaderV1:
         if (type(context) is not VerifiedStorageOpenContextV1 or context._reader is not self
                 or context._capability is not self._capability or context.control_path != str(self.path)):
             raise AuthorityUnavailable("installed C09 open context required")
-        current = self.read_verified_current_storage_v1(verify_files=False)
+        from .c09_paged_recovery_facts_v2 import C09VerifiedLegacyPreparedSummaryV2
+        if context.manifest["schema"] == "sylanne3.c09.storage_manifest.v3":
+            current = self.read_verified_current_storage_v3(verify_files=False)
+        elif type(context.prepared_original) is C09VerifiedLegacyPreparedSummaryV2:
+            with self._resource_sql_quantum_v3() as meter:
+                current = self.read_verified_current_storage_v2(meter=meter, verify_files=False)
+        else:
+            current = self.read_verified_current_storage_v1(verify_files=False)
         if (current.pointer_version, current.manifest_digest, current.stage) != (context.pointer_version, context.manifest_digest, context.stage):
             raise AuthorityUnavailable("C09 open context expired")
         if action in {"business", "accounting", "recovery"}:
+            from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+            if context.manifest['schema'] != "sylanne3.c09.storage_manifest.v3":
+                for member in context.manifest['members']:
+                    require_legacy_storage_file_v3(member['resolved_path'])
             if context.stage not in {"READY", "RELEASED"}:
                 raise AuthorityUnavailable("C09 maintenance admission closed")
             if context.stage == "RELEASED":
-                if self._applied_reader is None:
-                    raise AuthorityUnavailable("C09 installed scoped-applied reader absent")
-                proof = self._applied_reader.read_storage_applied_original_v1(context=context)
+                if context.manifest['schema'] == "sylanne3.c09.storage_manifest.v3":
+                    from .c09_close_apply_v1 import read_selected_storage_applied_original_v3
+                    from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2, C09PagedCaptureHold, C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+                    try:
+                        meter = current_c09_sql_meter_v2()
+                    except C09PagedCaptureHold:
+                        with self.reserve_control_read_v3() as budget:
+                            meter = require_c09_reserved_meter_v3(budget)
+                            with c09_sql_meter_quantum_v2(meter):
+                                proof = read_selected_storage_applied_original_v3(self, view=self._selected_history_read_v3, meter=meter)
+                    else:
+                        proof = read_selected_storage_applied_original_v3(self, view=self._selected_history_read_v3, meter=meter)
+                else:
+                    if self._applied_reader is None:
+                        raise AuthorityUnavailable("C09 installed scoped-applied reader absent")
+                    proof = self._applied_reader.read_storage_applied_original_v1(context=context)
                 if type(proof) is not dict or proof.get("manifest_digest") != context.manifest_digest or proof.get("state") != "applied" or not proof.get("graph_ack_digest"):
                     raise AuthorityUnavailable("C09 current scoped-applied proof differs")
 
@@ -500,8 +867,26 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
                 if row is None or row[0] != self._immutable_ddl(_BUILD_TABLE, action):
                     raise AuthorityUnavailable("C09 build-original trigger differs")
 
+    @contextmanager
+    def _resource_sql_quantum_v3(self):
+        from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2, C09PagedCaptureHold, C09SqlByteMeterV2, c09_sql_meter_quantum_v2
+        try:
+            meter = current_c09_sql_meter_v2()
+        except C09PagedCaptureHold:
+            with self.reserve_control_read_v3() as budget:
+                meter = require_c09_reserved_meter_v3(budget)
+                with c09_sql_meter_quantum_v2(meter):
+                    yield meter
+        else:
+            yield meter
+
     def _build_original_locked(self, db, operation_id, kind):
-        row = db.execute("SELECT original_json,original_digest FROM c09_storage_build_originals_v1 "
+        from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+        from .c09_paged_recovery_facts_v2 import _BoundedReadConnectionV2
+        meter = current_c09_sql_meter_v2()
+        bounded = _BoundedReadConnectionV2(db, meter)
+        bounded._natural_preflight_v3 = lambda size: meter.require_available(size * 7)
+        row = bounded.execute("SELECT original_json,original_digest FROM c09_storage_build_originals_v1 "
             "WHERE installation_id=? AND operation_id=? AND original_kind=?",
             (self.installation_id, operation_id, kind)).fetchone()
         if row is None:
@@ -515,13 +900,18 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
         return original
 
     def read_build_original_v1(self, *, operation_id, kind):
-        with self._db() as db:
-            self._current(db)
-            return self._build_original_locked(db, operation_id, kind)
+        with self._resource_sql_quantum_v3():
+            with self._db() as db:
+                self._current(db)
+                return self._build_original_locked(db, operation_id, kind)
 
     def record_build_original_v1(self, *, operation_id, kind, details):
         identifier(operation_id, "operation_id")
         identifier(kind, "original_kind")
+        with self._resource_sql_quantum_v3() as meter:
+            return self._record_build_original_in_quantum_v3(operation_id=operation_id, kind=kind, details=details, meter=meter)
+
+    def _record_build_original_in_quantum_v3(self, *, operation_id, kind, details, meter):
         with self._db(write=True) as db:
             current = self._current(db)
             preopen = kind.startswith("preopen_switch_quiescence:")
@@ -551,8 +941,9 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
                 "operation_id": operation_id, "original_kind": kind,
                 "old_manifest_digest": current["current_manifest_digest"],
                 "expected_pointer_version": current["pointer_version"], "details": details}, "original_digest")
-            db.execute("INSERT INTO c09_storage_build_originals_v1 VALUES(?,?,?,?,?)", (
-                self.installation_id, operation_id, kind, canonical(original), original["original_digest"]))
+            meter.write_row(db, 'c09_storage_build_originals_v1',
+                ('installation_id', 'operation_id', 'original_kind', 'original_json', 'original_digest'),
+                (self.installation_id, operation_id, kind, canonical(original), original["original_digest"]))
             return original
 
     def record_cleanup_plan_v1(self, *, operation_id, surface, details):
@@ -579,9 +970,13 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
 
     def _store_manifest(self, db, manifest):
         self._manifest(manifest)
-        signed = self.sign_original_v1("sylanne3.c09.manifest_signature.v1", dict(
-            schema="sylanne3.c09.manifest_signature.v1", manifest=manifest,
-            issuer_id=self.authority_id), "digest")
+        if manifest['schema']!='sylanne3.c09.storage_manifest.v3':
+            from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+            for member in manifest['members']:require_legacy_storage_file_v3(member['resolved_path'])
+        from .c09_storage_manifest_v2 import manifest_signature_domain
+        domain = manifest_signature_domain(manifest)
+        signed = self.sign_original_v1(domain, dict(
+            schema=domain, manifest=manifest, issuer_id=self.authority_id), "digest")
         row = db.execute("SELECT manifest_json FROM c09_storage_manifests_v1 WHERE manifest_digest=?", (manifest["manifest_digest"],)).fetchone()
         if row is not None:
             if row[0] != canonical(manifest):
@@ -592,6 +987,8 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
             canonical(manifest), self.authority_id, self.key_id, signed["signature"]))
 
     def bootstrap_installed_storage_v1(self, *, manifest):
+        if manifest['schema']=='sylanne3.c09.storage_manifest.v3':
+            raise AuthorityUnavailable('legacy bootstrap cannot qualify segmented V3 storage')
         if self.path.exists():
             raise AuthorityUnavailable("C09 bootstrap refuses existing control log")
         self._manifest(manifest)
@@ -599,6 +996,8 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
             raise AuthorityUnavailable("C09 bootstrap generation differs")
         for member in manifest["members"]:
             self.verify_member_v1(member, prepared=True)
+            from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+            require_legacy_storage_file_v3(member['resolved_path'])
         descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         os.close(descriptor)
         with self._db(write=True, create=True) as db:
@@ -650,6 +1049,15 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
             current["pointer_version"], current["current_manifest_digest"], current["last_event_digest"]))
         if changed.rowcount != 1:
             raise AuthorityUnavailable("C09 pointer CAS conflict")
+        proof = getattr(self, "_c09_control_chain_proof_v2", None)
+        if proof is not None:
+            proof.observe_committed_event(original)
+        if stage == 'SWITCHED':
+            self._selected_history_read_v3 = None
+            self._selected_history_builder_v3 = None
+            self._selected_applied_reader_v3 = None
+            self._selected_applied_read_v3 = None
+            self._c09_selected_legacy_prepared_v2 = None
         return original
 
     def record_maintenance_intent_v1(self, *, operation_id, namespace, installed_intent):
@@ -680,6 +1088,8 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
             return original
 
     def record_prepared_storage_v1(self, *, manifest, prepared_original,closing_continuation=None):
+        if manifest['schema']=='sylanne3.c09.storage_manifest.v3':
+            raise AuthorityUnavailable('V1 PREPARED cannot qualify segmented V3 storage')
         self._manifest(manifest)
         self.verify_original_v1(prepared_original, "prepared_digest")
         if set(prepared_original) != _PREPARED_FIELDS or prepared_original["schema"] != "sylanne3.c09.storage_prepared_original.v1":
@@ -690,6 +1100,8 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
             if member["resolved_path"] != intent["details"]["targets"][member["role"]]:
                 raise AuthorityUnavailable("C09 candidate differs from registered INTENT")
             self.verify_member_v1(member, prepared=True)
+            from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+            require_legacy_storage_file_v3(member['resolved_path'])
         with self._db(write=True) as db:
             current = self._current(db)
             prior = db.execute("SELECT prepared_original_json FROM c09_storage_operations_v1 WHERE operation_id=?", (operation_id,)).fetchone()
@@ -738,7 +1150,26 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
                     canonical(prepared_original), prepared_original["prepared_digest"], self.key_id, prepared_original["signature"]))
             return self._event(db, current, operation_id=operation_id, stage="PREPARED", details={"prepared_digest":prepared_original["prepared_digest"], "new_manifest_digest":manifest["manifest_digest"]})
 
+    def record_prepared_storage_v2(self, *, manifest, prepared_original, closing_continuation):
+        from .c09_prepared_storage_v2 import record_prepared_storage_v2
+        return record_prepared_storage_v2(self, manifest=manifest,
+            prepared_original=prepared_original, closing_continuation=closing_continuation)
+
     def switch_prepared_storage_v1(self, *, operation_id, quiescence_original):
+        from .c09_prepared_storage_v2 import TABLE_V2, validate_prepared_schema_v2, switch_prepared_storage_v2
+        with self._db() as db:
+            self._current(db)
+            present = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE_V2,)).fetchone()
+            v2 = None
+            if present is not None:
+                validate_prepared_schema_v2(self, db)
+                v2 = db.execute("SELECT 1 FROM c09_storage_operations_v2 WHERE operation_id=?", (operation_id,)).fetchone()
+            v1 = db.execute("SELECT 1 FROM c09_storage_operations_v1 WHERE operation_id=?", (operation_id,)).fetchone()
+            if v1 is not None and v2 is not None:
+                raise AuthorityUnavailable("C09 switch has conflicting operation versions")
+        if v2 is not None:
+            return switch_prepared_storage_v2(self, operation_id=operation_id,
+                                              quiescence_original=quiescence_original)
         self.verify_original_v1(quiescence_original, "quiescence_digest")
         with self._db(write=True) as db:
             current = self._current(db)
@@ -747,6 +1178,8 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
                 raise AuthorityUnavailable("C09 switch PREPARED absent")
             prepared = json.loads(row[0]); self.verify_original_v1(prepared, "prepared_digest")
             new = self._read_manifest(db, prepared["new_manifest_digest"])
+            from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
+            for member in new['members']:require_legacy_storage_file_v3(member['resolved_path'])
             old = self._read_manifest(db, prepared["old_manifest_digest"])
             details = {"prepared_digest":prepared["prepared_digest"],
                 "quiescence_digest":quiescence_original["quiescence_digest"],

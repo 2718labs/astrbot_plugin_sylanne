@@ -8,7 +8,7 @@ from ..memory_types import SourceRecord, access_key, source_key, validate_access
 
 def read_current_structural_source_closure_v1(
     db, snapshot: GraphSnapshot, namespace,
-    source_refs: tuple[str, ...],
+    source_refs: tuple[str, ...], *, prepared_inventory=None,
 ) -> tuple[tuple[GraphVersion, ...], tuple[str, ...]]:
     """Read D03/D05 support sources without adding them to D09 speech scope.
 
@@ -32,17 +32,24 @@ def read_current_structural_source_closure_v1(
         seen.add(key.owner.subject)
         if len(seen) > 256:
             raise ValueError("structural source ancestry exceeds bound")
-        source_atom = _current_atom(db, snapshot, key)
+        if prepared_inventory is None:
+            source_atom=_current_atom(db,snapshot,key)
+            metadata=SourceRecord.from_dict(source_atom.value)
+        else:
+            source_atom=prepared_inventory.source_metadata(db,namespace,prepared_inventory.query,key,require_grant=False)
+            metadata=source_atom.metadata
         access = access_key(*namespace.as_tuple, key.owner.subject)
-        access_atom = _current_atom(db, snapshot, access)
-        record = SourceRecord.from_dict(source_atom.value)
+        access_atom = (_current_atom(db,snapshot,access)if prepared_inventory is None
+            else prepared_inventory.projection.get(access))
+        if access_atom is None or not access_atom.valid:raise ValueError('structural source access missing')
+        record=metadata
         validate_access(access_atom.value)
-        allowed = (set(record.purposes) & set(access_atom.value["purposes"])
+        allowed = (set((record.purposes if prepared_inventory is None else record['purposes'])) & set(access_atom.value["purposes"])
                    & {"context", "audit"})
-        if (record.source_id != key.owner.subject
+        if ((record.source_id if prepared_inventory is None else record['source_id']) != key.owner.subject
                 or access_atom.value["source_id"] != key.owner.subject
                 or access_atom.value["status"] != "active"
-                or "owner" not in record.audiences
+                or "owner" not in (record.audiences if prepared_inventory is None else record['audiences'])
                 or "owner" not in access_atom.value["audiences"]
                 or not allowed):
             raise ValueError("structural source or access lacks current purpose and audience")
@@ -56,7 +63,7 @@ def read_current_structural_source_closure_v1(
         versions[key] = GraphVersion(key, source_atom.revision)
         versions[access] = GraphVersion(access, access_atom.revision)
         pending.extend(source_key(*namespace.as_tuple, parent).token
-                       for parent in record.parent_source_ids)
+                       for parent in (record.parent_source_ids if prepared_inventory is None else record['parent_source_ids']))
     return (tuple(sorted(versions.values(), key=lambda item: item.key.token)),
             tuple(sorted(absent_heads)))
 

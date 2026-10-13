@@ -121,7 +121,7 @@ class InstalledC04ExecutorV2:
         return self._service.inspect(binding)
 
 
-def compose_installed_c04_executor_v2(
+def compose_installed_c04_service_v2(
     *, bridge: AuthorityV2ExecutionBridge,
     namespace: NamespaceId,
     graph_db_path: str | Path,
@@ -130,7 +130,7 @@ def compose_installed_c04_executor_v2(
     component_signing_key: bytes,
     credential: object,
     install_bridge_verifier: bool = True,
-) -> tuple[AuthorityInternalWorkService, InstalledC04ExecutorV2]:
+) -> AuthorityInternalWorkService:
     """Install C04 from pinned formal package and immutable W01 originals.
 
     The manifest hash must come from administrator installation state outside
@@ -221,15 +221,38 @@ def compose_installed_c04_executor_v2(
         installed_build_attestation=build,
         trusted_manifest_sha256=trusted_manifest_sha256,
     )
-    executor = InstalledC04ExecutorV2(
-        service, frozen_input_reader=lambda binding: read_graph_original(
-            binding, frozen=True))
     if type(install_bridge_verifier) is not bool:
         raise AuthorityUnavailable("C04 bridge verifier install mode differs")
     if install_bridge_verifier:
         bridge.install_internal_work_terminal_verifier(service.verify_installed_terminal)
+    service._installed_frozen_input_reader = lambda binding: read_graph_original(binding, frozen=True)
+    return service
+
+
+def compose_installed_c04_executor_v2(
+    *, bridge: AuthorityV2ExecutionBridge,
+    namespace: NamespaceId,
+    graph_db_path: str | Path,
+    package_root: str | Path,
+    trusted_manifest_sha256: str,
+    component_signing_key: bytes,
+    credential: object,
+    install_bridge_verifier: bool = True,
+) -> tuple[AuthorityInternalWorkService, InstalledC04ExecutorV2]:
+    """Add the executor to the same formally installed historical service."""
+    service = compose_installed_c04_service_v2(
+        bridge=bridge,
+        namespace=namespace,
+        graph_db_path=graph_db_path,
+        package_root=package_root,
+        trusted_manifest_sha256=trusted_manifest_sha256,
+        component_signing_key=component_signing_key,
+        credential=credential,
+        install_bridge_verifier=install_bridge_verifier)
+    executor = InstalledC04ExecutorV2(service,
+        frozen_input_reader=service._installed_frozen_input_reader)
     return service, executor
 
 
 __all__ = ["ALGORITHM_ID", "InstalledC04ExecutorV2",
-           "compose_installed_c04_executor_v2"]
+           "compose_installed_c04_executor_v2", "compose_installed_c04_service_v2"]

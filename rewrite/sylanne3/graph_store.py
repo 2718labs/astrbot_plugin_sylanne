@@ -25,6 +25,12 @@ from .graph_types import (
     TypeRegistry,
 )
 from .store import Store
+from .runtime_storage_v3 import (
+    runtime_storage_v3, graph_value_column_v3, read_graph_head_v3, read_graph_history_v3,
+    read_graph_rows_v3, read_graph_row_v3, materialize_graph_value_v3,
+    reserve_runtime_payload_v3, seal_runtime_cell_in_transaction_v3,
+    runtime_storage_quantum_method_v3,
+)
 from .runtime import install_schema as install_runtime_schema
 from .runtime_contracts import NamespaceId, SnapshotRequirementsV2
 from .authority_service.v2_owner_contract import OwnerMigrationHeadV1
@@ -87,10 +93,7 @@ def _assert_migration_owner_head_in_transaction(
         db, namespace: NamespaceId, head: OwnerMigrationHeadV1 | None) -> None:
     """Compare restored graph originals with Authority's frozen latest Owner head."""
     key = owner_grant_key(*namespace.as_tuple)
-    grant_row = db.execute(
-        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-        (key.token,),
-    ).fetchone()
+    grant_row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(key.token,), history=False)
     issue_row = db.execute(
         "SELECT operation_id,request_digest,grant_id,grant_digest,"
         "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -206,13 +209,66 @@ class DeletionSnapshotPage:
 class GraphStore(Store):
     """Adds a typed, multi-owner graph to :class:`Store`'s database and lock."""
 
+    @classmethod
+    def open_registered_catalogue_upgrade_v1(cls, admission, registry):
+        """Open only an existing Graph under an issued Authority batch scope."""
+        import sqlite3
+        import threading
+        from pathlib import Path
+        from .authority_service.graph_catalogue_upgrade_v1 import require_issued_catalogue_batch_v1
+        from .runtime.graph_catalogue_upgrade_v1 import (
+            current_catalogue_hash_v1, registered_source_registry_v1,
+        )
+        scope = require_issued_catalogue_batch_v1(admission)
+        registered_source_registry_v1(registry, scope.source_catalogue_hash)
+        if cls is not GraphStore or registry.catalogue_hash != scope.target_catalogue_hash:
+            raise PermissionError("registered maintenance target differs")
+        store = cls.__new__(cls)
+        store._lock, store._closed = threading.RLock(), False
+        store._registry, store._migration_transfer_verifier = registry.freeze(), None
+        store._catalogue_admission = scope
+        store._db = sqlite3.connect(Path(scope.graph_path).as_uri() + '?mode=rw',
+            uri=True, check_same_thread=False, isolation_level=None)
+        try:
+            store._db.execute('PRAGMA busy_timeout=1000')
+            store._db.execute('PRAGMA synchronous=FULL')
+            if current_catalogue_hash_v1(store._db) not in {scope.source_catalogue_hash, scope.target_catalogue_hash}:
+                raise PermissionError("actual Graph is outside the registered catalogue transition")
+            return store
+        except BaseException:
+            store.close()
+            raise
+
+    def advance_registered_catalogue_upgrade_v1(self, admission):
+        from .authority_service.graph_catalogue_upgrade_v1 import require_issued_catalogue_batch_v1
+        from .runtime.graph_catalogue_upgrade_v1 import advance_graph_catalogue_upgrade_in_transaction_v1
+        scope = require_issued_catalogue_batch_v1(admission)
+        if getattr(self, '_catalogue_admission', None) is not scope:
+            raise PermissionError("Graph connection belongs to another maintenance scope")
+        with self._lock:
+            self._ensure_open()
+            self._db.execute('BEGIN IMMEDIATE')
+            try:
+                receipt = advance_graph_catalogue_upgrade_in_transaction_v1(self, scope)
+                self._db.execute('COMMIT')
+                return receipt
+            except BaseException:
+                self._db.execute('ROLLBACK')
+                raise
+
     def __init__(self, path, registry: TypeRegistry, *,
-                 migration_transfer_verifier: GraphMigrationTransferVerifier | None = None):
+                 migration_transfer_verifier: GraphMigrationTransferVerifier | None = None,
+                 selected_storage=None, storage_context=None, maintenance_basis=None):
         if not isinstance(registry, TypeRegistry):
             raise TypeError("registry must be TypeRegistry")
         self._registry = registry.freeze()
         self._migration_transfer_verifier = migration_transfer_verifier
-        super().__init__(path)
+        super().__init__(path, selected_storage=selected_storage, storage_context=storage_context,
+                         maintenance_basis=maintenance_basis)
+        if self._runtime_storage_v3 is not None:
+            with self._lock:
+                self._check_catalog()
+            return
         with self._lock:
             try:
                 self._create_graph_schema()
@@ -254,6 +310,10 @@ class GraphStore(Store):
                 install_d13_paid_coordinator_schema_v1(self._db)
                 from .runtime.installed_d13_wire_evidence_v1 import install_d13_wire_evidence_schema_v1
                 install_d13_wire_evidence_schema_v1(self._db)
+                from .authority_service.d13_wire_evidence_v6 import install_d13_wire_evidence_schema_v6
+                from .runtime.d11_derived_cache_payload_v1 import install_derived_payload_schema_v1
+                install_d13_wire_evidence_schema_v6(self._db)
+                install_derived_payload_schema_v1(self._db)
                 from .runtime.d04_semantic_installation_original_v3 import install_d04_semantic_installation_schema_v3
                 install_d04_semantic_installation_schema_v3(self._db)
                 from .runtime.d04_owner_initialization_v3 import install_d04_root_topology_originals_v3
@@ -882,6 +942,9 @@ class GraphStore(Store):
                 "ALTER TABLE graph_d13_precompression_attempts_v2 "
                 "ADD COLUMN rejected_json TEXT")
 
+        from .authority_service.v3_owner_paid_guard_observation import install_paid_owner_guard_links_v3
+        install_paid_owner_guard_links_v3(self._db)
+
     @staticmethod
     def _catalog_row(spec):
         return (
@@ -912,17 +975,11 @@ class GraphStore(Store):
             for name, writer, digest in expected_authority)
         if (actual == expected and authority == old_authority
                 and authority != expected_authority):
-            rows = self._db.execute(
-                "SELECT token,revision,value,valid FROM graph_atoms WHERE type_name=?",
-                (OWNER_GRANT_TYPE,),
-            ).fetchall()
+            rows = read_graph_rows_v3(self._db, ('token', 'revision', 'value', 'valid'), where='type_name=?', parameters=(OWNER_GRANT_TYPE,), history=False)
             for token, revision, raw, valid in rows:
                 value = json.loads(raw)
                 validate_owner_grant_v1(value)
-                history = self._db.execute(
-                    "SELECT revision,value,valid,event_session,event_id "
-                    "FROM graph_history WHERE token=?", (token,),
-                ).fetchall()
+                history = read_graph_rows_v3(self._db, ('revision', 'value', 'valid', 'event_session', 'event_id'), where='token=?', parameters=(token,), history=True)
                 if (canonical_json(value) != raw or revision != 1 or valid != 1
                         or value.get("state") != "pending_authority"
                         or value.get("grant_revision") != 1
@@ -1038,6 +1095,10 @@ class GraphStore(Store):
         return result
 
     def _recovery_row(self, namespace):
+        if self._runtime_storage_v3 is not None:
+            from .runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            return current_c09_sql_meter_v2().read_fixed_row(self._db,'graph_recovery_metadata_v2',
+                ('schema','requirements_json','graph_revision'),'bot=? AND persona=?',namespace.as_tuple)
         return self._db.execute(
             "SELECT schema,requirements_json,graph_revision "
             "FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
@@ -1270,7 +1331,20 @@ class GraphStore(Store):
         prepared = context.prepared_original
         members = {member["role"]: member for member in context.manifest["members"]}
         path = self._db.execute("PRAGMA database_list").fetchone()
-        old = prepared["old_execution_head_original"]
+        from .authority_service.c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+        selected = getattr(storage_reader, "_selected_history_read_v3", None)
+        if type(selected) is VerifiedSelectedHistoryReadV3:
+            from .runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            selected.basis.require_current(meter=current_c09_sql_meter_v2())
+            complete = selected.completion
+            if (selected.basis.control is not storage_reader
+                    or selected.basis.manifest["manifest_digest"] != context.manifest_digest
+                    or complete.scope_digest != selected.scope.scope_digest
+                    or complete.pin_digest != selected.basis.prepared["facts_pin_digest"]):
+                raise StaleRead("actual complete selected C09 facts do not match the current identity transition")
+            old = {"journal_id": complete.old_journal_id, "seq": complete.old_seq, "digest": complete.old_digest}
+        else:
+            old = prepared["old_execution_head_original"]
         with core._lock:
             if core._db is None or not core._db.in_transaction:
                 raise RuntimeError("C09 recovery identity needs actual Core and Graph transactions")
@@ -1298,7 +1372,8 @@ class GraphStore(Store):
         with self._lock:
             if not self._db.in_transaction:
                 raise RuntimeError("C09 recovery identity needs current Graph transaction")
-            changed = self._db.execute("UPDATE graph_recovery_metadata_v2 SET requirements_json=?,graph_revision=graph_revision+1 "
+            from .runtime.c09_paged_sql_v2 import _capture_write_v2
+            changed = _capture_write_v2(self._db, "UPDATE graph_recovery_metadata_v2 SET requirements_json=?,graph_revision=graph_revision+1 "
                 "WHERE bot=? AND persona=? AND schema=? AND requirements_json=? AND graph_revision=?",
                 (self._recovery_payload(replacement), *before.namespace.as_tuple, before.schema,
                     self._recovery_payload(before), expected.graph_revision)).rowcount
@@ -1334,7 +1409,8 @@ class GraphStore(Store):
             self._ensure_open()
             if not self._db.in_transaction:
                 raise RuntimeError("graph recovery CAS requires an active SQL transaction")
-            changed = self._db.execute(
+            from .runtime.c09_paged_sql_v2 import _capture_write_v2
+            changed = _capture_write_v2(self._db,
                 "UPDATE graph_recovery_metadata_v2 SET requirements_json=?,"
                 "graph_revision=graph_revision+1 WHERE bot=? AND persona=? "
                 "AND schema=? AND requirements_json=? AND graph_revision=?",
@@ -1426,9 +1502,7 @@ class GraphStore(Store):
                 atoms = []
                 for key in keys:
                     self._assert_c09_key_not_erased(key)
-                    row = self._db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)
-                    ).fetchone()
+                    row = read_graph_row_v3(self._db, ('revision', 'value', 'valid'), where='token=?', parameters=(key.token,), history=False)
                     atoms.append(
                         GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
                         if row else GraphAtom(key, 0, {}, False)
@@ -1462,8 +1536,9 @@ class GraphStore(Store):
 
     @staticmethod
     def _version_rows(encoded):
+        from .runtime.domain_background_read_v3 import background_json_loads_v3
         return tuple(GraphVersion(AtomKey.from_token(token), revision)
-                     for token, revision in json.loads(encoded))
+                     for token, revision in background_json_loads_v3(encoded))
 
     def graph_event_receipt(self, event, *, _capability=None):
         self._require_coordinator(_capability)
@@ -1532,9 +1607,9 @@ class GraphStore(Store):
                 epoch = GraphStore.graph_epoch(self, bot, persona, _capability=_capability)
                 if expected_epoch is not None and epoch != expected_epoch:
                     raise StaleRead('query namespace changed between pages')
-                rows = self._db.execute(
-                    'SELECT token,revision,value,valid FROM graph_atoms WHERE '
-                    + ' AND '.join(clauses) + ' ORDER BY token LIMIT ?', args).fetchall()
+                rows = read_graph_rows_v3(self._db, ('token','revision','value','valid'),
+                    where=' AND '.join(clauses), parameters=tuple(args[:-1]),
+                    order_by=('token',), limit=args[-1])
                 atoms = tuple(GraphAtom(AtomKey.from_token(row[0]), row[1],
                     json.loads(row[2]), bool(row[3])) for row in rows[:limit])
                 next_after = atoms[-1].key if len(rows) > limit else None
@@ -1606,16 +1681,13 @@ class GraphStore(Store):
 
                 atoms = []
                 for key in keys:
-                    row = self._db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms "
-                        "WHERE token=? AND bot=? AND persona=?",
-                        (key.token, *namespace.as_tuple)).fetchone()
+                    row = read_graph_row_v3(self._db, ('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(key.token, *namespace.as_tuple), history=False)
                     atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
                                  if row else GraphAtom(key, 0, {}, False))
                 placeholders = ",".join("?" for _ in keys)
                 reverse_rows = self._db.execute(
                     "SELECT d.dependent_token,d.dependency_token,d.dependency_revision,"
-                    "a.revision,a.value,a.valid FROM graph_dependencies d "
+                    f"a.revision,a.{graph_value_column_v3(self._db)},a.valid FROM graph_dependencies d "
                     "JOIN graph_atoms a ON a.token=d.dependent_token "
                     f"WHERE d.dependency_token IN ({placeholders}) "
                     "AND a.bot=? AND a.persona=? "
@@ -1624,6 +1696,7 @@ class GraphStore(Store):
                 known = set(keys)
                 reverse_edges = []
                 for dependent_token, dependency_token, dependency_revision, revision, value, valid in reverse_rows:
+                    value = materialize_graph_value_v3(self._db, value, token=dependent_token)
                     dependent = AtomKey.from_token(dependent_token)
                     dependency = AtomKey.from_token(dependency_token)
                     if (self._namespace(dependent) != namespace.as_tuple
@@ -1643,11 +1716,10 @@ class GraphStore(Store):
                                       " OR (h.token=? AND h.revision=? AND ?>0))")
                     history_args.extend((after.key.token, after.key.token, after.revision,
                                          after.key.token, after.revision, after.edge_offset))
-                history_rows_sql = self._db.execute(
-                    "SELECT h.token,h.revision,h.value,h.valid,h.dependencies,"
-                    "h.event_session,h.event_id FROM graph_history h WHERE "
-                    + history_where + " ORDER BY h.token,h.revision LIMIT ?",
-                    tuple(history_args) + (limit + 1,)).fetchall()
+                history_rows_sql = read_graph_rows_v3(self._db,
+                    ('token','revision','value','valid','dependencies','event_session','event_id'),
+                    where=history_where.replace('h.', ''), parameters=tuple(history_args),
+                    history=True, order_by=('token','revision'), limit=limit+1)
                 result_rows = []
                 history_edges = []
                 position = after
@@ -1690,8 +1762,15 @@ class GraphStore(Store):
                 self._db.execute("ROLLBACK")
                 raise
 
+    def _commit_metadata_reader_v3(self):
+        from .runtime.c09_paged_sql_v2 import peek_current_c09_sql_meter_v3
+        if peek_current_c09_sql_meter_v3() is None:
+            return self._db
+        from .authority_service.c09_graph_application_v1 import c09_actual_root_read_v3
+        return c09_actual_root_read_v3(self._db)
+
     def _current_revision(self, token):
-        row = self._db.execute(
+        row = self._commit_metadata_reader_v3().execute(
             "SELECT revision FROM graph_atoms WHERE token=?", (token,)
         ).fetchone()
         return row[0] if row else 0
@@ -1703,7 +1782,7 @@ class GraphStore(Store):
         pending = list(seeds)
         while pending:
             token = pending.pop()
-            rows = self._db.execute(
+            rows = self._commit_metadata_reader_v3().execute(
                 "SELECT dependent_token FROM graph_dependencies WHERE dependency_token=?",
                 (token,),
             ).fetchall()
@@ -1715,42 +1794,31 @@ class GraphStore(Store):
         return closure
 
     def _assert_acyclic(self, namespace, replacements):
-        # Replacing outgoing edges with empty sets cannot introduce a cycle.
         if not any(replacements.values()):
             return
-        bot, persona = namespace
-        nodes = {
-            row[0]: set() for row in self._db.execute(
-                "SELECT token FROM graph_atoms WHERE bot=? AND persona=?", (bot, persona)
-            )
-        }
-        for dependent, dependency in self._db.execute(
-            "SELECT d.dependent_token,d.dependency_token FROM graph_dependencies d "
-            "JOIN graph_atoms a ON a.token=d.dependent_token WHERE a.bot=? AND a.persona=?",
-            (bot, persona),
-        ):
-            nodes.setdefault(dependent, set()).add(dependency)
-            nodes.setdefault(dependency, set())
-        for token, dependencies in replacements.items():
-            nodes[token] = set(dependencies)
-            for dependency in dependencies:
-                nodes.setdefault(dependency, set())
-        # Kahn's algorithm avoids Python's recursion ceiling for long memory chains.
-        indegree = {token: 0 for token in nodes}
+        reader=self._commit_metadata_reader_v3()
+        nodes={};pending=list(replacements)
+        while pending:
+            token=pending.pop()
+            if token in nodes:continue
+            if token in replacements:
+                dependencies=set(replacements[token])
+            else:
+                dependencies={row[0] for row in reader.execute(
+                    "SELECT dependency_token FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token",
+                    (token,))}
+            nodes[token]=dependencies
+            pending.extend(dependency for dependency in dependencies if dependency not in nodes)
+        indegree={token:0 for token in nodes}
         for dependencies in nodes.values():
-            for dependency in dependencies:
-                indegree[dependency] += 1
-        ready = [token for token, degree in indegree.items() if degree == 0]
-        visited = 0
+            for dependency in dependencies:indegree[dependency]+=1
+        ready=[token for token,degree in indegree.items() if degree==0];visited=0
         while ready:
-            token = ready.pop()
-            visited += 1
+            token=ready.pop();visited+=1
             for dependency in nodes[token]:
-                indegree[dependency] -= 1
-                if indegree[dependency] == 0:
-                    ready.append(dependency)
-        if visited != len(nodes):
-            raise ValueError("instantaneous dependency cycle")
+                indegree[dependency]-=1
+                if indegree[dependency]==0:ready.append(dependency)
+        if visited!=len(nodes):raise ValueError("instantaneous dependency cycle")
 
     def _prepare_graph_candidate(self, candidate: GraphCandidate, *,
                                  _owner_issue: bool = False,
@@ -1794,7 +1862,15 @@ class GraphStore(Store):
                 raise ValueError("dependencies must belong to the complete read set")
             if spec.immutable and write.dependencies:
                 raise ValueError("immutable graph atoms cannot have invalidating dependencies")
-            prepared.append((write, spec, canonical_json(self._registry.validate(write.key, write.value))))
+            validated = self._registry.validate(write.key, write.value)
+            from .runtime.owner_material_source_storage_v3 import issued_sealed_source_graph_write_v3
+            if issued_sealed_source_graph_write_v3(write):
+                if self._runtime_storage_v3 is None:
+                    raise ValueError("sealed Source write requires its actual segmented role")
+                prepared.append((write, spec, None))
+            else:
+                reserve_runtime_payload_v3(self._db, validated)
+                prepared.append((write, spec, canonical_json(validated)))
         # The Event is the idempotency unit. A retry may legitimately rebuild its
         # candidate from the now-current snapshot, so candidate CAS material is
         # retained for audit but is not part of the event conflict digest.
@@ -1832,7 +1908,7 @@ class GraphStore(Store):
     def _graph_commit_in_transaction(self, candidate: GraphCandidate, *,
                                      _guard=None, _receipt_hook=None, _capability=None,
                                      _owner_issue: bool = False,
-                                     _owner_revoke: bool = False):
+                                     _owner_revoke: bool = False, _full_read_capture=None):
         """Run a graph commit inside the coordinator's existing write transaction.
 
         Caller holds this store's lock and owns COMMIT or ROLLBACK.
@@ -1843,11 +1919,22 @@ class GraphStore(Store):
         self._ensure_open()
         prepared = self._prepare_graph_candidate(
             candidate, _owner_issue=_owner_issue, _owner_revoke=_owner_revoke)
-        return self._graph_commit_core(*prepared, _guard=_guard, _receipt_hook=_receipt_hook)
+        if _full_read_capture is None:
+            return self._graph_commit_core(*prepared, _guard=_guard, _receipt_hook=_receipt_hook)
+        from .runtime.current_graph_full_write_v3 import _FullReadWriteCaptureV3
+        if type(_full_read_capture) is not _FullReadWriteCaptureV3:
+            raise TypeError("actual private FULL writer capture required")
+        _full_read_capture._enter_writer_v3(self,candidate,prepared,_capability)
+        def captured_hook(db,receipt):
+            return _full_read_capture._receipt_v3(db,receipt,_receipt_hook)
+        try:
+            return self._graph_commit_core(*prepared,_guard=_guard,_receipt_hook=captured_hook,
+                _full_read_capture=_full_read_capture)
+        finally:_full_read_capture._exit_writer_v3()
 
     @contextmanager
     def _provisional_graph_stage_in_transaction(
-            self, candidate: GraphCandidate, *, _capability=None):
+            self, candidate: GraphCandidate, *, _capability=None, _full_read_capture=None):
         """Expose a tentative graph E+1 only inside a caller-owned transaction.
 
         Every row, event, history entry and epoch written by this stage is
@@ -1867,25 +1954,39 @@ class GraphStore(Store):
             event.occurred_at, event.kind, event.payload)
         staged = GraphCandidate(
             staged_event, candidate.reads, candidate.writes, candidate.epochs)
+        if _full_read_capture is not None:
+            from .runtime.current_graph_full_write_v3 import _FullReadWriteCaptureV3
+            if type(_full_read_capture) is not _FullReadWriteCaptureV3:
+                raise TypeError("actual private provisional FULL capture required")
         name = "provisional_" + secrets.token_hex(16)
         self._db.execute("SAVEPOINT " + name)
         try:
+            if _full_read_capture is not None:
+                _full_read_capture._begin_savepoint_v3(self,candidate,staged,name,_capability)
             receipt = self._graph_commit_in_transaction(
-                staged, _capability=_capability)
+                staged, _capability=_capability,_full_read_capture=_full_read_capture)
             if receipt.status != "committed":
                 raise EventConflict("provisional graph event unexpectedly replayed")
-            yield receipt
+            if _full_read_capture is None:yield receipt
+            else:
+                with _full_read_capture.bind_provisional_v3():yield receipt
         finally:
-            self._db.execute("ROLLBACK TO SAVEPOINT " + name)
-            self._db.execute("RELEASE SAVEPOINT " + name)
+            try:
+                if _full_read_capture is not None:_full_read_capture._end_savepoint_v3()
+            finally:
+                self._db.execute("ROLLBACK TO SAVEPOINT " + name)
+                self._db.execute("RELEASE SAVEPOINT " + name)
 
+    @runtime_storage_quantum_method_v3
     def _graph_commit_core(self, namespace, reads, writes, epochs, prepared,
-                           digest, scope_key, *, _guard=None, _receipt_hook=None):
+                           digest, scope_key, *, _guard=None, _receipt_hook=None, _full_read_capture=None):
+        from .runtime.c09_paged_sql_v2 import _capture_write_v2
+        metadata_reader=self._commit_metadata_reader_v3()
         if _guard is not None:
             _guard(self._db)
         for write in writes:
             self._assert_c09_key_not_erased(write.key)
-        prior = self._db.execute(
+        prior = metadata_reader.execute(
             "SELECT digest,revisions,invalidated,epoch_revision FROM graph_events "
             "WHERE bot=? AND persona=? AND session=? AND event_id=?", scope_key
         ).fetchone()
@@ -1906,7 +2007,7 @@ class GraphStore(Store):
                 raise StaleRead(
                     f"{read.key.token}: expected {read.revision}, observed {actual}"
                 )
-        epoch_row = self._db.execute(
+        epoch_row = metadata_reader.execute(
             "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", namespace
         ).fetchone()
         current_epoch = epoch_row[0] if epoch_row else 0
@@ -1933,7 +2034,7 @@ class GraphStore(Store):
             post_revisions[write.key.token] = post_revisions[write.key.token] + 1
         post_valid = {}
         for token in to_invalidate:
-            row = self._db.execute(
+            row = metadata_reader.execute(
                 "SELECT valid FROM graph_atoms WHERE token=?", (token,)
             ).fetchone()
             post_valid[token] = False if row else False
@@ -1945,7 +2046,7 @@ class GraphStore(Store):
                 if token in post_valid:
                     valid = post_valid[token]
                 else:
-                    row = self._db.execute(
+                    row = metadata_reader.execute(
                         "SELECT valid FROM graph_atoms WHERE token=?", (token,)
                     ).fetchone()
                     # Revision-zero dependencies are explicit observations of
@@ -1959,12 +2060,14 @@ class GraphStore(Store):
 
         invalidation_rows = []
         for token in sorted(to_invalidate):
-            row = self._db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (token,)
+            row = metadata_reader.execute(
+                f"SELECT revision,{graph_value_column_v3(self._db)},valid FROM graph_atoms WHERE token=?", (token,)
             ).fetchone()
             if row and row[2]:
                 invalidation_rows.append((token, row[0] + 1, row[1]))
 
+        if _full_read_capture is not None:
+            _full_read_capture._record_before_v3(self,namespace,prepared,invalidation_rows)
         state_changed = bool(writes or invalidation_rows)
         new_epoch = current_epoch + int(state_changed)
         revisions = tuple(
@@ -1984,7 +2087,7 @@ class GraphStore(Store):
         invalidated_json = canonical_json(
             [[r.key.token, r.revision] for r in invalidated]
         )
-        self._db.execute(
+        _capture_write_v2(self._db,
             "INSERT INTO graph_events(bot,persona,session,event_id,digest,reads,epoch_reads,"
             "revisions,invalidated,epoch_revision) VALUES(?,?,?,?,?,?,?,?,?,?)",
             scope_key + (digest, reads_json, epoch_reads_json, revisions_json,
@@ -1995,15 +2098,34 @@ class GraphStore(Store):
             token = write.key.token
             revision = post_revisions[token]
             owner = write.key.owner
-            self._db.execute(
+            value_column = graph_value_column_v3(self._db)
+            from .runtime.owner_material_source_storage_v3 import (
+                issued_sealed_source_graph_write_v3, source_graph_cell_ref_v3)
+            if issued_sealed_source_graph_write_v3(write):
+                value_json = source_graph_cell_ref_v3(write,self._db,revision=revision,
+                    event_digest=digest,scope_key=scope_key,read_versions=reads,epochs=epochs)
+            elif self._runtime_storage_v3 is not None:
+                value_json = seal_runtime_cell_in_transaction_v3(self._db,
+                    locator={'table':'graph_atoms','token':token,'revision':revision},
+                    erasure_owner_ref=token, operation_id=scope_key[3], event_digest=digest,
+                    namespace=namespace, read_proof={'reads':[[r.key.token,r.revision] for r in reads],
+                        'epochs':[[e.bot,e.persona,e.revision] for e in epochs],
+                        'event_scope':scope_key, 'dependencies':[d.token for d in write.dependencies]},
+                    payload=value_json)
+            _capture_write_v2(self._db,
                 "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,type_name,name,"
-                "revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1) "
+                f"revision,{value_column},valid) VALUES(?,?,?,?,?,?,?,?,?,1) "
                 "ON CONFLICT(token) DO UPDATE SET revision=excluded.revision,"
-                "value=excluded.value,valid=1",
+                f"{value_column}=excluded.{value_column},valid=1",
                 (token, owner.bot, owner.persona, owner.kind, owner.subject,
                  write.key.type_name, write.key.name, revision, value_json),
             )
-            self._db.execute(
+            if self._runtime_storage_v3 is not None and write.key.type_name == 'd09.turn_slot.v1':
+                origin_ref = write.value['origin_ref']
+                _capture_write_v2(self._db, "INSERT INTO graph_d09_turn_slot_origins_v3(token,bot,persona,origin_ref) "
+                    "VALUES(?,?,?,?) ON CONFLICT(token) DO UPDATE SET origin_ref=excluded.origin_ref",
+                    (token,owner.bot,owner.persona,origin_ref))
+            _capture_write_v2(self._db,
                 "DELETE FROM graph_dependencies WHERE dependent_token=?", (token,)
             )
             dependency_rows = []
@@ -2012,37 +2134,37 @@ class GraphStore(Store):
                 if dep_revision is None:
                     dep_revision = self._current_revision(dependency.token)
                 dependency_rows.append((token, dependency.token, dep_revision))
-            self._db.executemany(
-                "INSERT INTO graph_dependencies(dependent_token,dependency_token,"
-                "dependency_revision) VALUES(?,?,?)", dependency_rows
-            )
+            for dependency_row in dependency_rows:
+                _capture_write_v2(self._db,
+                    "INSERT INTO graph_dependencies(dependent_token,dependency_token,"
+                    "dependency_revision) VALUES(?,?,?)", dependency_row)
             dependencies_json = canonical_json(
                 [[dependency, revision] for _, dependency, revision in dependency_rows]
             )
-            self._db.execute(
-                "INSERT INTO graph_history(token,revision,value,valid,dependencies,event_bot,"
+            _capture_write_v2(self._db,
+                f"INSERT INTO graph_history(token,revision,{graph_value_column_v3(self._db)},valid,dependencies,event_bot,"
                 "event_persona,event_session,event_id) VALUES(?,?,?,?,?,?,?,?,?)",
                 (token, revision, value_json, 1, dependencies_json) + scope_key,
             )
 
         for token, revision, value_json in invalidation_rows:
-            self._db.execute(
+            _capture_write_v2(self._db,
                 "UPDATE graph_atoms SET revision=?,valid=0 WHERE token=?",
                 (revision, token),
             )
-            dependencies = self._db.execute(
+            dependencies = metadata_reader.execute(
                 "SELECT dependency_token,dependency_revision FROM graph_dependencies "
                 "WHERE dependent_token=? ORDER BY dependency_token", (token,)
             ).fetchall()
-            self._db.execute(
-                "INSERT INTO graph_history(token,revision,value,valid,dependencies,event_bot,"
+            _capture_write_v2(self._db,
+                f"INSERT INTO graph_history(token,revision,{graph_value_column_v3(self._db)},valid,dependencies,event_bot,"
                 "event_persona,event_session,event_id) VALUES(?,?,?,?,?,?,?,?,?)",
                 (token, revision, value_json, 0,
                  canonical_json([list(row) for row in dependencies])) + scope_key,
             )
 
         if state_changed:
-            self._db.execute(
+            _capture_write_v2(self._db,
                 "INSERT INTO graph_epochs(bot,persona,revision) VALUES(?,?,?) "
                 "ON CONFLICT(bot,persona) DO UPDATE SET revision=excluded.revision",
                 namespace + (new_epoch,),

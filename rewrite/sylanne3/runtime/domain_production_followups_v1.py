@@ -6,6 +6,7 @@ This reader never acknowledges an effect, retries a dispatch or grants CPU.
 """
 from dataclasses import dataclass
 import json
+from .domain_background_read_v3 import background_history_v3, background_json_loads_v3, background_inventory_v3
 
 from ..graph_types import AtomKey
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize
@@ -30,14 +31,13 @@ def verify_current_followup_trigger_v1(db, namespace, event, causal_original, is
         versions = tuple(version for version in causal_original["receipt"].write_versions if version.key == key)
         if len(versions) != 1 or key.type_name != "memory.source" or not key.owner.subject.startswith("d10-life-experience:"):
             raise ValueError("experience source is not an actual member of the causal composite receipt")
-        row = db.execute("SELECT event_bot,event_persona,event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
-            (key.token, versions[0].revision)).fetchone()
+        row = background_history_v3(db,key.token,versions[0].revision,columns=('event_bot','event_persona','event_id','value','valid'))
         if row is None or row[:3] != (*namespace.as_tuple, event.causal_operation_id) or row[4] != 1:
             raise ValueError("experience source lost its actual causal Graph history")
         from ..memory_types import SourceRecord
         from ..domains.d06 import D06DomainAdapter, SourceAdmission
         from ..domains.d01.production_operations_v1 import plain_v1
-        source = SourceRecord.from_dict(json.loads(row[3]))
+        source = SourceRecord.from_dict(background_json_loads_v3(row[3]))
         progress = causal_original["payload"]["provenance"]["actual_progress"]
         expected_id = "d10-life-experience:" + canonical_digest((progress["activity_id"], progress["effect_id"]))[:48]
         expected_text = canonical_serialize({
@@ -48,10 +48,10 @@ def verify_current_followup_trigger_v1(db, namespace, event, causal_original, is
         roots = tuple(version for version in causal_original["read_versions"] if version.key.token == root_ref)
         if len(roots) != 1:
             raise ValueError("experience admission lost its actual causal parent read")
-        root = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?", (root_ref, roots[0].revision)).fetchone()
+        root = background_history_v3(db,root_ref,roots[0].revision,columns=('value','valid'))
         if root is None or root[1] != 1:
             raise ValueError("experience admission lost its actual parent source history")
-        actual_parent = SourceRecord.from_dict(json.loads(root[0]))
+        actual_parent = SourceRecord.from_dict(background_json_loads_v3(root[0]))
         family = actual_parent.provenance_root
         from ..graph_types import GraphAtom, GraphSnapshot
         from .d10_production_operations_v1 import experience_allowed_purposes_v1
@@ -59,11 +59,10 @@ def verify_current_followup_trigger_v1(db, namespace, event, causal_original, is
         for version in causal_original["read_versions"]:
             if version.revision < 1 or version.key.type_name not in {"memory.source", "memory.access", "d11.owner_grant.v1"}:
                 continue
-            value = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
-                (version.key.token, version.revision)).fetchone()
+            value = background_history_v3(db,version.key.token,version.revision,columns=('value','valid'))
             if value is None:
                 raise ValueError("experience admission lost its actual parent/Owner permission history")
-            historical.append(GraphAtom(version.key, version.revision, json.loads(value[0]), bool(value[1])))
+            historical.append(GraphAtom(version.key, version.revision, background_json_loads_v3(value[0]), bool(value[1])))
         purposes = experience_allowed_purposes_v1(GraphSnapshot(tuple(historical), ()), namespace, tuple(progress["source_refs"]))
         simulated = progress["reality"] == "role_simulation"
         admission = SourceAdmission(expected_id, expected_text, "persona:" + namespace.persona_id,
@@ -158,13 +157,9 @@ def read_plan_current_domain_followup_v1(db, *, namespace, event):
     keys += [version.key for version in original["read_versions"]]
     roots = [key.token for key in keys if key.type_name == "memory.source"]
     for type_id in fixed:
-        rows = db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? AND valid=1 "
-            "ORDER BY token LIMIT 129", (*namespace.as_tuple, type_id)).fetchall()
-        if len(rows) > 128:
-            raise MissingProductionOriginalV1("complete_followup_inventory:" + type_id,
-                continuation="followup-query:" + canonical_digest((namespace, event.dedupe_key, type_id))[:48])
-        for (encoded,) in rows:
-            raw = json.loads(encoded)
+        rows = background_inventory_v3(db,namespace,type_id,valid_only=True)
+        for atom in rows:
+            raw = atom.value
             roots += list(raw.get("source_refs", raw.get("creation_evidence_refs", ())))
             if type_id == "d10.proactive_opportunity.v1":
                 roots.append(raw["source_ref"])
@@ -243,11 +238,10 @@ def resolve_domain_followup_v1(db, current_frame, event):
             return wait("actual_adopted_d10_experience_sources")
         for ref in targets:
             atom = read.head(db, ref, required=True)
-            history = db.execute("SELECT event_bot,event_persona,event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
-                (ref, atom.revision)).fetchone()
+            history = background_history_v3(db,ref,atom.revision,columns=('event_bot','event_persona','event_id','value','valid'))
             adopted_revision = next(version.revision for version in original["receipt"].write_versions if version.key.token == ref)
             if (history is None or history[:3] != (*ns.as_tuple, event.causal_operation_id)
-                    or atom.revision != adopted_revision or history[4] != 1 or json.loads(history[3]) != atom.value):
+                    or atom.revision != adopted_revision or history[4] != 1 or background_json_loads_v3(history[3]) != atom.value):
                 raise ValueError("experience original is not from the actual causal D10 bundle")
         read.source_family(db, targets, purpose="consolidation")
         from ..domains.d06.structured_experience_v1 import EncodeCurrentStructuredExperienceRequestV1

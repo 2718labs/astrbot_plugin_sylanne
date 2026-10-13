@@ -143,7 +143,11 @@ def _shape(raw: object, kind: type) -> dict:
 def to_wire(value: WorkerModelResultReadRequestV1 | WorkerModelResultReadV1) -> dict:
     if type(value) not in {WorkerModelResultReadRequestV1, WorkerModelResultReadV1}:
         raise TypeError("typed worker model result read required")
-    return json.loads(canonical_serialize(asdict(value)))
+    data = json.loads(canonical_serialize(asdict(value)))
+    if type(value) is WorkerModelResultReadV1:
+        from .v2_model_egress_contract import model_observation_to_wire_v1
+        data["observation"] = model_observation_to_wire_v1(value.observation)
+    return data
 
 
 def from_wire(raw: object, kind: type):
@@ -154,13 +158,8 @@ def from_wire(raw: object, kind: type):
     elif kind is WorkerModelResultReadV1:
         data = _shape(raw, kind)
         data["request"] = from_wire(data["request"], WorkerModelResultReadRequestV1)
-        observation = _shape(data["observation"], ModelEgressObservationV1)
-        for name in ("usage", "cost"):
-            amounts = observation[name]
-            if type(amounts) is not list or any(type(pair) is not list for pair in amounts):
-                raise ValueError("worker result amount pairs differ")
-            observation[name] = tuple(tuple(pair) for pair in amounts)
-        data["observation"] = ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data["observation"] = model_observation_from_wire_v1(data["observation"])
         data["terminal_receipt"] = ModelTerminalReceiptV2(
             **_shape(data["terminal_receipt"], ModelTerminalReceiptV2))
         value = WorkerModelResultReadV1(**data)

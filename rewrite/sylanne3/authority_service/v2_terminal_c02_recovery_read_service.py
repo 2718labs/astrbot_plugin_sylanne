@@ -23,8 +23,9 @@ class TerminalC02RecoveryDeliveryV1:
 
     @property
     def handoff_digest(self) -> str:
+        from .v2_model_egress_contract import model_observation_to_wire_v1
         return canonical_digest({"request": asdict(self.request),
-                                 "observation": asdict(self.observation)})
+                                 "observation": model_observation_to_wire_v1(self.observation)})
 
 
 class AuthorityV2TerminalC02RecoveryReadService:

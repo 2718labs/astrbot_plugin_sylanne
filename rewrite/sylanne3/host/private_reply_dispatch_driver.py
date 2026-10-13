@@ -82,7 +82,11 @@ class InstalledPrivateReplyContinuationV1:
                  fence_port: V2FencePort, policy: AdminInstallationPolicy,
                  grant: InstallationGrantV2, server: HostReverseGraphClaimServer,
                  claim_writer: object, context: object, candidates: object,
-                 clock_policy: object, adapter_ref: str) -> None:
+                 clock_policy: object, adapter_ref: str, local_module_admission=None) -> None:
+        from ..runtime.local_module_admission_v1 import LocalModuleAdmissionV1
+        if local_module_admission is not None and type(local_module_admission) is not LocalModuleAdmissionV1:
+            raise TypeError("dispatch requires the frozen native module admission")
+        self._local_module_admission = local_module_admission or LocalModuleAdmissionV1()
         if (type(fence_port) is not V2FencePort
                 or type(policy) is not AdminInstallationPolicy
                 or type(grant) is not InstallationGrantV2
@@ -129,6 +133,7 @@ class InstalledPrivateReplyContinuationV1:
         return reading
 
     async def dispatch(self, original: OriginalPrivateReplyDispatchV1) -> str:
+        self._local_module_admission.require_v1(('d08', 'd09', 'd11'), "dispatch:InstalledPrivateReplyContinuationV1")
         from .astrbot_dispatch import (
             AstrBotV2TextSender, GraphTextPayloadResolver, ResolvedTextPayload,
         )
@@ -173,51 +178,55 @@ class InstalledPrivateReplyContinuationV1:
         identity = hashlib.sha256(
             (original.operation_id + "\0" + original.effect_id).encode("utf-8")
         ).hexdigest()
-        prepared, _ = await asyncio.to_thread(
-            self._port.execution_prepare,
-            namespace=namespace, authority_namespace=authority_namespace,
-            permit=permit, mutation_id="dispatch:" + identity,
-            footprint=footprint)
-        claimed, _ = await asyncio.to_thread(
-            self._port.execution_claim_v2,
-            namespace=namespace, authority_namespace=authority_namespace,
-            prepared_receipt=prepared, binding=binding)
-        handoff_id = "handoff:" + identity
-        # The paired clock is read on GraphWorker before the reverse callback
-        # window. Authority waits for that callback, so an Authority RPC from
-        # inside the callback would deadlock the two sides.
-        claim_writer = await self._worker.call(
-            lambda graph: self._claim_writer.prepare_for_handoff(
-                graph, claimed, handoff_id))
-        if not callable(claim_writer):
-            raise PrivateReplyDispatchHold("prepared final graph claim unavailable")
-        handoff = await asyncio.to_thread(
-            InstalledCurrentDispatchHandoffPort,
-            fence_port=self._port, policy=self._policy, grant=self._grant,
-            claimed_receipt=claimed)
-        sender = AstrBotV2TextSender(
-            context=self._context, candidates=self._candidates,
-            resolver=_FrozenGraphTextResolver(request, payload),
-            authority=handoff, clock_policy=self._clock_policy,
-            record_observation=handoff.record_observation)
-
-        async def begin(receipt, handoff_id):
-            return await asyncio.to_thread(
-                self._port.execution_begin_handoff_v2,
+        from ..runtime.dispatch_current_inventory_v3 import prepare_dispatch_inventory_on_worker_v3
+        async with prepare_dispatch_inventory_on_worker_v3(self._worker,self._authority,self._lease,
+                binding=binding,admission=original.admission,request=request,permit=permit,
+                now_utc=now_utc,dispatch_family="private_reply") as prepared_inventory:
+            prepared, _ = await asyncio.to_thread(
+                self._port.execution_prepare,
                 namespace=namespace, authority_namespace=authority_namespace,
-                claimed_receipt=receipt, handoff_id=handoff_id)
+                permit=permit, mutation_id="dispatch:" + identity,
+                footprint=footprint)
+            claimed, _ = await asyncio.to_thread(
+                self._port.execution_claim_v2,
+                namespace=namespace, authority_namespace=authority_namespace,
+                prepared_receipt=prepared, binding=binding)
+            handoff_id = "handoff:" + identity
+            # The paired clock is read on GraphWorker before the reverse callback
+            # window. Authority waits for that callback, so an Authority RPC from
+            # inside the callback would deadlock the two sides.
+            claim_writer = await self._worker.call(
+                lambda graph: self._claim_writer.prepare_for_handoff(
+                    graph, claimed, handoff_id, prepared_inventory=prepared_inventory))
+            if not callable(claim_writer):
+                raise PrivateReplyDispatchHold("prepared final graph claim unavailable")
+            handoff = await asyncio.to_thread(
+                InstalledCurrentDispatchHandoffPort,
+                fence_port=self._port, policy=self._policy, grant=self._grant,
+                claimed_receipt=claimed)
+            sender = AstrBotV2TextSender(
+                context=self._context, candidates=self._candidates,
+                resolver=_FrozenGraphTextResolver(request, payload),
+                authority=handoff, clock_policy=self._clock_policy,
+                record_observation=handoff.record_observation, local_module_admission=self._local_module_admission)
 
-        async with begin_handoff_with_reverse_claim(
-            worker=self._worker, server=self._server, claimed=claimed,
-            handoff_id=handoff_id,
-            claim_writer=claim_writer, begin=begin,
-        ) as decision:
-            if decision.replay:
-                return "replay"
-            observation = await sender.send(
-                decision=decision, binding=binding,
-                claimed_receipt=claimed, request=request)
-        return observation.outcome
+            async def begin(receipt, handoff_id):
+                return await asyncio.to_thread(
+                    self._port.execution_begin_handoff_v2,
+                    namespace=namespace, authority_namespace=authority_namespace,
+                    claimed_receipt=receipt, handoff_id=handoff_id)
+
+            async with begin_handoff_with_reverse_claim(
+                worker=self._worker, server=self._server, claimed=claimed,
+                handoff_id=handoff_id,
+                claim_writer=claim_writer, begin=begin,
+            ) as decision:
+                if decision.replay:
+                    return "replay"
+                observation = await sender.send(
+                    decision=decision, binding=binding,
+                    claimed_receipt=claimed, request=request)
+            return observation.outcome
 
 
 def _is_private_route(account_ref: str, destination_ref: str) -> bool:

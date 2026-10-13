@@ -12,7 +12,8 @@ import os
 from pathlib import Path
 
 from ..authority_service.contract import AuthorityUnavailable
-from ..authority_service.d12_package_files_v2 import InstalledPackageSelectionFilesV2, PackageSelectionV2
+from ..authority_service.d12_package_files_v2 import (InstalledPackageSelectionFilesV2, PackageSelectionV2,
+    decode_package_selection_v2, _require_registered_package_protection_v2)
 from ..authority_service.linux_installation_security_v1 import read_installed_json_v1, opened_installed_file_v1
 
 BINDING_NAME='package-cohort-control.json'
@@ -66,8 +67,24 @@ def selected_profile_payload_v2(profile_dir,system):
                 raise AuthorityUnavailable('selected profile bytes changed before loading')
         os.lseek(fd,0,os.SEEK_SET)
         yield SelectedProfileReadV2(fd,selection,binding['control_directory'],binding['profile_id'])
-        after,_,_=files.read_selected_host_cohort_v2()
-        if after!=selection:
+        # The entry read already qualified this exact package and policy.
+        # Exit still rereads every package byte and object permission; identical
+        # bytes need no second domain registry/policy semantic reconstruction.
+        after = decode_package_selection_v2(read_installed_json_v1(files.control_directory / 'selection.json'))
+        installation, current_cohort = files.read_registered_cohort_v2(after.cohort_ref)
+        if after != selection or installation != selection.installation_id or current_cohort != cohort:
+            raise AuthorityUnavailable('selected cohort changed during credential/profile loading')
+        with opened_installed_file_v1(profile.path) as current_fd:
+            with os.fdopen(os.dup(current_fd), 'rb') as stream:
+                if hashlib.file_digest(stream, 'sha256').hexdigest() != profile.sha256:
+                    raise AuthorityUnavailable('selected profile changed during credential/profile loading')
+        _require_registered_package_protection_v2(cohort.package)
+        from .installed_package import verify_installed_package
+        verified = verify_installed_package(cohort.package.package_root, cohort.package.manifest_sha256)
+        if not verified.verified or verified.package_version != cohort.package.package_version:
+            raise AuthorityUnavailable('selected package bytes changed during credential/profile loading')
+        final = decode_package_selection_v2(read_installed_json_v1(files.control_directory / 'selection.json'))
+        if final != selection:
             raise AuthorityUnavailable('selected cohort changed during credential/profile loading')
 
 

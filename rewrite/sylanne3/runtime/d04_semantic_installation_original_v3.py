@@ -61,14 +61,23 @@ def _read_signed(db, issuer, table, kind, namespace, *, operation_id=None):
         raise ValueError("D04 signed installation original requires a pinned transaction")
     suffix = " AND operation_id=?" if operation_id is not None else " ORDER BY revision DESC LIMIT 1"
     args = (*namespace.as_tuple, operation_id) if operation_id is not None else namespace.as_tuple
-    row = db.execute(f"SELECT revision,operation_id,original_json,original_digest,signature FROM {table} "
-        "WHERE bot=? AND persona=?" + suffix, args).fetchone()
+    from .domain_background_read_v3 import (_active_v3,background_point_v3,background_json_loads_v3,
+        background_verify_signature_v3,background_json_matches_v3,background_json_digest_v3)
+    from .d11_role_clock_installation_v1 import TABLE as ROLE_CLOCK_TABLE
+    if _active_v3(db)is not None and table in(TABLE,ROLE_CLOCK_TABLE):
+        selected=db.execute(f"SELECT revision FROM {table} WHERE bot=? AND persona=?"+suffix,args).fetchone()
+        row=None if selected is None else background_point_v3(db,table=table,
+            columns=('revision','operation_id','original_json','original_digest','signature'),
+            key_columns=('bot','persona','revision'),key=(*namespace.as_tuple,selected[0]),legacy_reader=lambda:None)
+    else:
+        row = db.execute(f"SELECT revision,operation_id,original_json,original_digest,signature FROM {table} "
+            "WHERE bot=? AND persona=?" + suffix, args).fetchone()
     if row is None:
         return None
     revision, operation, encoded, digest, signature = row
-    issuer._signer.verify(kind, encoded, signature)
-    original = json.loads(encoded)
-    if (canonical_serialize(original) != encoded or canonical_digest(original) != digest
+    background_verify_signature_v3(issuer._signer,kind,encoded,signature)
+    original = background_json_loads_v3(encoded)
+    if (not background_json_matches_v3(encoded,original) or background_json_digest_v3(encoded,original) != digest
             or original["namespace"] != asdict(namespace) or original["revision"] != revision
             or original["operation_id"] != operation):
         raise ValueError("D04 signed installation original identity or content differs")
@@ -83,73 +92,91 @@ def _insert_signed(db, issuer, table, kind, namespace, body):
 
 
 def _current_inputs(reader, db, namespace):
-    """Read complete current members and replay each actual committed lineage."""
+    """The unique current-component algorithm; Background consumes its staged result."""
+    from .domain_background_read_v3 import read_bound_background_role_clock_inputs_v3
+    handled,value=read_bound_background_role_clock_inputs_v3(reader,db,namespace)
+    if handled:return value
     from .d04_series_initial_original_v1 import d04_series_original_read_scope_v1
     with d04_series_original_read_scope_v1(db):
-        scope, guard, profile = reader._current(db, namespace)
-        graph = reader.graph
-        role, _bindings, epoch, _versions = graph._scene_binding_state_locked(namespace, guard)
-        if role.namespace != namespace or role.graph_epoch != epoch.revision:
-            raise ValueError("D04 current role epoch differs")
-        role_rows = []
-        for version in sorted(role.read_versions, key=lambda v: v.key.token):
-            row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (version.key.token,)).fetchone()
-            if row is None or row[0] != version.revision or row[2] != 1:
-                raise ValueError("D04 current role graph original changed")
-            role_rows.append((version.key.token, row[0], json.loads(row[1]), True))
+        steps=_current_inputs_steps_v3(reader,db,namespace)
+        while True:
+            try:next(steps)
+            except StopIteration as completed:return completed.value
+
+
+def _current_inputs_steps_v3(reader,db,namespace):
+    from .domain_background_read_v3 import background_role_clock_call_v3,background_graph_head_v3,background_inventory_v3,background_json_loads_v3
+    scope,guard,profile=yield from background_role_clock_call_v3(lambda:reader._current(db,namespace))
+    graph=reader.graph
+    role,_bindings,epoch,_versions=yield from background_role_clock_call_v3(lambda:graph._scene_binding_state_locked(namespace,guard))
+    if role.namespace != namespace or role.graph_epoch != epoch.revision:
+        raise ValueError("D04 current role epoch differs")
+    role_rows = []
+    for version in sorted(role.read_versions, key=lambda v: v.key.token):
+        row = yield from background_role_clock_call_v3(lambda:background_graph_head_v3(db,namespace,version.key))
+        if row is None or row[0] != version.revision or row[2] != 1:
+            raise ValueError("D04 current role graph original changed")
+        role_rows.append((version.key.token, row[0], background_json_loads_v3(row[1]), True))
+        yield None
+    from .domain_background_read_v3 import _active_v3
+    if _active_v3(db)is not None:
+        atoms=[]
+        for type_id in ('d04.numeric_checkpoint.v1','d04.numeric_checkpoint.v2'):
+            atoms.extend((yield from background_role_clock_call_v3(lambda:background_inventory_v3(db,namespace,type_id,valid_only=False))))
+        rows=tuple((atom.key.token,atom.revision,atom.value,atom.valid) for atom in sorted(atoms,key=lambda item:item.key.token))
+    else:
         rows = db.execute("SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
-            "AND type_name IN ('d04.numeric_checkpoint.v1','d04.numeric_checkpoint.v2') ORDER BY token",
-            namespace.as_tuple).fetchall()
-        if not rows or len(rows) > MAX_ROWS:
-            raise ValueError("D04 complete current numeric component is absent or too large")
-        members, roots, cursors, shares = [], {}, [], []
-        templates = dict(profile.raw["template_shares"])
-        used_templates = set()
-        for ref, revision, encoded, valid in rows:
-            key = AtomKey.from_token(ref)
-            if (not valid or revision < 1 or key.type_name != "d04.numeric_checkpoint.v2"
-                    or key.owner.kind != "persona" or (key.owner.bot, key.owner.persona) != namespace.as_tuple):
-                raise ValueError("D04 current component contains invalid or unsupported members")
-            checkpoint = decode_authored_numeric_checkpoint_v2(json.loads(encoded))
-            if checkpoint.namespace != namespace.as_tuple or key.name != checkpoint.block.block_id:
-                raise ValueError("D04 current checkpoint namespace or block identity differs")
-            state_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (checkpoint.graph_state.ref,)).fetchone()
-            if state_row is None or state_row[0] != revision or state_row[2] != 1:
-                raise ValueError("D04 current component state is incomplete")
-            decode = decode_authored_feeling_state_v1 if checkpoint.block.kind == "feeling" else decode_authored_mood_state_v1
-            state = decode(json.loads(state_row[1]))
-            validate_authored_joint_predecessor_v3(checkpoint, state, revision)
-            root = roots.get(state.root_operation_id)
-            if root is None:
-                root = read_d04_root_original_v3(db, namespace=namespace, operation_id=state.root_operation_id)
-                frozen = read_d11_root_freeze_v3(db, graph._GraphCoordinator__d11_issuer,
-                    namespace=namespace, operation_id=root.operation_id)
-                if frozen is None or frozen.original_digest != root.signed_freeze_digest:
-                    raise ValueError("D04 root lacks its independently signed D11 original")
-                candidate = decode_authored_root_candidate_v3(json.loads(root.candidate_json))
-                if (candidate.preset.preset_id != profile.raw["root_preset_id"]
-                        or candidate.preset.preset_version != profile.raw["root_preset_version"]
-                        or candidate.preset.digest != profile.raw["root_preset_digest"]):
-                    raise ValueError("D04 root preset is outside installed semantic profile")
-                roots[root.operation_id] = root
-            root_digest, _receipt_digest = _authored_predecessor_original(db, namespace, ref, revision, checkpoint, state)
-            if root_digest != root.original_digest:
-                raise ValueError("D04 current component root provenance differs")
-            template = checkpoint.block.template_id
-            if template not in templates or template in used_templates:
-                raise ValueError("D04 profile must explicitly cover each unique actual block template")
-            used_templates.add(template)
-            members.append((ref, checkpoint.block.block_id, checkpoint.block.facet_id, checkpoint.block.kind,
-                template, checkpoint.root_candidate_digest, root.operation_id, root.original_digest))
-            shares.append((ref, templates[template]))
-            cursors.append(checkpoint.cursor)
-        if len(roots) != 1 or used_templates != set(templates) or len(set(cursors)) != 1:
-            raise ValueError("D04 semantic profile requires exact complete synchronized root component coverage")
-        return {"guard": guard, "profile": profile, "role": role,
-            "role_rows": role_rows, "member_bindings": members, "block_shares": shares,
-            "cursor": cursors[0], "role_ref": role.head_id,
-            "persona_version": str(role.plan.version), "scope": scope}
+            "AND type_name IN ('d04.numeric_checkpoint.v1','d04.numeric_checkpoint.v2') ORDER BY token",namespace.as_tuple).fetchall()
+    if not rows or len(rows) > MAX_ROWS:
+        raise ValueError("D04 complete current numeric component is absent or too large")
+    members, roots, cursors, shares = [], {}, [], []
+    templates = dict(profile.raw["template_shares"])
+    used_templates = set()
+    for ref, revision, encoded, valid in rows:
+        key = AtomKey.from_token(ref)
+        if (not valid or revision < 1 or key.type_name != "d04.numeric_checkpoint.v2"
+                or key.owner.kind != "persona" or (key.owner.bot, key.owner.persona) != namespace.as_tuple):
+            raise ValueError("D04 current component contains invalid or unsupported members")
+        checkpoint = decode_authored_numeric_checkpoint_v2(encoded if type(encoded)is dict else json.loads(encoded))
+        if checkpoint.namespace != namespace.as_tuple or key.name != checkpoint.block.block_id:
+            raise ValueError("D04 current checkpoint namespace or block identity differs")
+        state_row=yield from background_role_clock_call_v3(lambda:background_graph_head_v3(db,namespace,AtomKey.from_token(checkpoint.graph_state.ref)))
+        if state_row is None or state_row[0] != revision or state_row[2] != 1:
+            raise ValueError("D04 current component state is incomplete")
+        decode = decode_authored_feeling_state_v1 if checkpoint.block.kind == "feeling" else decode_authored_mood_state_v1
+        state = decode(background_json_loads_v3(state_row[1]))
+        validate_authored_joint_predecessor_v3(checkpoint, state, revision)
+        root = roots.get(state.root_operation_id)
+        if root is None:
+            root = yield from background_role_clock_call_v3(lambda:read_d04_root_original_v3(db,namespace=namespace,operation_id=state.root_operation_id))
+            frozen=yield from background_role_clock_call_v3(lambda:read_d11_root_freeze_v3(db,graph._GraphCoordinator__d11_issuer,namespace=namespace,operation_id=root.operation_id))
+            if frozen is None or frozen.original_digest != root.signed_freeze_digest:
+                raise ValueError("D04 root lacks its independently signed D11 original")
+            candidate = decode_authored_root_candidate_v3(json.loads(root.candidate_json))
+            if (candidate.preset.preset_id != profile.raw["root_preset_id"]
+                    or candidate.preset.preset_version != profile.raw["root_preset_version"]
+                    or candidate.preset.digest != profile.raw["root_preset_digest"]):
+                raise ValueError("D04 root preset is outside installed semantic profile")
+            roots[root.operation_id] = root
+        from .joint_numeric_component import _authored_predecessor_steps_v3
+        root_digest,_receipt_digest=yield from _authored_predecessor_steps_v3(db,namespace,ref,revision,checkpoint,state)
+        if root_digest != root.original_digest:
+            raise ValueError("D04 current component root provenance differs")
+        template = checkpoint.block.template_id
+        if template not in templates or template in used_templates:
+            raise ValueError("D04 profile must explicitly cover each unique actual block template")
+        used_templates.add(template)
+        members.append((ref, checkpoint.block.block_id, checkpoint.block.facet_id, checkpoint.block.kind,
+            template, checkpoint.root_candidate_digest, root.operation_id, root.original_digest))
+        shares.append((ref, templates[template]))
+        cursors.append(checkpoint.cursor)
+        yield None
+    if len(roots) != 1 or used_templates != set(templates) or len(set(cursors)) != 1:
+        raise ValueError("D04 semantic profile requires exact complete synchronized root component coverage")
+    return {"guard": guard, "profile": profile, "role": role,
+        "role_rows": role_rows, "member_bindings": members, "block_shares": shares,
+        "cursor": cursors[0], "role_ref": role.head_id,
+        "persona_version": str(role.plan.version), "scope": scope}
 
 
 def _installation_ref(reader, namespace):

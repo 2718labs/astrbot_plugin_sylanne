@@ -16,8 +16,22 @@ def require_linux_administrator_v1():
         raise AuthorityUnavailable("Linux installation administration requires effective UID 0")
 
 
-def _check(fd, *, directory, private=False, allowed_gid=None):
+def _probe_acl_size_v1(fd,key):
+    # ACL bytes are never consumed: existence alone is a rejection predicate.
+    import ctypes
+    libc=ctypes.CDLL(None,use_errno=True)
+    probe=libc.fgetxattr;probe.argtypes=(ctypes.c_int,ctypes.c_char_p,ctypes.c_void_p,ctypes.c_size_t)
+    probe.restype=ctypes.c_ssize_t
+    size=probe(fd,key.encode('ascii'),None,0)
+    if size<0:
+        error=ctypes.get_errno();raise OSError(error,os.strerror(error))
+    return size
+
+
+def _check(fd, *, directory, private=False, allowed_gid=None, meter=None):
+    if meter is not None:meter.require_available(4096)
     info = os.fstat(fd)
+    if meter is not None:meter.charge_read(len(json.dumps(tuple(info),separators=(",",":")).encode("ascii")))
     if (not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
             or info.st_uid != 0 or info.st_mode & 0o022):
         raise AuthorityUnavailable("installed Linux object is not administrator-owned and immutable to Host")
@@ -26,7 +40,10 @@ def _check(fd, *, directory, private=False, allowed_gid=None):
         raise AuthorityUnavailable("installed Linux private object permissions differ")
     for key in (("system.posix_acl_access", "system.posix_acl_default") if directory else ("system.posix_acl_access",)):
         try:
-            os.getxattr(fd, key)
+            if meter is None:os.getxattr(fd,key)
+            else:
+                meter.require_available(8)
+                _probe_acl_size_v1(fd,key);meter.charge_read(8)
         except OSError as exc:
             if exc.errno == errno.ENODATA:
                 continue
@@ -35,7 +52,7 @@ def _check(fd, *, directory, private=False, allowed_gid=None):
 
 
 @contextmanager
-def opened_installed_file_v1(path, *, private=False, allowed_gid=None):
+def opened_installed_file_v1(path, *, private=False, allowed_gid=None, meter=None):
     path = Path(path)
     if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
         raise AuthorityUnavailable("absolute installed Linux path required")
@@ -43,14 +60,14 @@ def opened_installed_file_v1(path, *, private=False, allowed_gid=None):
     try:
         fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         descriptors.append(fd)
-        _check(fd, directory=True)
+        _check(fd, directory=True, meter=meter)
         for part in path.parts[1:-1]:
             fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
             descriptors.append(fd)
-            _check(fd, directory=True)
+            _check(fd, directory=True, meter=meter)
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
         descriptors.append(fd)
-        _check(fd, directory=False, private=private, allowed_gid=allowed_gid)
+        _check(fd, directory=False, private=private, allowed_gid=allowed_gid, meter=meter)
         yield fd
     finally:
         for fd in reversed(descriptors):

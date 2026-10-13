@@ -16,7 +16,7 @@ from ..authority_service.v2_contract import (
 from ..authority_service.v2_execution_bridge import (
     CurrentEffectReadV2, HandoffStartV2, handoff_start_digest_v2,
 )
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import InstallationGrantV2, NamespaceId

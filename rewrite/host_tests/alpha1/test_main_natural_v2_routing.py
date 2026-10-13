@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pytest
 from types import SimpleNamespace
 
 from rewrite.host_tests.alpha1.test_runtime_bootstrap import load_plugin_module
@@ -15,6 +16,7 @@ def _plugin(module):
     plugin._final_handoff_server = object()
     plugin._final_handoff_listener = object()
     plugin._scene_candidates = object()
+    plugin._artifact_task_waiters_v1 = {}
     return plugin
 
 
@@ -465,3 +467,81 @@ def test_new_durable_natural_original_requests_scan_when_queue_is_full(
     assert plugin._natural_stage_scan_pending is True
     assert plugin._natural_stage_scan_after is None
     assert "new-original" not in plugin._reply_attempted_jobs
+
+
+@pytest.mark.parametrize("protected_state", ("not_started", "queued", "unresolved"))
+def test_registered_task_wait_has_live_consumer_without_another_message(protected_state):
+    """Scheduler regression only: controlled read metadata, no authority/provider.
+
+    Signed original/CAS and full SDK ingress are separate installed regressions.
+    This checks the real Main waiter against the actual task/event ordering.
+    """
+    module = load_plugin_module()
+    plugin = _plugin(module)
+    installation = SimpleNamespace(admin_bundle=object())
+    calls = []
+
+    class Graph:
+        state = protected_state
+        def discover_registered_artifact_task_waits_v1(self, *_args):
+            return ("c02:first",)
+        def read_protected_artifact_task_reply_state_v1(self, *_args, **kwargs):
+            assert kwargs == {"c02_operation_id": "c02:first"}
+            return {"state": self.state, "job_id": "protected-first"}
+        def discover_waiting_artifact_task_messages_v1(self, *_args, **kwargs):
+            assert kwargs == {"initial_c02_operation_id": "c02:first"}
+            return ({"c02_operation_id": "c02:second-original", "source_ref": "second-source-original"},)
+
+    graph = Graph()
+    class Worker:
+        async def call(self, operation):
+            return operation(graph)
+    runtime = SimpleNamespace(_worker=Worker(), _v2_bootstrap=object())
+    plugin._runtime, plugin._v2_installation = runtime, installation
+    plugin._encoding_stopping = False
+    plugin._reply_tasks, plugin._natural_backlog = {}, {}
+
+    async def prepare(actual_runtime, actual_installation, c02_id, *, source_ref, new_ingress):
+        assert actual_runtime is runtime and actual_installation is installation
+        assert new_ingress is True
+        calls.append((c02_id, source_ref))
+    plugin._prepare_new_post_c02_natural_v2 = prepare
+
+    async def case():
+        parent_release, parent_entered = asyncio.Event(), asyncio.Event()
+        async def first_message():
+            parent_entered.set()
+            await parent_release.wait()
+        parent = asyncio.create_task(first_message())
+        await parent_entered.wait()
+        natural_release = asyncio.Event()
+        natural = None
+        if protected_state == "queued":
+            async def protected_worker():
+                await natural_release.wait()
+                graph.state = "settled"
+            natural = asyncio.create_task(protected_worker())
+            plugin._reply_tasks[natural] = "natural:protected-first"
+        await plugin._arm_registered_artifact_task_wait_v1(runtime, installation,
+            "c02:first", parent_task=parent)
+        waiter = plugin._artifact_task_waiters_v1["c02:first"][0]
+        # A loop scheduling boundary, without a wall-clock sleep, lets the
+        # consumer encounter the still-active first-message owner.
+        boundary = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(boundary.set_result, None)
+        await boundary
+        assert not calls and not waiter.done()
+        parent_release.set()
+        await parent
+        if natural is not None:
+            boundary = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(boundary.set_result, None)
+            await boundary
+            assert not calls and not waiter.done()
+            natural_release.set()
+            await natural
+        await asyncio.wait_for(waiter, timeout=2)
+        assert not plugin._artifact_task_waiters_v1
+        assert calls == ([] if protected_state == "unresolved" else
+            [("c02:second-original", "second-source-original")])
+    asyncio.run(case())

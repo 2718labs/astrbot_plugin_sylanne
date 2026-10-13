@@ -83,13 +83,17 @@ def record_offline_accounting_prepared_after_cas_v1(db, *, issuer, prepared):
 
 
 def read_offline_accounting_prepared_v1(db, *, binding, issuer, resource_issuer):
+    from .domain_background_read_v3 import (background_point_v3, background_json_loads_v3,
+        background_plain_original_digest_v3, background_json_matches_v3)
     ref = offline_accounting_original_ref_v1(binding)
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='accounting_prepared' AND original_ref=?", (*binding.namespace.as_tuple, ref)).fetchone()
+    row=background_point_v3(db,table=TABLE,columns=('producing_operation_id','payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'),key=(*binding.namespace.as_tuple,'accounting_prepared',ref),legacy_reader=lambda:db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='accounting_prepared' AND original_ref=?", (*binding.namespace.as_tuple, ref)).fetchone())
     if row is None:
         return None
-    value = _decode_json(row[1], D11OfflineAccountingPreparedV1)
-    digest = canonical_digest(plain_v1(value))
+    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+    value = decode_typed_production_value_v1(background_json_loads_v3(row[1]),D11OfflineAccountingPreparedV1)
+    digest = background_plain_original_digest_v3(row[1],value)
     issuer._signer.verify(SIGN_KIND, canonical_serialize((binding.namespace, "accounting_prepared", ref, digest)), row[3])
     if value.binding != binding or digest != row[2] or value.prepare_operation_id != row[0]:
         raise ValueError("actual signed offline accounting original identity differs")
@@ -101,10 +105,14 @@ def read_offline_accounting_prepared_v1(db, *, binding, issuer, resource_issuer)
     signed, signature = issuer.signed_budget_grant_at_version(db, grant.lease_id, grant.version)
     if signed != grant or signature != value.signed_grant_signature:
         raise ValueError("offline accounting actual signed grant differs")
-    reserve = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-        (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone()
-    reservation = db.execute("SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
-        (binding.parent_budget_lease_ref, binding.reservation_operation_id)).fetchone()
-    if reserve != (value.reserve_receipt_json,) or reservation != (binding.reservation_digest, canonical_serialize({"thread_cpu_ms": binding.cpu_ceiling_ms})):
+    reserve=background_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),
+        key_columns=('bot_id','persona_id','operation_id','phase'),key=(*binding.namespace.as_tuple,binding.reservation_operation_id,'reserve'),legacy_reader=lambda:db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+        (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone())
+    reservation=background_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json'),
+        key_columns=('lease_id','operation_id'),key=(binding.parent_budget_lease_ref,binding.reservation_operation_id),legacy_reader=lambda:db.execute("SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+        (binding.parent_budget_lease_ref, binding.reservation_operation_id)).fetchone())
+    if (reserve is None or not background_json_matches_v3(reserve[0],json.loads(value.reserve_receipt_json))
+            or reservation is None or reservation[0]!=binding.reservation_digest
+            or not background_json_matches_v3(reservation[1],{"thread_cpu_ms":binding.cpu_ceiling_ms})):
         raise ValueError("offline accounting actual original reserve differs")
     return value

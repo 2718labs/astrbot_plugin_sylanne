@@ -23,8 +23,15 @@ from ..graph_types import GraphVersion
 from ..model_broker.natural_reply_history_v3 import FrozenNaturalReplyRequestV3, TEMPLATE_VERSION as V3_TEMPLATE_VERSION
 from .natural_original_v3 import NaturalReplyGenerationOriginalSealV3
 from .natural_original_v4 import NaturalReplyGenerationOriginalSealV4
-from ..model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4, TEMPLATE_VERSION as V4_TEMPLATE_VERSION
-from .budget import get_budget_lease, reserve_budget
+from .natural_original_v6 import NaturalReplyGenerationOriginalSealV6
+from ..model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6,TEMPLATE_VERSION as V6_TEMPLATE_VERSION
+from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,TEMPLATE_VERSION as V7_TEMPLATE_VERSION
+from .natural_original_v7 import NaturalReplyGenerationOriginalSealV7
+from ..model_broker.natural_reply_history_v4 import (
+    FrozenNaturalReplyRequestV4, TEMPLATE_VERSION as V4_TEMPLATE_VERSION,
+    TEMPLATE_VERSION_V5, FROZEN_SCHEMA_V5,
+)
+from .budget import reserve_budget
 from .d11_types import runtime_job_key
 from .issuers import D02ResourceIssuer, D11BudgetJobIssuer, ResourceQuote
 from .jobs import PersistentJob, create_job
@@ -120,17 +127,38 @@ def read_original_scoped_query_proof_v2(db, saved):
     if (not db.in_transaction or type(saved) is not SavedNaturalPreparationV2
             or saved.stage != "generation"):
         raise NaturalGenerationIssueHold("natural scope read requires graph tx")
-    row = db.execute(
-        "SELECT original_seal_digest,proof_json FROM "
-        "graph_natural_generation_scopes_v2 WHERE bot=? AND persona=? "
-        "AND parent_original_id=?",
-        saved.seal.namespace.as_tuple + (saved.parent_original_id,),
-    ).fetchone()
+    from ..authority_service.current_authority_graph_read_v3 import (
+        read_bound_authority_graph_attachment_v3,
+        require_authority_json_column_v3)
+    namespace = saved.seal.namespace
+    key = (*namespace.as_tuple, saved.parent_original_id)
+    columns = ("original_seal_digest", "proof_json")
+    key_columns = ("bot", "persona", "parent_original_id")
+    handled, row = read_bound_authority_graph_attachment_v3(
+        db, table="graph_natural_generation_scopes_v2", columns=columns,
+        key_columns=key_columns, key=key)
+    if not handled:
+        row = db.execute(
+            "SELECT original_seal_digest,proof_json FROM "
+            "graph_natural_generation_scopes_v2 WHERE bot=? AND persona=? "
+            "AND parent_original_id=?", key,
+        ).fetchone()
     if row is None or row[0] != canonical_digest(asdict(saved.seal)):
         raise NaturalGenerationIssueHold("original natural scope seal differs")
-    proof = natural_scoped_query_proof_from_wire_v2(json.loads(row[1]))
-    if canonical_serialize(asdict(proof)) != row[1]:
-        raise NaturalGenerationIssueHold("original natural scope bytes differ")
+    if handled:
+        original = require_authority_json_column_v3(
+            db, table="graph_natural_generation_scopes_v2", columns=columns,
+            key_columns=key_columns, key=key, column="proof_json")
+        if original is None:
+            raise NaturalGenerationIssueHold("original natural scope EOF is absent")
+        proof = natural_scoped_query_proof_from_wire_v2(
+            original.require_v3(original.owner))
+        if not original.matches_v3(asdict(proof)):
+            raise NaturalGenerationIssueHold("original natural scope bytes differ")
+    else:
+        proof = natural_scoped_query_proof_from_wire_v2(json.loads(row[1]))
+        if canonical_serialize(asdict(proof)) != row[1]:
+            raise NaturalGenerationIssueHold("original natural scope bytes differ")
     assert_original_scoped_d06_projection_v2(proof, saved.frozen)
     return proof
 
@@ -191,18 +219,25 @@ def issue_original_natural_generation_in_transaction_v2(
     workflow = getattr(workflows, "natural_generation", None)
     if workflow is None:
         raise NaturalGenerationIssueHold("installed natural generation unavailable")
-    grant = d11_issuer.current_budget_grant(db, policy.root_lease.lease_id)
-    lease = get_budget_lease(db, grant.lease_id)
+    from .natural_reply_budget_v3 import resolve_natural_reply_budget_for_new_admission_v3
+    lease, grant = resolve_natural_reply_budget_for_new_admission_v3(db, namespace=namespace,
+        c02_operation_id=plan.c02_operation_id, source_ref=plan.source_ref.ref,
+        issuer=d11_issuer, installed_bundle=installed_bundle, now_utc=now_utc)
     ceiling = dict(workflow.quote_ceiling)
     ids = natural_job_ids_v2(namespace, plan.c02_operation_id, "generation")
-    if (policy.namespace != namespace or grant != policy.root_grant
+    if (policy.namespace != namespace
             or grant.lease_id != plan.parent_budget_lease_id
             or grant.version != plan.budget_grant_version
             or canonical_digest(grant) != plan.budget_grant_digest
             or tuple(sorted(ceiling.items())) != plan.generation_ceiling
             or workflow.work_kind != "natural_generation"
             or workflow.purpose != "proposal"
-            or workflow.template_version != (V4_TEMPLATE_VERSION if type(frozen) is FrozenNaturalReplyRequestV4 else V3_TEMPLATE_VERSION if type(frozen) is FrozenNaturalReplyRequestV3 else TEMPLATE_VERSION)
+            or workflow.template_version != (
+                V7_TEMPLATE_VERSION if type(frozen) is FrozenNaturalReplyRequestV7 else
+                V6_TEMPLATE_VERSION if type(frozen) is FrozenNaturalReplyRequestV6 else
+                TEMPLATE_VERSION_V5 if type(frozen) is FrozenNaturalReplyRequestV4 and frozen.schema == FROZEN_SCHEMA_V5 else
+                V4_TEMPLATE_VERSION if type(frozen) is FrozenNaturalReplyRequestV4 else
+                V3_TEMPLATE_VERSION if type(frozen) is FrozenNaturalReplyRequestV3 else TEMPLATE_VERSION)
             or frozen.input.plan.namespace != namespace
             or frozen.input.question.ref != plan.source_ref
             or frozen.input.plan.plan_ref.ref != plan_ref(namespace, plan)
@@ -259,10 +294,12 @@ def issue_original_natural_generation_in_transaction_v2(
     })
     history_status = ({"history_selection": "raw", "token_evidence": "token_evidence_unverified",
                        "activation": "activation_not_attempted"}
-                      if type(frozen) in (FrozenNaturalReplyRequestV3, FrozenNaturalReplyRequestV4) else {})
+                      if type(frozen) in (FrozenNaturalReplyRequestV3, FrozenNaturalReplyRequestV4,FrozenNaturalReplyRequestV6,FrozenNaturalReplyRequestV7) else {})
     if history_decision is not None:
         from .installed_d13_natural_frame_v4 import NaturalHistoryDecisionV4
-        if (type(history_decision) is not NaturalHistoryDecisionV4
+        from .installed_d13_natural_frame_v6 import NaturalHistoryDecisionV6
+        from .installed_d13_natural_frame_v7 import NaturalHistoryDecisionV7
+        if (type(history_decision) is not (NaturalHistoryDecisionV7 if type(frozen) is FrozenNaturalReplyRequestV7 else NaturalHistoryDecisionV6 if type(frozen) is FrozenNaturalReplyRequestV6 else NaturalHistoryDecisionV4)
                 or history_decision.wire_digest != frozen.model_request_digest
                 or (history_decision.selected == "compressed") != bool(frozen.input.stable_history)):
             raise NaturalGenerationIssueHold("installed D13 decision differs from actual frozen wire")
@@ -287,7 +324,10 @@ def issue_original_natural_generation_in_transaction_v2(
         namespace, read_versions, query_epochs, graph_epoch=graph_epoch,
         access_epoch=access_epoch, deletion_epoch=deletion_epoch,
     )
-    seal_class = (NaturalReplyGenerationOriginalSealV4 if type(frozen) is FrozenNaturalReplyRequestV4 else NaturalReplyGenerationOriginalSealV3 if type(frozen) is FrozenNaturalReplyRequestV3 else NaturalReplyGenerationOriginalSealV2)
+    seal_class = (NaturalReplyGenerationOriginalSealV7 if type(frozen) is FrozenNaturalReplyRequestV7 else NaturalReplyGenerationOriginalSealV6 if type(frozen) is FrozenNaturalReplyRequestV6 else NaturalReplyGenerationOriginalSealV4 if type(frozen) is FrozenNaturalReplyRequestV4 else NaturalReplyGenerationOriginalSealV3 if type(frozen) is FrozenNaturalReplyRequestV3 else NaturalReplyGenerationOriginalSealV2)
+    seal_version = ({"schema": "sylanne.d09.natural_generation_seal.v5",
+                     "template_version": TEMPLATE_VERSION_V5}
+                    if type(frozen) is FrozenNaturalReplyRequestV4 and frozen.schema == FROZEN_SCHEMA_V5 else {})
     seal = seal_class(
         namespace=namespace, c02_operation_id=plan.c02_operation_id,
         source_ref=plan.source_ref.ref, installation_id=policy.installation_id,
@@ -300,13 +340,20 @@ def issue_original_natural_generation_in_transaction_v2(
         original_graph_guard_digest=guard,
         parent_budget_lease_id=grant.lease_id,
         reservation_operation_id=reservation_id,
+        **seal_version,
     )
     d02_issuer.issue_quote(db, quote)
     reserve_budget(db, grant.lease_id, reservation_id, reservation_digest, ceiling)
     if history_decision is not None and history_decision.token_evidence != "token_evidence_unverified":
         from .installed_d13_wire_evidence_v1 import (
             D13ForegroundBudgetBindingV1, validate_reserved_d13_natural_selection_v1)
-        admitted = validate_reserved_d13_natural_selection_v1(history_wire_port,
+        from ..authority_service.d13_wire_evidence_v6 import validate_reserved_d13_natural_selection_v6
+        if type(frozen) is FrozenNaturalReplyRequestV7:
+            from ..authority_service.d13_wire_evidence_v7 import validate_reserved_d13_natural_selection_v7
+            validator=validate_reserved_d13_natural_selection_v7
+        else:
+            validator = validate_reserved_d13_natural_selection_v6 if type(frozen) is FrozenNaturalReplyRequestV6 else validate_reserved_d13_natural_selection_v1
+        admitted = validator(history_wire_port,
             selected=frozen, decision=history_decision,
             binding=D13ForegroundBudgetBindingV1(quote_id, 1, grant.lease_id, reservation_id, reservation_digest),
             read_versions=read_versions, now_utc=now_utc)

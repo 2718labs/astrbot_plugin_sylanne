@@ -203,6 +203,8 @@ class AuthorityV2FenceStore:
 
     @staticmethod
     def _check_schema_version(db: sqlite3.Connection, version: str) -> None:
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        db = c09_actual_root_read_v3(db)
         if version not in ("2", "3", "4", "5"):
             raise AuthorityUnavailable("unknown v2 fence schema version")
         try:
@@ -399,6 +401,8 @@ class AuthorityV2FenceStore:
 
     @staticmethod
     def _require_no_migration(db: sqlite3.Connection) -> None:
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        db = c09_actual_root_read_v3(db)
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='authority_meta'").fetchone() is None:
             return  # Isolated storage tests have no Core; never a service entry.
         row = db.execute("SELECT value FROM authority_meta WHERE key='deletion_v2_migration'").fetchone()
@@ -448,6 +452,8 @@ class AuthorityV2FenceStore:
 
     @staticmethod
     def _row(db, operation_id: str):
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        db = c09_actual_root_read_v3(db)
         return db.execute("SELECT operation_id,namespace,subject,token,fence_epoch,revision,state,permit,finish_request_id,finish_request_digest,pending FROM authority_v2_fences WHERE operation_id=?", (operation_id,)).fetchone()
 
     def reject_unbegun_content_fence_locked(
@@ -705,6 +711,8 @@ class AuthorityV2FenceStore:
 
     @staticmethod
     def mutation_locked(db: sqlite3.Connection, mutation_id: str):
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        db = c09_actual_root_read_v3(db)
         identifier(mutation_id, "mutation_id")
         return db.execute("SELECT operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,receipt,updated_permit,mutation_kind,deletion_evidence,footprint FROM authority_v2_mutations WHERE mutation_id=?", (mutation_id,)).fetchone()
 
@@ -723,8 +731,9 @@ class AuthorityV2FenceStore:
             raise AuthorityUnavailable("installed accepted deletion bridge required")
         namespace = receipt.pending.permit.namespace
         operation_id = receipt.pending.deletion_operation_id
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
         transition = read_current_deletion_continuation_v1_locked(
-            db, namespace=namespace, operation_id=operation_id)
+            c09_actual_root_read_v3(db), namespace=namespace, operation_id=operation_id)
         if transition is None:
             raise AuthorityUnavailable("accepted deletion storage transition is absent")
         authenticated = core.verify_c09_deletion_transition_v1(
@@ -740,7 +749,7 @@ class AuthorityV2FenceStore:
 
     @classmethod
     def require_prior_deletion_transition_locked(cls, db: sqlite3.Connection,
-                                                 pending: DeletionPendingV1, *, core=None) -> None:
+                                                 pending: DeletionPendingV1, *, core=None, selected_proof=None) -> None:
         """Bind a later phase to the one committed original, without a side table."""
         if type(pending) is not DeletionPendingV1:
             raise AuthorityUnavailable("typed deletion transition required")
@@ -749,17 +758,32 @@ class AuthorityV2FenceStore:
         if pending.evidence.deletion_epoch != pending.deletion_epoch:
             raise AuthorityUnavailable("graph barrier deletion epoch differs from request")
         matches = []
-        for row in db.execute(
-                "SELECT operation_id,namespace,subject,request_digest,state,"
-                "conflict_keys_json,pending,receipt,updated_permit,mutation_kind,"
-                "deletion_evidence,footprint FROM authority_v2_mutations "
-                "WHERE namespace=? AND mutation_kind='deletion' AND state='committed'",
-                (pending.permit.namespace,)):
-            kind, prior, receipt, updated = cls._decode_mutation_row(row)
-            if (kind == "deletion"
-                    and prior.deletion_operation_id == pending.deletion_operation_id
-                    and prior.target_phase == pending.source_phase):
-                matches.append((prior, receipt, updated))
+        if selected_proof is None:
+            for row in db.execute(
+                    "SELECT operation_id,namespace,subject,request_digest,state,"
+                    "conflict_keys_json,pending,receipt,updated_permit,mutation_kind,"
+                    "deletion_evidence,footprint FROM authority_v2_mutations "
+                    "WHERE namespace=? AND mutation_kind='deletion' AND state='committed'",
+                    (pending.permit.namespace,)):
+                kind, prior, receipt, updated = cls._decode_mutation_row(row)
+                if (kind == "deletion" and prior.deletion_operation_id == pending.deletion_operation_id
+                        and prior.target_phase == pending.source_phase):
+                    matches.append((prior, receipt, updated))
+        else:
+            from .c09_graph_application_v1 import SelectedC09JournalProofV3
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            if type(selected_proof) is not SelectedC09JournalProofV3 or core is None or db is not core._db or not db.in_transaction:
+                raise AuthorityUnavailable('actual private selected accepted Core transaction required')
+            selected_proof.require_identity(deletion=selected_proof.application.scoped.deletion,core=core)
+            selected_proof.view.require_current(meter=current_c09_sql_meter_v2())
+            row = cls.mutation_locked(db,selected_proof.accepted.pending.mutation_id)
+            stored = None if row is None else cls._decode_mutation_row(row)
+            if (stored is None or stored[0] != 'deletion' or row[4] != 'committed'
+                    or row[1:3] != (pending.permit.namespace,pending.permit.subject)
+                    or stored[2] != selected_proof.accepted or stored[1].target_phase != pending.source_phase
+                    or stored[1].deletion_operation_id != pending.deletion_operation_id):
+                raise AuthorityUnavailable('actual signed selected accepted predecessor differs')
+            matches.append(stored[1:])
         if len(matches) != 1:
             raise AuthorityUnavailable("unique prior deletion phase receipt required")
         prior, receipt, updated = matches[0]
@@ -794,6 +818,27 @@ class AuthorityV2FenceStore:
             context = core.require_current_storage_generation_locked(db,
                 namespace=pending.permit.namespace, action="maintenance")
             prepared = context.prepared_original
+            if selected_proof is not None:
+                from .c09_graph_rebase_issue_v2 import _read_issue, _verify_signature
+                from .c09_graph_application_v1 import c09_actual_root_read_v3
+                issued = _read_issue(c09_actual_root_read_v3(db),pending.permit.namespace,pending.deletion_operation_id)
+                if issued is None:
+                    raise AuthorityUnavailable('actual selected signed Core Graph issue absent before close')
+                _verify_signature(issued,selected_proof.application.control._key)
+                candidate = issued.certificate.candidate
+                view = selected_proof.view
+                if (prepared != view.basis.prepared or issued.issue_digest != view.basis.manifest['graph_issue_digest']
+                        or issued.certificate.certificate_digest != view.basis.manifest['certificate_digest']
+                        or candidate.scope != view.scope or candidate.scope.accepted_receipt_digest != canonical_digest(receipt)
+                        or (candidate.old_incarnation,candidate.old_graph_epoch,candidate.old_access_epoch,candidate.old_delete_epoch) !=
+                            (prior.evidence.incarnation,int(prior.evidence.graph_version.removeprefix('graph-epoch-')),
+                                prior.evidence.access_epoch,prior.evidence.deletion_epoch)
+                        or (candidate.new_incarnation,candidate.new_graph_epoch,candidate.new_access_epoch,candidate.new_delete_epoch) !=
+                            (pending.evidence.incarnation,int(pending.evidence.graph_version.removeprefix('graph-epoch-')),
+                                pending.evidence.access_epoch,pending.evidence.deletion_epoch)
+                        or prior.evidence.barrier_scope_digest != pending.evidence.barrier_scope_digest):
+                    raise AuthorityUnavailable('actual selected cleanup differs from the signed Graph transition')
+                return
             certificate = None if prepared is None else prepared["graph_certificate_original"]
             if (certificate is None or prepared["operation_id"] != pending.deletion_operation_id
                     or prepared["accepted_receipt_digest"] != canonical_digest(receipt)
@@ -813,12 +858,14 @@ class AuthorityV2FenceStore:
 
     def record_deletion_pending_locked(self, db: sqlite3.Connection,
                                        pending: DeletionPendingV1, *, subject: str,
-                                       current_anchor: RestoreAnchor, core=None) -> DeletionPendingV1:
+                                       current_anchor: RestoreAnchor, core=None, selected_proof=None) -> DeletionPendingV1:
         """Durably prepare one typed phase under the caller's Authority lock.
 
         The caller must first verify the phase-specific Owner/graph/cleanup
         original. This storage primitive does not make that trust decision.
         """
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
         if type(pending) is not DeletionPendingV1:
             raise AuthorityUnavailable("typed deletion pending required")
         identifier(subject, "subject")
@@ -829,7 +876,7 @@ class AuthorityV2FenceStore:
         if (permit.subject != subject or permit.pinned_anchor != current_anchor
                 or pending.before_anchor != current_anchor):
             raise AuthorityUnavailable("deletion preparation anchor or subject differs")
-        live = db.execute(
+        live = c09_actual_root_read_v3(db).execute(
             "SELECT holder,generation,phase,transfer_id,target,revocation_epoch,"
             "deletion_journal_id,deletion_seq,deletion_digest,deletion_phase,"
             "execution_journal_id,execution_seq,execution_digest,anchor_nonce "
@@ -849,7 +896,7 @@ class AuthorityV2FenceStore:
                                     current_anchor.execution_digest,
                                     current_anchor.proof)):
             raise AuthorityUnavailable("live deletion phase or anchor differs")
-        if db.execute(
+        if c09_actual_root_read_v3(db).execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='authority_scoped_erasure_v2'").fetchone():
             from .v2_scoped_erasure_store import AuthorityV2ScopedErasureStore
@@ -859,7 +906,7 @@ class AuthorityV2FenceStore:
                     or marker["namespace"] != permit.namespace
                     or not AuthorityV2ScopedErasureStore._table(db)):
                 raise AuthorityUnavailable("scoped deletion migration is incomplete")
-            scoped = db.execute(
+            scoped = c09_actual_root_read_v3(db).execute(
                 "SELECT active_operation_id,aggregate_phase,active_epoch "
                 "FROM authority_scoped_erasure_v2 WHERE namespace=?",
                 (permit.namespace,)).fetchone()
@@ -872,7 +919,7 @@ class AuthorityV2FenceStore:
         row = self._row(db, permit.operation_id)
         if (row is None or row[6] != "active" or self._permit(row) != permit):
             raise AuthorityUnavailable("deletion preparation has no active fence")
-        self.require_prior_deletion_transition_locked(db, pending, core=core)
+        self.require_prior_deletion_transition_locked(db, pending, core=core,selected_proof=selected_proof)
         prior = self.mutation_locked(db, pending.mutation_id)
         if prior is not None:
             kind, saved, receipt, updated = self._decode_mutation_row(prior)
@@ -882,14 +929,14 @@ class AuthorityV2FenceStore:
             return pending
         if row[10] is not None:
             raise AuthorityUnavailable("fence already has a pending mutation")
-        db.execute(
+        _capture_write_v2(db,
             "INSERT INTO authority_v2_mutations(mutation_id,operation_id,namespace,"
             "subject,request_digest,state,conflict_keys_json,pending,mutation_kind,"
             "deletion_evidence,footprint) VALUES(?,?,?,?,?,'pending','null',?,'deletion',?,NULL)",
             (pending.mutation_id, permit.operation_id, permit.namespace, subject,
              pending.request_digest, canonical_bytes(pending),
              canonical_bytes(pending.evidence)))
-        if db.execute(
+        if _capture_write_v2(db,
                 "UPDATE authority_v2_fences SET pending=? WHERE operation_id=? "
                 "AND state='active' AND pending IS NULL",
                 (canonical_bytes(pending), permit.operation_id)).rowcount != 1:
@@ -1005,6 +1052,8 @@ class AuthorityV2FenceStore:
             self, db: sqlite3.Connection, receipt: DeletionMutationReceiptV1,
             *, subject: str) -> FencePermitV2:
         """Store one original deletion result in the Authority CAS transaction."""
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
         if type(receipt) is not DeletionMutationReceiptV1:
             raise AuthorityUnavailable("typed deletion receipt required")
         self._check_schema(db)
@@ -1027,12 +1076,12 @@ class AuthorityV2FenceStore:
             raise AuthorityUnavailable("deletion pending record differs")
         updated = replace(permit, revision=receipt.updated_revision,
                           pinned_anchor=receipt.after_anchor)
-        changed_fence = db.execute(
+        changed_fence = _capture_write_v2(db,
             "UPDATE authority_v2_fences SET revision=?,permit=?,pending=NULL "
             "WHERE operation_id=? AND state='active' AND revision=? AND pending=?",
             (updated.revision, canonical_bytes(updated), permit.operation_id,
              permit.revision, canonical_bytes(pending))).rowcount
-        changed_mutation = db.execute(
+        changed_mutation = _capture_write_v2(db,
             "UPDATE authority_v2_mutations SET state='committed',receipt=?,updated_permit=? "
             "WHERE mutation_id=? AND state='pending' AND pending=? AND mutation_kind='deletion'",
             (canonical_bytes(receipt), canonical_bytes(updated), pending.mutation_id,
@@ -1054,6 +1103,8 @@ class AuthorityV2FenceStore:
                             *, subject: str, current_anchor: RestoreAnchor,
                             request_id: str, request_digest: str) -> None:
         """Finish within the caller's already-held Authority transaction."""
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
         if type(permit) is not FencePermitV2:
             raise AuthorityUnavailable("invalid v2 fence permit")
         if permit.operation == "model_egress":
@@ -1086,7 +1137,7 @@ class AuthorityV2FenceStore:
             raise AuthorityUnavailable("v2 fence anchor mismatch")
         if row[10] is not None:
             raise AuthorityUnavailable("pending mutation blocks fence finish")
-        db.execute("UPDATE authority_v2_fences SET state='finished',finish_request_id=?,finish_request_digest=? WHERE operation_id=?", (request_id, request_digest, permit.operation_id))
+        _capture_write_v2(db,"UPDATE authority_v2_fences SET state='finished',finish_request_id=?,finish_request_digest=? WHERE operation_id=?", (request_id, request_digest, permit.operation_id))
 
     def finish_observed_model_egress_locked(self, db: sqlite3.Connection,
                                             permit: FencePermitV2, *, intent,
@@ -1107,6 +1158,53 @@ class AuthorityV2FenceStore:
         if status in {"completed", "unknown"} and observation_digest is not None:
             return "sha256:" + observation_digest
         raise AuthorityUnavailable("invalid model egress terminal digest")
+
+    def finish_current_prepared_model_not_dispatched_locked(
+            self, db: sqlite3.Connection, permit: FencePermitV2, *, intent,
+            current_anchor: RestoreAnchor, subject: str, holder: str) -> None:
+        """Close an exact unsent original under fresh authentication, preserving its permit."""
+        from .v2_model_egress_contract import ModelEgressIntentV1
+        if (db is not self._db or not db.in_transaction
+                or type(permit) is not FencePermitV2 or type(intent) is not ModelEgressIntentV1
+                or permit.operation != "model_egress"):
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        self._require_anchor(current_anchor,permit.namespace)
+        self._check_schema(db)
+        self._require_no_migration(db)
+        row = self._row(db,permit.operation_id)
+        if (row is None or self._permit(row) != permit or row[10] is not None
+                or (permit.authority_id,permit.namespace,permit.subject,permit.holder) !=
+                    (current_anchor.authority_id,current_anchor.namespace,subject,holder)
+                or (intent.authority_id,intent.namespace,intent.subject,intent.operation_id,
+                    intent.fence_token,intent.fence_epoch,intent.fence_revision,intent.anchor_digest) !=
+                    (permit.authority_id,permit.namespace,permit.subject,permit.operation_id,
+                    permit.token,permit.fence_epoch,permit.revision,
+                    canonical_digest(asdict(permit.pinned_anchor)))
+                or db.execute("SELECT operation_id,token FROM authority_model_egress_bindings_v1 "
+                    "WHERE call_id=?",(intent.call_id,)).fetchone() !=
+                    (intent.operation_id,intent.fence_token)
+                or db.execute("SELECT 1 FROM authority_model_admissions_v2 WHERE call_id=?",
+                    (intent.call_id,)).fetchone() is not None):
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        # The service already validated the bounded canonical original; retain
+        # an exact persisted CAS check without reading any response content.
+        encoded = json.dumps(asdict(intent),sort_keys=True,
+            separators=(",",":"),ensure_ascii=True)
+        if db.execute("SELECT 1 FROM authority_model_egress_v1 WHERE call_id=? "
+                "AND state='prepared' AND identity_json=?",
+                (intent.call_id,encoded)).fetchone() is None:
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        digest = self.model_terminal_finish_digest(intent,permit,"not_dispatched")
+        if row[6] == "finished":
+            if (row[8],row[9]) == (intent.call_id,digest):
+                return
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        changed = db.execute("UPDATE authority_v2_fences SET state='finished',"
+            "finish_request_id=?,finish_request_digest=? WHERE operation_id=? "
+            "AND state='active' AND token=? AND revision=? AND pending IS NULL",
+            (intent.call_id,digest,permit.operation_id,permit.token,permit.revision))
+        if changed.rowcount != 1:
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
 
     def finish_terminal_model_egress_locked(self, db: sqlite3.Connection,
                                             permit: FencePermitV2, *, intent,

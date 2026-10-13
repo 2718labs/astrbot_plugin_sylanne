@@ -9,7 +9,7 @@ from ..runtime.model_cost_settlement import OriginalModelCostCommitV1
 from ..runtime_contracts import canonical_digest
 from ..model_broker.broker import ModelProviderDescriptor
 from ..model_broker.contact_expression_v1 import contact_provider_messages_v1
-from .astrbot_model_call import AstrBotModelProvider
+from .astrbot_model_call import AstrBotModelProvider, LocalModelCapacityDeniedV1
 from .authority_client import AuthorityClient, AuthoritySelection
 from .installation_grant_identity import same_installed_grant_identity_v2
 from .model_egress_executor import HostModelEgressExecutor
@@ -94,9 +94,12 @@ async def run_installed_contact_model_v1(runtime, installation, *, context, trus
             workflow.provider_config_ref, "unknown", False, False)
         adapter = AstrBotModelProvider(context=context, host_loop=asyncio.get_running_loop(), trusted_umo=trusted_umo,
             descriptor=descriptor, admin_model=workflow, installation_bundle=bundle)
-        executor = HostModelEgressExecutor(authority=client, bundle=bundle, grant=actual_grant, adapter=adapter)
+        executor = HostModelEgressExecutor(authority=client, bundle=bundle, grant=actual_grant, adapter=adapter, local_module_admission=runtime.local_module_admission)
         if intent is None:
-            record, permit = await client.model_prepare_fenced_v1(bundle, actual_grant, draft=draft, expected_anchor=anchor)
+            try:
+                record, permit = await executor.prepare_once(draft=draft, expected_anchor=anchor, request=request)
+            except LocalModelCapacityDeniedV1:
+                return InstalledContactModelProgressV1(prepared, "terminal_hold")
             intent = record.intent
             if ModelEgressDraftV1.from_intent(intent) != draft or permit.pinned_anchor != anchor:
                 raise ValueError("contact Authority changed its frozen actual model draft")

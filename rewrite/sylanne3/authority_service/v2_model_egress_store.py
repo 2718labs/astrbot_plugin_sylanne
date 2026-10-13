@@ -85,13 +85,10 @@ def _decoded(value: str) -> ModelEgressIntentV1:
 
 def _decoded_observation(value: str) -> ModelEgressObservationV1:
     data = json.loads(value)
-    if (type(data) is not dict
-            or set(data) != set(ModelEgressObservationV1.__dataclass_fields__)
-            or canonical_serialize(data) != value):
+    if canonical_serialize(data) != value:
         raise ValueError("noncanonical observation")
-    data["usage"] = tuple(tuple(item) for item in data["usage"])
-    data["cost"] = tuple(tuple(item) for item in data["cost"])
-    return ModelEgressObservationV1(**data)
+    from .v2_model_egress_contract import model_observation_from_wire_v1
+    return model_observation_from_wire_v1(data)
 
 
 class AuthorityV2ModelEgressStore:
@@ -339,6 +336,30 @@ class AuthorityV2ModelEgressStore:
              intent.subject, _encoded(intent)),
         )
         return ModelEgressRecoveryV1(intent, "prepared")
+
+    def capacity_original_locked_v1(self, db, draft):
+        """Read one bounded exact draft, without provider content or old permits."""
+        from .model_capacity_v1 import ORIGINAL_IDENTITY_BYTES_V1
+        from .v2_model_egress_contract import ModelEgressDraftV1
+        if db is not self._db or not db.in_transaction or type(draft) is not ModelEgressDraftV1:
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        row = db.execute(
+            "SELECT call_id,operation_id,namespace,subject,"
+            "CASE WHEN length(CAST(identity_json AS BLOB))<=? THEN identity_json END,state "
+            "FROM authority_model_egress_v1 WHERE call_id=?",
+            (ORIGINAL_IDENTITY_BYTES_V1,draft.call_id)).fetchone()
+        if row is None:
+            return None
+        if row[4] is None:
+            raise AuthorityUnavailable("MODEL_CAPACITY_CENSUS_OVERFLOW")
+        try:
+            intent = _decoded(row[4])
+        except (TypeError,ValueError,UnicodeError) as exc:
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED") from exc
+        if (row[:4] != (intent.call_id,intent.operation_id,intent.namespace,intent.subject)
+                or ModelEgressDraftV1.from_intent(intent) != draft):
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        return intent,row[5]
 
     def bind_original_identity_locked(self, db: sqlite3.Connection,
                                       intent: ModelEgressIntentV1,
@@ -599,6 +620,8 @@ class AuthorityV2ModelEgressStore:
             old.intent.subject, old.intent.operation_id,
             old.intent.call_id, old.intent.request_digest):
             raise ValueError("observation differs from original call")
+        from .v2_model_egress_contract import require_model_observation_billing_intent_v1
+        require_model_observation_billing_intent_v1(observation, old.intent)
         if not self.is_fence_bound_locked(db, old.intent):
             raise AuthorityUnavailable("original dispatch lacks atomic fence binding")
         fence = db.execute(
@@ -611,7 +634,8 @@ class AuthorityV2ModelEgressStore:
         target = ModelEgressRecoveryV1(old.intent, target_state,
                                        observation.digest, observation.usage,
                                        observation.cost)
-        raw = canonical_serialize(asdict(observation))
+        from .v2_model_egress_contract import model_observation_to_wire_v1
+        raw = canonical_serialize(model_observation_to_wire_v1(observation))
         db.execute(
             "INSERT INTO authority_model_egress_observations_v1(call_id,observation_json,observation_digest) VALUES(?,?,?)",
             (observation.call_id, raw, observation.digest),

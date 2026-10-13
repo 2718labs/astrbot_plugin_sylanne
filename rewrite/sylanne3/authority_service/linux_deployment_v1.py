@@ -39,7 +39,8 @@ def require_complete_provider_cache_binding_v1(bundle, provider_id):
     if workflows is None:
         raise AuthorityUnavailable("installed model provider inventory required")
     providers = {workflow.provider_id for name in (
-        "encode", "reply", "context_reply", "natural_generation", "natural_review", "appraisal", "d07_cognition", "contact_generation", "contact_review")
+        "encode", "reply", "context_reply", "natural_generation", "natural_review", "appraisal",
+        "d07_cognition", "contact_generation", "contact_review", "life_content", "life_numeric")
         if (workflow := getattr(workflows, name, None)) is not None}
     paid = bundle.d13_paid_precompression
     if paid is not None:
@@ -51,11 +52,41 @@ def require_complete_provider_cache_binding_v1(bundle, provider_id):
 def load_linux_deployment_config_v1(path):
     require_linux_administrator_v1()
     launch = read_installed_json_v1(path)
-    if set(launch) != _FIELDS or launch["schema"] != "sylanne3.authority.linux-deployment.v1":
+    process_mode = launch.get("schema") in {"sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3"}
+    fields = (_FIELDS - {"host_systemd_unit"}) | {"host_supervisor_provider"} if process_mode else _FIELDS
+    if launch.get('schema')=='sylanne3.authority.linux-deployment.v3':
+        fields=fields|{'root_lifetime_spec_path','root_lifetime_spec_digest'}
+    if set(launch) != fields or launch["schema"] not in {
+            "sylanne3.authority.linux-deployment.v1", "sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3"}:
         raise AuthorityUnavailable("installed Linux deployment fields differ")
+    if process_mode:
+        from .d12_installed_supervisor_v1 import decode_installed_supervisor_config_v1
+        from .installed_process_supervisor_v1 import InstalledProcessSupervisorSpecV2
+        selected_provider = decode_installed_supervisor_config_v1(launch["host_supervisor_provider"])
+        if launch['schema']=='sylanne3.authority.linux-deployment.v3':
+            from .installed_root_lifetime_observer_v3 import (SPEC_PATH,read_installed_root_lifetime_spec_v3,
+                read_root_lifetime_resource_approval_v3)
+            if launch['root_lifetime_spec_path']!=SPEC_PATH:
+                raise AuthorityUnavailable('production Root lifetime must use its fixed protected installed spec')
+            lifetime=read_installed_root_lifetime_spec_v3(SPEC_PATH)
+            if (lifetime['spec_digest']!=launch['root_lifetime_spec_digest']
+                    or lifetime['host_spec']['path']!=selected_provider.installed_spec_path
+                    or lifetime['authority_id']!=selected_provider.authority_id
+                    or lifetime['installation_id']!=selected_provider.installation_id):
+                raise AuthorityUnavailable('Linux deployment and actual outer Root lifetime scope differ')
+            read_root_lifetime_resource_approval_v3(lifetime)
+        if type(selected_provider) is not InstalledProcessSupervisorSpecV2 or selected_provider.service_role != "host":
+            raise AuthorityUnavailable("V2 deployment requires its exact installed process Host provider")
     assets = read_installed_json_v1(launch["assets_path"], limit=65536)
     bundle = _load_installation_bundle_from_root(launch["profile_id"], Path("/etc/sylanne/client/profiles"), "Linux")
     policy = bundle.installation_policy
+    if process_mode and (selected_provider.installation_id != policy.installation_id
+            or selected_provider.authority_id != policy.expected_authority_id
+            or selected_provider.profile_id != launch["profile_id"]
+            or selected_provider.namespace_cohort != (policy.authority_namespace,)
+            or selected_provider.expected_uid != launch["host_uid"]
+            or selected_provider.expected_gid != launch["host_gid"]):
+        raise AuthorityUnavailable("installed process provider differs from the actual Host/Authority identity")
     if (bundle.model_workflows is None or bundle.ingress_clock is None
             or policy.manifest_digest != launch["trusted_manifest_sha256"]):
         raise AuthorityUnavailable("installed Linux model, clock and exact package pins required")
@@ -109,6 +140,17 @@ def load_linux_deployment_config_v1(path):
         publisher_manifest_verifier=authorizer.publisher_manifest_verifier,
         utc_clock=lambda: datetime.now(timezone.utc), local_administrator_credential=authorizer.local_administrator_credential,
         c09_maintenance_factory=factory)
+    if factory is not None and process_mode:
+        from .d12_installed_supervisor_v1 import decode_installed_supervisor_config_v1,build_installed_supervisor_v1
+        from .c09_writer_peer_activation_v3 import InstalledPeerRegistryCensusV3
+        lifecycle=launch['host_lifecycle']
+        if type(lifecycle) is not dict or set(lifecycle)!={'supervisor','drain_timeout_seconds'}:
+            raise AuthorityUnavailable('actual protected complete Host lifecycle provider required for registry genesis')
+        actual_spec=decode_installed_supervisor_config_v1(lifecycle['supervisor'])
+        if actual_spec!=selected_provider:
+            raise AuthorityUnavailable('registry genesis and installed Host starts use different supervisors')
+        factory.install_peer_registry_census_v3(InstalledPeerRegistryCensusV3(
+            supervisor=build_installed_supervisor_v1(actual_spec),inventory_manifest=inventory,peer=peer))
     c09 = config.c09_storage_v2 or config.c09_storage_v1
     if (c09 is None or c09.authority_id != policy.expected_authority_id
             or config.namespace_bindings_v2.get((*peer, policy.namespace)) != policy.authority_namespace):
@@ -143,10 +185,10 @@ def open_linux_authority_v1(path):
 
 def install_linux_lifecycle_v1(daemon, launch):
     """Compose the real independent controller before opening any RPC listener."""
-    from .daemon import AuthorityFactualDaemonV2
-    if type(daemon) is AuthorityFactualDaemonV2:
-        raise AuthorityUnavailable("C09 V2 factual-only installation: lifecycle/business construction HOLD")
-    from .d12_installed_supervisor_v1 import D12SystemdSupervisorConfigV1, InstalledD12SystemdSupervisorV1
+    from .daemon import AuthorityDaemon
+    if type(daemon) is not AuthorityDaemon:
+        raise AuthorityUnavailable("Linux lifecycle requires the actual completed bootstrap daemon")
+    from .d12_installed_supervisor_v1 import decode_installed_supervisor_config_v1, build_installed_supervisor_v1
     from .d12_operation_status_v1 import InstalledD12OperationStatusServiceV1
     from .d12_operation_status_rpc_v1 import install_d12_operation_status_service_v1
     from .d12_installation_lifecycle_v1 import InstalledD12InstallationLifecycleV1
@@ -156,9 +198,18 @@ def install_linux_lifecycle_v1(daemon, launch):
     specification = launch["host_lifecycle"]
     if type(specification) is not dict or set(specification) != {"supervisor", "drain_timeout_seconds"}:
         raise AuthorityUnavailable("exact installed lifecycle configuration required")
-    supervisor = InstalledD12SystemdSupervisorV1(config=D12SystemdSupervisorConfigV1(**specification["supervisor"]))
-    if supervisor.config.unit_name != launch["host_systemd_unit"]:
-        raise AuthorityUnavailable("lifecycle and C09 supervisor units differ")
+    supervisor_config = decode_installed_supervisor_config_v1(specification["supervisor"])
+    if launch["schema"] in {"sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3"}:
+        supervisor=daemon.config.c09_maintenance_factory._peer_registry_census_v3.supervisor
+        if supervisor.config!=supervisor_config:
+            raise AuthorityUnavailable("actual bootstrap and lifecycle Root supervisors differ")
+        supervisor.install_peer_registry_start_v3(control=daemon.c09_control,gate=daemon.c09_gate)
+        if supervisor_config != decode_installed_supervisor_config_v1(launch["host_supervisor_provider"]):
+            raise AuthorityUnavailable("lifecycle and C09 process supervisors differ")
+    else:
+        supervisor=build_installed_supervisor_v1(supervisor_config)
+        if supervisor.config.unit_name != launch["host_systemd_unit"]:
+            raise AuthorityUnavailable("lifecycle and C09 supervisor units differ")
     bindings = tuple(daemon.config.namespace_bindings_v2.items())
     if len(bindings) != 1:
         raise AuthorityUnavailable("Linux whole-Host lifecycle requires one exact cohort")
@@ -197,7 +248,15 @@ def install_linux_lifecycle_v1(daemon, launch):
         journal = InstalledPackageSupervisorJournalV2(control_directory=files.control_directory,
             supervisor_policy_digest=files.read_maintenance_policy_v2()['supervisor_policy_digest'])
         package_service = InstalledD12PackageMaintenanceAuthorityV2(lifecycle=service,package_files=files,
-            supervisor_journal=journal,authority_supervisor=InstalledD12SystemdSupervisorV1(config=authority_config))
+            supervisor_journal=journal,authority_supervisor=build_installed_supervisor_v1(authority_config))
         package_service.install_schema_v2(daemon.config.local_administrator_credential('d12_package_install',namespace))
         install_d12_package_maintenance_authority_v2(daemon.server,package_service)
+        from .graph_catalogue_upgrade_v1 import InstalledGraphCatalogueUpgradeV1
+        catalogue = InstalledGraphCatalogueUpgradeV1(
+            lifecycle=service, package_files=files,
+            target_registry=load_verified_affect_scheme(
+                launch['package_root'], launch['trusted_manifest_sha256']).registry.type_registry)
+        catalogue.install_schema(daemon.config.local_administrator_credential('d12_lifecycle_install',namespace))
+        daemon.server._d12_graph_catalogue_upgrade_services_v1 = {
+            (namespace, installation.installation_id): catalogue}
     return service

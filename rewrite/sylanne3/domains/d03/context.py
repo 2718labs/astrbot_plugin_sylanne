@@ -6,6 +6,7 @@ D06 supplies source eligibility, and D08 consumes the resulting checks.
 
 from dataclasses import asdict, dataclass, fields
 import math
+import weakref
 
 from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 from ...domains.d01 import ActiveRoleQualification
@@ -232,6 +233,76 @@ class RoleBindingResolution:
     request: RoleBindingRequest | None = None
 
 
+_ROLE_CATALOGUES_V4 = {}
+_CATALOGUE_ISSUER_V4 = object()
+_CATALOGUE_ORIGINALS_V4 = weakref.WeakSet()
+
+def _resolve_role_binding_catalogue_v4(request,bindings,*,roles,norms):
+    """One frozen catalogue predicate, shared by current and historical reads."""
+    if not isinstance(request, RoleBindingRequest):
+        raise TypeError("request must be RoleBindingRequest")
+    if not isinstance(bindings, tuple) or any(not isinstance(item, RoleBinding) for item in bindings):
+        raise TypeError("bindings must be RoleBinding values")
+    matches = tuple(sorted((item for item in bindings if item.applies_to(request)),
+                           key=lambda item: (-item.precedence, item.role_binding_id)))
+    if not request.scope_complete:
+        return RoleBindingResolution("partial", (), (), ("scope_coverage",))
+    if not matches:
+        return RoleBindingResolution("no_applicable_binding", (), (), ())
+    unknown_roles = {item.social_role for item in matches} - roles
+    unknown_norms = {ref for item in matches for ref in item.norm_refs} - norms
+    if unknown_roles or unknown_norms:
+        missing = tuple(name for name, absent in (
+            ("role_catalogue", unknown_roles), ("norm_catalogue", unknown_norms)
+        ) if absent)
+        return RoleBindingResolution("partial", (), (), missing)
+    return RoleBindingResolution(
+        "complete",
+        tuple(item.role_binding_id for item in matches),
+        tuple(sorted({ref for item in matches for ref in item.norm_refs})),
+        (),
+        valid_until=min((item.effective_until for item in matches
+                         if item.effective_until is not None), default=None),
+    )
+
+
+def _remember_role_catalogue_v4(provider,resolution,roles,norms,request,db=None):
+    identity=id(resolution)
+    def expired(reference):
+        saved=_ROLE_CATALOGUES_V4.get(identity)
+        if saved is not None and saved[0] is reference:_ROLE_CATALOGUES_V4.pop(identity)
+    _ROLE_CATALOGUES_V4[identity]=(weakref.ref(resolution,expired),provider,roles,norms,request,db)
+
+def _rebind_role_catalogue_original_v4(provider,original_resolution,derived_resolution,*,db=None):
+    """Transfer only the actual resolver result's catalogue to its query wrapper."""
+    saved=_ROLE_CATALOGUES_V4.get(id(original_resolution))
+    if (saved is None or saved[0]() is not original_resolution or saved[1] is not provider
+            or type(derived_resolution) is not RoleBindingResolution
+            or tuple(getattr(original_resolution,n) for n in ('status','matched_bindings','applicable_norm_refs','missing_items','valid_until'))
+               !=tuple(getattr(derived_resolution,n) for n in ('status','matched_bindings','applicable_norm_refs','missing_items','valid_until'))
+            or derived_resolution.request!=saved[4] or db is not None and not db.in_transaction):
+        raise ValueError('actual D03 role catalogue resolver/query binding differs')
+    _remember_role_catalogue_v4(provider,derived_resolution,saved[2],saved[3],saved[4],db)
+
+class _NaturalFinalContextCatalogueOriginalV4:
+    """A successful role check's exact actual catalogue; consumed once by W01."""
+    def __init__(self,issuer,*,provider,resolution,receipt):
+        if issuer is not _CATALOGUE_ISSUER_V4:raise TypeError('actual D03 successful role-check catalogue issuer required')
+        saved=_ROLE_CATALOGUES_V4.get(id(resolution))
+        if saved is None or saved[0]() is not resolution or saved[1] is not provider or saved[5] is None or not saved[5].in_transaction:
+            raise ValueError('actual D03 check lacks its exact original transactional resolver catalogue')
+        self.provider=provider;self.roles=saved[2];self.norms=saved[3];self.receipt=receipt;self.db=saved[5];self.query=resolution.query_epoch;self.used=False
+        _CATALOGUE_ORIGINALS_V4.add(self)
+    def consume_for(self,*,provider,receipt,db,scope):
+        if (self not in _CATALOGUE_ORIGINALS_V4 or self.used or self.provider is not provider or self.receipt is not receipt
+                or self.db is not db or not db.in_transaction or scope.namespace!=self.query.namespace
+                or scope.operation!='write' or scope.graph_epoch.revision+1!=self.query.revision):
+            raise ValueError('natural catalogue original crossed its actual provider/receipt or was consumed')
+        self.used=True;_CATALOGUE_ORIGINALS_V4.discard(self)
+        return {'roles':sorted(self.roles),'norms':sorted(self.norms)}
+
+
+
 class ContextProvider:
     """D03 pure provider; graph commits and source checks remain external."""
 
@@ -356,31 +427,10 @@ class ContextProvider:
     def resolve_role_binding(
         self, request: RoleBindingRequest, bindings: tuple[RoleBinding, ...]
     ) -> RoleBindingResolution:
-        if not isinstance(request, RoleBindingRequest):
-            raise TypeError("request must be RoleBindingRequest")
-        if not isinstance(bindings, tuple) or any(not isinstance(item, RoleBinding) for item in bindings):
-            raise TypeError("bindings must be RoleBinding values")
-        matches = tuple(sorted((item for item in bindings if item.applies_to(request)),
-                               key=lambda item: (-item.precedence, item.role_binding_id)))
-        if not request.scope_complete:
-            return RoleBindingResolution("partial", (), (), ("scope_coverage",))
-        if not matches:
-            return RoleBindingResolution("no_applicable_binding", (), (), ())
-        unknown_roles = {item.social_role for item in matches} - self._roles
-        unknown_norms = {ref for item in matches for ref in item.norm_refs} - self._norms
-        if unknown_roles or unknown_norms:
-            missing = tuple(name for name, absent in (
-                ("role_catalogue", unknown_roles), ("norm_catalogue", unknown_norms)
-            ) if absent)
-            return RoleBindingResolution("partial", (), (), missing)
-        return RoleBindingResolution(
-            "complete",
-            tuple(item.role_binding_id for item in matches),
-            tuple(sorted({ref for item in matches for ref in item.norm_refs})),
-            (),
-            valid_until=min((item.effective_until for item in matches
-                             if item.effective_until is not None), default=None),
-        )
+        roles,norms=self._roles,self._norms
+        result=_resolve_role_binding_catalogue_v4(request,bindings,roles=roles,norms=norms)
+        _remember_role_catalogue_v4(self,result,roles,norms,request)
+        return result
 
     def resolve_role_binding_from_graph(
         self, request: RoleBindingRequest, coordinator: object,
@@ -446,7 +496,7 @@ class ContextProvider:
                 request=request,
             )
         result = self.resolve_role_binding(request, tuple(bindings))
-        return RoleBindingResolution(
+        observed=RoleBindingResolution(
             result.status, result.matched_bindings, result.applicable_norm_refs,
             result.missing_items,
             tuple(GraphVersion(atom.key, atom.revision) for atom in atoms),
@@ -454,9 +504,12 @@ class ContextProvider:
             result.valid_until,
             request,
         )
+        _rebind_role_catalogue_original_v4(self,result,observed)
+        return observed
 
     def provide_required_check(
         self, intent: ActionIntent, resolution: RoleBindingResolution, *, valid_until: float,
+        natural_catalogue_original_receiver=None,
     ) -> CheckReceipt:
         """Describe a D03 binding check; D11 must revalidate its graph guards."""
         if not isinstance(intent, ActionIntent) or not isinstance(resolution, RoleBindingResolution):
@@ -506,11 +559,16 @@ class ContextProvider:
             and pinned and (resolution.valid_until is None or expiry <= resolution.valid_until)
             and request is not None and expiry >= request.at_time
         )
-        return CheckReceipt(
+        receipt=CheckReceipt(
             spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
             spec.required_input_versions if passed else observed,
             coverage, "pass" if passed else "unknown", expiry, spec.provider_id,
         )
+        if passed and natural_catalogue_original_receiver is not None:
+            natural_catalogue_original_receiver(_NaturalFinalContextCatalogueOriginalV4(
+                _CATALOGUE_ISSUER_V4,provider=self,resolution=resolution,receipt=receipt))
+        return receipt
+
 
     def build_scene_binding_proposal(
         self, envelope: CommandEnvelope, binding: RoleBinding,

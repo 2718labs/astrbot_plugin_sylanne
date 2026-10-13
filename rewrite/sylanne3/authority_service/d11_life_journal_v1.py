@@ -1,5 +1,8 @@
 """Distinct D11 originals on the existing mixed independent execution chain."""
 from __future__ import annotations
+from ..runtime.d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
+from ..runtime.d11_life_contract_v1 import (D11DraftExecutionBindingV1, DraftRoleSegmentStartV1,
+    DraftTerminalPayloadV1, D11DraftClaimV1, D11DraftTerminalV1, LIFE_START_TYPES, LIFE_PAYLOAD_TYPES)
 
 import hashlib
 import json
@@ -19,7 +22,7 @@ ENTRY_SCHEMA = "sylanne.authority.d11-life-tick-entry.v1"
 
 
 def _encoded(journal, binding, payload, sequence, previous_digest):
-    phase = "claim" if type(payload) is RoleSegmentStartV1 else "terminal"
+    phase = "claim" if type(payload) in LIFE_START_TYPES else "terminal"
     return canonical_serialize({"d11_life_original": {
         "schema": ENTRY_SCHEMA, "phase": phase, "journal_id": journal.journal_id,
         "sequence": sequence, "previous_digest": previous_digest,
@@ -29,7 +32,8 @@ def _encoded(journal, binding, payload, sequence, previous_digest):
 
 
 def _claim_original(journal, binding, payload, row):
-    return D11LifeClaimV1(binding, payload, journal.journal_id, row[6], row[1])
+    cls = D11DraftClaimV1 if type(binding) is D11DraftExecutionBindingV1 else D11LifeClaimV1
+    return cls(binding, payload, journal.journal_id, row[6], row[1])
 
 
 def decode_life_row_v1(journal, row):
@@ -76,7 +80,8 @@ def decode_life_row_v1(journal, row):
         if old_binding != binding or old_terminal is not None:
             raise ValueError("life terminal crossed its original binding")
         claim = _claim_original(journal, binding, claim_payload, prior)
-        D11LifeTerminalV1(binding, claim, payload, journal.journal_id,
+        cls = D11DraftTerminalV1 if type(binding) is D11DraftExecutionBindingV1 else D11LifeTerminalV1
+        cls(binding, claim, payload, journal.journal_id,
                                 row[0], row[6], row[1])
         return binding, claim_payload, payload
     except (KeyError, TypeError, ValueError, UnicodeError) as exc:
@@ -84,7 +89,7 @@ def decode_life_row_v1(journal, row):
 
 
 def read_life_rows_locked_v1(journal, binding):
-    if (type(binding) is not D11LifeExecutionBindingV1
+    if (type(binding) not in LIFE_BINDING_TYPES
             or binding.authority_namespace != journal.namespace
             or journal._guard_owner != threading.get_ident()):
         raise AuthorityUnavailable("life originals need the actual frozen paired journal")
@@ -106,7 +111,8 @@ def read_life_rows_locked_v1(journal, binding):
             if claim is None or terminal is not None or claim.payload != claim_payload:
                 raise AuthorityUnavailable("life terminal has no unique preceding original")
             terminal_row = row
-            terminal = D11LifeTerminalV1(binding, claim, terminal_payload,
+            cls = D11DraftTerminalV1 if type(binding) is D11DraftExecutionBindingV1 else D11LifeTerminalV1
+            terminal = cls(binding, claim, terminal_payload,
                 journal.journal_id, row[0], row[6], row[1])
     return head, claim, terminal, claim_row, terminal_row
 
@@ -114,8 +120,8 @@ def read_life_rows_locked_v1(journal, binding):
 def append_life_entry_locked_v1(journal, *, binding, payload, before_head):
     """Private installed-service append, following actual final Core admission."""
     if (journal._guard_owner != threading.get_ident()
-            or type(binding) is not D11LifeExecutionBindingV1
-            or type(payload) not in {RoleSegmentStartV1, LifeTerminalPayloadV1}
+            or type(binding) not in LIFE_BINDING_TYPES
+            or type(payload) not in LIFE_START_TYPES | LIFE_PAYLOAD_TYPES
             or type(before_head) is not JournalHead
             or before_head.journal_id != journal.journal_id
             or binding.authority_namespace != journal.namespace):
@@ -123,7 +129,7 @@ def append_life_entry_locked_v1(journal, *, binding, payload, before_head):
     journal._check_schema()
     if journal._schema_version not in {"2", "4"}:
         raise AuthorityUnavailable("life originals require the mixed execution chain")
-    is_claim = type(payload) is RoleSegmentStartV1
+    is_claim = type(payload) in LIFE_START_TYPES
     if journal._installed_storage_reader is not None:
         journal._require_current_storage_v1(action="business" if is_claim else "recovery")
         if is_claim:

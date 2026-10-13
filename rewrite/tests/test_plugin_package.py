@@ -40,24 +40,24 @@ class WorkbenchAssetTests(unittest.TestCase):
     def test_verifier_rejects_source_drift_after_manifest_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "webui-heritage"
+            source = root / "workbench-src" / "prototype-v6"
             destination = root / "resources" / "workbench"
-            (source / "dist").mkdir(parents=True)
+            (source / "singlefile").mkdir(parents=True)
             destination.mkdir(parents=True)
             content = b"<main>current</main>\n"
-            (source / "dist" / "index.html").write_bytes(content)
+            (source / "singlefile" / "index.html").write_bytes(content)
             (destination / "index.html").write_bytes(content)
             manifest = {
                 "schema_version": "sylanne.workbench-assets.v1",
-                "source": "webui-heritage",
-                "build_output": "webui-heritage/dist/index.html",
+                "source": "workbench-src/prototype-v6",
+                "build_output": "workbench-src/prototype-v6/singlefile/index.html",
                 "files": [{"path": "index.html", "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}],
             }
             (destination / "workbench-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             verifier = _load_workbench_verifier()
             verifier.verify_workbench(root)
-            (source / "dist" / "index.html").write_bytes(b"<main>new</main>\n")
-            with self.assertRaisesRegex(ValueError, "differs from webui-heritage build output"):
+            (source / "singlefile" / "index.html").write_bytes(b"<main>new</main>\n")
+            with self.assertRaisesRegex(ValueError, "differs from prototype-v6 singlefile build output"):
                 verifier.verify_workbench(root)
 
 
@@ -103,11 +103,14 @@ class PluginPackageTests(unittest.TestCase):
         _run_git(self.project, "commit", "--quiet", "-m", "fixture")
         self.builder = _load_builder()
 
-    def test_archive_allowlist_excludes_legacy_workbench_source_mirror(self) -> None:
+    def test_archive_allowlist_contains_only_singlefile_workbench_resources(self) -> None:
         native_path = "rewrite/sylanne3/_native/windows-x86_64/sylanne3_kernel.dll"
         self.assertTrue(self.builder._allowed_package_member("resources/workbench/index.html", native_path))
         self.assertTrue(self.builder._allowed_package_member("resources/workbench/workbench-manifest.json", native_path))
-        self.assertFalse(self.builder._allowed_package_member("resources/workbench/src/app.js", native_path))
+        self.assertFalse(self.builder._allowed_package_member("resources/workbench/src/unpackaged.js", native_path))
+        self.assertEqual(self.builder.WORKBENCH_PACKAGE_FILES, frozenset({
+            "resources/workbench/index.html", "resources/workbench/workbench-manifest.json",
+        }))
 
     def test_backend_only_candidate_excludes_unfinished_workbench_and_cannot_be_formal(self) -> None:
         workbench = self.project / "resources" / "workbench"
@@ -231,13 +234,13 @@ class PluginPackageTests(unittest.TestCase):
         workbench_index = b"<main>Sylanne</main>\n"
         workbench_manifest = {
             "schema_version": "sylanne.workbench-assets.v1",
-            "source": "webui-heritage",
-            "build_output": "webui-heritage/dist/index.html",
+            "source": "workbench-src/prototype-v6",
+            "build_output": "workbench-src/prototype-v6/singlefile/index.html",
             "files": [{"path": "index.html", "sha256": hashlib.sha256(workbench_index).hexdigest(),
                        "bytes": len(workbench_index)}],
         }
         files = {
-            "webui-heritage/dist/index.html": workbench_index,
+            "workbench-src/prototype-v6/singlefile/index.html": workbench_index,
             "resources/workbench/index.html": workbench_index,
             "resources/workbench/workbench-manifest.json": json.dumps(workbench_manifest).encode(),
             "resources/catalogue/current.json": json.dumps(catalogue).encode() + b"\n",
@@ -275,7 +278,7 @@ class PluginPackageTests(unittest.TestCase):
             "rewrite/native/target/release/sylanne3_kernel.dll": b"stale native",
             "rewrite/sylanne3/__pycache__/runtime.pyc": b"cache",
             "rewrite/sylanne3/debug.log": b"log",
-            "resources/workbench/src/app.js": b"retained old source mirror",
+            "resources/workbench/src/unpackaged.js": b"synthetic unbuilt source mirror must remain excluded",
         }
         for relative, content in excluded.items():
             path = self.project / relative
@@ -316,7 +319,7 @@ class PluginPackageTests(unittest.TestCase):
             )
             self.assertNotIn("rewrite/sylanne3/__pycache__/runtime.pyc", names)
             self.assertNotIn("rewrite/sylanne3/debug.log", names)
-            self.assertNotIn("resources/workbench/src/app.js", names)
+            self.assertNotIn("resources/workbench/src/unpackaged.js", names)
             manifest = json.loads(archive.read("release-manifest.json"))
             self.assertEqual(manifest["package_version"], "3.0.0-dev.1")
             self.assertEqual(manifest["source"]["dirty"], True)
@@ -1016,7 +1019,7 @@ class PluginPackageTests(unittest.TestCase):
         (self.project / "webui-heritage/dist/index.html").write_bytes(b"<main>new source</main>\n")
         _run_git(self.project, "add", ".")
         _run_git(self.project, "commit", "--quiet", "-m", "new workbench source")
-        with self.assertRaisesRegex(ValueError, "packaged workbench differs from webui-heritage build output"):
+        with self.assertRaisesRegex(ValueError, "packaged workbench differs from prototype-v6 singlefile build output"):
             self.builder.build_package(
                 project_root=self.project, target_os="windows", target_arch="x86_64",
                 native_library=self._native(), output_dir=self.base / "stale-workbench",

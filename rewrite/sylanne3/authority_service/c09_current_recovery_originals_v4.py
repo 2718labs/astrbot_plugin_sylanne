@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+
 from contextlib import contextmanager, closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +24,7 @@ from ..runtime.c09_storage_rebase_contract_v1 import (
     SanitizedExecutionFactV4, SanitizedUnknownFactV4,
 )
 from ..runtime_contracts import NamespaceId, canonical_digest
-from .contract import JournalHead
+from .contract import AuthorityUnavailable, JournalHead
 from .v2_contract import PendingMutationV2, decode_bytes
 from .v2_fence_store import AuthorityV2FenceStore
 
@@ -61,7 +63,7 @@ class InstalledC09RecoveryOriginalsV4:
                        or not service.installed_runtime_verified
                        or service.journal.namespace != closure.namespace
                        or service.journal.path.resolve() != closure.execution.path.resolve()
-                       or service.installed_algorithm_id != algorithm
+                       or algorithm not in service.installed_builds
                        for algorithm, service in internal_services.items())):
             raise C09RecoveryFactsHold(("installed_readers",))
         self.core, self.closure, self.graph = core, closure, graph
@@ -438,7 +440,7 @@ class InstalledC09RecoveryOriginalsV4:
             from .c09_model_budget_original_v1 import capture_frozen_model_budget_originals_v1
             self._model_cache = capture_frozen_model_budget_originals_v1(core_db=control,
                 business=business, namespace_id=self.namespace_id, seal=seal, resource_issuer=self.resource_issuer,
-                require_existing=getattr(self, "_completed_core", False),
+                meter=current_c09_sql_meter_v2(), require_existing=getattr(self, "_completed_core", False),
                 budget_job_issuer=self.budget_job_issuer)
         return self._model_cache
 

@@ -179,7 +179,11 @@ def read_current_d04_appraisal_graph_v3(db, intent, issuer, now, *, allow_unseal
 def to_wire(value):
     if type(value) not in {D04AppraisalResultReadRequestV3, D04AppraisalResultReadV3}:
         raise TypeError("typed D04 appraisal Authority read required")
-    return json.loads(canonical_serialize(asdict(value)))
+    data = json.loads(canonical_serialize(asdict(value)))
+    if type(value) is D04AppraisalResultReadV3:
+        from .v2_model_egress_contract import model_observation_to_wire_v1
+        data["observation"] = model_observation_to_wire_v1(value.observation)
+    return data
 
 
 def from_wire(raw, kind):
@@ -190,10 +194,8 @@ def from_wire(raw, kind):
         data["namespace"] = NamespaceId(**data["namespace"])
     elif kind is D04AppraisalResultReadV3:
         data["request"] = from_wire(data["request"], D04AppraisalResultReadRequestV3)
-        observation = dict(data["observation"])
-        for name in ("usage", "cost"):
-            observation[name] = tuple(tuple(pair) for pair in observation[name])
-        data["observation"] = ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data["observation"] = model_observation_from_wire_v1(data["observation"])
         data["terminal_receipt"] = ModelTerminalReceiptV2(**data["terminal_receipt"])
     else:
         raise ValueError("unsupported D04 appraisal Authority read type")

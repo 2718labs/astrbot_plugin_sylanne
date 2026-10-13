@@ -400,8 +400,8 @@ def require_life_d04_before_for_claim_v1(db, *, prepared, issuer, required=False
     return value
 
 
-def read_current_life_d04_before_v1(db, *, frame, request, installed_readers):
-    """Actual current Episode/Source/Owner lineage, then historical before state."""
+def _read_current_life_d04_before_and_cause_v1(db, *, frame, request, installed_readers):
+    """One current lineage read, joined to its historical before in this transaction."""
     from .d06_internal_life_encoding_v1 import read_current_internal_life_encoding_cause_v1
     from .d11_life_preparation_v1 import read_prepared_life_by_ref_v1
     cause = read_current_internal_life_encoding_cause_v1(db, frame=frame, request=request, installed_readers=installed_readers)
@@ -418,6 +418,13 @@ def read_current_life_d04_before_v1(db, *, frame, request, installed_readers):
     identity = id(value)
     _CURRENT[identity] = (weakref.ref(value, lambda _: _CURRENT.pop(identity, None)), db, frame,
                          cause.occurrence.episode.episode_ref, canonical_digest(plain_v1(cause.occurrence)))
+    return cause, value
+
+
+def read_current_life_d04_before_v1(db, *, frame, request, installed_readers):
+    """Actual current Episode/Source/Owner lineage, then historical before state."""
+    _, value = _read_current_life_d04_before_and_cause_v1(
+        db, frame=frame, request=request, installed_readers=installed_readers)
     return value
 
 

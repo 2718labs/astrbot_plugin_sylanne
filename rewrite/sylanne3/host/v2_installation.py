@@ -22,6 +22,10 @@ from .authority_profile import (
 from .installed_package import verify_installed_backend_runtime_v1
 from .mtls_transport import MtlsAuthorityTransport
 from .v2_fence_port import V2FencePort
+from .managed_data_layout_v1 import (
+    GRAPH_NAME, InstalledDataLayoutV1, ManagedDataLayoutError,
+    managed_data_root_v1, inspect_installed_data_layout_v1,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,13 +48,27 @@ class V2InstallationAssembly:
     d03_arrival: AdminD03ArrivalPolicy | None = None
     reverse_handoff: object | None = None
     storage_admission: object | None = None
+    data_layout: InstalledDataLayoutV1 | None = None
+
+    def require_data_layout_v1(self) -> InstalledDataLayoutV1:
+        """Recheck the selection derived after complete installation verification."""
+        layout = self.data_layout
+        if self.storage_admission is not None:
+            if layout is None or layout.storage_admission is not self.storage_admission:
+                raise ManagedDataLayoutError("installed storage has no assembler-derived layout")
+            self.storage_admission.require_current_process_v1()
+        elif layout is None:
+            root = managed_data_root_v1(self.data_dir, allow_missing=True)
+            layout = InstalledDataLayoutV1(root, root / GRAPH_NAME)
+        if (layout.plugin_data_root != managed_data_root_v1(self.data_dir, allow_missing=True)
+                or layout.storage_admission is not self.storage_admission):
+            raise ManagedDataLayoutError("installation data layout binding differs")
+        inspect_installed_data_layout_v1(layout)
+        return layout
 
     @property
     def graph_path(self):
-        if self.storage_admission is not None:
-            self.storage_admission.require_current_process_v1()
-            return self.storage_admission.graph_path
-        return self.data_dir / "sylanne3.sqlite3"
+        return self.require_data_layout_v1().graph_path
 
 
 async def assemble_v2_installation(
@@ -118,6 +136,17 @@ async def assemble_v2_installation(
 
     await asyncio.to_thread(require_current_bundle_selection_v2, bundle, root, require_selected_python=True)
 
+    try:
+        data_root = await asyncio.to_thread(managed_data_root_v1, data, allow_missing=True)
+        if storage_admission is not None:
+            storage_admission.require_current_process_v1()
+        layout = InstalledDataLayoutV1(
+            data_root, storage_admission.graph_path if storage_admission is not None
+            else data_root / GRAPH_NAME, storage_admission)
+        await asyncio.to_thread(inspect_installed_data_layout_v1, layout)
+    except OSError as exc:
+        raise ManagedDataLayoutError("installed storage layout cannot be inspected") from exc
+
     request = AuthorityProvisioningRequest(
         protocol=AUTHORITY_PROTOCOL,
         profile_id=selection.profile_id,
@@ -140,6 +169,7 @@ async def assemble_v2_installation(
         getattr(bundle, "d03_arrival", None),
         getattr(bundle, "reverse_handoff", None),
         storage_admission,
+        layout,
     )
 
 

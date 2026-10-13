@@ -65,6 +65,53 @@ from .installed_platform_observation import (
 from ..runtime_contracts import NamespaceId
 
 
+def compose_installed_owner_ticket_store_v3(*, core, services, graph_db_path, utc_clock,
+        first_claim_verifier, verified_claimant, owner_sessions, creation_pairing_source,
+        create_owner_schema=False):
+    """Share the real finished-fence and Graph verifiers without an RPC server."""
+    def finished_fence(permit: FencePermitV2, finish_id: str,
+                       finish_digest: str) -> bool:
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or type(finish_id) is not str or type(finish_digest) is not str):
+            return False
+        service = services.get(permit.namespace)
+        if service is None:
+            return False
+        with service._frozen() as (db, deletion_head, execution_head,
+                                   deletion_history):
+            current = service._current_locked(db, deletion_head, execution_head)
+            if current != permit.pinned_anchor:
+                return False
+            AuthorityV2FenceStore._check_schema(db)
+            AuthorityV2FenceStore._require_no_migration(db)
+            row = AuthorityV2FenceStore._row(db, permit.operation_id)
+            # The epoch is fixed in this fence row. Later finished fences advance
+            # the issuance counter without invalidating this durable receipt.
+            return (row is not None
+                    and row[:6] == (
+                        permit.operation_id, permit.namespace, permit.subject,
+                        permit.token, permit.fence_epoch, permit.revision)
+                    and row[6] == "finished"
+                    and row[8:11] == (finish_id, finish_digest, None)
+                    and AuthorityV2FenceStore._permit(row) == permit
+                    and permit.authority_id == core._id(db))
+
+    graph_verifier = PinnedCurrentGraphVerifier(
+        graph_db_path, finished_fence_verifier=finished_fence)
+    revoke_graph_verifier = PinnedCurrentOwnerRevokeGraphVerifier(
+        graph_db_path, finished_fence_verifier=finished_fence)
+    return AuthorityV2OwnerTicketStore(
+        core, utc_clock=utc_clock,
+        first_claim_verifier=first_claim_verifier,
+        claimant_verifier=verified_claimant,
+        graph_commit_verifier=graph_verifier,
+        revoke_graph_commit_verifier=revoke_graph_verifier,
+        owner_sessions=owner_sessions,
+        creation_pairing_source=creation_pairing_source,
+        create=create_owner_schema,
+    )
+
+
 def compose_local_owner_authority(
     *, core: AuthorityServiceCore,
     v2_fences: Mapping[str, AuthorityV2FenceService],
@@ -156,47 +203,10 @@ def compose_local_owner_authority(
     if set(namespace_bindings_v2.values()) != set(services):
         raise AuthorityUnavailable("owner namespace bindings must cover the installed services")
 
-    def finished_fence(permit: FencePermitV2, finish_id: str,
-                       finish_digest: str) -> bool:
-        if (type(permit) is not FencePermitV2 or permit.operation != "write"
-                or type(finish_id) is not str or type(finish_digest) is not str):
-            return False
-        service = services.get(permit.namespace)
-        if service is None:
-            return False
-        with service._frozen() as (db, deletion_head, execution_head,
-                                   deletion_history):
-            current = service._current_locked(db, deletion_head, execution_head)
-            if current != permit.pinned_anchor:
-                return False
-            AuthorityV2FenceStore._check_schema(db)
-            AuthorityV2FenceStore._require_no_migration(db)
-            row = AuthorityV2FenceStore._row(db, permit.operation_id)
-            # The epoch is fixed in this fence row. Later finished fences advance
-            # the issuance counter without invalidating this durable receipt.
-            return (row is not None
-                    and row[:6] == (
-                        permit.operation_id, permit.namespace, permit.subject,
-                        permit.token, permit.fence_epoch, permit.revision)
-                    and row[6] == "finished"
-                    and row[8:11] == (finish_id, finish_digest, None)
-                    and AuthorityV2FenceStore._permit(row) == permit
-                    and permit.authority_id == core._id(db))
-
-    graph_verifier = PinnedCurrentGraphVerifier(
-        graph_db_path, finished_fence_verifier=finished_fence)
-    revoke_graph_verifier = PinnedCurrentOwnerRevokeGraphVerifier(
-        graph_db_path, finished_fence_verifier=finished_fence)
-    owner_tickets = AuthorityV2OwnerTicketStore(
-        core, utc_clock=utc_clock,
-        first_claim_verifier=first_claim_verifier,
-        claimant_verifier=verified_claimant,
-        graph_commit_verifier=graph_verifier,
-        revoke_graph_commit_verifier=revoke_graph_verifier,
-        owner_sessions=owner_sessions,
-        creation_pairing_source=creation_pairing_source,
-        create=create_owner_schema,
-    )
+    owner_tickets = compose_installed_owner_ticket_store_v3(core=core, services=services,
+        graph_db_path=graph_db_path, utc_clock=utc_clock, first_claim_verifier=first_claim_verifier,
+        verified_claimant=verified_claimant, owner_sessions=owner_sessions,
+        creation_pairing_source=creation_pairing_source, create_owner_schema=create_owner_schema)
     if v2_migration_rpc is not None and v2_migration_rpc_factory is not None:
         raise AuthorityUnavailable("migration handler has two installation sources")
     if v2_migration_rpc_factory is not None:

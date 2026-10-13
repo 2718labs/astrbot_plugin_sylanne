@@ -47,8 +47,37 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
             or request.prepare_operation_id != binding.prepare_operation_id or preparation.frame.envelope.identity.operation_id != binding.prepare_operation_id
             or bundle.envelope != preparation.frame.envelope):
         raise ValueError("life preparation has no exact current Owner fence attempt")
-    finish_digest = "sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
-        "operation_id": binding.prepare_operation_id, "request_digest": attempt[0], "permit_token": scope.permit.token})
+    owner_task=getattr(runtime,'_active_owner_task_issuance_v1',None)
+    issued = runtime._active_foreground_issuance_v1
+    if owner_task is not None:
+        from .owner_source_note_task_issuance_v1 import require_owner_source_note_task_issuance_v1
+        from .domain_production_commit_v1 import owner_task_domain_finish_digest_v1
+        from .d11_life_contract_v1 import D11LifeExecutionBindingV1
+        evidence=require_owner_source_note_task_issuance_v1(owner_task,graph,scope)
+        if (issued is not None or type(binding) is not D11LifeExecutionBindingV1
+                or evidence.request.operation_kind!='prepare_life'
+                or evidence.request.operation_id!=binding.prepare_operation_id
+                or attempt[0]!=canonical_digest(evidence.request)
+                or preparation.frame.envelope.authority.actor!=evidence.current_self.self_entity_ref
+                or preparation.prepared.plan.input_source.ref!=evidence.authorization.request.body_source_ref
+                or preparation.prepared.plan.project.ref!=evidence.authorization.request.project_ref):
+            raise ValueError('SourceNote Life preparation lost its exact independent Owner task witness')
+        finish_digest=owner_task_domain_finish_digest_v1(evidence.request,scope.permit)
+    elif issued is not None:
+        from .foreground_activity_issuance_v1 import require_foreground_activity_issuance_v1
+        from .domain_production_commit_v1 import foreground_domain_finish_digest_v1
+        from .d11_life_contract_v1 import D11DraftExecutionBindingV1
+        evidence = require_foreground_activity_issuance_v1(issued, graph, scope)
+        if (type(binding) is not D11DraftExecutionBindingV1
+                or evidence.request.operation_kind != "prepare_life"
+                or evidence.request.operation_id != binding.prepare_operation_id
+                or attempt[0] != canonical_digest(evidence.request)
+                or preparation.frame.envelope.authority.actor != evidence.current_self.self_entity_ref):
+            raise ValueError("draft Life preparation lost its exact independently issued foreground self witness")
+        finish_digest = foreground_domain_finish_digest_v1(evidence.request, scope.permit)
+    else:
+        finish_digest = "sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
+            "operation_id": binding.prepare_operation_id, "request_digest": attempt[0], "permit_token": scope.permit.token})
     _ACTIVE[id(witness)] = witness
     try:
         receipt = graph._commit_domain_bundle_fenced(bundle, process_lease, in_transaction=True,

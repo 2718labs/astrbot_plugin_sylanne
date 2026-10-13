@@ -135,6 +135,20 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
             if row:
                 question = json.loads(row[0])
                 roots.extend(question["source_refs"])
+                if question.get("schema") == "d07.relationship-semantic-question.v2":
+                    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+                    from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
+                    typed = decode_typed_production_value_v1(question, D07RelationshipSemanticQuestionV2)
+                    keys.append(typed.cycle_ref.key)
+                    keys.append(AtomKey.from_token(typed.trigger_original_ref))
+                    from .foreground_cycle_v1 import foreground_cycle_from_wire_v1
+                    from .jobs import get_job
+                    cycle = foreground_cycle_from_wire_v1(get_job(db, typed.cycle_ref.key.name).continuation)
+                    keys.append(AtomKey.from_token(cycle.source_ref))
+                    policy = db.execute("SELECT payload_json FROM graph_d05_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? AND revision=?",
+                        (*namespace.as_tuple, typed.policy_ref, typed.policy_revision)).fetchone()
+                    if policy:
+                        roots.extend(json.loads(policy[0])["policy_source_refs"])
                 try:
                     keys.append(AtomKey.from_token(question["target_ref"]["ref"]))
                 except (ValueError, TypeError):

@@ -655,15 +655,21 @@ _CONTACT_FINAL_WRITE_TYPES = frozenset({'d08.goal.v1','d08.action_intent.v1','d0
     'd09.contact_batch_provenance.v3','d09.contact_batch_eligibility.v3',
     'd10.contact_claim.v2','runtime.job','runtime.outbox'})
 
-def validate_contact_final_provenance_v3(value):
+def validate_contact_final_provenance_v3(value, *, prepared_evidence=None):
     """Closed C09/cold-reader shape; this is evidence decoding, not permission."""
     if type(value) is not dict or set(value) != _CONTACT_FINAL_PROVENANCE_FIELDS:
         raise ValueError('Contact final provenance fields differ')
     if value['schema'] != 'd08.contact-final-original.v3' or value['commit_state'] != 'committed_pending_finish':
         raise ValueError('Contact original commit marker cannot claim a later Authority ACK')
     from .contact_qualification_evidence_v3 import decode_contact_qualification_evidence_v3
-    qualification = decode_contact_qualification_evidence_v3(value['qualification_evidence'],
-        expected_digest=value['qualification_digest'])
+    if prepared_evidence is None:
+        qualification = decode_contact_qualification_evidence_v3(value['qualification_evidence'],
+            expected_digest=value['qualification_digest'])
+    else:
+        from .dispatch_initial_source_read_v3 import require_prepared_contact_evidence_v3
+        qualification=require_prepared_contact_evidence_v3(prepared_evidence)
+        if qualification.qualification.digest!=value['qualification_digest']:
+            raise ValueError('private prepared Contact original qualification digest differs')
     for field in ('reviewed_content_digest','qualification_digest','admission_receipt_digest','request_digest','footprint_digest'):
         item = value[field]
         if type(item) is not str or len(item) != 64 or any(c not in '0123456789abcdef' for c in item):

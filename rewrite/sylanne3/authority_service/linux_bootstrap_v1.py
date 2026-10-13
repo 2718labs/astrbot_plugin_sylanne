@@ -49,6 +49,10 @@ def initialize_fresh_authority_v1(config, registry, *, instance_lease=None):
     if len(config.execution_journals) != 1 or config.c09_storage_v1 is not None:
         raise AuthorityUnavailable("fresh initializer requires one unbound C09 cohort")
     namespace = next(iter(config.execution_journals))
+    peers = [(certificate, profile) for (certificate, profile, _), mapped in
+             config.namespace_bindings_v2.items() if mapped == namespace]
+    if len(peers) != 1:
+        raise AuthorityUnavailable("fresh initializer requires one actual Host namespace binding")
     paths = (config.authority_db, config.deletion_db, config.graph_db,
              config.execution_journals[namespace].path)
     if any(Path(path).exists() for path in paths):
@@ -83,6 +87,12 @@ def initialize_fresh_authority_v1(config, registry, *, instance_lease=None):
             cls(core=core, fences=fences, deletion=guard, execution=execution, namespace=namespace).run(credential=migration)
         AuthorityV2ScopedErasureStore(core=core, fences=fences, deletion=guard, execution=execution,
             namespace=namespace).migrate_zero_history(credential=migration)
+        if config.d13_counter_assets_v1:
+            from .d13_core_counter_service_v1 import install_initial_d13_counter_original_schema_v1
+            with core._tx() as db:
+                install_initial_d13_counter_original_schema_v1(db)
+                from .d13_provider_http_admission_v1 import install_initial_provider_http_binding_schema_v1
+                install_initial_provider_http_binding_schema_v1(db)
         AuthorityV2ModelEgressStore(core._db, create=True, lock=core._lock)
         AuthorityV2WorkerModelResultAttempts(core._db, create=True, lock=core._lock)
         clock = lambda: datetime.now(timezone.utc)
@@ -94,6 +104,7 @@ def initialize_fresh_authority_v1(config, registry, *, instance_lease=None):
             utc_clock=clock, identity=pairings, administrator_authorizer=config.administrator_authorizer,
             publisher_manifest_verifier=config.publisher_manifest_verifier, installations_v2=config.installations_v2,
             namespace_bindings_v2=config.namespace_bindings_v2,
+            self_identity_readers_v2={namespace: peers[0]}, create_self_identity_schema=True,
             v2_final_handoff_reverse={key: ReverseGraphClaimClient(value) for key, value in config.reverse_handoff_profiles.items()},
             v2_final_handoff_issuers=config.reverse_handoff_issuers, owner_sessions=sessions, create_owner_schema=True)
         authority_id = core._db.execute("SELECT value FROM authority_meta WHERE key='authority_id'").fetchone()[0]

@@ -271,7 +271,8 @@ def stage_prepare_life_numeric_in_transaction_v1(db, *, frame, request, installe
     provider.validate(primary.proposals[0], frame.snapshot)
     stage = InternalLifeNumericPreparationStageV1(primary, original, frozen, job, frame)
     identity = id(stage)
-    _STAGES[identity] = (weakref.ref(stage, lambda _: _STAGES.pop(identity, None)), db)
+    _STAGES[identity] = (weakref.ref(stage, lambda _: _STAGES.pop(identity, None)), db,
+        context, bundle, frozen.digest, installed_readers.issuer, installed_readers.resource_issuer, db.total_changes)
     return stage
 
 
@@ -280,8 +281,15 @@ def verify_life_numeric_preparation_in_transaction_v1(db, staged, readers, bundl
     if item is None or item[0]() is not staged or item[1] is not db or not db.in_transaction:
         raise ValueError('Life numeric preparation was not issued in this transaction')
     p, frame = staged.prepared, staged.frame
-    actual_bundle, _, _, frozen = _current(db, frame,
-        PrepareInternalLifeNumericRequestV1(p.frozen.identity.episode_ref, p.causal_operation_id), readers)
+    # The registered qualification remains valid only in this untouched W01 snapshot.
+    # Never update the saved counter or use this proof after an intervening write.
+    if (db.total_changes != item[7] or readers.life_numeric_bundle is not item[3]
+            or readers.issuer is not item[5] or readers.resource_issuer is not item[6]
+            or staged.frozen.digest != item[4]):
+        raise ValueError('Life numeric preparation qualification changed before CAS')
+    from .d06_life_numeric_context_v1 import require_current_life_numeric_context_v1
+    require_current_life_numeric_context_v1(item[2], db=db, frame=frame)
+    actual_bundle, frozen = item[3], staged.frozen
     quote = readers.resource_issuer.original_signed_quote(db, p.quote_id, 1)
     reserved = db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
         (quote.parent_budget_lease_ref, p.operation_id)).fetchone()

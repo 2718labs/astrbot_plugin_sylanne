@@ -43,6 +43,7 @@ class HostInstallationCaseV1:
     host_driver_function: str
     host_driver_sha256: str
     host_driver_configuration: dict
+    initial_phase_setup_file: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,6 +52,9 @@ class ParentAuthorityServicesV1:
     gate: object
     close_host_handles: object
     authenticate_completed: object
+    daemon: object = None
+    deployment_config: object = None
+    maintenance_factory: object = None
 
 
 @dataclasses.dataclass(frozen=True)

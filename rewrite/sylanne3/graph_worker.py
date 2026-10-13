@@ -1,20 +1,259 @@
-"""One bounded thread owns the production graph's synchronous lifetime."""
-
+"""One bounded thread owns graph calls and their explicit storage continuations."""
 from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
+from contextlib import ExitStack
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
 import inspect
+import traceback
 from queue import Queue
 from threading import BoundedSemaphore, Lock, Thread
 from typing import Callable
 
 from .contracts import CapacityExceeded
 
-
 _STOP = object()
 _WINDOW_READY = object()
 _WINDOW_END = object()
+_WORK_ISSUER_V3 = object()
+_RESULT_ISSUER_V3 = object()
+_STORAGE_INVOCATION_V3 = ContextVar("sylanne_graph_storage_invocation_v3", default=None)
+_STORAGE_KINDS_V3 = frozenset({"source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "current_graph_full_read_v3", "d13_standby_read_v3", "current_method_learning_read_v3", "domain_background_read_v3"})
+
+
+def _clear_storage_error_frames_v3(error):
+    """Preserve the actual traceback locations while detaching completed locals."""
+    pending,seen = [error],set()
+    while pending:
+        current=pending.pop()
+        if current is None or id(current) in seen:continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__,current.__context__))
+        if isinstance(current,BaseExceptionGroup):pending.extend(current.exceptions)
+
+
+class GraphStorageContinuationRequiredV3(RuntimeError):
+    """The actual installed storage operation requires its owning async worker."""
+
+
+@dataclass(frozen=True, slots=True)
+class _GraphStorageInvocationV3:
+    coordinator: object
+    ticket: int | None
+    mode: str
+    initial: bool
+
+
+def require_graph_storage_work_admission_v3(coordinator):
+    """Require an actual ordinary worker invocation before opening a fence."""
+    invocation = _STORAGE_INVOCATION_V3.get()
+    if (invocation is None or invocation.coordinator is not coordinator
+            or invocation.mode != "ordinary" or invocation.ticket is None):
+        raise GraphStorageContinuationRequiredV3("async_graph_worker_required")
+    return invocation.ticket
+
+
+@dataclass(frozen=True, slots=True)
+class GraphStorageStepV3:
+    status: str
+    result: object = None
+
+    def __post_init__(self):
+        if self.status not in {"progress", "complete"}:
+            raise ValueError("graph storage step has an unknown status")
+        if self.status == "progress" and self.result is not None:
+            raise ValueError("unfinished graph storage step cannot publish a result")
+
+
+class OwnedGraphStorageResultV3:
+    """Private DTO retention ownership, moved to the actual response encoder."""
+    __slots__ = ("_value", "_lease", "_lock", "_release_payload")
+
+    def __init__(self, issuer, value, lease, release_payload=None):
+        if issuer is not _RESULT_ISSUER_V3:
+            raise TypeError("actual graph worker result ownership required")
+        self._value, self._lease, self._lock = value, lease, Lock()
+        self._release_payload = release_payload
+
+    def take_value_v3(self):
+        """Move the actual value and the same lease together, exactly once."""
+        with self._lock:
+            if self._lease is None:
+                raise RuntimeError("graph storage result ownership already moved")
+            value, lease = self._value, self._lease
+            if self._release_payload is not None:
+                lease.transfer_payload_release_v3(self._release_payload)
+            self._value = self._lease = self._release_payload = None
+        return value, lease
+
+    def release_v3(self):
+        """Drop an abandoned value; an already moved wrapper owns nothing."""
+        with self._lock:
+            lease, release_payload = self._lease, self._release_payload
+            self._value = self._lease = self._release_payload = None
+        if lease is not None:
+            try:
+                if release_payload is not None:release_payload()
+            finally:
+                lease.release()
+
+
+class GraphStorageWorkV3:
+    """Private scheduling state; actual permissions remain with the producer.
+
+    ``state`` is the registered kind's actual state, retaining the original
+    job/input references and readset. A read operation does not invent a job.
+    ``operation`` is the original physical retention lease, never a new grant.
+    """
+    __slots__ = ("coordinator", "kind", "operation_id", "selection_digest",
+        "deadline_utc", "state", "operation", "phase", "terminal", "ticket",
+        "result_lease", "_handed_to_worker", "_finish_called", "_mappers",
+        "_request_lifetime")
+
+    def __init__(self, issuer, coordinator, *, kind, operation_id,
+                 selection_digest, deadline_utc, state, operation):
+        if issuer is not _WORK_ISSUER_V3:
+            raise TypeError("actual graph storage work producer required")
+        ticket = require_graph_storage_work_admission_v3(coordinator)
+        invocation = _STORAGE_INVOCATION_V3.get()
+        if not invocation.initial or kind not in _STORAGE_KINDS_V3:
+            raise GraphStorageContinuationRequiredV3("registered initial graph storage producer required")
+        self.coordinator, self.kind, self.ticket = coordinator, kind, ticket
+        self.operation_id, self.selection_digest = operation_id, selection_digest
+        self.deadline_utc, self.state, self.operation = deadline_utc, state, operation
+        self.phase, self.terminal, self.result_lease = "prepared", False, None
+        self._handed_to_worker = self._finish_called = False
+        self._mappers = []
+        self._request_lifetime = None
+
+    def _require_invocation(self, coordinator, *, initial=False):
+        if coordinator is not self.coordinator:
+            raise RuntimeError("graph storage work belongs to another coordinator")
+        ticket = require_graph_storage_work_admission_v3(coordinator)
+        invocation = _STORAGE_INVOCATION_V3.get()
+        if ticket != self.ticket or (initial and (not invocation.initial or self._handed_to_worker)):
+            raise RuntimeError("graph storage work belongs to another invocation")
+
+    def map_terminal_v3(self, stage, success_mapper, failure_mapper):
+        self._require_invocation(self.coordinator, initial=True)
+        if len(self._mappers) == 2 or stage not in {"issuer", "service"} or stage != ("issuer", "service")[len(self._mappers)]:
+            raise RuntimeError("graph storage terminal mapper stage is repeated or out of order")
+        if not callable(success_mapper) or not callable(failure_mapper):
+            raise TypeError("graph storage terminal mappers must be actual functions")
+        self._mappers.append((stage, success_mapper, failure_mapper))
+        return self
+
+    def adopt_request_lifetime_v3(self, lifetime):
+        self._require_invocation(self.coordinator, initial=True)
+        if type(lifetime) is not ExitStack or self._request_lifetime is not None:
+            raise RuntimeError("graph storage request lifetime must be transferred once")
+        self._request_lifetime = lifetime
+        return self
+
+    def _accept(self, coordinator, ticket):
+        self._require_invocation(coordinator, initial=True)
+        if ticket != self.ticket or self.terminal:
+            raise RuntimeError("graph storage work identity changed before worker ownership")
+        self._handed_to_worker = True
+
+    def advance(self, coordinator):
+        self._require_invocation(coordinator)
+        if not self._handed_to_worker or self.terminal:
+            raise RuntimeError("graph storage work is not owned and unfinished")
+        if self.kind == "current_graph_full_read_v3":
+            from .runtime.current_graph_full_read_v3 import advance_current_graph_full_read_v3
+            step = advance_current_graph_full_read_v3(coordinator,self)
+        else:
+            step = coordinator._advance_runtime_storage_work_v3(self)
+        if type(step) is not GraphStorageStepV3:
+            raise TypeError("actual graph storage producer step required")
+        return step
+
+    def _finish_and_map(self, coordinator, value, error):
+        self._require_invocation(coordinator)
+        if self._finish_called:
+            raise RuntimeError("graph storage work was already finalized")
+        self._finish_called = True
+        storage_payload = self.kind in {"owner_material_source_write_v3","dispatch_inventory_prepare_v3","current_graph_full_read_v3","d13_standby_read_v3","current_method_learning_read_v3","domain_background_read_v3"}
+        release_payload = (value.release_payload_v3
+            if self.kind in {"current_graph_full_read_v3","d13_standby_read_v3","current_method_learning_read_v3","domain_background_read_v3"} and error is None else None)
+        if storage_payload and error is not None:_clear_storage_error_frames_v3(error)
+        try:
+            if self.kind == "current_graph_full_read_v3":
+                from .runtime.current_graph_full_read_v3 import finish_current_graph_full_read_v3
+                finish_current_graph_full_read_v3(coordinator,self,error)
+            else:
+                coordinator._finish_runtime_storage_work_v3(self, error)
+        except BaseException as finish_error:
+            if error is not None:
+                finish_error.__cause__ = error
+            value, error = None, finish_error
+            if storage_payload:_clear_storage_error_frames_v3(error)
+        self.terminal = True
+        self.phase = "failed" if error is not None else "complete"
+        if error is None and self.kind == "current_method_learning_read_v3":
+            try:
+                value = value.require_business_result_v3(self)
+            except BaseException as result_error:
+                value, error = None, result_error
+                self.phase = "failed"
+                _clear_storage_error_frames_v3(error)
+        mappers, self._mappers = self._mappers, []
+        try:
+            for _, success, failed in mappers:
+                try:
+                    value = success(value) if error is None else failed(error)
+                    error = None
+                except BaseException as mapped_error:
+                    value, error = None, mapped_error
+                    if storage_payload:_clear_storage_error_frames_v3(error)
+        finally:
+            mappers.clear()
+            if self.kind == "owner_material_source_write_v3":
+                self.state.input_witness = None
+        if self._request_lifetime is not None:
+            lifetime, self._request_lifetime = self._request_lifetime, None
+            try:
+                lifetime.close()
+            except BaseException as close_error:
+                if error is not None:
+                    close_error.__cause__ = error
+                value, error = None, close_error
+                if storage_payload:_clear_storage_error_frames_v3(error)
+        lease, self.result_lease = self.result_lease, None
+        if error is not None:
+            if lease is not None:
+                try:
+                    if release_payload is not None:release_payload()
+                finally:
+                    lease.release()
+            raise error
+        if lease is not None:
+            return OwnedGraphStorageResultV3(_RESULT_ISSUER_V3, value, lease, release_payload)
+        return value
+
+
+def create_graph_storage_work_v3(coordinator, *, kind, operation_id,
+                                 selection_digest, deadline_utc, state, operation):
+    """Store an actual producer's fenced state without minting authority."""
+    return GraphStorageWorkV3(_WORK_ISSUER_V3, coordinator, kind=kind,
+        operation_id=operation_id, selection_digest=selection_digest,
+        deadline_utc=deadline_utc, state=state, operation=operation)
+
+
+class _GraphCallV3:
+    __slots__ = ("function", "args", "outcome", "is_callback", "ticket", "context",
+                 "started", "deliver", "work", "terminal", "delivery_abandoned",
+                 "delivered_result")
+
+    def __init__(self, function, args, outcome, *, is_callback, ticket):
+        self.function, self.args, self.outcome = function, args, outcome
+        self.is_callback, self.ticket, self.context = is_callback, ticket, copy_context()
+        self.started = self.deliver = self.terminal = self.delivery_abandoned = False
+        self.work = self.delivered_result = None
 
 
 class _ExclusiveCallbackWindow:
@@ -24,9 +263,8 @@ class _ExclusiveCallbackWindow:
         self._worker = worker
         self._ready: Future = Future()
         self._ended: Future = Future()
-        self._entered = False
-        self._ending = False
-        self._called = False
+        self._entered = self._ending = self._called = False
+        self._watermark = 0
 
     async def __aenter__(self) -> _ExclusiveCallbackWindow:
         worker = self._worker
@@ -37,19 +275,19 @@ class _ExclusiveCallbackWindow:
                 raise RuntimeError("graph worker is closed")
             if worker._callback_window is not None:
                 raise RuntimeError("graph worker callback window is active")
+            self._watermark = worker._accepted_ticket
             worker._callback_window = self
-            worker._queue.put_nowait((_WINDOW_READY, self._ready))
+            worker._queue.put_nowait((_WINDOW_READY, self))
         try:
             await asyncio.shield(asyncio.wrap_future(self._ready))
         except BaseException:
-            # The marker still drains accepted calls before reopening admission.
             self._end()
             raise
         self._entered = True
         return self
 
     async def call(self, function: Callable, *args):
-        """Submit one synchronous graph transaction; it must not make Authority RPCs."""
+        """One synchronous callback; it cannot create storage continuation work."""
         if not callable(function):
             raise TypeError("graph worker callback requires a callable")
         worker = self._worker
@@ -59,20 +297,20 @@ class _ExclusiveCallbackWindow:
             if self._called:
                 raise RuntimeError("graph worker callback already submitted")
             self._called = True
-            outcome: Future = Future()
-            worker._queue.put_nowait((function, args, outcome, True))
-        wrapped = asyncio.wrap_future(outcome)
-        wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
-        return await asyncio.shield(wrapped)
+            call = _GraphCallV3(function, args, Future(), is_callback=True, ticket=None)
+            worker._queue.put_nowait(call)
+        return await worker._await_call(call)
 
     def _end(self) -> None:
         worker = self._worker
         with worker._lock:
             if not self._ending:
                 if worker._callback_window is not self:
+                    if self._ended.done():
+                        return
                     raise RuntimeError("graph worker callback window is not open")
                 self._ending = True
-                worker._queue.put_nowait((_WINDOW_END, self, self._ended))
+                worker._queue.put_nowait((_WINDOW_END, self))
 
     async def __aexit__(self, _exc_type, _exc, _tb) -> None:
         self._end()
@@ -80,13 +318,11 @@ class _ExclusiveCallbackWindow:
 
 
 class GraphWorker:
-    """Run store creation, coordinator calls, and store close on one thread.
+    """One thread and bounded ordinary tickets own complete graph lifetimes.
 
-    ``store_factory`` creates a ProductionGraphStore. When supplied,
-    ``fence_port_factory`` creates the V2FencePort on the same thread before
-    ``coordinator_factory`` binds it to the GraphCoordinator. A submitted callable receives that
-    coordinator as its first argument. The fixed capacity counts both running
-    and queued ordinary calls until the worker actually finishes them.
+    An ordinary function executes once. Its exact private GraphStorageWorkV3
+    may advance one quantum per queue turn while retaining the same ticket,
+    capacity slot, Future, request Context and actual producer retention lease.
     """
 
     def __init__(self, store_factory: Callable, coordinator_factory: Callable,
@@ -97,16 +333,17 @@ class GraphWorker:
             raise TypeError("graph worker fence port factory must be callable")
         if type(capacity) is not int or capacity < 1:
             raise ValueError("graph worker capacity must be a positive integer")
-        self._store_factory = store_factory
-        self._coordinator_factory = coordinator_factory
+        self._store_factory, self._coordinator_factory = store_factory, coordinator_factory
         self._fence_port_factory = fence_port_factory
         self._slots = BoundedSemaphore(capacity)
-        # Ordinary work uses capacity slots. Two extra cells hold lease
-        # barriers or the callback; shutdown waits for an active lease.
         self._queue: Queue = Queue(maxsize=capacity + 2)
         self._lock = Lock()
-        self._closed = False
+        self._closed = self._stop_requested = False
+        self._accepted_ticket = 0
+        self._ordinary_calls = {}
+        self._callback_call = None
         self._callback_window: _ExclusiveCallbackWindow | None = None
+        self._pending_window = self._pending_window_end = None
         self._started: Future = Future()
         self._stopped: Future = Future()
         self._thread = Thread(target=self._run, name="sylanne-graph", daemon=True)
@@ -121,7 +358,6 @@ class GraphWorker:
         try:
             await asyncio.shield(asyncio.wrap_future(worker._started))
         except BaseException:
-            # A cancelled startup must not strand the newly created store.
             try:
                 await worker.close()
             except BaseException:
@@ -129,9 +365,131 @@ class GraphWorker:
             raise
         return worker
 
+    def _complete_call(self, call, value, error):
+        abandoned = None
+        with self._lock:
+            call.terminal = True
+            if not call.is_callback:
+                del self._ordinary_calls[call.ticket]
+                self._slots.release()
+            else:
+                self._callback_call = None
+            if type(value) is OwnedGraphStorageResultV3:
+                if call.delivery_abandoned or not call.deliver:
+                    abandoned, value = value, None
+                else:
+                    call.delivered_result = value
+        if abandoned is not None:
+            try:
+                abandoned.release_v3()
+            except BaseException as release_error:
+                error = release_error
+        # No completed queue cell may cache request Context or producer state.
+        call.function, call.args, call.context, call.work = None, (), None, None
+        if call.deliver:
+            if error is None:
+                call.outcome.set_result(value)
+            else:
+                call.outcome.set_exception(error)
+
+    def _step_call(self, call, coordinator):
+        initial = not call.started
+        if initial:
+            call.started = True
+            call.deliver = call.outcome.set_running_or_notify_cancel()
+        token = _STORAGE_INVOCATION_V3.set(_GraphStorageInvocationV3(
+            coordinator, call.ticket, "callback" if call.is_callback else "ordinary", initial))
+        value = error = None
+        try:
+            try:
+                if call.work is None:
+                    value = call.function(coordinator, *call.args)
+                    if type(value) is GraphStorageWorkV3:
+                        if call.is_callback:
+                            raise GraphStorageContinuationRequiredV3("callback cannot return graph storage work")
+                        value._accept(coordinator, call.ticket)
+                        call.work, value = value, None
+                        self._queue.put_nowait(call)
+                        return
+                    if inspect.isawaitable(value):
+                        if inspect.iscoroutine(value):
+                            value.close()
+                        raise TypeError("graph worker call must be synchronous")
+                else:
+                    step = call.work.advance(coordinator)
+                    if step.status == "progress":
+                        self._queue.put_nowait(call)
+                        return
+                    value = step.result
+            except BaseException as call_error:
+                value, error = None, call_error
+            if call.work is not None:
+                try:
+                    value = call.work._finish_and_map(coordinator, value, error)
+                    error = None
+                except BaseException as terminal_error:
+                    value, error = None, terminal_error
+            self._complete_call(call, value, error)
+        finally:
+            _STORAGE_INVOCATION_V3.reset(token)
+
+    def _pump_barriers(self):
+        ready = ended = None
+        with self._lock:
+            window = self._pending_window
+            if window is not None and not any(ticket <= window._watermark for ticket in self._ordinary_calls):
+                ready, self._pending_window = window._ready, None
+            window = self._pending_window_end
+            if (window is not None and self._pending_window is None
+                    and not any(ticket <= window._watermark for ticket in self._ordinary_calls)):
+                self._pending_window_end = self._callback_window = None
+                ended = window._ended
+                if self._closed:
+                    self._stop_requested = True
+            stop = (self._stop_requested and not self._ordinary_calls
+                    and self._callback_window is None and self._callback_call is None)
+        if ready is not None:
+            ready.set_result(None)
+        if ended is not None:
+            ended.set_result(None)
+        return stop
+
+    def _abort_calls(self, coordinator, failure):
+        with self._lock:
+            calls = list(self._ordinary_calls.values())
+            if self._callback_call is not None:
+                calls.append(self._callback_call)
+        for call in calls:
+            def abort():
+                if not call.started:
+                    call.started = True
+                    call.deliver = call.outcome.set_running_or_notify_cancel()
+                token = _STORAGE_INVOCATION_V3.set(_GraphStorageInvocationV3(
+                    coordinator, call.ticket, "callback" if call.is_callback else "ordinary", False))
+                error = failure
+                try:
+                    if call.work is not None and not call.work.terminal:
+                        try:
+                            discarded = call.work._finish_and_map(coordinator, None, failure)
+                            if type(discarded) is OwnedGraphStorageResultV3:
+                                discarded.release_v3()
+                        except BaseException as terminal_error:
+                            error = terminal_error
+                    self._complete_call(call, None, error)
+                finally:
+                    _STORAGE_INVOCATION_V3.reset(token)
+            call.context.run(abort)
+        with self._lock:
+            self._closed = True
+            window = self._callback_window
+            self._callback_window = self._pending_window = self._pending_window_end = None
+        if window is not None:
+            for outcome in (window._ready, window._ended):
+                if not outcome.done():
+                    outcome.set_exception(failure)
+
     def _run(self) -> None:
-        store = None
-        fence_port = None
+        store = fence_port = coordinator = None
         failure = None
         try:
             store = self._store_factory()
@@ -144,40 +502,20 @@ class GraphWorker:
             while True:
                 item = self._queue.get()
                 if item is _STOP:
+                    self._stop_requested = True
+                elif type(item) is _GraphCallV3:
+                    if item.is_callback:
+                        self._callback_call = item
+                    item.context.run(self._step_call, item, coordinator)
+                elif item[0] is _WINDOW_READY:
+                    self._pending_window = item[1]
+                elif item[0] is _WINDOW_END:
+                    self._pending_window_end = item[1]
+                if self._pump_barriers():
                     break
-                if item[0] is _WINDOW_READY:
-                    item[1].set_result(None)
-                    continue
-                if item[0] is _WINDOW_END:
-                    _, _, ended = item
-                    with self._lock:
-                        self._callback_window = None
-                        if self._closed:
-                            self._queue.put_nowait(_STOP)
-                    ended.set_result(None)
-                    continue
-                function, args, outcome, is_callback = item
-                deliver = outcome.set_running_or_notify_cancel()
-                result = None
-                call_failure = None
-                try:
-                    result = function(coordinator, *args)
-                    if inspect.isawaitable(result):
-                        if inspect.iscoroutine(result):
-                            result.close()
-                        raise TypeError("graph worker call must be synchronous")
-                except BaseException as exc:
-                    call_failure = exc
-                finally:
-                    if not is_callback:
-                        self._slots.release()
-                if deliver:
-                    if call_failure is None:
-                        outcome.set_result(result)
-                    else:
-                        outcome.set_exception(call_failure)
         except BaseException as exc:
             failure = exc
+            self._abort_calls(coordinator, failure)
         finally:
             if fence_port is not None:
                 try:
@@ -198,8 +536,27 @@ class GraphWorker:
             else:
                 self._stopped.set_exception(failure)
 
+    def _abandon_delivery(self, call):
+        with self._lock:
+            call.delivery_abandoned = True
+            owned, call.delivered_result = call.delivered_result, None
+        if owned is not None:
+            owned.release_v3()
+
+    async def _await_call(self, call):
+        wrapped = asyncio.wrap_future(call.outcome)
+        wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        try:
+            value = await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            self._abandon_delivery(call)
+            raise
+        with self._lock:
+            call.delivered_result = None
+        return value
+
     async def call(self, function: Callable, *args):
-        """Submit one synchronous coordinator call; cancellation leaves it owned."""
+        """Cancellation abandons delivery, never the accepted operation itself."""
         if not callable(function):
             raise TypeError("graph worker call requires a callable")
         with self._lock:
@@ -209,24 +566,18 @@ class GraphWorker:
                 raise RuntimeError("graph worker callback window is active")
             if not self._slots.acquire(blocking=False):
                 raise CapacityExceeded("graph worker capacity exhausted")
-            outcome: Future = Future()
-            self._queue.put_nowait((function, args, outcome, False))
-        wrapped = asyncio.wrap_future(outcome)
-        # An abandoned result can still be an exception; consume it while the
-        # underlying graph operation finishes and releases its slot.
-        wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
-        return await asyncio.shield(wrapped)
+            self._accepted_ticket += 1
+            call = _GraphCallV3(function, args, Future(), is_callback=False, ticket=self._accepted_ticket)
+            self._ordinary_calls[call.ticket] = call
+            self._queue.put_nowait(call)
+        return await self._await_call(call)
 
     def exclusive_callback_window(self) -> _ExclusiveCallbackWindow:
-        """Acquire before Authority begin_handoff, then hold through its response.
-
-        If the response is lost or cancelled, the dispatcher must retain the
-        lease until recovery for that same handoff_id has finished.
-        """
+        """Wait for all tickets before the captured watermark to terminate."""
         return _ExclusiveCallbackWindow(self)
 
     async def close(self) -> None:
-        """Stop admission, drain accepted calls, then close the store on worker."""
+        """Stop admission and drain accepted continuations before closing stores."""
         with self._lock:
             if not self._closed:
                 self._closed = True
@@ -238,4 +589,6 @@ class GraphWorker:
             await asyncio.to_thread(self._thread.join)
 
 
-__all__ = ("GraphWorker",)
+__all__ = ("GraphWorker", "GraphStorageWorkV3", "GraphStorageStepV3",
+    "GraphStorageContinuationRequiredV3", "OwnedGraphStorageResultV3",
+    "require_graph_storage_work_admission_v3", "create_graph_storage_work_v3")

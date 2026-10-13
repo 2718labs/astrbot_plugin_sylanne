@@ -5,6 +5,10 @@ identity of an activity just authenticated against the actual SQL/frame.
 """
 from dataclasses import dataclass
 import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .d06_life_activity_lineage_v1 import QualifiedLifeActivityV1
 
 from ..graph_types import AtomKey, GraphWrite, Owner, TypeSpec, OWNER_GRANT_TYPE, owner_grant_key
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize, schema_hash

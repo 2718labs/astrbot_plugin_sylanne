@@ -306,6 +306,10 @@ def test_model_workflows_fail_closed_on_invalid_scope(mutation) -> None:
     "https://workbench.example.org:8443",
     "https://127.0.0.1:6185",
     "https://[::1]:6185",
+    "http://workbench.example.org",
+    "http://workbench.example.org:6185",
+    "http://127.0.0.1:6185",
+    "http://[::1]:6185",
 ))
 def test_schema2_workbench_origin_is_canonical_and_optional(tmp_path: Path,
                                                               origin: str) -> None:
@@ -321,7 +325,7 @@ def test_schema2_workbench_origin_is_canonical_and_optional(tmp_path: Path,
 
 
 @pytest.mark.parametrize("origin", (
-    "http://workbench.example.org", "HTTPS://workbench.example.org",
+    "HTTP://workbench.example.org", "HTTPS://workbench.example.org",
     "https://Workbench.example.org", "https://workbench.example.org/",
     "https://workbench.example.org/path", "https://workbench.example.org?x=1",
     "https://workbench.example.org#fragment", "https://user@workbench.example.org",
@@ -329,6 +333,12 @@ def test_schema2_workbench_origin_is_canonical_and_optional(tmp_path: Path,
     "https://workbench.example.org:", "https://workbench.example.org.",
     "https://[fe80::1%25eth0]", "https://workbench.example.org:443/",
     "https://workbench.example.org@evil.example.org", "",
+    "http://Workbench.example.org", "http://workbench.example.org/",
+    "http://workbench.example.org/path", "http://workbench.example.org?x=1",
+    "http://workbench.example.org#fragment", "http://user@workbench.example.org",
+    "http://workbench.example.org:0", "http://workbench.example.org:65536",
+    "http://workbench.example.org:", "http://workbench.example.org.",
+    "http://[fe80::1%25eth0]", "http://workbench.example.org@evil.example.org",
     None, 12,
 ))
 def test_schema2_workbench_origin_rejects_noncanonical_content(tmp_path: Path,
@@ -609,3 +619,208 @@ def test_linux_acl_presence_or_unknown_semantics_fail_closed(tmp_path: Path) -> 
         with pytest.raises(authority_profile.AuthorityProfileUnavailable,
                            match="ACL verification failed"):
             authority_profile._check_linux_acl_tree(profile_dir)
+
+
+@pytest.mark.parametrize("version", (2, 3, 4))
+def test_d07_recall_template_is_a_finite_installed_workflow(version):
+    from sylanne3.model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
+    payload = _workflow_profile_payload()
+    payload["model_workflows"]["version"] = version
+    if version == 4:
+        payload["model_workflows"]["artifact_draft"] = None
+    payload["installation_policy"]["root_grant"]["allowed_work_kinds"].append("d07.cognition")
+    payload["model_workflows"]["d07_cognition"] = _model_workflow_payload(
+        "d07.cognition", "proposal", RECALL_TEMPLATE_VERSION_V1)
+    if version == 4:
+        # This node checks the formal workflow codec/constructor. A complete
+        # profile separately requires its explicit foreground/artifact policies.
+        from sylanne3.host.model_workflows_v4 import model_workflows_v4_from_payload
+        installed = model_workflows_v4_from_payload(payload["model_workflows"])
+    else:
+        installed = authority_profile._model_workflows_from_payload(payload)
+    assert installed.d07_cognition.template_version == RECALL_TEMPLATE_VERSION_V1
+    assert installed.d07_cognition.provider_config_ref == installed.reply.provider_config_ref
+
+
+@pytest.mark.parametrize("slot,work_kind,purpose,template", (
+    ("d07_cognition", "d07.cognition", "proposal", "unregistered-recall-template"),
+    ("d07_cognition", "reply", "proposal", "sylanne.d07.ingress_recall_routing_template.v1"),
+    ("d07_cognition", "d07.cognition", "consolidation", "sylanne.d07.ingress_recall_routing_template.v1"),
+    ("context_reply", "d07.cognition", "proposal", "sylanne.d07.ingress_recall_routing_template.v1"),
+))
+def test_d07_recall_workflow_rejects_unknown_and_wrong_slot(slot, work_kind, purpose, template):
+    from sylanne3.model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
+    payload = _workflow_profile_payload()
+    workflow = _model_workflow_payload(work_kind, purpose, template)
+    payload["model_workflows"][slot] = workflow
+    if slot == "context_reply":
+        # Same object in two slots must not turn the wrong context slot into D07.
+        workflow["template_version"] = RECALL_TEMPLATE_VERSION_V1
+        payload["model_workflows"]["d07_cognition"] = workflow
+    with pytest.raises(ValueError):
+        authority_profile._model_workflows_from_payload(payload)
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("missing_work_kind", "own root grant"),
+    ("grant_ceiling", "quote exceeds root budget"),
+    ("root_lease_consistency", "root grant exceeds administrator root lease"),
+])
+def test_life_numeric_v3_requires_its_own_root_grant_and_lease(failure, reason):
+    payload = _workflow_profile_payload()
+    payload["model_workflows"]["version"] = 3
+    payload["model_workflows"]["life_numeric"] = _model_workflow_payload(
+        "d06.encode_internal_life_numeric", "consolidation",
+        "sylanne.d06.internal_life_numeric.v1")
+    grant = payload["installation_policy"]["root_grant"]
+    lease = payload["installation_policy"]["root_lease"]
+    grant["allowed_work_kinds"].append("d06.encode_internal_life_numeric")
+    # Prove the complete typed profile passes before changing one binding.
+    policy = authority_profile._policy_from_payload(payload)
+    workflow = authority_profile._model_workflows_from_payload(payload).life_numeric
+    assert workflow.work_kind in policy.root_grant.allowed_work_kinds
+    assert workflow.quote_ceiling["output_tokens"] <= policy.root_grant.max_ceiling["output_tokens"]
+    assert workflow.quote_ceiling["output_tokens"] <= policy.root_lease.limits["output_tokens"]
+    if failure == "missing_work_kind":
+        grant["allowed_work_kinds"].remove(workflow.work_kind)
+    elif failure == "grant_ceiling":
+        payload["model_workflows"]["life_numeric"]["quote_ceiling"]["output_tokens"] = 65
+    else:
+        lease["limits"]["output_tokens"] = 32
+        payload["model_workflows"]["life_numeric"]["quote_ceiling"]["output_tokens"] = 33
+    with pytest.raises(ValueError, match=reason):
+        authority_profile._policy_from_payload(payload)
+
+
+@pytest.mark.parametrize("explicit_none", (False, True))
+def test_unconfigured_d13_wire_fields_need_no_service_helpers(explicit_none):
+    payload = {"d13_wire_policy": None, "d13_wire_counter": None} if explicit_none else {}
+    with patch.dict(sys.modules, {
+        "sylanne3.authority_service.d13_wire_evidence_v1": None,
+        "sylanne3.authority_service.d13_installed_counter_v1": None,
+    }):
+        assert authority_profile._d13_wire_policy_from_payload(payload, None) is None
+        assert authority_profile._d13_wire_counter_from_payload(payload) is None
+
+
+@pytest.mark.parametrize("field", ("d13_wire_policy", "d13_wire_counter"))
+def test_configured_d13_wire_fields_still_require_exact_contracts(field):
+    payload = {field: {}}
+    with pytest.raises(ValueError, match="fields differ"):
+        if field == "d13_wire_policy":
+            authority_profile._d13_wire_policy_from_payload(payload, None)
+        else:
+            authority_profile._d13_wire_counter_from_payload(payload)
+
+
+def test_profile_and_shared_channel_import_without_full_business_adapters():
+    root = Path(__file__).resolve().parents[3]
+    code = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "rewrite"))
+from sylanne3.host.authority_profile import AuthorityTlsProfile
+from sylanne3.host.mtls_channel import MtlsAuthorityChannel
+from sylanne3.host.authority_transport_contract import AuthorityTlsProfile as SharedProfile
+assert AuthorityTlsProfile is SharedProfile
+assert "sylanne3.host.authority_client" not in sys.modules
+assert "sylanne3.host.mtls_transport" not in sys.modules
+assert "sylanne3.authority_service.current_accepted_erasure_read" not in sys.modules
+assert "sylanne3.model_broker.natural_reply_history_v4" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-B", "-c", code, str(root)], check=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+
+
+def _artifact_draft_v3_payload():
+    main = _model_workflow_payload("artifact_draft_v1", "consolidation", "sylanne.artifact_draft_template.v1")
+    main["quote_ceiling"] = {"input_tokens": 100, "output_tokens": 32, "model_tokens": 132, "model_microusd": 100}
+    phase = {**main, "quote_ceiling": dict(main["quote_ceiling"]), "template_version": "sylanne.artifact_draft_phase_template.v2"}
+    return {
+        "model_workflow": main, "phase_model_workflow": phase,
+        "tool_scope": {"resource_id": "export", "filename": "draft.txt", "mode": "create",
+            "max_file_bytes": 32768, "generated_text_bytes": 32768, "readback_chunk_bytes": 65536,
+            "execution_timeout_seconds": 20},
+        "body_policy": {"policy_ref": "body:phase", "policy_version": 1,
+            "effect_component_policy_ref": "effect:phase", "effect_component_policy_version": 1,
+            "cpu_ceiling_ms": 10, "resource_id": "export"},
+        "observation_policy": None,
+        "standing_scope": {"policy_ref": "standing:phase", "policy_version": 1,
+            "platform_ref": '["fixture","aiocqhttp","bot"]',
+            "allowed_sender_refs": ['["fixture","owner"]'], "valid_until_utc": 4102444800,
+            "task_lifetime_seconds": 600, "root_window_seconds": 60, "maximum_active_tasks": 1,
+            "social_role": "owner", "norm_refs": [], "schema": "sylanne.artifact-standing-scope.v1"},
+        "schema": "sylanne.artifact-draft-policy.v3",
+    }
+
+
+def _artifact_draft_v3_bundle(tmp_path, *, billing=None):
+    from sylanne3.host.model_workflows_v4 import model_workflows_v4_from_payload
+    artifact = authority_profile.artifact_draft_policy_from_payload_v1(_artifact_draft_v3_payload())
+    payload = _workflow_profile_payload()
+    payload["model_workflows"]["version"] = 4
+    payload["model_workflows"]["artifact_draft"] = _artifact_draft_v3_payload()["model_workflow"]
+    installation = payload["installation_policy"]
+    amounts = {"input_tokens": 1000, "model_tokens": 1000, "model_microusd": 1000}
+    installation["root_lease"]["limits"].update(amounts)
+    installation["root_grant"]["max_ceiling"].update(amounts)
+    installation["root_grant"]["allowed_work_kinds"].extend(
+        ("artifact_draft_v1", "d10.life.artifact_draft.v1", "d11.foreground_cycle.v1"))
+    deadline = authority_profile.AdminForegroundDeadlinePolicyV1(
+        "sylanne.foreground-deadline-policy.v1", None, "signed_scope_intersection_v1")
+    foreground = authority_profile.AdminForegroundPolicyV1("sylanne.foreground-policy.v1", 1,
+        "d11.foreground-call-plan.v1", 6, 2, 1, "foreground:phase", 1, deadline)
+    from dataclasses import asdict
+    payload["foreground"] = asdict(foreground)
+    payload["artifact_draft"] = _artifact_draft_v3_payload()
+    foreground = authority_profile._foreground_from_payload(payload)
+    artifact = authority_profile._artifact_draft_from_payload(payload)
+    profile = AuthorityTlsProfile("safe", "127.0.0.1", 9443, "authority.example.org",
+        "authority:production", tmp_path / "ca.pem", tmp_path / "client.pem", tmp_path / "client.key")
+    return authority_profile.AdminInstallationBundle(profile, authority_profile._policy_from_payload(payload),
+        b"d" * 32, b"e" * 32, model_workflows=model_workflows_v4_from_payload(payload["model_workflows"]),
+        foreground=foreground, artifact_draft=artifact, provider_billing_policy_v1=billing)
+
+
+def test_artifact_policy_v3_keeps_create_only_and_closed_legacy_variants():
+    from copy import deepcopy
+    raw = _artifact_draft_v3_payload()
+    installed = authority_profile.artifact_draft_policy_from_payload_v1(raw)
+    assert type(installed) is authority_profile.AdminArtifactDraftPolicyV3
+    assert type(installed.tool_scope) is authority_profile.AdminArtifactDraftToolScopeV1
+    assert installed.model_workflow.template_version == "sylanne.artifact_draft_template.v1"
+    assert installed.phase_model_workflow.template_version == "sylanne.artifact_draft_phase_template.v2"
+    legacy = deepcopy(raw)
+    del legacy["phase_model_workflow"]
+    legacy["schema"] = "sylanne.artifact-draft-policy.v2"
+    scope = legacy["tool_scope"]
+    del scope["mode"]
+    scope.update(maximum_artifact_version=2, operations=["create", "replace_verified_predecessor"],
+        schema="sylanne.artifact-draft-tool-scope.v2")
+    assert type(authority_profile.artifact_draft_policy_from_payload_v1(legacy)) is authority_profile.AdminArtifactDraftPolicyV2
+    legacy["phase_model_workflow"] = raw["phase_model_workflow"]
+    with pytest.raises(ValueError, match="^artifact draft policy schema is invalid$"):
+        authority_profile.artifact_draft_policy_from_payload_v1(legacy)
+    expanded = deepcopy(raw)
+    expanded["phase_model_workflow"]["quote_ceiling"]["input_tokens"] = 101
+    with pytest.raises(ValueError, match="original C4 selection or bounds"):
+        authority_profile.artifact_draft_policy_from_payload_v1(expanded)
+
+
+def test_artifact_phase_identity_is_actual_installed_object(tmp_path):
+    from dataclasses import replace
+    bundle = _artifact_draft_v3_bundle(tmp_path)
+    phase = bundle.artifact_draft.phase_model_workflow
+    assert authority_profile.is_installed_artifact_draft_phase_slot_v2(bundle, phase)
+    assert not authority_profile.is_installed_artifact_draft_phase_slot_v2(bundle, replace(phase))
+    assert not authority_profile.is_installed_artifact_draft_phase_slot_v2(bundle, bundle.model_workflows.artifact_draft)
+
+
+def test_artifact_phase_root_caps_apply_without_billing(tmp_path):
+    from dataclasses import replace
+    bundle = _artifact_draft_v3_bundle(tmp_path)
+    grant = replace(bundle.installation_policy.root_grant,
+        max_ceiling={**bundle.installation_policy.root_grant.max_ceiling, "input_tokens": 99})
+    installation = replace(bundle.installation_policy, root_grant=grant)
+    with pytest.raises(ValueError, match="actual installed foreground/root grant/lease"):
+        replace(bundle, installation_policy=installation, provider_billing_policy_v1=None)

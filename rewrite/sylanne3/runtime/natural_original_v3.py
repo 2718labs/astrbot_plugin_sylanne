@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from ..runtime_contracts import NamespaceId, NATURAL_REPLY_REVIEW_WORKFLOW_V1, _digest, _nonempty
-from ..model_broker.natural_reply_history_v3 import TEMPLATE_VERSION
+from ..runtime_contracts import NATURAL_REPLY_GENERATION_WORKFLOW_V3 as TEMPLATE_VERSION
 
 @dataclass(frozen=True, slots=True)
 class NaturalReplyGenerationOriginalSealV3:
@@ -109,9 +109,18 @@ class NaturalReplyReviewOriginalSealV3:
 def natural_generation_template_digest(frozen):
     from ..model_broker.natural_reply import FrozenNaturalReplyRequestV2, TEMPLATE_DIGEST as V2_DIGEST
     from ..model_broker.natural_reply_history_v3 import FrozenNaturalReplyRequestV3, TEMPLATE_DIGEST as V3_DIGEST
-    from ..model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4, TEMPLATE_DIGEST as V4_DIGEST
+    from ..model_broker.natural_reply_history_v4 import (
+        FrozenNaturalReplyRequestV4, TEMPLATE_DIGEST as V4_DIGEST,
+        TEMPLATE_DIGEST_V5, FROZEN_SCHEMA_V5,
+    )
+    from ..model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6,TEMPLATE_DIGEST as V6_DIGEST
+    from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,TEMPLATE_DIGEST as V7_DIGEST
+    if type(frozen) is FrozenNaturalReplyRequestV7:
+        return V7_DIGEST
+    if type(frozen) is FrozenNaturalReplyRequestV6:
+        return V6_DIGEST
     if type(frozen) is FrozenNaturalReplyRequestV4:
-        return V4_DIGEST
+        return TEMPLATE_DIGEST_V5 if frozen.schema == FROZEN_SCHEMA_V5 else V4_DIGEST
     if type(frozen) is FrozenNaturalReplyRequestV2:
         return V2_DIGEST
     if type(frozen) is FrozenNaturalReplyRequestV3:
@@ -122,6 +131,12 @@ def refreeze_natural_generation(frozen):
     from ..model_broker.natural_reply import FrozenNaturalReplyRequestV2, freeze_natural_reply_request_v2
     from ..model_broker.natural_reply_history_v3 import FrozenNaturalReplyRequestV3, freeze_natural_reply_request_v3
     from ..model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4, freeze_natural_reply_request_v4
+    from ..model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6,freeze_natural_reply_request_v6
+    from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,freeze_natural_reply_request_v7
+    if type(frozen) is FrozenNaturalReplyRequestV7:
+        return freeze_natural_reply_request_v7(frozen.input,frozen.installation)
+    if type(frozen) is FrozenNaturalReplyRequestV6:
+        return freeze_natural_reply_request_v6(frozen.input,frozen.installation)
     if type(frozen) is FrozenNaturalReplyRequestV4:
         return freeze_natural_reply_request_v4(frozen.input, frozen.installation)
     if type(frozen) is FrozenNaturalReplyRequestV2:

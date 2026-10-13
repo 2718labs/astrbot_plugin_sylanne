@@ -7,15 +7,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 import socket
 import stat
 import struct
+import time
 
 from ..authority_service.contract import AuthorityUnavailable
 from ..authority_service.linux_installation_security_v1 import read_installed_json_v1
 from ..authority_service.c09_process_identity_v1 import read_process_identity_v1
+
+
+class InstalledHostStorageAdmissionTimeoutV1(TimeoutError):
+    def __init__(self, *, stage, elapsed_ns, stage_elapsed_ns):
+        super().__init__("C09 Host storage admission timed out")
+        self.stage = stage
+        self.elapsed_ns = elapsed_ns
+        self.stage_elapsed_ns = stage_elapsed_ns
+
+    def diagnostic_v1(self):
+        return {"stage": self.stage, "elapsed_ns": self.elapsed_ns,
+            "stage_elapsed_ns": self.stage_elapsed_ns}
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,24 +76,44 @@ def load_installed_host_storage_v1(profile_id, bundle):
     info = endpoint.lstat()
     if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o007:
         raise AuthorityUnavailable("C09 local admission socket is unsafe")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-        channel.settimeout(10)
-        channel.connect(str(endpoint))
-        pid, uid, _gid = struct.unpack("3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if uid != 0 or pid < 1:
-            raise AuthorityUnavailable("C09 local Authority process is not privileged")
-        request = {"schema": "sylanne3.c09.host-admission-request.v1", "profile_id": profile_id,
-            "installation_id": config["installation_id"], "authority_id": config["authority_id"]}
-        selected = getattr(bundle, 'package_selection', None)
-        if selected is not None:
-            from dataclasses import asdict
-            request['schema'] = 'sylanne3.c09.host-admission-request.v2'
-            request['package_selection'] = asdict(selected)
-        channel.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
-        with channel.makefile("rb") as stream:
-            raw = stream.readline(16385)
-        if len(raw) > 16384 or not raw.endswith(b"\n"):
-            raise AuthorityUnavailable("C09 admission response exceeds limit")
+    started = stage_started = time.monotonic_ns()
+    stage = "socket_create"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.settimeout(10)
+            stage = "connect"; stage_started = time.monotonic_ns()
+            channel.connect(str(endpoint))
+            stage = "peer_identity"; stage_started = time.monotonic_ns()
+            pid, uid, _gid = struct.unpack("3i", channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != 0 or pid < 1:
+                raise AuthorityUnavailable("C09 local Authority process is not privileged")
+            stage = "request_serialization"; stage_started = time.monotonic_ns()
+            request = {"schema": "sylanne3.c09.host-admission-request.v1", "profile_id": profile_id,
+                "installation_id": config["installation_id"], "authority_id": config["authority_id"]}
+            selected = getattr(bundle, 'package_selection', None)
+            if selected is not None:
+                from dataclasses import asdict
+                request['schema'] = 'sylanne3.c09.host-admission-request.v2'
+                request['package_selection'] = asdict(selected)
+            stage = "send"; stage_started = time.monotonic_ns()
+            channel.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            stage = "response_read"; stage_started = time.monotonic_ns()
+            with channel.makefile("rb") as stream:
+                raw = stream.readline(16385)
+            stage = "response_bound"; stage_started = time.monotonic_ns()
+            if len(raw) > 16384 or not raw.endswith(b"\n"):
+                raise AuthorityUnavailable("C09 admission response exceeds limit")
+    except Exception as exc:
+        observed = time.monotonic_ns()
+        diagnostic = {"stage": stage, "elapsed_ns": observed - started,
+            "stage_elapsed_ns": observed - stage_started, "exception_type": type(exc).__name__,
+            "observed_wall_time_ns": time.time_ns()}
+        logging.getLogger(__name__).error("Sylanne C09 Host storage admission failure metadata: " +
+            json.dumps(diagnostic, separators=(",", ":")))
+        if isinstance(exc, TimeoutError):
+            raise InstalledHostStorageAdmissionTimeoutV1(stage=stage, elapsed_ns=observed - started,
+                stage_elapsed_ns=observed - stage_started) from exc
+        raise
     result = json.loads(raw)
     if result.get("status") != "admitted":
         raise AuthorityUnavailable("C09 current Host admission is unavailable")

@@ -10,6 +10,7 @@ cannot obtain admission by calling this standalone foundation reader.
 """
 import json
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..domains.d09.contact_batch_v3 import (
     BATCH, PROVENANCE, ELIGIBILITY, contact_batch_keys_v3,
     decode_contact_batch_companion_v3, contact_batch_writes_from_proof_v3,
@@ -27,12 +28,10 @@ def require_current_contact_batch_v3(db, *, namespace, batch_ref, operation_id, 
     keys = tuple(AtomKey(key.owner, kind, key.name) for kind in (BATCH, PROVENANCE, ELIGIBILITY))
     current = {}
     for actual_key in keys:
-        row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-            (*namespace.as_tuple, actual_key.token)).fetchone()
+        row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='bot=? AND persona=? AND token=?', parameters=(*namespace.as_tuple, actual_key.token))
         if row is None or row[0] != 1 or row[2] != 1:
             raise ValueError('Contact v3 current fact/proof/eligibility is absent or invalidated')
-        history = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',
-            (actual_key.token,)).fetchone()
+        history = read_graph_row_v3(db, columns=('event_id', 'value', 'valid'), where='token=? AND revision=1', parameters=(actual_key.token,), history=True)
         if history != (operation_id, row[1], 1):
             raise ValueError('Contact v3 current member lacks its actual producing history')
         current[actual_key.type_name] = decode_contact_batch_companion_v3(actual_key.type_name, json.loads(row[1]))
@@ -54,8 +53,7 @@ def require_current_contact_batch_v3(db, *, namespace, batch_ref, operation_id, 
         if set(edges) != {(dependency.token,revisions[dependency.token]) for dependency in write.dependencies}:
             raise ValueError('Contact v3 current invalidation edge inventory differs')
     for row in proof.current_reads:
-        head = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-            (*namespace.as_tuple,row.ref)).fetchone()
+        head = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='bot=? AND persona=? AND token=?', parameters=(*namespace.as_tuple,row.ref))
         if head != ((row.revision,row.value_json,int(row.valid)) if row.revision else None):
             raise ValueError('Contact v3 Source/Access/Correction/Owner/plan head drifted')
     return batch, proof, eligible
@@ -112,8 +110,7 @@ def validate_contact_batch_history_v3(db, *, namespace, operation_id, receipt, q
     for write in contact_batch_writes_from_proof_v3(proof):
         if member_refs.get(write.key.token)!=1:
             raise ValueError('Contact v3 historical companion is not an actual COMMIT member')
-        actual=db.execute('SELECT event_id,value,valid,dependencies FROM graph_history WHERE token=? AND revision=1',
-            (write.key.token,)).fetchone()
+        actual=read_graph_row_v3(db, columns=('event_id', 'value', 'valid', 'dependencies'), where='token=? AND revision=1', parameters=(write.key.token,), history=True)
         expected_revisions={row.ref:row.revision for row in proof.current_reads}
         expected_revisions.update({contact_batch_keys_v3(namespace,proof.batch.content.activity_id,proof.batch.content.contact_id)[i].token:1 for i in (0,1)})
         expected_edges={(key.token,expected_revisions[key.token]) for key in write.dependencies}

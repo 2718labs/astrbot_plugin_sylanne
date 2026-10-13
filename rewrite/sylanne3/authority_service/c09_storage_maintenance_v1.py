@@ -1,12 +1,15 @@
 """Installed C09 maintenance gate and four-store prepare/switch/resume flow."""
 from __future__ import annotations
 
+from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+
 from contextlib import contextmanager, closing
 from dataclasses import asdict, fields
 import json
 from pathlib import Path
 import sqlite3
 import threading
+from weakref import WeakSet
 
 from ..runtime_contracts import canonical_digest, canonical_serialize
 from ..runtime.c09_storage_transition_v1 import C09ExecutionBindingV1,C09RecoveryBindingsV1
@@ -15,12 +18,57 @@ from .c09_storage_control_v1 import C09StorageControlV1,SURFACES,ROLES,canonical
 from .c09_recovery_resolver_v4 import InstalledSanitizedRecoveryResolverV4,read_recovery_bindings_v1_locked
 
 
+_PEER_REGISTRY_ACTIVATIONS_V3=WeakSet()
+_PEER_REGISTRY_ACTIVATION_ISSUER_V3=object()
+
+
+class VerifiedInstalledPeerRegistryActivationV3:
+    """Exact installed process census and continuous Gate exclusion, never wire permission."""
+    def __init__(self,issuer,*,control,gate,qualification,hold_token,meter):
+        if issuer is not _PEER_REGISTRY_ACTIVATION_ISSUER_V3:
+            raise AuthorityUnavailable('actual installed registry activation issuer required')
+        from .c09_writer_peer_activation_v3 import InstalledPeerRegistryCensusV3
+        if type(qualification) is InstalledPeerRegistryCensusV3:
+            qualification.require_current(control=control,gate=gate,meter=meter)
+        else:
+            from ..host.c09_controlled_sdk_bootstrap_v3 import VerifiedControlledSDKInstallerOriginalV3
+            if type(qualification) is not VerifiedControlledSDKInstallerOriginalV3:
+                raise AuthorityUnavailable('actual Root or controlled SDK installer process census required')
+            qualification.require_current(gate=gate,control=control,config=gate._installed_config_v3,meter=meter)
+        gate.require_peer_registry_activation_hold_v3(hold_token)
+        self.control,self.gate,self.qualification,self.hold_token=control,gate,qualification,hold_token
+        self.summary=qualification.activation_summary_v3(control=control,gate=gate,meter=meter)
+        _PEER_REGISTRY_ACTIVATIONS_V3.add(self)
+
+    def require_current(self,*,control,gate,meter):
+        if self not in _PEER_REGISTRY_ACTIVATIONS_V3 or self.control is not control or self.gate is not gate:
+            raise AuthorityUnavailable('actual installed registry activation changed its issuer or Gate')
+        gate.require_peer_registry_activation_hold_v3(self.hold_token)
+        if self.summary['mode']=='controlled_sdk_genesis':
+            self.qualification.require_current(gate=gate,control=control,config=gate._installed_config_v3,meter=meter)
+        else:self.qualification.require_current(control=control,gate=gate,meter=meter)
+        return self
+
+    def require_activation_original_for_gate_v3(self,original,*,control,gate,meter):
+        if (self not in _PEER_REGISTRY_ACTIVATIONS_V3 or self.control is not control or self.gate is not gate
+                or self.summary['mode']!='controlled_sdk_genesis'):
+            raise AuthorityUnavailable('actual same-installation controlled SDK qualification required')
+        self.qualification.require_activation_original_for_gate_v3(original,control=control,gate=gate,meter=meter)
+
+
 class InstalledC09WriterGateV1:
     """Installation-wide admission epoch; real writers hold this shared gate."""
-    def __init__(self, *, control):
+    def __init__(self, *, control, installed_config=None):
         if type(control) is not C09StorageControlV1:
             raise AuthorityUnavailable("installed C09 gate requires control authority")
         self.control = control
+        from .deployment_config import AuthorityDeploymentConfig
+        if installed_config is not None and type(installed_config) is not AuthorityDeploymentConfig:
+            raise AuthorityUnavailable("actual installed deployment config required for durable peer admission")
+        self._installed_config_v3=installed_config
+        self._installed_maintenance_v3=None
+        self._peer_admission_originals_v3={}
+        self._peer_retirement_coverage_v3=None
         self._condition = threading.Condition(threading.RLock())
         self._active = 0
         self._operation = None
@@ -30,12 +78,132 @@ class InstalledC09WriterGateV1:
         self._retired_peers = []
         self._peer_retirement_handler = None
         self._closing_continuation=None
+        self._peer_registry_activation_hold_v3=None
+        self._controlled_sdk_activation_v3=None
+
+    @contextmanager
+    def hold_peer_registry_activation_v3(self):
+        """Keep actual Gate admissions excluded through registry activation commit."""
+        with self.control.lease.hold_continuation_v3():
+            with self._condition:
+                if (self._peer_registry_activation_hold_v3 is not None
+                        or self._operation is not None or self._active):
+                    raise AuthorityUnavailable("installed peer registry activation exclusion unavailable")
+                token=(object(),self,threading.get_ident(),self._epoch)
+                self._peer_registry_activation_hold_v3=token
+                try:
+                    yield token
+                finally:
+                    self._peer_registry_activation_hold_v3=None
+
+    def require_peer_registry_activation_hold_v3(self, token):
+        if (self._peer_registry_activation_hold_v3 is not token
+                or token[1:]!=(self,threading.get_ident(),self._epoch)
+                or self._operation is not None or self._active):
+            raise AuthorityUnavailable("actual continuous peer registry Gate exclusion ended")
+        self.control.lease.require_held()
+
+    def require_registry_activation_domain_v3(self, original, *, meter):
+        schema=original.get('schema')
+        if schema=='sylanne3.c09.writer-peer-registry-activation.v3':
+            from .c09_writer_peer_activation_v3 import InstalledPeerRegistryCensusV3
+            census=self._installed_config_v3.c09_maintenance_factory._peer_registry_census_v3
+            if (type(census) is not InstalledPeerRegistryCensusV3
+                    or census.supervisor.config.spec_digest!=original['activation_basis']['supervisor_spec_digest']):
+                raise AuthorityUnavailable('production registry activation lacks its actual installed Root startup exclusion')
+            return
+        if schema!='sylanne3.c09.writer-peer-registry-activation.controlled-sdk.v3':
+            raise AuthorityUnavailable("unknown installed peer registry activation domain")
+        qualification=self._controlled_sdk_activation_v3
+        if (type(qualification) is not VerifiedInstalledPeerRegistryActivationV3
+                or qualification not in _PEER_REGISTRY_ACTIVATIONS_V3):
+            raise AuthorityUnavailable("controlled SDK activation has no installed private SDK qualification")
+        qualification.require_activation_original_for_gate_v3(original,
+            control=self.control,gate=self,meter=meter)
+
+    def install_pending_start_supervisor_v3(self,supervisor):
+        from .installed_process_supervisor_v1 import InstalledRootProcessSupervisorV1
+        if (type(supervisor) is not InstalledRootProcessSupervisorV1 or supervisor._peer_registry_gate_v3 is not self
+                or supervisor._peer_registry_control_v3 is not self.control
+                or getattr(self,'_pending_start_supervisor_v3',None) is not None):
+            raise AuthorityUnavailable('one actual installed Root pending-start supervisor required')
+        self._pending_start_supervisor_v3=supervisor
+
+    def require_pending_start_bootstrap_scope_v3(self,*,meter):
+        from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3
+        from ..host.c09_controlled_sdk_bootstrap_v3 import VerifiedControlledSDKProcessCensusV3
+        hold=self._pending_start_bootstrap_hold_v3
+        if type(hold) is RootPeerStartCoverageHoldV3:
+            hold.require_current(control=self.control,gate=self,meter=meter)
+        elif type(hold) is VerifiedControlledSDKProcessCensusV3:
+            hold.require_current()
+            scope=hold.original['selection_scope']
+            if (scope['authority_id']!=self.control.authority_id or scope['installation_id']!=self.control.installation_id
+                    or scope['control_store_id']!=self.control.control_store_id):
+                raise AuthorityUnavailable('actual SDK bootstrap pending EOF belongs to another installation')
+        else:raise AuthorityUnavailable('actual continuous Root pending EOF bootstrap scope required')
+        return hold
+
+    def resolve_pending_start_coverage_v3(self,pending):
+        from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3
+        from .c09_process_identity_v1 import read_process_identity_v1
+        hold=getattr(self,'_pending_start_bootstrap_hold_v3',None)
+        if pending['root_process_original']!=read_process_identity_v1(1):
+            from .installed_root_lifetime_observer_v3 import (read_installed_old_root_retirement_v3,
+                VerifiedInstalledRootCohortRetirementV3)
+            retirement=read_installed_old_root_retirement_v3(control=self.control,gate=self,pending=pending)
+            if type(retirement) is not VerifiedInstalledRootCohortRetirementV3:return retirement
+            try:
+                physical=self.control.retain_writer_peer_old_root_retirement_v3(self,retirement=retirement)
+                completion=self.control.read_writer_peer_pending_start_completion_v3(self,pending_start_original=pending)
+                if completion is None:
+                    completion=self.control.complete_writer_peer_pending_start_old_cohort_v3(self,retirement=retirement)
+                if type(hold) is RootPeerStartCoverageHoldV3:
+                    hold.ack_old_root_pending_v3(pending,physical,completion)
+                return completion
+            finally:retirement.close()
+        if type(hold) is RootPeerStartCoverageHoldV3:cap=hold.resolve_pending_v3(pending)
+        else:
+            supervisor=self._pending_start_supervisor_v3
+            cap=supervisor.resolve_pending_peer_start_v3(pending)
+        completion=self.control.read_writer_peer_pending_start_completion_v3(self,pending_start_original=pending)
+        if completion is None:completion=self.control.complete_writer_peer_pending_start_v3(self,observed_start=cap)
+        if type(hold) is RootPeerStartCoverageHoldV3:hold.ack_pending_v3(completion)
+        else:cap.baseline.close(completion)
+        return completion
+
+    def install_current_maintenance_v3(self, maintenance):
+        if (type(maintenance) is not InstalledC09MaintenanceV1 or maintenance.gate is not self
+                or maintenance.control is not self.control
+                or maintenance._installed_deployment_config_v2 is not self._installed_config_v3
+                or self._installed_maintenance_v3 is not None):
+            raise AuthorityUnavailable("actual same-config maintenance composition required for durable peer retirement")
+        self._installed_maintenance_v3=maintenance
+
+    def _current_context_v3(self, *, action, verify_files=True):
+        from .daemon import _bootstrap_control_quantum_v3
+        with _bootstrap_control_quantum_v3(self.control) as meter:
+            context=self.control.read_verified_current_storage_v2(meter=meter,verify_files=verify_files)
+            context.require_current(action)
+            return context
 
     def install_peer_retirement_handler_v1(self, handler):
         with self._condition:
             if self._peer_retirement_handler is not None or not callable(handler) or self._operation is not None:
                 raise AuthorityUnavailable("C09 installed peer supervisor already bound or invalid")
             self._peer_retirement_handler = handler
+
+    def retire_previous_peer_before_host_start_v3(self, *, peer):
+        from .c09_process_identity_v1 import require_process_retired_v1
+        with self._condition:
+            if self._operation is not None or self._active or self._peer_registry_activation_hold_v3 is not None:
+                raise AuthorityUnavailable('prior Host requests must drain before actual process replacement')
+            prior=self._peers.get(peer)
+            if prior is not None:
+                retired=require_process_retired_v1(prior[4])
+                self._retired_peers.append(retired)
+                del self._peers[peer]
+                self._peer_admission_originals_v3.pop(peer,None)
 
     def register_peer_process_v1(self, *, peer, process_id, process_incarnation,
                                  pointer_version, storage_generation):
@@ -50,8 +218,16 @@ class InstalledC09WriterGateV1:
                 or type(process_incarnation) is not str or not process_incarnation):
             raise AuthorityUnavailable("C09 installed peer process identity required")
         with self._condition:
-            context = self.control.read_verified_current_storage_v1()
-            context.require_current("business")
+            if self._peer_registry_activation_hold_v3 is not None:
+                raise AuthorityUnavailable("actual peer registry activation excludes Host and writer admission")
+            context=self._current_context_v3(action="business")
+            config=self._installed_config_v3
+            if config is None or peer not in config.installations_v2:
+                raise AuthorityUnavailable("actual installed peer registry is required for admission")
+            namespace=context.manifest["cohort_namespaces"][0]
+            if (config.installations_v2[peer].installation_id!=self.control.installation_id
+                    or not any(key[:2]==peer and value==namespace for key,value in config.namespace_bindings_v2.items())):
+                raise AuthorityUnavailable("peer profile is outside the installed selected namespace")
             identity = read_process_identity_v1(process_id)
             if (identity is None or self._operation is not None
                     or (pointer_version, storage_generation) !=
@@ -65,7 +241,12 @@ class InstalledC09WriterGateV1:
                     raise AuthorityUnavailable("C09 prior peer requests have not drained")
                 retired = require_process_retired_v1(prior[4])
                 self._retired_peers.append(retired)
-            self._peers[peer] = admission
+            original=self.control.retain_writer_peer_admission_v3(self,peer=peer,
+                process_incarnation=process_incarnation,process_original=identity,context=context)
+            # The durable original commits before this process receives its live capability.
+            self._peer_admission_originals_v3[peer]=original
+            self._peers[peer]=admission
+            return original
 
     @contextmanager
     def admit_peer_v1(self, *, peer):
@@ -84,8 +265,9 @@ class InstalledC09WriterGateV1:
     def admit_writer_v1(self, *, pointer_version, storage_generation, process_incarnation,
                         peer=None, expected_admission=None):
         with self._condition:
-            context = self.control.read_verified_current_storage_v1()
-            context.require_current("business")
+            if self._peer_registry_activation_hold_v3 is not None:
+                raise AuthorityUnavailable("actual peer registry activation excludes Host and writer admission")
+            context=self._current_context_v3(action="business")
             if self._operation is not None or (pointer_version,storage_generation) != (context.pointer_version,context.storage_generation):
                 raise AuthorityUnavailable("C09 writer admission generation revoked")
             if not process_incarnation:
@@ -108,8 +290,9 @@ class InstalledC09WriterGateV1:
         if not callable(getattr(process,"poll",None)) or not callable(getattr(process,"terminate",None)) or not callable(getattr(process,"wait",None)):
             raise AuthorityUnavailable("C09 actual installed worker process handle required")
         with self._condition:
-            context = self.control.read_verified_current_storage_v1()
-            context.require_current("business")
+            if self._peer_registry_activation_hold_v3 is not None:
+                raise AuthorityUnavailable("actual peer registry activation excludes Host and writer admission")
+            context=self._current_context_v3(action="business")
             if self._operation is not None or (pointer_version,storage_generation) != (context.pointer_version,context.storage_generation) or process_incarnation in self._workers:
                 raise AuthorityUnavailable("C09 worker admission conflict")
             from .c09_process_identity_v1 import read_process_identity_v1
@@ -117,6 +300,48 @@ class InstalledC09WriterGateV1:
             if identity is None or process.poll() is not None:
                 raise AuthorityUnavailable("C09 actual worker process is not live")
             self._workers[process_incarnation] = (process,pointer_version,storage_generation,identity)
+
+    def advance_peer_retirement_coverage_v3(self, *, operation_id):
+        """Revoke actual admission and advance one durable OS-retirement obligation."""
+        from .c09_writer_peer_originals_v3 import VerifiedPeerRetirementCoverageV3
+        with self._condition:
+            self.control.lease.require_held()
+            if self._operation not in {None,operation_id}:
+                raise AuthorityUnavailable("another actual maintenance gate is active")
+            if self._operation is None:
+                self._epoch+=1
+                self._operation=operation_id
+        result=self.control.advance_writer_peer_retirement_coverage_v3(self,operation_id=operation_id)
+        if type(result) is VerifiedPeerRetirementCoverageV3:
+            self._peer_retirement_coverage_v3=result
+            return result
+        if result["phase"]=="writer_peer_pending_start":
+            self.resolve_pending_start_coverage_v3(result['pending_start_original'])
+            return result
+        if result["phase"]=="writer_peer_waiting_retirement":
+            handler=self._peer_retirement_handler
+            if handler is None:
+                raise AuthorityUnavailable("actual recorded peer remains live; installed retirement supervisor required")
+            # The process observation came from the HMAC-verified durable admission.
+            # Its real installed supervisor runs outside the Gate's condition lock.
+            handler((result["process_original"],))
+        return result
+
+    def restore_prepared_peer_retirement_v3(self, *, operation_id, context):
+        """Bind signed old-selection retirement EOF after the actual pointer switch."""
+        from .c09_writer_peer_originals_v3 import VerifiedPreparedPeerRetirementCoverageV3
+        proof=self.control.read_writer_peer_retirement_coverage_for_prepared_v3(
+            self,operation_id=operation_id,context=context)
+        if type(proof) is not VerifiedPreparedPeerRetirementCoverageV3:
+            raise AuthorityUnavailable("actual prepared peer retirement coverage required")
+        with self._condition:
+            if self._operation not in {None,operation_id} or self._active or self._peers:
+                raise AuthorityUnavailable("prepared peer retirement cannot replace current live admission")
+            if self._operation is None:
+                self._epoch+=1
+                self._operation=operation_id
+            self._peer_retirement_coverage_v3=proof
+        return proof
 
     def revoke_and_drain_v1(self, *, operation_id):
         import time
@@ -153,16 +378,29 @@ class InstalledC09WriterGateV1:
             from .c09_process_identity_v1 import read_process_identity_v1, require_process_retired_v1
             if self._operation != operation_id or self._active:
                 raise AuthorityUnavailable("C09 real writer quiescence unavailable")
+            from .c09_writer_peer_originals_v3 import (
+                VerifiedPeerRetirementCoverageV3,VerifiedPreparedPeerRetirementCoverageV3)
+            from .daemon import _bootstrap_control_quantum_v3
+            coverage=self._peer_retirement_coverage_v3
+            if (type(coverage) not in {VerifiedPeerRetirementCoverageV3,VerifiedPreparedPeerRetirementCoverageV3}
+                    or coverage.operation_id!=operation_id):
+                raise AuthorityUnavailable("complete durable peer retirement EOF required before writer freeze")
+            with _bootstrap_control_quantum_v3(self.control) as meter:
+                coverage.require_current(meter=meter)
+            peer_completion=coverage.original
             retired = [require_process_retired_v1(identity) for _p,_v,_g,identity in self._workers.values()]
             retired_peers = list(self._retired_peers) + [require_process_retired_v1(admission[4])
                 for _, admission in sorted(self._peers.items())]
-            context = self.control.read_verified_current_storage_v1(verify_files=False)
-            return self.control.sign_original_v1("sylanne3.c09.writer_quiescence.v1",dict(
-                schema="sylanne3.c09.writer_quiescence.v1",installation_id=self.control.installation_id,
+            context=self._current_context_v3(action="maintenance",verify_files=False)
+            return self.control.sign_original_v1("sylanne3.c09.writer_quiescence.v3",dict(
+                schema="sylanne3.c09.writer_quiescence.v3",installation_id=self.control.installation_id,
                 operation_id=operation_id,pointer_version=context.pointer_version,
                 storage_generation=context.storage_generation,revoked_admission_epoch=self._epoch,
                 active_writers=0,exited_workers=sorted((name,p.pid,version,generation,p.poll()) for name,(p,version,generation,_identity) in self._workers.items()),
                 retired_worker_originals=retired, retired_peer_originals=retired_peers,
+                writer_peer_retirement_complete_original_digest=peer_completion["completion_digest"],
+                writer_peer_retirement_count=peer_completion["admission_count"],
+                writer_peer_retirement_root=peer_completion["retirement_root"],
                 authority_process_original=read_process_identity_v1(__import__('os').getpid()),
                 lock_path=str(self.control.lease.path),lock_process_id=__import__('os').getpid()),"quiescence_digest")
 
@@ -198,11 +436,14 @@ class InstalledC09WriterGateV1:
         with self._condition:
             if self._closing_continuation is not None:
                 raise AuthorityUnavailable("C09 cannot release during final continuation")
-            context = self.control.read_verified_current_storage_v1()
+            context=self._current_context_v3(action="maintenance")
             if context.stage != "RELEASED" or self._operation != operation_id:
                 raise AuthorityUnavailable("C09 gate release needs current RELEASED")
             context.require_current("business")
-            self._workers.clear(); self._peers.clear(); self._retired_peers.clear(); self._operation = None
+            self._workers.clear();self._peers.clear();self._retired_peers.clear()
+            self._peer_admission_originals_v3.clear()
+            self._peer_retirement_coverage_v3=None
+            self._operation=None
 
 
 class InstalledC09MaintenanceV1:
@@ -241,6 +482,7 @@ class InstalledC09MaintenanceV1:
         self.current_bundle_factory = current_bundle_factory
         self.surface_services = dict(surface_services)
         self.close_apply_service = close_apply_service
+        close_apply_service._maintenance_v3 = self
         self._candidate_originals = {}
         self._closed_connection_originals_v3={}
         self._maintenance_lock = threading.RLock()
@@ -421,92 +663,45 @@ class InstalledC09MaintenanceV1:
             closing_continuation=continuation)
         return prepared
 
-    def prepare_storage_rebase_v1(self, *, operation_id):
-        with self._maintenance_lock:
-            try:
-                return self._prepare_storage_rebase_v1(operation_id=operation_id)
-            finally:
-                from .c09_contact_finish_original_v1 import _revoke_contact_finish_scope_v1
-                port = self.core._execution_recovery_facts_ports_v4.get(self.closure.namespace)
-                if port is not None:
-                    _revoke_contact_finish_scope_v1(port)
-                    from .c09_life_completed_archive_v1 import revoke_completed_life_scope_v1
-                    revoke_completed_life_scope_v1(port)
+    def advance_current_c09_prepared_preflight_v2(self):
+        from .c09_paged_capture_control_v2 import InstalledC09PagedCaptureControlV2
+        control = getattr(self, "_paged_capture_control_v2", None)
+        if control is None:
+            control = InstalledC09PagedCaptureControlV2(self)
+            self._paged_capture_control_v2 = control
+        return control.advance_selected_prepared_preflight_v2()
 
-    def _prepare_storage_rebase_v1(self, *, operation_id):
-        from .erasure_closure_inventory import CleanupRunV2,_TABLES
-        from ..runtime.c09_graph_rebase_candidate_v1 import build_installed_graph_rebase_candidate_v1,install_verified_graph_rebase_certificate_v1
-        from .c09_authority_storage_rebase import build_installed_authority_storage_rebase_candidate_v1
-        current = self.control.read_verified_current_storage_v1()
-        self._require_historical_provider_cache_coverage_v1()
-        with self.core._tx() as db:
-            run = self.closure._read_record(db,_TABLES[1],operation_id,CleanupRunV2)
-            if run is None:
-                raise AuthorityUnavailable("C09 accepted run required before INTENT")
-            accepted = self.closure._accepted_locked(db,run,self.subject)
-            fence = db.execute("SELECT permit FROM authority_v2_fences WHERE operation_id=?",(accepted.pending.permit.operation_id,)).fetchone()
-            from .v2_contract import decode_bytes
-            permit = decode_bytes(fence[0])
-        quiescence = self.gate.revoke_and_drain_v1(operation_id=operation_id)
-        if current.stage in {"READY","RELEASED"}:
-            targets = self._targets(operation_id,current.storage_generation+1)
-            self.control.record_maintenance_intent_v1(operation_id=operation_id,namespace=self.closure.namespace,
-                installed_intent=dict(expected_pointer_version=current.pointer_version,old_manifest_digest=current.manifest_digest,
-                    targets=targets,accepted_receipt_digest=canonical_digest(accepted),quiescence_original=quiescence))
-        else:
-            intent = self.control.read_operation_event_v1(operation_id,"INTENT")
-            targets = intent["details"]["targets"]
-        # Recompute the complete historical scope after the actual writer drain,
-        # then pin it in protected control before any source/candidate sealing.
-        self._require_historical_provider_cache_coverage_v1(operation_id=operation_id)
-        self.core.prepare_c09_execution_source_v4(credential=self.credential,closure=self.closure,subject=self.subject,operation_id=operation_id)
-        self._checkpoint(self.graph,close=True)
-        self._checkpoint(self.core)
-        self._checkpoint(self.closure.execution)
-        self._checkpoint(self.closure.deletion)
-        from .c09_build_originals_v1 import decode_installed_build_original_v1
-        from ..runtime.c09_graph_rebase_candidate_v1 import GraphRebaseCandidateV1, graph_source_files_fingerprint_v1
-        saved = self.control.read_build_original_v1(operation_id=operation_id, kind="graph_candidate")
-        if saved is None:
-            inventory_view=self.current_source_location.observe_installation_inventory_v1(self.inventory_manifest,
-                credential=self.credential,subject=self.subject,accepted_mutation_id=run.accepted_mutation_id)
-            graph_candidate = build_installed_graph_rebase_candidate_v1(
-                next(Path(m["resolved_path"]) for m in current.manifest["members"] if m["role"] == "graph"),Path(targets["graph"]),
-                accepted_service=self.accepted_service,credential=self.credential,subject=self.subject,
-                installation_id=self.control.installation_id,namespace=self.namespace_id,operation_id=operation_id,
-                permit=permit,inventory_manifest=self.inventory_manifest,pinned_manifest_digest=self.inventory_manifest.manifest_digest,
-                writer_freeze_digest=self.control.read_operation_event_v1(operation_id, "INTENT")["details"]["quiescence_original"]["quiescence_digest"],
-                completion_control=self.control, registry=self.graph._registry,
-                contact_finish_scope=self.core._execution_recovery_facts_ports_v4[self.closure.namespace]._contact_finish_scope,
-                life_completed_scope=self.core._execution_recovery_facts_ports_v4[self.closure.namespace]._life_completed_scope,
-                current_inventory_qualifier=self.current_source_location,current_inventory_view=inventory_view)
-        else:
-            graph_candidate = decode_installed_build_original_v1(saved["details"]["candidate"], GraphRebaseCandidateV1)
-            if (graph_candidate.namespace != self.namespace_id or graph_candidate.operation_id != operation_id
-                    or graph_candidate.target_path != targets["graph"]
-                    or graph_source_files_fingerprint_v1(Path(graph_candidate.source_path)) != graph_candidate.source_files_fingerprint):
-                raise AuthorityUnavailable("C09 registered Graph candidate source identity differs")
-        from .c09_graph_rebase_issue_v1 import read_graph_rebase_issue_v1_locked
-        with self.core._tx() as db:
-            issued = read_graph_rebase_issue_v1_locked(db, self.closure.namespace, operation_id=operation_id)
-        if issued is None:
-            issued = self.core.issue_graph_rebase_certificate_v1(credential=self.credential,closure=self.closure,subject=self.subject,candidate=graph_candidate)
-        graph_mirror = install_verified_graph_rebase_certificate_v1(graph_candidate,core=self.core,credential=self.credential,issued=issued, registry=self.graph._registry)
-        candidate = build_installed_authority_storage_rebase_candidate_v1(core=self.core,closure=self.closure,maintenance=self,
-            operation_id=operation_id,subject=self.subject,credential=self.credential,graph_mirror=graph_mirror,targets=targets)
-        return self._seal_prepared(operation_id=operation_id,graph_candidate=graph_candidate,graph_mirror=graph_mirror,candidate=candidate)
+    def begin_current_c09_capture_v2(self, *, operation_id):
+        from .c09_paged_capture_control_v2 import begin_current_c09_capture_v2
+        return begin_current_c09_capture_v2(self, operation_id)
+
+    def prepare_storage_rebase_v1(self, *, operation_id):
+        """Actual progressive V3 capture; the legacy whole-frame prepare is retired."""
+        from .c09_maintenance_actor_v3 import prepare_current_storage_v3
+        return prepare_current_storage_v3(self, operation_id=operation_id)
 
     def switch_prepared_storage_v1(self, *, operation_id):
+        """Progress the actual V3 switch; request cold restart only after its CAS."""
         self._close_old_bundle_v1(operation_id=operation_id)
         original = self.gate.read_quiescence_original_v1(operation_id=operation_id)
-        event = self.control.switch_prepared_storage_v1(operation_id=operation_id,quiescence_original=original)
-        # Never hot-swap a subset of the daemon's objects: TLS handlers, Owner
-        # stores and cached readers still own the old bundle. Only a new OS
-        # process may open the switched files and prove cache retirement.
-        self.restart_required = True
-        return event
+        from .c09_prepared_storage_v3 import advance_prepared_switch_v3
+        progress = advance_prepared_switch_v3(self.control, operation_id=operation_id,
+            quiescence_original=original)
+        progress["operation_id"] = operation_id
+        if progress["status"] == "complete":
+            self.restart_required = True
+        return progress
 
     def cleanup_and_release_v1(self, *, operation_id):
+        from .c09_selected_history_v3 import advance_selected_obligation_coverage_v3, VerifiedSelectedHistoryReadV3
+        view = getattr(self.control, '_selected_history_read_v3', None)
+        if type(view) is VerifiedSelectedHistoryReadV3:
+            for consumer in ('execution_cleanup', 'model_release'):
+                progress = advance_selected_obligation_coverage_v3(self, view=view, consumer=consumer)
+                if progress['status'] != 'complete':
+                    return progress
+                setattr(self.control, '_selected_' + consumer + '_certificate_v3', progress['certificate'])
+            return self._advance_selected_cleanup_v3(operation_id=operation_id, view=view)
         context = self.control.read_verified_current_storage_v1()
         if context.stage not in {"SWITCHED","CLEANED"}:
             raise AuthorityUnavailable("C09 cleanup requires switched current files")
@@ -539,36 +734,174 @@ class InstalledC09MaintenanceV1:
         self.close_apply_service.apply_current_graph_head_v1(operation_id=operation_id)
         from .c09_model_budget_original_v1 import require_model_budget_release_safe_v1
         with self.core._tx() as db:
-            require_model_budget_release_safe_v1(db, namespace=self.closure.namespace)
+            require_model_budget_release_safe_v1(db, namespace=self.closure.namespace, meter=current_c09_sql_meter_v2())
         release = self.close_apply_service.read_release_original_v1(operation_id=operation_id,storage_reader=self.control)
         self.control.release_cleaned_storage_v1(operation_id=operation_id,release_original=release)
         self.gate.release_v1(operation_id=operation_id)
         return self.control.read_verified_current_storage_v1()
+
+    def _advance_selected_cleanup_v3(self, *, operation_id, view):
+        # All source obligations are qualified before any managed bytes disappear.
+        control = self._paged_capture_control_v2
+        with control.reserve_selected_history_quantum_v2(view) as meter:
+            context = self.control.read_verified_current_storage_v3(meter=meter)
+            if context.prepared_original['operation_id'] != operation_id:
+                raise AuthorityUnavailable('actual selected cleanup operation differs')
+            phase = getattr(self, '_selected_cleanup_phase_v3', 'surfaces')
+            if phase == 'surfaces':
+                existing = {item['surface']: item for item in self.control.read_surface_evidence_v1(operation_id)}
+                verified = getattr(self, '_selected_verified_surfaces_v3', None)
+                if verified is None:
+                    verified = {};self._selected_verified_surfaces_v3 = verified
+                for surface in sorted(SURFACES):
+                    original = existing.get(surface)
+                    if original is not None and verified.get(surface) == original['evidence_digest']:
+                        continue
+                    service = self.surface_services[surface]
+                    if original is None:
+                        if hasattr(service, 'advance_installed_surface_v3'):
+                            progress = service.advance_installed_surface_v3(operation_id=operation_id, storage_reader=self.control,
+                                view=view, meter=meter)
+                            if progress['status'] != 'complete':return progress
+                            original = progress['original']
+                        else:
+                            original = service.clean_installed_surface_v1(operation_id=operation_id, storage_reader=self.control)
+                        self.control.record_surface_evidence_v1(original)
+                        return dict(status='progress', phase='surface_evidence_recorded', surface=surface)
+                    if hasattr(service, 'advance_installed_surface_reread_v3'):
+                        progress = service.advance_installed_surface_reread_v3(operation_id=operation_id, storage_reader=self.control,
+                            view=view, meter=meter, original=original)
+                        if progress['status'] != 'complete':return progress
+                        if progress['original'] != original:
+                            raise AuthorityUnavailable('actual independent selected surface original differs: ' + surface)
+                    else:
+                        reread = service.reread_installed_surface_v1(operation_id=operation_id, storage_reader=self.control, original=original)
+                        if reread.get('evidence_digest') != original['evidence_digest'] or reread.get('after_observations') != original['after_observations']:
+                            raise AuthorityUnavailable('actual independent selected cleanup surface differs: ' + surface)
+                    verified[surface] = original['evidence_digest']
+                    return dict(status='progress', phase='surface_independently_verified', surface=surface)
+                self.control.record_cleaned_storage_v1(operation_id=operation_id,
+                    independently_verified_root=digest([existing[name]['evidence_digest'] for name in sorted(SURFACES)]))
+                self._selected_cleanup_phase_v3 = 'close'
+                return dict(status='progress', phase='CLEANED')
+            if phase == 'close':
+                progress = self.close_apply_service.advance_selected_close_v3(operation_id=operation_id, view=view, meter=meter)
+                if progress['status'] == 'complete':
+                    self._selected_cleanup_phase_v3 = 'apply'
+                return dict(progress, status='progress')
+            if phase == 'apply':
+                progress = self.close_apply_service.advance_selected_graph_application_v3(operation_id=operation_id, view=view, meter=meter)
+                if progress['status'] == 'complete':
+                    self._selected_cleanup_phase_v3 = 'release'
+                return dict(progress, status='progress')
+            certificate = self.control._selected_model_release_certificate_v3
+            self.control.verify_original_v1(certificate, 'checkpoint_digest')
+            if certificate['details']['eof'] is not True or certificate['details']['unknown_present']:
+                raise AuthorityUnavailable('actual complete model coverage retains pending or unknown debt')
+            release = self.close_apply_service.read_release_original_v1(operation_id=operation_id, storage_reader=self.control)
+            self.control.release_cleaned_storage_v1(operation_id=operation_id, release_original=release)
+            self.gate.release_v1(operation_id=operation_id)
+            return dict(status='complete', phase='RELEASED', stage='RELEASED', restart_required=False,
+                current_manifest_digest=context.manifest_digest, pointer_version=context.pointer_version,
+                storage_generation=context.storage_generation)
+
+    def bind_current_thread_actor_v3(self, *, operation_id):
+        """Register the actual installed actor before activating physical maintenance readers."""
+        from .c09_maintenance_actor_v3 import InstalledC09MaintenanceActorV3
+        from .c09_paged_capture_control_v2 import InstalledC09PagedCaptureControlV2
+        self.core._require(self.credential, 'delete', self.closure.namespace)
+        owner = threading.get_ident()
+        with self._maintenance_lock:
+            existing_owner = getattr(self, '_c09_actor_host_thread_v3', None)
+            if existing_owner is not None and existing_owner != owner:
+                raise AuthorityUnavailable('actual installed C09 host thread changed')
+            self._c09_actor_host_thread_v3 = owner
+            capture_control = getattr(self, '_paged_capture_control_v2', None)
+            if capture_control is None:
+                capture_control = InstalledC09PagedCaptureControlV2(self)
+                self._paged_capture_control_v2 = capture_control
+            capture_control._registered()
+            actor = getattr(self, '_maintenance_actor_v3', None)
+            if actor is None:
+                actor = InstalledC09MaintenanceActorV3(self, operation_id)
+                actor.owner_thread = owner
+                self._maintenance_actor_v3 = actor
+            elif actor.operation_id != operation_id or actor.thread is not None or actor.owner_thread != owner:
+                raise AuthorityUnavailable('actual installed actor is owned by another operation or thread')
+            return actor
+
+    def advance_storage_maintenance_current_thread_v3(self, *, operation_id):
+        """The installed bounded queue host owns all continuation calls on one thread."""
+        owner = threading.get_ident()
+        existing = getattr(self, '_c09_actor_host_thread_v3', None)
+        if existing is None:
+            if getattr(self, '_maintenance_actor_v3', None) is not None:
+                raise AuthorityUnavailable('actual C09 actor already has another thread owner')
+            self._c09_actor_host_thread_v3 = owner
+        elif existing != owner:
+            raise AuthorityUnavailable('actual C09 maintenance host thread changed')
+        return self.resume_storage_maintenance_v1(operation_id=operation_id)
 
     def resume_storage_maintenance_v1(self, *, operation_id):
         with self._maintenance_lock:
             return self._resume_storage_maintenance_v1(operation_id=operation_id)
 
     def _resume_storage_maintenance_v1(self, *, operation_id):
-        context = self.control.read_verified_current_storage_v1()
-        with self.control._db() as db:
-            current = self.control._current(db)
-            active_operation = current["active_operation_id"]
-        if context.stage == "RELEASED" and active_operation == operation_id:
-            context.require_current("business")
-            return context
-        if context.stage not in {"READY", "RELEASED"} and active_operation != operation_id:
+        actor = getattr(self, '_maintenance_actor_v3', None)
+        if actor is not None and actor.operation_id == operation_id:
+            snapshot = actor.snapshot()
+            if snapshot['status'] in {'progress', 'failed'}:
+                if snapshot['status'] == 'progress' and getattr(self, '_c09_actor_host_thread_v3', None) is not None:
+                    return actor.advance_one_quantum_v3()
+                return snapshot
+        status = self.control.read_verified_control_status_v3()
+        status["operation_id"] = operation_id
+        if status["status"] != "complete":
+            return status
+        stage, active = status["stage"], status["active_operation_id"]
+        if stage not in {"READY", "RELEASED"} and active != operation_id:
             raise AuthorityUnavailable("C09 other maintenance operation is active")
         if self.restart_required:
-            return context
+            return dict(status, status="complete", phase="SWITCHED", restart_required=True)
+        is_v3 = status["manifest_schema"] == "sylanne3.c09.storage_manifest.v3"
+        if is_v3 and stage in {"INTENT", "PREPARED", "SWITCHED", "CLEANED", "RELEASED"}:
+            from .c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+            selected = self.control.advance_selected_history_read_v3()
+            if type(selected) is not VerifiedSelectedHistoryReadV3:
+                progress = dict(status)
+                progress.update(selected)
+                progress['operation_id'] = operation_id
+                return progress
+            status["storage_generation"] = selected.basis.manifest["generation"]
+        if stage == "RELEASED" and active == operation_id:
+            if is_v3:
+                from .c09_close_apply_v1 import SelectedAppliedReadV3
+                applied = self.control.advance_selected_storage_applied_read_v3()
+                if type(applied) is not SelectedAppliedReadV3:
+                    progress = dict(status)
+                    progress.update(applied)
+                    return progress
+            context = self.control.read_verified_current_storage_v3() if is_v3 else self.control.read_verified_current_storage_v1()
+            context.require_current("business")
+            return dict(status, status="complete", phase="RELEASED", restart_required=False)
+        if stage in {"READY", "RELEASED", "INTENT"}:
+            progress = self.prepare_storage_rebase_v1(operation_id=operation_id)
+            result = dict(status, **progress)
+            if progress["status"] != "complete":
+                return result
+            # The actor has retained the actual PREPARED event. Read its CAS status
+            # in the next request; its old selected source is not a new opener.
+            return dict(result, status="progress", phase="PREPARED")
         self.gate.revoke_and_drain_v1(operation_id=operation_id)
-        if context.stage in {"READY","RELEASED","INTENT"}:
-            self.prepare_storage_rebase_v1(operation_id=operation_id)
-            context = self.control.read_verified_current_storage_v1()
-        if context.stage == "PREPARED":
-            self.switch_prepared_storage_v1(operation_id=operation_id)
-            return self.control.read_verified_current_storage_v1()
-        return self.cleanup_and_release_v1(operation_id=operation_id)
+        if stage == "PREPARED":
+            return dict(status, **self.switch_prepared_storage_v1(operation_id=operation_id),
+                restart_required=self.restart_required)
+        progress = self.cleanup_and_release_v1(operation_id=operation_id)
+        if type(progress) is dict:
+            return dict(status, **progress)
+        return dict(status, status="complete", phase="RELEASED", storage_generation=progress.storage_generation,
+            pointer_version=progress.pointer_version, current_manifest_digest=progress.manifest_digest,
+            stage=progress.stage, restart_required=False)
 
 
 def read_rebased_file_from_control_v1(control, *, operation_id, role):
@@ -649,7 +982,7 @@ def read_recovery_bindings_connection_v1(*, control, core_db, execution_reader, 
             raise AuthorityUnavailable("C09 original business execution binding differs")
         originals[execution] = (operation,kind,generation,binding)
     from .c09_model_budget_original_v1 import read_model_budget_originals_v1, model_unit_fact_v4
-    model_originals = read_model_budget_originals_v1(core_db, namespace=namespace, operation_id=bundle["seal"].operation_id)
+    model_originals = read_model_budget_originals_v1(core_db, namespace=namespace, operation_id=bundle["seal"].operation_id, meter=current_c09_sql_meter_v2())
     for original in model_originals:
         if original.call_id in originals:
             raise AuthorityUnavailable("C09 model call collides with an independent execution identity")

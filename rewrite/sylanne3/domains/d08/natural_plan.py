@@ -201,10 +201,14 @@ def _verify_d06_units_current(
         QualifiedExpressionUnitCandidate, recompute_qualified_expression_unit,
     )
 
+    from ...runtime.natural_producer_qualification_v1 import (
+        CANDIDATE_TYPES, C04_KIND, DRAFT_KIND, verify_live_producer_candidate_v1)
     if (type(d06_candidates) is not tuple
-            or any(type(item) is not QualifiedExpressionUnitCandidate
-                   for item in d06_candidates)):
-        raise TypeError("typed D06 qualification candidates required")
+            or any(type(item) not in (QualifiedExpressionUnitCandidate, *CANDIDATE_TYPES)
+                   for item in d06_candidates)
+            or any(unit.d06_claim_kind not in {
+                "attributed_report", "confirmed_external_fact", C04_KIND, DRAFT_KIND} for unit in plan.units)):
+        raise TypeError("finite typed natural qualification candidates required")
     candidates = {item.qualification_digest: item for item in d06_candidates}
     units = {unit.qualification_digest: unit for unit in plan.units
              if unit.d06_claim_kind is not None}
@@ -213,6 +217,16 @@ def _verify_d06_units_current(
             or None in units or set(candidates) != set(units)):
         raise ValueError("D06 qualification set is incomplete")
     for digest, unit in units.items():
+        candidate = candidates[digest]
+        if unit.d06_claim_kind in {C04_KIND, DRAFT_KIND}:
+            if type(candidate) not in CANDIDATE_TYPES:
+                raise TypeError("producer unit requires its exact reconstructed candidate")
+            verify_live_producer_candidate_v1(candidate, unit, snapshot=snapshot,
+                current_reads=snapshot.versions, access_epoch=access_epoch,
+                deletion_epoch=deletion_epoch, now_utc=now_utc)
+            continue
+        if type(candidate) is not QualifiedExpressionUnitCandidate:
+            raise TypeError("Source unit requires its original D06 candidate")
         rebuilt = recompute_qualified_expression_unit(
             snapshot, namespace=plan.namespace, candidate=candidates[digest],
             audiences=(plan.audience_id,), access_epoch=access_epoch,
@@ -316,6 +330,16 @@ def _expected_record(
     reads = tuple(sorted((GraphVersion(AtomKey.from_token(ref.ref), ref.version)
                           for ref in dict.fromkeys(refs)),
                          key=lambda row: row.key.token))
+    from ...runtime.natural_producer_qualification_v1 import producer_candidate_read_versions_v1
+    producer_reads = producer_candidate_read_versions_v1(d06_candidates)
+    if producer_reads:
+        by_key = {row.key: row for row in reads}
+        for row in producer_reads:
+            prior = by_key.get(row.key)
+            if prior is not None and prior != row:
+                raise ValueError("producer qualification changed a natural plan read")
+            by_key[row.key] = row
+        reads = tuple(by_key[key] for key in sorted(by_key, key=lambda key:key.token))
     generation_reservation_id = natural_job_ids_v2(
         plan.namespace, evidence.c02_operation_id, "generation")[4]
     review_reservation_id = natural_job_ids_v2(

@@ -47,21 +47,21 @@ def verify_migration_preview(migration: object) -> None:
 
 def verify_workbench(root: Path) -> None:
     workbench = root / "resources" / "workbench"
-    source = root / "webui-heritage"
-    build_output = source / "dist" / "index.html"
+    source = root / "workbench-src" / "prototype-v6"
+    build_output = source / "singlefile" / "index.html"
     manifest_path = workbench / "workbench-manifest.json"
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     if document.get("schema_version") != "sylanne.workbench-assets.v1": raise ValueError("unknown workbench asset schema")
-    if document.get("source") != "webui-heritage" or document.get("build_output") != "webui-heritage/dist/index.html":
+    if document.get("source") != "workbench-src/prototype-v6" or document.get("build_output") != "workbench-src/prototype-v6/singlefile/index.html":
         raise ValueError("workbench manifest source or build output is stale")
     listed = {row["path"]: row for row in document.get("files", [])}
     if not listed or "index.html" not in listed: raise ValueError("workbench manifest is incomplete")
     if set(listed) != {"index.html"} or not source.is_dir() or source.is_symlink():
         raise ValueError("workbench manifest file set or declared source is invalid")
-    if (source / "dist").is_symlink() or build_output.is_symlink() or not build_output.is_file():
+    if (source / "singlefile").is_symlink() or build_output.is_symlink() or not build_output.is_file():
         raise FileNotFoundError("webui-heritage build output is missing or unsafe")
     if build_output.read_bytes() != (workbench / "index.html").read_bytes():
-        raise ValueError("workbench resource differs from webui-heritage build output")
+        raise ValueError("workbench resource differs from prototype-v6 singlefile build output")
     actual = set()
     for resource_root in (workbench,):
         if not resource_root.is_dir(): raise ValueError(f"missing resource root: {resource_root.name}")
@@ -70,8 +70,6 @@ def verify_workbench(root: Path) -> None:
             if path.is_file() and (path.name.casefold() in FORBIDDEN_NAMES or path.suffix.casefold() in FORBIDDEN_SUFFIXES): raise ValueError(f"forbidden release resource: {path}")
             if resource_root == workbench and path.is_file() and path.name != "workbench-manifest.json":
                 relative = path.relative_to(workbench).as_posix()
-                if relative.startswith("src/"):
-                    continue  # Retained legacy source mirror; the package builder excludes it.
                 actual.add(relative)
                 row = listed.get(relative)
                 if not row or row.get("bytes") != path.stat().st_size or row.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest(): raise ValueError(f"workbench asset mismatch: {relative}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,8 @@ import socket
 import stat
 import struct
 import subprocess
+import time
+import traceback
 
 from .contract import AuthorityUnavailable
 from .c09_process_identity_v1 import read_process_identity_v1, require_process_retired_v1
@@ -17,14 +20,23 @@ from .linux_installation_security_v1 import require_linux_administrator_v1
 
 
 class InstalledLinuxHostSupervisorV1:
-    def __init__(self, *, daemon, socket_path, host_uid, host_gid, systemd_unit):
+    def __init__(self, *, daemon, socket_path, host_uid, host_gid, systemd_unit=None, process_supervisor=None):
         require_linux_administrator_v1()
         if (type(host_uid) is not int or host_uid < 1 or type(host_gid) is not int or host_gid < 1
-                or type(systemd_unit) is not str or not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", systemd_unit)
+                or process_supervisor is None and (type(systemd_unit) is not str
+                    or not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", systemd_unit))
                 or daemon.c09_gate is None):
             raise AuthorityUnavailable("installed non-root systemd Host identity required")
         self.daemon, self.path = daemon, Path(socket_path)
         self.uid, self.gid, self.unit = host_uid, host_gid, systemd_unit
+        self.process_supervisor = process_supervisor
+        if process_supervisor is not None:
+            from .installed_process_supervisor_v1 import InstalledRootProcessSupervisorV1
+            if (type(process_supervisor) is not InstalledRootProcessSupervisorV1 or systemd_unit is not None
+                    or process_supervisor.config.service_role != "host"
+                    or process_supervisor.config.expected_uid != host_uid
+                    or process_supervisor.config.expected_gid != host_gid):
+                raise AuthorityUnavailable("exact installed process Host provider required")
         self.listener = None
         daemon.c09_gate.install_peer_retirement_handler_v1(self.retire_peers_v1)
 
@@ -38,12 +50,27 @@ class InstalledLinuxHostSupervisorV1:
     def retire_peers_v1(self, originals):
         # systemd stops the whole service control group, including descendant
         # workers. Never send a signal to an unchecked caller-supplied PID.
-        self._systemctl("stop")
-        if self._systemctl("show", "--property=MainPID", "--value") != "0":
-            raise AuthorityUnavailable("installed Host main process remains live")
+        if self.process_supervisor is not None:
+            before = self.process_supervisor.read_current_host_state_v1()
+            self.process_supervisor.stop_original_host_v1(expected_invocation_id=before.invocation_id)
+        else:
+            self._systemctl("stop")
+            if self._systemctl("show", "--property=MainPID", "--value") != "0":
+                raise AuthorityUnavailable("installed Host main process remains live")
         return tuple(require_process_retired_v1(original) for original in originals)
 
     async def _admit(self, reader, writer):
+        started = time.monotonic_ns()
+        stage_started = started
+        stage = "request_read"
+        stages = []
+
+        def advance_stage(next_stage):
+            nonlocal stage_started, stage
+            observed = time.monotonic_ns()
+            stages.append({"stage": stage, "elapsed_ns": observed - stage_started})
+            stage_started, stage = observed, next_stage
+
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=5)
             if len(raw) > 8192:
@@ -57,11 +84,17 @@ class InstalledLinuxHostSupervisorV1:
             pid, uid, _gid = struct.unpack("3i", writer.get_extra_info("socket").getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
             if uid != self.uid:
                 raise AuthorityUnavailable("Host admission OS principal differs")
+            advance_stage("initial_process_identity")
             # MainPID establishes the installed service, not merely another
             # process sharing the user's UID. Spawned workers use separate grants.
-            actual_pid = await asyncio.to_thread(self._systemctl, "show", "--property=MainPID", "--value")
-            if actual_pid != str(pid):
-                raise AuthorityUnavailable("Host admission is not the installed service process")
+            if self.process_supervisor is not None:
+                observed_main = await asyncio.to_thread(self.process_supervisor.require_admitted_peer_v1,
+                    actual_socket_peer=(pid, uid, _gid))
+            else:
+                actual_pid = await asyncio.to_thread(self._systemctl, "show", "--property=MainPID", "--value")
+                if actual_pid != str(pid):
+                    raise AuthorityUnavailable("Host admission is not the installed service process")
+            advance_stage("selected_profile_identity")
             matches = [(peer, installation) for peer, installation in self.daemon.config.installations_v2.items()
                        if peer[1] == request["profile_id"] and installation.installation_id == request["installation_id"]]
             if len(matches) != 1 or request["authority_id"] != self.daemon.c09_control.authority_id:
@@ -83,8 +116,10 @@ class InstalledLinuxHostSupervisorV1:
                     raise AuthorityUnavailable('Host and running Authority selected cohorts differ')
                 await asyncio.to_thread(require_current_bundle_selection_v2,bundle,Path(__file__).absolute().parents[3],
                     require_selected_python=True,authority_private_config=True)
+            advance_stage("current_storage")
             context = self.daemon.c09_control.read_verified_current_storage_v1()
             context.require_current("business")
+            advance_stage("lifecycle_scope")
             from .d12_lifecycle_gate_v1 import read_lifecycle_head_in_tx_v1
             lifecycle_services = tuple(service for service in getattr(self.daemon.server,
                 "_d12_installation_lifecycle_services_v1", {}).values()
@@ -110,6 +145,7 @@ class InstalledLinuxHostSupervisorV1:
                         raise AuthorityUnavailable('resume has no original process start intent')
                     service._owner_still_current(db,row)
                     lifecycle_bootstrap = {'operation_id':head.operation_id,'expected_epoch':head.epoch}
+            advance_stage("lifecycle_process_identity")
             if head.state != 'active' and package_operation is not None:
                 from .mtls_server import MtlsPeerCredential
                 package_service = getattr(self.daemon.server,'_d12_package_services_v2',{}).get(service.namespace)
@@ -124,12 +160,25 @@ class InstalledLinuxHostSupervisorV1:
                 if observed.main_pid != pid or pid not in observed.process_ids or observed.active_state != 'active':
                     raise AuthorityUnavailable('resume Host is not the installed active invocation')
                 lifecycle_bootstrap['invocation_id'] = observed.invocation_id
+            advance_stage("final_process_identity")
             original = read_process_identity_v1(pid)
             if original is None:
                 raise AuthorityUnavailable("Host process exited before admission")
-            self.daemon.c09_gate.register_peer_process_v1(peer=matches[0][0], process_id=pid,
+            if self.process_supervisor is not None:
+                final_main = await asyncio.to_thread(self.process_supervisor.require_admitted_peer_v1,
+                    actual_socket_peer=(pid, uid, _gid))
+                if (original != observed_main.main_process_original or original != final_main.main_process_original
+                        or observed_main.invocation_id != final_main.invocation_id):
+                    raise AuthorityUnavailable("Host invocation changed during current storage admission")
+            advance_stage("peer_registration")
+            admission_original=self.daemon.c09_gate.register_peer_process_v1(peer=matches[0][0], process_id=pid,
                 process_incarnation="linux-host:" + original["birth"], pointer_version=context.pointer_version,
                 storage_generation=context.storage_generation)
+            self.daemon.c09_control.verify_original_v1(admission_original,"admission_digest")
+            if (admission_original["peer"]!=list(matches[0][0]) or admission_original["process_original"]!=original
+                    or admission_original["installation_id"]!=request["installation_id"]
+                    or admission_original["manifest_digest"]!=context.manifest_digest):
+                raise AuthorityUnavailable("actual durable Host peer admission differs from its verified OS/profile selection")
             member = next(item for item in context.manifest["members"] if item["role"] == "graph")
             result = {"schema": "sylanne3.c09.host-admission.v1", "status": "admitted", **{key: request[key]
                 for key in ("profile_id", "installation_id", "authority_id")},
@@ -141,8 +190,26 @@ class InstalledLinuxHostSupervisorV1:
                 result['schema'] = 'sylanne3.c09.host-admission.v2'
                 result['package_selection'] = asdict(selected)
                 result['package_bootstrap'] = package_bootstrap
-        except Exception:
+        except Exception as exc:
+            advance_stage("response_write")
+            diagnostic = traceback.TracebackException.from_exception(exc, capture_locals=False)
+            chain = []
+            while diagnostic is not None:
+                chain.append({"type": diagnostic.exc_type.__name__, "frames": [
+                    {"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                    for frame in diagnostic.stack]})
+                diagnostic = diagnostic.__cause__ or (
+                    None if diagnostic.__suppress_context__ else diagnostic.__context__)
+            logging.getLogger(__name__).error("Sylanne C09 Host admission cause metadata: " +
+                json.dumps({"elapsed_ns": time.monotonic_ns() - started,
+                    "stages": stages, "chain": chain}, separators=(",", ":")))
             result = {"status": "hold"}
+        else:
+            advance_stage("response_write")
+            elapsed = time.monotonic_ns() - started
+            if elapsed >= 10_000_000_000:
+                logging.getLogger(__name__).warning("Sylanne C09 Host admission duration metadata: " +
+                    json.dumps({"elapsed_ns": elapsed, "stages": stages}, separators=(",", ":")))
         try:
             writer.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
             await writer.drain()
@@ -201,7 +268,13 @@ class InstalledLinuxHostSupervisorV1:
                 # Only the original durable resume worker owns start_intent.
                 # A paused or ambiguous restart must never auto-start Host.
                 return False
-        await asyncio.to_thread(self._systemctl, "start", "--no-block")
+        if self.process_supervisor is not None:
+            before = await asyncio.to_thread(self.process_supervisor.read_current_host_state_v1)
+            if before.active_state != "active":
+                await asyncio.to_thread(self.process_supervisor.start_stopped_host_v1,
+                    expected_prior_invocation_id=before.invocation_id)
+        else:
+            await asyncio.to_thread(self._systemctl, "start", "--no-block")
         return True
 
     async def aclose(self):

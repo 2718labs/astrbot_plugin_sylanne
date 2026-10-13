@@ -32,9 +32,9 @@ def _size(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
-def _fingerprint(window: ConversationWindowProjectionV1, turns: tuple) -> str:
+def _fingerprint_value_v1(window: ConversationWindowProjectionV1, turns: tuple) -> dict:
     first, last = turns[0].sequence, turns[-1].sequence
-    return canonical_digest({
+    return {
         "namespace": window.namespace, "owner": window.owner_ref,
         "conversation": window.conversation_ref, "scene": window.scene_ref,
         "audience": window.audience_ref, "access_epoch": window.access_epoch,
@@ -43,8 +43,16 @@ def _fingerprint(window: ConversationWindowProjectionV1, turns: tuple) -> str:
                                 for start, end in window.missing_ranges
                                 if start <= last and end >= first),
         "turns": turns,
-    })
+    }
 
+
+def _fingerprint(window: ConversationWindowProjectionV1, turns: tuple, *, _prepared_paid_eof_v3=None) -> str:
+    if _prepared_paid_eof_v3 is not None:
+        from ...authority_service.d13_paid_block_verifier_v1 import PreparedD13PaidRequestEOFV3
+        if type(_prepared_paid_eof_v3)is not PreparedD13PaidRequestEOFV3:
+            raise ValueError('actual D13 Paid current fingerprint EOF required')
+        return _prepared_paid_eof_v3.require_current_fingerprint_v3(window,turns)
+    return canonical_digest(_fingerprint_value_v1(window,turns))
 
 @dataclass(frozen=True, slots=True)
 class PrecompressionPlan:
@@ -287,6 +295,7 @@ def compile_deterministic_candidate(
 def _validate_extractive_candidate(
     candidate: CompressedTurnBlockV2, plan: PrecompressionPlan,
     window: ConversationWindowProjectionV1,
+    *,_prepared_paid_eof_v3=None,
 ) -> None:
     """Check content and frozen source identity without claiming job settlement."""
     if (candidate.status != "candidate" or candidate.compiler_version != EXTRACTIVE_MODEL_VERSION
@@ -301,7 +310,7 @@ def _validate_extractive_candidate(
     if (len(turns) != plan.last_sequence - plan.first_sequence + 1
             or not turns or turns[0].sequence != plan.first_sequence
             or turns[-1].sequence != plan.last_sequence
-            or _fingerprint(window, turns) != plan.input_digest
+            or _fingerprint(window,turns,_prepared_paid_eof_v3=_prepared_paid_eof_v3) != plan.input_digest
             or window.scene_ref != plan.scene_ref or window.audience_ref != plan.audience_ref
             or (window.access_epoch, window.delete_epoch, window.activation_epoch) !=
             (plan.access_epoch, plan.delete_epoch, plan.activation_epoch)
@@ -346,6 +355,7 @@ def _omission_ranges(sequences: list[int]) -> tuple[tuple[int, int], ...]:
 def compile_extractive_model_output(
     window: ConversationWindowProjectionV1, plan: PrecompressionPlan,
     model_text: str,
+    *,_prepared_paid_eof_v3=None,
 ) -> CompressedTurnBlockV2:
     """Compile one bounded JSON model result into an unadopted candidate.
 
@@ -411,7 +421,7 @@ def compile_extractive_model_output(
         candidate_ref=plan.candidate_ref, expires_at_utc=plan.expires_at_utc,
         status="candidate",
     )
-    _validate_extractive_candidate(candidate, plan, window)
+    _validate_extractive_candidate(candidate,plan,window,_prepared_paid_eof_v3=_prepared_paid_eof_v3)
     if _size(candidate.rendered_text) >= sum(_size(t.text) for t in turns):
         raise ValueError("extractive model output does not reduce original text")
     return candidate
@@ -449,16 +459,33 @@ def _model_candidate_current(
 ) -> bool:
     if paid_verifier is None or block.compiler_version != EXTRACTIVE_MODEL_VERSION:
         return False
+    prepared=None
+    if getattr(paid_verifier,'_authority_collection',None)is not None:
+        work,_cap=paid_verifier._authority_collection
+        from ...runtime.installed_d13_natural_frame_v6 import require_authority_derived_blocks_reader_v6
+        from ...authority_service.d13_paid_block_verifier_v1 import PreparedD13PaidRequestEOFV3
+        from ...authority_service.contract import AuthorityUnavailable
+        prepared=require_authority_derived_blocks_reader_v6(work).paid_requests.get(plan.job_ref)
+        if type(prepared)is not PreparedD13PaidRequestEOFV3:
+            raise AuthorityUnavailable('actual D13 Paid current fingerprint was not prepared')
+        if prepared.require_originals_v3(paid_verifier,plan,window)is None:return False
     candidate = replace(block, status="candidate")
     try:
-        _validate_extractive_candidate(candidate, plan, window)
+        _validate_extractive_candidate(candidate,plan,window,_prepared_paid_eof_v3=prepared)
         turns = tuple(t for t in window.turns
                       if plan.first_sequence <= t.sequence <= plan.last_sequence)
         if _size(candidate.rendered_text) >= sum(_size(t.text) for t in turns):
             return False
         return paid_verifier.verify_current_paid_model_block_v2(
             candidate, plan=plan, window=window) is True
-    except Exception:
+    except Exception as error:
+        from ...authority_service.current_authority_graph_read_v3 import (AuthorityGraphAttachmentRequiredV3,
+            AuthorityNaturalOriginalRequiredV3)
+        from ...authority_service.contract import AuthorityUnavailable
+        from ...runtime.c09_paged_sql_v2 import C09PagedCaptureHold
+        if isinstance(error,(AuthorityGraphAttachmentRequiredV3,AuthorityNaturalOriginalRequiredV3,
+                AuthorityUnavailable,C09PagedCaptureHold)):
+            raise
         return False
 
 
@@ -496,6 +523,14 @@ def accept_model_or_deterministic(
         return replace(compile_deterministic_candidate(window, plan), status="standby")
 
 
+def _detail_rank_value_v1(slot,*,keys,mentioned,already_evidenced,overlap):
+    if slot.source_ref in already_evidenced:return None
+    score=(100 if slot.key in keys else 0)+(20 if slot.source_ref in mentioned else 0)+min(overlap,5)*10
+    if not score:return None
+    score+=2 if _QUALIFIER.search(slot.text) else 0
+    return (-score,slot.sequence,slot.key,slot)
+
+
 def select_detail_slots(
     block: CompressedTurnBlockV2, *, query_keys: tuple[str, ...],
     detail_byte_budget: int,
@@ -528,14 +563,10 @@ def select_detail_slots(
     terms = _lexical_terms(query_text)
     ranked = []
     for slot in block.detail_slots:
-        if slot.source_ref in already_evidenced:
-            continue
-        overlap = len(terms & _lexical_terms(slot.text))
-        score = (100 if slot.key in keys else 0) + (20 if slot.source_ref in mentioned else 0)
-        score += min(overlap, 5) * 10
-        if score:
-            score += 2 if _QUALIFIER.search(slot.text) else 0
-            ranked.append((-score, slot.sequence, slot.key, slot))
+        if slot.source_ref in already_evidenced:continue
+        row=_detail_rank_value_v1(slot,keys=keys,mentioned=mentioned,already_evidenced=already_evidenced,
+            overlap=len(terms & _lexical_terms(slot.text)))
+        if row is not None:ranked.append(row)
     chosen = []
     used = 0
     for _, _, _, slot in sorted(ranked):
@@ -636,3 +667,70 @@ def decide_activation(
         if standby != replace(expected, status="standby"):
             return "invalid"
     return "activate" if not raw_window_fits or proven_future_saving else "keep_raw"
+
+class _BoundedDetailSelectionV7:
+    """The same deterministic ranking; only matching query terms are retained."""
+    def __init__(self,block,*,query_keys,detail_byte_budget,query_text,evidence_sources,operation,rementioned_sources=()):
+        if (type(block)is not CompressedTurnBlockV2 or type(detail_byte_budget)is not int or detail_byte_budget<0
+                or type(query_keys)is not tuple or any(type(key)is not str or not key for key in query_keys)
+                or type(query_text)is not str or _size(query_text)>4096
+                or type(evidence_sources)is not tuple or any(type(ref)is not VersionedRef for ref in evidence_sources)
+                or type(rementioned_sources)is not tuple or any(type(ref)is not VersionedRef for ref in rementioned_sources)):
+            raise ValueError('actual bounded detail selection inputs required')
+        self.block,self.budget,self.operation=block,detail_byte_budget,operation
+        self.keys,self.evidence,self.mentioned=set(query_keys),set(evidence_sources),set(rementioned_sources)
+        self.terms=_lexical_terms(query_text);self.overlap=set();self.ranked=[];self.chosen=[]
+        self.position=self.offset=self.used=0;self.latin='';self.latin_possible=True;self.cjk=''
+        self.phase='rank';self.complete=False;self.result=None;self.rendered_parts=None;self.part=0;self.line_size=0
+        operation.retain(65536+len(self.terms)*256+len(block.detail_slots)*192)
+    def _end_latin(self):
+        if len(self.latin)>=3 and self.latin in self.terms:self.overlap.add(self.latin)
+        self.latin='';self.latin_possible=True
+    def advance(self,meter):
+        if self.complete:return self
+        if self.phase=='rank':
+            if self.position>=len(self.block.detail_slots):
+                self.ranked.sort();self.position=self.offset=0;self.phase='choose';return self
+            slot=self.block.detail_slots[self.position]
+            if slot.source_ref in self.evidence:self.position+=1;return self
+            if self.offset<len(slot.text):
+                end=min(self.offset+1024,len(slot.text));raw=slot.text[self.offset:end];lowered=raw.casefold()
+                meter.require_available(65536);meter.charge_encode((len(raw)+len(lowered))*4)
+                for char in lowered:
+                    if re.fullmatch(r'[a-z0-9_]',char,re.I):
+                        if self.latin_possible:
+                            self.latin+=char
+                            if not any(term.startswith(self.latin)for term in self.terms):
+                                self.latin='';self.latin_possible=False
+                    else:self._end_latin()
+                    if '\u3400'<=char<='\u9fff':
+                        if self.cjk and self.cjk+char in self.terms:self.overlap.add(self.cjk+char)
+                        self.cjk=char
+                    else:self.cjk=''
+                self.offset=end;return self
+            self._end_latin()
+            row=_detail_rank_value_v1(slot,keys=self.keys,mentioned=self.mentioned,already_evidenced=self.evidence,overlap=len(self.overlap))
+            if row is not None:self.ranked.append(row)
+            self.position+=1;self.offset=0;self.overlap.clear();self.cjk='';return self
+        if self.position>=len(self.ranked):
+            self.result=tuple(sorted(self.chosen,key=lambda slot:(slot.sequence,slot.key)));self.complete=True;return self
+        slot=self.ranked[self.position][3]
+        if self.rendered_parts is None:
+            anchor=next((turn for turn in self.block.turns if turn.sequence==slot.sequence),None)
+            if anchor is None or anchor.source_ref!=slot.source_ref:raise ValueError('detail slot has no matching original turn anchor')
+            self.rendered_parts=(f'[detail {slot.sequence} {anchor.trusted_utc} {anchor.speaker_ref} {slot.source_ref.ref}@{slot.source_ref.version}] ',slot.text)
+            self.part=self.offset=self.line_size=0
+        value=self.rendered_parts[self.part]
+        if self.offset<len(value):
+            end=min(self.offset+1024,len(value));fragment=value[self.offset:end].encode('utf-8')
+            meter.charge_encode(len(fragment));self.line_size+=len(fragment);self.offset=end;return self
+        self.part+=1;self.offset=0
+        if self.part<len(self.rendered_parts):return self
+        size=self.line_size+(1 if self.chosen else 0)
+        if self.used+size<=self.budget:self.chosen.append(slot);self.used+=size
+        self.position+=1;self.rendered_parts=None;return self
+
+
+def begin_bounded_detail_selection_v7(block,*,query_keys,detail_byte_budget,query_text,evidence_sources,operation,rementioned_sources=()):
+    return _BoundedDetailSelectionV7(block,query_keys=query_keys,detail_byte_budget=detail_byte_budget,
+        query_text=query_text,evidence_sources=evidence_sources,operation=operation,rementioned_sources=rementioned_sources)

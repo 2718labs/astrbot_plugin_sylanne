@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion
 from ...memory_types import SourceRecord
 from ..d06 import validate_source_correction_head
-from .relationship import BoundaryRule, RelationshipContribution, _tuple_payload
+from .relationship import (BoundaryRule, RelationshipContribution, _tuple_payload,
+    decode_relationship_projection_payload_v1, decode_relationship_contribution_payload_v1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +73,7 @@ def compile_d05_source_reevaluation(
     scopes: set[tuple[str, str, str, str, str | None]] = set()
     relations: set[tuple[str, str]] = set()
     for atom in snapshot.atoms:
-        if not atom.valid or atom.revision < 1:
+        if atom.revision < 1:
             continue
         if atom.key.type_name == "d05.boundary_rule":
             rule = BoundaryRule(**_tuple_payload(
@@ -82,12 +83,12 @@ def compile_d05_source_reevaluation(
             if affected.intersection(rule.source_refs):
                 historical_rules.append(atom.key.token)
                 selected[atom.key] = GraphVersion(atom.key, atom.revision)
-                if rule.status == "active":
+                if atom.valid and rule.status == "active":
                     current_rules.append(atom.key.token)
                     scopes.add((rule.subject_persona_ref, rule.target_entity_ref,
                                 rule.action_kind, rule.audience_scope, rule.scene_ref))
         elif atom.key.type_name == "d05.contribution":
-            item = RelationshipContribution(**_tuple_payload(atom.value, "source_refs"))
+            item = decode_relationship_contribution_payload_v1(atom.value)
             if (atom.key.owner.kind != "relation" or atom.key.owner.subject != item.subject_entity_ref
                     or atom.key.name != item.key):
                 raise ValueError("D05 contribution graph identity differs")
@@ -97,12 +98,11 @@ def compile_d05_source_reevaluation(
                 selected[atom.key] = GraphVersion(atom.key, atom.revision)
     projections: list[str] = []
     for atom in snapshot.atoms:
-        if (not atom.valid or atom.revision < 1
+        if (atom.revision < 1
                 or atom.key.type_name != "d05.relationship_projection"):
             continue
-        value = atom.value
+        value = decode_relationship_projection_payload_v1(atom.value)
         if (atom.key.owner.kind != "relation" or type(value) is not dict
-                or set(value) != {"subject_entity_ref", "dimension", "status"}
                 or atom.key.owner.subject != value["subject_entity_ref"]):
             raise ValueError("D05 relationship projection graph identity differs")
         if (value["subject_entity_ref"], value["dimension"]) in relations:

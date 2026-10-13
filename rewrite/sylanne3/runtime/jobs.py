@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import InitVar, dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 import re
@@ -99,8 +99,9 @@ class PersistentJob:
     cancel_epoch: int
     usage: Mapping[str, int]
     result_ref: str | None
+    _canonical_columns: InitVar[object | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _canonical_columns) -> None:
         for field, value in (
             ("job_id", self.job_id), ("operation_id", self.operation_id),
             ("activity_id", self.activity_id), ("bot_id", self.bot_id),
@@ -131,9 +132,16 @@ class PersistentJob:
             raise ValueError("waiting job requires a wake condition")
         if self.phase != "waiting" and self.wake_condition is not None:
             raise ValueError("only waiting jobs may carry a wake condition")
-        _json(self.continuation)
-        _json(self.wake_condition)
-        _json(self.operator_versions)
+        if _canonical_columns is None:
+            _json(self.continuation)
+            _json(self.wake_condition)
+            _json(self.operator_versions)
+        else:
+            from ..authority_service.current_authority_graph_read_v3 import (
+                PreparedAuthorityJobColumnsV3,require_authority_job_columns_v3)
+            if type(_canonical_columns)is not PreparedAuthorityJobColumnsV3:
+                raise TypeError('job columns require an actual issued canonical row original')
+            require_authority_job_columns_v3(_canonical_columns,self)
         usage = dict(self.usage)
         if len(usage) > 32:
             raise ValueError("job usage has too many dimensions")
@@ -203,18 +211,28 @@ def _job_dict(job: PersistentJob) -> dict[str, Any]:
 
 
 def _job_from_dict(value: Mapping[str, Any]) -> PersistentJob:
+    if value["work_kind"] == "d11.foreground_cycle.v1":
+        if value["continuation"].get("schema") == "d11.owner-source-note-task-continuation.v2":
+            from .owner_source_note_task_execution_v1 import decode_owner_source_note_task_job_v1
+            return decode_owner_source_note_task_job_v1(value)
+        from .foreground_cycle_v1 import decode_foreground_job_v1
+        return decode_foreground_job_v1(value)
     return PersistentJob(**value)
 
 
 def _job_from_row(row) -> PersistentJob:
+    from .domain_background_read_v3 import background_json_loads_v3
     if row is None:
         raise JobConflict("job does not exist")
-    return PersistentJob(
+    job = PersistentJob(
         row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8],
-        json.loads(row[9]), json.loads(row[10]) if row[10] is not None else None,
-        row[11], row[12], row[13], json.loads(row[14]), row[15], row[16],
-        row[17], row[18], json.loads(row[19]), row[20],
+        background_json_loads_v3(row[9]), background_json_loads_v3(row[10]) if row[10] is not None else None,
+        row[11], row[12], row[13], background_json_loads_v3(row[14]), row[15], row[16],
+        row[17], row[18], background_json_loads_v3(row[19]), row[20],
     )
+    if job.work_kind == "d11.foreground_cycle.v1":
+        return _job_from_dict(_job_dict(job))
+    return job
 
 
 _JOB_SELECT = (
@@ -227,7 +245,34 @@ _JOB_SELECT = (
 
 def get_job(db, job_id: str) -> PersistentJob:
     _identifier(job_id, "job_id")
-    return _job_from_row(db.execute(_JOB_SELECT, (job_id,)).fetchone())
+    from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_job_v3
+    bound,job=read_bound_authority_job_v3(db,job_id=job_id)
+    if not bound:
+        from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
+        row=model_reply_scope_point_v3(db,table='runtime_jobs',
+            columns=('job_id','operation_id','activity_id','effect_id','bot_id','persona_id','snapshot_ref','phase','work_kind',
+                'continuation_json','wake_condition_json','deadline_utc','budget_ref','resource_ref','operator_versions_json',
+                'lease_holder','lease_expires_utc','fence','cancel_epoch','usage_json','result_ref'),
+            key_columns=('job_id',),key=(job_id,),legacy_reader=lambda:db.execute(_JOB_SELECT,(job_id,)).fetchone())
+        job=_job_from_row(row)
+    from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
+    def family(lease_id,columns):
+        return model_reply_scope_point_v3(db,table='runtime_budget_leases',columns=columns,
+            key_columns=('lease_id',),key=(lease_id,),legacy_reader=lambda:db.execute(
+                'SELECT '+','.join(columns)+' FROM runtime_budget_leases WHERE lease_id=?',(lease_id,)).fetchone())
+    if job.work_kind == "d11.foreground_cycle.v1" and job.continuation.get("schema") == "d11.owner-source-note-task-continuation.v2":
+        root = family(job.budget_ref,('bot_id','persona_id'))
+        if root != (job.bot_id,job.persona_id):
+            raise JobConflict("Owner task current job lost its actual original parent namespace")
+        return job
+    if job.work_kind == "d11.foreground_cycle.v1":
+        from .foreground_cycle_v1 import foreground_cycle_from_wire_v1
+        plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
+        root = family(job.budget_ref,('bot_id','persona_id'))
+        child = family(plan.protected_reply_lease_ref,('parent_id','bot_id','persona_id'))
+        if root != (job.bot_id, job.persona_id) or child != (job.budget_ref, job.bot_id, job.persona_id):
+            raise JobConflict("foreground current job lost its actual original root/protected-child family")
+    return job
 
 
 def _save_job(db, job: PersistentJob) -> None:
@@ -335,9 +380,12 @@ def plan_job_acquire(job: PersistentJob, holder: str, *, now_utc: str,
         # effects still require their own execution-journal recovery check.
     elif job.phase != "queued":
         raise JobNotRunnable(f"job phase {job.phase} is not runnable")
+    expires = now + timedelta(seconds=lease_seconds)
+    if job.work_kind == "d11.foreground_cycle.v1":
+        expires = min(expires, _utc(job.deadline_utc, "deadline_utc"))
     return replace(
         job, phase="running", lease_holder=holder,
-        lease_expires_utc=_utc_text(now + timedelta(seconds=lease_seconds)),
+        lease_expires_utc=_utc_text(expires),
         fence=job.fence + 1,
     )
 

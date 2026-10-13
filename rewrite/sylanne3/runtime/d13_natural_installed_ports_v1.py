@@ -10,7 +10,7 @@ from .jobs import get_job
 
 
 def build_current_natural_d13_ports_v1(db, *, bundle, resource_issuer, budget_issuer,
-        c02_operation_id, original=None, authority_store=None, max_slots=64):
+        c02_operation_id, original=None, authority_store=None, max_slots=64, now_utc=None):
     if not db.in_transaction:
         raise ValueError("D13 installed selection needs the current Graph transaction")
     policy = bundle.installation_policy
@@ -25,11 +25,18 @@ def build_current_natural_d13_ports_v1(db, *, bundle, resource_issuer, budget_is
     if bundle.d13_wire_policy.max_slots != max_slots:
         raise ValueError("D13 pinned counter and current frame source page size differ")
     if original is None:
-        grant = budget_issuer.current_budget_grant(db, policy.root_grant.lease_id)
+        if now_utc is None:
+            raise ValueError("D13 fresh natural selection requires the actual current clock")
+        from .natural_reply_budget_v3 import resolve_natural_reply_budget_for_new_admission_v3
+        source_ref = _current_source_ref(db, policy.namespace, c02_operation_id)
+        _lease, grant = resolve_natural_reply_budget_for_new_admission_v3(db,
+            namespace=policy.namespace, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, issuer=budget_issuer, installed_bundle=bundle,
+            now_utc=now_utc)
         saved = natural_job_ids_v2(policy.namespace, c02_operation_id, "generation")
         suffix = canonical_digest({"schema": "sylanne.d09.natural-generation-identity.v2",
             "namespace": policy.namespace, "c02_operation_id": c02_operation_id,
-            "source_ref": _current_source_ref(db, policy.namespace, c02_operation_id)})[:48]
+            "source_ref": source_ref})[:48]
         budget = D13ForegroundBudgetPreparationV1(policy.namespace, grant.lease_id,
             grant.grant_id, grant.version, canonical_digest(grant),
             dict(bundle.model_workflows.natural_generation.quote_ceiling),

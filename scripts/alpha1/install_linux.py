@@ -6,7 +6,7 @@ or platform traffic. Starting the generated systemd unit is a separate action.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
@@ -74,6 +74,51 @@ def archive_manifest(package, expected_package, expected_manifest):
         return manifest
 
 
+HOST_PROCESS_FIELDS = frozenset((
+    "fixed_executable_path", "executable_sha256", "fixed_entry_ref", "entry_sha256",
+    "fixed_argv", "fixed_cwd", "finite_environment_policy", "maximum_processes",
+    "start_timeout", "drain_timeout"))
+
+
+def check_host_process_command_v3(command):
+    if type(command) is not dict or set(command) != HOST_PROCESS_FIELDS:
+        raise ValueError("exact finite Host process command required")
+    for name in ("fixed_executable_path", "fixed_entry_ref", "fixed_cwd"):
+        value = command[name]
+        if (type(value) is not str or not Path(value).is_absolute()
+                or str(Path(value)) != value or ".." in Path(value).parts):
+            raise ValueError("canonical absolute Host process path required")
+    for name in ("executable_sha256", "entry_sha256"):
+        if type(command[name]) is not str or re.fullmatch(r"[0-9a-f]{64}", command[name]) is None:
+            raise ValueError("actual Host executable and entry hashes required")
+    argv = command["fixed_argv"]
+    environment = command["finite_environment_policy"]
+    if (type(argv) is not list or not 2 <= len(argv) <= 64
+            or any(type(value) is not str or not value or "\0" in value or len(value) > 4096 for value in argv)
+            or argv[0] != command["fixed_executable_path"] or command["fixed_entry_ref"] not in argv
+            or type(environment) is not dict or len(environment) > 16
+            or any(type(key) is not str or type(value) is not str or not key or "\0" in key + value
+                   for key, value in environment.items())):
+        raise ValueError("exact finite Host argv and environment required")
+    for name, lower, upper in (("maximum_processes", 2, 256), ("start_timeout", 1, 60), ("drain_timeout", 1, 60)):
+        if type(command[name]) is not int or not lower <= command[name] <= upper:
+            raise ValueError("finite Host process limits required")
+    return command
+
+
+def verify_host_process_command_v3(command):
+    from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+    check_host_process_command_v3(command)
+    for name, pin in (("fixed_executable_path", "executable_sha256"), ("fixed_entry_ref", "entry_sha256")):
+        path = Path(command[name])
+        if str(path.resolve(strict=True)) != command[name]:
+            raise ValueError("registered Host code must use its actual canonical path")
+        if hashlib.sha256(read_installed_bytes_v1(path, limit=64 * 1024 * 1024)).hexdigest() != command[pin]:
+            raise ValueError("registered Host code bytes differ")
+    if not os.access(command["fixed_executable_path"], os.X_OK):
+        raise ValueError("registered Host executable is not executable")
+
+
 def check_request(request):
     fields = {"schema", "profile_id", "bot_id", "persona_id", "host_uid", "host_gid", "host_systemd_unit",
         "astrbot_plugins_directory", "authority_port", "reverse_port", "workbench_origin", "clock_error_seconds",
@@ -81,12 +126,42 @@ def check_request(request):
         "budget_max_ceiling", "currency", "budget_valid_until_utc", "model_audiences", "onebot_account",
         "onebot_adapter_ref", "provider_cache", "host_lifecycle", "d04_semantic_drive", "d04_joint_numeric",
         "d13_wire_policy", "d13_wire_counter", "d13_precompression", "d13_paid_precompression", "d07_cognition"}
-    if set(request) != fields or request["schema"] != "sylanne3.linux-install-request.v2":
+    version4 = request.get("schema") == "sylanne3.linux-install-request.v4"
+    process = request.get("schema") in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}
+    if process:
+        fields = fields - {"host_systemd_unit"} | {"host_process_command"}
+    if version4:
+        fields |= {"foreground", "artifact_draft"}
+        if "astrbot_namespace_v1" in request:
+            fields.add("astrbot_namespace_v1")
+        if "d06_recall" in request:
+            fields.add("d06_recall")
+        if "provider_billing_contract_v1" in request:
+            fields.add("provider_billing_contract_v1")
+        if "natural_template_pair_v1" in request:
+            fields.add("natural_template_pair_v1")
+        if "d13_counter_installation_v1" in request:
+            fields.add("d13_counter_installation_v1")
+    if set(request) != fields or request["schema"] not in {"sylanne3.linux-install-request.v2", "sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}:
         raise ValueError("installation request fields differ; use the bundled request template")
-    for name in ("profile_id", "bot_id", "persona_id"):
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", request[name]):
-            raise ValueError(name + " is invalid")
-    if not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", request["host_systemd_unit"]):
+    if type(request["profile_id"]) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", request["profile_id"]):
+        raise ValueError("profile_id is invalid")
+    from sylanne3.authority_service.installed_platform_observation import parse_installed_onebot_account_v2
+    account = parse_installed_onebot_account_v2(json.dumps(request["onebot_account"], separators=(",", ":")))
+    if "astrbot_namespace_v1" in request:
+        from sylanne3.host.identity import astrbot_namespace_from_configuration_v1
+        configured = request["astrbot_namespace_v1"]
+        derived = astrbot_namespace_from_configuration_v1(configured)
+        if ((request["bot_id"], request["persona_id"]) != derived.as_tuple
+                or account != (configured["platform_id"], "aiocqhttp", configured["self_id"])):
+            raise ValueError("configured AstrBot namespace differs from the exact installed account/persona")
+    else:
+        for name in ("bot_id", "persona_id"):
+            if type(request[name]) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", request[name]):
+                raise ValueError(name + " is invalid")
+    if process:
+        check_host_process_command_v3(request["host_process_command"])
+    elif not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", request["host_systemd_unit"]):
         raise ValueError("installed AstrBot systemd unit required")
     for name in ("host_uid", "host_gid"):
         if type(request[name]) is not int or request[name] < 1:
@@ -108,12 +183,13 @@ def check_request(request):
                 raise ValueError("per-call quote exceeds approved root budget")
     from sylanne3.authority_service.d12_installed_supervisor_v1 import D12SystemdSupervisorConfigV1
     life = request["host_lifecycle"]
-    if (type(life) is not dict or set(life) != {"supervisor", "drain_timeout_seconds"}
+    if (type(life) is not dict or set(life) != ({"drain_timeout_seconds"} if process else {"supervisor", "drain_timeout_seconds"})
             or type(life["drain_timeout_seconds"]) is not int or not 1 <= life["drain_timeout_seconds"] <= 3600):
         raise ValueError("explicit bounded installed lifecycle supervision required")
-    supervisor = D12SystemdSupervisorConfigV1(**life["supervisor"])
-    if supervisor.unit_name != request["host_systemd_unit"]:
-        raise ValueError("lifecycle and Host unit differ")
+    if not process:
+        supervisor = D12SystemdSupervisorConfigV1(**life["supervisor"])
+        if supervisor.unit_name != request["host_systemd_unit"]:
+            raise ValueError("lifecycle and Host unit differ")
     for name in ("d04_semantic_drive", "d04_joint_numeric"):
         if type(request[name]) is not dict or not request[name]:
             raise ValueError("full alpha1 requires explicit " + name)
@@ -125,7 +201,103 @@ def check_request(request):
     if (type(request["provider_cache"]) is not dict
             or request["provider_cache"].get("provider_id") != request["provider_id"]):
         raise ValueError("cache adapter must cover the installed model provider")
+    if version4:
+        pair=natural_template_pair_v1(request)
+        from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
+        if pair[0]==V7_TEMPLATE:
+            from sylanne3.authority_service.d13_installed_counter_factory_v1 import validate_d13_counter_initial_spec_v1
+            validate_d13_counter_initial_spec_v1(request.get("d13_counter_installation_v1"))
+            if request["d13_wire_policy"] is None or request["d13_wire_counter"] is not None:
+                raise ValueError("V7 requires its explicit Core policy and protected initial counter assets")
+        elif "d13_counter_installation_v1" in request:
+            raise ValueError("Core counter assets require the explicitly selected V7 template")
+        billing = request.get("provider_billing_contract_v1")
+        if billing is not None:
+            if (type(billing) is not dict or set(billing) != {"contract_id", "contract_version",
+                    "provider_ed25519_public_key_hex", "evidence_kind", "currency", "unit"}
+                    or type(billing["contract_version"]) is not int or billing["contract_version"] != 1
+                    or billing["evidence_kind"] not in {"provider_final_charge", "fixture_simulated_charge"}
+                    or (billing["currency"], billing["unit"]) != ("USD", "model_microusd")
+                    or type(billing["contract_id"]) is not str or not 0 < len(billing["contract_id"]) <= 256
+                    or type(billing["provider_ed25519_public_key_hex"]) is not str
+                    or re.fullmatch("[0-9a-f]{64}", billing["provider_ed25519_public_key_hex"]) is None):
+                raise ValueError("explicit finite provider billing contract/key/evidence/unit required")
+        from sylanne3.host.authority_profile import foreground_policy_from_payload_v1, artifact_draft_policy_from_payload_v1
+        foreground = foreground_policy_from_payload_v1(request["foreground"])
+        if "d06_recall" in request:
+            from sylanne3.host.authority_profile import d06_recall_policy_from_payload_v1
+            d06_recall_policy_from_payload_v1(request["d06_recall"])
+        if request["artifact_draft"] is None:
+            if foreground.deadline_policy.draft_mode is not None:
+                raise ValueError("unconfigured draft cannot request a signed-scope deadline")
+        else:
+            draft = artifact_draft_policy_from_payload_v1(request["artifact_draft"])
+            if foreground.deadline_policy.draft_mode != "signed_scope_intersection_v1":
+                raise ValueError("draft requires explicit signed-scope responsibility")
+            for name, amount in draft.model_workflow.quote_ceiling.items():
+                if name not in request["budget_limits"] or name not in request["budget_max_ceiling"]:
+                    raise ValueError("draft quote requires all explicit root budget dimensions")
+                if amount > min(request["budget_limits"][name], request["budget_max_ceiling"][name]):
+                    raise ValueError("draft per-call quote exceeds approved root budget")
+            if (draft.body_policy.cpu_ceiling_ms > request["budget_limits"]["cpu_ms"]
+                    or draft.body_policy.cpu_ceiling_ms > request["budget_max_ceiling"]["cpu_ms"]):
+                raise ValueError("draft Body ceiling exceeds approved root budget")
+            if draft.observation_policy is not None and (
+                    draft.observation_policy.cpu_ceiling_ms > request["budget_limits"]["cpu_ms"]
+                    or draft.observation_policy.cpu_ceiling_ms > request["budget_max_ceiling"]["cpu_ms"]):
+                raise ValueError("draft observation ceiling exceeds approved root budget")
     return request
+
+
+def natural_template_pair_v1(request):
+    """Choose a registered initial workflow pair before profile signing."""
+    from sylanne3.model_broker.natural_reply_history_v4 import TEMPLATE_VERSION, TEMPLATE_VERSION_V5
+    from sylanne3.model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as TEMPLATE_VERSION_V6
+    from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as TEMPLATE_VERSION_V7
+    from sylanne3.model_broker.natural_review import REVIEW_TEMPLATE_VERSION, REVIEW_TEMPLATE_VERSION_V2
+
+    legacy = (TEMPLATE_VERSION, REVIEW_TEMPLATE_VERSION)
+    selected = request.get("natural_template_pair_v1")
+    if selected is None:
+        return legacy
+    if (request.get("schema") != "sylanne3.linux-install-request.v4"
+            or type(selected) is not dict
+            or set(selected) != {"schema", "generation", "review"}
+            or selected["schema"] != "sylanne3.initial-natural-template-pair.v1"):
+        raise ValueError("exact initial natural template pair required")
+    pair = (selected["generation"], selected["review"])
+    if pair not in (legacy, (TEMPLATE_VERSION_V5, REVIEW_TEMPLATE_VERSION_V2), (TEMPLATE_VERSION_V6, REVIEW_TEMPLATE_VERSION_V2), (TEMPLATE_VERSION_V7, REVIEW_TEMPLATE_VERSION_V2)):
+        raise ValueError("initial natural generation/review pair is not registered")
+    return pair
+
+
+def selected_model_request_v1(request, value):
+    """Bind a public Host observation to local administrator installation input.
+
+    The observation selects a model; it grants no rights and supplies no budget.
+    The local provider configuration must still be the exact observed object.
+    """
+    from sylanne3.host.model_selection import parse_host_model_selection_v1
+    from sylanne3.runtime_contracts import canonical_digest
+
+    check_request(request)
+    selection = parse_host_model_selection_v1(value)
+    if selection.authority_profile != request["profile_id"]:
+        raise ValueError("model selection belongs to a different Authority profile")
+    config = json.loads(Path(request["provider_config_path"]).read_bytes())
+    if type(config) is not dict:
+        raise ValueError("exact local AstrBot provider configuration object required")
+    if canonical_digest(config) != selection.provider_config_digest:
+        raise ValueError("selected provider configuration changed; read the Host selection again")
+    if (config.get("id") != selection.provider_id
+            or config.get("model") != selection.model_id):
+        raise ValueError("selected provider or model differs from the local configuration")
+    if config.get("type") != "openai_chat_completion":
+        raise ValueError("selected provider adapter is not supported by the current installation contract")
+    updated = {**request, "provider_id": selection.provider_id,
+               "model_id": selection.model_id,
+               "provider_cache": {**request["provider_cache"], "provider_id": selection.provider_id}}
+    return check_request(updated)
 
 
 def tls_material():
@@ -161,8 +333,9 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
     from sylanne3.host.authority_profile import installed_model_config_ref, _policy_from_payload
     from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
     from sylanne3.model_broker.reply_language import REPLY_TEMPLATE_VERSION
-    from sylanne3.model_broker.natural_reply_history_v4 import TEMPLATE_VERSION
-    from sylanne3.model_broker.natural_review import REVIEW_TEMPLATE_VERSION
+    generation_template, review_template = natural_template_pair_v1(request)
+    from sylanne3.model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as NATURAL_GENERATION_V6
+    from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as NATURAL_GENERATION_V7
     from sylanne3.model_broker.d04_appraisal import TEMPLATE_VERSION as APPRAISAL_VERSION, WORK_KIND as APPRAISAL_KIND
     namespace = NamespaceId(request["bot_id"], request["persona_id"])
     provider_config = json.loads(Path(request["provider_config_path"]).read_bytes())
@@ -174,16 +347,39 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
         provider_config_digest=config_digest, audiences=request["model_audiences"], privacy_tier="private",
         required_capabilities=["text"], timeout_seconds=120.0, max_output_tokens=request["model_quote"]["output_tokens"],
         quote_ceiling=request["model_quote"])
+    encode_template=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+    if request.get("artifact_draft") is not None:
+        from sylanne3.host.authority_profile import artifact_draft_policy_from_payload_v1,AdminArtifactDraftPolicyV2
+        if type(artifact_draft_policy_from_payload_v1(request["artifact_draft"])) is AdminArtifactDraftPolicyV2:
+            from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
+            encode_template=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
     workflows = {"version": 2}
-    for name, kind, purpose, template in (("encode", "d06.encode_source", "consolidation", FIRST_INGRESS_ENCODING_TEMPLATE_VERSION),
-        ("reply", "reply", "proposal", REPLY_TEMPLATE_VERSION), ("natural_generation", "natural_generation", "proposal", TEMPLATE_VERSION),
-        ("natural_review", "natural_review", "proposal", REVIEW_TEMPLATE_VERSION), ("appraisal", APPRAISAL_KIND, "proposal", APPRAISAL_VERSION)):
+    for name, kind, purpose, template in (("encode", "d06.encode_source", "consolidation", encode_template),
+        ("reply", "reply", "proposal", REPLY_TEMPLATE_VERSION), ("natural_generation", "natural_generation", "proposal", generation_template),
+        ("natural_review", "natural_review", "proposal", review_template), ("appraisal", APPRAISAL_KIND, "proposal", APPRAISAL_VERSION)):
         workflows[name] = {**common, "work_kind": kind, "purpose": purpose, "template_version": template}
     if request['d07_cognition'] is not None:
         workflows['d07_cognition'] = dict(request['d07_cognition'])
         if any(workflows['d07_cognition'].get(name) != common[name]
                for name in ('provider_id', 'model_id', 'provider_config_ref', 'provider_config_digest')):
             raise ValueError('D07 cognition must explicitly match the installed main provider configuration')
+    if request['schema'] == 'sylanne3.linux-install-request.v4':
+        workflows['version'] = 4
+        workflows['artifact_draft'] = None
+        if request['artifact_draft'] is not None:
+            configured = request['artifact_draft']['model_workflow']
+            if any(configured[name] != common[name]
+                    for name in ('provider_id', 'model_id', 'provider_config_ref', 'provider_config_digest')):
+                raise ValueError('C4 requires the exact actual installed main provider configuration')
+            workflows['artifact_draft'] = dict(configured)
+    if generation_template == NATURAL_GENERATION_V7:
+        workflows['version']=7
+        workflows['d07_relationship_cognition']=None
+        workflows['growth_cognition']=None
+    if generation_template == NATURAL_GENERATION_V6:
+        workflows['version'] = 6
+        workflows['d07_relationship_cognition'] = None
+        workflows['growth_cognition'] = None
     local = dict(deadline_after_seconds=300.0, quote_ceiling=request["local_quote"],
         snapshot_ref="installed:snapshot:v1", resource_ref="installed:resource:v1")
     kinds = ["d06.encode_source", "reply", "natural_generation", "natural_review", APPRAISAL_KIND,
@@ -196,6 +392,16 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
                           ("d07_cognition", "d07.cognition")):
         if request[setting] is not None:
             kinds.append(kind)
+    if generation_template == NATURAL_GENERATION_V7:
+        # Issue the distinct bounded counter CPU step only in this new Root.
+        # The existing Root ceiling and expiry are unchanged.
+        kinds.append('d13.full_http_counter.v1')
+    if request['schema'] == 'sylanne3.linux-install-request.v4':
+        kinds.append('d11.foreground_cycle.v1')
+        if request['artifact_draft'] is not None:
+            kinds.extend(('artifact_draft_v1', 'd10.life.artifact_draft.v1'))
+            if request['artifact_draft']['observation_policy'] is not None:
+                kinds.append('d11.life.artifact_observation.v1')
     budget_identity = dict(bot_id=namespace.bot_id, persona_id=namespace.persona_id, currency=request["currency"])
     policy = dict(namespace=asdict(namespace), authority_namespace=namespace_ref(namespace), installation_id=installation_id,
         manifest_digest=manifest_pin, administrator_holder="host:" + request["profile_id"], expected_authority_id=authority_id,
@@ -217,6 +423,24 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
     for name in ("d04_semantic_drive", "d04_joint_numeric", "d13_precompression", "d13_paid_precompression", "d13_wire_counter"):
         if request[name] is not None:
             profile[name] = request[name]
+    if request['schema'] == 'sylanne3.linux-install-request.v4':
+        if "astrbot_namespace_v1" in request:
+            profile["astrbot_namespace_v1"] = request["astrbot_namespace_v1"]
+        profile['foreground'] = request['foreground']
+        profile['artifact_draft'] = request['artifact_draft']
+        from sylanne3.host.authority_profile import _foreground_from_payload, _artifact_draft_from_payload
+        _foreground_from_payload(profile)
+        _artifact_draft_from_payload(profile)
+        if "d06_recall" in request:
+            from sylanne3.host.authority_profile import _d06_recall_from_payload
+            profile["d06_recall"] = request["d06_recall"]
+            _d06_recall_from_payload(profile)
+        if request.get("provider_billing_contract_v1") is not None:
+            from sylanne3.model_broker.provider_billing_receipt_v1 import ProviderBillingPolicyV1
+            billing = ProviderBillingPolicyV1(namespace=namespace, installation_id=installation_id,
+                manifest_digest=manifest_pin, provider_id=request["provider_id"], model_id=request["model_id"],
+                provider_config_digest=config_digest, **request["provider_billing_contract_v1"])
+            profile["provider_billing_policy_v1"] = asdict(billing)
     if request["d13_wire_policy"] is not None:
         configured = dict(request["d13_wire_policy"])
         if configured.get("installation") != "$current_installation":
@@ -238,6 +462,8 @@ def preflight_profile(args, request):
     """Validate real pinned assets and full policy before touching system paths."""
     from sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
     archive_manifest(args.package, args.package_sha256, args.manifest_sha256)
+    if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}:
+        verify_host_process_command_v3(request["host_process_command"])
     with tempfile.TemporaryDirectory(prefix="sylanne-install-preflight-") as directory:
         with zipfile.ZipFile(args.package) as archive:
             archive.extractall(directory)
@@ -245,6 +471,22 @@ def preflight_profile(args, request):
         make_profile(request, manifest_pin=args.manifest_sha256,
             authority_id="authority:preflight-only", installation_id="installation:preflight-only",
             registry=affect.registry.type_registry, scheme=affect.scheme)
+
+
+def configure_draft_inventory_v4(request, inventory, directories):
+    """Declare the actual generated export surface; no live DraftRoot is issued."""
+    if request["schema"] != "sylanne3.linux-install-request.v4" or request["artifact_draft"] is None:
+        return inventory
+    from sylanne3.runtime_contracts import canonical_digest
+    selected = [resource for resource in inventory.resources if resource.resource_id == "export"]
+    if (len(selected) != 1 or selected[0].kind != "export"
+            or selected[0].path != str(Path(directories["export"]).resolve())):
+        raise ValueError("draft must bind the actual generated export resource")
+    export = replace(selected[0], content_coverage=tuple(sorted({*selected[0].content_coverage, "jobs_drafts"})))
+    resources = tuple(export if resource.resource_id == "export" else resource for resource in inventory.resources)
+    commitment = canonical_digest(("sylanne3.c09.installation_filesystem_manifest.v2",
+        inventory.authority_id, inventory.installation_id, inventory.namespace, resources))
+    return replace(inventory, resources=resources, manifest_digest=commitment)
 
 
 def install(args, request, manifest):
@@ -328,6 +570,13 @@ def install(args, request, manifest):
             host="127.0.0.1", port=request["reverse_port"], server_name="localhost", expected_host_certificate_sha256=host[2],
             trust_root=str(cert_dir / "ca.pem"), client_certificate=str(cert_dir / "client.pem"), client_private_key=str(cert_dir / "client.key"),
             timeout_seconds=30.0, max_message_bytes=1048576, issuer_id="graph:" + installation_id)])
+    if request.get("d13_counter_installation_v1") is not None:
+        from sylanne3.authority_service.d13_installed_counter_factory_v1 import stage_initial_d13_counter_assets_v1
+        initial_profile=make_profile(request,manifest_pin=args.manifest_sha256,authority_id="authority:pending-bootstrap",
+            installation_id=installation_id,registry=affect.registry.type_registry,scheme=affect.scheme)
+        assets["d13_counter_assets_v1"]=[stage_initial_d13_counter_assets_v1(
+            spec=request["d13_counter_installation_v1"],profile=initial_profile,package_root=code,
+            namespace_root=config_dir/"d13-counter",writer=write)]
     temporary_assets = config_dir / "bootstrap-assets.json"
     write(temporary_assets, canonical(assets))
     auth = InstalledAuthorityPolicyV2(peer_scopes={host[2]: InstalledPeerScopeV1(namespace, holder)},
@@ -340,6 +589,7 @@ def install(args, request, manifest):
         identities = initialize_fresh_authority_v1(config, affect.registry.type_registry, instance_lease=lease)
         inventory = build_initial_inventory_v1(authority_id=identities["authority_id"], installation_id=installation_id,
             namespace=namespace, files=files, directories=directories)
+        inventory = configure_draft_inventory_v4(request, inventory, directories)
         inventory_path = config_dir / "filesystem-inventory.json"
         write(inventory_path, canonical(asdict(inventory)))
         key = config_dir / "storage-control.key"
@@ -373,25 +623,35 @@ def install(args, request, manifest):
     deployment = dict(schema="sylanne3.authority.linux-deployment.v1", assets_path=str(config_dir / "assets.json"),
         package_root=str(code), trusted_manifest_sha256=args.manifest_sha256, profile_id=request["profile_id"],
         inventory_path=str(inventory_path), inventory_sha256=hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
-        host_uid=request["host_uid"], host_gid=gid, host_systemd_unit=request["host_systemd_unit"], admission_socket=socket_path,
+        host_uid=request["host_uid"], host_gid=gid, admission_socket=socket_path,
         target_directory=str(directories["rebuild_temp"]), provider_cache=request["provider_cache"],
         host_lifecycle=request["host_lifecycle"],
         host_observation=dict(adapter_ref=request["onebot_adapter_ref"], account_ref=json.dumps(request["onebot_account"], separators=(",", ":")),
             clock_source_ref="linux:kernel-adjtimex:v1"))
-    write(config_dir / "deployment.json", canonical(deployment))
+    process = request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}
+    if process:
+        deployment["schema"] = "sylanne3.authority.linux-deployment.v2"
+    else:
+        deployment["host_systemd_unit"] = request["host_systemd_unit"]
+        write(config_dir / "deployment.json", canonical(deployment))
     unit = f'''[Unit]\nDescription=Sylanne alpha1 independent Authority\nAfter=network.target time-sync.target\nWants=time-sync.target\n\n[Service]\nType=simple\nUser=root\nGroup=root\nWorkingDirectory={root}\nExecStart={sys.executable} -B {root}/bootstrap/authority_entry.py\nRestart=on-failure\nRestartSec=2\nRuntimeDirectory=sylanne\nRuntimeDirectoryMode=0755\nUMask=0077\nEnvironment=PYTHONDONTWRITEBYTECODE=1\nKillMode=control-group\nTimeoutStopSec=90\n\n[Install]\nWantedBy=multi-user.target\n'''
     unit_path = config_dir / "sylanne-authority.service"
-    write(unit_path, unit.encode(), mode=0o644)
+    if not process:
+        write(unit_path, unit.encode(), mode=0o644)
     from scripts.alpha1.install_linux_cohort_v2 import install_fixed_cohort_v2
     with InstalledC09InstanceLeaseV1(lock) as lease:
         control = C09StorageControlV1(**control_config, lease=lease)
         cohort_result = install_fixed_cohort_v2(code=code, profile_dir=profile_dir,
-            config_dir=config_dir, control=control, authority_unit_bytes=unit.encode(), writer=write)
+            config_dir=config_dir, control=control, authority_unit_bytes=None if process else unit.encode(), writer=write,
+            deployment=deployment if process else None,
+            process_command=request["host_process_command"] if process else None)
     plugin.symlink_to(root / 'bootstrap' / 'host', target_is_directory=True)
     print(json.dumps(dict(status="installed_service_stopped", authority_id=identities["authority_id"],
         deployment=cohort_result['deployment'], package_selection=cohort_result['selection'],
-        bootstrap_root=cohort_result['bootstrap_root'], systemd_unit_source=str(unit_path),
-        next="Install the generated unit, run daemon-reload, then start sylanne-authority.service explicitly")))
+        bootstrap_root=cohort_result['bootstrap_root'], systemd_unit_source=None if process else str(unit_path),
+        process_supervision=cohort_result.get('process_supervision'),
+        next=("Start the fixed root launcher as PID1 in an explicitly isolated PID/mount/proc namespace"
+              if process else "Install the generated unit, run daemon-reload, then start sylanne-authority.service explicitly"))))
 
 
 def request_template_v2():
@@ -404,7 +664,7 @@ def request_template_v2():
         budget_limits={"output_tokens": 0, "cpu_ms": 0, "thread_cpu_ms": 0},
         budget_max_ceiling={"output_tokens": 0, "cpu_ms": 0, "thread_cpu_ms": 0}, currency="FILL_BUDGET_UNIT",
         budget_valid_until_utc=0.0, model_audiences=["owner"],
-        onebot_account={"self_id": "FILL_ACCOUNT"}, onebot_adapter_ref="FILL_ADAPTER",
+        onebot_account=["FILL_PLATFORM", "aiocqhttp", "FILL_ACCOUNT"], onebot_adapter_ref="FILL_ADAPTER",
         provider_cache={"provider_id": "FILL_PROVIDER"},
         host_lifecycle={"supervisor": {"unit_name": "astrbot.service", "systemctl_path": "/usr/bin/systemctl",
             "unit_fragment_path": "/FILL/canonical/astrbot.service", "unit_fragment_sha256": "0" * 64,
@@ -417,13 +677,64 @@ def request_template_v2():
         d07_cognition=None)
 
 
+def request_template_v3():
+    value = request_template_v2()
+    value["schema"] = "sylanne3.linux-install-request.v3"
+    value.pop("host_systemd_unit")
+    value["host_lifecycle"] = {"drain_timeout_seconds": 300}
+    value["host_process_command"] = dict(
+        fixed_executable_path="/FILL/canonical/python", executable_sha256="0" * 64,
+        fixed_entry_ref="/FILL/canonical/host-entry.py", entry_sha256="0" * 64,
+        fixed_argv=["/FILL/canonical/python", "-B", "/FILL/canonical/host-entry.py"],
+        fixed_cwd="/FILL/protected/host", finite_environment_policy={"PYTHONDONTWRITEBYTECODE": "1"},
+        maximum_processes=16, start_timeout=60, drain_timeout=60)
+    return value
+
+
+def request_template_v4():
+    """Explicit configuration template; no natural window or draft rights default."""
+    value = request_template_v3()
+    value["schema"] = "sylanne3.linux-install-request.v4"
+    value["foreground"] = dict(schema="sylanne.foreground-policy.v1", version=1,
+        call_plan_schema="d11.foreground-call-plan.v1", max_calls=6, max_auxiliary_calls=2,
+        selected_steps=1, policy_ref="policy:foreground.v1", policy_version=1,
+        deadline_policy=dict(schema="sylanne.foreground-deadline-policy.v1", natural=None, draft_mode=None))
+    value["artifact_draft"] = None
+    return value
+
+
+def configuration_plan_v4(request):
+    """Review static scopes and exact budgets without issuing a responsibility."""
+    if request["schema"] != "sylanne3.linux-install-request.v4":
+        return None
+    kinds = ["d11.foreground_cycle.v1"]
+    draft = request["artifact_draft"]
+    if draft is not None:
+        kinds.extend(("artifact_draft_v1", "d10.life.artifact_draft.v1"))
+        if draft["observation_policy"] is not None:
+            kinds.append("d11.life.artifact_observation.v1")
+    return dict(foreground=request["foreground"], artifact_draft=draft,
+        **({"astrbot_namespace_v1": request["astrbot_namespace_v1"]} if "astrbot_namespace_v1" in request else {}),
+        **({"d06_recall": request["d06_recall"]} if "d06_recall" in request else {}),
+        **({"natural_template_pair_v1": request["natural_template_pair_v1"]}
+           if request.get("natural_template_pair_v1") is not None else {}),
+        installed_export_path="/var/lib/sylanne/export" if draft is not None else None,
+        added_work_kinds=kinds, root_budget_limits=request["budget_limits"],
+        root_budget_max_ceiling=request["budget_max_ceiling"],
+        configuration_is_live_permission=False,
+        dynamic_draft_scope="actual_current_owner_source_registration_required")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", action="store_true", help="Print an intentionally non-installable template; every limit requires review")
+    parser.add_argument("--template-version", choices=(2, 3, 4), type=int, default=2)
     parser.add_argument("--package", type=Path)
     parser.add_argument("--package-sha256")
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--request", type=Path)
+    parser.add_argument("--model-selection", type=Path,
+                        help="public current Host LLM observation; binds a fresh installation plan to the exact local provider config")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--install", action="store_true")
     mode.add_argument("--plan", action="store_true", help="Validate the pinned package and full policy without installing")
@@ -431,17 +742,32 @@ def main():
     if args.template:
         if args.install:
             parser.error("--template cannot install")
-        print(json.dumps(request_template_v2(), ensure_ascii=False, indent=2))
+        template = {2: request_template_v2, 3: request_template_v3, 4: request_template_v4}[args.template_version]()
+        print(json.dumps(template, ensure_ascii=False, indent=2))
         return
     if any(value is None for value in (args.package, args.package_sha256, args.manifest_sha256, args.request)):
         parser.error("package, external package/manifest hashes and explicit request are required")
     request = check_request(json.loads(args.request.read_bytes()))
+    selection = None
+    if args.model_selection is not None:
+        from sylanne3.host.model_selection import parse_host_model_selection_v1
+        raw_selection = args.model_selection.read_bytes()
+        if len(raw_selection) > 4096:
+            parser.error("model selection exceeds its public input bound")
+        value = json.loads(raw_selection)
+        request = selected_model_request_v1(request, value)
+        selection = parse_host_model_selection_v1(value)
     manifest = archive_manifest(args.package, args.package_sha256, args.manifest_sha256)
     if not args.install:
         preflight_profile(args, request)
         print(json.dumps(dict(status="plan_only", package_sha256=args.package_sha256, manifest_sha256=args.manifest_sha256,
+            model_selection=selection.to_dict() if selection is not None else None,
+            **({"foreground_configuration": configuration_plan_v4(request)} if request["schema"] == "sylanne3.linux-install-request.v4" else {}),
+            configuration_semantics="fresh_install_only; existing installations require the qualified package/configuration change protocol",
             changes=["new /opt/sylanne code", "new /etc/sylanne service/profile and local credentials", "new /var/lib/sylanne four-store cohort",
-                     "AstrBot plugin link", "systemd unit staged, not enabled or started"], model_calls=0, platform_sends=0)))
+                     "AstrBot plugin link", ("fixed process supervisor specs staged; no process started"
+                          if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}
+                         else "systemd unit staged, not enabled or started")], model_calls=0, platform_sends=0)))
         return
     install(args, request, manifest)
 

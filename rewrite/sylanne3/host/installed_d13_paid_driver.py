@@ -102,7 +102,7 @@ async def run_installed_d13_paid_precompression_v1(
                 or not same_installed_grant_identity_v2(grant, client_grant)):
             return None
         executor = HostModelEgressExecutor(
-            authority=client, bundle=bundle, grant=client_grant, adapter=adapter)
+            authority=client, bundle=bundle, grant=client_grant, adapter=adapter, local_module_admission=runtime.local_module_admission)
         try:
             return await run_paid(
                 envelope, ingress_operation_id, executor=executor)

@@ -8,6 +8,7 @@ its transaction and verify the encoding-time closure and installed assets.
 
 from __future__ import annotations
 
+
 from dataclasses import asdict, dataclass, fields
 import json
 import math
@@ -111,18 +112,19 @@ def _versions(encoded: str) -> tuple[GraphVersion, ...]:
 
 def _receipt(db: sqlite3.Connection, namespace: NamespaceId,
              operation_id: str) -> CommitReceipt:
-    row = db.execute(
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'activity_id', 'effect_id', 'commit_seq', 'receipt_json'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
         "FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         raise C04EncodingBaselineStoreHold("graph CommitReceipt is absent")
-    event = db.execute(
+    event = _producer_original_point_v3(db, table='graph_events', columns=('reads', 'revisions', 'epoch_revision', 'invalidated'), key_columns=('bot', 'persona', 'session', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))(namespace.as_tuple + (row[1], operation_id)), legacy_reader=lambda: db.execute(
         "SELECT reads,revisions,epoch_revision,invalidated FROM graph_events "
         "WHERE bot=? AND persona=? AND session=? AND event_id=?",
         namespace.as_tuple + (row[1], operation_id),
-    ).fetchone()
+    ).fetchone())
     if event is None:
         raise C04EncodingBaselineStoreHold("graph event is absent")
     try:
@@ -157,6 +159,7 @@ def _receipt(db: sqlite3.Connection, namespace: NamespaceId,
 def _historical_reads(db: sqlite3.Connection,
                       original: D04EncodingBaselineOriginalV3,
                       receipt: CommitReceipt) -> None:
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     required = (original.source, original.perspective,
                 *original.interpretations,
                 *(item.feeling for item in original.members),
@@ -167,10 +170,10 @@ def _historical_reads(db: sqlite3.Connection,
                    not in versions for item in required)):
         raise C04EncodingBaselineStoreHold("encoding exact originals are not graph reads")
     for item in required:
-        row = db.execute(
+        row = _producer_original_point_v3(db, table='graph_history', columns=('value', 'valid'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((item.ref, item.revision)), legacy_reader=lambda: db.execute(
             "SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
             (item.ref, item.revision),
-        ).fetchone()
+        ).fetchone())
         if row is None or row[1] != 1:
             raise C04EncodingBaselineStoreHold("encoding historical graph row is absent")
         try:
@@ -266,14 +269,15 @@ def _joint_numeric(db: sqlite3.Connection, namespace: NamespaceId,
                    operation_id: str, original_ref: str,
                    original_revision: int, receipt_digest: str,
                    expected_digest: str) -> JointNumericOriginalV1:
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     from .d04_series_original_v1 import require_series_adopted_original_v1
     require_series_adopted_original_v1(db, namespace, operation_id)
-    row = db.execute(
+    row = _producer_original_point_v3(db, table='graph_d04_joint_numeric_originals_v1', columns=('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,"
         "verification_digest FROM graph_d04_joint_numeric_originals_v1 "
         "WHERE bot=? AND persona=? AND operation_id=?",
         namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         raise C04EncodingBaselineStoreHold("joint numeric original is absent")
     try:
@@ -422,11 +426,16 @@ def read_c04_encoding_baseline_v3(
     encoding_operation_id: str, source_ref: str,
 ) -> C04EncodingBaselineStoreRecordV3:
     """Cold-open W01 read within its Owner fence; verify immutable history."""
-    _transaction(db)
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    if type(db) is sqlite3.Connection:
+        _transaction(db)
+    else:
+        from .c04_internal_work_original_v1 import _transaction as _original_read_transaction_v4
+        _original_read_transaction_v4(db,original_read=True)
     if type(namespace) is not NamespaceId:
         raise C04EncodingBaselineStoreHold("typed namespace required")
     key = namespace.as_tuple + (encoding_operation_id, source_ref)
-    row = db.execute(
+    row = _producer_original_point_v3(db, table='graph_c04_encoding_baselines_v3', columns=('joint_operation_id', 'original_json', 'original_digest', 'proof_json', 'proof_digest', 'as_known_at_json', 'historical_closure_digest', 'read_versions_json', 'read_versions_digest', 'encoding_receipt_digest', 'joint_receipt_digest', 'numeric_original_ref', 'numeric_original_revision', 'record_digest'), key_columns=('bot', 'persona', 'encoding_operation_id', 'source_ref'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))(key), legacy_reader=lambda: db.execute(
         "SELECT joint_operation_id,original_json,original_digest,proof_json,"
         "proof_digest,as_known_at_json,historical_closure_digest,"
         "read_versions_json,read_versions_digest,encoding_receipt_digest,"
@@ -434,7 +443,7 @@ def read_c04_encoding_baseline_v3(
         "record_digest FROM graph_c04_encoding_baselines_v3 "
         "WHERE bot=? AND persona=? AND encoding_operation_id=? AND source_ref=?",
         key,
-    ).fetchone()
+    ).fetchone())
     if row is None:
         raise C04EncodingBaselineStoreHold("encoding baseline original is absent")
     try:

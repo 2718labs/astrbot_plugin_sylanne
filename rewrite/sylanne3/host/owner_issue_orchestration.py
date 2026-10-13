@@ -15,7 +15,7 @@ from ..authority_service.v2_owner_contract import (
     OwnerGraphCommitProofV1,
 )
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from ..graph_types import owner_grant_policy_digest_v1, validate_owner_grant_v1
 from ..graph_worker import GraphWorker
 from ..runtime_contracts import NamespaceId, canonical_digest

@@ -273,6 +273,20 @@ def issue_paid_precompression_quote_v1(
     return quote
 
 
+def precompression_plan_from_wire_v1(payload) -> PrecompressionPlan:
+    """The existing exact durable plan decoder, without a fabricated job DTO."""
+    from dataclasses import fields
+    if type(payload) is not dict or set(payload)!={field.name for field in fields(PrecompressionPlan)}:
+        raise ValueError("invalid durable D13 plan fields")
+    return PrecompressionPlan(
+        job_ref=payload["job_ref"], candidate_ref=payload["candidate_ref"], input_digest=payload["input_digest"],
+        first_sequence=payload["first_sequence"], last_sequence=payload["last_sequence"],
+        source_dependencies=tuple(VersionedRef(**ref) for ref in payload["source_dependencies"]),
+        scene_ref=VersionedRef(**payload["scene_ref"]), audience_ref=VersionedRef(**payload["audience_ref"]),
+        access_epoch=payload["access_epoch"], delete_epoch=payload["delete_epoch"],
+        activation_epoch=payload["activation_epoch"], expires_at_utc=payload["expires_at_utc"])
+
+
 def plan_from_precompression_job_v1(job: PersistentJob) -> PrecompressionPlan:
     """Recover the immutable source closure from D11's durable original job."""
     if (type(job) is not PersistentJob
@@ -282,20 +296,7 @@ def plan_from_precompression_job_v1(job: PersistentJob) -> PrecompressionPlan:
     if type(payload) is not dict:
         raise ValueError("D13 job has no durable plan")
     try:
-        plan = PrecompressionPlan(
-            job_ref=payload["job_ref"], candidate_ref=payload["candidate_ref"],
-            input_digest=payload["input_digest"],
-            first_sequence=payload["first_sequence"],
-            last_sequence=payload["last_sequence"],
-            source_dependencies=tuple(VersionedRef(**ref)
-                                      for ref in payload["source_dependencies"]),
-            scene_ref=VersionedRef(**payload["scene_ref"]),
-            audience_ref=VersionedRef(**payload["audience_ref"]),
-            access_epoch=payload["access_epoch"],
-            delete_epoch=payload["delete_epoch"],
-            activation_epoch=payload["activation_epoch"],
-            expires_at_utc=payload["expires_at_utc"],
-        )
+        plan = precompression_plan_from_wire_v1(payload)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("invalid durable D13 plan") from exc
     if (canonical_digest(asdict(plan)) != canonical_digest(payload) or

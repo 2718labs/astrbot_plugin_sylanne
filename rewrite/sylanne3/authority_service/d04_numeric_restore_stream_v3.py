@@ -6,6 +6,7 @@ trusted result, and no retained server payload cache adds a C09 erasure surface.
 import base64
 from hashlib import sha256
 import json
+import zlib
 
 from ..runtime_contracts import canonical_serialize,canonical_digest
 from .contract import AuthorityUnavailable
@@ -13,6 +14,7 @@ from .d04_numeric_claim_bridge_v3 import D04NumericRestoreOriginalV3,numeric_res
 
 RESTORE_PACKET_MAX_BYTES_V3=32*1024*1024
 RESTORE_CHUNK_BYTES_V3=24*1024
+RESTORE_ENCODING_V3="zlib-level1-v1"
 MANIFEST_METHOD="d04_numeric_restore_manifest_v3"
 CHUNK_METHOD="d04_numeric_restore_chunk_v3"
 
@@ -35,17 +37,42 @@ def _qualified_packet(service,binding,*,light=False):
     return original.qualification_digest,packet,sha256(packet).hexdigest()
 
 
+def _encoded_packet(service, binding, *, light=False):
+    qualification, decoded, decoded_digest = _qualified_packet(service, binding, light=light)
+    packet = zlib.compress(decoded, level=1)
+    if len(packet) > RESTORE_PACKET_MAX_BYTES_V3:
+        raise AuthorityUnavailable("encoded numeric restore packet exceeds installed bound")
+    return qualification, packet, sha256(packet).hexdigest(), decoded_digest, len(decoded)
+
+
+def _decode_packet(packet, *, decoded_bytes, decoded_digest):
+    if (type(decoded_bytes) is not int or not 0 < decoded_bytes <= RESTORE_PACKET_MAX_BYTES_V3
+            or type(decoded_digest) is not str or len(decoded_digest) != 64
+            or any(char not in "0123456789abcdef" for char in decoded_digest)):
+        raise RuntimeError("numeric restoration decoded bound or commitment differs")
+    decoder = zlib.decompressobj()
+    try:
+        decoded = decoder.decompress(packet, decoded_bytes + 1)
+    except zlib.error as exc:
+        raise RuntimeError("numeric restoration compressed packet differs") from exc
+    if (len(decoded) != decoded_bytes or not decoder.eof or decoder.unused_data
+            or decoder.unconsumed_tail or sha256(decoded).hexdigest() != decoded_digest):
+        raise RuntimeError("numeric restoration decoded bytes or termination differ")
+    return decoded
+
+
 def read_numeric_restore_manifest_v3(service,binding):
-    qualification,packet,commitment=_qualified_packet(service,binding)
+    qualification,packet,commitment,decoded_digest,decoded_bytes=_encoded_packet(service,binding)
     return {"packet_digest":commitment,"packet_bytes":len(packet),"chunk_bytes":RESTORE_CHUNK_BYTES_V3,
-        "qualification_digest":qualification}
+        "encoding":RESTORE_ENCODING_V3,"decoded_packet_digest":decoded_digest,
+        "decoded_packet_bytes":decoded_bytes,"qualification_digest":qualification}
 
 
 def read_numeric_restore_chunk_v3(service,binding,*,packet_digest,offset):
     if (type(packet_digest) is not str or len(packet_digest)!=64 or any(c not in "0123456789abcdef" for c in packet_digest)
             or type(offset) is not int or offset<0 or offset%RESTORE_CHUNK_BYTES_V3 or offset>=RESTORE_PACKET_MAX_BYTES_V3):
         raise AuthorityUnavailable("exact bounded numeric restore packet offset required")
-    qualification,packet,commitment=_qualified_packet(service,binding,light=True)
+    qualification,packet,commitment,_,_=_encoded_packet(service,binding,light=True)
     if commitment!=packet_digest or offset>=len(packet):raise AuthorityUnavailable("numeric restore packet changed or offset is absent")
     chunk=packet[offset:offset+RESTORE_CHUNK_BYTES_V3]
     return {"packet_digest":commitment,"offset":offset,"chunk_base64":base64.b64encode(chunk).decode("ascii"),
@@ -74,10 +101,16 @@ async def read_numeric_restore_stream_v3(transport,request,handshake,*,namespace
             handshake=renewed;paired_at=time.monotonic()
         return await transport._content_rpc(request,handshake,method,command,protocol=SCHEMA)
     response=await rpc(MANIFEST_METHOD,command)
-    if (type(response) is not dict or set(response)!={"packet_digest","packet_bytes","chunk_bytes","qualification_digest","channel_binding_sha256"}
+    if (type(response) is not dict or set(response)!={"packet_digest","packet_bytes","chunk_bytes","encoding","decoded_packet_digest","decoded_packet_bytes","qualification_digest","channel_binding_sha256"}
             or response["channel_binding_sha256"]!=handshake.channel_binding_sha256
             or type(response["packet_bytes"]) is not int or not 0<response["packet_bytes"]<=RESTORE_PACKET_MAX_BYTES_V3
             or response["chunk_bytes"]!=RESTORE_CHUNK_BYTES_V3
+            or response["encoding"]!=RESTORE_ENCODING_V3
+            or type(response["decoded_packet_bytes"]) is not int
+            or not 0 < response["decoded_packet_bytes"] <= RESTORE_PACKET_MAX_BYTES_V3
+            or type(response["decoded_packet_digest"]) is not str
+            or len(response["decoded_packet_digest"]) != 64
+            or any(c not in "0123456789abcdef" for c in response["decoded_packet_digest"])
             or type(response["packet_digest"]) is not str or len(response["packet_digest"])!=64):
         raise RuntimeError("numeric restoration manifest is not a bounded current original")
     packet_digest,total=response["packet_digest"],response["packet_bytes"]
@@ -96,10 +129,13 @@ async def read_numeric_restore_stream_v3(transport,request,handshake,*,namespace
         pieces.append(chunk);qualifications.append(part["qualification_digest"]);offset+=len(chunk)
     packet=b"".join(pieces)
     if sha256(packet).hexdigest()!=packet_digest:raise RuntimeError("numeric restoration packet hash differs")
+    packet=_decode_packet(packet,decoded_bytes=response["decoded_packet_bytes"],
+        decoded_digest=response["decoded_packet_digest"])
     raw=json.loads(packet)
     if type(raw) is not dict or set(raw)!={"terminal","prepared","artifact_payload"} or canonical_serialize(raw).encode()!=packet:
         raise RuntimeError("numeric restoration packet is noncanonical")
     value=numeric_restore_from_wire_v3({**raw,"artifact_json":canonical_serialize(raw["artifact_payload"]),
-        "qualification_digest":canonical_digest((packet_digest,total,tuple(qualifications)))})
+        "qualification_digest":canonical_digest((RESTORE_ENCODING_V3,packet_digest,total,
+            response["decoded_packet_digest"],response["decoded_packet_bytes"],tuple(qualifications)))})
     if value.terminal.binding!=binding or value.prepared.binding!=binding:raise RuntimeError("numeric restored packet binding differs")
     return value

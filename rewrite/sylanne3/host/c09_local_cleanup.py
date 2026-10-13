@@ -14,6 +14,9 @@ from uuid import UUID
 
 from ..runtime_contracts import NamespaceId
 from ..workbench_api.support_export import SCHEMA
+from .managed_data_layout_v1 import (
+    ManagedDataLayoutError, support_export_files_v1, support_export_root_v1,
+)
 
 
 class LocalCleanupHold(RuntimeError):
@@ -31,10 +34,11 @@ class ManagedSupportExportPurgeV1:
 
 def _inventory(root: Path) -> tuple[tuple[Path, dict, bytes], ...]:
     entries: list[tuple[Path, dict, bytes]] = []
-    for path in root.iterdir():
-        if (path.is_symlink() or not path.is_file() or path.suffix != ".json"
-                or path.resolve(strict=True).parent != root):
-            raise LocalCleanupHold("support export inventory contains an unmanaged entry")
+    try:
+        paths = support_export_files_v1(root)
+    except (OSError, ManagedDataLayoutError) as exc:
+        raise LocalCleanupHold("support export inventory contains an unmanaged entry") from exc
+    for path in paths:
         try:
             operation = UUID(path.stem)
             content = path.read_bytes()
@@ -84,13 +88,10 @@ async def purge_stopped_support_exports_v1(
         if (runtime.health.status != "stopped" or runtime._worker is not None
                 or runtime._store is not None):
             raise LocalCleanupHold("runtime writer restarted")
-        data_dir = runtime._data_dir.resolve(strict=True)
-        root = data_dir / "support_exports"
-        if root.is_symlink() or not root.is_dir():
-            raise LocalCleanupHold("managed support export directory is absent")
-        root = root.resolve(strict=True)
-        if root.parent != data_dir:
-            raise LocalCleanupHold("support export root left installed data directory")
+        try:
+            root = support_export_root_v1(runtime._data_dir)
+        except (OSError, ManagedDataLayoutError) as exc:
+            raise LocalCleanupHold("managed support export directory is absent or unsafe") from exc
         scope = "/".join(namespace.as_tuple)
         entries = _inventory(root)
         target = tuple((path, content) for path, raw, content in entries

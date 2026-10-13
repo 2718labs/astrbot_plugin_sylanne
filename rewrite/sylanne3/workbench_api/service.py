@@ -7,6 +7,8 @@ binding was performed and does not accept actor/capability claims from JSON.
 
 from __future__ import annotations
 
+from ..runtime.local_module_admission_v1 import LocalModuleAdmissionDeniedV1
+
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
@@ -33,16 +35,25 @@ _ACTIONS = frozenset({
     "correct_or_edit", "run_experiment", "prepare_transfer", "execute_transfer",
     "erase_or_retire", "diagnose_and_export_support", "install_or_upgrade",
     "configure_or_control", "read_backend_operation", "read_installation_lifecycle",
+    "read_owner_artifact_project_context_options", "read_source_correction_context_v1",
+    "read_project_control_context_v1", "read_project_control_context_v2", "pause_project_v1", "resume_project_v1",
+    "read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1",
 })
-_READ_ACTIONS = frozenset({"open_workspace", "read_character_view", "read_backend_operation", "read_installation_lifecycle"})
+_READ_ACTIONS = frozenset({"open_workspace", "read_character_view", "read_backend_operation", "read_installation_lifecycle",
+    "read_owner_artifact_project_context_options", "read_source_correction_context_v1", "read_project_control_context_v1", "read_project_control_context_v2", "read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1"})
 _WIRED_COMMANDS = frozenset({
     "create_character", "bind_scene", "compile_scheme", "preview_scheme",
-    "activate_scheme", "correct_or_edit", "run_experiment",
+    "activate_scheme", "correct_or_edit", "run_experiment", "pause_project_v1", "resume_project_v1",
     "diagnose_and_export_support", "erase_or_retire",
     "prepare_transfer", "execute_transfer", "install_or_upgrade", "configure_or_control",
 })
 _MUTATION_CAPABILITIES = {
     "read_creator_draft": "workbench.create",
+    "read_owner_artifact_project_context_options": "workbench.create",
+    "read_source_correction_context_v1": "workbench.correct",
+    "read_project_control_context_v1": "workbench.control",
+    "read_project_control_context_v2": "workbench.control",
+    "pause_project_v1": "workbench.control", "resume_project_v1": "workbench.control",
     "create_character": "workbench.create", "bind_scene": "workbench.bind_scene",
     "compile_scheme": "workbench.compile", "preview_scheme": "workbench.experiment",
     "activate_scheme": "workbench.activate",
@@ -51,10 +62,23 @@ _MUTATION_CAPABILITIES = {
     "erase_or_retire": "workbench.erase", "diagnose_and_export_support": "workbench.diagnose",
     "install_or_upgrade": "workbench.maintain", "configure_or_control": "workbench.control",
 }
+_ACTIONS |= {'read_owner_material_source_status_v1','read_owner_source_note_task_options_v1','read_owner_source_note_task_status_v1'}
+_READ_ACTIONS |= {'read_owner_material_source_status_v1','read_owner_source_note_task_options_v1','read_owner_source_note_task_status_v1'}
 _PROJECTION_STATES = frozenset({"loading", "empty", "unauthorized", "stale", "partial", "unavailable", "ready"})
 _INPUT_FIELDS = {
+    'read_owner_source_note_task_options_v1':frozenset({'project_ref'}),
+    'read_owner_material_source_status_v1':frozenset({'owner_operation_id','input_digest'}),
+    'read_owner_source_note_task_status_v1':frozenset({'owner_operation_id','input_digest'}),
     "read_backend_operation": frozenset({"original_ref"}),
     "read_installation_lifecycle": frozenset(),
+    "read_owner_artifact_project_context_options": frozenset(),
+    "read_source_correction_context_v1": frozenset({"source_id"}),
+    "read_project_control_context_v1": frozenset({"project_ref"}),
+    "read_project_control_context_v2": frozenset({"project_ref"}),
+    "read_owner_project_artifact_options_v1": frozenset({"project_ref"}),
+    "read_owner_project_artifact_v1": frozenset({"project_ref", "progress_ref", "expected_artifact_version", "expected_content_digest"}),
+    "pause_project_v1": frozenset({"project_ref", "plan_ref", "expected_plan_revision"}),
+    "resume_project_v1": frozenset({"project_ref", "plan_ref", "expected_plan_revision", "pause_original_ref"}),
     "open_workspace": frozenset({"client_protocol"}),
     "create_character": frozenset({"display_name", "blueprint", "model_capability_ref", "budget_ref"}),
     "bind_scene": frozenset({"scene_ref", "visibility", "acknowledgement"}),
@@ -75,6 +99,13 @@ _INPUT_FIELDS = {
     "configure_or_control": frozenset({"config_diff", "object_ref", "control", "test_intent"}),
 }
 
+from .creator_configuration_v1 import READ_ACTION as _CONFIGURATION_READ, SAVE_ACTION as _CONFIGURATION_SAVE, SAVE_FIELDS as _CONFIGURATION_SAVE_FIELDS
+_ACTIONS |= {_CONFIGURATION_READ, _CONFIGURATION_SAVE}
+_READ_ACTIONS |= {_CONFIGURATION_READ}
+_WIRED_COMMANDS |= {_CONFIGURATION_SAVE}
+_MUTATION_CAPABILITIES.update({_CONFIGURATION_READ: "workbench.create", _CONFIGURATION_SAVE: "workbench.create"})
+_INPUT_FIELDS.update({_CONFIGURATION_READ: frozenset(), _CONFIGURATION_SAVE: _CONFIGURATION_SAVE_FIELDS})
+
 from .d04_initialization_v3 import ACTIONS as _D04_INITIALIZATION_ACTIONS
 _ACTIONS |= frozenset(_D04_INITIALIZATION_ACTIONS) | {"read_d04_initialization_profile"}
 _READ_ACTIONS |= {"read_d04_initialization_profile"}
@@ -86,7 +117,8 @@ _MUTATION_CAPABILITIES.update({action: spec[1] for action, spec in _D04_INITIALI
 from .domain_operations_v1 import ACTIONS as _DOMAIN_OPERATION_ACTIONS, INPUT_FIELDS as _DOMAIN_OPERATION_FIELDS
 _ACTIONS |= frozenset(_DOMAIN_OPERATION_ACTIONS)
 _WIRED_COMMANDS |= frozenset(_DOMAIN_OPERATION_ACTIONS)
-_INPUT_FIELDS.update({action: _DOMAIN_OPERATION_FIELDS for action in _DOMAIN_OPERATION_ACTIONS})
+from .domain_operations_v1 import input_fields_for_action_v1
+_INPUT_FIELDS.update({action: input_fields_for_action_v1(action) for action in _DOMAIN_OPERATION_ACTIONS})
 _MUTATION_CAPABILITIES.update({action: spec.capability for action, spec in _DOMAIN_OPERATION_ACTIONS.items()})
 _ACTIONS |= {"d02_fixed_work_policy"}
 _WIRED_COMMANDS |= {"d02_fixed_work_policy"}
@@ -350,6 +382,72 @@ class WorkbenchService:
                     expected_graph_revision=command["input"].get("expected_graph_revision"),
                 )
                 return self._projection_response(returned)
+            if command["action"] == _CONFIGURATION_READ:
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "creator_configuration_unavailable", "当前配置权威尚未接入。", False)
+                returned = self._issuer.read_configuration_draft(
+                    session=session, scope=command["scope"], purpose=command["purpose"], audience=command["audience"])
+                return self._projection_response(returned)
+            if command['action']=='read_owner_material_source_status_v1':
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem('unavailable','owner_material_read_unavailable','当前材料读取权威尚未接入。',False)
+                return self._projection_response(self._issuer.read_owner_material_source_status_v1(session=session,
+                    scope=command['scope'],purpose=command['purpose'],audience=command['audience'],input_data=command['input']))
+            if command['action'] in {'read_owner_source_note_task_options_v1','read_owner_source_note_task_status_v1'}:
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem('unavailable','owner_source_note_task_read_unavailable','当前任务读取权威尚未接入。',False)
+                returned=self._issuer.read_owner_source_note_task_v1(session=session,scope=command['scope'],
+                    purpose=command['purpose'],audience=command['audience'],input_data=command['input'],
+                    options=command['action']=='read_owner_source_note_task_options_v1')
+                return self._projection_response(returned)
+            if command["action"] in {"read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1"}:
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "artifact_read_authority_unavailable", "当前作品读取权威尚未接入。", False)
+                returned = self._issuer.read_owner_project_artifact_v1(session=session,
+                    scope=command["scope"], purpose=command["purpose"], audience=command["audience"],
+                    input_data=command["input"], options=command["action"] == "read_owner_project_artifact_options_v1")
+                return self._projection_response(returned)
+            if command["action"] in {"read_project_control_context_v1", "read_project_control_context_v2"}:
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "project_control_context_unavailable", "当前项目控制权威尚未接入。", False)
+                reader = (self._issuer.read_project_control_context_v1 if command["action"] == "read_project_control_context_v1"
+                    else self._issuer.read_project_control_context_v2)
+                returned = reader(session=session,
+                    scope=command["scope"], purpose=command["purpose"], audience=command["audience"],
+                    project_ref=command["input"]["project_ref"])
+                return self._projection_response(returned)
+            if command["action"] == "read_source_correction_context_v1":
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "source_correction_context_unavailable", "当前来源纠错权威尚未接入。", False)
+                returned = self._issuer.read_source_correction_context_v1(session=session,
+                    scope=command["scope"], purpose=command["purpose"], audience=command["audience"],
+                    source_id=command["input"]["source_id"])
+                from ..graph_worker import GraphStorageWorkV3
+                if type(returned) is GraphStorageWorkV3:
+                    return returned.map_terminal_v3("service", self._projection_response,
+                                                     self._projection_error_v3)
+                return self._projection_response(returned)
+            if command["action"] == "read_owner_artifact_project_context_options":
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "project_context_unavailable", "当前项目配置权威尚未接入。", False)
+                returned = self._issuer.read_owner_artifact_project_context_options(
+                    session=session, scope=command["scope"], purpose=command["purpose"], audience=command["audience"])
+                return self._projection_response(returned)
+            if command["action"] == _CONFIGURATION_SAVE:
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "creator_configuration_unavailable", "当前配置权威尚未接入。", False)
+                returned = self._issuer.save_creator_draft(
+                    session=session, scope=command["scope"], purpose=command["purpose"], audience=command["audience"],
+                    operation_id=command["operation_id"], input_data=command["input"])
+                return self._command_response(command["action"], command["operation_id"], command["input"], returned)
             if command["action"] == "run_experiment":
                 # This route depends on W01's signed Owner read and persisted
                 # paid original. A generic WorkbenchIssuer receipt is not proof.
@@ -379,13 +477,55 @@ class WorkbenchService:
             returned = self._issuer.execute(session=session, action=command["action"], scope=command["scope"],
                                             purpose=command["purpose"], audience=command["audience"],
                                             operation_id=command["operation_id"], input_data=command["input"])
+            from ..graph_worker import GraphStorageWorkV3
+            if type(returned) is GraphStorageWorkV3:
+                action, operation_id, input_data = command["action"], command["operation_id"], command["input"]
+                if returned.kind == "current_method_learning_read_v3":
+                    from .domain_operations_v1 import ACTIONS
+                    from ..runtime.current_method_learning_read_v3 import (
+                        METHOD_INPUT_OPERATIONS_V3, _MethodLearningReadV3)
+                    state = returned.state
+                    if (action not in ACTIONS or ACTIONS[action].operation_kind not in METHOD_INPUT_OPERATIONS_V3
+                            or type(state) is not _MethodLearningReadV3 or state.work is not returned
+                            or returned.coordinator is not self._issuer._coordinator
+                            or returned.operation_id != operation_id
+                            or state.operation_kind != ACTIONS[action].operation_kind):
+                        raise ValueError("service continuation differs from its actual Owner method command")
+                    return returned.map_terminal_v3("service",
+                        lambda value: self._command_response(action, operation_id, input_data, value),
+                        self._projection_error_v3)
+                if (action != "domain_admit_owner_material_source_v1"
+                        or returned.kind != "owner_material_source_write_v3" or returned.operation_id != operation_id):
+                    raise ValueError("service continuation differs from the actual Owner Source command")
+                state = returned.state
+                return returned.map_terminal_v3("service",
+                    lambda value: self._command_response(action, operation_id, input_data, value,
+                        owner_material_input_witness=state.input_witness), self._projection_error_v3)
             return self._command_response(command["action"], command["operation_id"], command["input"], returned)
         except PermissionError:
             return self._problem("unauthorized", "capability_denied", "服务端拒绝了当前能力。", False)
+        except LocalModuleAdmissionDeniedV1 as exc:
+            modules = ", ".join(value.upper() for value in exc.disabled_modules)
+            return self._problem("unavailable", "local_module_disabled",
+                f"本机模块 {modules} 已关闭新工作。请在插件配置页开启并重载后再创建新操作。", False)
         except LookupError:
             return self._problem("unavailable", "provider_unavailable", "请求的领域提供方不可用。", True)
         except Exception:
             return self._problem("unavailable", "provider_failed", "领域提供方未能完成请求。", True)
+
+    def _projection_error_v3(self, error):
+        # Pure terminal packaging, matching handle's existing exception order.
+        if isinstance(error, PermissionError):
+            return self._problem("unauthorized", "capability_denied", "服务端拒绝了当前能力。", False)
+        if isinstance(error, LocalModuleAdmissionDeniedV1):
+            modules = ", ".join(value.upper() for value in error.disabled_modules)
+            return self._problem("unavailable", "local_module_disabled",
+                f"本机模块 {modules} 已关闭新工作。请在插件配置页开启并重载后再创建新操作。", False)
+        if isinstance(error, LookupError):
+            return self._problem("unavailable", "provider_unavailable", "请求的领域提供方不可用。", True)
+        if isinstance(error, Exception):
+            return self._problem("unavailable", "provider_failed", "领域提供方未能完成请求。", True)
+        raise error
 
     @staticmethod
     def _parse(payload: object) -> dict[str, Any]:
@@ -454,6 +594,12 @@ class WorkbenchService:
             if audience != "owner" or len(scope.split("/")) != 2:
                 raise ValueError("domain commands require the exact signed Owner scope")
             validate_input_v1(action, input_data)
+        if action in {_CONFIGURATION_READ, _CONFIGURATION_SAVE}:
+            from .creator_configuration_v1 import validate_creator_configuration_input_v1
+            if len(scope.split("/")) != 2:
+                raise ValueError("creator configuration requires the exact Owner scope")
+            validate_creator_configuration_input_v1(action, input_data, purpose=purpose,
+                                                   audience=audience, operation_id=operation_id)
         if action in _D04_INITIALIZATION_ACTIONS:
             from .d04_initialization_v3 import validate_input_v3
             if audience != "owner" or len(scope.split("/")) != 2:
@@ -513,6 +659,66 @@ class WorkbenchService:
             if (audience != "owner" or purpose not in {"audit", "workbench_view"} or type(ref) is not str
                     or re.fullmatch(r"d12authority:[0-9a-f]{64}", ref) is None):
                 raise ValueError("backend status requires an exact Authority operation reference and Owner audience")
+        if action in {'read_owner_material_source_status_v1','read_owner_source_note_task_options_v1','read_owner_source_note_task_status_v1'}:
+            if audience!='owner' or purpose!='workbench_view' or len(scope.split('/'))!=2:
+                raise ValueError('Owner task read requires its exact authenticated Owner scope')
+            if action=='read_owner_source_note_task_options_v1':
+                from ..graph_types import AtomKey
+                key=AtomKey.from_token(input_data['project_ref'])
+                if key.type_name!='d10.life_project.v1' or (key.owner.bot,key.owner.persona)!=tuple(scope.split('/')):
+                    raise ValueError('Owner task project selector crossed namespace/type')
+            else:
+                if (type(input_data['owner_operation_id']) is not str or not 1<=len(input_data['owner_operation_id'])<=128
+                        or type(input_data['input_digest']) is not str or re.fullmatch(r'[0-9a-f]{64}',input_data['input_digest']) is None):
+                    raise ValueError('Owner task status needs its original operation and public input digest')
+        if action in {"read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1"}:
+            if (set(input_data) != _INPUT_FIELDS[action] or audience != "owner"
+                    or purpose != "workbench_view" or len(scope.split("/")) != 2):
+                raise ValueError("artifact read requires exact current Owner view selectors")
+            from ..graph_types import AtomKey
+            for name, expected in (("project_ref", "d10.life_project.v1"), ("progress_ref", "d10.life_progress.v1")):
+                if name not in input_data:
+                    continue
+                ref = input_data[name]
+                if type(ref) is not str or not 1 <= len(ref) <= 4096:
+                    raise ValueError("artifact read selector must be bounded")
+                key = AtomKey.from_token(ref)
+                if key.type_name != expected or (key.owner.bot, key.owner.persona) != tuple(scope.split("/")):
+                    raise ValueError("artifact read selector crossed actual scope")
+            if action == "read_owner_project_artifact_v1":
+                if type(input_data["expected_artifact_version"]) is not int or input_data["expected_artifact_version"] < 1:
+                    raise ValueError("artifact read requires an actual selected version")
+                if type(input_data["expected_content_digest"]) is not str or re.fullmatch(r"[0-9a-f]{64}", input_data["expected_content_digest"]) is None:
+                    raise ValueError("artifact read requires its actual content commitment")
+        if action in {"read_project_control_context_v1", "read_project_control_context_v2", "pause_project_v1", "resume_project_v1"}:
+            if (set(input_data) != _INPUT_FIELDS[action] or audience != "owner"
+                    or purpose != "workbench_user_action" or len(scope.split("/")) != 2):
+                raise ValueError("project control requires its exact current Owner input")
+            from ..graph_types import AtomKey
+            types = {"project_ref": "d10.life_project.v1", "plan_ref": "d08.personal_plan.v1"}
+            for name, expected in types.items():
+                if name not in input_data:
+                    continue
+                ref = input_data[name]
+                if type(ref) is not str or not 1 <= len(ref) <= 4096:
+                    raise ValueError("project control selector must be bounded")
+                key = AtomKey.from_token(ref)
+                if key.type_name != expected or (key.owner.bot, key.owner.persona) != tuple(scope.split("/")):
+                    raise ValueError("project control selector crosses current scope")
+            if action not in {"read_project_control_context_v1", "read_project_control_context_v2"}:
+                revision = input_data["expected_plan_revision"]
+                if type(revision) is not int or revision < 1:
+                    raise ValueError("project control requires actual Plan head CAS")
+            if action == "resume_project_v1" and (type(input_data["pause_original_ref"]) is not str
+                    or not 1 <= len(input_data["pause_original_ref"]) <= 4096):
+                raise ValueError("project resume requires its actual pause original")
+        if action == "read_source_correction_context_v1":
+            if (set(input_data) != {"source_id"} or audience != "owner"
+                    or purpose != "workbench_user_action" or len(scope.split("/")) != 2):
+                raise ValueError("source correction context requires exact current Owner scope")
+            source_id = input_data["source_id"]
+            if type(source_id) is not str or not 1 <= len(source_id) <= 256 or not source_id.strip():
+                raise ValueError("source correction requires one bounded Source identity")
         if action == "read_creator_draft":
             if (not isinstance(input_data.get("draft_ref"), str)
                     or not 1 <= len(input_data["draft_ref"]) <= 4096):
@@ -681,7 +887,8 @@ class WorkbenchService:
     @classmethod
     def _command_response(cls, action: str, operation_id: str, input_data: Mapping[str, Any],
                           returned: Mapping[str, Any], *,
-                          expected_digest: str | None = None) -> ApiResponse:
+                          expected_digest: str | None = None,
+                          owner_material_input_witness=None) -> ApiResponse:
         status = returned.get("status")
         backend_original = (action in {"prepare_transfer", "execute_transfer", "install_or_upgrade", "configure_or_control"}
                             or action == "run_experiment" and input_data.get("experiment") != "d12.scheme_preview.v1"
@@ -756,6 +963,18 @@ class WorkbenchService:
         receipt = returned.get("receipt")
         if not isinstance(receipt, Mapping) or receipt.get("operation_id") != operation_id:
             return cls._problem("unavailable", "invalid_provider_response", "提供方没有与请求绑定的耐久操作收据。", False)
+        if action in {"pause_project_v1", "resume_project_v1"}:
+            from ..runtime_contracts import canonical_digest
+            if (receipt.get("schema") != "d12.project-control-receipt.v1" or receipt.get("action") != action
+                    or receipt.get("input_digest") != canonical_digest(dict(input_data))
+                    or type(receipt.get("original")) is not dict
+                    or receipt["original"].get("operation_id") != operation_id
+                    or receipt.get("original_digest") != canonical_digest(receipt["original"])):
+                return cls._problem("unavailable", "invalid_provider_response", "项目控制缺少匹配的真实领域原件。", False)
+        if action == _CONFIGURATION_SAVE:
+            from .creator_configuration_v1 import valid_creator_save_receipt_v1
+            if not valid_creator_save_receipt_v1(receipt, operation_id, input_data):
+                return cls._problem("unavailable", "invalid_provider_response", "配置保存缺少当前草稿的真实原件。", False)
         if action in _C04_ACTIONS:
             from ..runtime_contracts import canonical_digest
             if (receipt.get("schema") != "d12.c04-work-receipt.v3" or receipt.get("action") != action
@@ -774,9 +993,17 @@ class WorkbenchService:
                 return cls._problem("unavailable", "invalid_provider_response", "身体工作政策缺少匹配的真实原件。", False)
         if action in _DOMAIN_OPERATION_ACTIONS:
             from ..runtime_contracts import canonical_digest
+            if owner_material_input_witness is not None:
+                from ..runtime.owner_material_source_storage_v3 import require_owner_material_input_witness_v3
+                if action != "domain_admit_owner_material_source_v1":
+                    raise ValueError("Owner Source input witness cannot bind another domain command")
+                input_digest = require_owner_material_input_witness_v3(owner_material_input_witness,
+                    request=input_data, operation_id=operation_id)
+            else:
+                input_digest = canonical_digest(dict(input_data))
             if (receipt.get("schema") != "d12.domain-operation-receipt.v1"
                     or receipt.get("action") != action
-                    or receipt.get("input_digest") != canonical_digest(dict(input_data))
+                    or receipt.get("input_digest") != input_digest
                     or type(receipt.get("original")) is not dict
                     or receipt["original"].get("operation_id") != operation_id
                     or receipt.get("original_digest") != canonical_digest(receipt["original"])):

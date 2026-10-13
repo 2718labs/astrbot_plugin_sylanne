@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import math
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..domains.d09 import D09ExpressionProvider
 from ..graph_types import AtomKey
 from ..host.identity import astrbot_namespace
@@ -117,17 +118,9 @@ def read_current_dispatch_segment(
         if (event is None or event[1] != receipt.graph_epoch
                 or [batch_ref, batch_revision] not in json.loads(event[0])):
             _hold("dispatch batch has no matching commit event")
-        historical = db.execute(
-            "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
-            "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-            (batch_ref, batch_revision) + namespace.as_tuple + (
-                request.activity_id, request.operation_id),
-        ).fetchone()
-        current = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? "
-            "AND persona=? AND type_name='d09.verified_segment_batch.v1'",
-            (batch_ref,) + namespace.as_tuple,
-        ).fetchone()
+        historical = read_graph_row_v3(db, columns=('value', 'valid'), where='token=? AND revision=? AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?', parameters=(batch_ref, batch_revision) + namespace.as_tuple + (
+                request.activity_id, request.operation_id), history=True)
+        current = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where="token=? AND bot=? AND persona=? AND type_name='d09.verified_segment_batch.v1'", parameters=(batch_ref,) + namespace.as_tuple)
         epoch = db.execute(
             "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
             namespace.as_tuple,

@@ -17,6 +17,7 @@ import uuid
 from ..memory_types import source_key
 from ..runtime.c09_erasure_barrier_store_v1 import C09GraphBarrierReceiptV1
 from ..runtime.c09_erasure_plan_original_v1 import C09ErasurePlanOriginalV1
+from ..runtime.c09_source_plan_barrier_v2 import C09SourcePlanCaptureV2,C09GraphBarrierReceiptV2,authority_c09_plan_request_identity_v2
 from ..runtime_contracts import NamespaceId, canonical_digest
 from .contract import AuthorityUnavailable, identifier
 from .v2_contract import (
@@ -68,6 +69,26 @@ class GraphBarrierAttestationV1:
                 or graph.root_source_refs != expected_roots
                 or graph.delete_epoch_after != pending.deletion_epoch):
             raise ValueError("graph barrier differs from pending original")
+
+
+@dataclass(frozen=True, slots=True)
+class GraphBarrierAttestationV2:
+    """Bound actual Core pending and complete multi-page Source withdrawal."""
+    pending_receipt: DeletionMutationReceiptV1
+    graph_receipt: C09GraphBarrierReceiptV2
+
+    def __post_init__(self):
+        if type(self.pending_receipt) is not DeletionMutationReceiptV1 or type(self.graph_receipt) is not C09GraphBarrierReceiptV2:
+            raise TypeError('actual Core pending and V2 Source barrier required')
+        pending=self.pending_receipt.pending;graph=self.graph_receipt
+        if ((pending.source_phase,pending.target_phase)!=('absent','pending') or len(pending.closure_roots)!=1
+                or graph.operation_id!=pending.deletion_operation_id
+                or graph.request_digest!=pending.request_digest.removeprefix('sha256:')
+                or graph.pending_receipt_digest!=canonical_digest(self.pending_receipt)
+                or graph.closure_digest!=deletion_scope_digest(pending.closure_roots,pending.deletion_epoch,pending.policy_ref).removeprefix('sha256:')
+                or graph.root_source_refs!=(source_key(*graph.namespace.as_tuple,pending.closure_roots[0]).token,)
+                or graph.delete_epoch_after!=pending.deletion_epoch):
+            raise ValueError('complete paged Source barrier differs from actual pending')
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,12 +379,12 @@ class CurrentErasureAuthority:
                          permit=permit)
         if reader.get_pending_deletion_for_graph_write(**arguments) != receipt:
             raise AuthorityUnavailable("Owner-fenced pending original changed")
-        graph = coordinator.read_current_c09_graph_barrier_v1(
+        graph = coordinator.read_current_c09_graph_barrier_versioned_v2(
             bootstrap, namespace=namespace_id,
             deletion_operation_id=pending.deletion_operation_id, permit=permit)
         if reader.get_pending_deletion_for_graph_write(**arguments) != receipt:
             raise AuthorityUnavailable("Owner-fenced pending original changed after graph read")
-        return GraphBarrierAttestationV1(receipt, graph)
+        return GraphBarrierAttestationV2(receipt,graph) if type(graph) is C09GraphBarrierReceiptV2 else GraphBarrierAttestationV1(receipt,graph)
 
     def recover_prepared_pending(self, *, credential, subject: str,
                                  mutation_id: str) -> DeletionMutationReceiptV1 | None:
@@ -429,7 +450,7 @@ class CurrentErasureAuthority:
                                deletion_operation_id: str,
                                closure_roots: tuple[str, ...], deletion_epoch: int | None,
                                policy_ref: str | None,
-                               plan: C09ErasurePlanOriginalV1 | None,
+                               plan: C09ErasurePlanOriginalV1 | C09SourcePlanCaptureV2 | None,
                                replay_issuer: str,
                                ) -> tuple[DeletionMutationReceiptV1, FencePermitV2]:
         if self._prepare is None:
@@ -527,7 +548,7 @@ class CurrentErasureAuthority:
                         policy_version=1 if scoped is not None else 0)
                     if plan is not None:
                         from ..runtime.c09_erasure_plan_original_v1 import authority_c09_plan_request_identity_v1
-                        identity = authority_c09_plan_request_identity_v1(namespace, plan)
+                        identity = authority_c09_plan_request_identity_v2(namespace,plan) if type(plan) is C09SourcePlanCaptureV2 else authority_c09_plan_request_identity_v1(namespace,plan)
                     if scoped is None:
                         identity.update(installation_id=installed_id,
                                         owner_actor_id=owner_actor_id,
@@ -633,7 +654,7 @@ class CurrentErasureAuthority:
             evidence = DeletionEvidenceV1(
                 authority_id=live_permit.authority_id, namespace=namespace,
                 deletion_operation_id=operation_id, kind="barrier_installed",
-                issuer_id="authority-pinned-graph-barrier-v1",
+                issuer_id=("authority-pinned-graph-barrier-v2" if type(graph) is C09GraphBarrierReceiptV2 else "authority-pinned-graph-barrier-v1"),
                 evidence_id=self._protocol_id(namespace, operation_id,
                                               "accepted-evidence"),
                 bound_anchor=pending_receipt.after_anchor,
@@ -687,7 +708,7 @@ class CurrentErasureAuthority:
                 or pending.deletion_epoch != original.deletion_epoch
                 or pending.policy_ref != original.policy_ref
                 or pending.before_anchor != pending_receipt.after_anchor
-                or pending.evidence.issuer_id != "authority-pinned-graph-barrier-v1"):
+                or pending.evidence.issuer_id not in {"authority-pinned-graph-barrier-v1","authority-pinned-graph-barrier-v2"}):
             raise AuthorityUnavailable("accepted original replay differs")
         if prior_receipt is None:
             service.deletion.append_transition(

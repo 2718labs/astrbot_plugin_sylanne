@@ -6,7 +6,7 @@ validate and execute the frozen input, but cannot read a graph or issue C04.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 import hashlib
 import json
 import math
@@ -39,7 +39,7 @@ def _fields(value: object, expected: set[str], name: str) -> dict:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class FrozenGraphReadV2:
     """One exact graph head; revision zero is an explicit absent read."""
 
@@ -47,18 +47,25 @@ class FrozenGraphReadV2:
     revision: int
     valid: bool
     value_json: str | None
+    _canonical_original: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _canonical_original) -> None:
         if (type(self.key) is not AtomKey or type(self.revision) is not int
                 or self.revision < 0 or type(self.valid) is not bool):
             raise TypeError("frozen graph read needs an exact key, revision and validity")
         if self.revision == 0:
             if self.valid or self.value_json is not None:
                 raise ValueError("absent graph head must be revision zero without a value")
+        elif _canonical_original is not None:
+            if type(self.value_json)is not str:raise ValueError('present frozen head needs its exact canonical wire')
         elif (type(self.value_json) is not str
               or type(json.loads(self.value_json)) is not dict
               or canonical_json(json.loads(self.value_json)) != self.value_json):
             raise ValueError("present graph head needs a canonical complete JSON object")
+        if _canonical_original is not None:
+            from ...runtime.c04_direct_seed_v4 import retain_c04_canonical_head_v4
+            retain_c04_canonical_head_v4(self,_canonical_original,ref_value=self.key.token,
+                revision=self.revision,valid=self.valid,wire=self.value_json)
 
     @classmethod
     def from_atom(cls, atom: GraphAtom) -> FrozenGraphReadV2:
@@ -72,7 +79,17 @@ class FrozenGraphReadV2:
 
     @property
     def value(self) -> dict | None:
-        return None if self.value_json is None else json.loads(self.value_json)
+        from ...runtime.c04_direct_seed_v4 import canonical_original_for_c04_head_v4
+        original=canonical_original_for_c04_head_v4(self)
+        return original.value_v4()if original is not None else None if self.value_json is None else json.loads(self.value_json)
+
+    @property
+    def value_digest(self):
+        from ...runtime.c04_direct_seed_v4 import canonical_original_for_c04_head_v4
+        original=canonical_original_for_c04_head_v4(self)
+        if original is not None:return original.sha256
+        from ...runtime_contracts import canonical_digest
+        return None if self.value_json is None else canonical_digest(self.value)
 
     def semantic_row(self) -> dict:
         return {"key": self.key.token, "revision": self.revision,
@@ -434,6 +451,11 @@ __all__ = ["ALGORITHM_ID", "FrozenGraphReadV2", "AssociationQueryCoverageV2",
 
 
 def _validate_complete_graph_closure_v1(self, *, mood_type):
+    return _validate_complete_graph_closure_from_roots_v1(
+        self, mood_type=mood_type, activation_roots=(self.cue_source_ref,))
+
+
+def _validate_complete_graph_closure_from_roots_v1(self, *, mood_type, activation_roots):
     """Shared exact closure checks; lineage is selected by a fixed DTO reader."""
     by_key = {item.key: item for item in self.reads}
     refs = (self.cue_source_ref, self.focus_ref, self.attention_ticket_ref, self.mood_ref)
@@ -511,9 +533,9 @@ def _validate_complete_graph_closure_v1(self, *, mood_type):
         raise ValueError("cue edge query is missing")
     if self.budget.max_hops == 0 and self.edge_queries:
         raise ValueError("zero-hop input cannot query edges")
-    required_sources = {cue.token, *ticket_value["source_refs"],
+    required_sources = {*activation_roots, *ticket_value["source_refs"],
                         *mood_value.source_refs}
-    reachable = {cue.token: 0}
+    reachable = {ref: 0 for ref in activation_roots}
     for row in edges.values():
         if row.revision < 1 or not row.valid:
             raise ValueError("association edge original is invalid")

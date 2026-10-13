@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import json
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..domains.d08.execution import ActionSchema, RequiredCheckRegistry, GoalExecutionProvider
 from ..domains.d09.contact_batch_v1 import validate_contact_verified_batch_v1
 from ..graph_types import AtomKey
@@ -26,8 +27,7 @@ class ContactFinalD11RuntimeV1:
 
 def _value(db, namespace, ref, type_name):
     key = AtomKey.from_token(ref)
-    row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
-        (ref, *namespace.as_tuple)).fetchone()
+    row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(ref, *namespace.as_tuple))
     if key.type_name != type_name or row is None or row[2] != 1:
         raise ValueError('contact current graph material is absent')
     return row[0], json.loads(row[1])
@@ -68,8 +68,7 @@ def inspect_contact_final_d11_v1(db, *, bundle, candidate, qualification,
             or batch.digest != candidate.batch_digest):
         raise ValueError('contact final qualification or whole-batch identity changed')
     for v in candidate.content_dependency_versions:
-        row = db.execute('SELECT revision,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
-            (v.key.token, *ns.as_tuple)).fetchone()
+        row = read_graph_row_v3(db, columns=('revision', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(v.key.token, *ns.as_tuple))
         if (v.revision == 0 and row is not None) or (v.revision > 0 and row != (v.revision, 1)):
             raise ValueError('contact whole-content dependency changed')
     if db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',

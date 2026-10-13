@@ -8,6 +8,8 @@ the locator's own hash is never used as an original or authority receipt.
 """
 from __future__ import annotations
 
+from ..runtime_storage_v3 import read_graph_row_v3, read_graph_rows_v3
+
 from dataclasses import dataclass
 import json
 
@@ -43,13 +45,256 @@ _POLICY_TABLES = (
 )
 
 
-def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None, life_d04_before_capture_policy=None):
+def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None, life_d04_before_capture_policy=None, d06_recall_policy=None, d07_execution_service=None, ingress_c03_readers=None, self_c04_readers=None, ingress_task_scope_readers=None, personal_candidate_readers=None, artifact_phase_readers=None, installed_readers=None):
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("domain read plan needs the actual W01 current transaction")
+    from .domain_production_registry_v1 import _POSTCONDITION_OPERATIONS
+    if operation_kind in _POSTCONDITION_OPERATIONS:
+        from .artifact_phase_postconditions_v1 import read_plan_artifact_phase_postconditions_v1
+        return read_plan_artifact_phase_postconditions_v1(db, namespace=namespace,
+            request=request, installed_readers=artifact_phase_readers)
+    if operation_kind == "derive_ingress_artifact_task_scope_v1":
+        from .ingress_artifact_task_scope_v1 import read_plan_ingress_artifact_task_scope_v1
+        return read_plan_ingress_artifact_task_scope_v1(db,namespace=namespace,request=request,
+            readers=ingress_task_scope_readers,now_utc=now_utc)
+    from .domain_production_registry_v1 import _PERSONAL_OPERATIONS, _ARTIFACT_OPERATIONS
+    from .domain_production_registry_v1 import _FOREGROUND_OPERATIONS
+    if operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"}:
+        from .c04_ingress_preparation_v4 import read_plan_self_c04_v4
+        return read_plan_self_c04_v4(db, namespace=namespace, request=request, readers=self_c04_readers, operation_kind=operation_kind)
+    if operation_kind == "select_ingress_recall_seed_v1":
+        from .d06_ingress_c03_selection_v1 import read_plan_ingress_c03_selection_v1
+        if domain != "d06" or ingress_c03_readers is None:
+            raise ValueError("C03 history keys need the actual private installed retrieval handle")
+        return read_plan_ingress_c03_selection_v1(db, namespace=namespace, request=request, readers=ingress_c03_readers)
+    if operation_kind in {"prepare_ingress_recall_result_read_v1", "finish_ingress_recall_model_v1", "adopt_ingress_recall_model_v1"}:
+        from .d07_ingress_recall_result_v1 import read_plan_ingress_recall_result_v1
+        expected_domain = "d11" if operation_kind == "finish_ingress_recall_model_v1" else "d07"
+        if domain != expected_domain or d07_execution_service is None:
+            raise ValueError("Self C3 result requires its exact installed writer/service")
+        return read_plan_ingress_recall_result_v1(db, namespace=namespace, request=request, service=d07_execution_service)
+    if operation_kind == "acquire_ingress_recall_model_v1":
+        from .d07_ingress_recall_acquisition_v1 import read_plan_ingress_recall_acquire_v1
+        if domain != "d11" or d07_execution_service is None:
+            raise ValueError("Self C3 acquisition needs its installed D07 reader")
+        return read_plan_ingress_recall_acquire_v1(db, namespace=namespace, request=request, service=d07_execution_service)
+    if operation_kind == "prepare_ingress_recall_model_v1":
+        from .d07_ingress_recall_preparation_v1 import read_plan_ingress_recall_model_v1
+        if domain != "d07" or d07_execution_service is None:
+            raise ValueError("Self C3 read plan requires its actual installed D07 service")
+        return read_plan_ingress_recall_model_v1(db, namespace=namespace, activity_id=activity_id,
+            request=request, service=d07_execution_service)
+    if operation_kind == "prepare_ingress_recall_need_v1":
+        if domain != "d07":
+            raise ValueError("ingress recall need has another actual issuer domain")
+        from .d06_ingress_recall_v1 import read_plan_ingress_recall_need_v1
+        return read_plan_ingress_recall_need_v1(db, namespace=namespace, request=request, policy=d06_recall_policy)
+    if operation_kind == "register_artifact_draft_root":
+        from .foreground_activity_issuance_v1 import read_plan_draft_root_registration_v1
+        return read_plan_draft_root_registration_v1(db, namespace=namespace, request=request)
+    if operation_kind == "adopt_owner_artifact_project_context_v1":
+        from .d03_life_project_context_v1 import read_plan_artifact_draft_project_context_v1
+        return read_plan_artifact_draft_project_context_v1(db, namespace=namespace, request=request)
+    if operation_kind in _ARTIFACT_OPERATIONS:
+        if _ARTIFACT_OPERATIONS[operation_kind][0] != domain:
+            raise ValueError("artifact task operation belongs to another exact issuer domain")
+        if operation_kind == "revise_artifact_task_plan_v2":
+            from .d08_personal_plan_v1 import read_plan_current_artifact_task_plan_revision_v2
+            return read_plan_current_artifact_task_plan_revision_v2(db, namespace=namespace,
+                request=request, installed_readers=artifact_phase_readers)
+        if operation_kind == "activate_artifact_task_project_checkpoint_v2":
+            from .d10_project_checkpoint_v1 import read_plan_activate_current_artifact_task_project_checkpoint_v2
+            return read_plan_activate_current_artifact_task_project_checkpoint_v2(db, namespace=namespace,
+                request=request, installed_readers=artifact_phase_readers)
+        if operation_kind == "register_artifact_task_milestone_v2":
+            from .artifact_task_observer_v1 import read_plan_current_artifact_task_milestone_v2
+            return read_plan_current_artifact_task_milestone_v2(db, namespace=namespace,
+                request=request, installed_readers=artifact_phase_readers)
+        if operation_kind in {"initialize_artifact_task_project_checkpoint_v1", "activate_artifact_task_project_checkpoint_v1"}:
+            from .d10_project_checkpoint_v1 import read_plan_current_artifact_task_checkpoint_v1
+            return read_plan_current_artifact_task_checkpoint_v1(db, namespace=namespace,
+                request=request, installed_readers=artifact_phase_readers)
+        if operation_kind == "create_artifact_task_project_v1":
+            from .d10_project_checkpoint_v1 import read_plan_create_current_artifact_task_project_v1
+            return read_plan_create_current_artifact_task_project_v1(db, namespace=namespace,
+                request=request, installed_readers=artifact_phase_readers)
+        if operation_kind in {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1", "revise_existing_artifact_v1"}:
+            from .artifact_continuation_originals_v1 import read_plan_existing_artifact_continuation_v1
+            plan = read_plan_existing_artifact_continuation_v1(db, namespace=namespace, request=request,
+                include_content=operation_kind == "revise_existing_artifact_v1")
+            if operation_kind == "await_existing_artifact_revision_v1":
+                from ..domains.d10.project_checkpoint_v1 import CHECKPOINT_TYPE
+                return production_read_plan_v1((*plan.fixed_type_ids, CHECKPOINT_TYPE),
+                    plan.exact_keys, plan.source_roots, plan.required_original_refs)
+            return plan
+        if operation_kind in {"prepare_artifact_draft_model_v2", "acquire_artifact_draft_model_v2"}:
+            from .d11_artifact_draft_model_v1 import read_plan_artifact_draft_model_v2
+            return read_plan_artifact_draft_model_v2(db, namespace=namespace, operation_kind=operation_kind, request=request, installed_readers=artifact_phase_readers)
+        if operation_kind in {"prepare_artifact_draft_model", "acquire_artifact_draft_model"}:
+            from .d11_artifact_draft_model_v1 import read_plan_artifact_draft_model_v1
+            return read_plan_artifact_draft_model_v1(db, namespace=namespace, operation_kind=operation_kind, request=request)
+        if operation_kind == "propose_artifact_draft_phase_action_v2":
+            from .d08_personal_plan_v1 import read_plan_current_artifact_phase_action_v2
+            return read_plan_current_artifact_phase_action_v2(db, namespace=namespace,
+                request=request, installed_readers=artifact_phase_readers)
+        if operation_kind == "adopt_artifact_draft_content_v2":
+            from .d11_artifact_draft_content_v1 import read_plan_artifact_draft_content_adoption_v2
+            return read_plan_artifact_draft_content_adoption_v2(db, namespace=namespace, request=request, installed_readers=artifact_phase_readers)
+        if operation_kind == "verify_artifact_draft_phase_v2":
+            from .d11_artifact_draft_content_v1 import read_plan_artifact_draft_phase_verification_v2
+            return read_plan_artifact_draft_phase_verification_v2(db, namespace=namespace, request=request, installed_readers=artifact_phase_readers)
+        if operation_kind == "adopt_artifact_draft_content":
+            from .d11_artifact_draft_content_v1 import read_plan_artifact_draft_content_adoption_v1
+            return read_plan_artifact_draft_content_adoption_v1(db, namespace=namespace, request=request)
+        if operation_kind in {"compose_artifact_goal_plan", "propose_artifact_draft_action"}:
+            from .d08_personal_plan_v1 import read_plan_current_personal_plan_operation_v1
+            return read_plan_current_personal_plan_operation_v1(db, namespace=namespace, activity_id=activity_id,
+                operation_kind=operation_kind, request=request, operation_id=operation_id)
+        if operation_kind == "create_artifact_project":
+            from .d10_project_checkpoint_v1 import read_plan_create_current_artifact_project_v1
+            return read_plan_create_current_artifact_project_v1(db, namespace=namespace, activity_id=activity_id, request=request)
+        from .d03_life_project_context_v1 import read_plan_artifact_draft_project_context_v1
+        return read_plan_artifact_draft_project_context_v1(db, namespace=namespace, request=request)
+    if operation_kind in _FOREGROUND_OPERATIONS:
+        if domain != "d11":
+            raise ValueError("foreground cycle compiler has a different issuer domain")
+        from .foreground_cycle_v1 import read_plan_current_foreground_cycle_v1
+        return read_plan_current_foreground_cycle_v1(db, namespace=namespace, request=request)
+    if operation_kind in {"prepare_personal_candidates_v1", "select_personal_step_v2"}:
+        if domain != "d08":
+            raise ValueError("personal candidate operation belongs to D08")
+        from .d08_personal_candidate_v1 import read_plan_personal_candidates_v1
+        return read_plan_personal_candidates_v1(db, namespace=namespace, activity_id=activity_id,
+            request=request, operation_id=operation_id, installed_readers=personal_candidate_readers)
+    if operation_kind in {"pause_project_v1", "resume_project_v1"}:
+        if domain != "d08":
+            raise ValueError("project control has another domain writer")
+        from .d08_project_control_v1 import read_plan_project_control_v1
+        return read_plan_project_control_v1(db, namespace=namespace, operation_kind=operation_kind, request=request)
+    from .d01_method_learning_v1 import OPERATIONS as METHOD_OPERATIONS, read_plan_current_method_learning_v1
+    if operation_kind in METHOD_OPERATIONS:
+        if domain != "d01" or installed_readers is None:
+            raise ValueError("method-learning plan needs its actual installed D01 reader")
+        return read_plan_current_method_learning_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request, installed_readers=installed_readers)
+    if operation_kind == "observe_method_comparison_v1":
+        if domain != "d11" or installed_readers is None:
+            raise ValueError("actual method measurement needs its installed protected reader")
+        from .d11_method_observation_v1 import read_plan_method_observation_v1
+        return read_plan_method_observation_v1(db, namespace=namespace, request=request, installed_readers=installed_readers)
+    if operation_kind == "quote_current_method_choices_v1":
+        if domain != "d02" or installed_readers is None:
+            raise ValueError("method readiness requires its actual installed prospective reader")
+        from .d02_method_readiness_v1 import read_plan_current_method_readiness_v1
+        return read_plan_current_method_readiness_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request, installed_readers=installed_readers)
+    if operation_kind == "adopt_current_task_no_search_v1":
+        if domain != "d07" or installed_readers is None:
+            raise ValueError("task no-search requires its actual installed D07 reader")
+        from .d07_task_history_v1 import read_plan_current_task_no_search_v1
+        return read_plan_current_task_no_search_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request, installed_readers=installed_readers)
+    if operation_kind == "adopt_current_c1_method_conditions_v1":
+        if domain != "d07" or installed_readers is None:
+            raise ValueError("C1 method-condition plan needs its actual installed D07 reader")
+        from .d07_method_conditions_v1 import read_plan_current_c1_method_conditions_v1
+        return read_plan_current_c1_method_conditions_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request, installed_readers=installed_readers)
+    if operation_kind == "checkpoint_source_note_foreground_cycle_v1":
+        from .foreground_cycle_v1 import read_plan_current_foreground_cycle_v1
+        return read_plan_current_foreground_cycle_v1(db, namespace=namespace, request=request)
+    if operation_kind == "prepare_selected_source_note_action_v2":
+        if domain != "d08" or installed_readers is None:
+            raise ValueError("selected SourceNote read plan needs its actual installed Self reader")
+        from .d08_source_note_action_v1 import read_plan_selected_source_note_action_v2
+        return read_plan_selected_source_note_action_v2(db, namespace=namespace, activity_id=activity_id,
+            operation_id=operation_id, request=request, now_utc=now_utc, audiences=audiences, installed_readers=installed_readers)
+    if operation_kind == "cancel_owner_source_note_task_v1":
+        if domain != "d11" or installed_readers is None:
+            raise ValueError("Owner task cancellation requires its actual installed Owner reader")
+        from .cancel_owner_source_note_task_v1 import read_plan_cancel_owner_source_note_task_v1
+        return read_plan_cancel_owner_source_note_task_v1(db, namespace=namespace, request=request, installed_readers=installed_readers)
+    if operation_kind in {"register_owner_source_note_life_plan_v1", "register_owner_source_note_life_outcome_v1"}:
+        if domain != "d10" or installed_readers is None:
+            raise ValueError("Owner Life selectors require their actual installed task reader")
+        from .owner_source_note_life_v1 import read_plan_owner_source_note_life_v1
+        return read_plan_owner_source_note_life_v1(db, namespace=namespace, request=request, operation_kind=operation_kind, installed_readers=installed_readers)
+    if operation_kind in {"create_owner_source_note_task_v1", "acquire_owner_source_note_task_v1", "checkpoint_owner_source_note_task_v1"}:
+        if domain != "d11" or installed_readers is None:
+            raise ValueError("Owner task execution needs its actual installed Self reader")
+        from .owner_source_note_task_execution_v1 import read_plan_owner_source_note_task_execution_v1
+        return read_plan_owner_source_note_task_execution_v1(db, namespace=namespace,
+            operation_kind=operation_kind, request=request, installed_readers=installed_readers)
+    if operation_kind == "prepare_owner_source_note_need_v1":
+        if domain != "d07" or installed_readers is None:
+            raise ValueError("Owner task Need needs its actual installed Self reader")
+        from .owner_source_note_need_v1 import read_plan_owner_source_note_need_v1
+        return read_plan_owner_source_note_need_v1(db, namespace=namespace, request=request, installed_readers=installed_readers)
+    if operation_kind == "input:freeze_owner_source_note_values_parent_v1":
+        if domain != "d08" or installed_readers is None: raise ValueError("Owner Values parent needs its actual installed task reader")
+        from .owner_source_note_values_v1 import read_plan_owner_task_values_parent_v1
+        return read_plan_owner_task_values_parent_v1(db, namespace=namespace, request=request, installed_readers=installed_readers)
+    if operation_kind in {"input:freeze_values", "evaluate_values"} and installed_readers is not None and hasattr(installed_readers, "_owner_task_values_child_v1"):
+        from .owner_source_note_values_v1 import read_plan_owner_task_values_child_v1
+        evidence = installed_readers._owner_task_values_child_v1.current()
+        return read_plan_owner_task_values_child_v1(db, namespace=namespace, selector=evidence.request, issuer=installed_readers.issuer)
+    if operation_kind == "admit_owner_material_source_v1":
+        if domain != "d06" or operation_id is None:
+            raise ValueError("Owner material needs its actual D06 operation identity")
+        from .owner_material_source_v1 import read_plan_owner_material_source_v1
+        return read_plan_owner_material_source_v1(db, namespace=namespace, operation_id=operation_id, request=request)
+    if operation_kind == "submit_owner_source_note_task_v1":
+        if domain != "d08" or operation_id is None:
+            raise ValueError("Owner task submission needs its actual D08 operation identity")
+        from .owner_source_note_task_v1 import read_plan_owner_source_note_task_v1
+        return read_plan_owner_source_note_task_v1(db, namespace=namespace, request=request, operation_id=operation_id)
+    if operation_kind == "authorize_source_note_task_v1":
+        if domain != "d11":
+            raise ValueError("SourceNote authorization has another writer")
+        from .source_note_task_authorization_v1 import read_plan_source_note_task_authorization_v1
+        return read_plan_source_note_task_authorization_v1(db, namespace=namespace, request=request)
+    if operation_kind == "create_source_note_foreground_cycle_v1":
+        if domain != "d11" or installed_readers is None:
+            raise ValueError("SourceNote initial creation needs its actual installed Self reader")
+        from .source_note_foreground_v1 import read_plan_source_note_foreground_v1
+        return read_plan_source_note_foreground_v1(db, namespace=namespace, request=request, installed_readers=installed_readers)
+    if operation_kind == "initialize_relationship_prior_v2":
+        if domain != "d05" or not operation_id:
+            raise ValueError("relationship prior needs its actual Owner operation identity")
+        from .d05_relationship_revision_v2 import read_plan_initialize_current_relationship_prior_v2
+        return read_plan_initialize_current_relationship_prior_v2(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request, operation_id=operation_id)
+    if operation_kind == "adopt_relationship_revision_v2":
+        if domain != "d05":
+            raise ValueError("relationship revision has another domain writer")
+        from .d05_relationship_revision_v2 import read_plan_current_relationship_revision_v2
+        return read_plan_current_relationship_revision_v2(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
+    if operation_kind in _PERSONAL_OPERATIONS:
+        if _PERSONAL_OPERATIONS[operation_kind][0] != domain:
+            raise ValueError("personal operation belongs to a different domain")
+        if domain == "d08":
+            if operation_kind == "create_artifact_task_plan_v1":
+                from .d08_personal_plan_v1 import read_plan_current_artifact_task_plan_v1
+                return read_plan_current_artifact_task_plan_v1(db, namespace=namespace,
+                    request=request, installed_readers=artifact_phase_readers)
+            from .d08_personal_plan_v1 import read_plan_current_personal_plan_operation_v1
+            return read_plan_current_personal_plan_operation_v1(
+                db, namespace=namespace, activity_id=activity_id,
+                operation_kind=operation_kind, request=request,
+                operation_id=operation_id)
+        from .d10_project_checkpoint_v1 import read_plan_current_project_checkpoint_operation_v1
+        return read_plan_current_project_checkpoint_operation_v1(
+            db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
+    if operation_kind == "input:register_artifact_task_text_extent":
+        from .artifact_task_text_extent_v1 import read_plan_artifact_task_text_extent_v1
+        return read_plan_artifact_task_text_extent_v1(db, namespace=namespace, request=request,
+            installed_readers=personal_candidate_readers)
     if operation_kind.startswith("input:"):
         from .domain_production_inputs_v1 import read_plan_current_domain_input_v1
         return read_plan_current_domain_input_v1(db, namespace=namespace, activity_id=activity_id,
-            producer_kind=operation_kind[len("input:"):], request=request)
+            producer_kind=operation_kind[len("input:"):], request=request, installed_readers=artifact_phase_readers)
     if operation_kind == "prepare_contact_dispatch_v3":
         from .contact_final_stage_v3 import read_plan_contact_final_v3
         return read_plan_contact_final_v3(db, namespace=namespace, activity_id=activity_id,
@@ -84,10 +329,10 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         from .d08_source_note_action_v1 import read_plan_source_note_action_v1
         return read_plan_source_note_action_v1(db, namespace=namespace, activity_id=activity_id,
             operation_id=operation_id, request=request, now_utc=now_utc, audiences=audiences)
-    if operation_kind == "prepare_source_note_body":
+    if operation_kind in {"prepare_source_note_body", "prepare_artifact_draft_body"}:
         from .d02_life_body_preparation_v1 import read_plan_source_note_body_v1
         return read_plan_source_note_body_v1(db, namespace=namespace, activity_id=activity_id,
-            operation_id=operation_id, request=request, now_utc=now_utc)
+            operation_id=operation_id, request=request, now_utc=now_utc, installed_readers=installed_readers)
     if domain == "d10" and operation_kind == "prepare_offline_tick":
         from .d10_offline_tick_execution_v1 import read_plan_current_offline_tick_v1
         return read_plan_current_offline_tick_v1(db, namespace=namespace, activity_id=activity_id,
@@ -178,19 +423,20 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
             continue
         if type_name not in {"d03.entity_anchor", "d03.role_binding", "d03.world_event", "d05.boundary_rule"}:
             continue
-        rows = db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? AND valid=1 "
-                          "ORDER BY token LIMIT 129", (*namespace.as_tuple, type_name)).fetchall()
+        rows = read_graph_rows_v3(db, ('value',), where='bot=? AND persona=? AND type_name=? AND valid=1', parameters=(*namespace.as_tuple, type_name), history=False, order_by=('token',), limit=129)
         if len(rows) > 128:
             # Materialization records its partial page; it must not claim full
             # entity/boundary coverage or arbitrarily omit private tails.
             continue
         for (encoded,) in rows:
-            value = json.loads(encoded)
+            from .domain_background_read_v3 import background_json_loads_v3
+            value = background_json_loads_v3(encoded)
             for ref in value.get("source_refs", value.get("creation_evidence_refs", ())):
                 roots.append(ref)
     keys = plan.exact_keys
-    if operation_id is not None and domain == "d01" and operation_kind == "adopt_growth":
-        keys += (waiting_domain_job_key_v1(namespace, operation_id, domain, "growth", activity_id),)
+    if operation_id is not None and domain == "d01" and operation_kind in {"adopt_growth","migrate_semantic_identity_v3","project_self_model_v3"}:
+        pending_kind="growth" if operation_kind=="adopt_growth" else operation_kind
+        keys += (waiting_domain_job_key_v1(namespace, operation_id, domain, pending_kind, activity_id),)
     return production_read_plan_v1(plan.fixed_type_ids, keys, roots, plan.required_original_refs)
 
 
@@ -207,26 +453,44 @@ def _issuer(installed_readers):
 
 
 def _committed(db, namespace, operation):
-    row = db.execute("SELECT digest,receipt_json,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-                     (*namespace.as_tuple, operation)).fetchone()
-    if row is None or row[2] < 1 or json.loads(row[1]).get("commit_seq") != row[2]:
+    from .current_method_learning_read_v3 import read_bound_method_learning_attachment_v3
+    from .domain_background_read_v3 import background_point_v3, background_json_loads_v3
+    columns = ("digest", "receipt_json", "commit_seq")
+    key_columns = ("bot", "persona", "operation_id")
+    key = (*namespace.as_tuple, operation)
+    handled, row = read_bound_method_learning_attachment_v3(
+        db, table="graph_bundle_operations", columns=columns,
+        key_columns=key_columns, key=key)
+    if not handled:
+        row = background_point_v3(
+            db, table="graph_bundle_operations", columns=columns,
+            key_columns=key_columns, key=key,
+            legacy_reader=lambda: db.execute(
+                "SELECT digest,receipt_json,commit_seq FROM graph_bundle_operations "
+                "WHERE bot=? AND persona=? AND operation_id=?", key,
+            ).fetchone())
+    if row is None or row[2] < 1 or background_json_loads_v3(row[1]).get("commit_seq") != row[2]:
         raise ValueError("production original lost its actually committed producing operation")
 
 
 def _signed_input(db, namespace, ref, issuer):
+    from .domain_background_read_v3 import (background_signed_input_row_v3,background_json_loads_v3,
+        background_json_matches_v3,background_json_digest_v3,background_verify_signature_v3)
     found = []
     for table, sign_kind, domain, kind in _INPUT_TABLES:
         if not table_exists_v1(db, table):
             continue
         select_kind = "kind" if kind == "kind" else "?"
         args = () if kind == "kind" else (kind,)
-        row = db.execute("SELECT " + select_kind + ",producing_operation_id,payload_json,payload_digest,signature "
-            "FROM " + table + " WHERE bot=? AND persona=? AND original_ref=?", (*args, *namespace.as_tuple, ref)).fetchone()
+        row=background_signed_input_row_v3(db,namespace,table,ref,kind,legacy_reader=lambda:db.execute("SELECT " + select_kind + ",producing_operation_id,payload_json,payload_digest,signature "
+            "FROM " + table + " WHERE bot=? AND persona=? AND original_ref=?", (*args, *namespace.as_tuple, ref)).fetchone())
         if row is None:
             continue
-        issuer._signer.verify(sign_kind, row[2], row[4])
-        raw = json.loads(row[2])
-        if canonical_serialize(raw) != row[2] or canonical_digest(raw) != row[3]:
+        if table=="graph_d01_production_inputs_v1" and row[0] in {"identity_plasticity_policy_v3","identity_trial_observation_policy_v3"}:
+            continue  # Exact policy kinds are authenticated once by _signed_policy, never as ordinary inputs.
+        background_verify_signature_v3(issuer._signer,sign_kind,row[2],row[4])
+        raw = background_json_loads_v3(row[2])
+        if not background_json_matches_v3(row[2],raw) or background_json_digest_v3(row[2],raw) != row[3]:
             raise ValueError("signed production input bytes changed")
         _committed(db, namespace, row[1])
         found.append(ProductionOriginalRefV1(domain + "." + row[0], ref, row[3]))
@@ -237,6 +501,21 @@ def _signed_input(db, namespace, ref, issuer):
 
 def _signed_policy(db, namespace, ref, issuer):
     found = []
+    from .d01_production_operations_v1 import TABLE as D01_TABLE, SIGN_KIND as D01_SIGN_KIND, _ORIGINAL_TYPES
+    if table_exists_v1(db,D01_TABLE):
+        row=db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM "+D01_TABLE+
+            " WHERE bot=? AND persona=? AND original_ref=?",(*namespace.as_tuple,ref)).fetchone()
+        if row and row[0] in {"identity_plasticity_policy_v3","identity_trial_observation_policy_v3"}:
+            issuer._signer.verify(D01_SIGN_KIND,row[2],row[4])
+            from .domain_production_erasure_v1 import decode_typed_production_value_v1
+            raw=json.loads(row[2]);policy=decode_typed_production_value_v1(raw,_ORIGINAL_TYPES[row[0]])
+            actual=db.execute("SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+                (*namespace.as_tuple,row[1])).fetchone()
+            if (canonical_serialize(raw)!=row[2] or canonical_digest(raw)!=row[3]
+                    or policy.namespace!=namespace or policy.policy_ref!=ref or actual is None or actual[0]<1):
+                raise ValueError("D01 signed Owner policy original or producing commit changed")
+            found.append((ProductionOriginalRefV1("d01."+row[0],ref,row[3]),
+                ProductionPolicyRefV1(ref,policy.revision,row[3])))
     for table, sign_kind, domain in _POLICY_TABLES:
         if not table_exists_v1(db, table):
             continue
@@ -244,8 +523,13 @@ def _signed_policy(db, namespace, ref, issuer):
             " WHERE bot=? AND persona=? AND policy_ref=? ORDER BY revision DESC LIMIT 1", (*namespace.as_tuple, ref)).fetchone()
         if row is None:
             continue
-        issuer._signer.verify(sign_kind, row[1], row[3])
         raw = json.loads(row[1])
+        if domain == "d05" and raw.get("schema_version") == 2:
+            sign_kind = "d11.d05-production-policy.v2"
+            from ..domains.d05.relationship_revision_v2 import InstalledRelationshipPolicyV2
+            from .domain_production_erasure_v1 import decode_typed_production_value_v1
+            decode_typed_production_value_v1(raw, InstalledRelationshipPolicyV2)
+        issuer._signer.verify(sign_kind, row[1], row[3])
         if (canonical_serialize(raw) != row[1] or canonical_digest(raw) != row[2]
                 or raw.get("policy_ref") != ref or raw.get("revision") != row[0]
                 or raw.get("namespace") != {"bot_id": namespace.bot_id, "persona_id": namespace.persona_id}):
@@ -257,6 +541,91 @@ def _signed_policy(db, namespace, ref, issuer):
     return found[0] if found else None
 
 
+def read_committed_recollection_original_v1(db, namespace, ref):
+    """Authenticate the immutable C04 activity against its actual W01 commit."""
+    from ..domains.d06 import _validate_recollection
+    from ..graph_store import GraphStore
+    key = AtomKey.from_token(ref)
+    if key.type_name != "d06.recollection.v1" or key.owner.kind != "activity" or NamespaceId.from_key(key) != namespace:
+        raise ValueError("recollection original has another namespace/type")
+    row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(ref, *namespace.as_tuple), history=False)
+    if row is None or row[0] < 1 or row[2] != 1:
+        raise MissingProductionOriginalV1("actual_adopted_recollection_trigger:" + ref)
+    value = json.loads(row[1])
+    _validate_recollection(value)
+    if value["activity_basis_refs"] != [value["selection_ref"], value["candidate_set_id"]]:
+        raise ValueError("recollection activity basis differs from its selected ticket/set")
+    history = read_graph_row_v3(db, ('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'), where='token=? AND revision=?', parameters=(ref, row[0]), history=True)
+    if (history is None or history[:2] != row[1:] or history[2:4] != namespace.as_tuple
+            or history[4] != value["activity_id"] or key.owner.subject != value["activity_id"]
+            or key.name != value["recollection_id"]):
+        raise ValueError("recollection original has no exact adopted activity history")
+    operation = history[5]
+    committed = db.execute("SELECT digest,activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations "
+        "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation)).fetchone()
+    event = db.execute("SELECT reads,revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+        history[2:]).fetchone()
+    if committed is None or event is None:
+        raise MissingProductionOriginalV1("actual_committed_recollection_receipt:" + ref)
+    receipt = json.loads(committed[4])
+    version = GraphVersion(key, row[0])
+    if (committed[1] != value["activity_id"] or type(committed[3]) is not int or committed[3] < 1
+            or receipt.get("commit_seq") != committed[3]
+            or receipt.get("status", "committed") not in {"committed", "duplicate"}
+            or version not in GraphStore._version_rows(event[1])):
+        raise ValueError("recollection original receipt/activity/write version differs")
+    identity = {"namespace": namespace, "operation_id": operation, "activity_id": committed[1],
+        "effect_id": committed[2], "commit_seq": committed[3], "bundle_digest": committed[0],
+        "receipt": receipt, "write_version": (ref, row[0])}
+    original = ProductionOriginalRefV1("d06.adopted_recollection", ref,
+        canonical_digest({"value": value, "commit": identity}), (version,))
+    canonical_activity = "recollection-activity:" + canonical_digest((namespace, committed[1], committed[2]))
+    return original, canonical_activity
+
+
+def read_d05_recollection_migration_material_v2(db, namespace, ref, *, legacy_source_token):
+    """Actual immutable activity and original content families; no new qualification."""
+    from ..domains.d05.relationship import AuthenticatedRecollectionMigrationMaterialV2
+    from ..graph_store import GraphStore
+    from ..memory_types import SourceRecord, source_key
+    if not db.in_transaction:
+        raise ValueError("D05 migration material needs the maintained read transaction")
+    original, canonical = read_committed_recollection_original_v1(db, namespace, ref)
+    version = original.read_versions[0]
+    value, event_session, operation = read_graph_row_v3(db, ('value', 'event_session', 'event_id'), where='token=? AND revision=?', parameters=(ref, version.revision), history=True)
+    value = json.loads(value)
+    committed = db.execute("SELECT activity_id,effect_id,commit_seq FROM graph_bundle_operations "
+        "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation)).fetchone()
+    reads = GraphStore._version_rows(db.execute("SELECT reads FROM graph_events "
+        "WHERE bot=? AND persona=? AND session=? AND event_id=?", (*namespace.as_tuple, event_session, operation)).fetchone()[0])
+    read_index = {item.key: item for item in reads}
+    roots = tuple(source_key(*namespace.as_tuple, item).token for item in value["content_refs"])
+    families, source_versions, seen, pending = [], [], set(), list(roots)
+    while pending:
+        source_ref = pending.pop()
+        if source_ref in seen:
+            continue
+        seen.add(source_ref)
+        if len(seen) > 32:
+            raise MissingProductionOriginalV1("bounded_original_recollection_content_family")
+        key = AtomKey.from_token(source_ref)
+        source_version = read_index.get(key)
+        if source_version is None or source_version.revision < 1:
+            raise MissingProductionOriginalV1("actual_original_recollection_source_read:" + source_ref)
+        row = read_graph_row_v3(db, ('value', 'valid'), where='token=? AND revision=?', parameters=(source_ref, source_version.revision), history=True)
+        if row is None or row[1] != 1:
+            raise MissingProductionOriginalV1("actual_original_recollection_source_history:" + source_ref)
+        source = SourceRecord.from_dict(json.loads(row[0]))
+        if source.source_id != key.owner.subject:
+            raise ValueError("original recollection source identity differs")
+        families.append(source.provenance_root)
+        source_versions.append(source_version)
+        pending.extend(source_key(*namespace.as_tuple, parent).token for parent in source.parent_source_ids)
+    return AuthenticatedRecollectionMigrationMaterialV2(namespace, legacy_source_token, ref, canonical,
+        committed[0], committed[1], operation, committed[2], version, original.original_digest,
+        roots, tuple(sorted(set(families))), (version, *source_versions))
+
+
 def _graph_original(db, namespace, ref):
     try:
         key = AtomKey.from_token(ref)
@@ -264,12 +633,19 @@ def _graph_original(db, namespace, ref):
         return None
     if NamespaceId.from_key(key) != namespace:
         raise ValueError("production graph original crossed namespace")
-    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                     (ref, *namespace.as_tuple)).fetchone()
+    from ..domains.d01.method_learning_v1 import VALUE_TYPES
+    if key.type_name in VALUE_TYPES:
+        from .d01_method_learning_v1 import read_adopted_method_learning_original_v1
+        return read_adopted_method_learning_original_v1(db, namespace=namespace, ref=ref)
+    if key.type_name == "d07.current_interpretation.v1":
+        from .d07_method_conditions_v1 import read_adopted_c1_method_condition_original_v1
+        method_condition = read_adopted_c1_method_condition_original_v1(db, namespace=namespace, ref=ref)
+        if method_condition is not None:
+            return method_condition
+    row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(ref, *namespace.as_tuple), history=False)
     if row is None or row[0] < 1 or row[2] != 1:
         return None
-    history = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
-                         (ref, row[0])).fetchone()
+    history = read_graph_row_v3(db, ('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'), where='token=? AND revision=?', parameters=(ref, row[0]), history=True)
     if history is None or history[:2] != (row[1], row[2]) or history[2:4] != namespace.as_tuple:
         raise ValueError("production original has no exact adopted graph history")
     event = db.execute("SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
@@ -281,6 +657,8 @@ def _graph_original(db, namespace, ref):
         raise ValueError("production original head was not adopted by its graph event")
     value = json.loads(row[1])
     kind = key.type_name
+    if key.type_name == "d06.recollection.v1":
+        return read_committed_recollection_original_v1(db, namespace, ref)[0]
     if key.type_name == "runtime.cost_settlement":
         from .d11_types import cost_settlement_from_runtime
         cost = cost_settlement_from_runtime(db, **{name: value[name] for name in (
@@ -318,6 +696,22 @@ def _adopted_domain_original(db, namespace, ref):
     row = db.execute("SELECT operation_id FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? "
         "AND (operation_id=? OR domain || '-current:' || substr(original_digest,1,48)=?) LIMIT 2",
         (*namespace.as_tuple, ref, ref)).fetchall()
+    physical = []
+    if table_exists_v1(db, "graph_domain_production_originals_v3"):
+        physical = db.execute("SELECT operation_id FROM graph_domain_production_originals_v3 WHERE bot=? AND persona=? "
+            "AND (operation_id=? OR domain || '-current:' || substr(original_digest,1,48)=?) LIMIT 2",
+            (*namespace.as_tuple, ref, ref)).fetchall()
+    if physical:
+        if row or len(physical) != 1:
+            raise ValueError("domain adopted original identity is ambiguous across physical versions")
+        from .domain_production_originals_v1 import _physical_original_row_v3, _validate_physical_original_metadata_v3
+        from ..runtime_storage_v3 import begin_runtime_cell_read_v3
+        saved = _physical_original_row_v3(db, namespace, physical[0][0])
+        _validate_physical_original_metadata_v3(db, namespace, physical[0][0], saved)
+        cell = begin_runtime_cell_read_v3(db, saved[4])
+        if cell.header[5] != saved[3]:
+            raise ValueError("adopted physical original header digest differs")
+        return ProductionOriginalRefV1(saved[0] + ".current-" + saved[1], ref, saved[3])
     if not row:
         return None
     if len(row) != 1:
@@ -379,6 +773,36 @@ def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_reade
         if original is None:
             from .d11_life_product_adapter_v1 import read_current_life_original_ref_v1
             original = read_current_life_original_ref_v1(db, namespace=namespace, original_ref=ref, issuer=issuer)
+        if original is None:
+            from .artifact_phase_postconditions_v1 import read_current_artifact_phase_postcondition_original_ref_v1
+            original = read_current_artifact_phase_postcondition_original_ref_v1(db, namespace=namespace,
+                original_ref=ref, issuer=issuer)
+        if original is None:
+            from .artifact_task_observer_v1 import read_current_artifact_task_milestone_original_ref_v2
+            original = read_current_artifact_task_milestone_original_ref_v2(db, namespace=namespace,
+                original_ref=ref, issuer=issuer)
+        if original is None and ref.startswith("method-readiness-quote:"):
+            from .d02_method_readiness_v1 import read_current_method_readiness_quote_original_v1
+            original = read_current_method_readiness_quote_original_v1(db, namespace=namespace, ref=ref, issuer=issuer)
+        if original is None and ref.startswith("method-comparison-observation:"):
+            from .d11_method_observation_v1 import read_current_method_observation_original_ref_v1
+            original = read_current_method_observation_original_ref_v1(db, namespace=namespace, original_ref=ref, issuer=issuer)
+        if original is None and ref.startswith("owner-note-values-parent:"):
+            from .owner_source_note_values_v1 import read_owner_task_values_parent_original_ref_v1
+            original = read_owner_task_values_parent_original_ref_v1(db, namespace=namespace, original_ref=ref, issuer=issuer)
+        if original is None and ref.startswith("owner-note-responsibility:"):
+            from .owner_source_note_task_execution_v1 import read_owner_source_note_task_responsibility_v2
+            saved_task = read_owner_source_note_task_responsibility_v2(db,namespace=namespace,original_ref=ref,issuer=issuer)
+            if saved_task is not None:
+                original = ProductionOriginalRefV1('d11.life_owner_source_note_task_responsibility_v2',ref,saved_task[0].digest)
+        if original is None and ref.startswith(("owner-source-note-authorization:","owner-source-note-cause:")):
+            from .owner_source_note_task_v1 import read_owner_source_note_task_original_ref_v1
+            original = read_owner_source_note_task_original_ref_v1(db, namespace=namespace, original_ref=ref, issuer=issuer)
+        if original is None and ref.startswith("source-note-task-authorization:"):
+            from .source_note_task_authorization_v1 import read_source_note_task_authorization_v1
+            saved = read_source_note_task_authorization_v1(db, namespace=namespace, original_ref=ref, issuer=issuer)
+            if saved is not None:
+                    original = ProductionOriginalRefV1("d11.life_source_note_task_authorization", ref, saved[0].digest)
         original = original or _graph_original(db, namespace, ref)
         if original is None:
             service = getattr(installed_readers, "execution_reader", None)
@@ -442,15 +866,22 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("command identity must be derived in the current W01 transaction")
     activity, effect, purpose = requested_activity_id, None, "context"
-    if operation_kind in {"prepare_life_project_context", "focus_life_project"}:
+    if operation_kind in {"prepare_life_project_context", "focus_life_project", "prepare_personal_candidates_v1", "select_personal_step_v2",
+            "input:register_artifact_phase_postcondition_policy_v1", "register_artifact_phase_postcondition_contract_v1",
+            "observe_artifact_phase_postconditions_v1"}:
         purpose = "consolidation"
     elif operation_kind == "prepare_source_note_action":
         from .d08_source_note_action_v1 import source_note_effect_id_v1
         effect, purpose = source_note_effect_id_v1(namespace, request.project_ref, operation_id), "consolidation"
-    elif operation_kind == "prepare_source_note_body":
-        from .d08_source_note_action_v1 import require_source_note_action_original_v1
-        root = require_source_note_action_original_v1(db, namespace=namespace,
-            action_intent_ref=request.action_intent_ref, issuer=_issuer(installed_readers))
+    elif operation_kind in {"prepare_source_note_body", "prepare_artifact_draft_body"}:
+        if operation_kind == "prepare_artifact_draft_body":
+            from .d08_life_admission_v1 import require_draft_action_root_v1
+            root = require_draft_action_root_v1(db, namespace=namespace,
+                action_intent_ref=request.action_intent_ref, issuer=_issuer(installed_readers))
+        else:
+            from .d08_source_note_action_v1 import require_source_note_action_original_v1
+            root = require_source_note_action_original_v1(db, namespace=namespace,
+                action_intent_ref=request.action_intent_ref, issuer=_issuer(installed_readers))
         if operation_id != "d02-life-body:" + root.action_operation_id:
             raise ValueError("Body B must be the actual distinct command of root A")
         activity, effect, purpose = root.activity_id, root.effect_id, "consolidation"
@@ -555,8 +986,9 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
         activity = proof.event.activity.activity_id
         effect = 'effect:life-encoding:' + canonical_digest((namespace, request.episode_ref, operation_id))[:48]
         purpose = 'consolidation'
-    elif operation_kind in {"encode_structured_experience", "form_association", "adopt_growth", "adopt_relationship_contribution", "reevaluate_relationship",
-            "input:prepare_growth_input", "input:derive_growth_trial"}:
+    elif operation_kind in {"encode_structured_experience", "form_association", "adopt_growth", "migrate_semantic_identity_v3", "project_self_model_v3", "adopt_relationship_contribution", "reevaluate_relationship",
+            "input:prepare_growth_input", "input:derive_growth_trial", "input:prepare_semantic_growth_input_v3",
+            "input:start_semantic_growth_trial_v3"}:
         purpose = "consolidation"
     elif operation_kind == "prepare_contact_dispatch_v3":
         from .contact_final_stage_v3 import command_identity_contact_final_v3
@@ -731,10 +1163,23 @@ def rebuild_current_domain_stage_v1(db, *, frame, request, domain, operation_kin
     """Closed current issuer dispatcher used by W01's private commit witness."""
     if not db.in_transaction:
         raise ValueError("domain stage reissuance requires W01's current business transaction")
+    from .domain_production_registry_v1 import (
+        _PERSONAL_OPERATIONS, installed_operation_v1,
+        stage_installed_domain_operation_v1)
+    from .domain_production_registry_v1 import _FOREGROUND_OPERATIONS
+    if operation_kind in _PERSONAL_OPERATIONS or operation_kind in _FOREGROUND_OPERATIONS:
+        operation = installed_operation_v1(operation_kind)
+        if operation.domain != domain:
+            raise ValueError("personal operation belongs to a different domain")
+        return stage_installed_domain_operation_v1(
+            db, operation=operation, frame=frame, request=request,
+            installed_readers=installed_readers)
     if domain == "d01":
-        from .d01_production_operations_v1 import stage_evaluate_current_values_in_transaction_v1, stage_adopt_current_growth_in_transaction_v1
+        from .d01_production_operations_v1 import stage_evaluate_current_values_in_transaction_v1, stage_adopt_current_growth_in_transaction_v1, stage_migrate_semantic_identity_v3, stage_project_self_model_v3
         dispatch = {"evaluate_values": stage_evaluate_current_values_in_transaction_v1,
-                    "adopt_growth": stage_adopt_current_growth_in_transaction_v1}
+                    "adopt_growth": stage_adopt_current_growth_in_transaction_v1,
+                    "migrate_semantic_identity_v3": stage_migrate_semantic_identity_v3,
+                    "project_self_model_v3": stage_project_self_model_v3}
     elif domain == "d02":
         from .d02_production_operations_v1 import stage_advance_current_body_in_transaction_v1, stage_apply_current_body_effect_in_transaction_v1
         dispatch = {"advance_body": stage_advance_current_body_in_transaction_v1,

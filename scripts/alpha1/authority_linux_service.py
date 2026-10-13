@@ -20,14 +20,15 @@ async def run(config, *, selection_revision=None, cohort_digest=None):
     from sylanne3.authority_service.linux_deployment_v1 import open_linux_authority_v1, install_linux_lifecycle_v1
     from sylanne3.authority_service.linux_host_supervisor_v1 import InstalledLinuxHostSupervisorV1
     from sylanne3.authority_service.contract import AuthorityColdRestartRequired
+    bootstrap,launch=open_linux_authority_v1(config)
     try:
-        daemon, launch = open_linux_authority_v1(config)
+        daemon=await bootstrap.await_business_ready_v3()
     except AuthorityColdRestartRequired:
+        await bootstrap.aclose()
         return 75
-    from sylanne3.authority_service.daemon import AuthorityFactualDaemonV2
-    if type(daemon) is AuthorityFactualDaemonV2:
-        await daemon.aclose()
-        raise RuntimeError('C09 V2 factual-only installation: Host/business service startup HOLD')
+    except BaseException:
+        await bootstrap.aclose()
+        raise
     bundles = tuple(item.installation_bundle for item in daemon.config.natural_model_authorities_v2.values())
     if len(bundles) != 1:
         await daemon.aclose()
@@ -42,17 +43,23 @@ async def run(config, *, selection_revision=None, cohort_digest=None):
     loop = asyncio.get_running_loop()
     for name in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(name, stop.set)
-    supervisor = InstalledLinuxHostSupervisorV1(daemon=daemon, socket_path=launch["admission_socket"],
-        host_uid=launch["host_uid"], host_gid=launch["host_gid"], systemd_unit=launch["host_systemd_unit"])
+    if launch["schema"] == "sylanne3.authority.linux-deployment.v2":
+        from sylanne3.authority_service.d12_installed_supervisor_v1 import (
+            build_installed_supervisor_v1, decode_installed_supervisor_config_v1)
+        host_provider = build_installed_supervisor_v1(decode_installed_supervisor_config_v1(launch["host_supervisor_provider"]))
+        supervisor = InstalledLinuxHostSupervisorV1(daemon=daemon, socket_path=launch["admission_socket"],
+            host_uid=launch["host_uid"], host_gid=launch["host_gid"], process_supervisor=host_provider)
+    else:
+        supervisor = InstalledLinuxHostSupervisorV1(daemon=daemon, socket_path=launch["admission_socket"],
+            host_uid=launch["host_uid"], host_gid=launch["host_gid"], systemd_unit=launch["host_systemd_unit"])
     try:
-        if await daemon.resume_cold_maintenance_v1():
-            return 75
         lifecycle = install_linux_lifecycle_v1(daemon, launch)
         await daemon.start()
         await supervisor.start()
         lifecycle.resume_pending_operations_v1()
         await supervisor.start_host()
-        current = daemon.c09_control.read_verified_current_storage_v1()
+        daemon._resolved_storage_composition_v3.require_current()
+        current=daemon._resolved_storage_composition_v3.context
         print(json.dumps({"event": "ready", "authority_id": current.manifest["authority_id"],
             "pointer_version": current.pointer_version, "storage_generation": current.storage_generation,
             "stage": current.stage, "package_selection_revision": selection_revision,

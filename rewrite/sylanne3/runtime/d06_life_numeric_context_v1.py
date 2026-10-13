@@ -17,9 +17,9 @@ from ..graph_types import AtomKey, GraphVersion, GraphWrite, Owner
 from ..memory_types import SourceRecord
 from ..runtime_contracts import DependencySet, DomainProposal, NamespaceId, SourceQualification, canonical_digest, canonical_serialize, schema_hash
 from .d01_production_operations_v1 import CurrentDomainReadV1, production_read_plan_v1
-from .d06_internal_life_encoding_v1 import EncodeInternalLifeRequestV1, read_current_internal_life_encoding_cause_v1
+from .d06_internal_life_encoding_v1 import EncodeInternalLifeRequestV1
 from .d06_internal_life_episode_v2 import internal_life_episode_read_inputs_v2, PROVENANCE, decode_internal_life_value_v2
-from .d04_life_before_original_v1 import (read_current_life_d04_before_v1, require_current_life_d04_before_qualification_v1,
+from .d04_life_before_original_v1 import (_read_current_life_d04_before_and_cause_v1, require_current_life_d04_before_qualification_v1,
     life_d04_before_current_read_inputs_v1)
 
 OPERATION = 'prepare_internal_life_numeric_context'
@@ -152,8 +152,8 @@ def read_plan_life_numeric_context_v1(db, *, namespace, activity_id, operation_k
 def _derive(db, frame, request, installed_readers):
     read = CurrentDomainReadV1(frame); read.check(db)
     locator = EncodeInternalLifeRequestV1(request.episode_ref, request.causal_operation_id)
-    cause = read_current_internal_life_encoding_cause_v1(db, frame=frame, request=locator, installed_readers=installed_readers)
-    before = read_current_life_d04_before_v1(db, frame=frame, request=locator, installed_readers=installed_readers)
+    cause, before = _read_current_life_d04_before_and_cause_v1(
+        db, frame=frame, request=locator, installed_readers=installed_readers)
     episode, digest = require_current_life_d04_before_qualification_v1(before, db=db, frame=frame)
     proof = cause.occurrence; event = proof.event; activity = event.activity
     if episode != request.episode_ref or digest != canonical_digest(plain_v1(proof)):

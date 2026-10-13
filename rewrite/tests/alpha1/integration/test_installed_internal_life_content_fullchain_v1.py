@@ -26,7 +26,8 @@ from sylanne3.authority_service.v2_model_egress_contract import ModelTerminalRec
 
 async def run_installed_life_content_fullchain_v1(tmp_path,installed_d04_root,*,after_completed=None,
         enable_c09_maintenance=False, terminal_after_completed=False,
-        host_process_runner=None, c09_protected_root=None):
+        host_process_runner=None,c09_protected_root=None,initial_phase_fixture_installation=None,
+        complete_c09_current_v3=False,c09_phase_setup_file=None):
     if terminal_after_completed and (after_completed is None or not enable_c09_maintenance):
         raise ValueError("terminal C09 scenario requires its maintenance callback")
     async def after(case):
@@ -36,17 +37,25 @@ async def run_installed_life_content_fullchain_v1(tmp_path,installed_d04_root,*,
         fences=server._v2_fences[case['authority_namespace']]
         control=graph._actual_d04_authority_acceptance_v3.storage_control
         path=Path(store._db.execute('PRAGMA database_list').fetchone()[2]).resolve()
-        owner=InstalledD12OwnerStorageAdmissionServiceV1(fences=fences,owner_tickets=server._v2_owner_tickets,
-            graph_db_path=path,namespace_id=ns,installation_id=policy.installation_id,
-            holder=policy.administrator_holder,control=control,close_apply=control._applied_reader)
+        if complete_c09_current_v3:
+            owner=server._d12_owner_storage_services_v1[(case['authority_namespace'],policy.installation_id)]
+            assert owner.core is case['c09_daemon'].core and owner.control is control
+        else:
+            owner=InstalledD12OwnerStorageAdmissionServiceV1(fences=fences,owner_tickets=server._v2_owner_tickets,
+                graph_db_path=path,namespace_id=ns,installation_id=policy.installation_id,
+                holder=policy.administrator_holder,control=control,close_apply=control._applied_reader)
         readers=InstalledD06StructuredExperienceReadersV1(issuer=issuer,resource_issuer=issuer.resource_issuer,
             body_quote_authority=graph._GraphCoordinator__body_quote_authority)
         reader=InstalledInternalLifeModelGraphReaderV2(owner_storage=owner,structured_readers=readers,
             bundle=bundle,read_subject=case['client_grant'].subject)
         model=case['model_service'];verifier=model._graph_verifier
         from sylanne3.authority_service.current_source_location_v1 import InstalledCurrentSourceLocationQualifierV1
-        location=InstalledCurrentSourceLocationQualifierV1(fences=fences,scoped=control._applied_reader.scoped,
-            control=control,graph_db_path=path,namespace_id=ns,installation_id=policy.installation_id)
+        if complete_c09_current_v3:
+            location=server._d11_life_services_v1[case['authority_namespace']].current_source_location
+            assert location._control is control and location.core is case['c09_daemon'].core
+        else:
+            location=InstalledCurrentSourceLocationQualifierV1(fences=fences,scoped=control._applied_reader.scoped,
+                control=control,graph_db_path=path,namespace_id=ns,installation_id=policy.installation_id)
         model.install_current_source_location_v1(location)
         verifier.install_internal_life_reader_v2(reader)
         original_current=verifier._current
@@ -287,7 +296,8 @@ async def run_installed_life_content_fullchain_v1(tmp_path,installed_d04_root,*,
                     'content_trace':trace, 'content_adopted':adopted,
                     'content_mock_transport':mock, 'content_model_adapter':adapter,
                     'content_model_workflow':workflow, 'content_model_descriptor':descriptor,
-                    'content_installation_bundle':bundle})
+                    'content_installation_bundle':bundle,
+                    'content_source_execution_id':case['life_source_execution_id']})
                 if terminal_after_completed:
                     return
             # Real Authority logout revokes this exact session. A process lease
@@ -314,7 +324,9 @@ async def run_installed_life_content_fullchain_v1(tmp_path,installed_d04_root,*,
     await run_installed_life_content_preparation_case(tmp_path,installed_d04_root,
         acquire=True,worker_v2=True,after_acquire=after,
         enable_c09_maintenance=enable_c09_maintenance,
-        host_process_runner=host_process_runner, c09_protected_root=c09_protected_root)
+        host_process_runner=host_process_runner,c09_protected_root=c09_protected_root,
+        initial_phase_fixture_installation=initial_phase_fixture_installation,complete_c09_current_v3=complete_c09_current_v3,
+        c09_phase_setup_file=c09_phase_setup_file)
 
 
 @pytest.mark.asyncio

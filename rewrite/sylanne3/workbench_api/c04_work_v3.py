@@ -2,11 +2,12 @@
 from dataclasses import fields, asdict
 from ..runtime_contracts import NamespaceId, canonical_digest
 from ..runtime.c04_cpu_quote_policy import C04InternalCpuQuotePolicyV1
+from ..runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyV1
 from ..runtime.c04_current_trigger_v3 import CurrentC04TriggerV3
 from ..runtime.c04_v3_contracts import AssociationBudgetV3
 
-ACTIONS={'c04_cpu_policy':'c04.cpu_policy.install','c04_prepare':'c04.internal_work.prepare','c04_advance':'c04.internal_work.prepare'}
-INPUTS={'c04_cpu_policy':frozenset({'policy'}),'c04_prepare':frozenset({'request'}),'c04_advance':frozenset({'original_operation_id'})}
+ACTIONS={'d13_counter_cpu_policy':'d13.counter.cpu_policy.install','c04_cpu_policy':'c04.cpu_policy.install','c04_prepare':'c04.internal_work.prepare','c04_advance':'c04.internal_work.prepare'}
+INPUTS={'d13_counter_cpu_policy':frozenset({'policy'}),'c04_cpu_policy':frozenset({'policy'}),'c04_prepare':frozenset({'request'}),'c04_advance':frozenset({'original_operation_id'})}
 
 
 def _exact(raw,cls):
@@ -17,6 +18,10 @@ def _exact(raw,cls):
 
 def validate_c04_input_v3(action,raw):
     if action not in ACTIONS or type(raw) is not dict or set(raw)!=INPUTS[action]:raise ValueError('C04 command fields differ')
+    if action=='d13_counter_cpu_policy':
+        value=_exact(raw['policy'],D13CounterCpuQuotePolicyV1)
+        value['namespace']=NamespaceId(**_exact(value['namespace'],NamespaceId))
+        return D13CounterCpuQuotePolicyV1(**value)
     if action=='c04_cpu_policy':
         value=_exact(raw['policy'],C04InternalCpuQuotePolicyV1)
         value['namespace']=NamespaceId(**_exact(value['namespace'],NamespaceId))
@@ -43,7 +48,9 @@ def execute_c04_work_v3(issuer,*,session,action,scope,purpose,audience,operation
     grant=issuer._resolve(session,scope,purpose,audience,domains=('d02','d04','d06','d07','d11','d12'))
     if grant is None or capability not in grant.capabilities:return _unavailable('signed_c04_owner_capability_unavailable')
     graph=issuer._coordinator
-    if action=='c04_cpu_policy':
+    if action=='d13_counter_cpu_policy':
+        result=graph.adopt_current_d13_counter_cpu_policy_v1(grant.authority,grant.lease,operation_id=operation_id,policy=request)
+    elif action=='c04_cpu_policy':
         result=graph.adopt_current_c04_cpu_policy_v3(grant.authority,grant.lease,operation_id=operation_id,policy=request)
     elif action=='c04_prepare':
         # Current source/route rights are derived by the coordinator. The W09

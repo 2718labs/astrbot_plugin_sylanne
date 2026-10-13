@@ -6,6 +6,12 @@ response may supply the local start identity; recovery reads the original fact.
 
 from __future__ import annotations
 from .model_workflows_v3 import AdminModelWorkflowsV3
+from .model_workflows_v4 import AdminModelWorkflowsV4
+from .model_workflows_v5 import AdminModelWorkflowsV5, is_installed_relationship_cognition_slot_v2
+from .model_workflows_v6 import AdminModelWorkflowsV6, is_installed_growth_cognition_slot_v2
+from .model_workflows_v7 import AdminModelWorkflowsV7, is_installed_growth_cognition_slot_v3, is_installed_relationship_cognition_slot_v3
+from ..runtime.d11_artifact_draft_model_v1 import is_installed_artifact_draft_slot_v1
+from .authority_profile import is_installed_artifact_draft_phase_slot_v2
 
 import asyncio
 import hashlib
@@ -14,8 +20,10 @@ from dataclasses import asdict, dataclass, replace
 
 from ..authority_service.v2_model_egress_contract import (
     HostObservedModelCompletionV2, ModelEgressDraftV1, ModelEgressIntentV1,
-    ModelTerminalReceiptV2,
+    ModelTerminalReceiptV2, ModelAdmissionV2, ModelEgressRecoveryV1,
 )
+from ..authority_service.v2_contract import FencePermitV2
+from ..authority_service.v2_fence_store import AuthorityV2FenceStore
 from ..authority_service.v2_model_egress_wire import from_wire as model_from_wire
 from ..authority_service.v2_model_result_read_contract import ModelResultReadRequestV1
 from ..authority_service.v2_worker_model_result_contract import (
@@ -56,7 +64,7 @@ from ..runtime_contracts import (
     CommandEnvelope, CompressedTurnBlockV2, InstallationGrantV2,
     canonical_digest, canonical_serialize,
 )
-from .astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
+from .astrbot_model_call import AstrBotModelProvider, LocalModelCapacityDeniedV1
 from ..authority_service.natural_original_binding_verifier import (
     NaturalOriginalCallIdentityReadV2,
 )
@@ -65,6 +73,9 @@ from .authority_profile import (
     AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowV2,
 )
 from .first_ingress_result import OriginalFirstIngressRead
+from ..runtime.local_module_admission_v1 import (
+    LocalModuleAdmissionV1, LocalModuleAdmissionDeniedV1, MODEL_MODULES_V1,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,11 +159,69 @@ def _plain_frozen(value):
     return value
 
 
+def _bound_model_admission_v1(adapter, bundle, grant, intent, permit, admission):
+    """Match all identities returned by the existing paired model RPC."""
+    if (type(intent) is not ModelEgressIntentV1 or type(permit) is not FencePermitV2
+            or type(admission) is not ModelAdmissionV2):
+        return False
+    policy = bundle.installation_policy
+    model = adapter._admin_model
+    return (
+        (intent.authority_id, intent.namespace, intent.provider_id, intent.model_id,
+         intent.provider_config_digest) ==
+        (grant.authority_id, policy.authority_namespace, model.provider_id, model.model_id, model.provider_config_digest)
+        and (policy.expected_authority_id, policy.installation_id, policy.manifest_digest,
+             policy.administrator_holder) ==
+            (grant.authority_id, grant.installation_id, grant.manifest_digest, grant.administrator_holder)
+        and (permit.authority_id, permit.namespace, permit.subject, permit.holder, permit.generation,
+             permit.operation, permit.operation_id, permit.token, permit.fence_epoch, permit.revision) ==
+            (intent.authority_id, intent.namespace, intent.subject, grant.administrator_holder,
+             intent.authority_activation_generation, "model_egress", intent.operation_id,
+             intent.fence_token, intent.fence_epoch, intent.fence_revision)
+        and canonical_digest(asdict(permit.pinned_anchor)) == intent.anchor_digest
+        and grant.subject.startswith("mtls:sha256:")
+        and (admission.authority_id, admission.namespace, admission.subject, admission.operation_id,
+             admission.call_id, admission.request_digest, admission.provider_config_digest,
+             admission.installation_id, admission.observer_peer_sha256, admission.observer_profile_id,
+             admission.manifest_digest, admission.host_incarnation) ==
+            (intent.authority_id, intent.namespace, intent.subject, intent.operation_id, intent.call_id,
+             intent.request_digest, intent.provider_config_digest, grant.installation_id,
+             grant.subject.removeprefix("mtls:sha256:"), bundle.tls_profile.profile_id,
+             grant.manifest_digest, adapter.host_incarnation))
+
+
+def _retire_observed_local_model_v1(executor, *, intent, record, permit, admission, receipt, report=None):
+    """Called only after paired complete/fact returned, never a public DTO eraser."""
+    if (type(executor) is not HostModelEgressExecutor or type(record) is not ModelEgressRecoveryV1
+            or record.state != "observed" or record.intent != intent
+            or type(receipt) is not ModelTerminalReceiptV2
+            or not _bound_model_admission_v1(executor._adapter, executor._bundle,
+                                            executor._grant, intent, permit, admission)
+            or (receipt.admission_id, receipt.call_id, receipt.request_digest,
+                receipt.installation_id, receipt.host_incarnation, receipt.observation_digest) !=
+               (admission.admission_id, intent.call_id, intent.request_digest,
+                admission.installation_id, admission.host_incarnation, record.observation_digest)
+            or receipt.finish_digest != AuthorityV2FenceStore.model_terminal_finish_digest(
+                intent, permit, "completed", record.observation_digest)):
+        return False
+    if report is not None and (
+            type(report) is not HostObservedModelCompletionV2
+            or report.admission_id != admission.admission_id
+            or report.host_incarnation != admission.host_incarnation
+            or receipt.report_digest != report.digest
+            or receipt.observation_digest != report.observation_for(intent).digest):
+        return False
+    executor._verified_terminal_return = (admission.admission_id, intent.call_id, intent.request_digest,
+        intent.provider_config_digest, admission.host_incarnation, receipt.report_digest)
+    return executor._adapter._retire_confirmed_from_executor_v1(executor)
+
+
 class HostModelEgressExecutor:
     """A short-lived executor for one installed adapter and paired Authority client."""
 
     def __init__(self, *, authority: AuthorityClient, bundle: AdminInstallationBundle,
-                 grant: InstallationGrantV2, adapter: AstrBotModelProvider) -> None:
+                 grant: InstallationGrantV2, adapter: AstrBotModelProvider,
+                 local_module_admission: LocalModuleAdmissionV1 | None = None) -> None:
         if (type(authority) is not AuthorityClient
                 or type(bundle) is not AdminInstallationBundle
                 or type(grant) is not InstallationGrantV2
@@ -175,15 +244,126 @@ class HostModelEgressExecutor:
                               or model is workflows.contact_review
                               or model is workflows.appraisal
                               or model is workflows.d07_cognition
-                              or (type(workflows) is AdminModelWorkflowsV3
-                                  and model is workflows.life_content)))
+                              or (is_installed_relationship_cognition_slot_v2(bundle, model) or is_installed_relationship_cognition_slot_v3(bundle, model))
+                              or (is_installed_growth_cognition_slot_v2(bundle, model) or is_installed_growth_cognition_slot_v3(bundle, model))
+                              or is_installed_artifact_draft_slot_v1(bundle,model)
+                              or is_installed_artifact_draft_phase_slot_v2(bundle,model)
+                              or (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+                                  and (model is workflows.life_content
+                                       or model is workflows.life_numeric))))
         if not installed:
             raise ValueError("executor model workflow is not installed")
         self._authority = authority
         self._bundle = bundle
         self._grant = grant
         self._adapter = adapter
+        self._verified_start_return = None
+        self._verified_start_binding_v1 = None
+        self._verified_terminal_return = None
+        self._verified_capacity_return = None
+        if local_module_admission is not None and type(local_module_admission) is not LocalModuleAdmissionV1:
+            raise TypeError("model executor requires the frozen native module admission")
+        self._local_module_admission = local_module_admission or LocalModuleAdmissionV1()
         self._frozen_attempts: set[str] = set()
+
+    def _remember_frozen_attempt_v1(self, call_id):
+        # Executors are short lived; repeated successful use still has a bound.
+        identity = canonical_digest(call_id)
+        if identity in self._frozen_attempts or len(self._frozen_attempts) >= 512:
+            return False
+        self._frozen_attempts.add(identity)
+        return True
+
+    async def reconcile_capacity_current_v1(
+        self, *, expected_anchor: RestoreAnchor,
+        draft: ModelEgressDraftV1 | None = None, close_prepared: bool = False,
+    ) -> dict[str, object]:
+        """Read current Core capacity, or close only one exact never-admitted call.
+
+        An absent snapshot is not a release proof. Core must durably reject the
+        never-begun operation or finish its original prepared/no-admission fence.
+        The returned fact cannot mint a model start handle.
+        """
+        fact = await self._authority.model_capacity_reconcile_v1(
+            self._bundle, self._grant, expected_anchor=expected_anchor,
+            draft=draft, close_prepared=close_prepared)
+        if draft is not None and fact["status"] in {"not_dispatched", "never_begun"}:
+            self._verified_capacity_return = (draft.call_id, draft.request_digest,
+                                              draft.provider_config_digest, fact["status"])
+            self._adapter._retire_unadmitted_from_executor_v1(self)
+        return fact
+
+    async def _require_core_capacity_v1(self, *, draft, expected_anchor):
+        # Every fresh executor/Host reads the durable census. This read grants
+        # no slot: prepare and admission each repeat it in their Core transaction.
+        fact = await self.reconcile_capacity_current_v1(
+            expected_anchor=expected_anchor, draft=draft)
+        if fact["status"] not in {"absent", "prepared"}:
+            raise LocalModelCapacityDeniedV1("MODEL_CAPACITY_ORIGINAL_" + fact["status"].upper())
+        if not fact["capacity_available"]:
+            raise LocalModelCapacityDeniedV1("MODEL_CAPACITY_GLOBAL_FULL")
+
+    async def prepare_once(self, *, draft, expected_anchor, request):
+        """Capacity precedes the first paired prepare RPC, never Authority truth.
+
+        This does not undo an earlier domain budget reservation or job acquire.
+        Capacity denial means zero new model prepare/admit/provider calls here.
+        """
+        if (type(draft) is not ModelEgressDraftV1 or type(request) is not ModelCallRequest
+                or type(expected_anchor) is not RestoreAnchor
+                or (draft.call_id, draft.request_digest, draft.operation_id) !=
+                   (request.call_id, request.digest, request.identity.operation_id)):
+            raise ValueError("model prepare differs from the original request")
+        self._require_new_model_attempt_v1(request)
+        reservation = self._adapter._claim_capacity_from_executor_v1(self, request, preparing=True)
+        if not reservation:
+            self._frozen_attempts.discard(canonical_digest(request.call_id))
+            raise LocalModelCapacityDeniedV1("process-local model capacity unavailable")
+        try:
+            await self._require_core_capacity_v1(
+                draft=draft, expected_anchor=expected_anchor)
+            return await self._authority.model_prepare_fenced_v1(
+                self._bundle, self._grant, draft=draft, expected_anchor=expected_anchor,
+                _on_dispatch=lambda: self._adapter._mark_capacity_rpc_dispatched_v1(
+                    self, request.call_id, reservation))
+        finally:
+            if self._adapter._release_unsent_capacity_v1(self, request.call_id, reservation):
+                self._frozen_attempts.discard(canonical_digest(request.call_id))
+
+    def _require_new_model_attempt_v1(self, request):
+        model = self._adapter._admin_model
+        if is_installed_artifact_draft_phase_slot_v2(self._bundle, model):
+            from ..model_broker.artifact_draft_v1 import artifact_draft_input_from_wire_v2
+            from ..model_broker.artifact_phase_count_v1 import artifact_phase_provider_request_v1
+            from .authority_profile import AdminArtifactDraftToolScopeV2
+            from ..domains.d01 import TONE_SAMPLE_METHOD_V1
+            artifact_phase_provider_request_v1(request, billing_policy=self._adapter._billing_policy)
+            frozen = artifact_draft_input_from_wire_v2(dict(request.payload)["input"])
+            from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, require_paired_phase_frozen_target_v4
+            tool_scope = self._bundle.artifact_draft.tool_scope
+            if type(self._bundle.artifact_draft) is AdminArtifactDraftPairedPolicyV4:
+                tool_scope = require_paired_phase_frozen_target_v4(self._bundle.artifact_draft,frozen)
+            if (frozen.selector.method_ref == TONE_SAMPLE_METHOD_V1
+                    and (type(tool_scope) is not AdminArtifactDraftToolScopeV2
+                        or tool_scope.maximum_artifact_version < 2)):
+                raise ValueError("tone sample phase lacks its explicit installed replacement scope")
+            self._local_module_admission.require_v1(("d06", "d10", "d11"), "model:artifact_draft_phase_v2")
+            return
+        if is_installed_artifact_draft_slot_v1(self._bundle,model):
+            self._local_module_admission.require_v1(("d06","d10","d11"),"model:artifact_draft")
+            return
+        if request.identity.phase == "d13.precompress":
+            slot = "d13_precompression"
+        elif type(model) is AdminIngressModelPolicy:
+            slot = "reply"
+        else:
+            workflows = self._bundle.model_workflows
+            slot = next((name for name in MODEL_MODULES_V1
+                         if name != "d13_precompression"
+                         and getattr(workflows, name, None) is model), None)
+            if slot is None:
+                raise ValueError("new model attempt has no installed workflow slot")
+        self._local_module_admission.require_v1(MODEL_MODULES_V1[slot], "model:" + slot)
 
     def _frozen_encoding_request(
         self, binding: EncodingCallBinding, draft: ModelEgressDraftV1,
@@ -195,6 +375,7 @@ class HostModelEgressExecutor:
                 or type(expected_anchor) is not RestoreAnchor
                 or type(self._adapter._admin_model) is not AdminModelWorkflowV2):
             raise ValueError("frozen encoding binding, draft and anchor are required")
+        from ..model_broker.first_ingress_encoding import ENCODING_TEMPLATE_VERSIONS, encoding_template_digest_v1
         binding_to_json(binding)
         frozen = binding.request
         model = self._adapter._admin_model
@@ -204,7 +385,7 @@ class HostModelEgressExecutor:
                            "sylanne.first-ingress-encoding-call.v3"}
                 or model is not self._bundle.model_workflows.encode
                 or model.work_kind != "d06.encode_source"
-                or model.template_version != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                or model.template_version not in ENCODING_TEMPLATE_VERSIONS
                 or binding.namespace != policy.namespace
                 or draft.namespace != policy.authority_namespace
                 or draft.authority_id != self._grant.authority_id
@@ -235,8 +416,8 @@ class HostModelEgressExecutor:
                 or request.identity.phase != "encode"
                 or request.envelope.input_refs != (source_token,)
                 or request.envelope.source_qualification.source_refs != (source_token,)
-                or request.prompt_template_digest != FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST
-                or frozen["prompt_template_version"] != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                or request.prompt_template_digest != encoding_template_digest_v1(model.template_version)
+                or frozen["prompt_template_version"] != model.template_version
                 or frozen["provider_config_ref"] != model.provider_config_ref
                 or frozen["provider_config_digest"] != model.provider_config_digest
                 or authority.namespace != binding.namespace
@@ -278,13 +459,11 @@ class HostModelEgressExecutor:
             request = self._frozen_encoding_request(binding, draft, expected_anchor)
         except (EncodingCallConflict, KeyError, TypeError, ValueError):
             return None
-        if binding.call_id in self._frozen_attempts:
+        if not self._remember_frozen_attempt_v1(binding.call_id):
             return None
-        self._frozen_attempts.add(binding.call_id)
         try:
-            record, permit = await self._authority.model_prepare_fenced_v1(
-                self._bundle, self._grant, draft=draft,
-                expected_anchor=expected_anchor)
+            record, permit = await self.prepare_once(
+                draft=draft, expected_anchor=expected_anchor, request=request)
         except Exception:
             return None
         intent = record.intent
@@ -354,13 +533,13 @@ class HostModelEgressExecutor:
                 or seal.installation_id != self._grant.installation_id
                 or seal.namespace != self._bundle.installation_policy.namespace
                 or request.digest != original.typed_request_digest
-                or request.call_id in self._frozen_attempts):
+                or canonical_digest(request.call_id) in self._frozen_attempts):
             return None
-        self._frozen_attempts.add(request.call_id)
+        if not self._remember_frozen_attempt_v1(request.call_id):
+            return None
         try:
-            record, permit = await self._authority.model_prepare_fenced_v1(
-                self._bundle, self._grant, draft=draft,
-                expected_anchor=expected_anchor)
+            record, permit = await self.prepare_once(
+                draft=draft, expected_anchor=expected_anchor, request=request)
         except Exception:
             return None
         intent = record.intent
@@ -432,7 +611,7 @@ class HostModelEgressExecutor:
                     call_original.intent_original_digest) != (
                         original.namespace, binding.job_ref,
                         binding.binding_digest, original.original_digest)
-                or binding.call_id in self._frozen_attempts):
+                or canonical_digest(binding.call_id) in self._frozen_attempts):
             return None
         try:
             request = issue_unadmitted_d13_model_request_v1(
@@ -478,11 +657,11 @@ class HostModelEgressExecutor:
                        model.provider_id, model.model_id,
                        model.provider_config_digest, model.max_output_tokens)):
             return None
-        self._frozen_attempts.add(binding.call_id)
+        if not self._remember_frozen_attempt_v1(binding.call_id):
+            return None
         try:
-            record, permit = await self._authority.model_prepare_fenced_v1(
-                self._bundle, self._grant, draft=draft,
-                expected_anchor=expected_anchor)
+            record, permit = await self.prepare_once(
+                draft=draft, expected_anchor=expected_anchor, request=request)
         except Exception:
             return None
         intent = record.intent
@@ -511,11 +690,8 @@ class HostModelEgressExecutor:
                     self._bundle, self._grant, intent=intent))
         except Exception:
             return None
-        if (record.intent != intent
-                or permit.operation_id != intent.operation_id
-                or admission.call_id != intent.call_id
-                or receipt is None
-                or record.state != "observed"):
+        if not _retire_observed_local_model_v1(self, intent=intent, record=record,
+                permit=permit, admission=admission, receipt=receipt):
             return None
         return receipt
 
@@ -819,6 +995,7 @@ class HostModelEgressExecutor:
         natural_original: NaturalOriginalCallIdentityReadV2 | None = None,
         appraisal_original=None,
         d07_original=None,
+        artifact_draft_original=None,
     ) -> ModelTerminalReceiptV2 | None:
         """Return a durable content-free receipt, or HOLD without another send.
 
@@ -832,12 +1009,89 @@ class HostModelEgressExecutor:
         model = self._adapter._admin_model
         if type(model) is AdminModelWorkflowV2:
             workflows = self._bundle.model_workflows
-            if model is workflows.d07_cognition:
-                from ..runtime.d07_execution_v1 import D07PreparedExecutionV1
-                from ..model_broker.d07_cognition_v1 import thaw_d07_cognition_request_v1
-                if type(d07_original) is not D07PreparedExecutionV1:
+            quote_ceiling = model.quote_ceiling
+            if is_installed_artifact_draft_phase_slot_v2(self._bundle, model):
+                from ..runtime.d11_artifact_draft_model_v1 import ArtifactDraftModelPreparedV2
+                from ..model_broker.artifact_draft_v1 import (
+                    artifact_draft_input_from_wire_v2,
+                    artifact_draft_phase_token_limits_v2, artifact_draft_model_ids_v2,
+                )
+                from ..model_broker.artifact_phase_count_v1 import artifact_phase_provider_request_v1
+                from .authority_profile import AdminArtifactDraftToolScopeV2
+                from ..domains.d01 import TONE_SAMPLE_METHOD_V1
+                original = artifact_draft_original
+                if type(original) is not ArtifactDraftModelPreparedV2:
                     return None
-                frozen = thaw_d07_cognition_request_v1(json.loads(d07_original.frozen_json))
+                artifact_phase_provider_request_v1(request, billing_policy=self._adapter._billing_policy)
+                frozen = artifact_draft_input_from_wire_v2(dict(request.payload)["input"])
+                ids = artifact_draft_model_ids_v2(frozen.selector)
+                limits = artifact_draft_phase_token_limits_v2(frozen.selector)
+                from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, require_paired_phase_frozen_target_v4
+                tool_scope = self._bundle.artifact_draft.tool_scope
+                if type(self._bundle.artifact_draft) is AdminArtifactDraftPairedPolicyV4:
+                    tool_scope = require_paired_phase_frozen_target_v4(self._bundle.artifact_draft,frozen)
+                if (original.selector != frozen.selector or original.digest != intent.binding_digest
+                        or frozen.digest != original.frozen_digest
+                        or (intent.job_id, intent.call_id, intent.acquire_operation_id, intent.budget_reservation_operation_id,
+                            intent.budget_reservation_digest) != (original.job_id, original.call_id, original.acquire_operation_id,
+                            original.operation_id, original.reservation_digest)
+                        or (original.job_id, original.call_id, original.acquire_operation_id, original.operation_id) !=
+                            (ids["job"], ids["call"], ids["acquire"], ids["prepare"])
+                        or original.namespace != self._bundle.installation_policy.namespace
+                        or original.manifest_digest != self._grant.manifest_digest
+                        or request.max_output_tokens != min(model.max_output_tokens, limits["output_tokens"])
+                        or frozen.selector.method_ref == TONE_SAMPLE_METHOD_V1
+                            and (type(tool_scope) is not AdminArtifactDraftToolScopeV2
+                                or tool_scope.maximum_artifact_version < 2)):
+                    return None
+                quote_ceiling = {**model.quote_ceiling,
+                    "input_tokens": min(model.quote_ceiling["input_tokens"], limits["input_tokens"]),
+                    "output_tokens": min(model.quote_ceiling["output_tokens"], limits["output_tokens"])}
+            elif is_installed_artifact_draft_slot_v1(self._bundle,model):
+                from ..runtime.d11_artifact_draft_model_v1 import ArtifactDraftModelPreparedV1
+                from ..model_broker.artifact_draft_v1 import ArtifactDraftInputV1,artifact_draft_from_wire_v1
+                original=artifact_draft_original
+                if type(original) is not ArtifactDraftModelPreparedV1:return None
+                frozen=artifact_draft_from_wire_v1(dict(request.payload)["input"],ArtifactDraftInputV1)
+                if (original.digest!=intent.binding_digest or frozen.digest!=original.frozen_digest
+                        or (intent.job_id,intent.call_id,intent.acquire_operation_id,intent.budget_reservation_operation_id,
+                            intent.budget_reservation_digest)!=(original.job_id,original.call_id,original.acquire_operation_id,
+                            original.operation_id,original.reservation_digest)
+                        or original.namespace!=self._bundle.installation_policy.namespace
+                        or original.manifest_digest!=self._grant.manifest_digest):return None
+            if request.identity.phase == "d13.precompress":
+                from ..runtime.d13_installed_paid_purpose_v1 import installed_d13_paid_context_request_v1
+                if not installed_d13_paid_context_request_v1(self._bundle, model, request):
+                    return None
+                quote_ceiling = self._bundle.d13_paid_precompression.quote_ceiling
+            if (model is workflows.d07_cognition or (is_installed_relationship_cognition_slot_v2(self._bundle, model) or is_installed_relationship_cognition_slot_v3(self._bundle, model))
+                    or (is_installed_growth_cognition_slot_v2(self._bundle, model) or is_installed_growth_cognition_slot_v3(self._bundle, model))):
+                from ..runtime.d07_execution_v1 import D07PreparedExecutionV1, D07IngressRecallPreparedV1, D07RelationshipPreparedV2
+                from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
+                from ..model_broker.d07_cognition_v1 import (
+                    thaw_d07_cognition_request_v1, thaw_d07_ingress_recall_request_v1,
+                    TEMPLATE_VERSION, RECALL_TEMPLATE_VERSION_V1,
+                )
+                if type(d07_original) is D07IngressRecallPreparedV1:
+                    if model.template_version != RECALL_TEMPLATE_VERSION_V1:
+                        return None
+                    frozen = thaw_d07_ingress_recall_request_v1(json.loads(d07_original.frozen_json))
+                elif type(d07_original) is D07MethodGrowthPreparedV2:
+                    if (not (is_installed_growth_cognition_slot_v2(self._bundle, model) or is_installed_growth_cognition_slot_v3(self._bundle, model))
+                            or model.template_version != TEMPLATE_VERSION):
+                        return None
+                    frozen = thaw_d07_cognition_request_v1(json.loads(d07_original.frozen_json))
+                elif type(d07_original) is D07RelationshipPreparedV2:
+                    if (not (is_installed_relationship_cognition_slot_v2(self._bundle, model) or is_installed_relationship_cognition_slot_v3(self._bundle, model))
+                            or model.template_version != TEMPLATE_VERSION):
+                        return None
+                    frozen = thaw_d07_cognition_request_v1(json.loads(d07_original.frozen_json))
+                elif type(d07_original) is D07PreparedExecutionV1:
+                    if model is not workflows.d07_cognition or model.template_version != TEMPLATE_VERSION:
+                        return None
+                    frozen = thaw_d07_cognition_request_v1(json.loads(d07_original.frozen_json))
+                else:
+                    return None
                 if (d07_original.namespace != self._bundle.installation_policy.namespace
                         or d07_original.activation_generation != intent.authority_activation_generation
                         or d07_original.digest != intent.binding_digest
@@ -903,32 +1157,39 @@ class HostModelEgressExecutor:
                     or intent.max_output_tokens != request.max_output_tokens
                     or intent.budget_lease_id
                        != request.envelope.parent_budget_lease_ref
-                    or any(amount > model.quote_ceiling.get(dimension, 0)
+                    or any(amount > quote_ceiling.get(dimension, 0)
                            for dimension, amount in intent.budget_ceiling)
                     or not self._adapter._request_allowed(request)):
                 return None
         try:
+            self._require_new_model_attempt_v1(request)
+        except LocalModuleAdmissionDeniedV1:
+            return None
+        reservation = self._adapter._claim_capacity_from_executor_v1(self, request, preparing=False)
+        if not reservation:
+            return None
+        try:
             record, permit, admission = await self._authority.model_admit_dispatch_once_v2(
                 self._bundle, self._grant, intent=intent,
                 expected_anchor=expected_anchor, model_request=request,
-                host_incarnation=self._adapter.host_incarnation)
+                host_incarnation=self._adapter.host_incarnation,
+                _on_dispatch=lambda: self._adapter._mark_capacity_rpc_dispatched_v1(
+                    self, request.call_id, reservation))
         except Exception:
             return None
+        finally:
+            self._adapter._release_unsent_capacity_v1(self, request.call_id, reservation)
         if (record.state != "dispatch_started" or record.intent != intent
-                or permit.operation != "model_egress"
                 or permit.pinned_anchor != expected_anchor
-                or admission.host_incarnation != self._adapter.host_incarnation
                 or admission.request_digest != request.digest
-                or admission.provider_config_digest !=
-                   self._adapter._admin_model.provider_config_digest):
+                or not _bound_model_admission_v1(self._adapter, self._bundle, self._grant,
+                                                intent, permit, admission)):
             return None
-        # LocalModelAdmission is not itself an Authority credential. Its values
-        # are minted here only after the paired v2 client verified the reply.
+        # A public admission DTO cannot manufacture the private one-start handle.
         try:
-            local = LocalModelAdmission(
-                admission.admission_id, admission.host_incarnation,
-                admission.call_id, admission.request_digest,
-                admission.provider_config_digest)
+            self._verified_start_return = admission
+            self._verified_start_binding_v1 = (intent, permit, admission, request)
+            local = self._adapter._issue_start_from_executor_v1(self)
             response = await self._adapter.invoke_admitted(
                 request, local, asyncio.Event())
         except Exception:
@@ -943,7 +1204,8 @@ class HostModelEgressExecutor:
                 intent.model_id, intent.provider_config_digest,
                 canonical_serialize(dict(response.result)),
                 tuple(sorted(response.usage.items())),
-                tuple(sorted(response.cost.items())), response.provider_call_ref)
+                tuple(sorted(response.cost.items())), response.provider_call_ref,
+                response.billing_receipt_json)
             completed, terminal_permit, receipt = (
                 await self._authority.model_complete_observed_v2(
                     self._bundle, self._grant, intent=intent,
@@ -953,7 +1215,8 @@ class HostModelEgressExecutor:
             return None
         if (completed.state != "observed" or completed.intent != intent
                 or terminal_permit != permit
-                or receipt.report_digest != report.digest):
+                or not _retire_observed_local_model_v1(self, intent=intent, record=completed,
+                    permit=terminal_permit, admission=admission, receipt=receipt, report=report)):
             return None
         return receipt
 

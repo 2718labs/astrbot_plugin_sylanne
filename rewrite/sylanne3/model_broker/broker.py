@@ -8,7 +8,7 @@ existing identity; this module must never reset or manufacture a budget.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from hashlib import sha256
 import json
 from typing import Any, Mapping, Protocol
@@ -162,8 +162,9 @@ class ModelCallRequest:
     payload: Mapping[str, Any]
     timeout_seconds: float
     max_output_tokens: int
+    _prepared_payload_eof_v3: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _prepared_payload_eof_v3=None) -> None:
         if not isinstance(self.envelope, CommandEnvelope):
             raise TypeError("envelope must be CommandEnvelope")
         _text(self.call_id, "call_id")
@@ -174,8 +175,17 @@ class ModelCallRequest:
         if not isinstance(self.prompt_template_digest, str) or len(self.prompt_template_digest) != 64 or any(c not in "0123456789abcdef" for c in self.prompt_template_digest):
             raise ValueError("prompt_template_digest must be a SHA-256 digest")
         if not isinstance(self.payload, Mapping): raise TypeError("payload must be an object")
-        try: json.dumps(dict(self.payload), sort_keys=True, allow_nan=False)
-        except (TypeError, ValueError) as exc: raise ValueError("payload must be JSON-safe") from exc
+        if _prepared_payload_eof_v3 is None:
+            try: json.dumps(dict(self.payload), sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError) as exc: raise ValueError("payload must be JSON-safe") from exc
+        else:
+            from ..authority_service.d13_paid_block_verifier_v1 import (
+                PreparedD13PaidRequestEOFV3,require_prepared_d13_paid_payload_eof_v3)
+            if type(_prepared_payload_eof_v3)is PreparedD13PaidRequestEOFV3:
+                require_prepared_d13_paid_payload_eof_v3(_prepared_payload_eof_v3,self)
+            else:
+                from ..runtime.dispatch_initial_source_read_v3 import require_prepared_model_payload_eof_v3
+                require_prepared_model_payload_eof_v3(_prepared_payload_eof_v3,self)
         if not isinstance(self.timeout_seconds, (int, float)) or isinstance(self.timeout_seconds, bool) or not 0 < self.timeout_seconds <= 300:
             raise ValueError("timeout_seconds must be in (0,300]")
         if type(self.max_output_tokens) is not int or self.max_output_tokens < 1:
@@ -188,6 +198,12 @@ class ModelCallRequest:
 
     @property
     def digest(self) -> str:
+        from ..authority_service.d13_paid_block_verifier_v1 import prepared_d13_paid_request_digest_v3
+        prepared=prepared_d13_paid_request_digest_v3(self)
+        if prepared is not None:return prepared
+        from ..authority_service.current_authority_graph_read_v3 import prepared_authority_model_request_digest_v3
+        prepared=prepared_authority_model_request_digest_v3(self)
+        if prepared is not None:return prepared
         return canonical_digest({"envelope": self.envelope, "call_id": self.call_id,
                                  "provider_id": self.provider_id, "model_id": self.model_id,
                                  "purpose": self.envelope.authority.purpose,
@@ -205,6 +221,7 @@ class ProviderResponse:
     usage: Mapping[str, int] | None
     cost: Mapping[str, int] | None
     provider_call_ref: str | None
+    billing_receipt_json: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"completed", "not_dispatched", "unknown"}: raise ValueError("invalid provider response status")
@@ -212,8 +229,19 @@ class ProviderResponse:
             if not isinstance(self.result, Mapping): raise TypeError("result must be an object")
             try: json.dumps(dict(self.result), sort_keys=True, allow_nan=False)
             except (TypeError, ValueError) as exc: raise ValueError("result must be JSON-safe") from exc
+        original_usage, original_cost = self.usage, self.cost
         object.__setattr__(self, "usage", _amounts(self.usage, "usage"))
         object.__setattr__(self, "cost", _amounts(self.cost, "cost"))
+        if self.billing_receipt_json is not None:
+            from .provider_billing_receipt_v1 import provider_billing_receipt_from_json_v1
+            receipt = provider_billing_receipt_from_json_v1(self.billing_receipt_json)
+            if (self.status != "completed" or receipt.provider_call_ref != self.provider_call_ref
+                    or receipt.usage != dict(original_usage)
+                    or dict(original_cost) != {"model_microusd": receipt.final_charged_amount}):
+                raise ValueError("provider billing original differs from the completed response")
+            # A signed final zero is a known measurement, not a missing amount.
+            object.__setattr__(self, "usage", receipt.usage)
+            object.__setattr__(self, "cost", {"model_microusd": receipt.final_charged_amount})
         if self.provider_call_ref is not None: _text(self.provider_call_ref, "provider_call_ref")
         if self.status == "completed" and self.result is None: raise ValueError("completed response requires a result")
         if self.status == "not_dispatched" and (self.result is not None or self.usage or self.cost):

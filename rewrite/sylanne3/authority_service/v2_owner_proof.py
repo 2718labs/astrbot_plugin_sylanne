@@ -24,7 +24,7 @@ from .v2_owner_contract import (
     OwnerAuthorizationOperationV1, OwnerPrincipalV1, canonical_digest,
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 
 
 SCHEMA = "sylanne3.authority.owner-proof.v1"

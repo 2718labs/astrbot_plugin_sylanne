@@ -251,21 +251,26 @@ def install_schema(db) -> None:
 
 
 def _lease_from_row(row) -> BudgetLease:
+    from .domain_background_read_v3 import background_json_loads_v3
     if row is None:
         raise BudgetUnavailable("budget lease does not exist")
     return BudgetLease(
-        row[0], row[1], row[2], row[3], row[4], json.loads(row[5]),
-        json.loads(row[6]), json.loads(row[7]), json.loads(row[8]), row[9], row[10],
+        row[0], row[1], row[2], row[3], row[4], background_json_loads_v3(row[5]),
+        background_json_loads_v3(row[6]), background_json_loads_v3(row[7]), background_json_loads_v3(row[8]), row[9], row[10],
     )
 
 
 def get_budget_lease(db, lease_id: str) -> BudgetLease:
     _identifier(lease_id, "lease_id")
-    return _lease_from_row(db.execute(
-        "SELECT lease_id,parent_id,bot_id,persona_id,currency,limits_json,used_json,"
-        "reserved_json,unconfirmed_json,version,state FROM runtime_budget_leases "
-        "WHERE lease_id=?", (lease_id,),
-    ).fetchone())
+    from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
+    row=model_reply_scope_point_v3(db,table='runtime_budget_leases',
+        columns=('lease_id','parent_id','bot_id','persona_id','currency','limits_json','used_json',
+            'reserved_json','unconfirmed_json','version','state'),
+        key_columns=('lease_id',),key=(lease_id,),legacy_reader=lambda:db.execute(
+            "SELECT lease_id,parent_id,bot_id,persona_id,currency,limits_json,used_json,"
+            "reserved_json,unconfirmed_json,version,state FROM runtime_budget_leases "
+            "WHERE lease_id=?", (lease_id,)).fetchone())
+    return _lease_from_row(row)
 
 
 def _lease_ancestry(db, lease_id: str):

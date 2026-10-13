@@ -94,7 +94,14 @@ def _json(raw):
         return value
     if type(raw) is not dict:
         raise D04NumericArtifactHold("numeric artifact object required")
-    return _json(canonical_serialize(raw))
+    # These bytes come from the canonical encoder in this call. Decoding
+    # still normalizes typed values and enforces duplicate/nonfinite rules;
+    # re-encoding the entire decoded artifact would prove the same bytes twice.
+    encoded = canonical_serialize(raw)
+    if len(encoded.encode("utf-8")) > MAX_ARTIFACT_BYTES:
+        raise D04NumericArtifactHold("numeric artifact exceeds installed bound")
+    return json.loads(encoded, object_pairs_hook=_unique,
+        parse_constant=lambda _: (_ for _ in ()).throw(D04NumericArtifactHold("nonfinite artifact")))
 
 
 def _unpack(raw, depth=0):

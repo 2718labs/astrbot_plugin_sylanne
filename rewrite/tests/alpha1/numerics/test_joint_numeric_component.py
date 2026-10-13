@@ -41,7 +41,7 @@ def _component(tmp_path, *, edge_interval=(1.0, 2.0), include_second_drive=True)
     return store, namespace, scheme, root, other, edge
 
 
-def _read(store, namespace, scheme, root):
+def _read(store, namespace, scheme, root, *, life_source_bridge=None):
     store._db.execute("BEGIN IMMEDIATE")
     try:
         return read_joint_numeric_component(
@@ -51,6 +51,7 @@ def _read(store, namespace, scheme, root):
             expected_graph_incarnation="graph:one", expected_graph_revision=1,
             expected_access_epoch=0, expected_delete_epoch=0,
             audience=("owner",), purpose="context",
+            _life_source_bridge=life_source_bridge,
         )
     finally:
         store._db.execute("ROLLBACK")
@@ -165,5 +166,45 @@ def test_new_feeling_joint_freezes_current_interpretation_and_source_closure(tmp
         )
         with pytest.raises(JointNumericHold, match="interpretation original is unavailable"):
             _read(store, namespace, scheme, root)
+    finally:
+        store.close()
+
+
+def test_ordinary_derived_source_cannot_use_life_joint_bridge(tmp_path):
+    from sylanne3.memory_types import SourceRecord, access_key
+    store, namespace, scheme, root, _other, _edge = _component(tmp_path)
+    try:
+        assert len(_read(store, namespace, scheme, root).block_drives) == 2
+        source = source_key(*namespace.as_tuple, "source-1")
+        original = SourceRecord.from_dict(json.loads(store._db.execute(
+            "SELECT value FROM graph_atoms WHERE token=?", (source.token,),
+        ).fetchone()[0]))
+        parent = replace(original, source_id="source-parent", provenance_root="family-parent")
+        _insert(store._db, namespace, source_key(*namespace.as_tuple, parent.source_id), parent.to_dict())
+        _insert(store._db, namespace, access_key(*namespace.as_tuple, parent.source_id), {
+            "source_id": parent.source_id, "audiences": ["owner"],
+            "purposes": ["context"], "status": "active", "recorded_at": 0.0,
+        })
+        derived = replace(original, source_kind="internal", parent_source_ids=(parent.source_id,))
+        store._db.execute("UPDATE graph_atoms SET value=? WHERE token=?",
+            (canonical_json(derived.to_dict()), source.token))
+        changes = store._db.total_changes
+        with pytest.raises(JointNumericHold, match="requires an independent root source"):
+            _read(store, namespace, scheme, root)
+        assert store._db.total_changes == changes
+    finally:
+        store.close()
+
+
+def test_constructed_life_bridge_has_no_private_issuance(tmp_path):
+    from sylanne3.runtime.d06_life_numeric_joint_v1 import _LifeJointSourceBridgeV1
+    store, namespace, scheme, root, _other, _edge = _component(tmp_path)
+    try:
+        assert len(_read(store, namespace, scheme, root).block_drives) == 2
+        unissued = _LifeJointSourceBridgeV1(object(), object(), None, None)
+        changes = store._db.total_changes
+        with pytest.raises(ValueError, match="requires its live private issuance"):
+            _read(store, namespace, scheme, root, life_source_bridge=unissued)
+        assert store._db.total_changes == changes
     finally:
         store.close()

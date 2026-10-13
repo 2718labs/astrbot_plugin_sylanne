@@ -161,9 +161,14 @@ def _read_retired_source_v2(component,operation_id,*,phase):
     if set(observed)!={'host','authority'}:raise AuthorityUnavailable('offline rollback needs both original retirement identities')
     for role,supervisor in (('host',component.host),('authority',component.authority)):
         actual=supervisor.read_current_host_state_v1();prior=observed[role].body
-        if (not actual.stopped_and_drained or any(prior['systemd'][k]!=asdict(actual)[k] for k in ('unit_name','control_group','unit_fragment_sha256'))):raise AuthorityUnavailable('offline rollback actual unit retirement differs')
+        from .d12_installed_supervisor_v1 import process_observation_state_v1,D12SupervisorObservationV1
+        state=process_observation_state_v1(prior)
+        fixed=('unit_name','control_group','unit_fragment_sha256') if type(actual) is D12SupervisorObservationV1 else (
+            'provider_kind','supervisor_id','spec_digest','service_role','installed_code_digest',
+            'invocation_id','launcher_process_original','pid_namespace_identity','mount_namespace_identity')
+        if (not actual.stopped_and_drained or any(state[k]!=asdict(actual)[k] for k in fixed)):raise AuthorityUnavailable('offline rollback actual supervisor retirement differs')
         if prior['process_original'] is not None:require_process_retired_v1(prior['process_original'])
-        elif prior['systemd']['main_pid']!=0 or prior['systemd']['process_ids'] or prior['systemd']['active_state'] not in {'inactive','failed'}:
+        elif state['main_pid']!=0 or state['process_ids'] or state.get('active_state',state.get('state')) not in {'inactive','stopped','failed'}:
             raise AuthorityUnavailable('offline rollback prior absent process was not actually drained')
     component.reader.lease.require_held();context=component.reader.read_verified_current_storage_v1();context.require_current('maintenance')
     storage={'pointer_version':context.pointer_version,'manifest_digest':context.manifest_digest,'storage_generation':context.storage_generation,

@@ -19,7 +19,9 @@ from ..runtime_journal import RecoveryConstraintFootprint
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
-from .v2_contract import FencePermitV2, FenceNeverBegunReceiptV2
+from .v2_contract import (
+    ContentWriteAttemptObservationV1, FencePermitV2, FenceNeverBegunReceiptV2,
+)
 from .v2_deletion_guard import AuthorityV2DeletionGuard
 from .v2_execution_journal import AuthorityV2ExecutionJournal
 from .v2_fence_store import AuthorityV2FenceStore
@@ -53,9 +55,11 @@ class AuthorityV2FenceService:
 
     @staticmethod
     def _require_mode(db):
-        if db.execute("SELECT value FROM authority_meta WHERE key='service_mode'").fetchone() != ("v2-only",):
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        read = c09_actual_root_read_v3(db)
+        if read.execute("SELECT value FROM authority_meta WHERE key='service_mode'").fetchone() != ("v2-only",):
             raise AuthorityUnavailable("v2 protected read requires persistent v2-only mode")
-        AuthorityServiceCore._require_no_deletion_migration(db)
+        AuthorityServiceCore._require_no_deletion_migration(read)
 
     def _current_locked(self, db, deletion_head, execution_head, *, holder: str | None = None,
                         generation: int | None = None,
@@ -75,7 +79,8 @@ class AuthorityV2FenceService:
             raise AuthorityUnavailable("Authority is behind or differs from an independent journal")
         if require_clear and self.deletion.has_deletion_history(self.namespace):
             self.core.require_current_content_ready_locked(db, namespace=self.namespace)
-        if require_no_pending and db.execute(
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        if require_no_pending and c09_actual_root_read_v3(db).execute(
                 "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
                 "AND pending IS NOT NULL LIMIT 1",
                 (self.namespace,)).fetchone():
@@ -83,12 +88,23 @@ class AuthorityV2FenceService:
         return self.core._anchor(db, self.namespace, row)
 
     @contextmanager
-    def _frozen(self, *, first_graph_preflight=None):
+    def _frozen(self, *, first_graph_preflight=None, selected_proof=None):
         with self.deletion.freeze_writes():
             with self.execution.freeze_writes():
-                deletion_head = self.deletion.verified_head()
-                deletion_history = self.deletion.has_deletion_history(self.namespace)
-                execution_head = self.execution.verified_head()
+                if selected_proof is None:
+                    deletion_head = self.deletion.verified_head()
+                    deletion_history = self.deletion.has_deletion_history(self.namespace)
+                    execution_head = self.execution.verified_head()
+                else:
+                    from .c09_graph_application_v1 import SelectedC09JournalProofV3
+                    from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+                    if type(selected_proof) is not SelectedC09JournalProofV3:
+                        raise AuthorityUnavailable('actual private selected journal proof required')
+                    selected_proof.require_identity(deletion=self.deletion,execution=self.execution,core=self.core)
+                    meter = current_c09_sql_meter_v2()
+                    deletion_head = selected_proof.deletion_head_locked(self.deletion,meter=meter)
+                    execution_head = selected_proof.execution_head_locked(self.execution,meter=meter)
+                    deletion_history = True
                 if first_graph_preflight is not None:
                     first_graph_preflight()
                 with self.core._tx() as db:
@@ -388,6 +404,52 @@ class AuthorityV2FenceService:
                 db, permit, subject=subject, current_anchor=anchor,
                 request_id=request_id, request_digest=request_digest)
 
+
+    def observe_content_write_attempt_v1(
+        self, *, credential, subject: str, holder: str, operation_id: str,
+        expected_anchor: RestoreAnchor,
+    ) -> ContentWriteAttemptObservationV1:
+        """Read this exact current write attempt without issuing or retiring it."""
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        identifier(operation_id, "operation_id")
+        if (type(expected_anchor) is not RestoreAnchor
+                or expected_anchor.namespace != self.namespace):
+            raise AuthorityUnavailable("write attempt observation requires its full anchor")
+        self.core._require(credential, "current", self.namespace)
+        self.core._require(credential, "write", self.namespace, holder)
+        with self._frozen() as (db, deletion_head, execution_head, _):
+            anchor = self._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=expected_anchor.activation_generation)
+            self.fences._require_no_migration(db)
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("write attempt current anchor changed")
+            if db.execute(
+                    "SELECT 1 FROM authority_v2_mutations WHERE state='pending' "
+                    "AND (namespace=? OR operation_id=?) LIMIT 1",
+                    (self.namespace, operation_id)).fetchone():
+                raise AuthorityUnavailable("write attempt observation has a pending mutation")
+            if db.execute(
+                    "SELECT 1 FROM authority_v2_never_begun WHERE operation_id=?",
+                    (operation_id,)).fetchone():
+                raise AuthorityUnavailable("write attempt was durably rejected before begin")
+            row = self.fences._row(db, operation_id)
+            permit = None
+            state = "absent"
+            if row is not None:
+                permit = self.fences._permit(row)
+                if ((permit.authority_id, permit.namespace, permit.subject,
+                     permit.holder, permit.operation_id, permit.operation,
+                     permit.generation, permit.pinned_anchor) != (
+                         anchor.authority_id, self.namespace, subject, holder,
+                         operation_id, "write", anchor.activation_generation, anchor)
+                        or row[6] not in {"active", "finished"} or row[10] is not None):
+                    raise AuthorityUnavailable("write attempt persisted identity or state differs")
+                state = row[6]
+            return ContentWriteAttemptObservationV1(
+                anchor.authority_id, self.namespace, subject, holder, operation_id,
+                anchor, state, permit)
 
     def get_fence_operation(self, *, credential, subject: str,
                             operation_id: str) -> tuple[FencePermitV2, str]:

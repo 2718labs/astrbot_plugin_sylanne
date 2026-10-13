@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Any
 
-from ..graph_worker import GraphWorker
+from ..graph_worker import GraphWorker, GraphStorageWorkV3, OwnedGraphStorageResultV3
 from ..domains.d12.scheme_command import D12CreatorDraftReadPort
 from .issuer import DomainViewRegistry, GrantResolver, GraphWorkbenchIssuer
 from .onboarding import OnboardingPolicyResolver
@@ -51,12 +51,12 @@ class AsyncGraphWorkbenchService:
         self._package_maintenance_port = package_maintenance_port
 
     async def handle(self, payload: Any, *, session: AuthenticatedSession | None,
-                     context: RequestContext) -> ApiResponse:
+                     context: RequestContext) -> ApiResponse | OwnedGraphStorageResultV3:
         return await self._worker.call(self._handle_on_worker, payload, session, context)
 
     def _handle_on_worker(self, coordinator: object, payload: Any,
                           session: AuthenticatedSession | None,
-                          context: RequestContext) -> ApiResponse:
+                          context: RequestContext) -> ApiResponse | GraphStorageWorkV3:
         issuer = GraphWorkbenchIssuer(coordinator, self._grants, self._view_registry,
                                       self._onboarding,
                                       self._correction_installation_policy,
@@ -70,9 +70,17 @@ class AsyncGraphWorkbenchService:
                                       maintenance_port=self._maintenance_port,
                                       package_maintenance_port=self._package_maintenance_port)
         scope = getattr(self._grants, "request_scope", None)
-        with scope() if callable(scope) else nullcontext():
-            return WorkbenchService(issuer).handle(
-                payload, session=session, context=context)
+        with ExitStack() as lifetime:
+            lifetime.enter_context(scope() if callable(scope) else nullcontext())
+            response = WorkbenchService(issuer).handle(payload, session=session, context=context)
+            if type(response) is GraphStorageWorkV3:
+                retained = lifetime.pop_all()
+                try:
+                    response.adopt_request_lifetime_v3(retained)
+                except BaseException:
+                    retained.close()
+                    raise
+            return response
 
     def _erasure_prepare_port(self):
         client = self._authority_client

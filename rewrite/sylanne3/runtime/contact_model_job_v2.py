@@ -130,9 +130,14 @@ def prepare_contact_model_in_transaction_v2(db, *, frame, contact_id, phase, ins
     CurrentDomainReadV1(frame).check(db)
     from ..host.authority_profile import AdminInstallationBundle
     from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+    from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+    from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+    from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+    from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     if (type(installed_bundle) is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows) is not AdminModelWorkflowsV3):
-        raise ValueError("Contact V2 paid preparation requires its installed workflow container V3")
+            or type(installed_bundle.model_workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
+                AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)):
+        raise ValueError("Contact V2 paid preparation requires an explicit installed workflow container V3-V7")
     ns, now = frame.envelope.authority.namespace, frame.now_utc
     plan, expression, plan_raw, plan_digest = read_adopted_contact_plan_v2(db, namespace=ns, contact_id=contact_id, issuer=issuer)
     require_contact_scope_current_v2(db, plan, expression, now=now)

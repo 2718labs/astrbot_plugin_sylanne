@@ -6,13 +6,34 @@ from .contracts import (Scope, Atom, AtomVersion, Snapshot, CommitReceipt,
                         EventConflict, StaleRead, canonical_json, json_object, nonempty)
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, *, selected_storage=None, storage_context=None, storage_role="graph", maintenance_basis=None):
         self._lock = threading.RLock()
         self._closed = False
         self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._db.execute('PRAGMA busy_timeout=5000')
         self._db.execute('PRAGMA journal_mode=WAL')
         self._db.execute('PRAGMA synchronous=FULL')
+        self._runtime_storage_v3 = None
+        from .runtime_storage_v3 import install_selected_runtime_storage_v3, runtime_storage_v3
+        if selected_storage is not None and maintenance_basis is not None:
+            raise ValueError("one exact selected runtime composition required")
+        if maintenance_basis is not None:
+            from .runtime_storage_v3 import install_selected_maintenance_storage_v3
+            self._runtime_storage_v3 = install_selected_maintenance_storage_v3(
+                self._db,role=storage_role,basis=maintenance_basis)
+            return
+        if selected_storage is not None:
+            try:
+                self._runtime_storage_v3 = install_selected_runtime_storage_v3(
+                    self._db, role=storage_role, selected=selected_storage, context=storage_context)
+            except BaseException:
+                if self._runtime_storage_v3 is not None:
+                    self._runtime_storage_v3.close()
+                self._db.close()
+                self._closed = True
+                raise
+            return
+        runtime_storage_v3(self._db)
         self._db.executescript('''
             CREATE TABLE IF NOT EXISTS atoms (
                 bot TEXT NOT NULL, persona TEXT NOT NULL, session TEXT NOT NULL,
@@ -99,5 +120,7 @@ class Store:
     def close(self):
         with self._lock:
             if not self._closed:
+                if self._runtime_storage_v3 is not None:
+                    self._runtime_storage_v3.close()
                 self._db.close()
                 self._closed = True

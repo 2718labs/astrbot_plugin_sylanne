@@ -439,6 +439,15 @@ def prepare_current_association_interpretation_v3(
 ):
     """Single pure issuer API shared by prepare and final current re-admission."""
     from ..domains.d07.current_issuer_v1 import issue_current_recollection_interpretation_v3
+    from .c04_direct_seed_v4 import AssociationWorkInputV4
+    if type(work) is AssociationWorkInputV4:
+        from ..domains.d07.current_issuer_v1 import issue_current_recollection_interpretation_v4
+        return issue_current_recollection_interpretation_v4(
+        work, result, selection, source_heads, interpretation_originals,
+        installed_policy, binding_digest=binding_digest, execution_id=execution_id,
+        activation_generation=activation_generation, adoption_original=adoption_original,
+        paid_original=paid_original)
+
     return issue_current_recollection_interpretation_v3(
         work, result, selection, source_heads, interpretation_originals,
         installed_policy, binding_digest=binding_digest, execution_id=execution_id,

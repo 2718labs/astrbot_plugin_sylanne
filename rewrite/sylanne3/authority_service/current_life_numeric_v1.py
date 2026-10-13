@@ -136,6 +136,8 @@ def life_numeric_result_to_wire_v1(value):
     if type(value) is LifeNumericModelResultReadRequestV1:return plain_v1(value)
     if type(value) is not LifeNumericModelResultReadV1:raise TypeError('closed Life model-result DTO required')
     data=plain_v1(value)
+    from .v2_model_egress_contract import model_observation_to_wire_v1
+    data['observation']=model_observation_to_wire_v1(value.observation)
     data['terminal_receipt']=terminal_wire(value.terminal_receipt)
     return data
 
@@ -154,14 +156,10 @@ def life_numeric_result_from_wire_v1(raw,kind):
         data['namespace']=NamespaceId(**_shape(data['namespace'],NamespaceId))
     else:
         data['request']=life_numeric_result_from_wire_v1(data['request'],LifeNumericModelResultReadRequestV1)
-        observation=_shape(data['observation'],ModelEgressObservationV1)
-        for name in ('usage','cost'):
-            pairs=observation[name]
-            if (type(pairs) is not list or len(pairs)>64 or any(type(pair) is not list or len(pair)!=2
-                    or type(pair[0]) is not str or type(pair[1]) is not int for pair in pairs)):
-                raise ValueError('Life model-result observation amount pairs differ')
-            observation[name]=tuple(tuple(pair) for pair in pairs)
-        data['observation']=ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data['observation']=model_observation_from_wire_v1(data['observation'])
+        if len(data['observation'].usage)>64 or len(data['observation'].cost)>64:
+            raise ValueError('Life model-result observation amount pairs differ')
         data['terminal_receipt']=terminal_from_wire(data['terminal_receipt'],ModelTerminalReceiptV2)
     result=kind(**data)
     if canonical_serialize(life_numeric_result_to_wire_v1(result))!=canonical_serialize(raw):
@@ -186,7 +184,7 @@ from ..runtime.domain_production_contracts_v1 import (
     CurrentOperationFrameV1, ProductionOwnerGuardV1, ProductionQueryCoverageV1,
     ProductionOperationLimitsV1,
 )
-from ..runtime.d06_life_numeric_worker_v1 import read_committed_life_numeric_request_v1
+from ..runtime.d06_life_numeric_worker_v1 import _read_committed_life_numeric_request_originals_v1
 from ..runtime.d06_life_numeric_task_v1 import (
     PrepareInternalLifeNumericRequestV1, read_plan_life_numeric_prepare_v1,
 )
@@ -199,6 +197,10 @@ from ..runtime.jobs import get_job
 from ..runtime.d11_types import job_graph_write
 from ..runtime.budget import require_budget_family_admissible
 from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
 from .v2_model_egress_contract import ModelEgressIntentV1
 
@@ -213,6 +215,7 @@ class LifeNumericCurrentModelGraphV1:
     owner_guard: object
     storage_admission: object
     current_scope_digest: str
+    valid_until_utc: float
 
 
 def _current_frame(db, prepared, request, readers, now):
@@ -291,7 +294,8 @@ class InstalledLifeNumericModelGraphReaderV1:
                 or not read_subject.startswith("mtls:sha256:")
                 or type(owner_storage) is not InstalledD12OwnerStorageAdmissionServiceV1
                 or type(structured_readers) is not InstalledD06StructuredExperienceReadersV1
-                or type(workflows) is not AdminModelWorkflowsV3 or workflows.life_numeric is None
+                or type(workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
+                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7) or workflows.life_numeric is None
                 or structured_readers.resource_issuer is not structured_readers.issuer.resource_issuer):
             raise TypeError('actual installed Life Owner/original readers and workflow required')
         policy=bundle.installation_policy
@@ -315,8 +319,16 @@ class InstalledLifeNumericModelGraphReaderV1:
         ns = NamespaceId(job.bot_id, job.persona_id)
         if ns != owner_service.namespace_id or intent.namespace != owner_service.namespace:
             raise ValueError('Life model selected installation/namespace differs')
-        prepared, binding, request = read_committed_life_numeric_request_v1(db,
+        prepared, binding, request, adopted = _read_committed_life_numeric_request_originals_v1(db,
             namespace=ns, issuer=self.readers.issuer, job_id=job.job_id)
+        # Refuse an already canceled/retired worker before constructing its
+        # complete Source frame. The same signed acquisition was verified above;
+        # all Source/Owner/deadline checks still apply to every live worker.
+        if (job.phase != 'running' or job.operation_id != prepared.prepare_operation_id
+                or job.fence != intent.worker_fence or job.fence != request.envelope.authority.worker_fence
+                or job.cancel_epoch != 0 or job.lease_holder != intent.subject or job.lease_holder != binding.worker_subject
+                or job.result_ref is not None or job.lease_expires_utc is None):
+            raise ValueError('Life model installed workflow/current worker/input identity changed')
         frozen = prepared.frozen
         workflow = self.workflows.life_numeric
         with owner_service.fences._frozen() as (core_db, deletion, execution, _):
@@ -351,10 +363,8 @@ class InstalledLifeNumericModelGraphReaderV1:
             raise ValueError('Life model actual Owner/actor/generation/current storage changed')
         # Qualification uses the actual Owner authority saved in the durable
         # acquisition. This is read material, never a rewritten model grant.
-        from ..runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
         from ..runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
         from ..runtime_contracts import AuthorityContext
-        adopted=read_adopted_domain_operation_v1(db,ns,prepared.acquire_operation_id)
         owner_authority=decode_typed_production_value_v1(adopted['payload']['authority'],AuthorityContext)
         owner_request=replace(request,envelope=replace(request.envelope,authority=owner_authority))
         frame = _current_frame(db, prepared, owner_request, self.readers, float(now))
@@ -382,10 +392,6 @@ class InstalledLifeNumericModelGraphReaderV1:
                 or request.required_capabilities != frozenset(workflow.required_capabilities)
                 or request.privacy_tier != workflow.privacy_tier or request.timeout_seconds != workflow.timeout_seconds
                 or prepared.provider_config_ref != workflow.provider_config_ref
-                or job.phase != 'running' or job.operation_id != prepared.prepare_operation_id
-                or job.fence != intent.worker_fence or job.fence != request.envelope.authority.worker_fence
-                or job.cancel_epoch != 0 or job.lease_holder != intent.subject or job.lease_holder != binding.worker_subject
-                or job.result_ref is not None or job.lease_expires_utc is None
                 or now >= min(binding.deadline_utc, request.envelope.deadline_utc,
                     datetime.fromisoformat(job.deadline_utc.replace('Z', '+00:00')).timestamp(),
                     datetime.fromisoformat(job.lease_expires_utc.replace('Z', '+00:00')).timestamp())):
@@ -430,4 +436,9 @@ class InstalledLifeNumericModelGraphReaderV1:
             'prepared_digest':prepared.digest, 'worker_binding_digest':binding.digest, 'current_reads':frame.snapshot.versions,
             'query_coverage':frame.query_coverage, 'owner_guard':head.guard,
             'storage_admission':admission, 'source_rights':(intent.access_epoch,intent.delete_epoch)})
-        return LifeNumericCurrentModelGraphV1(prepared, binding, frozen, job, request, head.guard, admission, scope_digest)
+        valid_until = min(binding.deadline_utc, request.envelope.deadline_utc,
+            datetime.fromisoformat(job.deadline_utc.replace('Z', '+00:00')).timestamp(),
+            datetime.fromisoformat(job.lease_expires_utc.replace('Z', '+00:00')).timestamp(),
+            quote.valid_until_utc, quote.deadline_utc, parent.valid_until_utc)
+        return LifeNumericCurrentModelGraphV1(prepared, binding, frozen, job, request,
+            head.guard, admission, scope_digest, valid_until)

@@ -41,6 +41,13 @@ class V3ActivationComputation:
 def compute_association_activation_v3(work: object, *,
                                       conditioned_salience: dict[str, float]
                                       ) -> V3ActivationComputation:
+    return _compute_association_activation_from_roots_v3(work,
+        conditioned_salience=conditioned_salience, initial_activation={work.cue_source_ref: 1.0})
+
+
+def _compute_association_activation_from_roots_v3(work: object, *,
+                                      conditioned_salience: dict[str, float], initial_activation: dict[str, float]
+                                      ) -> V3ActivationComputation:
     """Run bounded activation with individually authenticated target weights.
 
     ``conditioned_salience`` is assembled exclusively from each target's V3
@@ -49,8 +56,8 @@ def compute_association_activation_v3(work: object, *,
     by_key = {AtomKey.from_token(item.ref): item for item in work.reads}
     traversed: list[AssociationEdge] = []
     edge_refs: list[str] = []
-    allowed = {work.cue_source_ref}
-    frontier = {work.cue_source_ref}
+    allowed = set(initial_activation)
+    frontier = set(initial_activation)
     expanded: set[str] = set()
     queries = {item.source_ref: item for item in work.edge_pages}
     for _ in range(work.budget.max_hops):
@@ -79,7 +86,7 @@ def compute_association_activation_v3(work: object, *,
         if not frontier:
             break
     activation = AssociationActivator(work.policy).propagate(
-        {work.cue_source_ref: 1.0}, tuple(traversed))
+        initial_activation, tuple(traversed))
     ranked = sorted((
         V3ActivationCandidate(ref, score, conditioned_salience[ref],
                               score * conditioned_salience[ref])

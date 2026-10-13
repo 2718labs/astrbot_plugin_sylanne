@@ -8,6 +8,7 @@ from ..contracts import Event, Scope, canonical_json
 from ..domains.d04.projection_issuer_v2 import load_installed_d04_projection_assets_v2
 from ..graph_coordinator import UnavailableGuard, AuthorityDenied
 from ..contracts import StaleRead
+from ..domains.d01.production_operations_v1 import plain_v1
 from ..graph_store import GraphStore
 from ..graph_types import AtomKey, GraphCandidate, GraphVersion, owner_grant_key
 from ..runtime_contracts import canonical_digest
@@ -60,7 +61,9 @@ def acquire_current_c04_job_v3(c, authority, lease, operation_id, *, holder, lea
     return c._owner_domain_write_v3(authority, lease,
         operation_id="c04-acquire-" + canonical_digest((operation_id, holder, lease_seconds))[:48],
         request_digest=request_digest, domains=("d04", "d06", "d07", "d11"),
-        capability="c04.internal_work.prepare", commit=commit)
+        capability="c04.internal_work.prepare", commit=commit,
+        new_work_admission=lambda db: c.local_module_admission.require_v1(
+            ("d04", "d06", "d07", "d11"), "c04:acquire"))
 
 
 def commit_current_c04_adoption_v3(c, authority, lease, *, proof, holder, fence):
@@ -141,7 +144,7 @@ def commit_current_c04_adoption_v3(c, authority, lease, *, proof, holder, fence)
             "receipt_digest": canonical_digest(receipt), "policy_original_digest": canonical_digest(policy_original),
             "interpretation": assembly.interpretation_provenance}
         db.execute("INSERT INTO graph_c04_adoption_provenance_v3 VALUES(?,?,?,?,?)",
-            (*namespace.as_tuple, prepared.binding.operation_id, canonical_json(provenance), canonical_digest(provenance)))
+            (*namespace.as_tuple, prepared.binding.operation_id, canonical_json(plain_v1(provenance)), canonical_digest(plain_v1(provenance))))
         return {"status": "adopted", "operation_id": prepared.binding.operation_id,
             "binding_digest": prepared.binding.binding_digest, "plan_digest": plan.plan_digest,
             "receipt_digest": canonical_digest(receipt), "job_id": job.job_id,
@@ -163,7 +166,9 @@ def commit_current_c04_adoption_v3(c, authority, lease, *, proof, holder, fence)
     result = c._owner_domain_write_v3(authority, lease,
         operation_id="c04-adopt-" + proof.binding.binding_digest[:48],
         request_digest=canonical_digest(("c04.current-adoption.v3", namespace, proof, holder, fence)),
-        domains=("d04", "d06", "d07", "d11"), capability="c04.internal_work.prepare", commit=checked_commit)
+        domains=("d04", "d06", "d07", "d11"), capability="c04.internal_work.prepare", commit=checked_commit,
+        new_work_admission=lambda db: c.local_module_admission.require_v1(
+            ("d04", "d06", "d07", "d11"), "c04:adopt"))
     if result["status"] == "adoption_refused":
         raise UnavailableGuard("C04 current adoption was refused after preserving its actual costs")
     return result
@@ -180,6 +185,7 @@ def advance_current_c04_product_v3(c, authority, lease, operation_id, *, holder,
     observed = port.inspect(prepared.binding)
     proof = c04_terminal_proof_from_inspection_v3(observed)
     if proof is None and observed.claim is None:
+        c.local_module_admission.require_v1(("d04", "d06", "d07", "d11"), "c04:first_native_claim")
         if job.continuation.get("schema") == "c04.prepared-job-continuation.v4":
             if job.phase != "running" or job.fence != 1 or job.cancel_epoch or job.lease_holder != holder:
                 raise UnavailableGuard("C04 original prepared worker changed before its first claim")

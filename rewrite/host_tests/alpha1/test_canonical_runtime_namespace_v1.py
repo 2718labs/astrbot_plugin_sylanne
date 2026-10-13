@@ -21,7 +21,9 @@ if sys.argv[2]=='plugin':
 else:
     from _runtime_bootstrap import load_canonical_runtime_v1
     load_canonical_runtime_v1(root)
-from sylanne3.runtime_contracts import NamespaceId,canonical_serialize
+from sylanne3.runtime_contracts import NamespaceId,canonical_serialize,namespace_ref
+from sylanne3.graph_coordinator import namespace_ref as graph_namespace_ref
+assert graph_namespace_ref is namespace_ref
 from sylanne3.runtime.issuers import ResourceQuote
 namespace=NamespaceId('bot','persona')
 quote=ResourceQuote('quote',1,'bot','persona','activity','operation',None,'lease','probe','snapshot',100.,'resource',None,(),(),{'cpu_ms':1},None,100.)

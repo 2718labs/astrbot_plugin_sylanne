@@ -144,7 +144,7 @@ class InstalledD12CandidateCompatibilityV2:
                 or candidate.compatibility_plan_ref != source_cohort.compatibility_plan_ref
                 or candidate.supervisor_policy_digest != intent.supervisor_policy_digest):
             raise AuthorityUnavailable("candidate configuration changes installed identity or policy")
-        read_verified_configuration_cohort_v2(candidate)
+        candidate_configuration = read_verified_configuration_cohort_v2(candidate)
         policy, host_policy, authority_policy = read_fixed_supervisor_policy_v2(self.files)
         if (self.backup.host.config != host_policy or self.backup.authority.config != authority_policy
                 or policy["namespace_cohort"] != list(intent.namespace_cohort)
@@ -212,6 +212,17 @@ class InstalledD12CandidateCompatibilityV2:
             db = sqlite3.connect(uri, uri=True, isolation_level=None)
             try:
                 db.execute("PRAGMA query_only=ON"); db.execute("BEGIN")
+                if member['role'] == 'core':
+                    from .graph_catalogue_upgrade_v1 import (
+                        require_no_pending_catalogue_upgrade_in_tx_v1,
+                        validate_catalogue_upgrade_core_schema_v1,
+                    )
+                    validate_catalogue_upgrade_core_schema_v1(db)
+                    require_no_pending_catalogue_upgrade_in_tx_v1(db,intent.namespace_cohort[0])
+                elif member['role'] == 'graph':
+                    from ..runtime.graph_catalogue_upgrade_v1 import current_catalogue_hash_v1
+                    if current_catalogue_hash_v1(db) != candidate_configuration['host_profile']['installation_policy']['catalogue_hash']:
+                        raise AuthorityUnavailable('package candidate cannot restart another Graph catalogue')
                 if (db.execute("PRAGMA quick_check").fetchone() != ("ok",)
                         or sqlite_logical_inventory_v2(db, maximum_rows=100000, deadline=deadline) != inventories[member["role"]]):
                     raise AuthorityUnavailable("current data changed since its authenticated backup")

@@ -266,5 +266,50 @@ class LifeDomainTests(unittest.TestCase):
             project.to_graph_spec().validator({"project_id": "project:one"})
 
 
+class ProjectCheckpointContractTests(unittest.TestCase):
+    def test_work_versions_are_effect_bound_and_do_not_mutate_initial_project_definition(self):
+        from sylanne3.domains.d10.project_checkpoint_v1 import (ProjectCheckpointV1, ProjectWorkVersionV1,
+            project_work_version_key_v1, project_checkpoint_key_v1, decode_project_checkpoint_type_v1, WORK_TYPE)
+        from sylanne3.graph_types import AtomKey, Owner
+        from sylanne3.memory_types import source_key
+        from sylanne3.domains.d01.production_operations_v1 import plain_v1
+        namespace = NamespaceId("bot", "persona")
+        project = AtomKey(Owner("persona", "bot", "persona"), "d10.life_project.v1", "project:one").token
+        owner = Owner("activity", "bot", "persona", "activity:one")
+        plan = AtomKey(owner, "d08.personal_plan.v1", "plan:one").token
+        progress = AtomKey(owner, "d10.life_progress.v1", "effect:one").token
+        outcome = AtomKey(owner, "d08.action_outcome.v1", "outcome:one").token
+        source = source_key("bot", "persona", "original").token
+        work = ProjectWorkVersionV1(project, "registered-root:target-one", 1, progress, "artifact:one", "a" * 64,
+            12, "terminal:one", outcome, (source,), (VersionedRef(source, 1),),
+            "activity:one", "effect:one", "attempt:one", "task:draft")
+        key = project_work_version_key_v1(namespace, project, work.effect_id)
+        checkpoint = ProjectCheckpointV1(project, 2, plan, 1, ("task:draft",), (progress,), (key.token,),
+            None, "completed", (VersionedRef(source, 1),))
+        self.assertEqual(decode_project_checkpoint_type_v1(WORK_TYPE, plain_v1(work)), work)
+        self.assertNotEqual(key, project_work_version_key_v1(namespace, project, "effect:two"))
+        self.assertNotEqual(project_checkpoint_key_v1(namespace, project).token, project)
+        self.assertIsNone(checkpoint.next_step)
+        with self.assertRaises(ValueError):
+            replace(checkpoint, state="active", next_step="task:draft")
+
+    def test_waiting_requires_original_job_and_observed_watermark_in_checkpoint(self):
+        from sylanne3.domains.d10.project_checkpoint_v1 import ProjectCheckpointV1, ProjectWaitConditionV1
+        from sylanne3.graph_types import AtomKey, Owner
+        from sylanne3.memory_types import source_key
+        namespace = NamespaceId("bot", "persona")
+        owner = Owner("activity", "bot", "persona", "activity:one")
+        project = AtomKey(Owner("persona", "bot", "persona"), "d10.life_project.v1", "project:one").token
+        plan = AtomKey(owner, "d08.personal_plan.v1", "plan:one").token
+        source = source_key("bot", "persona", "original").token
+        job = AtomKey(owner, "runtime.job", "job:original").token
+        wake = ProjectWaitConditionV1("d11", "original_effect_observed", (VersionedRef(source, 1),),
+            QueryEpoch(namespace, "namespace", 7), job, 4)
+        checkpoint = ProjectCheckpointV1(project, 1, plan, 1, (), (), (), None, "waiting", (VersionedRef(source, 1),), wake)
+        self.assertEqual(checkpoint.wait_condition.resume_job_ref, job)
+        with self.assertRaises(ValueError):
+            replace(checkpoint, wait_condition=None)
+
+
 if __name__ == "__main__":
     unittest.main()

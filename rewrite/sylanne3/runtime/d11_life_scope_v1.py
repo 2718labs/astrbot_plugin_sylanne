@@ -74,6 +74,23 @@ class LifeSemanticScopeV1:
             "d12.active_scheme_head.v1"}
 
 
+@dataclass(frozen=True,slots=True)
+class DraftLifeSemanticScopeV1(LifeSemanticScopeV1):
+    def role_request(self):
+        if self.now_utc is None:raise ValueError("current draft role resolution requires trusted time")
+        return RoleBindingRequest("persona:"+self.namespace.persona_id,self.target_ref,None,None,
+            "artifact_draft_v1","consolidation",self.now_utc,True)
+
+    def boundary_applies(self,rule):
+        if self.now_utc is not None:
+            return any(rule.applies_to(subject_persona_ref="persona:"+self.namespace.persona_id,
+                target_entity_ref=self.target_ref,action_kind="artifact_draft_v1",audience_scope=audience,
+                scene_ref=None,at_time=self.now_utc) for audience in self.audiences)
+        return (rule.status=="active" and rule.subject_persona_ref=="persona:"+self.namespace.persona_id
+            and rule.target_entity_ref==self.target_ref and rule.action_kind=="artifact_draft_v1"
+            and rule.audience_scope in self.audiences and rule.scene_ref is None)
+
+
 def life_scope_from_action_v1(db, *, namespace, action_ref, project_ref, input_source_ref, audiences, now_utc):
     row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
         (action_ref, *namespace.as_tuple)).fetchone()
@@ -90,7 +107,8 @@ def life_scope_from_action_v1(db, *, namespace, action_ref, project_ref, input_s
     matches = [token for token, encoded in entities if json.loads(encoded)["entity_id"] == action.target_ref]
     if len(matches) != 1:
         raise MissingProductionOriginalV1("unique_current_life_target_entity")
-    return LifeSemanticScopeV1(namespace, project_ref, input_source_ref, matches[0], action.target_ref,
+    kind=DraftLifeSemanticScopeV1 if action.action_kind=="artifact_draft_v1" else LifeSemanticScopeV1
+    return kind(namespace, project_ref, input_source_ref, matches[0], action.target_ref,
         action.action_id, action.goal_ref, action.commitment_refs, tuple(audiences), now_utc)
 
 

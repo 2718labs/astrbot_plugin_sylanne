@@ -66,14 +66,15 @@ def verify_life_numeric_task_commit_v1(db, witness, readers):
 
 
 def require_life_numeric_job_registration_v1(witness, db):
+    from ..runtime_contracts import PERSISTENT_JOB_REF_KIND
     require_exact_life_numeric_task_issuance_v1(witness, witness.graph, witness.bundle)
     prepare, _, _ = _numeric_stage_types()
     if type(witness.stage) is prepare:
         raise ValueError('numeric Life first prepare cannot reuse a persistent job registration')
     ref, = witness.bundle.persistent_job_refs
     p = witness.stage.prepared
-    row = db.execute("SELECT operation_id FROM graph_bundle_refs WHERE bot=? AND persona=? AND ref_kind='persistent_job_refs' AND ref=?",
-        (*p.namespace.as_tuple, ref)).fetchone()
+    row = db.execute("SELECT operation_id FROM graph_bundle_refs WHERE bot=? AND persona=? AND ref_kind=? AND ref=?",
+        (*p.namespace.as_tuple, PERSISTENT_JOB_REF_KIND, ref)).fetchone()
     if row != (p.operation_id,):
         raise ValueError('numeric Life worker/adoption lost its first prepare registration')
     return (ref,)
@@ -106,6 +107,13 @@ def commit_life_numeric_task_v1(runtime, db, *, operation, request, preparation,
         raise ValueError('numeric Life task lacks its actual Owner command/permit')
     prepare, acquire, adopt = _numeric_stage_types()
     job = preparation.completed_job if type(preparation) is adopt else preparation.job
+    if type(preparation) is adopt:
+        from .jobs import transition_job
+        original = preparation.original_job
+        completed = transition_job(db, original.job_id, original.lease_holder, original.fence,
+            target_phase='completed', result_ref=job.result_ref)
+        if completed != job:
+            raise ValueError('numeric Life official job transition differs from its exact staged completion')
     reconcile_runtime_write(db, job_graph_write(job))
     witness = _ProductionCommitWitnessV1(runtime, graph, scope, preparation.frame, preparation,
         operation, request, owner, guard, bundle, tuple(external_originals))

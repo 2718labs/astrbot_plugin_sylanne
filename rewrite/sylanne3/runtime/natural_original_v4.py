@@ -2,7 +2,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from ..runtime_contracts import NamespaceId, NATURAL_REPLY_REVIEW_WORKFLOW_V1, _digest, _nonempty
-from ..model_broker.natural_reply_history_v4 import TEMPLATE_VERSION
+from ..runtime_contracts import (NATURAL_REPLY_GENERATION_WORKFLOW_V4 as TEMPLATE_VERSION,
+    NATURAL_REPLY_GENERATION_WORKFLOW_V5 as TEMPLATE_VERSION_V5)
+
+GENERATION_SEAL_SCHEMA_V5 = "sylanne.d09.natural_generation_seal.v5"
+REVIEW_SEAL_SCHEMA_V5 = "sylanne.d09.natural_review_seal.v5"
+from ..runtime_contracts import NATURAL_REPLY_REVIEW_WORKFLOW_V2 as REVIEW_TEMPLATE_VERSION_V2
 
 @dataclass(frozen=True, slots=True)
 class NaturalReplyGenerationOriginalSealV4:
@@ -32,8 +37,9 @@ class NaturalReplyGenerationOriginalSealV4:
 
     def __post_init__(self) -> None:
         if type(self.namespace) is not NamespaceId or (
-                self.schema != "sylanne.d09.natural_generation_seal.v4"
-                or self.template_version != TEMPLATE_VERSION):
+                (self.schema, self.template_version) not in {
+                    ("sylanne.d09.natural_generation_seal.v4", TEMPLATE_VERSION),
+                    (GENERATION_SEAL_SCHEMA_V5, TEMPLATE_VERSION_V5)}):
             raise ValueError("unknown natural generation original identity")
         for name in (
             "c02_operation_id", "source_ref", "installation_id", "job_id",
@@ -82,8 +88,9 @@ class NaturalReplyReviewOriginalSealV4:
 
     def __post_init__(self) -> None:
         if type(self.namespace) is not NamespaceId or (
-                self.schema != "sylanne.d09.natural_review_seal.v4"
-                or self.template_version != NATURAL_REPLY_REVIEW_WORKFLOW_V1):
+                (self.schema, self.template_version) not in {
+                    ("sylanne.d09.natural_review_seal.v4", NATURAL_REPLY_REVIEW_WORKFLOW_V1),
+                    (REVIEW_SEAL_SCHEMA_V5, REVIEW_TEMPLATE_VERSION_V2)}):
             raise ValueError("unknown natural review original identity")
         for name in (
             "installation_id", "job_id", "original_operation_id",

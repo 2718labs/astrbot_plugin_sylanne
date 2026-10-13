@@ -8,7 +8,7 @@ from ..domains.d06 import D06DomainProvider, SourceGrantRead
 from ..domains.d08 import ActionIntent, ActionSchema, ActionSchemaRecord, GoalExecutionProvider
 from ..domains.d09 import ClaimUse, D09ExpressionProvider
 from ..domains.d09.natural_batch import (
-    NATURAL_BATCH_SCHEMA_V2, validate_natural_verified_batch_value_v2,
+    NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3, validate_natural_verified_batch_value,
 )
 from ..graph_types import GraphWrite
 from ..memory_types import access_key, source_key
@@ -38,12 +38,12 @@ def dispatch_segment_payload_ref(batch_ref: str, index: int) -> str:
 def natural_dispatch_segment_payload_ref_v2(batch_ref: str, index: int) -> str:
     """Name a natural V2 segment without changing existing V1 payload IDs."""
     if (type(batch_ref) is not str
-            or AtomKey.from_token(batch_ref).type_name != NATURAL_BATCH_SCHEMA_V2):
+            or AtomKey.from_token(batch_ref).type_name not in {NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3}):
         raise ValueError("payload reference requires a natural V2 batch atom")
     if type(index) is not int or index < 0:
         raise ValueError("segment index must be a nonnegative exact integer")
     return "d09-natural:" + canonical_digest({
-        "schema": NATURAL_BATCH_SCHEMA_V2,
+        "schema": AtomKey.from_token(batch_ref).type_name,
         "batch_ref": batch_ref, "segment_index": index,
     })
 
@@ -149,7 +149,7 @@ def validate_dispatch_candidate_writes(
 ) -> DispatchCandidateEvidenceV1 | NaturalDispatchCandidateEvidenceV2 | None:
     """Require a single exact D08/D09 candidate in the same bundle transaction."""
     natural_writes = tuple((domain, write) for domain, write in writes
-                           if write.key.type_name == NATURAL_BATCH_SCHEMA_V2)
+                           if write.key.type_name in {NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3})
     if natural_writes:
         if len(natural_writes) != 1 or any(
                 write.key.type_name == "d09.verified_segment_batch.v1"
@@ -271,14 +271,19 @@ def validate_natural_dispatch_candidate_writes(
     access_epoch: int, delete_epoch: int, query_epoch: int,
 ) -> NaturalDispatchCandidateEvidenceV2:
     """Bind D08 and natural D09 graph writes without granting dispatch."""
+    batch_names = {write.key.type_name for _, write in writes
+                   if write.key.type_name in {NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3}}
+    if len(batch_names) != 1:
+        raise ValueError("one explicit natural batch version required")
+    batch_name = next(iter(batch_names))
     names = {"d08.action_intent.v1", "d08.action_schema.v1",
-             "d08.communication_intent_grant.v1", NATURAL_BATCH_SCHEMA_V2}
+             "d08.communication_intent_grant.v1", batch_name}
     selected: dict[str, GraphWrite] = {}
     for domain, write in writes:
         name = write.key.type_name
         if name not in names:
             continue
-        if (name in selected or domain != ("d09" if name == NATURAL_BATCH_SCHEMA_V2
+        if (name in selected or domain != ("d09" if name == batch_name
                                              else "d08")
                 or (write.key.owner.bot, write.key.owner.persona)
                    != namespace.as_tuple
@@ -296,11 +301,11 @@ def validate_natural_dispatch_candidate_writes(
     action_write = selected["d08.action_intent.v1"]
     schema_write = selected["d08.action_schema.v1"]
     grant_write = selected["d08.communication_intent_grant.v1"]
-    batch_write = selected[NATURAL_BATCH_SCHEMA_V2]
+    batch_write = selected[batch_name]
     action = d08[action_write.key.type_name].validator(action_write.value)
     schema = d08[schema_write.key.type_name].validator(schema_write.value)
     grant = d08[grant_write.key.type_name].validator(grant_write.value)
-    validate_natural_verified_batch_value_v2(batch_write.value)
+    validate_natural_verified_batch_value(batch_write.value)
     batch = batch_write.value
     paid = batch["paid_review"]
     segment = batch["segment"]

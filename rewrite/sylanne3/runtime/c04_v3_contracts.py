@@ -6,7 +6,7 @@ must independently authenticate their own originals before any adoption.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import InitVar, dataclass, fields, is_dataclass
 import hashlib
 import json
 import math
@@ -77,28 +77,50 @@ def canonical_v3_digest(value: object) -> str:
     return _semantic_digest(value)
 
 
-@dataclass(frozen=True, slots=True)
+def _canonical_head_original_v3(row):
+    from .c04_direct_seed_v4 import canonical_original_for_c04_head_v4
+    return canonical_original_for_c04_head_v4(row)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class GraphHeadV3:
     ref: str
     revision: int
     valid: bool
     value_json: str | None
+    _canonical_original: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _canonical_original) -> None:
         AtomKey.from_token(self.ref)
         if type(self.revision) is not int or self.revision < 0 or type(self.valid) is not bool:
             raise ValueError("graph head needs exact revision and validity")
         if self.revision == 0:
             if self.valid or self.value_json is not None:
                 raise ValueError("absent graph head has no value")
+        elif _canonical_original is not None:
+            if type(self.value_json)is not str:raise ValueError('present graph head needs its exact canonical wire')
         elif (type(self.value_json) is not str
               or type(json.loads(self.value_json)) is not dict
               or canonical_json(json.loads(self.value_json)) != self.value_json):
             raise ValueError("graph head value must be a canonical complete object")
+        if _canonical_original is not None:
+            from .c04_direct_seed_v4 import retain_c04_canonical_head_v4
+            retain_c04_canonical_head_v4(self,_canonical_original,ref_value=self.ref,
+                revision=self.revision,valid=self.valid,wire=self.value_json)
 
     @property
     def value(self) -> dict | None:
-        return None if self.value_json is None else json.loads(self.value_json)
+        from .c04_direct_seed_v4 import canonical_original_for_c04_head_v4
+        original=canonical_original_for_c04_head_v4(self)
+        return original.value_v4()if original is not None else None if self.value_json is None else json.loads(self.value_json)
+
+    @property
+    def value_digest(self):
+        from .c04_direct_seed_v4 import canonical_original_for_c04_head_v4
+        original=canonical_original_for_c04_head_v4(self)
+        if original is not None:return original.sha256
+        from ..runtime_contracts import canonical_digest
+        return None if self.value_json is None else canonical_digest(self.value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +392,66 @@ class AssociationBudgetV3:
                 raise ValueError(f"{name} exceeds bounded C04 work")
 
 
+def _validate_c04_common_input_fields_v3(work, *, authored):
+    _ref(work.cue_source_ref, work.namespace, "cue", "memory.source")
+    _ref(work.focus_ref, work.namespace, "focus", "d07.focus.v1")
+    _ref(work.attention_ticket_ref, work.namespace, "attention ticket", "d07.attention_ticket.v1")
+    _ref(work.mood_ref, work.namespace, "mood",
+         "d04.authored_mood_state.v1" if authored else "d04.mood_field.v1")
+    if (type(work.selection_ticket) is not SelectionTicket
+            or work.selection_ticket.activity_id != work.activity_id
+            or work.selection_ticket_digest != _semantic_digest(work.selection_ticket)):
+        raise ValueError("selection ticket identity or digest differs")
+    for name in ("selection_ticket_digest", "algorithm_build_digest"):
+        _digest(getattr(work, name), name)
+    if (type(work.budget) is not AssociationBudgetV3
+            or type(work.policy) is not ActivationPolicy
+            or type(work.truncated) is not bool):
+        raise TypeError("budget, policy and truncation must be typed")
+    if (work.policy.leak, work.policy.spread, work.policy.max_iterations,
+            work.policy.max_nodes, work.policy.min_activation) != (
+            0.5, 0.25, work.budget.max_iterations, work.budget.max_nodes, 1e-6):
+        raise ValueError("activation policy differs from installed V3 numeric policy")
+    for name in ("graph_epoch", "owner_epoch", "access_epoch", "delete_epoch"):
+        if type(getattr(work, name)) is not int or getattr(work, name) < 0:
+            raise ValueError(f"{name} must be nonnegative")
+    if (type(work.context_tags) is not tuple or len(work.context_tags) > 8
+            or tuple(sorted(set(work.context_tags))) != work.context_tags):
+        raise ValueError("context tags must be bounded, sorted and unique")
+    if (type(work.reads) is not tuple or len(work.reads) > 1024
+            or any(type(item) is not GraphHeadV3 for item in work.reads)
+            or tuple(sorted({item.ref for item in work.reads})) != tuple(item.ref for item in work.reads)):
+        raise ValueError("graph reads must be bounded, sorted and unique")
+    for item in work.reads:
+        _ref(item.ref, work.namespace, "read")
+    if (type(work.edge_pages) is not tuple or len(work.edge_pages) > work.budget.max_nodes
+            or any(type(item) is not AssociationPageV3 for item in work.edge_pages)
+            or tuple(sorted({item.source_ref for item in work.edge_pages}))
+               != tuple(item.source_ref for item in work.edge_pages)):
+        raise ValueError("edge pages must be bounded, sorted and unique")
+    for page in work.edge_pages:
+        _ref(page.source_ref, work.namespace, "page source", "memory.source")
+        for edge_ref in page.edge_refs:
+            _ref(edge_ref, work.namespace, "page edge", "memory.association.v1")
+    if (type(work.targets) is not tuple or not work.targets
+            or len(work.targets) > work.budget.max_nodes
+            or any(type(item) is not (AssociationTargetAuthoredV3 if authored else AssociationTargetV3)
+                   for item in work.targets)
+            or tuple(sorted({item.source_ref for item in work.targets}))
+               != tuple(item.source_ref for item in work.targets)):
+        raise ValueError("targets must be bounded, sorted and unique")
+    for target in work.targets:
+        condition = target.condition
+        if (condition.namespace != work.namespace or condition.operation_id != work.operation_id
+                or (condition.audience, condition.purpose) != (work.audience, work.purpose)
+                or condition.current_mood.ref != work.mood_ref
+                or (condition.owner_epoch, condition.access_epoch, condition.delete_epoch)
+                   != (work.owner_epoch, work.access_epoch, work.delete_epoch)):
+            raise ValueError("target condition differs from frozen operation or rights")
+    if work.cue_source_ref not in {target.source_ref for target in work.targets}:
+        raise ValueError("cue needs its own qualified condition")
+
+
 @dataclass(frozen=True, slots=True)
 class AssociationWorkInputV3:
     namespace: NamespaceId
@@ -405,64 +487,7 @@ class AssociationWorkInputV3:
             _text(getattr(self, name), name)
         if self.algorithm_id != ALGORITHM_ID_V3:
             raise ValueError("C04 V3 algorithm identity differs")
-        _ref(self.cue_source_ref, self.namespace, "cue", "memory.source")
-        _ref(self.focus_ref, self.namespace, "focus", "d07.focus.v1")
-        _ref(self.attention_ticket_ref, self.namespace, "attention ticket", "d07.attention_ticket.v1")
-        authored = self.schema == AUTHORED_INPUT_SCHEMA_V3
-        _ref(self.mood_ref, self.namespace, "mood",
-             "d04.authored_mood_state.v1" if authored else "d04.mood_field.v1")
-        if (type(self.selection_ticket) is not SelectionTicket
-                or self.selection_ticket.activity_id != self.activity_id
-                or self.selection_ticket_digest != _semantic_digest(self.selection_ticket)):
-            raise ValueError("selection ticket identity or digest differs")
-        for name in ("selection_ticket_digest", "algorithm_build_digest"):
-            _digest(getattr(self, name), name)
-        if (type(self.budget) is not AssociationBudgetV3
-                or type(self.policy) is not ActivationPolicy
-                or type(self.truncated) is not bool):
-            raise TypeError("budget, policy and truncation must be typed")
-        if (self.policy.leak, self.policy.spread, self.policy.max_iterations,
-                self.policy.max_nodes, self.policy.min_activation) != (
-                0.5, 0.25, self.budget.max_iterations, self.budget.max_nodes, 1e-6):
-            raise ValueError("activation policy differs from installed V3 numeric policy")
-        for name in ("graph_epoch", "owner_epoch", "access_epoch", "delete_epoch"):
-            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
-                raise ValueError(f"{name} must be nonnegative")
-        if (type(self.context_tags) is not tuple or len(self.context_tags) > 8
-                or tuple(sorted(set(self.context_tags))) != self.context_tags):
-            raise ValueError("context tags must be bounded, sorted and unique")
-        if (type(self.reads) is not tuple or len(self.reads) > 1024
-                or any(type(item) is not GraphHeadV3 for item in self.reads)
-                or tuple(sorted({item.ref for item in self.reads})) != tuple(item.ref for item in self.reads)):
-            raise ValueError("graph reads must be bounded, sorted and unique")
-        for item in self.reads:
-            _ref(item.ref, self.namespace, "read")
-        if (type(self.edge_pages) is not tuple or len(self.edge_pages) > self.budget.max_nodes
-                or any(type(item) is not AssociationPageV3 for item in self.edge_pages)
-                or tuple(sorted({item.source_ref for item in self.edge_pages}))
-                   != tuple(item.source_ref for item in self.edge_pages)):
-            raise ValueError("edge pages must be bounded, sorted and unique")
-        for page in self.edge_pages:
-            _ref(page.source_ref, self.namespace, "page source", "memory.source")
-            for edge_ref in page.edge_refs:
-                _ref(edge_ref, self.namespace, "page edge", "memory.association.v1")
-        if (type(self.targets) is not tuple or not self.targets
-                or len(self.targets) > self.budget.max_nodes
-                or any(type(item) is not (AssociationTargetAuthoredV3 if authored else AssociationTargetV3)
-                       for item in self.targets)
-                or tuple(sorted({item.source_ref for item in self.targets}))
-                   != tuple(item.source_ref for item in self.targets)):
-            raise ValueError("targets must be bounded, sorted and unique")
-        for target in self.targets:
-            condition = target.condition
-            if (condition.namespace != self.namespace or condition.operation_id != self.operation_id
-                    or (condition.audience, condition.purpose) != (self.audience, self.purpose)
-                    or condition.current_mood.ref != self.mood_ref
-                    or (condition.owner_epoch, condition.access_epoch, condition.delete_epoch)
-                       != (self.owner_epoch, self.access_epoch, self.delete_epoch)):
-                raise ValueError("target condition differs from frozen operation or rights")
-        if self.cue_source_ref not in {target.source_ref for target in self.targets}:
-            raise ValueError("cue needs its own qualified condition")
+        _validate_c04_common_input_fields_v3(self, authored=self.schema == AUTHORED_INPUT_SCHEMA_V3)
         self._validate_closure()
 
     def _validate_closure(self) -> None:
@@ -530,7 +555,7 @@ class AssociationWorkInputV3:
                 selection_ticket=self.selection_ticket, audience=self.audience, purpose=self.purpose,
                 context_tags=self.context_tags, budget=self.budget, truncated=self.truncated,
                 reads=tuple(FrozenGraphReadV2(AtomKey.from_token(row.ref), row.revision,
-                    row.valid, row.value_json) for row in self.reads),
+                    row.valid, row.value_json, _canonical_original=_canonical_head_original_v3(row)) for row in self.reads),
                 edge_queries=tuple(AssociationQueryCoverageV2(page.source_ref,page.hop,page.edge_refs,page.next_after)
                     for page in self.edge_pages))
             _validate_complete_graph_closure_v1(closure,mood_type="d04.authored_mood_state.v1")
@@ -548,7 +573,7 @@ class AssociationWorkInputV3:
                 self.budget.max_hops, self.budget.max_edges, self.budget.max_nodes,
                 self.budget.max_iterations, self.budget.max_candidates),
             tuple(FrozenGraphReadV2(AtomKey.from_token(row.ref), row.revision,
-                                    row.valid, row.value_json) for row in self.reads),
+                                    row.valid, row.value_json, _canonical_original=_canonical_head_original_v3(row)) for row in self.reads),
             tuple(AssociationQueryCoverageV2(page.source_ref, page.hop,
                                              page.edge_refs, page.next_after)
                   for page in self.edge_pages),
@@ -592,6 +617,43 @@ class AssociationScoreV3:
             raise ValueError("association cannot upgrade evidence")
 
 
+def _validate_c04_common_result_fields_v3(work):
+    for name in ("operation_id", "algorithm_id", "stop_reason"):
+        _text(getattr(work, name), name)
+    for name in ("input_digest", "algorithm_build_digest"):
+        _digest(getattr(work, name), name)
+    if (type(work.candidates) is not tuple
+            or any(type(item) is not AssociationScoreV3 for item in work.candidates)
+            or len({item.source_ref for item in work.candidates}) != len(work.candidates)):
+        raise ValueError("result candidates must be unique")
+    for item in work.candidates:
+        _ref(item.source_ref, work.namespace, "result source", "memory.source")
+    for name in ("visited_nodes", "visited_edges", "iterations"):
+        if type(getattr(work, name)) is not int or getattr(work, name) < 0:
+            raise ValueError(f"{name} must be nonnegative")
+    if type(work.truncated) is not bool:
+        raise TypeError("result truncation must be explicit")
+
+
+def _validate_c04_result_against_input_v3(result, work):
+    if ((result.namespace, result.operation_id, result.input_digest,
+                result.algorithm_id, result.algorithm_build_digest)
+               != (work.namespace, work.operation_id, work.input_digest,
+                   work.algorithm_id, work.algorithm_build_digest)
+            or len(result.candidates) > work.budget.max_candidates
+            or any(item.source_ref not in {target.source_ref for target in work.targets}
+                   or item.condition_digest != next(target.condition.digest
+                       for target in work.targets if target.source_ref == item.source_ref)
+                   or item.conditioned_salience != sum(next(
+                       target.condition.conditioned_salience_interval
+                       for target in work.targets if target.source_ref == item.source_ref)) / 2
+                   or not math.isclose(item.score,
+                       item.activation * item.conditioned_salience,
+                       rel_tol=0, abs_tol=1e-12)
+                   for item in result.candidates)):
+        raise ValueError("C04 result differs from frozen input or target originals")
+
+
 @dataclass(frozen=True, slots=True)
 class AssociationWorkResultV3:
     namespace: NamespaceId
@@ -610,44 +672,16 @@ class AssociationWorkResultV3:
     def __post_init__(self) -> None:
         if self.schema != _SCHEMA + ".result" or type(self.namespace) is not NamespaceId:
             raise ValueError("unknown C04 V3 result schema")
-        for name in ("operation_id", "algorithm_id", "stop_reason"):
-            _text(getattr(self, name), name)
-        for name in ("input_digest", "algorithm_build_digest"):
-            _digest(getattr(self, name), name)
-        if (type(self.candidates) is not tuple
-                or any(type(item) is not AssociationScoreV3 for item in self.candidates)
-                or len({item.source_ref for item in self.candidates}) != len(self.candidates)):
-            raise ValueError("result candidates must be unique")
-        for item in self.candidates:
-            _ref(item.source_ref, self.namespace, "result source", "memory.source")
-        for name in ("visited_nodes", "visited_edges", "iterations"):
-            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
-                raise ValueError(f"{name} must be nonnegative")
-        if type(self.truncated) is not bool:
-            raise TypeError("result truncation must be explicit")
+        _validate_c04_common_result_fields_v3(self)
 
     @property
     def result_digest(self) -> str:
         return _semantic_digest(self)
 
     def validate_input(self, work: AssociationWorkInputV3) -> None:
-        if (type(work) is not AssociationWorkInputV3
-                or (self.namespace, self.operation_id, self.input_digest,
-                    self.algorithm_id, self.algorithm_build_digest)
-                   != (work.namespace, work.operation_id, work.input_digest,
-                       work.algorithm_id, work.algorithm_build_digest)
-                or len(self.candidates) > work.budget.max_candidates
-                or any(item.source_ref not in {target.source_ref for target in work.targets}
-                       or item.condition_digest != next(target.condition.digest
-                           for target in work.targets if target.source_ref == item.source_ref)
-                       or item.conditioned_salience != sum(next(
-                           target.condition.conditioned_salience_interval
-                           for target in work.targets if target.source_ref == item.source_ref)) / 2
-                       or not math.isclose(item.score,
-                           item.activation * item.conditioned_salience,
-                           rel_tol=0, abs_tol=1e-12)
-                       for item in self.candidates)):
+        if type(work) is not AssociationWorkInputV3:
             raise ValueError("C04 result differs from frozen input or target originals")
+        _validate_c04_result_against_input_v3(self, work)
 
     def to_json(self) -> str:
         return encode_v3(self)
@@ -790,7 +824,9 @@ def _encode(value: object) -> object:
     return value
 
 
-def _decode(expected: object, value: object) -> object:
+def _decode(expected: object, value: object, *, _canonical_original=None) -> object:
+    if _canonical_original is not None and expected is not GraphHeadV3:
+        raise TypeError('canonical C04 head proof belongs only to its exact GraphHead constructor')
     origin = get_origin(expected)
     if origin is tuple:
         args = get_args(expected)
@@ -840,8 +876,10 @@ def _decode(expected: object, value: object) -> object:
         hints = get_type_hints(expected)
         if set(value) != {"$type", *(field.name for field in fields(expected))}:
             raise ValueError("wire V3 fields differ")
-        return expected(**{field.name: _decode(hints[field.name], value[field.name])
-                           for field in fields(expected)})
+        decoded={field.name:_decode(hints[field.name],value[field.name])for field in fields(expected)}
+        if expected is GraphHeadV3 and _canonical_original is not None:
+            decoded['_canonical_original']=_canonical_original
+        return expected(**decoded)
     raise TypeError("unsupported C04 V3 wire type")
 
 

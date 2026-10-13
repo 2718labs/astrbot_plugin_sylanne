@@ -312,8 +312,8 @@ async def prepare_and_run_installed_reply_model_v1(
                    for name, amount in draft.budget_ceiling)):
         return None
     try:
-        recovery, permit = await executor._authority.model_prepare_fenced_v1(
-            bundle, grant, draft=draft, expected_anchor=expected_anchor)
+        recovery, permit = await executor.prepare_once(
+            draft=draft, expected_anchor=expected_anchor, request=request)
     except Exception:
         return None
     if (type(recovery) is not ModelEgressRecoveryV1
@@ -584,7 +584,7 @@ async def run_installed_post_c02_reply_model_v1(
                 trusted_umo=trusted_umo, descriptor=descriptor,
                 admin_model=workflow, installation_bundle=bundle)
             executor = HostModelEgressExecutor(
-                authority=client, bundle=bundle, grant=client_grant, adapter=adapter)
+                authority=client, bundle=bundle, grant=client_grant, adapter=adapter, local_module_admission=runtime.local_module_admission)
             run = await prepare_and_run_installed_reply_model_v1(
                 c02_receipt=c02, envelope=envelope, source=source,
                 attention=attention, focus_revision=focus_revision,

@@ -11,6 +11,7 @@ import sqlite3
 
 from ..authority_service.internal_work_contract import InternalWorkTerminalProofV1, InternalWorkTerminalV2
 from ..authority_service.internal_work_service import InternalWorkJournalInspectionV1
+from ..authority_service.contract import JournalHead
 from ..runtime_contracts import NamespaceId, canonical_digest
 from .c04_internal_work_original_v1 import C04InternalWorkPreparedV1
 from .c04_prepare_service_v3 import c04_prepare_job_id_v3
@@ -51,7 +52,8 @@ def c04_terminal_proof_from_inspection_v3(
         inspection.binding, inspection.claim, inspection.terminal,
         inspection.claim_append.receipt_ref, inspection.claim_append.content_digest,
         inspection.terminal_append.receipt_ref, inspection.terminal_append.content_digest,
-        inspection.verified_head)
+        JournalHead(inspection.terminal_append.journal_id, inspection.terminal_append.sequence,
+                    inspection.terminal_append.chain_digest))
 
 
 def read_original_c04_product_job_v3(db: sqlite3.Connection, namespace: NamespaceId,

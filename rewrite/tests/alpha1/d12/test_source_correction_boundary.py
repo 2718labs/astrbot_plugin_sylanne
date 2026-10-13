@@ -142,3 +142,27 @@ def test_dedicated_port_is_not_called_without_signed_owner_session():
     answer = WorkbenchService(issuer).handle(command(), session=unsigned, context=CONTEXT)
     assert answer.status == "unavailable" and answer.receipt is None
     assert answer.problem["code"] == "signed_owner_session_unavailable"
+
+
+def test_correction_context_requires_read_and_correct_and_signed_owner_before_grant():
+    issuer = GraphWorkbenchIssuer(NoCorrectionPort(), NoReadGrant(), NoViews())
+    for capabilities, token in (({"workbench.read"}, "signed"),
+                                ({"workbench.correct"}, "signed"),
+                                ({"workbench.read", "workbench.correct"}, "")):
+        candidate = replace(SESSION, scope_capabilities={SCOPE: frozenset(capabilities)},
+                            owner_session_token=token)
+        answer = issuer.read_source_correction_context_v1(session=candidate, scope=SCOPE,
+            purpose="workbench_user_action", audience="owner", source_id="actual-source")
+        assert answer["status"] == "unavailable"
+        assert answer["problem"]["code"] == "source_correction_policy_unavailable"
+
+
+def test_correction_context_rejects_client_authority_fields_and_requires_owner_purpose():
+    payload = {"schema_version": "d12.contract.v1", "action": "read_source_correction_context_v1",
+        "scope": SCOPE, "purpose": "workbench_user_action", "audience": "owner",
+        "operation_id": str(uuid4()), "input": {"source_id": "actual-source", "access_epoch": 7}}
+    owner = replace(SESSION, scope_capabilities={SCOPE: frozenset({"workbench.read", "workbench.correct"})})
+    for values in ({"source_id": "actual-source", "access_epoch": 7}, {"source_id": " "}, {}):
+        answer = WorkbenchService().handle({**payload, "input": values}, session=owner, context=CONTEXT)
+        assert answer.problem["code"] == "invalid_request"
+        assert answer.receipt is None

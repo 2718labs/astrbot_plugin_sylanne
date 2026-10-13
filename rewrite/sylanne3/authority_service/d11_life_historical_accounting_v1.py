@@ -1,4 +1,6 @@
 """Installed D11 historical cost permission over independently retained originals."""
+from ..runtime.d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
+from ..runtime.d11_life_contract_v1 import D11DraftExecutionBindingV1
 from dataclasses import dataclass, fields
 import json
 import sqlite3
@@ -35,7 +37,7 @@ class D11LifeHistoricalCostGrantV1:
 
     def __post_init__(self):
         if (self.schema != "d11.life-historical-cost-grant.v1"
-                or type(self.binding) is not D11LifeExecutionBindingV1
+                or type(self.binding) not in LIFE_BINDING_TYPES
                 or type(self.permit) is not FencePermitV2 or self.permit.operation != "accounting"
                 or self.permit.namespace != self.binding.authority_namespace
                 or self.permit.authority_id != self.binding.authority_id
@@ -47,7 +49,8 @@ class D11LifeHistoricalCostGrantV1:
                 or self.terminal_sequence <= self.claim_sequence
                 or self.terminal_sequence > self.permit.pinned_anchor.execution_seq
                 or self.status not in {"completed", "failed", "unknown"}
-                or (self.status == "unknown" and self.actual_cpu_ms is not None)
+                or (self.status == "unknown" and self.actual_cpu_ms is not None and type(self.binding) is not D11DraftExecutionBindingV1)
+                or self.actual_cpu_ms is not None and (type(self.actual_cpu_ms) is not int or self.actual_cpu_ms < 0)
                 or (self.status != "unknown" and (type(self.actual_cpu_ms) is not int or self.actual_cpu_ms < 0))):
             raise ValueError("exact independent life historical cost grant required")
         for value in (self.accounting_original_digest, self.prepared_digest, self.durable_closure_digest):
@@ -101,7 +104,7 @@ def historical_accounting_from_wire_v1(raw):
 
 def _scope(service, binding):
     from .d11_life_service_v1 import AuthorityD11LifeServiceV1
-    if (type(service) is not AuthorityD11LifeServiceV1 or type(binding) is not D11LifeExecutionBindingV1
+    if (type(service) is not AuthorityD11LifeServiceV1 or type(binding) not in LIFE_BINDING_TYPES
             or binding.namespace != service.namespace or binding.authority_namespace != service.bridge.namespace
             or binding.installation_id != service.installation_id):
         raise AuthorityUnavailable("life historical original crossed its installed service")
@@ -118,7 +121,7 @@ def _retained_originals(service, binding):
             raise AuthorityUnavailable("life claim-only work remains occupied HOLD")
         service._verify_payload(claim.payload)
         service._verify_payload(terminal.payload)
-    if terminal.status == "unknown":
+    if terminal.status == "unknown" and terminal.actual_cpu_ms is None:
         process = json.loads(claim.payload.executor_incarnation)
         if canonical_serialize(process) != claim.payload.executor_incarnation:
             raise AuthorityUnavailable("life original OS birth identity bytes differ")

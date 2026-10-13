@@ -126,7 +126,7 @@ def load_installed_d04_semantic_profile_v3(package_root, trusted_manifest_sha256
     verified = verify_installed_backend_runtime_v1(root, trusted_manifest_sha256,
         available_cpu_features=available_cpu_features)
     if (not verified.verified or verified.manifest_digest != trusted_manifest_sha256
-            or verified.runtime_scope not in {"formal-alpha1", "backend-production-acceptance"}):
+            or verified.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}):
         raise ValueError("D04 semantic profile requires verified installed runtime bytes")
     manifest_path, path = _safe_file(root, "release-manifest.json"), _safe_file(root, PROFILE_PATH)
     if manifest_path is None or path is None:
@@ -242,16 +242,22 @@ class InstalledD04SemanticMappingReaderV3:
         # outside the business lock, just like the ordinary Owner fence path.
         from ..runtime.d04_semantic_installation_original_v3 import TABLE, SIGN_KIND
         from ..runtime.d11_role_clock_installation_v1 import TABLE as CLOCK_TABLE, SIGN_KIND as CLOCK_SIGN_KIND
+        from ..runtime.domain_background_read_v3 import read_bound_background_role_clock_selections_v3
+        background,selections=read_bound_background_role_clock_selections_v3(db,self,scope)
         for table, kind in ((TABLE, SIGN_KIND), (CLOCK_TABLE, CLOCK_SIGN_KIND)):
-            with graph._GraphCoordinator__store._lock:
-                row = db.execute(f"SELECT original_json,original_digest,signature FROM {table} "
-                    "WHERE bot=? AND persona=? ORDER BY revision DESC LIMIT 1", scope.namespace.as_tuple).fetchone()
-            if row is None or self._selection_owner.get() is not None:
-                continue
-            graph._GraphCoordinator__d11_issuer._signer.verify(kind, row[0], row[2])
-            raw = json.loads(row[0])
-            if canonical_digest(raw) != row[1] or raw.get("namespace") != asdict(scope.namespace):
-                raise ValueError("D04 accepting Owner original identity differs")
+            if background:
+                actual=next(original for name,sign_kind,original in selections if name==table and sign_kind==kind)
+                if actual is None or self._selection_owner.get() is not None:continue
+                raw,_original_digest=actual
+            else:
+                with graph._GraphCoordinator__store._lock:
+                    row = db.execute(f"SELECT original_json,original_digest,signature FROM {table} "
+                        "WHERE bot=? AND persona=? ORDER BY revision DESC LIMIT 1", scope.namespace.as_tuple).fetchone()
+                if row is None or self._selection_owner.get() is not None:continue
+                graph._GraphCoordinator__d11_issuer._signer.verify(kind,row[0],row[2])
+                raw=json.loads(row[0])
+                if canonical_digest(raw)!=row[1] or raw.get('namespace')!=asdict(scope.namespace):
+                    raise ValueError('D04 accepting Owner original identity differs')
             original_manifest = self._qualified_original_manifest(scope.namespace, raw)
             source_ref = (None if target is None else "d04-semantic-installation:" + canonical_digest(
                 (scope.namespace, target.source_installation_id, original_manifest)))
@@ -421,7 +427,8 @@ class InstalledD04SemanticMappingReaderV3:
             return
         req = metadata.requirements
         grant_key = owner_grant_key(*namespace.as_tuple)
-        grant = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (grant_key.token,)).fetchone()
+        from ..runtime.domain_background_read_v3 import background_graph_head_v3,background_json_loads_v3
+        grant=background_graph_head_v3(db,namespace,grant_key)
         imported = _read_import_receipt_locked(db, namespace, target.transfer_id)
         if (target.namespace != namespace or target.authority_namespace != req.authority_namespace
                 or target.target_installation_id != self.graph._GraphCoordinator__content_fence_v2.installation_grant.installation_id
@@ -429,8 +436,8 @@ class InstalledD04SemanticMappingReaderV3:
                 or target.revocation_epoch != req.revocation_epoch or target.graph_incarnation != req.graph_incarnation
                 or target.source_owner_guard != current.guard or target.source_grant_ref != grant_key.token
                 or grant is None or grant[0] != target.source_grant_revision or grant[2] != 1
-                or digest(json.loads(grant[1])) != target.source_grant_digest
-                or json.loads(grant[1])["principal"] != asdict(target.principal)
+                or digest(background_json_loads_v3(grant[1])) != target.source_grant_digest
+                or background_json_loads_v3(grant[1])["principal"] != asdict(target.principal)
                 or imported is None or imported.graph_commit_digest != target.target_import_digest
                 or imported.snapshot_digest != target.source_snapshot_digest
                 or imported.target_activation_generation != target.activation_generation

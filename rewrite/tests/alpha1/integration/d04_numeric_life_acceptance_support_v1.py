@@ -9,6 +9,8 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import time
+import traceback
 
 import pytest
 
@@ -51,7 +53,101 @@ def _command(case, kind, request, operation_id):
     return result
 
 
-async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d04_root, appraisal_ref):
+@contextmanager
+def _observe_numeric_rpc_wait_v1(case, evidence_path):
+    """Observe actual RPC work and stacks; never retain arguments or locals."""
+    import threading
+    import sys
+    server = case['server']
+    actual_dispatch = server.dispatch
+    actual_enqueue = server._dispatch_on_worker
+    actual_run = case['graph']._GraphCoordinator__c04_authority_port_v3._run
+    stream = evidence_path.open('x', encoding='utf-8')
+    lock = threading.Lock()
+    started = time.monotonic()
+    sequence = 0
+    def record(stage, **values):
+        with lock:
+            stream.write(json.dumps({'stage': stage,
+                'elapsed_seconds': time.monotonic() - started,
+                'wall_utc_observation': time.time(),
+                'thread_name': threading.current_thread().name, **values}) + '\n')
+            stream.flush()
+    def stacks():
+        frames = sys._current_frames()
+        return [{'thread_name': thread.name, 'frames': [
+            {'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
+            for frame in traceback.extract_stack(frames[thread.ident])[-24:]]}
+            for thread in threading.enumerate() if thread.ident in frames]
+    def dispatch(method, *args, **kwargs):
+        record('dispatch:begin', method=method)
+        try:
+            result = actual_dispatch(method, *args, **kwargs)
+        except BaseException as exc:
+            record('dispatch:error', method=method, category=type(exc).__name__)
+            raise
+        record('dispatch:end', method=method)
+        return result
+    async def enqueue(method, *args, **kwargs):
+        nonlocal sequence
+        sequence += 1
+        invocation = sequence
+        record('enqueue:begin', method=method, invocation=invocation)
+        try:
+            result = await actual_enqueue(method, *args, **kwargs)
+        except BaseException as exc:
+            record('enqueue:error', method=method, invocation=invocation,
+                category=type(exc).__name__, stacks=stacks())
+            raise
+        record('enqueue:end', method=method, invocation=invocation)
+        return result
+    def run(coroutine, **kwargs):
+        code = coroutine.cr_code
+        client_started = time.monotonic()
+        original_timeout = case['installed_bundle'].tls_profile.timeout_seconds
+        deadline_observation = client_started + original_timeout
+        record('client:begin', function=code.co_name, client_started_monotonic=client_started,
+            original_tls_timeout_seconds=original_timeout)
+        probe = threading.Timer(original_timeout,
+            lambda: record('client:first_transport_deadline', function=code.co_name,
+                client_started_monotonic=client_started,
+                client_elapsed_seconds=time.monotonic() - client_started,
+                original_tls_timeout_seconds=original_timeout,
+                timer_lateness_seconds=time.monotonic() - deadline_observation,
+                observation_scope='elapsed from actual port._run entry; HTTP handshake phase is not identified',
+                stacks=stacks()))
+        probe.daemon = True
+        probe.start()
+        try:
+            result = actual_run(coroutine, **kwargs)
+        except BaseException as exc:
+            record('client:error', function=code.co_name,
+                client_started_monotonic=client_started,
+                client_elapsed_seconds=time.monotonic() - client_started,
+                category=type(exc).__name__, frames=[
+                    {'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
+                    for frame in traceback.extract_tb(exc.__traceback__)], stacks=stacks())
+            raise
+        finally:
+            probe.cancel()
+            probe.join()
+        record('client:end', function=code.co_name, client_started_monotonic=client_started,
+            client_elapsed_seconds=time.monotonic() - client_started)
+        return result
+    port = case['graph']._GraphCoordinator__c04_authority_port_v3
+    server.dispatch = dispatch
+    server._dispatch_on_worker = enqueue
+    port._run = run
+    try:
+        yield
+    finally:
+        port._run = actual_run
+        server._dispatch_on_worker = actual_enqueue
+        server.dispatch = actual_dispatch
+        stream.close()
+
+
+async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d04_root, appraisal_ref, native_wait_diagnostic=False):
     from d04_numeric_authority_acceptance_support_v3 import install_actual_numeric_authority_case_v3
     from sylanne3.runtime.d06_life_numeric_drive_v1 import (
         PrepareLifeNumericDriveRequestV1, life_numeric_drive_ids_v1, OPERATION as DRIVE_OPERATION,
@@ -75,7 +171,8 @@ async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d
     from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
     from sylanne3.domains.d01.production_operations_v1 import plain_v1
     from sylanne3.graph_types import AtomKey
-    graph, worker, namespace = case['graph'], case['http_worker'], case['namespace']
+    graph, namespace = case['graph'], case['namespace']
+    worker = await case['get_http_worker']()
     bundle = graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle
     assert bundle.d04_joint_numeric is not None and bundle.d04_semantic_drive is not None
     assert Path(installed_d04_root).resolve() == Path(case['package_root']).resolve()
@@ -122,16 +219,38 @@ async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d
         ticket = issue_current_life_numeric_math_ticket_v1(current, case['bootstrap'], bundle, queue, request=joint_request)
         return queue, ticket
     queue, ticket = await worker.call(issue)
+    diagnostic_started = time.monotonic()
+    def native_stage(label, **values):
+        if native_wait_diagnostic:
+            row = {'stage': label, 'elapsed_seconds': time.monotonic() - diagnostic_started,
+                'wall_utc_observation': time.time(), **values}
+            with (tmp_path / 'native-post-terminal-diagnostic.jsonl').open('a') as stream:
+                stream.write(json.dumps(row) + '\n'); stream.flush()
+    async def observed(label, action):
+        native_stage(label + ':begin')
+        try:
+            value = await action()
+        except BaseException as exc:
+            native_stage(label + ':error', category=type(exc).__name__, frames=[
+                {'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
+                for frame in traceback.extract_tb(exc.__traceback__)])
+            raise
+        native_stage(label + ':end')
+        return value
     try:
         assert type(ticket) is _MathTicketV3, repr(ticket)
-        returned = await asyncio.shield(asyncio.wrap_future(queue.submit(ticket)))
-        execution = await worker.call(lambda current: queue.accept(current, returned))
-        assert execution.prepared == prepared
-        assert execution.terminal.measurement.status == 'completed', execution.status
-        assert execution.terminal.measurement.actual_cpu_ms >= 0
-        adoption = await worker.call(lambda current: adopt_post_c02_joint_numeric_v3(
-            current, case['bootstrap'], bundle, operation_id=joint_ids['operation']))
+        returned = await observed('native_future', lambda: asyncio.shield(asyncio.wrap_future(queue.submit(ticket))))
+        with _observe_numeric_rpc_wait_v1(case, tmp_path / 'numeric-adoption-rpc-first.jsonl'):
+            execution = await observed('accept_terminal', lambda: worker.call(lambda current: queue.accept(current, returned)))
+            assert execution.prepared == prepared
+            assert execution.terminal.measurement.status == 'completed', execution.status
+            assert execution.terminal.measurement.actual_cpu_ms >= 0
+            adoption = await observed('restore_and_adopt', lambda: worker.call(lambda current: adopt_post_c02_joint_numeric_v3(
+                current, case['bootstrap'], bundle, operation_id=joint_ids['operation'])))
         assert adoption['status'] == 'joint_advance_committed', adoption
+        if native_wait_diagnostic:
+            native_stage('DIAGNOSTIC_NOT_FULL_NUMERIC_PASS', actual_adoption_status=adoption['status'])
+            return
         baseline_request = PrepareLifeEncodingBaselineRequestV1(episode, causal, joint_ids['operation'])
         baseline_ids = life_encoding_baseline_ids_v1(namespace, episode, joint_ids['operation'])
         baseline_receipt = await asyncio.to_thread(_command, case, BASELINE_OPERATION, baseline_request, baseline_ids['operation'])
@@ -230,6 +349,8 @@ async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d
             'prepared_digest': prepared.digest, 'baseline_digest': cold_before[0].digest,
             'trace_digest': cold_before[1].digest, 'c04_record_digest': cold_before[3]}
     finally:
+        native_stage('queue_close:begin')
         await asyncio.to_thread(queue.close)
+        native_stage('queue_close:end')
         # The outer actual root/Life fixture owns and closes the reused storage
         # selection and Authority support after its real writers are closed.

@@ -147,8 +147,11 @@ def mixed_execution_facts_locked_v1(bridge,db,rows,permit):
     return tuple(sorted(facts.values(),key=lambda e:(e.family,e.execution_id)))
 
 
-def read_life_execution_inventory_v1(service,*,permit):
-    if type(permit) is not FencePermitV2 or permit.operation != "write" or permit.namespace != service.bridge.namespace:
+def read_life_execution_inventory_v1(service,*,permit,binding=None):
+    from ..runtime.d11_life_contract_v1 import D11DraftExecutionBindingV1
+    if (type(permit) is not FencePermitV2 or permit.operation not in {"write", "accounting"}
+            or permit.namespace != service.bridge.namespace
+            or permit.operation == "accounting" and type(binding) is not D11DraftExecutionBindingV1):
         raise AuthorityUnavailable("Life inventory requires actual ordinary write fence")
     service.bridge.core._require(service.credential,"execution",service.bridge.namespace)
     with service._frozen() as (db,deletion,execution,_deletion_history):
@@ -156,6 +159,15 @@ def read_life_execution_inventory_v1(service,*,permit):
         actual_head,rows=service.bridge.journal._scan_locked()
         if actual_head != execution: raise AuthorityUnavailable("Life inventory mixed head changed")
         anchor,_=service._current(db,deletion,execution)
+        if permit.operation == "accounting":
+            from .d11_life_journal_v1 import read_life_rows_locked_v1
+            head,claim,terminal,_,_=read_life_rows_locked_v1(service.bridge.journal,binding)
+            original,row=service._gate(db,binding,"terminal")
+            if (claim is None or terminal is not None or original!=permit or row[6]!="active"
+                    or (head.seq,head.digest)!=(claim.claim_sequence,claim.claim_digest)
+                    or permit.command_digest!="sha256:"+canonical_digest((binding.digest,claim.claim_digest))):
+                raise AuthorityUnavailable("draft inventory needs its exact original unresolved claim continuation")
+            service._verify_payload(claim.payload)
         service.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
         if permit.pinned_anchor != anchor: raise AuthorityUnavailable("Life inventory actual head changed")
         entries=mixed_execution_facts_locked_v1(service.bridge,db,rows,permit)

@@ -13,6 +13,7 @@ from sylanne3.runtime.graph_migration_snapshot_v1 import (
     validate_snapshot_for_isolated_target,
 )
 from sylanne3.runtime_contracts import NamespaceId, SnapshotRequirementsV2
+from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
 from sylanne3.runtime.natural_reply_job_v2 import install_schema as install_natural_preparations
 from sylanne3.runtime.natural_review_issue_v2 import install_review_attempt_schema
 from sylanne3.runtime.d12_compiled_candidate_store_v1 import (
@@ -28,6 +29,90 @@ from sylanne3.runtime.c04_internal_work_original_v1 import (
 
 
 NAMESPACE = NamespaceId("migration-bot", "migration-persona")
+
+
+def test_life_family_checks_empty_schema_and_exact_objects(tmp_path):
+    source = GraphStore(tmp_path / "life-schema.db", TypeRegistry())
+    try:
+        tables = {name: rows for name, _, rows in _inventory(source._db, NAMESPACE)}
+        assert tables["graph_d11_life_originals_v1"] == ()
+        assert tables["graph_d11_life_artifact_stage_v1"] == ()
+        source._db.execute("CREATE INDEX life_unreviewed ON graph_d11_life_originals_v1(kind)")
+        with pytest.raises(IncompleteMigrationClosure, match="Life durable schema differs"):
+            _inventory(source._db, NAMESPACE)
+        source._db.execute("DROP INDEX life_unreviewed")
+        source._db.execute("ALTER TABLE graph_d11_life_artifact_stage_v1 ADD COLUMN unexpected TEXT")
+        with pytest.raises(IncompleteMigrationClosure, match="Life durable schema differs"):
+            _inventory(source._db, NAMESPACE)
+    finally:
+        source.close()
+
+
+def test_life_family_rejects_unregistered_noncanonical_and_cross_namespace_rows():
+    from sylanne3.runtime.graph_migration_snapshot_v1 import _validate_life_row
+    from sylanne3.runtime.domain_production_erasure_v1 import TABLE_COLUMNS
+    from sylanne3.runtime.d11_artifact_draft_contract_v1 import DraftActivityScopeV1, draft_to_wire_v1
+    from sylanne3.runtime.d11_life_contract_v1 import LifeInputRefV1
+    from sylanne3.memory_types import source_key
+
+    table = "graph_d11_life_originals_v1"
+    scope = DraftActivityScopeV1("activity", "actor", "ingress", "c02",
+        LifeInputRefV1(source_key(*NAMESPACE.as_tuple, "source").token, 1, "a" * 64),
+        "lease", "registration", "b" * 64, "2030-01-01T00:00:00Z", "owner", 1, "c" * 64)
+    raw = draft_to_wire_v1(scope)
+    payload = canonical_serialize(raw)
+    # A typed codec check alone is not a signed or committed producer original.
+    row = (*NAMESPACE.as_tuple, "activity_scope", "scope", "producer", payload, canonical_digest(raw), "d" * 64)
+    assert _validate_life_row(table, TABLE_COLUMNS[table], row, NAMESPACE)[2] == scope
+    bad_rows = (
+        (*row[:2], "unregistered_future_kind", *row[3:]),
+        (*row[:5], payload + " ", *row[6:]),
+        (*row[:5], payload[:-1] + ',"schema":"d11.artifact-draft-activity-scope.v1"}', *row[6:]),
+        (*row[:6], "e" * 64, row[7]),
+        (*row[:7], "invalid-signature"),
+        ("other-bot", row[1], *row[2:]),
+    )
+    for invalid in bad_rows:
+        with pytest.raises(IncompleteMigrationClosure, match="Life durable row is not closed"):
+            _validate_life_row(table, TABLE_COLUMNS[table], invalid, NAMESPACE)
+
+
+def test_life_stage_source_and_target_require_prepared_original_and_preserve_blob(tmp_path):
+    from sylanne3.runtime.graph_migration_snapshot_v1 import _check_snapshot_rows, _hash, _validate_life_row
+    from sylanne3.runtime.domain_production_erasure_v1 import TABLE_COLUMNS
+    from sylanne3.runtime.d11_life_contract_v1 import ARTIFACT_SCHEMA, RECIPE_ID, life_artifact_ref_v1
+    from sylanne3.memory_types import SourceRecord, source_key
+
+    capability = object()
+    source = GraphStore(tmp_path / "life-source.db", TypeRegistry())
+    target = GraphStore(tmp_path / "life-target.db", TypeRegistry())
+    source._coordinator_capability = target._coordinator_capability = capability
+    try:
+        expected = source.install_graph_recovery_genesis(_requirements(), _capability=capability)
+        snapshot = _seal(source, capability, expected)
+        record = SourceRecord("source", "Bounded test input", "actor", "reported", "confirmed",
+            0, 0, "test-source", ("owner",), ("context",))
+        artifact = dict(schema=ARTIFACT_SCHEMA, recipe_id=RECIPE_ID, recipe_version=1,
+            activity_id="activity", effect_id="effect", attempt_id="attempt",
+            source_ref=source_key(*NAMESPACE.as_tuple, "source").token, source_revision=1,
+            source_digest=canonical_digest(record.to_dict()), source_record=record.to_dict())
+        blob = canonical_serialize(artifact).encode("utf-8")
+        row = (*NAMESPACE.as_tuple, "execution", "a" * 64, life_artifact_ref_v1(NAMESPACE, "effect"),
+            blob, sha256(blob).hexdigest(), len(blob), None)
+        table = "graph_d11_life_artifact_stage_v1"
+        assert _validate_life_row(table, TABLE_COLUMNS[table], row, NAMESPACE)[1]["artifact_bytes"] is blob
+        assert _hash(row) != _hash((*row[:5], blob.decode(), *row[6:]))
+        source._db.execute("INSERT INTO " + table + " VALUES(?,?,?,?,?,?,?,?,?)", row)
+        with pytest.raises(IncompleteMigrationClosure, match="no exact prepared execution"):
+            _inventory(source._db, NAMESPACE)
+        entries = tuple((name, columns, (row,) if name == table else rows)
+            for name, columns, rows in snapshot.tables)
+        with pytest.raises(IncompleteMigrationClosure, match="no exact prepared execution"):
+            _check_snapshot_rows(target._db, replace(snapshot, tables=entries))
+        assert target._db.execute("SELECT count(*) FROM " + table).fetchone() == (0,)
+    finally:
+        source.close()
+        target.close()
 
 
 def _requirements():
@@ -281,10 +366,8 @@ def test_migration_round_trips_owner_revoke_and_d12_original_rows(tmp_path):
                      "other-quote-bytes", "other-signature"),
                 )
                 record_c04_internal_work_prepared_v1(db, NAMESPACE, prepared)
-                db.execute("""CREATE TABLE graph_d12_compile_attempts_v1 (
-                    bot TEXT NOT NULL, persona TEXT NOT NULL, operation_id TEXT NOT NULL,
-                    request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,operation_id), UNIQUE(attempt_id))""")
+                assert tuple(row[1] for row in db.execute("PRAGMA table_info(graph_d12_compile_attempts_v1)")) == (
+                    "bot", "persona", "operation_id", "request_digest", "attempt_id")
                 db.executemany(
                     f"INSERT INTO graph_owner_revoke_intents_v1 ({intent_columns}) "
                     "VALUES(" + ",".join("?" for _ in range(16)) + ")", intent_rows)
@@ -330,10 +413,8 @@ def test_migration_round_trips_owner_revoke_and_d12_original_rows(tmp_path):
                 install_d12_compiled_candidate_store_v1(db)
                 install_c04_internal_work_original_v1(db)
                 install_body_quote_schema(db)
-                db.execute("""CREATE TABLE graph_d12_compile_attempts_v1 (
-                    bot TEXT NOT NULL, persona TEXT NOT NULL, operation_id TEXT NOT NULL,
-                    request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,operation_id), UNIQUE(attempt_id))""")
+                assert tuple(row[1] for row in db.execute("PRAGMA table_info(graph_d12_compile_attempts_v1)")) == (
+                    "bot", "persona", "operation_id", "request_digest", "attempt_id")
                 db.execute("COMMIT")
             except BaseException:
                 db.execute("ROLLBACK")

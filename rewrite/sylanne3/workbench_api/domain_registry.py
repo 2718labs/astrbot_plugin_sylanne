@@ -37,6 +37,7 @@ class ProjectionContextV2:
     purpose: str
     snapshot_proof: object
     schema_version: str = PROJECTION_CONTEXT_V2
+    trusted_now_utc: float | None = None
 
 
 @dataclass(frozen=True)
@@ -185,7 +186,8 @@ class CurrentDomainViewRegistry:
                 raise PermissionError("complete fenced snapshot proof is unavailable")
             result = definition.projector(
                 view_type, atoms,
-                context=ProjectionContextV2(authority, audience, purpose, snapshot_proof))
+                context=ProjectionContextV2(authority, audience, purpose, snapshot_proof,
+                    trusted_now_utc=snapshot_proof.trusted_now_utc))
         else:
             result = definition.projector(view_type, atoms)
         if not isinstance(result, Mapping) or set(result) - definition.fields:

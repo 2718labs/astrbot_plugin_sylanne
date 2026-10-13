@@ -55,17 +55,28 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
     if exists is None:
         return None
     operation_id = ingress_ids(source_ref)[2]
-    row = db.execute(
-        "SELECT source_ref,platform_ref,conversation_ref,sender_ref,message_id,"
-        "visibility,identity_json,content_fingerprint,learned_at,bundle_digest "
-        "FROM graph_first_ingress_identity_v1 WHERE bot=? AND persona=? "
-        "AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3
+    def point(table,columns,legacy_reader):
+        return model_reply_scope_point_v3(db,table=table,columns=columns,
+            key_columns=('bot','persona','operation_id'),key=namespace.as_tuple+(operation_id,),legacy_reader=legacy_reader)
+    from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_graph_attachment_v3
+    bound,row=read_bound_authority_graph_attachment_v3(db,table='graph_first_ingress_identity_v1',
+        columns=('source_ref','platform_ref','conversation_ref','sender_ref','message_id','visibility','identity_json',
+            'content_fingerprint','learned_at','bundle_digest'),key_columns=('bot','persona','operation_id'),
+        key=namespace.as_tuple+(operation_id,))
+    if not bound:
+        row = point('graph_first_ingress_identity_v1',
+            ('source_ref','platform_ref','conversation_ref','sender_ref','message_id','visibility','identity_json',
+                'content_fingerprint','learned_at','bundle_digest'),lambda:db.execute(
+            "SELECT source_ref,platform_ref,conversation_ref,sender_ref,message_id,"
+            "visibility,identity_json,content_fingerprint,learned_at,bundle_digest "
+            "FROM graph_first_ingress_identity_v1 WHERE bot=? AND persona=? "
+            "AND operation_id=?",namespace.as_tuple+(operation_id,)).fetchone())
     if row is None:
         return None
     try:
-        identity = json.loads(row[6])
+        identity = background_json_loads_v3(row[6])
         valid = (
             type(identity) is dict and set(identity) == {
                 "schema", "namespace", "operation_id", "source_ref",
@@ -78,34 +89,30 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
                 "source_ref", "platform_ref", "conversation_ref", "sender_ref",
                 "message_id", "visibility")) == row[:6]
             and identity["source_ref"] == source_ref
-            and canonical_json(identity) == row[6]
+            and (canonical_json(identity)==row[6]if type(row[6])is str else background_json_matches_v3(row[6],identity))
         )
     except (TypeError, ValueError, KeyError):
         valid = False
-    observed = db.execute(
-        "SELECT content_fingerprint,learned_at,bundle_digest "
-        "FROM ingress_first_observations WHERE bot=? AND persona=? "
-        "AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone()
-    committed = db.execute(
-        "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
-        "AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone()
-    intent = db.execute(
-        "SELECT identity_json FROM graph_first_ingress_intents_v2 "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    observed = point('ingress_first_observations',('content_fingerprint','learned_at','bundle_digest'),lambda:db.execute(
+        "SELECT content_fingerprint,learned_at,bundle_digest FROM ingress_first_observations "
+        "WHERE bot=? AND persona=? AND operation_id=?",namespace.as_tuple+(operation_id,)).fetchone())
+    committed = point('graph_bundle_operations',('digest',),lambda:db.execute(
+        "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple+(operation_id,)).fetchone())
+    bound,intent=read_bound_authority_graph_attachment_v3(db,table='graph_first_ingress_intents_v2',
+        columns=('identity_json',),key_columns=('bot','persona','operation_id'),key=namespace.as_tuple+(operation_id,))
+    if not bound:
+        intent = point('graph_first_ingress_intents_v2',('identity_json',),lambda:db.execute(
+            "SELECT identity_json FROM graph_first_ingress_intents_v2 WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple+(operation_id,)).fetchone())
     try:
-        pinned_fingerprint = json.loads(intent[0])["fingerprint"] if intent else None
+        pinned_fingerprint = background_json_loads_v3(intent[0])["fingerprint"] if intent else None
     except (TypeError, ValueError, KeyError):
         pinned_fingerprint = None
     if (not valid or observed != row[7:10] or committed != (row[9],)
             or pinned_fingerprint != row[7]):
         raise EventConflict("committed ingress identity differs from original")
-    return IngressIdentityReceipt(row[6], row[7], row[8], row[9])
+    return IngressIdentityReceipt(canonical_json(identity), row[7], row[8], row[9])
 
 
 async def _run_durable(operation, *args):

@@ -34,7 +34,7 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
     mount = WorkbenchHostMount()
     with patch("astrbot.api.web.request", SimpleNamespace(username="dashboard-admin")):
         mount.register(context)
-        assert len(context.registered_web_apis) == 9
+        assert len(context.registered_web_apis) == 14
         assert context.registered_web_apis[0][0] == COMMAND_ROUTE
         matched = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST",
@@ -52,13 +52,13 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
         assert Path(index.path).read_bytes().startswith(b"<!doctype html>")
         assert index.headers["cache-control"] == "no-store"
         asset, params = _match_registered_web_api(
-            context.registered_web_apis, "/astrbot_plugin_sylanne/workbench/src/app.js", "GET",
+            context.registered_web_apis, "/astrbot_plugin_sylanne/workbench/index.html", "GET",
         )
-        assert params == {"asset": "src/app.js"}
-        script = asyncio.run(asset(**params))
-        assert script.status_code == 200
-        assert script.media_type == "text/javascript; charset=utf-8"
-        assert Path(script.path).read_bytes().startswith(b"import ")
+        assert params == {"asset": "index.html"}
+        singlefile = asyncio.run(asset(**params))
+        assert singlefile.status_code == 200
+        assert singlefile.media_type == "text/html; charset=utf-8"
+        assert Path(singlefile.path).read_bytes().startswith(b"<!doctype html>")
         assert _match_registered_web_api(context.registered_web_apis, COMMAND_ROUTE, "GET") is not None
         session, _ = _match_registered_web_api(
             context.registered_web_apis, SESSION_ROUTE, "GET")
@@ -81,7 +81,7 @@ def test_backend_only_mount_starts_without_packaged_ui(tmp_path, monkeypatch):
     mount = WorkbenchHostMount()
     with patch("astrbot.api.web.request", SimpleNamespace(username="dashboard-admin")):
         mount.register(context)
-        assert len(context.registered_web_apis) == 9
+        assert len(context.registered_web_apis) == 14
         command, _ = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST")
         assert json.loads(asyncio.run(command()).body)["problem"]["code"] == (
@@ -202,3 +202,82 @@ def test_scene_candidates_require_dashboard_and_owner_and_only_return_installed_
         assert json.loads(asyncio.run(handler()).body)["problem"]["code"] == "owner_session_locked"
         request.username = None
         assert json.loads(asyncio.run(handler()).body)["problem"]["code"] == "host_session_missing"
+
+
+def test_public_body_writer_keeps_named_cap_metadata_and_other_actions_bounded():
+    """Controlled transport output exercises the real SDK writer, not installed file qualification."""
+    import base64
+    import hashlib
+    from uuid import uuid4
+    from sylanne3.workbench_api.service import ApiResponse
+
+    text = ("中文与控制字符\n" * 7000).encode()
+    projection = {"schema": "d12.owner-artifact-read-result.v2",
+        "namespace": {"bot_id": "bot", "persona_id": "persona"}, "installation_id": "controlled-install",
+        "project_ref": "controlled-project", "progress_ref": "controlled-progress",
+        "artifact_ref": "controlled-artifact", "artifact_version": 1,
+        "content_digest": hashlib.sha256(text).hexdigest(), "content_length_bytes": len(text),
+        "content_type": "text/plain; charset=utf-8", "body_encoding": "base64",
+        "body_base64": base64.b64encode(text).decode()}
+    session = AuthenticatedSession("owner", "session", {"bot/persona": frozenset({"workbench.read"})},
+        {"bot/persona": frozenset({"owner"})}, {"bot/persona": frozenset({"workbench_view"})},
+        host_username="dashboard-admin")
+
+    class Resolver:
+        def resolve(self, *, username, session_hint):
+            return session if username == "dashboard-admin" and session_hint == "controlled-token" else None
+
+    class Csrf:
+        def validate(self, *, session, token):
+            return token == "controlled-csrf"
+
+    class ControlledService:
+        def handle(self, payload, *, session, context):
+            return ApiResponse("ready", projection=current[0])
+
+    class Request:
+        username = "dashboard-admin"
+        content_type = "application/json"
+        cookies = {"sylanne_owner_session": "controlled-token"}
+        headers = {"origin": "https://dashboard.local", "x-csrf-token": "controlled-csrf"}
+        def __init__(self):
+            self.cached = b""
+        async def body(self):
+            return self.cached
+
+    current = [projection]
+    request = Request()
+    context = _Context()
+    mount = WorkbenchHostMount()
+    mount.attach_transport(WorkbenchHttpTransport(ControlledService(), Resolver(), Csrf(),
+        TransportConfig("https://dashboard.local", Path("."))))
+    with patch("astrbot.api.web.request", request):
+        mount.register(context)
+        handler, _ = _match_registered_web_api(context.registered_web_apis, COMMAND_ROUTE, "POST")
+        def respond(action, output):
+            current[0] = output
+            request.cached = json.dumps({"schema_version": "d12.contract.v1", "action": action,
+                "scope": "bot/persona", "purpose": "workbench_view", "audience": "owner",
+                "operation_id": str(uuid4()), "input": {}}).encode()
+            return asyncio.run(handler())
+
+        body = respond("read_owner_project_artifact_v1", projection)
+        assert body.status_code == 200 and 65536 < len(body.body) < 1048576
+        decoded = json.loads(body.body)["projection"]
+        assert base64.b64decode(decoded["body_base64"]) == text
+        assert body.headers["cache-control"] == "no-store"
+        # The same large output does not enlarge an ordinary read's response contract.
+        wrong_action = respond("read_character_view", projection)
+        assert wrong_action.status_code == 502 and json.loads(wrong_action.body)["problem"]["code"] == "response_too_large"
+        assert "projection" not in json.loads(wrong_action.body)
+        private = {**projection, "read_binding": {"private": "must-never-be-public"}}
+        assert respond("read_owner_project_artifact_v1", private).status_code == 502
+        # Compare Unicode bytes and JSON escaping, not Python character counts.
+        for marker in ("中" * 24000, "\0" * 12000):
+            metadata = {**projection, "installation_id": marker}
+            result = respond("read_owner_project_artifact_v1", metadata)
+            assert result.status_code == 502
+            assert json.loads(result.body)["problem"]["code"] == "artifact_response_metadata_too_large"
+        oversized = {**projection, "body_base64": "A" * 1048576}
+        assert respond("read_owner_project_artifact_v1", oversized).status_code == 502
+        mount.close()

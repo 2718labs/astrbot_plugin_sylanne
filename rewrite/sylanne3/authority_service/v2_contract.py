@@ -7,7 +7,7 @@ can make those decisions against its current state and service-owned journal.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, asdict
 from datetime import datetime
 import hashlib
 import json
@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .v2_owner_contract import OwnerAuthorizationGuardV1
 
-from .contract import CONTENT_OPERATIONS, identifier
+from .contract import CONTENT_OPERATIONS, JournalHead, identifier
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_journal import RecoveryConstraintFootprint
 
@@ -152,6 +152,44 @@ class FencePermitV2:
         _unique_ids(operation_id=self.operation_id, effect_id=self.effect_id)
         _anchor(self.pinned_anchor, self.authority_id, self.namespace,
                 self.generation)
+
+
+@dataclass(frozen=True, slots=True)
+class ContentWriteAttemptObservationV1:
+    """Current authenticated facts; absence neither admits nor closes a write."""
+
+    authority_id: str
+    namespace: str
+    subject: str
+    holder: str
+    operation_id: str
+    current_anchor: RestoreAnchor
+    state: str
+    permit: FencePermitV2 | None
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        for name in ("authority_id", "namespace", "subject", "holder", "operation_id"):
+            identifier(getattr(self, name), name)
+        if type(self.current_anchor) is not RestoreAnchor:
+            raise ValueError("write attempt observation requires a current anchor")
+        _anchor(self.current_anchor, self.authority_id, self.namespace,
+                self.current_anchor.activation_generation)
+        if type(self.state) is not str or self.state not in {"absent", "active", "finished"}:
+            raise ValueError("invalid content write attempt state")
+        if self.state == "absent":
+            if self.permit is not None:
+                raise ValueError("absent write attempt cannot contain a permit")
+        elif (type(self.permit) is not FencePermitV2
+              or (self.permit.authority_id, self.permit.namespace,
+                  self.permit.subject, self.permit.holder, self.permit.operation_id,
+                  self.permit.operation, self.permit.generation,
+                  self.permit.pinned_anchor) != (
+                      self.authority_id, self.namespace, self.subject, self.holder,
+                      self.operation_id, "write", self.current_anchor.activation_generation,
+                      self.current_anchor)):
+            raise ValueError("content write attempt permit identity differs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -968,13 +1006,13 @@ def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
     return footprint
 
 
-def to_wire(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
+def to_wire(value: FencePermitV2 | ContentWriteAttemptObservationV1 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
             ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1 |
             PlatformObservationV2 |
             DispatchHandoffContextV1 | OwnerDispatchWitnessV1 |
             AuthorityUnresolvedEffectV1 | AuthorityDispatchSnapshotV1 |
-            AuthorityCurrentEffectSnapshotV2 |
+            AuthorityCurrentEffectSnapshotV2 | CurrentEffectReadV2 | AuthorityNaturalFinalEffectObservationV4 | NaturalFinalEffectObservationReadV4 |
             DispatchGraphClaimReceiptV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
@@ -987,6 +1025,15 @@ def to_wire(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 
             "pinned_anchor": _anchor_wire(value.pinned_anchor),
             "effect_id": value.effect_id, "command_digest": value.command_digest,
             "footprint_digest": value.footprint_digest,
+        }
+    if type(value) is ContentWriteAttemptObservationV1:
+        return {
+            "schema": value.schema, "kind": "content_write_attempt_observation_v1",
+            "authority_id": value.authority_id, "namespace": value.namespace,
+            "subject": value.subject, "holder": value.holder,
+            "operation_id": value.operation_id,
+            "current_anchor": _anchor_wire(value.current_anchor), "state": value.state,
+            "permit": None if value.permit is None else to_wire(value.permit),
         }
     if type(value) is FenceNeverBegunReceiptV2:
         return {
@@ -1034,6 +1081,20 @@ def to_wire(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 
                 "pending_mutation_ids": list(value.pending_mutation_ids),
                 "unresolved_effects": [to_wire(effect)
                                        for effect in value.unresolved_effects]}
+    if type(value) is CurrentEffectReadV2:
+        return {"schema":SCHEMA,"kind":"current_effect_read_v2",**asdict(value)}
+    if type(value) is AuthorityNaturalFinalEffectObservationV4:
+        return {"schema":value.schema,"kind":"authority_natural_final_effect_observation_v4",
+            "authority_id":value.authority_id,"installation_id":value.installation_id,"authority_namespace":value.authority_namespace,
+            "operation_id":value.operation_id,"target_effect_id":value.target_effect_id,"permit":to_wire(value.permit),
+            "anchor":_anchor_wire(value.anchor),"execution_journal_id":value.execution_journal_id,
+            "execution_head_seq":value.execution_head_seq,"execution_head_digest":value.execution_head_digest,
+            "deletion_head":asdict(value.deletion_head),"owner_state":asdict(value.owner_state),
+            "active_fence_operation_ids":list(value.active_fence_operation_ids),"pending_mutation_ids":list(value.pending_mutation_ids),
+            "current_effect":to_wire(value.current_effect),"effect_snapshot":to_wire(value.effect_snapshot),"observation_kind":value.observation_kind}
+    if type(value) is NaturalFinalEffectObservationReadV4:
+        return {"schema":value.schema,"kind":"natural_final_effect_observation_read_v4","observation":to_wire(value.observation),
+            "original_ref":value.original_ref,"original_digest":value.original_digest}
     if type(value) is AuthorityCurrentEffectSnapshotV2:
         return {"schema": value.schema, "kind": "authority_current_effect_snapshot_v2",
                 "authority_id": value.authority_id, "namespace": value.namespace,
@@ -1197,14 +1258,14 @@ def to_wire(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 
     raise TypeError("unsupported authority v2 DTO")
 
 
-def from_wire(value: object) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
+def from_wire(value: object) -> (FencePermitV2 | ContentWriteAttemptObservationV1 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                                  DeletionEvidenceV1 | DeletionPendingV1 |
                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                  PlatformObservationV1 | PlatformObservationV2 |
                                  DispatchHandoffContextV1 |
                                  OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
                                  AuthorityDispatchSnapshotV1 |
-                                 AuthorityCurrentEffectSnapshotV2 |
+                                 AuthorityCurrentEffectSnapshotV2 | CurrentEffectReadV2 | AuthorityNaturalFinalEffectObservationV4 | NaturalFinalEffectObservationReadV4 |
                                  DispatchGraphClaimReceiptV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
@@ -1237,6 +1298,26 @@ def from_wire(value: object) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | Pend
             **{key: item for key, item in value.items()
                if key not in ("kind", "anchor", "unresolved_effects",
                               "pending_mutation_ids")})
+    if kind == "current_effect_read_v2":
+        _fields(value,frozenset({"schema","kind",*CurrentEffectReadV2.__dataclass_fields__}),"current effect read")
+        return CurrentEffectReadV2(**{k:v for k,v in value.items() if k not in {"kind","schema"}})
+    if kind == "authority_natural_final_effect_observation_v4":
+        _fields(value,frozenset({"kind",*AuthorityNaturalFinalEffectObservationV4.__dataclass_fields__}),"natural final effect observation")
+        deletion=_fields(value["deletion_head"],frozenset({"journal_id","seq","digest"}),"observation deletion head")
+        owner=_fields(value["owner_state"],frozenset(NaturalFinalAuthorityOwnerStateV4.__dataclass_fields__),"observation owner state")
+        if type(value["active_fence_operation_ids"]) is not list or type(value["pending_mutation_ids"]) is not list:
+            raise ValueError("observation inventory IDs require exact arrays")
+        result=AuthorityNaturalFinalEffectObservationV4(**{k:v for k,v in value.items() if k not in
+            {"kind","permit","anchor","deletion_head","owner_state","active_fence_operation_ids","pending_mutation_ids","current_effect","effect_snapshot"}},
+            permit=from_wire(value["permit"]),anchor=_anchor_from_wire(value["anchor"]),deletion_head=JournalHead(**deletion),
+            owner_state=NaturalFinalAuthorityOwnerStateV4(**owner),active_fence_operation_ids=tuple(value["active_fence_operation_ids"]),
+            pending_mutation_ids=tuple(value["pending_mutation_ids"]),current_effect=from_wire(value["current_effect"]),effect_snapshot=from_wire(value["effect_snapshot"]))
+        if to_wire(result)!=value:raise ValueError("natural final observation wire is not canonical")
+        return result
+    if kind == "natural_final_effect_observation_read_v4":
+        _fields(value,frozenset({"schema","kind","observation","original_ref","original_digest"}),"natural final observation read")
+        return NaturalFinalEffectObservationReadV4(observation=from_wire(value["observation"]),
+            original_ref=value["original_ref"],original_digest=value["original_digest"],schema=value["schema"])
     if kind == "authority_current_effect_snapshot_v2":
         _fields(value, frozenset({"schema", "kind", "authority_id", "namespace",
                                   "anchor", "permit_digest", "execution_head_seq",
@@ -1293,6 +1374,17 @@ def from_wire(value: object) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | Pend
         }), "fence permit")
         return FencePermitV2(**{key: (_anchor_from_wire(item) if key == "pinned_anchor" else item)
                                 for key, item in value.items() if key != "kind"})
+    if kind == "content_write_attempt_observation_v1":
+        _fields(value, frozenset({
+            "schema", "kind", "authority_id", "namespace", "subject", "holder",
+            "operation_id", "current_anchor", "state", "permit",
+        }), "content write attempt observation")
+        return ContentWriteAttemptObservationV1(
+            current_anchor=_anchor_from_wire(value["current_anchor"]),
+            permit=None if value["permit"] is None else from_wire(value["permit"]),
+            **{key: item for key, item in value.items()
+               if key not in {"kind", "current_anchor", "permit"}},
+        )
     if kind == "fence_never_begun_receipt_v2":
         _fields(value, frozenset({
             "schema", "kind", "authority_id", "namespace", "subject",
@@ -1466,28 +1558,28 @@ def _reject_constant(value: str) -> None:
     raise ValueError(f"nonfinite JSON number: {value}")
 
 
-def canonical_bytes(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
+def canonical_bytes(value: FencePermitV2 | ContentWriteAttemptObservationV1 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                     DeletionEvidenceV1 | DeletionPendingV1 |
                     DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1 | DispatchHandoffContextV1 |
                      OwnerDispatchWitnessV1 |
-                     DispatchGraphClaimReceiptV1) -> bytes:
+                     DispatchGraphClaimReceiptV1 | CurrentEffectReadV2 | AuthorityNaturalFinalEffectObservationV4 | NaturalFinalEffectObservationReadV4) -> bytes:
     return json.dumps(to_wire(value), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def canonical_digest(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
+def canonical_digest(value: FencePermitV2 | ContentWriteAttemptObservationV1 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                      DeletionEvidenceV1 | DeletionPendingV1 |
                      DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1 | DispatchHandoffContextV1 |
                      OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
                      AuthorityDispatchSnapshotV1 |
-                     AuthorityCurrentEffectSnapshotV2 |
+                     AuthorityCurrentEffectSnapshotV2 | CurrentEffectReadV2 | AuthorityNaturalFinalEffectObservationV4 | NaturalFinalEffectObservationReadV4 |
                      DispatchGraphClaimReceiptV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def decode_bytes(data: bytes) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
+def decode_bytes(data: bytes) -> (FencePermitV2 | ContentWriteAttemptObservationV1 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                                   DeletionEvidenceV1 | DeletionPendingV1 |
                                   DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                   PlatformObservationV1 | OwnerDispatchWitnessV1):
@@ -1498,7 +1590,201 @@ def decode_bytes(data: bytes) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | Pen
     return from_wire(value)
 
 
-__all__ = ["SCHEMA", "FencePermitV2", "FenceNeverBegunReceiptV2", "PendingMutationV2", "MutationReceiptV2",
+@dataclass(frozen=True, slots=True)
+class CurrentEffectReadV2:
+    """Content-free Authority evidence including the original observed outcome."""
+
+    authority_id: str
+    namespace: str
+    effect_id: str
+    activation_generation: int
+    state: str  # absent, unresolved, or observed
+    execution_head_seq: int
+    execution_head_digest: str
+    effect_seq: int | None = None
+    append_id: str | None = None
+    append_digest: str | None = None
+    mutation_id: str | None = None
+    observation_id: str | None = None
+    observation_outcome: str | None = None
+
+
+@dataclass(frozen=True,slots=True)
+class NaturalFinalAuthorityOwnerStateV4:
+    holder: str
+    generation: int
+    phase: str
+    transfer_id: str | None
+    target: str | None
+    revocation_epoch: int
+    deletion_phase: str
+    anchor_nonce: str
+
+    def __post_init__(self):
+        identifier(self.holder,"holder")
+        _exact_int(self.generation,"generation",minimum=1)
+        _exact_int(self.revocation_epoch,"revocation_epoch")
+        identifier(self.deletion_phase,"deletion_phase")
+        if (self.phase!="active" or self.transfer_id is not None or self.target is not None
+                or type(self.anchor_nonce) is not str or not self.anchor_nonce):
+            raise ValueError("natural final observation requires its actual active owner")
+
+
+@dataclass(frozen=True,slots=True)
+class AuthorityNaturalFinalEffectObservationV4:
+    authority_id: str
+    installation_id: str
+    authority_namespace: str
+    operation_id: str
+    target_effect_id: str
+    permit: FencePermitV2
+    anchor: RestoreAnchor
+    execution_journal_id: str
+    execution_head_seq: int
+    execution_head_digest: str
+    deletion_head: JournalHead
+    owner_state: NaturalFinalAuthorityOwnerStateV4
+    active_fence_operation_ids: tuple[str,...]
+    pending_mutation_ids: tuple[str,...]
+    current_effect: CurrentEffectReadV2
+    effect_snapshot: AuthorityCurrentEffectSnapshotV2
+    observation_kind: str = "effect_inventory"
+    schema: str = SCHEMA
+
+    def __post_init__(self):
+        _schema(self.schema)
+        for n in ("authority_id","installation_id","authority_namespace","operation_id","target_effect_id","execution_journal_id"):
+            identifier(getattr(self,n),n)
+        if (type(self.permit) is not FencePermitV2 or type(self.anchor) is not RestoreAnchor
+                or type(self.deletion_head) is not JournalHead or type(self.owner_state) is not NaturalFinalAuthorityOwnerStateV4
+                or type(self.current_effect) is not CurrentEffectReadV2 or type(self.effect_snapshot) is not AuthorityCurrentEffectSnapshotV2
+                or self.observation_kind!="effect_inventory" or type(self.active_fence_operation_ids) is not tuple
+                or self.active_fence_operation_ids!=(self.operation_id,) or type(self.pending_mutation_ids) is not tuple
+                or self.pending_mutation_ids):
+            raise ValueError("natural final observation lacks exact same-transaction inventory")
+        permit=self.permit;owner=self.owner_state;effect=self.current_effect;snapshot=self.effect_snapshot
+        if (permit.operation!="write" or (permit.authority_id,permit.namespace,permit.operation_id,permit.holder,permit.generation,permit.pinned_anchor)!=
+                (self.authority_id,self.authority_namespace,self.operation_id,owner.holder,owner.generation,self.anchor)
+                or (self.execution_journal_id,self.execution_head_seq,self.execution_head_digest)!=
+                    (self.anchor.execution_journal_id,self.anchor.execution_seq,self.anchor.execution_digest)
+                or (self.deletion_head.journal_id,self.deletion_head.seq,self.deletion_head.digest)!=
+                    (self.anchor.deletion_journal_id,self.anchor.deletion_seq,self.anchor.deletion_digest)
+                or (owner.revocation_epoch,owner.anchor_nonce)!=(self.anchor.revocation_epoch,self.anchor.proof)
+                or (effect.authority_id,effect.namespace,effect.effect_id,effect.activation_generation,effect.execution_head_seq,effect.execution_head_digest)!=
+                    (self.authority_id,self.authority_namespace,self.target_effect_id,owner.generation,self.execution_head_seq,self.execution_head_digest)
+                or effect.state!="absent" or any(getattr(effect,n) is not None for n in
+                    ("effect_seq","append_id","append_digest","mutation_id","observation_id","observation_outcome"))
+                or (snapshot.authority_id,snapshot.namespace,snapshot.anchor,snapshot.permit_digest,snapshot.execution_head_seq,snapshot.execution_head_digest)!=
+                    (self.authority_id,self.authority_namespace,self.anchor,canonical_digest(permit),self.execution_head_seq,self.execution_head_digest)
+                or snapshot.coverage!="complete"):
+            raise ValueError("natural final observation changed its actual pinned target/heads/owner/fence")
+
+    @property
+    def original_ref(self):
+        material=json.dumps((self.authority_namespace,self.operation_id,self.observation_kind),separators=(",",":"),ensure_ascii=False).encode("utf-8")
+        return "authority-natural-final-observation:"+hashlib.sha256(material).hexdigest()
+
+    @property
+    def original_digest(self):return canonical_digest(self)
+
+
+@dataclass(frozen=True,slots=True)
+class NaturalFinalEffectObservationReadV4:
+    observation: AuthorityNaturalFinalEffectObservationV4
+    original_ref: str
+    original_digest: str
+    schema: str = SCHEMA
+
+    def __post_init__(self):
+        _schema(self.schema)
+        if (type(self.observation) is not AuthorityNaturalFinalEffectObservationV4
+                or (self.original_ref,self.original_digest)!=(self.observation.original_ref,self.observation.original_digest)):
+            raise ValueError("natural final observation read differs from actual immutable original")
+
+    @property
+    def current_effect(self):return self.observation.current_effect
+    @property
+    def effect_snapshot(self):return self.observation.effect_snapshot
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffStartV2:
+    """One durable Authority start bound to a current dispatch fence.
+
+    The business graph's independently durable claim is named, not reproduced.
+    This receipt alone cannot authorize a platform adapter to send.
+    """
+
+    handoff_id: str
+    operation_id: str
+    effect_id: str
+    namespace: str
+    claim_digest: str
+    binding_digest: str
+    graph_claim_ref: str
+    permit: FencePermitV2
+    replay: bool = False
+    graph_claim_receipt: DispatchGraphClaimReceiptV1 | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("handoff_id", "operation_id", "effect_id", "namespace",
+                     "graph_claim_ref"):
+            identifier(getattr(self, name), name)
+        if type(self.replay) is not bool:
+            raise ValueError("handoff replay must be an exact boolean")
+        if not self.replay and self.graph_claim_receipt is None:
+            raise ValueError("new handoff start requires a graph claim receipt")
+        if self.graph_claim_receipt is not None and (
+                type(self.graph_claim_receipt) is not DispatchGraphClaimReceiptV1
+                or self.graph_claim_receipt.graph_claim_ref != self.graph_claim_ref
+                or self.graph_claim_receipt.context_digest != canonical_digest(
+                    DispatchHandoffContextV1(
+                        permit=self.permit,
+                        claimed_receipt_digest=self.claim_digest,
+                        binding_digest=self.binding_digest,
+                        handoff_id=self.handoff_id))):
+            raise ValueError("handoff graph receipt identity differs")
+        if (type(self.permit) is not FencePermitV2
+                or self.permit.operation != "dispatch"
+                or self.permit.operation_id != self.operation_id
+                or self.permit.effect_id != self.effect_id
+                or self.permit.namespace != self.namespace
+                or any(type(value) is not str or not value.startswith("sha256:")
+                       or len(value) != 71
+                       or any(ch not in "0123456789abcdef" for ch in value[7:])
+                       for value in (
+                           self.claim_digest, self.binding_digest))):
+            raise ValueError("handoff start identity is invalid")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"handoff_id": self.handoff_id, "operation_id": self.operation_id,
+                "effect_id": self.effect_id, "namespace": self.namespace,
+                "claim_digest": self.claim_digest,
+                "binding_digest": self.binding_digest,
+                "graph_claim_ref": self.graph_claim_ref,
+                "permit": to_wire(self.permit), "replay": self.replay,
+                "graph_claim_receipt": (to_wire(self.graph_claim_receipt)
+                                        if self.graph_claim_receipt is not None else None)}
+
+    @classmethod
+    def from_wire(cls, value: object) -> "HandoffStartV2":
+        if type(value) is not dict or set(value) != {
+                "handoff_id", "operation_id", "effect_id", "namespace",
+                "claim_digest", "binding_digest", "graph_claim_ref", "permit",
+                "replay", "graph_claim_receipt"}:
+            raise ValueError("handoff start wire fields differ")
+        permit = from_wire(value["permit"])
+        receipt = (from_wire(value["graph_claim_receipt"])
+                   if value["graph_claim_receipt"] is not None else None)
+        result = cls(**{key: item for key, item in value.items()
+                        if key not in ("permit", "graph_claim_receipt")},
+                     permit=permit, graph_claim_receipt=receipt)
+        if result.to_wire() != value:
+            raise ValueError("handoff start wire is not canonical")
+        return result
+
+
+__all__ = ["SCHEMA", "FencePermitV2", "ContentWriteAttemptObservationV1", "FenceNeverBegunReceiptV2", "PendingMutationV2", "MutationReceiptV2",
            "ExecutionBindingV1", "ExecutionBindingV2", "PlatformObservationV1",
            "PlatformObservationV2",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
@@ -1507,4 +1793,5 @@ __all__ = ["SCHEMA", "FencePermitV2", "FenceNeverBegunReceiptV2", "PendingMutati
            "OwnerDispatchWitnessV1", "AuthorityUnresolvedEffectV1",
            "AuthorityDispatchSnapshotV1",
            "AuthorityCurrentEffectSnapshotV2",
-           "DispatchGraphClaimReceiptV1"]
+           "DispatchGraphClaimReceiptV1", 'CurrentEffectReadV2', 'HandoffStartV2','NaturalFinalAuthorityOwnerStateV4',
+           'AuthorityNaturalFinalEffectObservationV4','NaturalFinalEffectObservationReadV4']

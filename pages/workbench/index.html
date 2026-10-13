@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sylanne WebUI / 模块状态</title>
+<style>body{font:15px/1.7 system-ui,sans-serif;margin:32px;max-width:900px;color:#334147;background:#f4f6f2}h1{font-size:26px;font-weight:500}button,input{font:inherit;min-height:44px;padding:8px 12px;border:1px solid #acbcb5;background:transparent;color:inherit}input{width:100%;box-sizing:border-box}button{cursor:pointer}dl{display:grid;grid-template-columns:1fr 1fr;gap:10px}dd{margin:0}p{overflow-wrap:anywhere}.notice{padding:12px 0;border-bottom:1px solid #bcc9c1}.modules{columns:2;list-style:none;padding:0}li{padding:5px 0}@media(max-width:600px){body{margin:18px}.modules{columns:1}}</style></head>
+<body><h1>Sylanne WebUI</h1><p>高级设置在独立工作台；插件配置页保留运行许可、模型选择、端口和 D01–D13 开关。</p>
+<p id="state" role="status">正在读取本插件的实际监听状态。</p>
+<label for="address">独立入口地址</label><input id="address" readonly><button id="select" type="button">选择地址</button>
+<p>复制上面的地址并在浏览器新标签打开。AstrBot 4.28.2 的插件 Page 使用受限 iframe，此页不携带登录令牌跳转。</p>
+<p class="notice">Docker 映射 <code>2718:2718</code>；监听 <code>0.0.0.0</code> 时浏览器使用宿主机 IP 或域名。自定义端口后映射对应容器端口。</p>
+<p id="security"></p><p id="business"></p><p id="origin"></p><h2>D01–D13 当前启动许可</h2><ul id="modules" class="modules"></ul><button id="read" type="button">重新读取状态</button>
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<script>
+const labels=['主体与人格','身体与需求','世界与情境','情绪与调节','社会关系','记忆系统','注意与认知','动机与执行','对话与表达','生活与主动行为','运行内核与宿主','工作台与交付','短期上下文'];
+const state=document.getElementById('state'),address=document.getElementById('address'),read=document.getElementById('read');
+document.getElementById('select').onclick=()=>{address.focus();address.select()};
+async function load(){read.disabled=true;try{
+ await window.AstrBotPluginPage.ready();
+ const data=await window.AstrBotPluginPage.apiGet('workbench/v1/host-controls/v1');
+ if(data.schema_version!=='sylanne.host-controls.v1')throw Error('unsupported');
+ const listener=data.listener;
+ if(listener){const values=listener.startup_values;const bound=listener.bound_addresses?.[0];const actualPort=bound?.port??values.port;state.textContent=`${listener.state} · ${listener.scheme.toUpperCase()} · ${bound?.host??values.bind}:${actualPort} · ${listener.reason_code}`;
+  if(listener.state==='listening'){const url=new URL(window.location.href);url.protocol=listener.scheme+':';url.port=String(actualPort);url.pathname='/';url.search='';url.hash='';address.value=url.href}else{address.value=''}
+  document.getElementById('security').textContent=listener.state!=='listening'?'当前入口尚未监听，请先处理上面的启动原因。':listener.scheme==='https'?'此端口已加载 HTTPS。必须复制上方以 https:// 开头的完整地址；直接输入 IP:端口 可能按 HTTP 打开并出现 ERR_EMPTY_RESPONSE。浏览器证书须匹配实际域名或 IP，后台与 Owner 登录仍分别核验。':'此 HTTP 端口提供前端与公开状态，安全 API 尚未开放。请在 AstrBot 全局配置中启用 WebUI HTTPS，填写容器内可读的 PEM 证书和私钥路径，然后完整重启 AstrBot。启用后使用与证书匹配的域名或 IP 访问 HTTPS 2718。';
+ }else{state.textContent='监听服务不可用，请核对插件启动日志。';address.value=''}
+ document.getElementById('business').textContent=data.business_enabled?'本机与 Authority 总许可均开启；各项业务仍须通过当前授权。':'当前业务总许可未开启；配置和恢复入口仍可使用。';
+ document.getElementById('origin').textContent=data.required_origin?'已安装 Owner 来源：'+data.required_origin+'。更换端口后需正式登记新的 HTTPS 来源。':'尚未取得正式安装的 Owner 来源。';
+ const modules=document.getElementById('modules');modules.replaceChildren();
+ if(data.modules.startup_values)labels.forEach((label,i)=>{const key='d'+String(i+1).padStart(2,'0'),li=document.createElement('li');li.textContent=key.toUpperCase()+' '+label+'：'+(data.modules.startup_values[key]?'允许新工作':'关闭新工作');modules.append(li)});
+ }catch{try{const health=await window.AstrBotPluginPage.apiGet('workbench/v1/status');state.textContent=health.reason_code==='runtime_restart_required'?'新包已导入，当前进程仍加载旧运行库。请完整重启 AstrBot 后读取新端口状态。':'未取得状态，请确认当前后台登录和插件启动日志。'}catch{state.textContent='未取得状态，请确认当前后台登录和插件启动日志。'}}finally{read.disabled=false}}
+read.onclick=load;load();
+</script></body></html>

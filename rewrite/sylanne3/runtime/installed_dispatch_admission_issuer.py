@@ -897,6 +897,7 @@ def inspect_current_d11_dispatch_budget(
     db, intent: ActionIntent, *, d11_issuer: D11BudgetGrantIssuer | None,
     d02_issuer: D02ResourceIssuer | None, now_utc: float,
     natural_communication: bool = False,
+    natural_budget_original_receiver=None,
 ) -> DispatchBudgetInspectionV1:
     """Recompute one scoped D11 budget check from signed and durable state.
 
@@ -1018,6 +1019,12 @@ def inspect_current_d11_dispatch_budget(
     if ledger.result != "pass" or ledger.coverage != "full":
         return hold("d11.current_budget_provider_not_pass",
                     lease_id=lease_id, quote_id=quote_id)
+    if natural_communication and natural_budget_original_receiver is not None:
+        from ..authority_service.c09_natural_final_budget_v4 import _mint_natural_final_budget_original_v4
+        original = _mint_natural_final_budget_original_v4(
+            db, intent=intent, quote=quote, grant=grant, lease=lease, reservation=reservation,
+            receipt=ledger, d11_issuer=d11_issuer, d02_issuer=d02_issuer, now_utc=now_utc)
+        natural_budget_original_receiver(original)
     return DispatchBudgetInspectionV1("check_pass", (), ledger, lease_id, quote_id)
 
 

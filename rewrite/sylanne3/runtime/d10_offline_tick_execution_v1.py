@@ -35,7 +35,7 @@ class PrepareCurrentOfflineTickRequestV1:
         _utc(self.scheduled_at_utc)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class OfflineTickGraphReadV1:
     ref: str
     revision: int
@@ -46,7 +46,9 @@ class OfflineTickGraphReadV1:
         AtomKey.from_token(self.ref)
         if type(self.revision) is not int or self.revision < 0 or type(self.valid) is not bool:
             raise ValueError("exact current tick graph read required")
-        if canonical_serialize(json.loads(self.value_json)) != self.value_json:
+        from .domain_background_read_v3 import background_offline_read_row_json_v3
+        prepared,_value=background_offline_read_row_json_v3(self)
+        if not prepared and canonical_serialize(json.loads(self.value_json)) != self.value_json:
             raise ValueError("tick original contains noncanonical current graph bytes")
 
 
@@ -116,10 +118,12 @@ def read_plan_current_offline_tick_v1(db, *, namespace, activity_id, operation_k
     keys = [owner_grant_key(*namespace.as_tuple), AtomKey(Owner("activity", *namespace.as_tuple, activity_id), "runtime.job", ids["job"])]
     originals = [request.schedule_ref]
     if table_exists_v1(db, TABLE):
-        row = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' AND original_ref=?",
-            (*namespace.as_tuple, request.schedule_ref)).fetchone()
-        if row:
-            originals.append(json.loads(row[0])["clock_mapping_ref"])
+        from .domain_background_read_v3 import background_point_v3,background_json_loads_v3
+        row=background_point_v3(db,table=TABLE,columns=('payload_json',),key_columns=('bot','persona','kind','original_ref'),
+            key=(*namespace.as_tuple,'registered_schedule',request.schedule_ref),legacy_reader=lambda:db.execute(
+                "SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' AND original_ref=?",
+                (*namespace.as_tuple,request.schedule_ref)).fetchone())
+        if row:originals.append(background_json_loads_v3(row[0])["clock_mapping_ref"])
     return production_read_plan_v1(("d01.persona_activation.v1", "d03.role_binding"), keys, (), originals)
 
 
@@ -150,7 +154,12 @@ def stage_prepare_current_offline_tick_in_transaction_v1(db, *, frame, request, 
 
 def _decode_json(value, kind):
     from .domain_production_erasure_v1 import _json, decode_typed_production_value_v1
-    return decode_typed_production_value_v1(_json(value), kind)
+    from .domain_background_read_v3 import BackgroundJSONColumnV3,background_json_loads_v3
+    if type(value)is BackgroundJSONColumnV3 and kind is D10OfflineTickPreparedV1:
+        from .domain_background_read_v3 import bind_background_offline_prepared_json_v3
+        raw=background_json_loads_v3(value)
+        with bind_background_offline_prepared_json_v3(value,raw):return decode_typed_production_value_v1(raw,kind)
+    return decode_typed_production_value_v1(background_json_loads_v3(value) if type(value)is BackgroundJSONColumnV3 else _json(value),kind)
 
 
 def validate_offline_tick_prepared_content_v1(prepared):
@@ -240,7 +249,9 @@ def validate_offline_tick_prepared_content_v1(prepared):
         key = AtomKey.from_token(row.ref)
         if NamespaceId.from_key(key) != binding.namespace:
             raise ValueError("offline frozen content read crossed namespace")
-        raw = _json(row.value_json)
+        from .domain_background_read_v3 import background_offline_read_row_json_v3
+        prepared_row,raw=background_offline_read_row_json_v3(row)
+        if not prepared_row:raw=_json(row.value_json)
         if row.revision == 0:
             if row.valid or raw != {}:
                 raise ValueError("offline absent content read has body content")
@@ -372,19 +383,23 @@ def prepare_current_offline_tick_in_transaction_v1(db, *, frame, request, issuer
 
 
 def read_prepared_offline_tick_v1(db, *, namespace, prepared_original_ref, issuer):
+    from .domain_background_read_v3 import (background_point_v3,background_json_loads_v3,
+        background_json_matches_v3,background_json_digest_v3,background_plain_original_digest_v3)
     from .d01_production_operations_v1 import table_exists_v1
     if not table_exists_v1(db, TABLE):
         return None
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='prepared_tick' AND original_ref=?", (*namespace.as_tuple, prepared_original_ref)).fetchone()
+    row=background_point_v3(db,table=TABLE,columns=('producing_operation_id','payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'),key=(*namespace.as_tuple,'prepared_tick',prepared_original_ref),
+        legacy_reader=lambda:db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='prepared_tick' AND original_ref=?", (*namespace.as_tuple, prepared_original_ref)).fetchone())
     if row is None:
         return None
     from .d11_offline_originals_v1 import SIGN_KIND
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     issuer._signer.verify(SIGN_KIND, canonical_serialize((namespace, "prepared_tick", prepared_original_ref, row[2])), row[3])
-    raw = json.loads(row[1])
+    raw = background_json_loads_v3(row[1])
     value = decode_typed_production_value_v1(raw, D10OfflineTickPreparedV1)
-    if canonical_serialize(raw) != row[1] or value.digest != row[2] or value.binding.namespace != namespace:
+    if not background_json_matches_v3(row[1],raw) or background_plain_original_digest_v3(row[1],value) != row[2] or value.binding.namespace != namespace:
         raise ValueError("signed actual offline preparation bytes differ")
     from .domain_production_read_plans_v1 import _committed
     _committed(db, namespace, row[0])
@@ -397,29 +412,34 @@ def read_prepared_offline_tick_v1(db, *, namespace, prepared_original_ref, issue
 
 def _verify_offline_original_inputs_v1(db, prepared, issuer, resource_issuer, now_utc, *, for_execution=True):
     """Read-only signature, reservation, clock and registered policy joins."""
+    from .domain_background_read_v3 import (background_point_v3,background_rows_v3,background_json_matches_v3,
+        background_json_loads_v3,background_verify_signature_v3,background_json_digest_v3)
     from .d11_offline_originals_v1 import read_current_d11_offline_value_v1
     from .d01_production_operations_v1 import table_exists_v1
     ns, binding = prepared.binding.namespace, prepared.binding
     schedule = read_current_d11_offline_value_v1(db, namespace=ns, original_ref=binding.schedule_ref, issuer=issuer)
     if schedule != prepared.schedule:
         raise ValueError("offline original registered schedule differs from frozen content")
-    rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' ORDER BY original_ref LIMIT 129", ns.as_tuple).fetchall()
+    rows=background_rows_v3(db,table=TABLE,columns=('original_ref',),group_columns=('bot','persona','kind'),
+        group=(*ns.as_tuple,'registered_schedule'),order_columns=('original_ref',),limit=129,
+        legacy_reader=lambda:db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' ORDER BY original_ref LIMIT 129",ns.as_tuple).fetchall())
     if len(rows) > 128:
         raise ValueError("offline current schedule inventory exceeds its bound")
     group = tuple(value for (ref,) in rows if (value := read_current_d11_offline_value_v1(db, namespace=ns,
         original_ref=ref, issuer=issuer)).schedule_id == schedule.schedule_id)
     if max(value.revision for value in group) != schedule.revision:
         raise ValueError("offline prepared schedule has been explicitly superseded")
-    recipe_row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM graph_d10_production_inputs_v1 "
-        "WHERE bot=? AND persona=? AND kind='offline_recipe' AND original_ref=?", (*ns.as_tuple, schedule.recipe_ref)).fetchone()
+    recipe_row=background_point_v3(db,table='graph_d10_production_inputs_v1',columns=('producing_operation_id','payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','original_ref'),key=(*ns.as_tuple,schedule.recipe_ref),legacy_reader=lambda:db.execute(
+            "SELECT producing_operation_id,payload_json,payload_digest,signature FROM graph_d10_production_inputs_v1 WHERE bot=? AND persona=? AND kind='offline_recipe' AND original_ref=?",(*ns.as_tuple,schedule.recipe_ref)).fetchone())
     schedule_row = db.execute("SELECT producing_operation_id FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' AND original_ref=?",
         (*ns.as_tuple, schedule.schedule_ref)).fetchone()
     if recipe_row is None or schedule_row is None or recipe_row[0] != schedule_row[0]:
         raise ValueError("offline actual schedule/recipe producing operation differs")
-    issuer._signer.verify("d11.d10-production-input.v1", recipe_row[1], recipe_row[3])
+    background_verify_signature_v3(issuer._signer,"d11.d10-production-input.v1",recipe_row[1],recipe_row[3])
     from ..domains.d10.offline_interval import OfflineTickRecipeV1, offline_tick_recipe_to_wire_v1
     recipe = _decode_json(recipe_row[1], OfflineTickRecipeV1)
-    if (canonical_digest(offline_tick_recipe_to_wire_v1(recipe)) != recipe_row[2] or (recipe.recipe_id, recipe.version,
+    if (background_json_digest_v3(recipe_row[1],offline_tick_recipe_to_wire_v1(recipe)) != recipe_row[2] or (recipe.recipe_id, recipe.version,
             recipe.schedule_ref, recipe.cadence_seconds, recipe.max_ticks_per_slice, recipe.cadence_origin_utc) != (schedule.recipe_ref, schedule.revision,
             VersionedRef(schedule.schedule_ref, schedule.revision), schedule.cadence_seconds, schedule.max_ticks_per_slice, schedule.starts_at_utc)):
         raise ValueError("offline original recipe does not bind its exact registered schedule")
@@ -430,9 +450,9 @@ def _verify_offline_original_inputs_v1(db, prepared, issuer, resource_issuer, no
     if prepared.quote_json != canonical_serialize(plain_v1(quote)):
         raise ValueError("offline signed original quote changed")
     grant = issuer.current_budget_grant(db, binding.parent_budget_lease_ref)
-    grant_row = db.execute("SELECT grant_json,signature FROM runtime_budget_grants WHERE lease_id=? AND version=?",
-        (grant.lease_id, grant.version)).fetchone()
-    if grant_row != (prepared.signed_grant_json, prepared.signed_grant_signature):
+    grant_row=background_point_v3(db,table='runtime_budget_grants',columns=('grant_json','signature'),key_columns=('lease_id','version'),
+        key=(grant.lease_id,grant.version),legacy_reader=lambda:db.execute("SELECT grant_json,signature FROM runtime_budget_grants WHERE lease_id=? AND version=?",(grant.lease_id,grant.version)).fetchone())
+    if grant_row is None or grant_row[1]!=prepared.signed_grant_signature or not background_json_matches_v3(grant_row[0],json.loads(prepared.signed_grant_json)):
         raise ValueError("offline original signed grant changed")
     current = get_budget_lease(db, binding.parent_budget_lease_ref)
     original = _decode_json(prepared.parent_budget_json, BudgetLease)
@@ -441,24 +461,27 @@ def _verify_offline_original_inputs_v1(db, prepared, issuer, resource_issuer, no
             or (for_execution and (grant.valid_until_utc <= now_utc or _utc(binding.deadline_utc).timestamp() <= now_utc
                 or _utc(binding.job_lease_expires_utc).timestamp() <= now_utc))):
         raise ValueError("offline prepared budget or original worker deadline is no longer current")
-    reservation = db.execute("SELECT digest,ceiling_json,state,actual_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
-        (binding.parent_budget_lease_ref, binding.reservation_operation_id)).fetchone()
-    reserve = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-        (*ns.as_tuple, binding.reservation_operation_id)).fetchone()
-    if (reservation != (binding.reservation_digest, canonical_serialize({"thread_cpu_ms": binding.cpu_ceiling_ms}), "reserved", None)
-            or reserve != (prepared.reserve_receipt_json,)):
+    reservation=background_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json','state','actual_json'),
+        key_columns=('lease_id','operation_id'),key=(binding.parent_budget_lease_ref,binding.reservation_operation_id),legacy_reader=lambda:db.execute(
+            "SELECT digest,ceiling_json,state,actual_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",(binding.parent_budget_lease_ref,binding.reservation_operation_id)).fetchone())
+    reserve=background_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),key_columns=('bot_id','persona_id','operation_id','phase'),
+        key=(*ns.as_tuple,binding.reservation_operation_id,'reserve'),legacy_reader=lambda:db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",(*ns.as_tuple,binding.reservation_operation_id)).fetchone())
+    if (reservation is None or (reservation[0],reservation[2],reservation[3])!=(binding.reservation_digest,'reserved',None)
+            or not background_json_matches_v3(reservation[1],{'thread_cpu_ms':binding.cpu_ceiling_ms})
+            or reserve is None or not background_json_matches_v3(reserve[0],json.loads(prepared.reserve_receipt_json))):
         raise ValueError("offline actual reserved CPU/receipt differs from original preparation")
     require_budget_family_admissible(db, binding.parent_budget_lease_ref)
     return prepared
 
 
 def _verify_offline_content_rows_v1(db, prepared):
+    from .domain_background_read_v3 import background_graph_head_v3,background_json_matches_v3
     for frozen in prepared.read_rows:
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (frozen.ref,)).fetchone()
+        row=background_graph_head_v3(db,prepared.binding.namespace,AtomKey.from_token(frozen.ref))
         expected = (frozen.revision, frozen.value_json, int(frozen.valid))
         if frozen.revision == 0 and row is None:
             continue
-        if row != expected:
+        if row is None or (row[0],row[2])!=(frozen.revision,int(frozen.valid)) or not background_json_matches_v3(row[1],json.loads(frozen.value_json)):
             raise ValueError("offline frozen actual current input row changed")
     return prepared
 

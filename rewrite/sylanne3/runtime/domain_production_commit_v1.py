@@ -42,9 +42,168 @@ class _ProductionCommitWitnessV1:
 
 
 _ACTIVE = {}
+_FOREGROUND_VALIDATED = {}
+_FOREGROUND_APPLIED = {}
+
+
+def require_owner_stop_projection_commit_v1(witness, graph, db, bundle=None):
+    from types import SimpleNamespace
+    from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1, stage_owner_stop_reply_projection_v1
+    from .domain_production_contracts_v1 import require_owner_stop_projection_frame_v1
+    if (type(witness) is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness)) is not witness
+            or witness.graph is not graph or witness.runtime.graph is not graph
+            or type(witness.stage) is not OwnerStopReplyProjectionStageV1
+            or witness.operation.operation_kind != "owner_stop_reply_v1"
+            or db is not graph._GraphCoordinator__store._db or not db.in_transaction
+            or not graph._GraphCoordinator__store._lock._is_owned()
+            or bundle is not None and witness.bundle != bundle):
+        raise ValueError("Stop projection requires its exact active installed W01 witness")
+    observed = require_owner_stop_projection_frame_v1(witness.frame)
+    if (witness.runtime._active_owner_stop_projection_v1 is not witness.frame.issuance
+            or witness.request != observed.request or witness.stage.original != observed.initial_original
+            or witness.scope != witness.frame.issuance.scope
+            or witness.bundle.envelope != witness.frame.envelope
+            or witness.bundle.proposals != witness.stage.stage.proposals):
+        raise ValueError("Stop projection changed its original private Owner/permit bundle")
+    rebuilt = stage_owner_stop_reply_projection_v1(db, frame=witness.frame, request=witness.request,
+        original=observed.initial_original, installed_readers=SimpleNamespace(issuer=graph._GraphCoordinator__d11_issuer))
+    if rebuilt != witness.stage:
+        raise ValueError("Stop projection actual metadata changed before CAS")
+    return witness
+
+
+def foreground_domain_finish_digest_v1(selector, permit):
+    return "sha256:" + canonical_digest({"schema": "w01.foreground-domain-write.v1",
+        "operation_id": selector.operation_id, "request_digest": canonical_digest(selector), "permit_token": permit.token})
+
+
+def owner_task_domain_finish_digest_v1(selector, permit):
+    return 'sha256:' + canonical_digest({'schema':'w01.owner-task-domain-write.v1',
+        'operation_id':selector.operation_id,'request_digest':canonical_digest(selector),'permit_token':permit.token})
+
+
+def _require_owner_task_witness_v1(witness, graph, db, bundle):
+    from .owner_source_note_task_issuance_v1 import require_owner_source_note_task_issuance_v1
+    from ..authority_service.current_owner_source_note_task_v1 import owner_task_typed_command_digest_v1
+    issued=getattr(witness.runtime,'_active_owner_task_issuance_v1',None)
+    if getattr(witness.runtime,'_active_foreground_issuance_v1',None) is not None:
+        raise ValueError('Owner task and foreground issuances cannot overlap')
+    evidence=require_owner_source_note_task_issuance_v1(issued,graph,witness.scope)
+    envelope=bundle.envelope
+    if (evidence.request.request_digest!=owner_task_typed_command_digest_v1(witness.operation,witness.request)
+            or envelope.authority.issuer_domain!=witness.operation.domain
+            or envelope.identity.phase!=witness.operation.operation_kind
+            or envelope.identity.operation_id!=evidence.request.operation_id
+            or envelope.authority.actor!=evidence.current_self.self_entity_ref
+            or witness.frame.owner_guard!=evidence.owner_guard
+            or not {proposal.domain for proposal in bundle.proposals}<=set(evidence.allowed_write_domains)):
+        raise ValueError('Owner task final command/domain/actor differs from its real private issuance')
+    return issued,evidence
+
+
+def _require_foreground_witness_v1(witness, graph, db, bundle):
+    from .foreground_activity_issuance_v1 import require_foreground_activity_issuance_v1
+    from ..authority_service.current_foreground_activity_v1 import foreground_typed_command_digest_v1
+    issued = getattr(witness.runtime, "_active_foreground_issuance_v1", None)
+    evidence = require_foreground_activity_issuance_v1(issued, graph, witness.scope)
+    envelope = bundle.envelope
+    if (evidence.request.request_digest != foreground_typed_command_digest_v1(witness.operation, witness.request)
+            or envelope.authority.issuer_domain != witness.operation.domain
+            or envelope.identity.phase != witness.operation.operation_kind
+            or envelope.identity.operation_id != evidence.request.operation_id
+            or envelope.authority.actor != evidence.current_self.self_entity_ref
+            or witness.frame.owner_guard != evidence.owner_guard
+            or not {proposal.domain for proposal in bundle.proposals} <= set(evidence.allowed_write_domains)):
+        raise ValueError("final foreground issuer/phase/body/domain/actor differs from actual issued qualification")
+    if witness.operation.operation_kind == "await_existing_artifact_revision_v1":
+        from ..domains.d10.project_checkpoint_v1 import project_checkpoint_key_v1
+        key = project_checkpoint_key_v1(evidence.request.namespace, witness.request.project_ref)
+        writes = tuple(write for proposal in bundle.proposals for write in proposal.typed_writes)
+        if (len(bundle.proposals) != 1 or bundle.proposals[0].domain != "d10"
+                or len(writes) != 1 or writes[0].key != key
+                or writes[0].value["state"] != "waiting" or writes[0].value["next_step"] is not None):
+            raise ValueError("artifact waiting bridge may write only its exact metadata checkpoint")
+    return issued, evidence
+
+
+def apply_foreground_cycle_before_graph_write_v1(witness, graph, db):
+    from .c04_ingress_preparation_v4 import _SelfC04CommitV4, apply_self_c04_prepare_once_v4
+    from .c04_ingress_adoption_v4 import SelfC04AdoptionStageV4, apply_self_c04_adoption_once_v4
+    if type(witness) is _SelfC04CommitV4:
+        return apply_self_c04_prepare_once_v4(witness, graph, db)
+    if type(getattr(witness, "stage", None)) is SelfC04AdoptionStageV4:
+        return apply_self_c04_adoption_once_v4(witness, graph, db)
+    """The fixed W01 guard calls this after current CAS guards, before projection reconciliation."""
+    from .cancel_owner_source_note_task_v1 import CancelOwnerSourceNoteTaskStageV1,apply_cancel_owner_source_note_task_in_transaction_v1
+    if type(getattr(witness,'stage',None)) is CancelOwnerSourceNoteTaskStageV1:
+        if (_ACTIVE.get(id(witness)) is not witness or _FOREGROUND_VALIDATED.get(id(witness)) is not witness
+                or id(witness) in _FOREGROUND_APPLIED):
+            raise ValueError('Owner cancellation once apply requires its exact current W01 witness')
+        apply_cancel_owner_source_note_task_in_transaction_v1(db,stage=witness.stage)
+        _FOREGROUND_APPLIED[id(witness)]=witness
+        return True
+    from .owner_source_note_task_execution_v1 import (OwnerSourceNoteTaskStageV1,
+        apply_owner_source_note_task_stage_in_transaction_v1)
+    if type(getattr(witness,'stage',None)) is OwnerSourceNoteTaskStageV1:
+        if (_ACTIVE.get(id(witness)) is not witness or _FOREGROUND_VALIDATED.get(id(witness)) is not witness
+                or id(witness) in _FOREGROUND_APPLIED):
+            raise ValueError('Owner task once apply requires its exact privately validated W01 witness')
+        _require_owner_task_witness_v1(witness,graph,db,witness.bundle)
+        apply_owner_source_note_task_stage_in_transaction_v1(db,stage=witness.stage)
+        _FOREGROUND_APPLIED[id(witness)]=witness
+        return True
+    from .d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1, apply_ingress_recall_result_once_v1
+    if type(getattr(witness, "stage", None)) is D07IngressRecallResultStageV1:
+        return apply_ingress_recall_result_once_v1(witness, graph, db)
+    from .d07_ingress_recall_acquisition_v1 import D07IngressRecallAcquisitionStageV1, apply_ingress_recall_acquisition_once_v1
+    if type(getattr(witness, "stage", None)) is D07IngressRecallAcquisitionStageV1:
+        return apply_ingress_recall_acquisition_once_v1(witness, graph, db)
+    from .d07_ingress_recall_preparation_v1 import D07IngressRecallMaterializedStageV1, apply_ingress_recall_cycle_once_v1
+    if type(getattr(witness, "stage", None)) is D07IngressRecallMaterializedStageV1:
+        return apply_ingress_recall_cycle_once_v1(witness, graph, db)
+    from .foreground_cycle_v1 import ForegroundCycleStageV1, apply_foreground_cycle_stage_v1
+    from .d11_artifact_draft_model_v1 import ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, apply_artifact_draft_model_stage_v1
+    from .d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2, apply_artifact_draft_content_stage_v1
+    from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1, apply_owner_stop_reply_projection_once_v1
+    if type(getattr(witness, "stage", None)) is OwnerStopReplyProjectionStageV1:
+        from types import SimpleNamespace
+        require_owner_stop_projection_commit_v1(witness, graph, db)
+        if id(witness) in _FOREGROUND_APPLIED:
+            raise ValueError("Stop projection cannot apply twice in one CAS")
+        apply_owner_stop_reply_projection_once_v1(db, witness.stage,
+            SimpleNamespace(issuer=graph._GraphCoordinator__d11_issuer))
+        _FOREGROUND_APPLIED[id(witness)] = witness
+        return True
+    if type(getattr(witness, "stage", None)) not in {ForegroundCycleStageV1, ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2}:
+        return False
+    if (_ACTIVE.get(id(witness)) is not witness or _FOREGROUND_VALIDATED.get(id(witness)) is not witness
+            or witness.graph is not graph or db is not graph._GraphCoordinator__store._db
+            or not db.in_transaction or not graph._GraphCoordinator__store._lock._is_owned()
+            or id(witness) in _FOREGROUND_APPLIED):
+        raise ValueError("foreground once-apply requires its privately validated exact W01 witness")
+    issued, evidence = _require_foreground_witness_v1(witness, graph, db, witness.bundle)
+    from .domain_production_registry_v1 import installed_readers_for_operation_v1
+    readers = installed_readers_for_operation_v1(graph, witness.operation, scope=witness.scope,
+        owner_guard=evidence.owner_guard, foreground_issuance=issued)
+    if type(witness.stage) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2}:
+        return apply_artifact_draft_model_stage_v1(witness, graph, db, readers)
+    if type(witness.stage) in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}:
+        return apply_artifact_draft_content_stage_v1(witness, graph, db, readers)
+    if type(witness.stage) is ArtifactDraftPhaseVerificationStageV2:
+        from .d11_artifact_draft_content_v1 import apply_artifact_draft_phase_verification_stage_v2
+        return apply_artifact_draft_phase_verification_stage_v2(witness, graph, db, readers)
+    apply_foreground_cycle_stage_v1(db, witness.stage, readers)
+    _FOREGROUND_APPLIED[id(witness)] = witness
+    return True
 
 
 def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
+    from .c04_ingress_preparation_v4 import _SelfC04CommitV4, require_self_c04_prepare_commit_v4
+    from .c04_ingress_adoption_v4 import SelfC04AdoptionStageV4, require_self_c04_adoption_commit_v4
+    if type(witness) is _SelfC04CommitV4:
+        return require_self_c04_prepare_commit_v4(witness, graph, db, bundle, v2_write)
+    if type(getattr(witness, "stage", None)) is SelfC04AdoptionStageV4:
+        return require_self_c04_adoption_commit_v4(witness, graph, db, bundle, v2_write)
     from .internal_life_content_worker_v2 import InternalLifeContentAcquisitionStageV2
     if type(getattr(witness,'stage',None)) is InternalLifeContentAcquisitionStageV2:
         from .internal_life_content_worker_v2 import (
@@ -89,6 +248,122 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
             or not graph._anchor_matches(v2_write[0].requirements, witness.scope.pinned_anchor)):
         raise ValueError('installed domain commit witness/current Graph fence differs')
     witness.runtime._current()
+    from .owner_material_source_storage_v3 import (
+        StagedDomainOperationV3,require_owner_material_sealed_stage_v3,
+    )
+    if type(witness.stage) is StagedDomainOperationV3:
+        require_owner_material_sealed_stage_v3(
+            witness.stage,witness.runtime,db,frame=witness.frame,
+            request=witness.request,scope=witness.scope,
+            installed_readers=witness.stage.prepared.readers)
+        if (witness.stage.operation_kind!=witness.operation.operation_kind
+                or witness.stage.proposals!=bundle.proposals):
+            raise ValueError('sealed Owner Source operation or actual W01 proposals changed')
+        return witness
+    from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
+    if type(witness.stage) is OwnerStopReplyProjectionStageV1:
+        return require_owner_stop_projection_commit_v1(witness, graph, db, bundle)
+    owner_task=getattr(witness.runtime,'_active_owner_task_issuance_v1',None)
+    if owner_task is not None:
+        issued,evidence=_require_owner_task_witness_v1(witness,graph,db,bundle)
+        from .d11_life_preparation_v1 import LifePreparationStageV1,verify_life_preparation_in_transaction_v1
+        if type(witness.stage) is LifePreparationStageV1:
+            from .d11_life_preparation_commit_v1 import life_preparation_bundle_v1
+            verify_life_preparation_in_transaction_v1(db,witness.stage,issuer=graph._GraphCoordinator__d11_issuer,
+                resource_issuer=graph._GraphCoordinator__d02_issuer)
+            if life_preparation_bundle_v1(graph,witness.stage)!=bundle:
+                raise ValueError('Owner task SourceNote preparation changed its actual job-only bundle')
+            return witness
+        rebuilt_frame,rebuilt,_=witness.runtime.compile_owner_task_in_transaction_v1(db,
+            operation=witness.operation,request=witness.request,envelope=witness.frame.envelope,
+            scope=witness.scope,issued=issued,now_utc=witness.frame.now_utc,
+            external_originals=witness.external_originals)
+        if rebuilt_frame!=witness.frame or rebuilt!=witness.stage or _members(rebuilt)[1]!=bundle.proposals:
+            raise ValueError('Owner task actual current stage changed before Graph CAS')
+        from .owner_source_note_task_execution_v1 import OwnerSourceNoteTaskStageV1,verify_owner_source_note_task_stage_v1
+        if type(witness.stage) is OwnerSourceNoteTaskStageV1:
+            verify_owner_source_note_task_stage_v1(witness.stage)
+            _FOREGROUND_VALIDATED[id(witness)]=witness
+        return witness
+    foreground = getattr(witness.runtime, "_active_foreground_issuance_v1", None)
+    if foreground is not None:
+        issued, evidence = _require_foreground_witness_v1(witness, graph, db, bundle)
+        from .d07_ingress_recall_preparation_v1 import D07IngressRecallMaterializedStageV1, verify_ingress_recall_model_commit_v1
+        if type(witness.stage) is D07IngressRecallMaterializedStageV1:
+            return verify_ingress_recall_model_commit_v1(witness, graph, db, bundle)
+        from .foreground_cycle_v1 import ForegroundCycleStageV1, verify_foreground_cycle_stage_v1
+        if type(witness.stage) is ForegroundCycleStageV1:
+            from .domain_production_registry_v1 import installed_readers_for_operation_v1
+            readers = installed_readers_for_operation_v1(graph, witness.operation, scope=witness.scope,
+                owner_guard=evidence.owner_guard, foreground_issuance=issued)
+            verify_foreground_cycle_stage_v1(db, witness.stage, readers)
+            if witness.stage.stage.proposals != bundle.proposals:
+                raise ValueError("foreground job bundle differs from its pure frozen proposal")
+            _FOREGROUND_VALIDATED[id(witness)] = witness
+            return witness
+        from .d11_life_preparation_v1 import LifePreparationStageV1, verify_life_preparation_in_transaction_v1
+        if type(witness.stage) is LifePreparationStageV1:
+            from .d11_life_preparation_commit_v1 import life_preparation_bundle_v1
+            verify_life_preparation_in_transaction_v1(db, witness.stage,
+                issuer=graph._GraphCoordinator__d11_issuer, resource_issuer=graph._GraphCoordinator__d02_issuer)
+            if life_preparation_bundle_v1(graph, witness.stage) != bundle:
+                raise ValueError("foreground draft Life preparation changed its actual job-only bundle")
+            return witness
+        frame, stage, _ = witness.runtime.compile_foreground_in_transaction(db, operation=witness.operation,
+            request=witness.request, envelope=witness.frame.envelope, scope=witness.scope, issued=issued,
+            now_utc=witness.frame.now_utc, external_originals=witness.external_originals)
+        if frame != witness.frame or stage != witness.stage:
+            raise ValueError("foreground exact stage changed at final Graph CAS")
+        from .artifact_continuation_originals_v1 import ExistingArtifactRevisionStageV1
+        from .artifact_task_observer_v1 import ArtifactTaskSettlementStageV1
+        from .d08_personal_plan_v1 import ArtifactTaskPlanRevisionStageV2
+        from .ingress_artifact_task_scope_v1 import IngressArtifactTaskScopeStageV1
+        from .d11_artifact_draft_model_v1 import ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, validate_artifact_draft_model_proposal_v1
+        from .d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2, validate_artifact_draft_content_job_proposal_v1
+        from .d07_ingress_recall_acquisition_v1 import D07IngressRecallAcquisitionStageV1
+        from .d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1
+        if type(stage) in {D07IngressRecallAcquisitionStageV1, D07IngressRecallResultStageV1}:
+            if stage.stage.proposals != bundle.proposals:
+                raise ValueError("Self C3 acquisition changed its pure once job proposal")
+            _FOREGROUND_VALIDATED[id(witness)] = witness
+        elif type(stage) is IngressArtifactTaskScopeStageV1:
+            if _members(stage)[1] != bundle.proposals:
+                raise ValueError("Self task scope changed its exact D10/D08 bundle")
+        elif type(stage) in {ArtifactTaskSettlementStageV1, ArtifactTaskPlanRevisionStageV2}:
+            if _members(stage)[1] != bundle.proposals:
+                raise ValueError("artifact task changed its exact same-W01 D08/D10 bundle")
+        elif type(stage) is ExistingArtifactRevisionStageV1:
+            if (*stage.stage.proposals, *stage.d10_stage.proposals) != bundle.proposals:
+                raise ValueError("artifact amendment changed its exact shared D08/D10 bundle")
+        elif type(stage) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2}:
+            for proposal in stage.stage.proposals:
+                validate_artifact_draft_model_proposal_v1(proposal, frame.snapshot, stage)
+            if stage.stage.proposals != bundle.proposals:
+                raise ValueError("C4 model bundle differs from its exact privately rebuilt stage")
+            _FOREGROUND_VALIDATED[id(witness)] = witness
+        elif type(stage) in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}:
+            for proposal in stage.stage.proposals:
+                if proposal.domain == "d11":
+                    validate_artifact_draft_content_job_proposal_v1(proposal, frame.snapshot, stage)
+            if stage.stage.proposals != bundle.proposals:
+                raise ValueError("C4 content bundle differs from its exact privately rebuilt stage")
+            _FOREGROUND_VALIDATED[id(witness)] = witness
+        elif type(stage) is ArtifactDraftPhaseVerificationStageV2:
+            if stage.stage.proposals != bundle.proposals:
+                raise ValueError("phase verification changed its actual no-write W01 stage")
+            _FOREGROUND_VALIDATED[id(witness)] = witness
+        return witness
+    from .cancel_owner_source_note_task_v1 import CancelOwnerSourceNoteTaskStageV1,verify_cancel_owner_source_note_task_stage_v1
+    if type(witness.stage) is CancelOwnerSourceNoteTaskStageV1:
+        frame,stage,_=witness.runtime.compile_in_transaction(db,operation=witness.operation,
+            request=witness.request,envelope=witness.frame.envelope,scope=witness.scope,
+            owner=witness.owner,guard=witness.guard,now_utc=witness.frame.now_utc,
+            external_originals=witness.external_originals)
+        if frame!=witness.frame or stage!=witness.stage or stage.stage.proposals!=bundle.proposals:
+            raise ValueError('Owner task cancellation changed before actual Graph CAS')
+        verify_cancel_owner_source_note_task_stage_v1(stage)
+        _FOREGROUND_VALIDATED[id(witness)]=witness
+        return witness
     # Rebuild before jobs/projections are staged; the concrete runtime froze it
     # under this exact independently validated write permit, with all policies
     # and current originals. Rechecking its full frozen readset below remains a
@@ -98,6 +373,7 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
     from .d11_life_preparation_v1 import LifePreparationStageV1
     from .contact_product_adapter_v1 import ContactModelStageV1
     from .contact_product_adapter_v2 import ContactModelStageV2
+    from .d11_method_observation_v1 import MethodObservationStageV1
     from .internal_life_content_preparation_v1 import InternalLifeContentPreparationStageV1,verify_internal_life_content_preparation_in_transaction_v1
     from .internal_life_content_worker_v1 import InternalLifeContentAcquisitionStageV1
     from .internal_life_content_adoption_v1 import InternalLifeContentAdoptionStageV1,verify_content_stage_v1,content_bundle_v1
@@ -167,6 +443,13 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
             issuer=graph._GraphCoordinator__d11_issuer, resource_issuer=graph._GraphCoordinator__d02_issuer)
         if life_preparation_bundle_v1(graph, witness.stage) != bundle:
             raise ValueError('Life current prepared bundle differs')
+    elif type(witness.stage) is MethodObservationStageV1:
+        from .d11_method_observation_v1 import install_method_observation_readers_v1, stage_observe_method_comparison_v1
+        readers = install_method_observation_readers_v1(graph, scope=witness.scope,
+            owner_guard=witness.guard, owner_binding=witness.owner)
+        rebuilt = stage_observe_method_comparison_v1(db, frame=witness.frame, request=witness.request, installed_readers=readers)
+        if rebuilt != witness.stage or _members(rebuilt)[1] != bundle.proposals:
+            raise ValueError("actual method measurement Source and billing support changed before CAS")
     elif type(witness.stage) is ContactModelStageV2:
         from .contact_product_adapter_v2 import verify_contact_model_preparation_in_transaction_v2
         from .contact_model_preparation_commit_v2 import contact_model_preparation_bundle_v2
@@ -216,6 +499,59 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
 
 
 def _members(stage):
+    from .owner_material_source_storage_v3 import StagedDomainOperationV3
+    if type(stage) is StagedDomainOperationV3:
+        stage.prepared.require_current()
+        return stage,stage.proposals,(),(),()
+    from .cancel_owner_source_note_task_v1 import CancelOwnerSourceNoteTaskStageV1,verify_cancel_owner_source_note_task_stage_v1
+    if type(stage) is CancelOwnerSourceNoteTaskStageV1:
+        verify_cancel_owner_source_note_task_stage_v1(stage)
+        return stage.stage,stage.stage.proposals,(),(),()
+    from .owner_source_note_task_execution_v1 import OwnerSourceNoteTaskStageV1,verify_owner_source_note_task_stage_v1
+    if type(stage) is OwnerSourceNoteTaskStageV1:
+        verify_owner_source_note_task_stage_v1(stage)
+        return stage.stage,stage.stage.proposals,(),(),()
+    from .d11_method_observation_v1 import MethodObservationStageV1, verify_method_observation_stage_v1
+    if type(stage) is MethodObservationStageV1:
+        verify_method_observation_stage_v1(stage)
+        return stage.stage, (*stage.stage.proposals, *stage.memory_stage.proposals), (), (), ()
+    from .artifact_task_observer_v1 import ArtifactTaskSettlementStageV1
+    from .d08_personal_plan_v1 import ArtifactTaskPlanRevisionStageV2
+    if type(stage) in {ArtifactTaskSettlementStageV1, ArtifactTaskPlanRevisionStageV2}:
+        return stage.stage,(*stage.stage.proposals,*stage.checkpoint_stage.proposals),(),(),()
+    from .ingress_artifact_task_scope_v1 import IngressArtifactTaskScopeStageV1
+    if type(stage) is IngressArtifactTaskScopeStageV1:
+        amendment=() if stage.amendment_stage is None else stage.amendment_stage.proposals
+        return stage.stage, (*stage.stage.proposals,*stage.goal_stage.proposals,*amendment), (), (), ()
+    from .artifact_continuation_originals_v1 import ExistingArtifactRevisionStageV1
+    if type(stage) is ExistingArtifactRevisionStageV1:
+        return stage.stage, (*stage.stage.proposals, *stage.d10_stage.proposals), (), (), ()
+    from .c04_ingress_preparation_v4 import SelfC04PreparationStageV4
+    from .c04_ingress_adoption_v4 import SelfC04AdoptionStageV4
+    if type(stage) in {SelfC04PreparationStageV4, SelfC04AdoptionStageV4}:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1
+    if type(stage) is D07IngressRecallResultStageV1:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .d07_ingress_recall_acquisition_v1 import D07IngressRecallAcquisitionStageV1
+    if type(stage) is D07IngressRecallAcquisitionStageV1:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .d07_ingress_recall_preparation_v1 import D07IngressRecallPreparationStageV1
+    if type(stage) is D07IngressRecallPreparationStageV1:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .d11_life_preparation_v1 import LifePreparationStageV1
+    if type(stage) is LifePreparationStageV1:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
+    if type(stage) is OwnerStopReplyProjectionStageV1:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .d11_artifact_draft_model_v1 import ArtifactDraftModelStageV1, ArtifactDraftModelStageV2
+    from .d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2
+    if type(stage) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2}:
+        return stage.stage, stage.stage.proposals, (), (), ()
+    from .foreground_cycle_v1 import ForegroundCycleStageV1
+    if type(stage) is ForegroundCycleStageV1:
+        return stage.stage, stage.stage.proposals, (), (), ()
     from .d06_life_numeric_commit_v1 import life_numeric_math_stages_v1
     if type(stage) in life_numeric_math_stages_v1():
         return stage.primary_stage, stage.primary_stage.proposals, (), (), ()
@@ -260,7 +596,19 @@ def _members(stage):
 
 def commit_installed_domain_operation_v1(runtime, db, *, operation, request, frame, stage,
         readers, scope, owner, guard, metadata, epoch, process_lease, external_originals=()):
+    from .c04_ingress_preparation_v4 import SelfC04PreparationStageV4, commit_self_c04_prepare_v4
+    from .c04_ingress_adoption_v4 import SelfC04AdoptionStageV4, commit_self_c04_adopt_v4
+    if type(stage) in {SelfC04PreparationStageV4, SelfC04AdoptionStageV4}:
+        commit = commit_self_c04_prepare_v4 if type(stage) is SelfC04PreparationStageV4 else commit_self_c04_adopt_v4
+        return commit(runtime, db, operation=operation, request=request, frame=frame, stage=stage,
+            readers=readers, scope=scope, metadata=metadata, epoch=epoch, process_lease=process_lease,
+            owner=owner, guard=guard, external_originals=external_originals)
     graph = runtime.graph
+    from .d07_ingress_recall_preparation_v1 import D07IngressRecallPreparationStageV1, commit_ingress_recall_preparation_v1
+    if type(stage) is D07IngressRecallPreparationStageV1:
+        return commit_ingress_recall_preparation_v1(runtime, db, operation=operation, request=request,
+            preparation=stage, readers=readers, scope=scope, owner=owner, guard=guard,
+            metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
     from .d06_life_numeric_joint_v1 import LifeNumericJointStageV1
     if type(stage) is LifeNumericJointStageV1:
         from .d06_life_numeric_commit_v1 import commit_life_numeric_joint_stage_v1
@@ -338,9 +686,29 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
             metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
     # Pure/current readers are replayed from the same real DB before any new
     # projection row. A caller cannot pass a prebuilt proposal as authorization.
-    rebuilt_frame, rebuilt, _ = runtime.compile_in_transaction(db, operation=operation, request=request,
-        envelope=frame.envelope, scope=scope, owner=owner, guard=guard,
-        now_utc=frame.now_utc, external_originals=external_originals)
+    owner_task=getattr(runtime,'_active_owner_task_issuance_v1',None)
+    issued = getattr(runtime, "_active_foreground_issuance_v1", None)
+    from .owner_material_source_storage_v3 import (
+        StagedDomainOperationV3,require_owner_material_sealed_stage_v3,
+    )
+    if type(stage) is StagedDomainOperationV3:
+        if owner_task is not None or issued is not None:
+            raise ValueError('Owner Source preparation cannot borrow foreground/task issuance')
+        require_owner_material_sealed_stage_v3(
+            stage,runtime,db,frame=frame,request=request,scope=scope,
+            installed_readers=readers)
+        rebuilt_frame,rebuilt=frame,stage
+    elif owner_task is not None:
+        if issued is not None:raise ValueError('Owner task and foreground issuances overlap')
+        rebuilt_frame,rebuilt,_=runtime.compile_owner_task_in_transaction_v1(db,operation=operation,request=request,
+            envelope=frame.envelope,scope=scope,issued=owner_task,now_utc=frame.now_utc,external_originals=external_originals)
+    elif issued is not None:
+        rebuilt_frame, rebuilt, _ = runtime.compile_foreground_in_transaction(db, operation=operation, request=request,
+            envelope=frame.envelope, scope=scope, issued=issued, now_utc=frame.now_utc, external_originals=external_originals)
+    else:
+        rebuilt_frame, rebuilt, _ = runtime.compile_in_transaction(db, operation=operation, request=request,
+            envelope=frame.envelope, scope=scope, owner=owner, guard=guard,
+            now_utc=frame.now_utc, external_originals=external_originals)
     if rebuilt_frame != frame or rebuilt != stage:
         raise ValueError('current installed domain stage changed before atomic adoption')
     from .d02_life_body_preparation_v1 import LifeBodyPreparationStageV1, issue_life_body_quotes_before_cas_v1
@@ -371,6 +739,27 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
             (), DependencySet(), (), ()),)
     bundle = DomainBundle(frame.envelope, tuple(proposals), experiences, (), settlements, (),
         (primary.operation_id,), tuple(write.key.token for write in job_writes), ())
+    from .foreground_cycle_v1 import ForegroundCycleStageV1
+    from .d07_ingress_recall_acquisition_v1 import D07IngressRecallAcquisitionStageV1
+    from .d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1
+    if type(stage) in {ForegroundCycleStageV1, D07IngressRecallAcquisitionStageV1, D07IngressRecallResultStageV1}:
+        bundle = replace(bundle, persistent_job_refs=() if stage.after_job is None else (job_graph_write(stage.after_job).key.token,))
+    from .d11_artifact_draft_model_v1 import ArtifactDraftModelStageV1, ArtifactDraftModelStageV2
+    from .d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2
+    if type(stage) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2}:
+        jobs = (stage.job,) if stage.after_cycle is None else (stage.job, stage.after_cycle)
+        bundle = replace(bundle, persistent_job_refs=tuple(job_graph_write(job).key.token for job in jobs))
+    elif type(stage) in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}:
+        bundle = replace(bundle, persistent_job_refs=(job_graph_write(stage.after_job).key.token,))
+    from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
+    if type(stage) is OwnerStopReplyProjectionStageV1:
+        bundle = replace(bundle, persistent_job_refs=tuple(job_graph_write(job).key.token for job in stage.after_jobs))
+    from .owner_source_note_task_execution_v1 import OwnerSourceNoteTaskStageV1
+    if type(stage) is OwnerSourceNoteTaskStageV1:
+        bundle=replace(bundle,persistent_job_refs=(job_graph_write(stage.after_job).key.token,))
+    from .cancel_owner_source_note_task_v1 import CancelOwnerSourceNoteTaskStageV1
+    if type(stage) is CancelOwnerSourceNoteTaskStageV1:
+        bundle=replace(bundle,persistent_job_refs=(job_graph_write(stage.after_job).key.token,))
     witness = _ProductionCommitWitnessV1(runtime, graph, scope, frame, stage, operation, request,
         owner, guard, bundle, tuple(external_originals))
     from ..authority_service.v2_contract import to_wire
@@ -380,15 +769,34 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         'WHERE bot=? AND persona=? AND operation_id=?', (*primary.namespace.as_tuple, primary.operation_id)).fetchone()
     if attempt is None or attempt[1] != scope.operation_id:
         raise ValueError('actual Owner operation original is absent')
-    finish_digest = 'sha256:' + canonical_digest({'schema': 'w01.owner-domain-write.v3',
-        'operation_id': primary.operation_id, 'request_digest': attempt[0], 'permit_token': scope.permit.token})
+    owner_task=getattr(runtime,'_active_owner_task_issuance_v1',None)
+    issued = getattr(runtime, "_active_foreground_issuance_v1", None)
+    if owner_task is not None:
+        from .owner_source_note_task_issuance_v1 import require_owner_source_note_task_issuance_v1
+        evidence=require_owner_source_note_task_issuance_v1(owner_task,graph,scope)
+        if attempt[0]!=canonical_digest(evidence.request):
+            raise ValueError('Owner task original attempt changed its exact selector')
+        finish_digest=owner_task_domain_finish_digest_v1(evidence.request,scope.permit)
+    elif issued is not None:
+        from .foreground_activity_issuance_v1 import require_foreground_activity_issuance_v1
+        evidence = require_foreground_activity_issuance_v1(issued, graph, scope)
+        if attempt[0] != canonical_digest(evidence.request):
+            raise ValueError("foreground original attempt does not bind its full actual selector")
+        finish_digest = foreground_domain_finish_digest_v1(evidence.request, scope.permit)
+    else:
+        finish_digest = 'sha256:' + canonical_digest({'schema': 'w01.owner-domain-write.v3',
+            'operation_id': primary.operation_id, 'request_digest': attempt[0], 'permit_token': scope.permit.token})
     _ACTIVE[id(witness)] = witness
     try:
         receipt = graph._commit_domain_bundle_fenced(bundle, process_lease, in_transaction=True,
             v2_write=(metadata, epoch, finish_id, finish_digest, canonical_json(to_wire(scope.permit))),
             now_utc=frame.now_utc, domain_production_issuance_v1=witness)
+        if type(stage) in {CancelOwnerSourceNoteTaskStageV1, OwnerSourceNoteTaskStageV1, ForegroundCycleStageV1, D07IngressRecallAcquisitionStageV1, D07IngressRecallResultStageV1, ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2, OwnerStopReplyProjectionStageV1} and _FOREGROUND_APPLIED.get(id(witness)) is not witness:
+            raise ValueError("foreground actual W01 guard did not apply its frozen job stage")
     finally:
         _ACTIVE.pop(id(witness), None)
+        _FOREGROUND_VALIDATED.pop(id(witness), None)
+        _FOREGROUND_APPLIED.pop(id(witness), None)
     from .domain_production_inputs_v1 import StagedDomainInputV1, record_current_domain_input_after_commit_v1
     produced = ()
     from .contact_plan_adoption_v2 import ContactPlanStageV2,record_contact_plan_after_cas_v2
@@ -427,12 +835,81 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     from .d06_life_numeric_commit_v1 import life_numeric_math_stages_v1, record_life_numeric_math_stage_v1
     if type(stage) in life_numeric_math_stages_v1():
         produced = (record_life_numeric_math_stage_v1(db, stage, readers.issuer, receipt),)
+    from .ingress_artifact_task_scope_v1 import IngressArtifactTaskScopeStageV1
+    from .artifact_task_observer_v1 import ArtifactTaskSettlementStageV1
+    if type(stage) in {IngressArtifactTaskScopeStageV1,ArtifactTaskSettlementStageV1}:
+        payload=json.loads(primary.original_payload_json)
+        payload["writes"]=[{"key":write.key.token,"value":write.value,
+            "dependencies":[key.token for key in write.dependencies]}
+            for proposal in _members(stage)[1] for write in proposal.typed_writes]
+        primary=replace(primary,original_payload_json=canonical_serialize(payload),original_digest=canonical_digest(payload))
+    root_original = None
+    if operation.operation_kind == "register_artifact_draft_root":
+        from .foreground_activity_issuance_v1 import record_draft_root_registration_after_commit_v1
+        root_original = record_draft_root_registration_after_commit_v1(db, graph=graph,
+            issued=runtime._active_draft_root_registration_v1, frame=frame, receipt=receipt, issuer=readers.issuer)
+        produced = (*produced, root_original)
     original = record_adopted_domain_operation_v1(db, primary, receipt)
+    if type(stage) is CancelOwnerSourceNoteTaskStageV1:
+        from .cancel_owner_source_note_task_v1 import record_cancel_owner_source_note_task_after_cas_v1
+        produced=(*produced,*record_cancel_owner_source_note_task_after_cas_v1(db,frame=frame,
+            stage=stage,receipt=receipt,installed_readers=readers))
+    if operation.operation_kind in {'register_owner_source_note_life_plan_v1','register_owner_source_note_life_outcome_v1'}:
+        from .owner_source_note_life_v1 import record_owner_source_note_life_after_cas_v1
+        produced=(*produced,record_owner_source_note_life_after_cas_v1(db,frame=frame,stage=primary,
+            receipt=receipt,installed_readers=readers))
+    if operation.operation_kind=='input:freeze_owner_source_note_values_parent_v1':
+        from .owner_source_note_values_v1 import record_owner_source_note_values_parent_after_cas_v1
+        produced=(*produced,record_owner_source_note_values_parent_after_cas_v1(db,frame=frame,
+            stage=primary,receipt=receipt,installed_readers=readers))
+    if type(stage) is OwnerSourceNoteTaskStageV1:
+        from .owner_source_note_task_execution_v1 import record_owner_source_note_task_execution_after_cas_v1
+        produced=(*produced,*record_owner_source_note_task_execution_after_cas_v1(db,frame=frame,
+            stage=stage,receipt=receipt,installed_readers=readers))
+    from .d11_method_observation_v1 import record_method_observation_after_cas_v1
+    produced = (*produced, *record_method_observation_after_cas_v1(db,
+        frame=frame, stage=stage, receipt=receipt, issuer=graph._GraphCoordinator__d11_issuer))
+    from .domain_production_registry_v1 import _POSTCONDITION_OPERATIONS
+    if operation.operation_kind in _POSTCONDITION_OPERATIONS and primary.coverage == "complete":
+        from .artifact_phase_postconditions_v1 import record_artifact_phase_postcondition_after_cas_v1
+        produced = (*produced, record_artifact_phase_postcondition_after_cas_v1(db,
+            frame=frame, stage=primary, receipt=receipt, issuer=readers.issuer))
+    if operation.operation_kind == "register_artifact_task_milestone_v2" and primary.coverage == "complete":
+        from .artifact_task_observer_v1 import record_artifact_task_milestone_after_cas_v2
+        produced = (*produced, record_artifact_task_milestone_after_cas_v2(db,
+            frame=frame, stage=primary, receipt=receipt, issuer=readers.issuer))
+    if operation.operation_kind == "input:register_artifact_task_text_extent" and primary.coverage == "complete":
+        from .artifact_task_text_extent_v1 import record_artifact_task_text_extent_after_cas_v1
+        produced = (*produced, record_artifact_task_text_extent_after_cas_v1(db, frame=frame,
+            stage=primary, receipt=receipt, issuer=readers.issuer))
+    if operation.operation_kind == "submit_owner_source_note_task_v1" and primary.coverage == "complete":
+        from .owner_source_note_task_v1 import record_owner_source_note_task_after_cas_v1
+        produced = (*produced, record_owner_source_note_task_after_cas_v1(db, frame=frame,
+            stage=primary, receipt=receipt, installed_readers=readers))
+    if operation.operation_kind == "authorize_source_note_task_v1" and primary.coverage == "complete":
+        from .source_note_task_authorization_v1 import record_source_note_task_authorization_after_cas_v1
+        produced = (*produced, record_source_note_task_authorization_after_cas_v1(db, frame=frame,
+            stage=primary, receipt=receipt, installed_readers=readers))
+    if operation.operation_kind == "create_source_note_foreground_cycle_v1" and primary.coverage == "complete":
+        from .source_note_foreground_v1 import record_source_note_responsibility_after_cas_v1
+        produced = (*produced, record_source_note_responsibility_after_cas_v1(db, frame=frame,
+            stage=primary, receipt=receipt, installed_readers=readers))
+    if operation.operation_kind == "prepare_personal_candidates_v1" and primary.coverage == "complete":
+        from .d08_personal_candidate_v1 import record_personal_candidates_after_cas_v1
+        produced = (*produced, record_personal_candidates_after_cas_v1(db, frame=frame,
+            stage=primary, receipt=receipt, issuer=readers.issuer))
+    from .foreground_cycle_v1 import WakeArtifactDraftCycleRequestV1, WakeArtifactDraftCycleRequestV2, record_artifact_draft_wake_disposition_after_cas_v1
+    if type(stage) is ForegroundCycleStageV1 and type(stage.request) in {WakeArtifactDraftCycleRequestV1, WakeArtifactDraftCycleRequestV2}:
+        record_artifact_draft_wake_disposition_after_cas_v1(db, stage=stage, receipt=receipt)
     from .d06_internal_life_episode_v2 import InternalLifeEpisodeStageV2, PROVENANCE, decode_internal_life_value_v2, validate_internal_life_episode_history_v2
     if type(stage) is InternalLifeEpisodeStageV2:
         proof_write = next(write for proposal in primary.proposals for write in proposal.typed_writes if write.key.type_name == PROVENANCE)
         validate_internal_life_episode_history_v2(db, decode_internal_life_value_v2(PROVENANCE, proof_write.value))
     for event in primary.outbox:
+        if type(stage) is ArtifactTaskSettlementStageV1:
+            event=replace(event,trigger_original=original)
+        if root_original is not None:
+            event = replace(event, trigger_original=root_original)
         row = (*primary.namespace.as_tuple, event.dedupe_key, event.causal_operation_id,
             event.receiver_domain, event.event_kind, event.trigger_original.original_ref,
             event.trigger_original.original_digest, 'pending', None, None)
@@ -446,7 +923,8 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         'operation_kind': primary.operation_kind, 'operation_id': primary.operation_id,
         'activity_id': primary.activity_id, 'original_ref': original.original_ref,
         'original_digest': original.original_digest, 'receipt': _receipt_wire(receipt),
-        'receipt_digest': canonical_digest(receipt), 'job_states': [[j.job_id, j.phase] for j in primary.jobs],
+        'receipt_digest': canonical_digest(receipt), 'job_states': [[j.job_id, j.phase] for j in
+            ((stage.after_job,) if type(stage) is ForegroundCycleStageV1 else primary.jobs)],
         'coverage': primary.coverage, 'missing_inputs': list(primary.missing_inputs),
         'continuation_ref': primary.continuation_ref,
         'outbox': [event.dedupe_key for event in primary.outbox],

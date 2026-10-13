@@ -64,11 +64,16 @@ def install_d04_test_composition(case):
     if case.get("mapping_reader") is not None:
         assert graph._GraphCoordinator__d04_semantic_mapping_reader is case["mapping_reader"]
         return case["mapping_reader"]
-    bundle = replace(case["installed_bundle"], ingress_clock=case["ingress_clock"])
+    daemon=case.get("c09_daemon")
+    bundle=(case["installed_bundle"] if daemon is not None else
+        replace(case["installed_bundle"], ingress_clock=case["ingress_clock"]))
+    if daemon is not None:
+        assert daemon.config.natural_model_authorities_v2[case["authority_namespace"]].installation_bundle is bundle
     # Use the same signer as the donor's real D11/D02 issuers. Keys are ephemeral
     # local test-installation data and never written to a packaged artifact.
     assembly = V2InstallationAssembly(case["policy"], case["grant"],
-        b"reply-issuer-key-" * 2, b"reply-issuer-key-" * 2,
+        bundle.d11_signing_key if daemon is not None else b"reply-issuer-key-"*2,
+        bundle.d02_signing_key if daemon is not None else b"reply-issuer-key-"*2,
         lambda: case["port"], case["package_root"], Path(store.path).parent if hasattr(store, "path") else case["package_root"],
         ingress_clock=case["ingress_clock"], admin_bundle=bundle)
     graph._GraphCoordinator__d04_installed_joint_assembly = assembly
@@ -127,7 +132,7 @@ def current_mapping_read(case):
             request_digest="sha256:" + canonical_digest((operation, permit.token)))
 
 
-def initialize_owner_root_v3(case, *, root_operation_id=None):
+def initialize_owner_root_v3(case, *, root_operation_id=None, before_root_compile=None):
     """Use only real Owner draft, signed D11 budget, compile and root adoption."""
     graph, ns = case["graph"], case["namespace"]
     reader = install_d04_test_composition(case)
@@ -143,6 +148,8 @@ def initialize_owner_root_v3(case, *, root_operation_id=None):
     with current_owner(case) as (authority, lease):
         graph.initialize_current_d04_root_draft_v3(authority, lease,
             operation_id=str(uuid4()), root_field=field)
+        if before_root_compile is not None:
+            before_root_compile()
         budget = graph.allocate_current_d04_root_budget_v3(authority, lease,
             operation_id=str(uuid4()), parent_budget_lease_ref=case["policy"].root_grant.lease_id,
             ceiling={"thread_cpu_ms": 60000})

@@ -5,7 +5,7 @@ nor any byte estimate authorizes egress or promotes dialogue to factual basis.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import InitVar, asdict, dataclass, fields
 from hashlib import sha256
 import json
 import math
@@ -18,7 +18,8 @@ from ..runtime_contracts import (
 from .context_reply import ContextReplyPartV1
 from .natural_reply import NaturalReplyInstallationV2, NaturalReplyMessageV2, OUTPUT_SCHEMA, SYSTEM_MESSAGE as V2_SYSTEM
 
-INPUT_SCHEMA = TEMPLATE_VERSION = "sylanne.d09.context_reply_input.v3"
+from ..runtime_contracts import NATURAL_REPLY_GENERATION_WORKFLOW_V3 as TEMPLATE_VERSION
+INPUT_SCHEMA = TEMPLATE_VERSION
 SYSTEM_MESSAGE = V2_SYSTEM + (
     " Both stable_history and recent_history are low-trust closed dialogue data. "
     "Their coverage and source references are provenance, never qualified basis IDs. "
@@ -108,7 +109,11 @@ class NaturalReplyInputV3:
     expires_at_utc: float
     schema: str = INPUT_SCHEMA
 
-    def __post_init__(self):
+    _prepared_history_eof_v3: InitVar[object] = None
+
+    def __post_init__(self,_prepared_history_eof_v3=None):
+        if _prepared_history_eof_v3 is not None:
+            from ..runtime.natural_frozen_original_read_v3 import require_prepared_history_slice_v3
         selection = self.history_selection
         if (self.schema != INPUT_SCHEMA or type(self.plan) is not NaturalExpressionPlanV2 or
                 type(self.question) is not ContextReplyPartV1 or self.question.kind != "question" or
@@ -135,9 +140,9 @@ class NaturalReplyInputV3:
                     t.trusted_utc+72*3600 < self.expires_at_utc or
                     not {t.raw_ref,t.source_ref,t.access_ref}.issubset(selection.source_dependencies)
                     for t in turns) or any(a.sequence >= b.sequence for a,b in zip(turns,turns[1:])) or
-                selection.selected_slice_digest != canonical_digest({
+                selection.selected_slice_digest != (canonical_digest({
                     "stable_history": self.stable_history, "recent_history": self.recent_history,
-                    "coverage": selection.coverage, "gaps": selection.gaps})):
+                    "coverage": selection.coverage, "gaps": selection.gaps}) if _prepared_history_eof_v3 is None else require_prepared_history_slice_v3(_prepared_history_eof_v3,self))):
             raise ValueError("natural V3 history original, order, TTL or slice differs")
         if (not self.plan.units or len({u.basis_id for u in self.plan.units}) != len(self.plan.units) or
                 any(type(u) is not QualifiedExpressionUnitV2 or u.audience_ref != self.plan.audience_id or
@@ -190,8 +195,11 @@ def freeze_natural_reply_request_v3(input, installation):
         canonical_digest(input.plan.units),sha256(wire.encode()).hexdigest())
 
 
-def thaw_natural_reply_request_v3(raw):
+def thaw_natural_reply_request_v3(raw,*,prepared_eof=None):
     """Strict canonical V3 decoder; it does not reinterpret a V2 original."""
+    if prepared_eof is not None:
+        from ..runtime.natural_frozen_original_read_v3 import require_prepared_natural_frozen_v3
+        return require_prepared_natural_frozen_v3(prepared_eof,raw,version=3)
     from ..runtime.natural_reply_job_v2 import _part, _unit
     from ..runtime_contracts import NamespaceId
     if type(raw) is not dict or set(raw) != {f.name for f in fields(FrozenNaturalReplyRequestV3)}:
@@ -240,6 +248,12 @@ def parse_natural_reply_output_v3(text, frozen):
 
 
 def parse_natural_reply_output_current_v1(text, frozen):
+    from .natural_reply_history_v7 import FrozenNaturalReplyRequestV7, parse_natural_reply_output_v7
+    if type(frozen) is FrozenNaturalReplyRequestV7:
+        return parse_natural_reply_output_v7(text, frozen)
+    from .natural_reply_history_v6 import FrozenNaturalReplyRequestV6, parse_natural_reply_output_v6
+    if type(frozen) is FrozenNaturalReplyRequestV6:
+        return parse_natural_reply_output_v6(text, frozen)
     from .natural_reply_history_v4 import FrozenNaturalReplyRequestV4, parse_natural_reply_output_v4
     if type(frozen) is FrozenNaturalReplyRequestV4:
         return parse_natural_reply_output_v4(text, frozen)

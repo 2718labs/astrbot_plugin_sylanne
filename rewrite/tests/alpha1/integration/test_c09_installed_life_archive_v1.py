@@ -234,6 +234,7 @@ def test_installed_completed_life_authenticates_maintenance_archive(tmp_path, in
         outcomes.append(result)
     assert len({row['pid'] for row in outcomes}) == len(outcomes)
     assert outcomes[-1]['execution_count'] > 0 and outcomes[-1]['files_unchanged'] > 0
+    assert outcomes[-1]['model_capacity']['verified_moved_terminals'] > 0
     (tmp_path / 'life-c09-phase-outcomes.json').write_text(json.dumps(outcomes, sort_keys=True))
 
 
@@ -276,12 +277,220 @@ def _run_observed_life_phase_v1(command, environment, guard, phase):
     return SimpleNamespace(pid=process.pid, returncode=process.returncode, stdout=stdout, stderr=stderr), receipt
 
 
+
+async def _run_actual_current_producers_v3(case):
+    """One real completed-Life graph; all subsequent producers use public current APIs."""
+    from m1_artifact_draft_acceptance_support_v1 import (compose_actual_m1_services_v1,install_actual_m1_c3_runtime_v2,
+        adopt_m1_phase_owner_project_role_v2,M1_PHASE_FULL_TEXT_V2,cold_originals_v1)
+    from test_m1_installed_artifact_draft_v1 import (_actual_full_phase_file_readback_v2,
+        _actual_phase_check_and_settlement_v2,_assert_actual_phase_protected_reply_v2)
+    from sylanne3.runtime.d07_ingress_recall_preparation_v1 import OPERATION
+    from sylanne3.runtime.c04_self_scope_v4 import PREPARE_OPERATION
+    from sylanne3.runtime.natural_reply_job_v2 import read_original_preparation
+    from sylanne3.runtime.natural_producer_qualification_v1 import C04_KIND,DRAFT_KIND
+    worker=case['phase_worker'];bundle=case['installed_bundle'];bootstrap=case['bootstrap']
+    assert worker is case['phase_fixture_qualification'].worker
+    assert case['phase_model_runtime'] is case['phase_fixture_qualification'].model_runtime
+    case['m1_model_runtime']=case['phase_model_runtime']
+    await worker.call(lambda graph:compose_actual_m1_services_v1(case))
+    arguments=dict(c02_operation_id=case['c02'].operation_id,source_ref=case['source_ref'])
+    created=await worker.call(lambda graph:graph.prepare_post_c02_foreground_cycle_v1(bootstrap,bundle,**arguments))
+    acquired=await worker.call(lambda graph:graph.acquire_post_c02_foreground_cycle_v1(bootstrap,bundle,**arguments))
+    assert created['receipt']['status']==acquired['receipt']['status']=='committed'
+    service=await install_actual_m1_c3_runtime_v2(case)
+    need=await worker.call(lambda graph:graph.prepare_current_post_c02_recall_need_v1(bootstrap,bundle,**arguments))
+    assert need['receipt']['receipt']['status']=='committed'
+    c3=await worker.call(lambda graph:graph.run_current_post_c02_ingress_recall_model_operation_v1(bootstrap,bundle,
+        operation_kind=OPERATION,**arguments))
+    assert c3['receipt']['status']=='committed'
+    await asyncio.sleep(0);assert service._runner_task is not None;await service._runner_task
+    acquired=await worker.call(lambda graph:graph.acquire_post_c02_foreground_cycle_v1(bootstrap,bundle,**arguments))
+    assert acquired['receipt']['status']=='committed'
+    selected=await worker.call(lambda graph:graph.select_current_post_c02_ingress_recall_seed_v1(bootstrap,bundle,**arguments))
+    assert selected['receipt']['receipt']['status']=='committed' and selected['selection']['selected_source_ref']
+    c04=await worker.call(lambda graph:graph.run_current_post_c02_ingress_c04_operation_v4(bootstrap,bundle,
+        operation_kind=PREPARE_OPERATION,**arguments))
+    assert c04['receipt']['status']=='committed'
+    adopted=await worker.call(lambda graph:graph.advance_current_post_c02_ingress_c04_v4(bootstrap,bundle,**arguments))
+    assert adopted['status']=='recollection_adopted' and not adopted.get('replayed',False)
+    acquired=await worker.call(lambda graph:graph.acquire_post_c02_foreground_cycle_v1(bootstrap,bundle,**arguments))
+    assert acquired['receipt']['status']=='committed'
+    for kind in ('create_artifact_task_plan_v1','create_artifact_task_project_v1'):
+        value=await worker.call(lambda graph:graph.run_current_post_c02_artifact_task_setup_v1(bootstrap,bundle,operation_kind=kind,**arguments))
+        assert value['receipt']['status']=='committed'
+    await worker.call(lambda graph:adopt_m1_phase_owner_project_role_v2(case))
+    value=await worker.call(lambda graph:graph.run_current_post_c02_artifact_task_setup_v1(bootstrap,bundle,
+        operation_kind='initialize_artifact_task_project_checkpoint_v1',**arguments))
+    assert value['receipt']['status']=='committed'
+    choice=await worker.call(lambda graph:graph.prepare_current_post_c02_artifact_phase_choice_v3(bootstrap,bundle,**arguments))
+    assert choice['status']=='selected'
+    verified=await _actual_full_phase_file_readback_v2(case,expected_content=M1_PHASE_FULL_TEXT_V2,expected_version=1)
+    assert verified.structurally_verified and verified.readback.version==1
+    await _actual_phase_check_and_settlement_v2(case,semantic_index=0)
+    await _assert_actual_phase_protected_reply_v2(case)
+    def original_units():
+        with cold_originals_v1(case) as db:
+            saved=read_original_preparation(db,case['namespace'],case['c02'].operation_id,'generation')
+            assert saved is not None and saved.state=='terminal' and saved.terminal_receipt_digest
+            units=saved.frozen.input.plan.units
+            assert {C04_KIND,DRAFT_KIND}<={unit.d06_claim_kind for unit in units}
+            return dict(generation=saved.seal.original_operation_id,unit_count=len(units),
+                c04_qualification_digests=[unit.qualification_digest for unit in units if unit.d06_claim_kind==C04_KIND],
+                draft_qualification_digests=[unit.qualification_digest for unit in units if unit.d06_claim_kind==DRAFT_KIND],
+                c04_adoption_operation=adopted['operation_id'],draft_terminal=case['phase_file_terminal'].original_ref)
+    return await worker.call(lambda graph:original_units())
+
+
+
+def _accept_actual_current_barrier_v3(case):
+    from sylanne3.authority_service.erasure_closure_inventory import SurfaceTargetV1
+    from sylanne3.authority_service.c09_storage_control_v1 import SURFACES
+    daemon=case['c09_daemon'];graph=case['graph'];control=daemon.c09_control;maintenance=daemon.c09_maintenance
+    assert daemon.server is case['server'] and daemon.core is case['core']
+    assert maintenance._installed_deployment_config_v2 is daemon.config
+    graph.install_current_c09_source_plan_resources_v2(case['bootstrap'],maintenance._paged_capture_control_v2)
+    namespace=case['authority_namespace'];policy=case['policy'];peer=case['peer'];subject=case['client_grant'].subject
+    erasure=daemon.server._current_erasure_prepares[(namespace,policy.installation_id)]
+    operation=str(uuid4())
+    authority,lease,_=graph.grant_current_owner(case['bootstrap'],actor='owner-actor-reply',namespace=case['namespace'],
+        domains=('d06',),purpose='context',audience=case['life_audience'],activation_generation=1,
+        owner_session_token=case['owner_session_token'],owner_session_request=case['owner_session_request'])
+    try:
+        plan=graph.issue_current_c09_erasure_plan_v1(authority,lease,operation_id=operation,source_ref=case['source_ref'])
+        receipt,permit=erasure.prepare_request(credential=peer,subject=subject,holder=policy.administrator_holder,
+            installation_id=policy.installation_id,owner_actor_id='owner-actor-reply',owner_session_token=case['owner_session_token'],
+            owner_session_request=case['owner_session_request'],deletion_operation_id=operation,source_id=plan.source_id)
+        graph.commit_current_c09_source_barrier_v1(case['bootstrap'],namespace=case['namespace'],deletion_operation_id=operation,permit=permit)
+        accepted,_=erasure.accept_verified_graph_barrier(credential=peer,subject=subject,pending_mutation_id=receipt.pending.mutation_id)
+    finally:graph.release_current_owner_lease(case['bootstrap'],lease)
+    current=control.read_verified_current_storage_v1();files={row['role']:Path(row['resolved_path']) for row in current.manifest['members']}
+    targets=tuple(SurfaceTargetV1(name,'sqlite_execution_journal' if name=='execution_journal_payloads' else 'installed_current_four_store',
+        str(files['execution']) if name=='execution_journal_payloads' else str(files['graph'].parent),'c09.installed.v1',
+        maintenance.closure.execution.journal_id if name=='execution_journal_payloads' else 'generation:0','installed') for name in sorted(SURFACES))
+    maintenance.closure.install_registry(credential=peer,targets=targets)
+    maintenance.closure.begin_run(credential=peer,subject=subject,accepted_mutation_id=accepted.pending.mutation_id)
+    # This process is the admitted real business peer. It cannot prepare INTENT;
+    # the next OS process must consume its signed admission and observed retirement.
+    return dict(operation_id=operation,accepted_mutation_id=accepted.pending.mutation_id,
+        cold_fixture=case['c09_cold_fixture'],source_execution_id=case['content_source_execution_id'],
+        source_execution_commitment=hashlib.sha256(case['content_source_execution_id'].encode()).hexdigest())
+
+
+async def _run_current_business_v3(root,installed_root,setup_file):
+    from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
+    installation=M1PhaseFixtureInstallationV2.from_protected_setup_v2(setup_file)
+    assert installation.package_root.resolve(strict=True)==Path(installed_root).resolve(strict=True)
+    assert installation.workflows.life_content is not None
+    result=None
+    async def completed(case):
+        nonlocal result
+        producers=await _run_actual_current_producers_v3(case)
+        accepted=await asyncio.to_thread(_accept_actual_current_barrier_v3,case)
+        result=dict(phase='business_current_v3',pid=os.getpid(),producers=producers,**accepted)
+    await run_installed_life_content_fullchain_v1(installation.data_dir,installed_root,after_completed=completed,
+        enable_c09_maintenance=True,terminal_after_completed=True,c09_protected_root=Path(root)/'protected',
+        initial_phase_fixture_installation=installation,complete_c09_current_v3=True,c09_phase_setup_file=setup_file)
+    assert result is not None
+    return result
+
+def _run_current_observed_phase_v3(command,environment,guard,phase):
+    """Exclusive first-attempt logs retain actual fatal stderr and timeout evidence."""
+    import time
+    from sylanne3.authority_service.c09_process_identity_v1 import read_process_identity_v1,require_process_retired_v1
+    stdout_path=guard/(phase+'.stdout.log');stderr_path=guard/(phase+'.stderr.log');receipt_path=guard/(phase+'.process.json')
+    assert not any(path.exists() for path in (stdout_path,stderr_path,receipt_path)), 'a failed current phase cannot be reused'
+    started=time.monotonic_ns();process=None;identity=None;timeout=False
+    try:
+        with stdout_path.open('x',encoding='utf-8') as stdout,stderr_path.open('x',encoding='utf-8') as stderr:
+            process=subprocess.Popen(command,env=dict(environment,PYTHONFAULTHANDLER='1'),cwd=guard,stdout=stdout,stderr=stderr)
+            identity=read_process_identity_v1(process.pid)
+            assert identity is not None and process.poll() is None,'actual live current phase process admission required'
+            try:
+                process.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                timeout=True
+                raise
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill();process.wait(timeout=5)
+    finally:
+        receipt=dict(schema='sylanne.test.c09.current-phase-process.v3',phase=phase,observer_process_id=os.getpid(),
+            process_identity=identity,actual_exit_code=None if process is None else process.returncode,
+            timed_out=timeout,elapsed_ns=time.monotonic_ns()-started,
+            retirement=None if identity is None else require_process_retired_v1(identity),
+            stdout_path=str(stdout_path),stderr_path=str(stderr_path))
+        with receipt_path.open('x',encoding='utf-8') as output:output.write(json.dumps(receipt,sort_keys=True)+'\n')
+    assert process.returncode==0,phase+' first failure; original stderr: '+str(stderr_path)+'\n'+stderr_path.read_text()
+    result=json.loads(stdout_path.read_text().strip().splitlines()[-1])
+    assert result['phase']==phase and result['pid']==process.pid==identity['pid']
+    assert receipt['retirement']=={'original_process':identity,'state':'retired'}
+    pin=json.loads((guard/('pin-'+str(process.pid)+'.json')).read_text())
+    assert pin['process_identity']==identity
+    assert pin['installed_root']==environment['SYLANNE_C09_INSTALLED_ROOT']
+    assert pin['manifest_sha256']==environment['SYLANNE_C09_MANIFEST_SHA256']
+    assert pin['engineering_inventory_sha256']==environment['SYLANNE_C09_ENGINEERING_INVENTORY_SHA256']
+    return result,receipt
+
+
+def test_installed_completed_life_segmented_four_role_current_v3(tmp_path,installed_d04_root):
+    """Same fresh actual installation, nonempty producers, full V3 and cold EOF."""
+    import sys
+    from test_c09_daemon_factual_process_v2 import _installed_phase_environment
+    from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
+    selected=os.environ.get('SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP')
+    assert selected,'explicit fresh Root-prepared current phase setup is required'
+    setup=Path(selected).resolve(strict=True);initial=M1PhaseFixtureInstallationV2.from_protected_setup_v2(setup)
+    assert initial.c04_component_key is not None and initial.workflows.life_content is not None
+    assert initial.package_root.resolve(strict=True)==Path(installed_d04_root).resolve(strict=True)
+    assert initial.data_dir.resolve(strict=True)!=tmp_path.resolve(strict=True)
+    environment,fixture,installed,guard=_installed_phase_environment(tmp_path,Path(__file__).resolve())
+    assert installed==initial.package_root.resolve(strict=True)
+    environment['SYLANNE_D04_INSTALLED_ROOT']=str(installed)
+    script=fixture/'rewrite/tests/alpha1/integration'/Path(__file__).name
+    result,receipt=_run_current_observed_phase_v3([sys.executable,str(script),'business_current_v3',str(tmp_path),str(setup)],
+        environment,guard,'business_current_v3')
+    assert result['producers']['c04_qualification_digests'] and result['producers']['draft_qualification_digests']
+    assert result['producers']['unit_count']>=2
+    operation=result['operation_id'];descriptor=result['cold_fixture'];execution=result['source_execution_id']
+    assert result['source_execution_commitment']==hashlib.sha256(execution.encode()).hexdigest()
+    outcomes=[result];receipts=[receipt]
+    for phase in ('prepare_switch_current_v3','release_current_v3','cold_current_v3'):
+        result,receipt=_run_current_observed_phase_v3([sys.executable,str(script),phase,str(tmp_path),
+            descriptor['path'],descriptor['fixture_digest'],operation,execution],environment,guard,phase)
+        assert result['operation_id']==operation
+        outcomes.append(result);receipts.append(receipt)
+    business,switched,released,cold=outcomes
+    assert len({item['pid'] for item in outcomes})==4
+    assert switched['restart_required'] is True and switched['execution_count']>0 and switched['model_count']>0
+    assert switched['prepared_digest']==released['prepared_digest']==cold['prepared_digest']
+    assert switched['segmented_roles']==released['selected_roles']==cold['selected_roles']
+    assert released['manifest_digest']==cold['manifest_digest'] and released['pointer_version']==cold['pointer_version']
+    assert released['storage_generation']==cold['storage_generation'] and cold['storage_generation']>0
+    assert released['family_eof']==cold['family_eof'] and cold['family_eof']['model']['record_count']>0
+    assert released['terminal_commitment']==cold['terminal_commitment']
+    assert released['exact_selected_files_unchanged'] is cold['exact_selected_files_unchanged'] is True
+    assert released['factual_meter_bytes']>0 and cold['factual_meter_bytes']>0
+    assert cold['source_execution_commitment']==business['source_execution_commitment']
+    assert released['provider_cache_request_count']==cold['provider_cache_request_count']==0
+    with (guard/'c09-current-complete.json').open('x',encoding='utf-8') as output:
+        output.write(json.dumps(dict(outcomes=outcomes,processes=receipts),sort_keys=True)+'\n')
+
+
 if __name__ == '__main__':
     import json, os, sys
     phase, root = sys.argv[1], Path(sys.argv[2]).resolve(strict=True)
     installed = Path(os.environ['SYLANNE_C09_INSTALLED_ROOT']).resolve(strict=True)
     try:
-        if phase == 'prepare':
+        if phase=='business_current_v3':
+            outcome=asyncio.run(_run_current_business_v3(root,installed,Path(sys.argv[3]).resolve(strict=True)))
+        elif phase in {'prepare_switch_current_v3','release_current_v3','cold_current_v3'}:
+            from c09_life_authority_phase_support_v1 import run_life_current_cold_phase_v3
+            outcome=asyncio.run(run_life_current_cold_phase_v3(sys.argv[3],phase,expected_fixture_digest=sys.argv[4],
+                operation_id=sys.argv[5],source_execution_id=sys.argv[6]))
+        elif phase == 'prepare':
             outcome = asyncio.run(_run_live_prepare(root, installed))
         else:
             from c09_life_authority_phase_support_v1 import run_life_cold_phase_v1

@@ -13,7 +13,8 @@ from ..domains.d13.raw_slice import _merge_ranges
 from ..graph_types import AtomKey, GraphVersion, GraphWrite
 from ..model_broker.context_reply import ContextReplyPartV1
 from ..model_broker.natural_reply_history_v4 import (
-    TEMPLATE_VERSION, D13NaturalDetailPartV1, D13NaturalHistorySelectionV1,
+    TEMPLATE_VERSION, INPUT_SCHEMA, INPUT_SCHEMA_V5,
+    D13NaturalDetailPartV1, D13NaturalHistorySelectionV1,
     D13NaturalRawTurnV1, FrozenNaturalReplyRequestV4, NaturalReplyInputV4,
     freeze_natural_reply_request_v4,
 )
@@ -150,7 +151,8 @@ def prepare_current_natural_wire_preflight_v1(db, **kwargs):
 
 def build_natural_frame_v4(*, window, plan, question, installation,
                            frozen_at_utc, expires_at_utc, policy_digest,
-                           context_query=None, block_ref=None, paid_verifier=None):
+                           context_query=None, block_ref=None, paid_verifier=None,
+                           input_schema=INPUT_SCHEMA):
     """Pure exact wire construction, not permission to consume compression.
 
     The compressed option validates its real active projection independently.
@@ -218,7 +220,8 @@ def build_natural_frame_v4(*, window, plan, question, installation,
                           "detail_history": details, "coverage": coverage, "gaps": gaps}),
         POLICY_REF, policy_digest)
     return freeze_natural_reply_request_v4(NaturalReplyInputV4(
-        question, plan, stable, raw, selection, details, frozen_at_utc, expiry), installation)
+        question, plan, stable, raw, selection, details, frozen_at_utc, expiry,
+        schema=input_schema), installation)
 
 
 def freeze_current_natural_frame_v4(
@@ -226,6 +229,7 @@ def freeze_current_natural_frame_v4(
     activation_generation, max_slots=64, original=None, installed_wire_port=None,
     paid_verifier=None, history_byte_budget=262144, cache_ref=None,
     preflight=None, preflight_out=None,
+    input_schema=INPUT_SCHEMA,
 ):
     """Read current scope, prepare the real pair, then ask installed authority.
 
@@ -282,9 +286,16 @@ def freeze_current_natural_frame_v4(
           now_utc if original is None else original.input.frozen_at_utc)
     expiry = (preflight.expires_at_utc if preflight is not None else
               expires_at_utc if original is None else original.input.expires_at_utc)
+    if input_schema not in {INPUT_SCHEMA, INPUT_SCHEMA_V5}:
+        raise ValueError("registered natural history input schema required")
+    if original is not None and original.input.schema != input_schema:
+        raise ValueError("natural replay cannot change its original input schema")
+    if preflight is not None and (preflight.raw.input.schema != input_schema
+            or preflight.compressed.input.schema != input_schema):
+        raise ValueError("natural preflight template differs from current workflow")
     raw = build_natural_frame_v4(window=window, plan=plan, question=question,
         installation=installation, frozen_at_utc=at, expires_at_utc=expiry,
-        policy_digest=policy_digest)
+        policy_digest=policy_digest, input_schema=input_schema)
 
     def finish(frozen, proof=None, write=None, expected=None):
         if original is not None and (frozen != original
@@ -355,7 +366,7 @@ def freeze_current_natural_frame_v4(
             compressed = build_natural_frame_v4(window=window, plan=plan, question=question,
                 installation=installation, frozen_at_utc=at, expires_at_utc=expiry,
                 policy_digest=policy_digest, context_query=query, block_ref=target,
-                paid_verifier=paid_verifier)
+                paid_verifier=paid_verifier, input_schema=input_schema)
         except (ValueError, TypeError, KeyError):
             if original is not None or preflight is not None:
                 raise ValueError("D13 original/preflight compressed source closure changed")
@@ -364,12 +375,12 @@ def freeze_current_natural_frame_v4(
         if raw.input.expires_at_utc != pair_expiry:
             raw = build_natural_frame_v4(window=window, plan=plan, question=question,
                 installation=installation, frozen_at_utc=at, expires_at_utc=pair_expiry,
-                policy_digest=policy_digest)
+                policy_digest=policy_digest, input_schema=input_schema)
         if compressed.input.expires_at_utc != pair_expiry:
             compressed = build_natural_frame_v4(window=window, plan=plan, question=question,
                 installation=installation, frozen_at_utc=at, expires_at_utc=pair_expiry,
                 policy_digest=policy_digest, context_query=query, block_ref=target,
-                paid_verifier=paid_verifier)
+                paid_verifier=paid_verifier, input_schema=input_schema)
         if preflight_out is not None:
             preflight_out.append(D13NaturalWirePreflightV1(raw, compressed, window,
                 replace(block, status="standby"), compression_plan, VersionedRef(token, revision),

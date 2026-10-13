@@ -499,7 +499,10 @@ class D11RuntimeProvider:
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
         from .d11_life_graph_types_v1 import life_graph_type_specs_v1
-        return graph_type_specs() + (role_resources_spec(), dispatch_claim_type_spec()) + life_graph_type_specs_v1()
+        from .contact_p2_qualification_v1 import contact_p2_graph_proof_type_spec_v1
+        from .contact_observation_v1 import contact_platform_observation_type_spec_v1
+        return graph_type_specs() + (role_resources_spec(), dispatch_claim_type_spec()) + life_graph_type_specs_v1() + (
+            contact_p2_graph_proof_type_spec_v1(), contact_platform_observation_type_spec_v1())
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())

@@ -595,9 +595,14 @@ def test_workbench_port_issues_real_current_owner_lease(owner_graph):
         assert current is not None
         assert current.scope == "bot/persona" and current.grant_id == "grant-1"
         assert current.grant.authority.namespace == NAMESPACE
-        assert DurableOwnerGrantResolver(subject).resolve(
+        resolved = DurableOwnerGrantResolver(subject).resolve(
             session=session, scope="bot/persona", purpose="workbench_view",
-            audience="owner") is not None
+            audience="owner")
+        assert resolved is not None
+        assert resolved.owner_grant_ref == owner_grant_key(*NAMESPACE.as_tuple).token
+        assert resolved.owner_grant_ref != current.grant_id
+        assert (resolved.owner_grant_revision, resolved.owner_grant_digest) == (
+            current.grant_revision, current.grant_digest)
         assert coordinator.query(
             current.grant.authority, current.grant.lease,
             type_names=(key.type_name,), owner_kind="persona")

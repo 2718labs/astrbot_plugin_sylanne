@@ -85,3 +85,41 @@ def test_incomplete_or_ambiguous_multisource_inventory_holds(tmp_path, case):
             _read_v2(store, candidate, scheme, refs)
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("bridge_kind", ("absent", "copied_dto"))
+def test_final_numeric_source_parent_requires_actual_final_witness(tmp_path, bridge_kind):
+    from types import SimpleNamespace
+    from sylanne3.runtime.d04_joint_advance_v2 import _current_numeric_sources, JointAdvanceHold
+    from sylanne3.runtime.d06_life_numeric_joint_v1 import _LifeJointSourceBridgeV1
+    from sylanne3.runtime_contracts import canonical_serialize
+
+    store, namespace, scheme, assets, source_ref, root = _fixture(tmp_path)
+    try:
+        drive = _drive(root, source_ref)
+        write = sourced_numeric_drive_write(drive)
+        _insert(store._db, namespace, write.key, write.value)
+        source_row = store._db.execute("SELECT value FROM graph_atoms WHERE token=?", (source_ref.token,)).fetchone()
+        import json
+        source = SourceRecord.from_dict(json.loads(source_row[0]))
+        receipt = SimpleNamespace(source_versions=((write.key.token, 1, source_ref.token, 1,
+            drive.access_ref, drive.access_revision, source.provenance_root),))
+        evidence = SimpleNamespace(namespace=namespace)
+        store._db.execute("BEGIN IMMEDIATE")
+        try:
+            # The exact same current rows pass the established root-source path.
+            _current_numeric_sources(store._db, evidence, receipt, (drive,))
+            derived = replace(source, parent_source_ids=("actual-parent-required",))
+            store._db.execute("UPDATE graph_atoms SET value=? WHERE token=?",
+                (canonical_serialize(derived.to_dict()), source_ref.token))
+            if bridge_kind == "absent":
+                with pytest.raises(JointAdvanceHold, match="numeric source family proof differs"):
+                    _current_numeric_sources(store._db, evidence, receipt, (drive,))
+            else:
+                bridge = _LifeJointSourceBridgeV1(None, None, None, object())
+                with pytest.raises(ValueError, match="live private issuance"):
+                    _current_numeric_sources(store._db, evidence, receipt, (drive,), _life_source_bridge=bridge)
+        finally:
+            store._db.rollback()
+    finally:
+        store.close()

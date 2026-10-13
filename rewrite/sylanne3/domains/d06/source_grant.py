@@ -124,4 +124,67 @@ def provide_source_grant_check(
     return receipt("pass", "full")
 
 
-__all__ = ["SourceGrantRead", "provide_source_grant_check"]
+def provide_prepared_source_grant_check_v3(intent, *, prepared_inventory, db, audience, purpose, valid_until):
+    """The same D06 grant rules over actual private full-EOF Source metadata."""
+    from ...runtime.dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3, PreparedCurrentDispatchSuccessorInventoryV3
+    if (type(prepared_inventory) not in (PreparedCurrentDispatchInventoryV3,PreparedCurrentDispatchSuccessorInventoryV3)
+            or not isinstance(intent,ActionIntent)):
+        raise TypeError('actual prepared inventory and typed action required')
+    prepared_inventory.require_current(db,prepared_inventory.namespace,prepared_inventory.query)
+    if (type(audience) is not tuple or not audience or any(type(v) is not str or not v for v in audience)
+            or purpose not in {'context','expression','consolidation','audit'}):
+        raise ValueError('actual D06 purpose and complete recipients required')
+    if type(valid_until) not in (int,float) or not math.isfinite(valid_until) or valid_until<0:
+        raise ValueError('valid_until must be a finite nonnegative time')
+    specs=[item for item in intent.required_checks if item.check_kind=='source_grant']
+    if len(specs)!=1 or specs[0].provider_id!='d06.source_grant':
+        raise ValueError('action must require exactly one D06 source-grant check')
+    spec=specs[0]
+    if spec.action_ref!=intent.action_id or spec.purpose!=intent.purpose:
+        raise ValueError('source-grant check scope differs from action')
+    def receipt(result,coverage):
+        return CheckReceipt(spec.check_kind,spec.subject_ref,spec.action_ref,spec.purpose,
+            spec.required_input_versions,coverage,result,float(valid_until),spec.provider_id)
+    if purpose!='expression':return receipt('unknown','partial')
+    expected={item.ref:item.version for item in spec.required_input_versions}
+    if len(expected)!=len(spec.required_input_versions):return receipt('unknown','partial')
+    ns=prepared_inventory.namespace
+    try:
+        pinned={AtomKey.from_token(ref):version for ref,version in expected.items()}
+    except (TypeError,ValueError):return receipt('unknown','partial')
+    if len(pinned)!=len(expected):return receipt('unknown','partial')
+    for key,version in pinned.items():
+        if key.type_name=='memory.source':
+            source=prepared_inventory.source_metadata(db,ns,prepared_inventory.query,key,require_grant=False)
+            if source.revision!=version or not source.valid:return receipt('unknown','partial')
+        else:
+            atom=prepared_inventory.projection.get(key)
+            if atom is None or atom.revision!=version or not atom.valid:return receipt('unknown','partial')
+    pending=list(intent.source_refs);visited=set()
+    while pending:
+        token=pending.pop()
+        try:key=AtomKey.from_token(token)
+        except (TypeError,ValueError):return receipt('unknown','partial')
+        if (key.type_name!='memory.source' or key.name!='record' or key.owner.kind!='event'
+                or (key.owner.bot,key.owner.persona)!=ns.as_tuple):return receipt('unknown','partial')
+        source_id=key.owner.subject
+        if source_id in visited:continue
+        visited.add(source_id)
+        access=access_key(*ns.as_tuple,source_id)
+        source=prepared_inventory.source_metadata(db,ns,prepared_inventory.query,key,require_grant=False)
+        access_atom=prepared_inventory.projection.get(access)
+        if (access_atom is None or key not in pinned or access not in pinned or source.revision<1
+                or access_atom.revision<1 or not source.valid or not access_atom.valid):return receipt('unknown','partial')
+        try:validate_access(access_atom.value)
+        except (TypeError,ValueError):return receipt('unknown','partial')
+        metadata=source.metadata
+        if metadata['source_id']!=source_id or access_atom.value['source_id']!=source_id:
+            return receipt('unknown','partial')
+        if (access_atom.value['status']!='active' or purpose not in metadata['purposes']
+                or purpose not in access_atom.value['purposes'] or not set(audience)<=set(metadata['audiences'])
+                or not set(audience)<=set(access_atom.value['audiences'])):return receipt('fail','full')
+        pending.extend(source_key(*ns.as_tuple,parent).token for parent in metadata['parent_source_ids'])
+    return receipt('pass','full')
+
+
+__all__ = ["SourceGrantRead", "provide_source_grant_check", "provide_prepared_source_grant_check_v3"]

@@ -48,6 +48,30 @@ def _pass_text():
     return json.dumps({"schema": OUTPUT_SCHEMA, "verdict": "pass", "issues": []})
 
 
+def test_semantic_review_binds_complete_manifest_and_requires_prefix_safe_verdict():
+    from sylanne3.domains.d09.natural_reply import NATURAL_REPLY_OUTPUT_SCHEMA_V3
+    from sylanne3.model_broker.natural_review import OUTPUT_SCHEMA_V2, INPUT_SCHEMA_V2
+    _, _, output = _case()
+    output.update(schema=NATURAL_REPLY_OUTPUT_SCHEMA_V3,
+                  semantic_segments=[{"start": 0, "end": len(output["body"])}])
+    generation, frozen, review = _frozen_and_seals(output)
+    payload = json.loads(frozen.canonical_input)
+    assert payload["schema"] == INPUT_SCHEMA_V2
+    assert payload["semantic_segments"] == output["semantic_segments"]
+    assert frozen.generation_output_digest == canonical_digest(output)
+    with pytest.raises(ValueError, match="shape"):
+        parse_natural_reply_review_output_v1(_pass_text(), frozen, generation, review)
+    unsafe = {"schema": OUTPUT_SCHEMA_V2, "verdict": "pass", "issues": [], "prefix_safe": False}
+    parsed = parse_natural_reply_review_output_v1(json.dumps(unsafe), frozen, generation, review)
+    assert parsed.verdict == "hold"
+    assert parsed.output_digest == canonical_digest(unsafe)
+    assert parsed.issues == (("other_semantic_risk", "/semantic_segments"),)
+    safe = {**unsafe, "prefix_safe": True}
+    parsed = parse_natural_reply_review_output_v1(json.dumps(safe), frozen, generation, review)
+    assert parsed.verdict == "pass"
+    assert parsed.status == "untrusted_review_candidate"
+
+
 def test_review_freeze_is_bound_to_generation_output_and_same_qualified_basis():
     generation, frozen, review = _frozen_and_seals()
     parsed = parse_natural_reply_review_output_v1(

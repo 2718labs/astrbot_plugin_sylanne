@@ -35,16 +35,18 @@ def require_d04_source_storage_binding_v1(db, *, namespace, metadata, scope,
             or db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
                 != (scope.graph_epoch.revision,)):
         raise ValueError("D04 source storage current snapshot and observed fence differ")
-    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-        (owner_grant_key(*namespace.as_tuple).token,)).fetchone()
-    proof_row = db.execute("SELECT operation_id,request_digest,grant_id,grant_digest,graph_incarnation,"
-        "graph_access_epoch,graph_epoch,graph_receipt_digest,proof_json FROM graph_owner_issue_operations_v1 "
-        "WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+    from .domain_background_read_v3 import background_graph_head_v3,background_json_loads_v3,background_json_matches_v3
+    row=background_graph_head_v3(db,namespace,owner_grant_key(*namespace.as_tuple))
+    from .domain_background_read_v3 import background_point_v3
+    proof_row=background_point_v3(db,table='graph_owner_issue_operations_v1',columns=(
+        'operation_id','request_digest','grant_id','grant_digest','graph_incarnation','graph_access_epoch','graph_epoch','graph_receipt_digest','proof_json'),
+        key_columns=('bot','persona'),key=namespace.as_tuple,legacy_reader=lambda:db.execute(
+            'SELECT operation_id,request_digest,grant_id,grant_digest,graph_incarnation,graph_access_epoch,graph_epoch,graph_receipt_digest,proof_json FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?',namespace.as_tuple).fetchone())
     if row is None or row[0] != 1 or row[2] != 1 or proof_row is None:
         raise ValueError("D04 source storage immutable Owner grant/proof absent")
-    grant = json.loads(row[1]); validate_owner_grant_v1(grant)
+    grant = background_json_loads_v3(row[1]); validate_owner_grant_v1(grant)
     proof = OwnerGraphCommitProofV1(namespace, *proof_row[:5], row[0], *proof_row[5:8])
-    if (proof_row[8] != canonical_json(asdict(proof)) or canonical_json(grant) != row[1]
+    if (not background_json_matches_v3(proof_row[8],asdict(proof)) or not background_json_matches_v3(row[1],grant)
             or digest(grant) != proof.grant_digest or grant["installation_id"] != installation_id
             or grant["grant_id"] != proof.grant_id or grant["issue_operation_id"] != proof.operation_id
             or grant["authority_id"] != req.authority_id
@@ -72,8 +74,11 @@ def require_d04_source_storage_binding_v1(db, *, namespace, metadata, scope,
             or admission.revocation_epoch != req.revocation_epoch):
         raise ValueError("D04 source storage actual RELEASED continuation differs")
     certificates = {}
-    for (operation,) in db.execute("SELECT operation_id FROM graph_c09_rebase_certificates_v1 WHERE bot=? AND persona=?",
-            namespace.as_tuple):
+    from .domain_background_read_v3 import background_rows_v3
+    certificate_rows=background_rows_v3(db,table='graph_c09_rebase_certificates_v1',columns=('operation_id',),
+        group_columns=('bot','persona'),group=namespace.as_tuple,order_columns=('operation_id',),limit=None,
+        legacy_reader=lambda:db.execute('SELECT operation_id FROM graph_c09_rebase_certificates_v1 WHERE bot=? AND persona=?',namespace.as_tuple).fetchall())
+    for (operation,) in certificate_rows:
         certificate = read_graph_rebase_certificate_v1(db, namespace, operation)
         if certificate is None or certificate.certificate_digest in certificates:
             raise ValueError("D04 source storage certificate inventory is ambiguous")

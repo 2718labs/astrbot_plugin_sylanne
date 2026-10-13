@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from sylanne3.authority_service import AuthorityServiceCore, JournalHead
@@ -155,10 +156,22 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
     def test_unknown_or_oversize_rpc_never_returns_content_diagnostics(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
             self.server._dispatch_for_test("unknown", self.request, self.peer, b"channel")
-        self.assertEqual(
-            AuthorityRpcServer.error_payload(RuntimeError("secret path: /role/content")),
-            {"ok": False, "error": "authority_unavailable"},
-        )
+        secret = "credential and signing key: /role/content"
+        try:
+            try:
+                raise ValueError(secret)
+            except ValueError as cause:
+                raise RuntimeError(secret) from cause
+        except RuntimeError as failure:
+            with self.assertLogs("sylanne3.authority_service.mtls_server", level="ERROR") as captured:
+                response = AuthorityRpcServer.error_payload(failure)
+        self.assertEqual(response, {"ok": False, "error": "authority_unavailable"})
+        self.assertNotIn(secret, "\n".join(captured.output))
+        diagnostic = json.loads(captured.records[0].getMessage().split(": ", 1)[1])
+        self.assertEqual([entry["type"] for entry in diagnostic], ["RuntimeError", "ValueError"])
+        for entry in diagnostic:
+            self.assertTrue(entry["frames"])
+            self.assertEqual(set(entry["frames"][-1]), {"file", "line", "function"})
 
     def test_production_dispatch_rejects_non_mtls_credential(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "mTLS"):
@@ -304,3 +317,38 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_shared_channel_preserves_existing_contract_identity_and_type_hints():
+    import inspect
+    from typing import get_type_hints
+    from sylanne3.host import authority_client, authority_transport_contract, mtls_channel, mtls_transport
+
+    for name in (
+        "PublisherPackageIdentity", "AuthorityProvisioningRequest", "AuthorityHandshake",
+        "AuthorityEnrollmentGrant", "AuthorityCapabilityGrant",
+    ):
+        shared = getattr(authority_transport_contract, name)
+        assert getattr(authority_client, name) is shared
+        assert shared.__module__ == "sylanne3.host.authority_transport_contract"
+        get_type_hints(shared)
+    assert mtls_transport.AuthorityTlsProfile is authority_transport_contract.AuthorityTlsProfile
+    assert get_type_hints(authority_transport_contract.AuthorityTlsProfile)["trust_root"] is Path
+    assert get_type_hints(authority_transport_contract.AuthorityProvisioningRequest)["publisher_package"] is PublisherPackageIdentity
+    assert authority_client.AUTHORITY_PROTOCOL is authority_transport_contract.AUTHORITY_PROTOCOL
+    assert authority_client.AUTHORITY_V2_PROTOCOL is authority_transport_contract.AUTHORITY_V2_PROTOCOL
+    assert authority_client.REQUIRED_AUTHORITY_CAPABILITIES is authority_transport_contract.REQUIRED_AUTHORITY_CAPABILITIES
+    for name in (
+        "AuthorityChannelUnavailable", "V2OwnerAuthorizationBarrier",
+        "V2PlatformObservationVerifierUnavailable",
+    ):
+        assert getattr(mtls_transport, name) is getattr(mtls_channel, name)
+    assert issubclass(MtlsAuthorityTransport, mtls_channel.MtlsAuthorityChannel)
+    for owner in (mtls_channel.MtlsAuthorityChannel, MtlsAuthorityTransport):
+        for method in vars(owner).values():
+            if isinstance(method, staticmethod):
+                method = method.__func__
+            if inspect.isfunction(method):
+                get_type_hints(method)
+    for name in ("_rpc", "_content_rpc", "handshake", "installation_grant_v2", "close"):
+        assert getattr(MtlsAuthorityTransport, name) is getattr(mtls_channel.MtlsAuthorityChannel, name)

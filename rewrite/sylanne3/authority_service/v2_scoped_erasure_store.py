@@ -194,7 +194,8 @@ class AuthorityV2ScopedErasureStore:
     def state_locked(self, db, *, allow_reserved: bool = False) -> ScopedErasureStateV2:
         if db is not self.core._db or not db.in_transaction:
             raise AuthorityUnavailable("scoped deletion state needs Core transaction")
-        return read_scoped_erasure_state_in_tx_v1(db, namespace=self.namespace, allow_reserved=allow_reserved)
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        return read_scoped_erasure_state_in_tx_v1(c09_actual_root_read_v3(db), namespace=self.namespace, allow_reserved=allow_reserved)
 
     def reserve_locked(self, db, pending: DeletionPendingV1) -> None:
         """Reserve one operation in the same transaction as typed pending."""
@@ -233,11 +234,12 @@ class AuthorityV2ScopedErasureStore:
 
     def transition_locked(self, db, pending: DeletionPendingV1) -> str:
         """Advance the aggregate inside the journal-to-Core CAS transaction."""
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
         self.require_pending_locked(db, pending)
         if pending.target_phase == "pending":
             return "pending"
         if pending.target_phase == "accepted":
-            changed = db.execute(
+            changed = _capture_write_v2(db,
                 "UPDATE authority_scoped_erasure_v2 SET aggregate_phase='accepted' "
                 "WHERE namespace=? AND active_operation_id=? "
                 "AND aggregate_phase='pending' AND active_epoch=? AND closed_seq IS NULL",
@@ -245,7 +247,7 @@ class AuthorityV2ScopedErasureStore:
                  pending.deletion_epoch)).rowcount
             result = "accepted"
         elif pending.target_phase == "closed":
-            changed = db.execute(
+            changed = _capture_write_v2(db,
                 "UPDATE authority_scoped_erasure_v2 SET closed_seq=?,closed_digest=? "
                 "WHERE namespace=? AND active_operation_id=? "
                 "AND aggregate_phase='accepted' AND active_epoch=? "
@@ -312,12 +314,24 @@ class AuthorityV2ScopedErasureStore:
                 with self.core._tx() as db:
                     return self._apply_verified_head_locked_v1(db, head, execution_head, subject, receipt)
 
-    def _apply_verified_head_locked_v1(self, db, head, execution_head, subject, receipt):
+    def _apply_verified_head_locked_v1(self, db, head, execution_head, subject, receipt, *, selected_proof=None):
         if (head.seq, head.digest) != (receipt.deletion_seq, receipt.deletion_digest):
             raise AuthorityUnavailable("Graph application is not at latest deletion head")
-        if self.deletion.latest_phases().get((self.namespace, receipt.deletion_operation_id)) != "closed":
-            raise AuthorityUnavailable("scoped deletion is not closed")
-        tail = self.deletion._db.execute(
+        if selected_proof is None:
+            if self.deletion.latest_phases().get((self.namespace, receipt.deletion_operation_id)) != "closed":
+                raise AuthorityUnavailable("scoped deletion is not closed")
+        else:
+            from .c09_graph_application_v1 import SelectedC09JournalProofV3
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            if type(selected_proof) is not SelectedC09JournalProofV3:
+                raise AuthorityUnavailable('actual private selected scoped journal proof required')
+            actual = selected_proof.require_current_locked(deletion=self.deletion,execution=self.execution,
+                core=self.core,db=db,meter=current_c09_sql_meter_v2())
+            if actual != (head,execution_head) or receipt.deletion_operation_id != selected_proof.view.scope.operation_id:
+                raise AuthorityUnavailable('actual selected scoped application journals differ')
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        tail = c09_actual_root_read_v3(self.deletion._db).execute(
             "SELECT mutation_id,operation_id,phase FROM authority_deletion_v2_tail WHERE seq=?",
             (head.seq,)).fetchone()
         if tail is None or tail[1:] != (receipt.deletion_operation_id, "closed"):
@@ -362,7 +376,7 @@ class AuthorityV2ScopedErasureStore:
                      deletion_epoch=receipt.deletion_epoch,
                      graph_receipt_digest=receipt.graph_receipt_digest),
                 sort_keys=True, separators=(",", ":")).encode()).hexdigest())
-        changed = db.execute(
+        changed = _capture_write_v2(db,
             "UPDATE authority_namespaces SET deletion_phase='clear',"
             "revocation_epoch=revocation_epoch+1,anchor_nonce=? "
             "WHERE namespace=? AND deletion_phase='accepted' "
@@ -371,7 +385,7 @@ class AuthorityV2ScopedErasureStore:
              head.seq, head.digest)).rowcount
         if changed != 1:
             raise AuthorityUnavailable("scoped deletion clear CAS failed")
-        changed = db.execute(
+        changed = _capture_write_v2(db,
             "UPDATE authority_scoped_erasure_v2 SET "
             "active_operation_id=NULL,aggregate_phase='clear',"
             "active_epoch=NULL,closed_seq=NULL,closed_digest=NULL,"

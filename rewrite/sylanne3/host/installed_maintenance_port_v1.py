@@ -199,7 +199,7 @@ return None for unresolved). executor.read_current_installation_digest_v1
         verification = verify_installed_backend_runtime_v1(root, plan.release_manifest_digest[7:],
             available_cpu_features=frozenset(plan.available_cpu_features))
         if (not verification.verified or verification.runtime_scope not in {
-                "backend-production-acceptance", "formal-alpha1"}
+                "backend-production-acceptance", "backend-local-alpha2-acceptance", "formal-alpha1"}
                 or verification.package_version != plan.package_version):
             raise ValueError("installed backend package qualification failed: " + verification.reason)
         manifest = json.loads((root / "release-manifest.json").read_bytes())

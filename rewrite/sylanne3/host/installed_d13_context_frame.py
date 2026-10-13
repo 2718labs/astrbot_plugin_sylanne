@@ -57,6 +57,7 @@ async def read_installed_d13_raw_context_frame_v1(
             or type(ingress_operation_id) is not str
             or ingress_ids(envelope.lineage.source_ref)[2] != ingress_operation_id):
         return None
+    runtime.local_module_admission.require_v1(("d13", "d11"), "d13:new_context_input_frame")
     policy = runtime._v2_policy
     bundle = runtime._v2_model_bundle
     grant = runtime._v2_installation_grant

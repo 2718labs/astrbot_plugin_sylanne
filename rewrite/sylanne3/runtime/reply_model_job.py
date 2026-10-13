@@ -6,6 +6,11 @@ from a later GraphCoordinator-produced ``ModelEgressDraftV1``.
 
 from __future__ import annotations
 
+from ..authority_service.current_authority_graph_read_v3 import (
+    authority_graph_projection_for_db_v3,require_authority_source_metadata_v3,
+    _authority_attachment_owner_v3,read_authority_current_point_v3,authority_current_json_v3,
+    authority_current_json_matches_v3)
+
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -55,6 +60,107 @@ class CurrentReplyModelInputsV1:
     graph_snapshot: GraphSnapshot
 
 
+_PREPARED_REPLY_INPUT_ISSUER_V3 = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedReplySourceMetadataV3:
+    witness: object
+    source_ref: str
+    source_revision: int
+    access_revision: int
+
+    @property
+    def source(self):
+        from .dispatch_initial_source_read_v3 import _SourceMetadataRecordV3
+        return _SourceMetadataRecordV3(self.witness.metadata)
+
+
+class _PreparedCurrentReplyModelInputsV3:
+    def __init__(self, issuer, receipt, source, attention, conversation, projection, inventory):
+        if issuer is not _PREPARED_REPLY_INPUT_ISSUER_V3:
+            raise ReplyModelJobHold("actual prepared C02 input issuer required")
+        self.c02_receipt,self.source,self.attention = receipt,source,attention
+        self.conversation_ref,self.graph_snapshot,self.prepared_inventory = conversation,projection,inventory
+
+    def require_for_v3(self,db,namespace,source_ref):
+        inventory=self.prepared_inventory
+        inventory.require_current(db,namespace,inventory.query,self.graph_snapshot)
+        from ..graph_types import AtomKey
+        actual=inventory.source_metadata(db,namespace,inventory.query,AtomKey.from_token(source_ref),
+            revision=self.source.source_revision,require_grant=False)
+        if actual is not self.source.witness or self.source.source_ref!=source_ref:
+            raise ReplyModelJobHold("actual prepared C02 Source witness changed")
+
+
+class _PrefinalReplyModelInputsV3:
+    """Verified C02/current metadata under the actual prefinal Work; no body grant."""
+    def __init__(self,issuer,receipt,source,attention,conversation,projection,prefinal,family):
+        if issuer is not _PREPARED_REPLY_INPUT_ISSUER_V3:
+            raise ReplyModelJobHold('actual prefinal C02 evidence issuer required')
+        self.c02_receipt,self.source,self.attention=receipt,source,attention
+        self.conversation_ref,self.graph_snapshot=conversation,projection
+        self.prefinal_inventory,self.attention_source_read=prefinal,family
+
+
+class _PreparedFullReplyModelInputsV3:
+    """Current FULL metadata route; Source material keeps its separate rights-scoped Work."""
+    def __init__(self,issuer,receipt,source,attention,conversation,projection,full_read,source_family,witness,material):
+        if issuer is not _PREPARED_REPLY_INPUT_ISSUER_V3:
+            raise ReplyModelJobHold('actual ordinary FULL C02 input issuer required')
+        self.c02_receipt,self.source,self.attention=receipt,source,attention
+        self.conversation_ref,self.graph_snapshot=conversation,projection
+        self.prepared_full_read,self.attention_source_read=full_read,source_family
+        self.source_witness,self.source_material=witness,material
+    def require_for_v3(self,db,namespace,source_ref):
+        from .current_graph_full_read_v3 import (PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3,
+            require_bound_graph_full_read_proof_for_db_v3,require_bound_graph_full_source_metadata_v3,
+            CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3)
+        from ..domains.d07.qualified_attention_read import require_qualified_attention_source_family_v3
+        from ..graph_types import AtomKey
+        full=self.prepared_full_read
+        if type(full) not in(PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3):
+            raise ReplyModelJobHold('actual ordinary FULL reply input proof required')
+        actual=require_bound_graph_full_read_proof_for_db_v3(db,namespace,
+            required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3}))
+        if actual is not full or self.graph_snapshot is not actual.projection:
+            raise ReplyModelJobHold('ordinary FULL reply projection/Work changed')
+        witness=require_bound_graph_full_source_metadata_v3(db,namespace,AtomKey.from_token(source_ref),revision=self.source.source_revision)
+        if witness is not self.source_witness or self.source.source_ref!=source_ref:
+            raise ReplyModelJobHold('ordinary FULL reply Source witness changed')
+        if self.source_material is not None:
+            record=self.source_material.source_record_for_v3(db=db,prepared_full_read=full,namespace=namespace,
+                source_ref=source_ref,audiences=(self.conversation_ref,))
+            if record is not self.source.source:raise ReplyModelJobHold('actual Source material changed')
+            return
+        family=require_qualified_attention_source_family_v3(self.graph_snapshot,namespace,attention=self.attention,
+            audience=self.conversation_ref,purpose='expression',prepared_full_read=full,db=db)
+        if (family.read_versions!=self.attention_source_read.read_versions
+                or family.source_metadata!=self.attention_source_read.source_metadata):
+            raise ReplyModelJobHold('ordinary FULL reply Source family/current rights changed')
+
+
+class _PreparedAuthorityReplyModelInputsV3:
+    """Only this Authority Work's selected expression Source body and original C02."""
+    def __init__(self,issuer,work,receipt,source,attention,conversation):
+        if issuer is not _PREPARED_REPLY_INPUT_ISSUER_V3:
+            raise ReplyModelJobHold('actual Authority current C02 input issuer required')
+        self.work,self.c02_receipt,self.source,self.attention=work,receipt,source,attention
+        self.conversation_ref,self.graph_snapshot=conversation,work.projection
+        self.require_for_v3(work.db,work.namespace,source.source_ref)
+    def require_for_v3(self,db,namespace,source_ref):
+        work=_authority_attachment_owner_v3(db)
+        if work is not self.work or self.graph_snapshot is not work.projection:
+            raise ReplyModelJobHold('Authority C02 inputs crossed the original Work/projection')
+        material=work.source_material
+        record=material.source_record_for_v3(db=db,prepared_full_read=work.prepared,namespace=namespace,
+            source_ref=source_ref,audiences=(self.conversation_ref,))
+        witness=material.witnesses[source_ref].require_current_v3()
+        if (record is not self.source.source or self.source.source_ref!=source_ref
+                or self.source.source_revision!=witness.revision or material.attention!=self.attention):
+            raise ReplyModelJobHold('Authority C02 Source body/attention/versions changed')
+
+
 @dataclass(frozen=True, slots=True)
 class CurrentReplyRouteManifestV2:
     """Original committed private ingress route, pending live host recheck."""
@@ -77,10 +183,12 @@ def read_current_reply_route_manifest_v2(
     from .ingress_observation import read_committed_ingress_identity
 
     if (not db.in_transaction or type(namespace) is not NamespaceId
-            or type(inputs) not in {CurrentReplyModelInputsV1, SettledC02ReplySourceV1}
+            or type(inputs) not in {CurrentReplyModelInputsV1, SettledC02ReplySourceV1, _PreparedCurrentReplyModelInputsV3, _PreparedFullReplyModelInputsV3, _PreparedAuthorityReplyModelInputsV3}
             or inputs.c02_receipt.status != "committed"
             or inputs.source.source_ref != source_ref):
         raise ReplyModelJobHold("transactional original reply route required")
+    if type(inputs) in (_PreparedCurrentReplyModelInputsV3,_PreparedFullReplyModelInputsV3,_PreparedAuthorityReplyModelInputsV3):
+        inputs.require_for_v3(db,namespace,source_ref)
     source_id = source_key_from_ref(source_ref, namespace)
     original = read_committed_ingress_identity(db, namespace, source_id)
     if original is None:
@@ -301,15 +409,13 @@ def read_saved_reply_job_v1(db, issuer: D02ResourceIssuer,
         raise ReplyModelJobHold("saved reply identity differs")
     quote = issuer.original_signed_quote(db, quote_id, version)
     job = get_job(db, job_id)
-    reservation = db.execute(
-        "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
-        "WHERE lease_id=? AND operation_id=?",
-        (quote.parent_budget_lease_ref, original_operation_id),
-    ).fetchone()
-    projection = db.execute(
-        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-        (job_ref,),
-    ).fetchone()
+    reservation=read_authority_current_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json','state'),
+        key_columns=('lease_id','operation_id'),key=(quote.parent_budget_lease_ref,original_operation_id),
+        legacy_reader=lambda:db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
+            (quote.parent_budget_lease_ref,original_operation_id)).fetchone())
+    projection=read_authority_current_point_v3(db,table='graph_atoms',columns=('revision','value','valid'),
+        key_columns=('token',),key=(job_ref,),legacy_reader=lambda:db.execute(
+            'SELECT revision,value,valid FROM graph_atoms WHERE token=?',(job_ref,)).fetchone())
     if ((job.bot_id, job.persona_id, job.activity_id, job.operation_id,
          job.work_kind, job.budget_ref) != (*namespace.as_tuple, activity_id,
                                           original_operation_id, "reply",
@@ -319,11 +425,11 @@ def read_saved_reply_job_v1(db, issuer: D02ResourceIssuer,
                     *namespace.as_tuple, activity_id, original_operation_id,
                     "reply", job_ref)
             or reservation is None or reservation[0] != digest
-            or json.loads(reservation[1]) != dict(quote.ceiling)
+            or authority_current_json_v3(reservation[1]) != dict(quote.ceiling)
             or reservation[2] not in {"reserved", "unknown", "settled"}
             or projection is None or projection[0] != revision
             or projection[2] != 1
-            or json.loads(projection[1]) != job_graph_write(job).value
+            or authority_current_json_v3(projection[1]) != job_graph_write(job).value
             or db.execute(
                 "SELECT 1 FROM graph_events WHERE bot=? AND persona=? "
                 "AND session=? AND event_id=?",
@@ -338,48 +444,105 @@ def read_saved_reply_job_v1(db, issuer: D02ResourceIssuer,
 def read_current_reply_model_inputs_v1(
     db, issuer: D02ResourceIssuer, namespace: NamespaceId,
     c02_receipt: CommitReceipt, source_ref: str,
-    snapshot: GraphSnapshot, attention: CurrentAttentionTicketReadV1,
-) -> CurrentReplyModelInputsV1:
+    snapshot: GraphSnapshot, attention: CurrentAttentionTicketReadV1, *, prepared_inventory=None, prepared_full_read=None, _prefinal_source_inventory=None, _prepared_c02_originals=None,
+) -> CurrentReplyModelInputsV1 | _PreparedCurrentReplyModelInputsV3 | _PreparedFullReplyModelInputsV3 | _PrefinalReplyModelInputsV3:
     """Join the original settled C02 to current source/access/attention.
 
     ``snapshot`` must be read by GraphCoordinator from the same live SQLite
     transaction.  Every relevant atom is checked against that transaction.
     """
+    authority_projection=authority_graph_projection_for_db_v3(db,namespace)
+    authority_work=None if authority_projection is None else _authority_attachment_owner_v3(db)
+    if authority_work is not None and (snapshot is not authority_projection or prepared_inventory is not None
+            or prepared_full_read is not None or _prefinal_source_inventory is not None):
+        raise ReplyModelJobHold("Authority C02 inputs must use their exact independently prepared projection")
+    if _prefinal_source_inventory is not None:
+        from .current_graph_full_read_v3 import _PrefinalSourceInventoryV3
+        if (type(_prefinal_source_inventory) is not _PrefinalSourceInventoryV3
+                or prepared_inventory is not None or prepared_full_read is not None):
+            raise ReplyModelJobHold('actual private prefinal C02 inventory required')
+        _prefinal_source_inventory.require_current()
+        if (snapshot is not _prefinal_source_inventory.projection or namespace!=_prefinal_source_inventory.namespace
+                or db is not _prefinal_source_inventory.db
+                or _prefinal_source_inventory.actual_entry.c02_operation_id!=c02_receipt.operation_id):
+            raise ReplyModelJobHold('prefinal C02 metadata belongs to another actual entry/Work')
+    if prepared_inventory is not None and prepared_full_read is not None:
+        raise ReplyModelJobHold('reply inputs require one actual prepared read authority')
+    if prepared_full_read is not None:
+        from .current_graph_full_read_v3 import (PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3,
+            require_bound_graph_full_read_proof_for_db_v3,CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3)
+        if type(prepared_full_read) not in(PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3):
+            raise ReplyModelJobHold('actual ordinary FULL reply input proof required')
+        actual=require_bound_graph_full_read_proof_for_db_v3(db,namespace,
+            required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3}))
+        if actual is not prepared_full_read or snapshot is not actual.projection:
+            raise ReplyModelJobHold('reply inputs must use the actual ordinary FULL fixed projection')
+        actual.operation.retain(8192)
+    if prepared_inventory is not None:
+        from .dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
+        if type(prepared_inventory) is not PreparedCurrentDispatchInventoryV3:
+            raise ReplyModelJobHold("actual prepared reply inventory required")
+        prepared_inventory.require_current(db,namespace,prepared_inventory.query,snapshot)
+        prepared_inventory.operation.retain(8192)
     if (not db.in_transaction or type(issuer) is not D02ResourceIssuer
             or type(namespace) is not NamespaceId
             or type(c02_receipt) is not CommitReceipt
             or c02_receipt.status != "committed"
-            or type(snapshot) is not GraphSnapshot
+            or prepared_inventory is None and prepared_full_read is None and _prefinal_source_inventory is None and authority_work is None and type(snapshot) is not GraphSnapshot
             or type(attention) is not CurrentAttentionTicketReadV1
             or len(snapshot.epochs) != 1
             or snapshot.epochs[0].bot != namespace.bot_id
             or snapshot.epochs[0].persona != namespace.persona_id):
         raise ReplyModelJobHold("transactional C02/current graph evidence required")
-    c02_operation_id = c02_receipt.operation_id
-    archive = db.execute(
-        "SELECT schema,bundle_digest,evidence_json,quote_json FROM "
-        "graph_first_ingress_c02_committed_seals_v2 "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (c02_operation_id,),
-    ).fetchone()
-    business = db.execute(
-        "SELECT digest,activity_id,receipt_json FROM graph_bundle_operations "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (c02_operation_id,),
-    ).fetchone()
-    cost_attempt = db.execute(
-        "SELECT state FROM graph_c02_cost_attempts_v1 "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (c02_operation_id,),
-    ).fetchone()
-    cost_operation_id = "c02-cost-" + canonical_digest({
-        "namespace": list(namespace.as_tuple), "operation_id": c02_operation_id,
-    })[:48]
-    cost = db.execute(
-        "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? "
-        "AND persona=? AND operation_id=?",
-        namespace.as_tuple + (cost_operation_id,),
-    ).fetchone()
+    meter=None
+    actual_reader=authority_work if authority_work is not None else _prefinal_source_inventory if _prefinal_source_inventory is not None else prepared_full_read
+    if actual_reader is not None:
+        from .c09_paged_sql_v2 import current_c09_sql_meter_v2,require_c09_reserved_meter_v3
+        current=current_c09_sql_meter_v2()
+        meter=require_c09_reserved_meter_v3(current.budget)
+    def read_row(table,columns,where,args):
+        if authority_work is not None:
+            keys={
+                'bot=? AND persona=? AND operation_id=?':('bot','persona','operation_id'),
+                'lease_id=? AND operation_id=?':('lease_id','operation_id'),
+                'dependent_token=? AND dependency_token=?':('dependent_token','dependency_token'),
+                'token=?':('token',),'token=? AND valid=1':('token',),
+                "bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'":('bot_id','persona_id','operation_id','phase'),
+            }.get(where)
+            if keys is not None:
+                actual_args=tuple(args)+(('settle',)if keys[-1]=='phase'else())
+                return read_authority_current_point_v3(db,table=table,columns=columns,key_columns=keys,
+                    key=actual_args,required_valid=where=='token=? AND valid=1',
+                    legacy_reader=lambda:None)
+        if meter is None:
+            return db.execute('SELECT '+','.join(columns)+' FROM '+table+' WHERE '+where,args).fetchone()
+        row=meter.read_fixed_row(db,table,columns,where,args)
+        if row is not None:
+            actual_reader.operation.retain(sum(len(value)*32 for value in row if type(value)in(str,bytes))+4096)
+        return row
+    originals=_prepared_c02_originals
+    if originals is None and prepared_full_read is not None and prepared_full_read.source_material is not None:
+        originals=prepared_full_read.source_material.c02_originals
+    if originals is not None:
+        from .current_graph_source_material_v3 import PreparedCurrentC02OriginalsV3
+        prefinal=_prefinal_source_inventory if _prefinal_source_inventory is not None else prepared_full_read.prefinal
+        if type(originals)is not PreparedCurrentC02OriginalsV3:
+            raise ReplyModelJobHold('actual completed same-Work C02 original columns required')
+        originals.require_for_v3(prefinal,prefinal.actual_entry)
+        if originals.entry.c02_operation_id!=c02_receipt.operation_id:
+            raise ReplyModelJobHold('completed C02 originals belong to another actual entry')
+    c02_operation_id=c02_receipt.operation_id
+    archive=read_row('graph_first_ingress_c02_committed_seals_v2',
+        ('schema','bundle_digest')if originals is not None else('schema','bundle_digest','evidence_json','quote_json'),
+        'bot=? AND persona=? AND operation_id=?',namespace.as_tuple+(c02_operation_id,))
+    business=read_row('graph_bundle_operations',
+        ('digest','activity_id')if originals is not None else('digest','activity_id','receipt_json'),
+        'bot=? AND persona=? AND operation_id=?',namespace.as_tuple+(c02_operation_id,))
+    cost_attempt=read_row('graph_c02_cost_attempts_v1',('state',),
+        'bot=? AND persona=? AND operation_id=?',namespace.as_tuple+(c02_operation_id,))
+    cost_operation_id='c02-cost-'+canonical_digest({'namespace':list(namespace.as_tuple),'operation_id':c02_operation_id})[:48]
+    cost=read_row('graph_bundle_operations',('operation_id',)if originals is not None else('receipt_json',),
+        'bot=? AND persona=? AND operation_id=?',namespace.as_tuple+(cost_operation_id,))
     if (archive is None or business is None or cost_attempt != ("committed",)
             or cost is None or archive[0] != "sylanne.first-ingress-c02-candidate.v2"
             or archive[1] != business[0]
@@ -389,64 +552,68 @@ def read_current_reply_model_inputs_v1(
                <= {version.key.type_name for version in c02_receipt.write_versions}):
         raise ReplyModelJobHold("original C02 business and cost are not committed")
     try:
-        evidence = json.loads(archive[2])
-        detail = json.loads(business[2])["first_ingress_c02"]
-        cost_detail = json.loads(cost[0])
+        evidence=authority_current_json_v3(archive[2])if originals is None else originals.value_v3('evidence')
+        detail=(authority_current_json_v3(business[2])if originals is None else originals.value_v3('business'))['first_ingress_c02']
+        cost_detail=authority_current_json_v3(cost[0])if originals is None else originals.value_v3('cost')
         from .issuers import d06_first_ingress_c02_quote_id
         quote = issuer.original_signed_quote(
-            db, d06_first_ingress_c02_quote_id(namespace, c02_operation_id), 1)
+            db, d06_first_ingress_c02_quote_id(namespace, c02_operation_id), 1, meter=meter, prepared_originals=originals)
         source_key_value = source_key(*namespace.as_tuple,
                                       source_key_from_ref(source_ref, namespace))
         access_key_value = access_key(*namespace.as_tuple,
                                       source_key_value.owner.subject)
-        source_atom = snapshot.get(source_key_value)
+        if authority_work is not None:
+            source_atom=require_authority_source_metadata_v3(db,namespace,source_ref)
+        elif _prefinal_source_inventory is not None:
+            source_atom=_prefinal_source_inventory.source_metadata(db,namespace,_prefinal_source_inventory.query,
+                source_key_value,require_grant=False)
+        elif prepared_full_read is not None:
+            from .current_graph_full_read_v3 import require_bound_graph_full_source_metadata_v3
+            source_atom=require_bound_graph_full_source_metadata_v3(db,namespace,source_key_value)
+        else:
+            source_atom = (snapshot.get(source_key_value) if prepared_inventory is None else
+                prepared_inventory.source_metadata(db,namespace,prepared_inventory.query,source_key_value,require_grant=False))
         access_atom = snapshot.get(access_key_value)
-        source = SourceRecord.from_dict(source_atom.value)
+        if prepared_inventory is None and prepared_full_read is None and _prefinal_source_inventory is None and authority_work is None:
+            source = SourceRecord.from_dict(source_atom.value)
+        else:
+            from .dispatch_initial_source_read_v3 import _SourceMetadataRecordV3
+            source = _SourceMetadataRecordV3(source_atom.metadata)
         validate_access(access_atom.value)
     except (KeyError, TypeError, ValueError, AttributeError,
             json.JSONDecodeError) as exc:
         raise ReplyModelJobHold("C02 or current source evidence is invalid") from exc
-    settled = db.execute(
-        "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
-        "AND operation_id=? AND phase='settle'",
-        namespace.as_tuple + (c02_operation_id,),
-    ).fetchone()
-    reservation = db.execute(
-        "SELECT state FROM runtime_budget_reservations WHERE lease_id=? "
-        "AND operation_id=?", (quote.parent_budget_lease_ref, c02_operation_id),
-    ).fetchone()
-    dep = db.execute(
-        "SELECT dependency_revision FROM graph_dependencies WHERE dependent_token=? "
-        "AND dependency_token=?", (access_key_value.token, source_ref),
-    ).fetchone()
-    ingress = db.execute(
-        "SELECT conversation_ref,visibility FROM graph_first_ingress_identity_v1 "
-        "WHERE bot=? AND persona=? AND source_ref=?",
-        namespace.as_tuple + (source.source_id,),
-    ).fetchall()
+    settled = read_row('runtime_budget_operations',('operation_id',),"bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",namespace.as_tuple + (c02_operation_id,))
+    reservation = read_row('runtime_budget_reservations',('state',),'lease_id=? AND operation_id=?',(quote.parent_budget_lease_ref, c02_operation_id))
+    dep = read_row('graph_dependencies',('dependency_revision',),'dependent_token=? AND dependency_token=?',(access_key_value.token, source_ref))
+    if meter is None:
+        ingress=db.execute('SELECT conversation_ref,visibility FROM graph_first_ingress_identity_v1 '
+            'WHERE bot=? AND persona=? AND source_ref=?',namespace.as_tuple+(source.source_id,)).fetchall()
+    else:
+        first=read_row('graph_first_ingress_identity_v1',('operation_id','conversation_ref','visibility'),
+            'bot=? AND persona=? AND source_ref=? ORDER BY operation_id',namespace.as_tuple+(source.source_id,))
+        second=None if first is None else read_row('graph_first_ingress_identity_v1',('operation_id','conversation_ref','visibility'),
+            'bot=? AND persona=? AND source_ref=? AND operation_id>? ORDER BY operation_id',
+            namespace.as_tuple+(source.source_id,first[0]))
+        ingress=[]if first is None else[first[1:]]if second is None else[first[1:],second[1:]]
     episode_versions = tuple(
         version for version in c02_receipt.write_versions
         if version.key.type_name in {
             "memory.episode.v1", "memory.subjective_trace.v2"})
+    if originals is not None:originals.require_archive_quote_v3()
     if (evidence.get("source_ref") != source.source_id
             or detail.get("seal_schema") != archive[0]
             or cost_detail.get("original_operation_id") != c02_operation_id
             or cost_detail.get("cost_ref") is None
-            or db.execute(
-                "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
-                (cost_detail["cost_ref"],),
-            ).fetchone() is None
+            or read_row('graph_atoms',('token',),'token=? AND valid=1',(cost_detail["cost_ref"],)) is None
             or settled is None or reservation is None
             or reservation[0] not in {"unknown", "settled", "overrun"}
-            or archive[3] != canonical_serialize(asdict(quote))
+            or originals is None and not authority_current_json_matches_v3(archive[3],asdict(quote),legacy_serializer=canonical_serialize)
             or (quote.bot_id, quote.persona_id, quote.activity_id,
                 quote.operation_id) != (*namespace.as_tuple,
                                         c02_receipt.activity_id, c02_operation_id)
             or len(episode_versions) != 2
-            or any(db.execute(
-                "SELECT revision,valid FROM graph_atoms WHERE token=?",
-                (version.key.token,),
-            ).fetchone() != (version.revision, 1)
+            or any(read_row('graph_atoms',('revision', 'valid'),'token=?',(version.key.token,)) != (version.revision, 1)
                    for version in episode_versions)
             or source_atom is None or access_atom is None
             or not source_atom.valid or not access_atom.valid
@@ -470,6 +637,37 @@ def read_current_reply_model_inputs_v1(
             or attention.source_versions[0].key != source_key_value
             or attention.source_versions[0].revision != source_atom.revision):
         raise ReplyModelJobHold("current source, audience, or D07 ticket differs")
+    if authority_work is not None:
+        material=authority_work.source_material
+        record=material.source_record_for_v3(db=db,prepared_full_read=authority_work.prepared,namespace=namespace,
+            source_ref=source_ref,audiences=(ingress[0][0],))
+        return _PreparedAuthorityReplyModelInputsV3(_PREPARED_REPLY_INPUT_ISSUER_V3,authority_work,c02_receipt,
+            ReplySourceSnapshot(record,source_ref,source_atom.revision,access_atom.revision),attention,ingress[0][0])
+    if _prefinal_source_inventory is not None:
+        return _PrefinalReplyModelInputsV3(_PREPARED_REPLY_INPUT_ISSUER_V3,c02_receipt,
+            _PreparedReplySourceMetadataV3(source_atom,source_ref,source_atom.revision,access_atom.revision),
+            attention,ingress[0][0],snapshot,_prefinal_source_inventory,None)
+    if prepared_full_read is not None:
+        material=prepared_full_read.source_material
+        if material is not None:
+            record=material.source_record_for_v3(db=db,prepared_full_read=prepared_full_read,namespace=namespace,
+                source_ref=source_ref,audiences=(ingress[0][0],))
+            current_source=ReplySourceSnapshot(record,source_ref,source_atom.revision,access_atom.revision)
+            family=material.family
+        else:
+            from ..domains.d07.qualified_attention_read import require_qualified_attention_source_family_v3
+            try:
+                family=require_qualified_attention_source_family_v3(snapshot,namespace,attention=attention,
+                    audience=ingress[0][0],purpose='expression',prepared_full_read=prepared_full_read,db=db)
+            except ValueError as exc:
+                raise ReplyModelJobHold('ordinary FULL reply Source ancestry/rights or D07 evidence differs')from exc
+            current_source=_PreparedReplySourceMetadataV3(source_atom,source_ref,source_atom.revision,access_atom.revision)
+        return _PreparedFullReplyModelInputsV3(_PREPARED_REPLY_INPUT_ISSUER_V3,c02_receipt,current_source,
+            attention,ingress[0][0],snapshot,prepared_full_read,family,source_atom,material)
+    if prepared_inventory is not None:
+        return _PreparedCurrentReplyModelInputsV3(_PREPARED_REPLY_INPUT_ISSUER_V3,c02_receipt,
+            _PreparedReplySourceMetadataV3(source_atom,source_ref,source_atom.revision,access_atom.revision),
+            attention,ingress[0][0],snapshot,prepared_inventory)
     return CurrentReplyModelInputsV1(
         c02_receipt, ReplySourceSnapshot(source, source_ref,
                                         source_atom.revision,
@@ -764,9 +962,9 @@ def reply_envelope_from_wire_v1(text: str):
     from ..runtime_contracts import CommandEnvelope
     from .c02_bundle_codec import _decode
 
-    raw = json.loads(text)
+    raw = authority_current_json_v3(text)
     envelope = _decode(raw, CommandEnvelope)
-    if canonical_serialize(envelope) != text:
+    if not authority_current_json_matches_v3(text,asdict(envelope),legacy_serializer=canonical_serialize):
         raise ReplyModelJobHold("stored reply envelope is noncanonical")
     return envelope
 

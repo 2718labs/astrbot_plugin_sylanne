@@ -22,6 +22,17 @@ load_canonical_runtime_v1(ROOT)
 def command_for(action, data, namespace):
     if type(data) is not dict:
         raise ValueError("one explicit JSON object required")
+    if action == "register-credential":
+        from sylanne3.authority_service.v2_owner_proof import (
+            OwnerCredentialRegistrationV1, from_wire as proof_from_wire, to_wire as proof_to_wire,
+        )
+        if set(data) != {"registration"}:
+            raise ValueError("exact administrator-paired public Owner credential required")
+        registration = proof_from_wire(data["registration"])
+        if type(registration) is not OwnerCredentialRegistrationV1 or proof_to_wire(registration) != data["registration"]:
+            raise ValueError("public Owner credential registration differs")
+        return "register_owner_credential_v1", {"namespace": namespace,
+            "registration": data["registration"], "rotation_signature": None}
     if action == "challenge":
         if set(data) != {"request"}:
             raise ValueError("challenge requires the exact signed-Owner login request")
@@ -49,19 +60,20 @@ def command_for(action, data, namespace):
         return 'd12_package_maintenance_v2', {'namespace': namespace,
             'action': 'accept' if action == 'package-accept' else 'status', **data}
     extra = {"inspect": set(), "status": {"operation_id"}, "continue": {"operation_id"},
-        "resume": {"pause_operation_id", "operation_id", "expected_lifecycle_epoch"}}
+        "resume": {"pause_operation_id", "operation_id", "expected_lifecycle_epoch"},
+        "upgrade-catalogue": {"operation_id", "pause_operation_id", "target_cohort_ref", "source_catalogue_hash"}}
     common = {"owner_actor_id", "owner_session_request", "owner_session_token"}
     if action not in extra or set(data) != common | extra[action]:
         raise ValueError("exact current signed Owner and lifecycle original fields required")
-    return "d12_installation_control_v1", {"namespace": namespace, "action": action, **data}
+    return "d12_installation_control_v1", {"namespace": namespace,
+        "action": "upgrade_catalogue" if action == "upgrade-catalogue" else action, **data}
 
 
 async def execute(args, data):
     from sylanne3.host.authority_profile import load_admin_installation_bundle
-    from sylanne3.host.authority_client import AuthorityProvisioningRequest, PublisherPackageIdentity, AUTHORITY_PROTOCOL, AUTHORITY_V2_PROTOCOL
+    from sylanne3.host.authority_transport_contract import AuthorityProvisioningRequest, PublisherPackageIdentity, AUTHORITY_PROTOCOL, AUTHORITY_V2_PROTOCOL
     from sylanne3.host.installed_package import verify_installed_backend_runtime_v1
-    from sylanne3.host.mtls_transport import MtlsAuthorityTransport
-    from sylanne3.authority_service.v2_owner_session import from_wire, OwnerSessionLoginChallengeV1
+    from sylanne3.host.mtls_channel import MtlsAuthorityChannel
     bundle = load_admin_installation_bundle(args.profile)
     policy = bundle.installation_policy
     if bundle.package_selection is not None:
@@ -86,7 +98,7 @@ async def execute(args, data):
     method, command = command_for(args.action, data, policy.authority_namespace)
     request = AuthorityProvisioningRequest(AUTHORITY_PROTOCOL, args.profile, "astrbot_plugin_sylanne", "4.28.1",
         root, root, PublisherPackageIdentity(policy.manifest_digest))
-    transport = MtlsAuthorityTransport({args.profile: bundle.tls_profile})
+    transport = MtlsAuthorityChannel({args.profile: bundle.tls_profile})
     try:
         handshake = await transport.handshake(request, protocol=AUTHORITY_V2_PROTOCOL)
         grant = await transport.installation_grant_v2(request, handshake)
@@ -96,6 +108,7 @@ async def execute(args, data):
         result = await transport._content_rpc(request, handshake, method, command, protocol=AUTHORITY_V2_PROTOCOL)
         result = {k: v for k, v in result.items() if k != "channel_binding_sha256"}
         if args.action == "challenge":
+            from sylanne3.authority_service.v2_owner_session import from_wire, OwnerSessionLoginChallengeV1
             challenge = from_wire(result.get("challenge"))
             if type(challenge) is not OwnerSessionLoginChallengeV1:
                 raise ValueError("signed login challenge response differs")
@@ -109,7 +122,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--package-root", type=Path)
-    parser.add_argument("action", choices=("challenge", "accept", "logout", "inspect", "status", "continue", "resume", 'package-accept', 'package-status', 'first-owner-issue'))
+    parser.add_argument("action", choices=("register-credential", "challenge", "accept", "logout", "inspect", "status", "continue", "resume", 'package-accept', 'package-status', 'first-owner-issue', 'upgrade-catalogue'))
     args = parser.parse_args()
     raw = sys.stdin.buffer.read(65537)
     if len(raw) > 65536:

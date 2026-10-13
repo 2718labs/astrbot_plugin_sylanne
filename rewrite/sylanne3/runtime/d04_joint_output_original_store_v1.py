@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 from dataclasses import asdict, fields
 import json
 import sqlite3
@@ -128,16 +129,19 @@ def read_d04_joint_output_original_v1(
         db: sqlite3.Connection, namespace: NamespaceId,
         operation_id: str) -> JointStateOutputOriginalV1 | None:
     """Read the committed typed original; the caller must also check current graph."""
-    row = db.execute(
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .domain_background_read_v3 import background_typed_original_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table='graph_d04_joint_output_originals_v1', columns=('evidence_digest', 'original_json', 'original_digest', 'write_set_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT evidence_digest,original_json,original_digest,write_set_digest "
         "FROM graph_d04_joint_output_originals_v1 WHERE bot=? AND persona=? "
         "AND operation_id=?", namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         return None
     try:
-        raw = json.loads(row[1])
-        if type(raw) is not dict or canonical_serialize(raw) != row[1]:
+        raw = background_json_loads_v3(row[1])
+        if type(raw) is not dict or not background_json_matches_v3(row[1],raw):
             raise ValueError("noncanonical output original")
         if raw.get("schema") not in {SCHEMA, AUTHORED_SCHEMA}:
             raise ValueError("joint output original schema differs")
@@ -174,16 +178,16 @@ def read_d04_joint_output_original_v1(
             members.append(JointStateOutputMemberV1(**item))
         raw["members"] = tuple(members)
         original = JointStateOutputOriginalV1(**raw)
-        joint = db.execute(
+        joint = _producer_original_point_v3(db, table='graph_d04_joint_advances_v2', columns=('evidence_digest',), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
             "SELECT evidence_digest FROM graph_d04_joint_advances_v2 "
             "WHERE bot=? AND persona=? AND operation_id=?",
             namespace.as_tuple + (operation_id,),
-        ).fetchone()
+        ).fetchone())
         if (original.namespace != namespace or original.operation_id != operation_id
                 or original.original_digest != row[2]
                 or original.write_set_digest != row[3]
-                or _content_digest(original) != row[2]
-                or canonical_serialize(asdict(original)) != row[1]
+                or background_typed_original_digest_v3(db,row[1],{field.name:getattr(original,field.name) for field in fields(original) if field.name not in {"original_digest","status"}}) != row[2]
+                or not background_json_matches_v3(row[1],asdict(original))
                 or joint != (row[0],)):
             raise ValueError("committed output original identity differs")
         return original

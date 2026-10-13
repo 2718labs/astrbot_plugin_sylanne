@@ -474,10 +474,10 @@ def read_plan_current_d08_operation_v1(db, *, namespace, activity_id, operation_
         if action:
             intent = _decode_intent(action)
             roots += list(intent.source_refs)
-            for atom_ref, encoded in db.execute("SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? "
-                    "AND type_name='d08.action_schema.v1' AND valid=1 ORDER BY token LIMIT 129", namespace.as_tuple).fetchall():
-                if json.loads(encoded)["action_id"] == intent.action_id:
-                    originals.append(atom_ref)
+            from .domain_background_read_v3 import background_inventory_v3
+            for schema_atom in background_inventory_v3(db,namespace,'d08.action_schema.v1',valid_only=True):
+                if schema_atom.value["action_id"] == intent.action_id:
+                    originals.append(schema_atom.key.token)
             for spec in intent.required_checks:
                 for version in spec.required_input_versions:
                     try:

@@ -123,12 +123,14 @@ def read_graph_rebase_certificate_v1(
     """Read the certificate mirrored into the switched Graph generation."""
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("frozen switched Graph transaction required")
-    row = db.execute("SELECT certificate_json FROM graph_c09_rebase_certificates_v1 "
-                     "WHERE bot=? AND persona=? AND operation_id=?",
-                     (*namespace.as_tuple, operation_id)).fetchone()
+    from .domain_background_read_v3 import background_point_v3,background_json_loads_v3,background_json_matches_v3
+    row=background_point_v3(db,table='graph_c09_rebase_certificates_v1',columns=('certificate_json',),
+        key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation_id),legacy_reader=lambda:db.execute(
+            'SELECT certificate_json FROM graph_c09_rebase_certificates_v1 WHERE bot=? AND persona=? AND operation_id=?',
+            (*namespace.as_tuple,operation_id)).fetchone())
     if row is None:
         return None
-    raw = json.loads(row[0])
+    raw = background_json_loads_v3(row[0])
     if type(raw) is not dict:
         raise ValueError("Graph rebase certificate malformed")
     from .c09_storage_rebase_contract_v1 import (
@@ -144,16 +146,15 @@ def read_graph_rebase_certificate_v1(
         raw[key] = tuple(raw[key])
     raw["component_hashes"] = tuple(tuple(item) for item in raw["component_hashes"])
     certificate = GraphErasureRebaseCertificateV1(**raw)
-    recovery = db.execute(
-        "SELECT requirements_json FROM graph_recovery_metadata_v2 "
-        "WHERE bot=? AND persona=?", namespace.as_tuple,
-    ).fetchone()
+    recovery=background_point_v3(db,table='graph_recovery_metadata_v2',columns=('requirements_json',),
+        key_columns=('bot','persona'),key=namespace.as_tuple,legacy_reader=lambda:db.execute(
+            'SELECT requirements_json FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?',namespace.as_tuple).fetchone())
     if recovery is None:
         raise ValueError("Graph recovery identity is absent")
-    authority_namespace = json.loads(recovery[0])["authority_namespace"]
+    authority_namespace = background_json_loads_v3(recovery[0])["authority_namespace"]
     if (certificate.namespace != authority_namespace
             or certificate.operation_id != operation_id
-            or canonical_serialize(asdict(certificate)) != row[0]):
+            or not background_json_matches_v3(row[0],asdict(certificate))):
         raise ValueError("Graph rebase certificate bytes or identity differ")
     return certificate
 

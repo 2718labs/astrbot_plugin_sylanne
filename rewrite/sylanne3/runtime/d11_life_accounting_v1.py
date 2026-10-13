@@ -3,6 +3,7 @@
 It survives removal of raw Graph input bodies. It preserves the accepted cost
 contract and never authorizes recomputation or simulated-source production.
 """
+from .d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
 from dataclasses import dataclass
 import json
 
@@ -10,7 +11,7 @@ from ..domains.d01.production_operations_v1 import plain_v1
 from ..runtime_contracts import canonical_digest, canonical_serialize
 from .budget import BudgetLease, BudgetReceipt
 from .d11_life_preparation_v1 import TABLE, SIGN_KIND
-from .d11_life_contract_v1 import WORK_KIND, ALGORITHM_ID, D11LifeExecutionBindingV1
+from .d11_life_contract_v1 import WORK_KIND, ALGORITHM_ID, D11LifeExecutionBindingV1, life_work_kind_v1
 from .d11_offline_originals_v1 import _digest
 from .d10_offline_tick_execution_v1 import _decode_json
 from .issuers import BudgetLeaseGrant, ResourceQuote
@@ -30,9 +31,10 @@ class D11LifeAccountingPreparedV1:
     schema: str = "d11.life-content-free-accounting-prepared.v1"
 
     def __post_init__(self):
-        if self.schema != "d11.life-content-free-accounting-prepared.v1" or type(self.binding) is not D11LifeExecutionBindingV1:
+        if self.schema != "d11.life-content-free-accounting-prepared.v1" or type(self.binding) not in LIFE_BINDING_TYPES:
             raise ValueError("exact content-free life accounting schema required")
         binding = self.binding
+        work_kind = life_work_kind_v1(binding)
         _digest(self.prepared_digest)
         _digest(self.signed_grant_signature)
         if (self.accounting_original_ref != life_accounting_original_ref_v1(binding)
@@ -45,12 +47,12 @@ class D11LifeAccountingPreparedV1:
         if ((quote.quote_id, quote.version, quote.activity_id, quote.operation_id, quote.effect_id, quote.parent_budget_lease_ref,
                 quote.work_kind, quote.resource_ref, quote.required_worker_fence, quote.ceiling) !=
                 (binding.quote_id, binding.quote_version, binding.activity_id, binding.prepare_operation_id, binding.effect_id, binding.parent_budget_lease_ref,
-                WORK_KIND, ALGORITHM_ID, binding.job_fence, {"thread_cpu_ms": binding.cpu_ceiling_ms})
+                work_kind, binding.algorithm_id, binding.job_fence, {"thread_cpu_ms": binding.cpu_ceiling_ms})
                 or canonical_digest(quote) != binding.quote_digest or quote.outbox_refs or quote.d02_settlement_refs
                 or quote.job_continuation is not None or parent.lease_id != binding.parent_budget_lease_ref
                 or (grant.bot_id, grant.persona_id, grant.lease_id, grant.currency) !=
                     (*binding.namespace.as_tuple, parent.lease_id, parent.currency)
-                or WORK_KIND not in grant.allowed_work_kinds or grant.max_ceiling.get("thread_cpu_ms", 0) < binding.cpu_ceiling_ms
+                or work_kind not in grant.allowed_work_kinds or grant.max_ceiling.get("thread_cpu_ms", 0) < binding.cpu_ceiling_ms
                 or (reserve.operation_id, reserve.lease_id, reserve.digest, reserve.status) !=
                     (binding.reservation_operation_id, binding.parent_budget_lease_ref, binding.reservation_digest, "reserved")):
             raise ValueError("life accounting exact signed quote/grant/reserve contract differs")

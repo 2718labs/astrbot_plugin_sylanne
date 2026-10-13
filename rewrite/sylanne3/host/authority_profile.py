@@ -11,7 +11,8 @@ from __future__ import annotations
 import errno
 import ctypes
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 import ipaddress
 import json
 import math
@@ -26,7 +27,13 @@ from typing import Iterator, Mapping, TYPE_CHECKING
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
+    from .mtls_transport import MtlsAuthorityTransport
     from ..authority_service.d12_package_files_v2 import PackageSelectionV2
+    from .model_workflows_v3 import AdminModelWorkflowsV3
+    from .model_workflows_v4 import AdminModelWorkflowsV4
+    from .model_workflows_v5 import AdminModelWorkflowsV5
+    from .model_workflows_v6 import AdminModelWorkflowsV6
+    from .model_workflows_v7 import AdminModelWorkflowsV7
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
@@ -39,19 +46,22 @@ from ..runtime.d13_technical_policy import (
 )
 from ..model_broker.d13_precompression import D13PrecompressionInstallationV1
 from ..runtime_contracts import NamespaceId, canonical_digest
-from ..model_broker.context_reply import CONTEXT_REPLY_TEMPLATE_VERSION
-from ..model_broker.natural_reply import TEMPLATE_VERSION as NATURAL_GENERATION_TEMPLATE_VERSION
-from ..model_broker.natural_reply_history_v3 import TEMPLATE_VERSION as NATURAL_GENERATION_TEMPLATE_VERSION_V3
-from ..model_broker.natural_reply_history_v4 import TEMPLATE_VERSION as NATURAL_GENERATION_TEMPLATE_VERSION_V4
-from ..model_broker.natural_review import REVIEW_TEMPLATE_VERSION
-from ..model_broker.contact_expression_v1 import (
-    GENERATION_TEMPLATE_VERSION as CONTACT_GENERATION_TEMPLATE_VERSION,
-    REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_TEMPLATE_VERSION,
+from ..model_broker.provider_billing_receipt_v1 import ProviderBillingPolicyV1, provider_billing_policy_from_wire_v1
+from ..model_broker.artifact_phase_count_v1 import ArtifactPhaseCountPolicyV1
+from ..runtime_contracts import (
+    CONTEXT_REPLY_WORKFLOW_V1 as CONTEXT_REPLY_TEMPLATE_VERSION,
+    NATURAL_REPLY_GENERATION_WORKFLOW_V2 as NATURAL_GENERATION_TEMPLATE_VERSION,
+    NATURAL_REPLY_GENERATION_WORKFLOW_V3 as NATURAL_GENERATION_TEMPLATE_VERSION_V3,
+    NATURAL_REPLY_GENERATION_WORKFLOW_V4 as NATURAL_GENERATION_TEMPLATE_VERSION_V4,
+    NATURAL_REPLY_GENERATION_WORKFLOW_V5 as NATURAL_GENERATION_TEMPLATE_VERSION_V5,
+    NATURAL_REPLY_REVIEW_WORKFLOW_V1 as REVIEW_TEMPLATE_VERSION,
+    NATURAL_REPLY_REVIEW_WORKFLOW_V2 as REVIEW_TEMPLATE_VERSION_V2,
+    CONTACT_GENERATION_WORKFLOW_V1 as CONTACT_GENERATION_TEMPLATE_VERSION,
+    CONTACT_REVIEW_WORKFLOW_V1 as CONTACT_REVIEW_TEMPLATE_VERSION,
+    D04_APPRAISAL_TEMPLATE_V1 as APPRAISAL_TEMPLATE_VERSION,
+    D04_APPRAISAL_WORK_KIND as APPRAISAL_WORK_KIND,
 )
-from ..model_broker.d04_appraisal import (
-    TEMPLATE_VERSION as APPRAISAL_TEMPLATE_VERSION, WORK_KIND as APPRAISAL_WORK_KIND,
-)
-from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
+from .authority_transport_contract import AuthorityTlsProfile
 
 
 _PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -641,6 +651,7 @@ class AdminModelWorkflowsV2:
     contact_review: AdminModelWorkflowV2 | None = None
 
     def __post_init__(self) -> None:
+        from ..model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
         if (type(self.version) is not int or self.version != 2
                 or type(self.encode) is not AdminModelWorkflowV2
                 or type(self.reply) is not AdminModelWorkflowV2
@@ -653,8 +664,13 @@ class AdminModelWorkflowsV2:
                     or (workflow.work_kind, workflow.purpose,
                         workflow.template_version) not in (
                             (expected, ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V3),
-                                       ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V4))
-                            if workflow is self.natural_generation else (expected,)))
+                                       ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V4),
+                                       ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V5))
+                            if expected[0] == "natural_generation" else
+                            (expected, ("natural_review", "proposal", REVIEW_TEMPLATE_VERSION_V2))
+                            if expected[0] == "natural_review" else
+                            (expected, ("d07.cognition", "proposal", RECALL_TEMPLATE_VERSION_V1))
+                            if expected[0] == "d07.cognition" else (expected,)))
                     for workflow, expected in (
                         (self.context_reply, ("context_reply", "proposal",
                                               CONTEXT_REPLY_TEMPLATE_VERSION)),
@@ -669,6 +685,9 @@ class AdminModelWorkflowsV2:
                         (self.contact_generation, ("contact_generation", "proposal", CONTACT_GENERATION_TEMPLATE_VERSION)),
                         (self.contact_review, ("contact_review", "proposal", CONTACT_REVIEW_TEMPLATE_VERSION))))):
             raise ValueError("model workflows need distinct version-2 encode and reply authority")
+        if ((self.natural_generation is not None and self.natural_generation.template_version == NATURAL_GENERATION_TEMPLATE_VERSION_V5)
+                != (self.natural_review is not None and self.natural_review.template_version == REVIEW_TEMPLATE_VERSION_V2)):
+            raise ValueError("semantic natural generation v5 requires its independent review v2 workflow")
         if (self.contact_generation is None) != (self.contact_review is None):
             raise ValueError("contact needs both installed generation and independent review workflows")
         if self.contact_generation is not None:
@@ -694,6 +713,444 @@ class AdminD06PrivateReplySourcePolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminForegroundNaturalDeadlinePolicyV1:
+    mode: str
+    window_seconds: float
+    anchor: str
+
+    def __post_init__(self):
+        if (self.mode != "bounded_causal_window_v1"
+                or self.anchor != "original_post_c02_cause_v1"
+                or type(self.window_seconds) not in (int, float)
+                or not math.isfinite(self.window_seconds) or not 0 < self.window_seconds <= 86400):
+            raise ValueError("explicit bounded causal foreground deadline required")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminForegroundDeadlinePolicyV1:
+    schema: str
+    natural: AdminForegroundNaturalDeadlinePolicyV1 | None
+    draft_mode: str | None
+
+    def __post_init__(self):
+        if (self.schema != "sylanne.foreground-deadline-policy.v1"
+                or self.natural is not None and type(self.natural) is not AdminForegroundNaturalDeadlinePolicyV1
+                or self.draft_mode not in (None, "signed_scope_intersection_v1")):
+            raise ValueError("foreground responsibility deadline policy differs")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminForegroundPolicyV1:
+    schema: str
+    version: int
+    call_plan_schema: str
+    max_calls: int
+    max_auxiliary_calls: int
+    selected_steps: int
+    policy_ref: str
+    policy_version: int
+    deadline_policy: AdminForegroundDeadlinePolicyV1
+
+    def __post_init__(self):
+        from ..runtime.foreground_call_plan_v1 import SCHEMA
+        if (self.schema != "sylanne.foreground-policy.v1" or type(self.version) is not int or self.version != 1
+                or self.call_plan_schema != SCHEMA or (self.max_calls, self.max_auxiliary_calls, self.selected_steps) != (6, 2, 1)
+                or any(type(value) is not int for value in (self.max_calls, self.max_auxiliary_calls, self.selected_steps))
+                or type(self.policy_ref) is not str or not 0 < len(self.policy_ref) <= 256
+                or type(self.policy_version) is not int or self.policy_version < 1
+                or type(self.deadline_policy) is not AdminForegroundDeadlinePolicyV1):
+            raise ValueError("explicit finite foreground policy required")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftToolScopeV1:
+    resource_id: str
+    filename: str
+    mode: str
+    max_file_bytes: int
+    generated_text_bytes: int
+    readback_chunk_bytes: int
+    execution_timeout_seconds: float
+
+    def __post_init__(self):
+        if (self.resource_id != "export" or self.mode != "create" or type(self.filename) is not str
+                or not 0 < len(self.filename) <= 255 or self.filename in (".", "..")
+                or "/" in self.filename or "\\" in self.filename or "\0" in self.filename
+                or type(self.max_file_bytes) is not int or not 0 < self.max_file_bytes <= 524288
+                or type(self.generated_text_bytes) is not int or not 0 < self.generated_text_bytes <= 32768
+                or self.generated_text_bytes > self.max_file_bytes
+                or type(self.readback_chunk_bytes) is not int or self.readback_chunk_bytes != 65536
+                or type(self.execution_timeout_seconds) not in (int, float)
+                or not math.isfinite(self.execution_timeout_seconds) or not 0 < self.execution_timeout_seconds <= 300):
+            raise ValueError("draft requires one explicit installed export/create target")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftToolScopeV2:
+    """Explicit finite create plus authenticated predecessor replacement policy."""
+    resource_id: str
+    filename: str
+    max_file_bytes: int
+    generated_text_bytes: int
+    readback_chunk_bytes: int
+    execution_timeout_seconds: float
+    maximum_artifact_version: int
+    operations: tuple[str, ...]
+    schema: str = "sylanne.artifact-draft-tool-scope.v2"
+
+    def __post_init__(self):
+        AdminArtifactDraftToolScopeV1(self.resource_id, self.filename, "create",
+            self.max_file_bytes, self.generated_text_bytes, self.readback_chunk_bytes,
+            self.execution_timeout_seconds)
+        if (self.schema != "sylanne.artifact-draft-tool-scope.v2"
+                or self.operations != ("create", "replace_verified_predecessor")
+                or type(self.operations) is not tuple
+                or type(self.maximum_artifact_version) is not int
+                or not 2 <= self.maximum_artifact_version <= 8):
+            raise ValueError("explicit finite verified-replacement policy required")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftBodyPolicyV1:
+    policy_ref: str
+    policy_version: int
+    effect_component_policy_ref: str
+    effect_component_policy_version: int
+    cpu_ceiling_ms: int
+    resource_id: str
+
+    def __post_init__(self):
+        if (any(type(value) is not str or not 0 < len(value) <= 256
+                for value in (self.policy_ref, self.effect_component_policy_ref))
+                or any(type(value) is not int or value < 1
+                    for value in (self.policy_version, self.effect_component_policy_version, self.cpu_ceiling_ms))
+                or self.resource_id != "export"):
+            raise ValueError("explicit draft Body policy registration input required")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftObservationPolicyV1:
+    policy_ref: str
+    policy_version: int
+    timeout_seconds: float
+    cpu_ceiling_ms: int
+    read_bytes_ceiling: int
+
+    def __post_init__(self):
+        if (type(self.policy_ref) is not str or not 0 < len(self.policy_ref) <= 256
+                or any(type(value) is not int or value < 1
+                    for value in (self.policy_version, self.cpu_ceiling_ms, self.read_bytes_ceiling))
+                or self.read_bytes_ceiling > 524288 or type(self.timeout_seconds) not in (int, float)
+                or not math.isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 300):
+            raise ValueError("explicit independent draft observation policy required")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftPolicyV1:
+    model_workflow: AdminModelWorkflowV2
+    tool_scope: AdminArtifactDraftToolScopeV1 | AdminArtifactDraftToolScopeV2
+    body_policy: AdminArtifactDraftBodyPolicyV1
+    observation_policy: AdminArtifactDraftObservationPolicyV1 | None
+
+    def __post_init__(self):
+        if (type(self.model_workflow) is not AdminModelWorkflowV2
+                or (self.model_workflow.work_kind, self.model_workflow.purpose, self.model_workflow.template_version)
+                != ("artifact_draft_v1", "consolidation", "sylanne.artifact_draft_template.v1")
+                or type(self.tool_scope) not in {AdminArtifactDraftToolScopeV1, AdminArtifactDraftToolScopeV2}
+                or type(self.body_policy) is not AdminArtifactDraftBodyPolicyV1
+                or self.observation_policy is not None and type(self.observation_policy) is not AdminArtifactDraftObservationPolicyV1):
+            raise ValueError("explicit installed draft policy variants required")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactStandingScopeV1:
+    """Initial signed envelope for one finite private-ingress artifact task family."""
+    policy_ref: str
+    policy_version: int
+    platform_ref: str
+    allowed_sender_refs: tuple[str, ...]
+    valid_until_utc: float
+    task_lifetime_seconds: int
+    root_window_seconds: int
+    maximum_active_tasks: int
+    social_role: str
+    norm_refs: tuple[str, ...]
+    schema: str = "sylanne.artifact-standing-scope.v1"
+
+    def __post_init__(self):
+        import json
+        if (self.schema != "sylanne.artifact-standing-scope.v1"
+                or type(self.policy_ref) is not str or not 1 <= len(self.policy_ref) <= 256
+                or type(self.policy_version) is not int or self.policy_version < 1
+                or type(self.allowed_sender_refs) is not tuple or not 1 <= len(self.allowed_sender_refs) <= 8
+                or len(set(self.allowed_sender_refs)) != len(self.allowed_sender_refs)
+                or type(self.valid_until_utc) not in (int,float) or not math.isfinite(self.valid_until_utc)
+                or self.valid_until_utc <= 0
+                or type(self.task_lifetime_seconds) is not int or not 1 <= self.task_lifetime_seconds <= 1209600
+                or type(self.root_window_seconds) is not int or not 1 <= self.root_window_seconds <= 600
+                or type(self.maximum_active_tasks) is not int or not 1 <= self.maximum_active_tasks <= 3
+                or type(self.social_role) is not str or not 1 <= len(self.social_role) <= 128
+                or type(self.norm_refs) is not tuple or len(self.norm_refs) > 32
+                or len(set(self.norm_refs)) != len(self.norm_refs)
+                or any(type(ref) is not str or not ref for ref in self.norm_refs)):
+            raise ValueError("explicit finite standing artifact scope required")
+        platform=json.loads(self.platform_ref)
+        if (type(platform) is not list or len(platform)!=3 or platform[1]!='aiocqhttp'
+                or any(type(item) is not str or not item for item in platform)
+                or json.dumps(platform,ensure_ascii=True,separators=(',',':'))!=self.platform_ref):
+            raise ValueError("standing scope needs its exact installed platform account")
+        for sender in self.allowed_sender_refs:
+            value=json.loads(sender)
+            if (type(value) is not list or len(value)!=2 or value[0]!=platform[0]
+                    or any(type(item) is not str or not item for item in value)
+                    or json.dumps(value,ensure_ascii=True,separators=(',',':'))!=sender):
+                raise ValueError("standing sender must be an exact account-scoped identity")
+
+
+STANDING_PREDECISION_OPERATIONS_V2 = (
+    "input:register_artifact_task_text_extent",
+    "input:register_artifact_phase_postcondition_policy_v1",
+    "prepare_personal_candidates_v1", "select_personal_step_v2")
+STANDING_RUBRIC_KINDS_V2 = frozenset({"length", "literal", "sections", "tone", "task_semantics"})
+STANDING_OBJECTIVE_OBSERVER_V2 = "d11.explicit-task-objective"
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactStandingScopeV2(AdminArtifactStandingScopeV1):
+    predecision_operations: tuple[str, ...] = field(kw_only=True)
+    method_refs: tuple[str, ...] = field(kw_only=True)
+    rubric_scope: tuple[str, ...] = field(kw_only=True)
+    observer_scope: tuple[str, ...] = field(kw_only=True)
+    self_actor_ref: str = field(kw_only=True)
+    approval_original_ref: str = field(kw_only=True)
+    schema: str = "sylanne.artifact-standing-scope.v2"
+
+    def __post_init__(self):
+        from dataclasses import fields
+        from ..domains.d01 import FULL_DRAFT_METHOD_V1, TONE_SAMPLE_METHOD_V1
+        AdminArtifactStandingScopeV1(**{f.name: getattr(self, f.name)
+            for f in fields(AdminArtifactStandingScopeV1) if f.name != "schema"})
+        if (self.schema != "sylanne.artifact-standing-scope.v2"
+                or type(self.predecision_operations) is not tuple or len(self.predecision_operations) != 4
+                or set(self.predecision_operations) != set(STANDING_PREDECISION_OPERATIONS_V2)
+                or type(self.method_refs) is not tuple or not 1 <= len(self.method_refs) <= 2
+                or len(set(self.method_refs)) != len(self.method_refs)
+                or not set(self.method_refs) <= {FULL_DRAFT_METHOD_V1, TONE_SAMPLE_METHOD_V1}
+                or type(self.rubric_scope) is not tuple or not 1 <= len(self.rubric_scope) <= 5
+                or len(set(self.rubric_scope)) != len(self.rubric_scope)
+                or not set(self.rubric_scope) <= STANDING_RUBRIC_KINDS_V2
+                or type(self.observer_scope) is not tuple or not 1 <= len(self.observer_scope) <= 2
+                or len(set(self.observer_scope)) != len(self.observer_scope)
+                or any(type(ref) is not str or not ref or len(ref) > 1024
+                    or ref != STANDING_OBJECTIVE_OBSERVER_V2 and not ref.startswith("/")
+                    for ref in self.observer_scope)
+                or type(self.self_actor_ref) is not str or not self.self_actor_ref.startswith("entity:")
+                or self.self_actor_ref.startswith("entity:account-v1:")
+                or type(self.approval_original_ref) is not str
+                or not self.approval_original_ref.startswith("artifact-standing-approval:")):
+            raise ValueError("standing V2 requires its finite explicit Self predecision approval declaration")
+
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactCandidatePreparationDependencyContractV1:
+    parent_operation: str = "prepare_personal_candidates_v1"
+    internal_children: tuple[tuple[str, str], ...] = (("freeze", "input:freeze_values"), ("evaluate", "evaluate_values"))
+    schema: str = "d08.artifact-candidate-preparation-dependency-contract.v1"
+
+    def __post_init__(self):
+        if (self.schema != "d08.artifact-candidate-preparation-dependency-contract.v1"
+                or self.parent_operation != "prepare_personal_candidates_v1"
+                or self.internal_children != (("freeze", "input:freeze_values"), ("evaluate", "evaluate_values"))):
+            raise ValueError("candidate preparation has exactly two internal D01 dependencies")
+
+    @property
+    def digest(self):
+        from ..domains.d01.production_operations_v1 import plain_v1
+        return canonical_digest(plain_v1(self))
+
+    @property
+    def original_ref(self):
+        return "artifact-candidate-preparation-contract:" + self.digest[:48]
+
+
+def artifact_candidate_preparation_dependency_contract_v1():
+    return ArtifactCandidatePreparationDependencyContractV1()
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactStandingScopeV3(AdminArtifactStandingScopeV2):
+    preparation_dependency_contract_ref: str = field(kw_only=True)
+    preparation_dependency_contract_digest: str = field(kw_only=True)
+    schema: str = "sylanne.artifact-standing-scope.v3"
+
+    def __post_init__(self):
+        from dataclasses import fields
+        AdminArtifactStandingScopeV2(**{f.name: getattr(self, f.name)
+            for f in fields(AdminArtifactStandingScopeV2) if f.name != "schema"})
+        contract = artifact_candidate_preparation_dependency_contract_v1()
+        if (self.schema != "sylanne.artifact-standing-scope.v3"
+                or self.preparation_dependency_contract_ref != contract.original_ref
+                or self.preparation_dependency_contract_digest != contract.digest):
+            raise ValueError("fresh standing V3 explicitly declares its preparation dependency contract")
+
+
+def artifact_standing_scope_approval_ref_v2(scope, *, namespace, installation_id, manifest_digest, profile_id):
+    from ..runtime_contracts import NamespaceId
+    from ..domains.d01.production_operations_v1 import plain_v1
+    if type(scope) not in {AdminArtifactStandingScopeV2, AdminArtifactStandingScopeV3} or type(namespace) is not NamespaceId:
+        raise TypeError("approval reference requires the exact installed standing V2 declaration")
+    material = plain_v1(scope)
+    del material["approval_original_ref"]
+    return "artifact-standing-approval:" + canonical_digest({"scope": material,
+        "namespace": namespace, "installation_id": installation_id,
+        "manifest_digest": manifest_digest, "profile_id": profile_id})[:48]
+
+
+def artifact_standing_scope_from_payload_v2(raw):
+    from dataclasses import fields
+    if type(raw) is not dict:
+        raise ValueError("standing scope requires its closed JSON object")
+    kind = {"sylanne.artifact-standing-scope.v1": AdminArtifactStandingScopeV1,
+        "sylanne.artifact-standing-scope.v2": AdminArtifactStandingScopeV2,
+        "sylanne.artifact-standing-scope.v3": AdminArtifactStandingScopeV3}.get(raw.get("schema"))
+    if kind is None:
+        raise ValueError("unregistered standing scope schema")
+    values = dict(_exact_object(raw, {f.name for f in fields(kind)}, "artifact standing scope"))
+    arrays = ("allowed_sender_refs", "norm_refs") + (("predecision_operations", "method_refs",
+        "rubric_scope", "observer_scope") if kind in {AdminArtifactStandingScopeV2, AdminArtifactStandingScopeV3} else ())
+    for name in arrays:
+        if type(values[name]) is not list:
+            raise ValueError("standing scope requires exact explicit JSON arrays")
+        values[name] = tuple(values[name])
+    return kind(**values)
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftPolicyV2:
+    model_workflow: AdminModelWorkflowV2
+    tool_scope: AdminArtifactDraftToolScopeV2
+    body_policy: AdminArtifactDraftBodyPolicyV1
+    observation_policy: AdminArtifactDraftObservationPolicyV1 | None
+    standing_scope: AdminArtifactStandingScopeV1 | AdminArtifactStandingScopeV2 | AdminArtifactStandingScopeV3
+    schema: str = "sylanne.artifact-draft-policy.v2"
+
+    def __post_init__(self):
+        AdminArtifactDraftPolicyV1(self.model_workflow,self.tool_scope,self.body_policy,self.observation_policy)
+        if (self.schema!="sylanne.artifact-draft-policy.v2"
+                or type(self.tool_scope) is not AdminArtifactDraftToolScopeV2
+                or type(self.standing_scope) not in {AdminArtifactStandingScopeV1, AdminArtifactStandingScopeV2, AdminArtifactStandingScopeV3}):
+            raise ValueError("automatic artifact tasks require the exact new installed scope variant")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminArtifactDraftPolicyV3:
+    model_workflow: AdminModelWorkflowV2
+    tool_scope: AdminArtifactDraftToolScopeV1 | AdminArtifactDraftToolScopeV2
+    body_policy: AdminArtifactDraftBodyPolicyV1
+    observation_policy: AdminArtifactDraftObservationPolicyV1 | None
+    standing_scope: AdminArtifactStandingScopeV1 | AdminArtifactStandingScopeV2 | AdminArtifactStandingScopeV3
+    phase_model_workflow: AdminModelWorkflowV2 = field(kw_only=True)
+    schema: str = "sylanne.artifact-draft-policy.v3"
+
+    def __post_init__(self):
+        from ..model_broker.artifact_draft_v1 import WORK_KIND, TEMPLATE_VERSION_V2
+        AdminArtifactDraftPolicyV1(self.model_workflow, self.tool_scope, self.body_policy, self.observation_policy)
+        if (self.schema != "sylanne.artifact-draft-policy.v3"
+                or type(self.standing_scope) not in {AdminArtifactStandingScopeV1, AdminArtifactStandingScopeV2, AdminArtifactStandingScopeV3}
+                or type(self.phase_model_workflow) is not AdminModelWorkflowV2):
+            raise ValueError("phase artifact policy requires its exact installed V3 fields")
+        main, phase = self.model_workflow, self.phase_model_workflow
+        if ((phase.work_kind, phase.purpose, phase.template_version) != (WORK_KIND, "consolidation", TEMPLATE_VERSION_V2)
+                or (phase.provider_id, phase.model_id, phase.provider_config_ref, phase.provider_config_digest,
+                    phase.privacy_tier, phase.audiences, phase.required_capabilities) !=
+                   (main.provider_id, main.model_id, main.provider_config_ref, main.provider_config_digest,
+                    main.privacy_tier, main.audiences, main.required_capabilities)
+                or set(phase.quote_ceiling) != {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+                or phase.quote_ceiling["input_tokens"] > 10000 or phase.quote_ceiling["output_tokens"] > 2000
+                or phase.max_output_tokens > min(2000, main.max_output_tokens)
+                or phase.timeout_seconds > main.timeout_seconds
+                or any(amount > main.quote_ceiling.get(name, 0) for name, amount in phase.quote_ceiling.items())):
+            raise ValueError("phase workflow exceeds the exact original C4 selection or bounds")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminD06RecallProfileV1:
+    name: str
+    max_rounds: int
+    max_candidates: int
+    max_nodes: int
+    max_hops: int
+
+    def __post_init__(self):
+        ceilings = {"light": (1, 32, 128, 0), "normal": (3, 64, 128, 1), "deep": (4, 64, 128, 2)}
+        if self.name not in ceilings:
+            raise ValueError("unknown installed recall profile")
+        for field, ceiling in zip(("max_rounds", "max_candidates", "max_nodes", "max_hops"), ceilings[self.name]):
+            value = getattr(self, field)
+            if type(value) is not int or not (0 if field == "max_hops" else 1) <= value <= ceiling:
+                raise ValueError("installed recall profile exceeds its bounded work allowance")
+
+
+@dataclass(frozen=True, slots=True)
+class AdminD06RecallPolicyV1:
+    """Explicit read/traversal limits and existing C04 policy identities, never a grant."""
+
+    policy_ref: str
+    policy_version: int
+    body_policy_id: str
+    body_policy_version: int
+    cognition_body_policy_id: str
+    cognition_body_policy_version: int
+    cpu_policy_id: str
+    cpu_policy_version: int
+    interpretation_policy_id: str
+    interpretation_policy_version: str
+    profiles: tuple[AdminD06RecallProfileV1, ...]
+    max_search_plans: int
+    max_candidates_per_channel: int
+    max_ledger_pages: int
+    max_ledger_nodes: int
+    read_timeout_seconds: float
+    max_edges: int
+    max_iterations: int
+    max_recollection_candidates: int
+    recall_token_ceiling: int
+    working_ref_ceiling: int
+    working_token_ceiling: int
+    schema: str = "sylanne.d06.installed-recall-policy.v1"
+
+    def __post_init__(self):
+        if self.schema != "sylanne.d06.installed-recall-policy.v1":
+            raise ValueError("unknown installed recall policy schema")
+        for name in ("policy_ref", "body_policy_id", "cognition_body_policy_id", "cpu_policy_id", "interpretation_policy_id", "interpretation_policy_version"):
+            value = getattr(self, name)
+            if type(value) is not str or not 0 < len(value) <= 128:
+                raise ValueError("recall policy requires explicit bounded policy identities")
+        for name in ("policy_version", "body_policy_version", "cognition_body_policy_version", "cpu_policy_version"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError("recall policy versions must be positive integers")
+        if (type(self.profiles) is not tuple or len(self.profiles) != 3
+                or any(type(profile) is not AdminD06RecallProfileV1 for profile in self.profiles)
+                or tuple(profile.name for profile in self.profiles) != ("light", "normal", "deep")):
+            raise ValueError("explicit light, normal and deep recall profiles required")
+        for name, ceiling in (("max_search_plans", 5), ("max_candidates_per_channel", 32),
+                ("max_ledger_pages", 128), ("max_ledger_nodes", 8192), ("max_edges", 128),
+                ("max_iterations", 64), ("max_recollection_candidates", 32),
+                ("recall_token_ceiling", 2048), ("working_ref_ceiling", 16), ("working_token_ceiling", 4096)):
+            if type(getattr(self, name)) is not int or not 1 <= getattr(self, name) <= ceiling:
+                raise ValueError("installed recall allowance exceeds its finite ceiling")
+        if (type(self.read_timeout_seconds) not in (int, float)
+                or not math.isfinite(self.read_timeout_seconds) or not 0 < self.read_timeout_seconds <= 300):
+            raise ValueError("installed recall read timeout must be finite and bounded")
+
+    @property
+    def policy_digest(self):
+        from dataclasses import asdict
+        return canonical_digest(asdict(self))
+
+
+@dataclass(frozen=True, slots=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -706,7 +1163,7 @@ class AdminInstallationBundle:
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
-    model_workflows: AdminModelWorkflowsV2 | None = None
+    model_workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | None = None
     d04_encoding_baseline: AdminD04EncodingBaselinePolicy | None = None
     d06_first_ingress_c02: AdminD06FirstIngressC02Policy | None = None
     d03_self_identity_projection: AdminD03SelfIdentityProjectionPolicy | None = None
@@ -725,6 +1182,113 @@ class AdminInstallationBundle:
     # Prospective capture is currently installed only by the explicit alpha1
     # test composition. Ordinary profile JSON does not enable this capability.
     life_d04_before_capture_policy: object | None = None
+    foreground: AdminForegroundPolicyV1 | None = None
+    artifact_draft: AdminArtifactDraftPolicyV1 | AdminArtifactDraftPolicyV2 | AdminArtifactDraftPolicyV3 | None = None
+    provider_billing_policy_v1: ProviderBillingPolicyV1 | None = None
+    d06_recall: AdminD06RecallPolicyV1 | None = None
+    artifact_phase_counter: ArtifactPhaseCountPolicyV1 | None = None
+    method_measurement_policy: object | None = field(default=None, kw_only=True)
+
+    def __post_init__(self):
+        if self.method_measurement_policy is not None:
+            from ..runtime.d11_method_observation_v1 import MethodMeasurementPolicyV1
+            from ..domains.d01.production_operations_v1 import plain_v1
+            if (type(self.method_measurement_policy) is not MethodMeasurementPolicyV1
+                    or self.provider_billing_policy_v1 is None
+                    or self.method_measurement_policy.billing_policy_digest != canonical_digest(plain_v1(self.provider_billing_policy_v1))):
+                raise ValueError("method measurement needs its exact installed policy and original billing contract")
+        if self.d06_recall is not None:
+            if type(self.d06_recall) is not AdminD06RecallPolicyV1 or type(self.foreground) is not AdminForegroundPolicyV1:
+                raise ValueError("installed recall requires its exact policy and original foreground policy")
+            from ..model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
+            workflow = None if self.model_workflows is None else self.model_workflows.d07_cognition
+            if (type(workflow) is not AdminModelWorkflowV2
+                    or (workflow.work_kind, workflow.purpose, workflow.template_version) !=
+                    ("d07.cognition", "proposal", RECALL_TEMPLATE_VERSION_V1)):
+                raise ValueError("installed ingress recall requires its explicit exact C3 routing workflow")
+        if type(self.artifact_draft) is AdminArtifactDraftPolicyV3:
+            from .model_workflows_v4 import AdminModelWorkflowsV4
+            from .model_workflows_v5 import AdminModelWorkflowsV5
+            from .model_workflows_v6 import AdminModelWorkflowsV6
+            from .model_workflows_v7 import AdminModelWorkflowsV7
+            artifact = self.artifact_draft
+            phase = artifact.phase_model_workflow
+            policy = self.installation_policy
+            if (type(self.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+                    or artifact.model_workflow != self.model_workflows.artifact_draft
+                    or type(self.foreground) is not AdminForegroundPolicyV1
+                    or self.foreground.deadline_policy.draft_mode != "signed_scope_intersection_v1"
+                    or not {"artifact_draft_v1", "d10.life.artifact_draft.v1"} <= set(policy.root_grant.allowed_work_kinds)
+                    or artifact.observation_policy is not None and "d11.life.artifact_observation.v1" not in policy.root_grant.allowed_work_kinds
+                    or any(amount > policy.root_grant.max_ceiling.get(name, 0)
+                        or amount > policy.root_lease.limits.get(name, 0) for name, amount in phase.quote_ceiling.items())):
+                raise ValueError("phase workflow lacks its actual installed foreground/root grant/lease")
+        counter = self.artifact_phase_counter
+        if counter is not None:
+            _require_artifact_phase_counter_binding_v1(counter, self.installation_policy, self.artifact_draft)
+            if counter.profile_id != self.tls_profile.profile_id:
+                raise ValueError("phase counter differs from its actual installed TLS profile")
+        billing = self.provider_billing_policy_v1
+        if billing is None:
+            return
+        if type(billing) is not ProviderBillingPolicyV1:
+            raise TypeError("installed provider billing policy must be its exact typed contract")
+        policy = self.installation_policy
+        if (billing.namespace, billing.installation_id, billing.manifest_digest) != (
+                policy.namespace, policy.installation_id, policy.manifest_digest):
+            raise ValueError("provider billing policy differs from its installed namespace/package")
+        from dataclasses import fields
+        from .model_workflows_v3 import AdminModelWorkflowsV3
+        from .model_workflows_v4 import AdminModelWorkflowsV4
+        from .model_workflows_v5 import AdminModelWorkflowsV5
+        from .model_workflows_v6 import AdminModelWorkflowsV6
+        from .model_workflows_v7 import AdminModelWorkflowsV7
+        if type(self.model_workflows) not in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+            raise ValueError("provider billing requires the actual installed workflow container")
+        workflows = tuple(getattr(self.model_workflows, field.name) for field in fields(self.model_workflows)
+            if field.name != "version")
+        if type(self.artifact_draft) is AdminArtifactDraftPolicyV3:
+            workflows += (self.artifact_draft.phase_model_workflow,)
+        if not any(workflow is not None and (workflow.provider_id, workflow.model_id, workflow.provider_config_digest) ==
+                (billing.provider_id, billing.model_id, billing.provider_config_digest) for workflow in workflows):
+            raise ValueError("provider billing selection is absent from the installed workflows")
+
+
+
+def is_installed_life_numeric_slot_v1(bundle, workflow):
+    """Recognize only the original actual installed Numeric workflow object."""
+    from .model_workflows_v3 import AdminModelWorkflowsV3
+    from .model_workflows_v4 import AdminModelWorkflowsV4
+    from .model_workflows_v5 import AdminModelWorkflowsV5
+    from .model_workflows_v6 import AdminModelWorkflowsV6
+    from .model_workflows_v7 import AdminModelWorkflowsV7
+    return (type(bundle) is AdminInstallationBundle and type(workflow) is AdminModelWorkflowV2
+        and type(bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+        and workflow is bundle.model_workflows.life_numeric
+        and (workflow.work_kind, workflow.purpose, workflow.template_version) ==
+            ('d06.encode_internal_life_numeric', 'consolidation', 'sylanne.d06.internal_life_numeric.v1'))
+
+
+def is_installed_artifact_draft_slot_v1(bundle,workflow):
+    # Version dispatch is followed by exact class and object identity checks.
+    # Old containers are never interpreted as the new slot.
+    from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+    from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+    from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+    from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+    return (type(bundle.model_workflows) in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+        and workflow is bundle.model_workflows.artifact_draft)
+
+
+def is_installed_artifact_draft_phase_slot_v2(bundle, workflow):
+    """Recognize the actual installed phase object; this grants no model call."""
+    from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+    return (type(bundle) is AdminInstallationBundle
+        and type(bundle.artifact_draft) in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}
+        and workflow is bundle.artifact_draft.phase_model_workflow
+        and (bundle.artifact_phase_counter is None or bundle.artifact_phase_counter.source_scope != "LOCAL_FIXTURE"
+            or _artifact_phase_fixture_registered_component_v1(bundle)
+            or _artifact_phase_fixture_scope_bundle_v1(bundle)))
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -1045,20 +1609,482 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
     return value
 
 
+_ARTIFACT_PHASE_FIXTURE_ISSUER_V1 = object()
+_ARTIFACT_PHASE_FIXTURE_SCOPE_V1 = ContextVar("sylanne_artifact_phase_fixture_installation_v1", default=None)
+_ARTIFACT_PHASE_FIXTURE_REGISTRY_V1 = {}
+_ARTIFACT_PHASE_FIXTURE_BUNDLES_V1 = {}
+
+
+@dataclass(frozen=True, slots=True, init=False, eq=False, repr=False)
+class _ArtifactPhaseFixtureInstallationV1:
+    qualification_ref: str
+    base_bundle: AdminInstallationBundle
+    counter: ArtifactPhaseCountPolicyV1
+    authority_client: object
+    client_grant: object
+    provider_client: object
+    mock_transport: object
+    mock_handler: object
+    package_root: Path
+    profile_directory: Path
+    protected_profile_digest: str
+    bundle: AdminInstallationBundle | None
+    observer_spec: object | None
+    observer_asset: Path | None
+    observer_asset_digest: str | None
+    graph: object | None
+    graph_store: object | None
+    model_runtime: object | None
+    worker: object | None
+    graph_db_path: Path | None
+    graph_db: object | None
+
+    def __init__(self, token, *, qualification_ref, base_bundle, counter, authority_client, client_grant,
+            provider_client, mock_transport, package_root, profile_directory, protected_profile_digest,
+            observer_spec=None, observer_asset=None, observer_asset_digest=None):
+        if token is not _ARTIFACT_PHASE_FIXTURE_ISSUER_V1:
+            raise TypeError("fixture qualification requires its actual protected installation issuer")
+        for name, value in (("qualification_ref", qualification_ref), ("base_bundle", base_bundle), ("counter", counter),
+                ("authority_client", authority_client), ("client_grant", client_grant), ("provider_client", provider_client),
+                ("mock_transport", mock_transport), ("mock_handler", mock_transport.handler), ("package_root", package_root),
+                ("profile_directory", profile_directory), ("protected_profile_digest", protected_profile_digest), ("bundle", None),
+                ("observer_spec", observer_spec), ("observer_asset", observer_asset), ("observer_asset_digest", observer_asset_digest),
+                ("graph", None), ("graph_store", None), ("model_runtime", None), ("worker", None),
+                ("graph_db_path", None), ("graph_db", None)):
+            object.__setattr__(self, name, value)
+
+
+def _artifact_phase_fixture_mock_binding_v1(qualification):
+    import httpx
+    from openai import AsyncOpenAI
+    client, transport = qualification.provider_client, qualification.mock_transport
+    return (type(client) is AsyncOpenAI and type(transport) is httpx.MockTransport
+        and type(client._client) is httpx.AsyncClient and client._client._transport is transport
+        and transport.handler is qualification.mock_handler and not client._client.is_closed
+        and all(value is None or value is transport for value in client._client._mounts.values()))
+
+
+def _artifact_phase_fixture_scope_bundle_v1(bundle):
+    qualification = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.get()
+    record = None if qualification is None else _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1.get(id(qualification))
+    return (record is not None and record[0] is qualification and record[1] == qualification.qualification_ref and record[2] == qualification.counter.digest
+        and qualification.bundle is bundle and _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(bundle)) is qualification
+        and bundle.artifact_phase_counter is qualification.counter and _artifact_phase_fixture_mock_binding_v1(qualification))
+
+
+def _require_artifact_phase_fixture_registration_v1(bundle, *, client_grant):
+    from ..runtime_contracts import InstallationGrantV2
+    qualification = _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(bundle))
+    record = None if qualification is None else _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1.get(id(qualification))
+    if (type(bundle) is not AdminInstallationBundle or type(qualification) is not _ArtifactPhaseFixtureInstallationV1
+            or record is None or record[0] is not qualification or record[1] != qualification.qualification_ref
+            or record[2] != qualification.counter.digest or record[3] != qualification.protected_profile_digest
+            or qualification.bundle is not bundle or type(client_grant) is not InstallationGrantV2
+            or client_grant is not qualification.client_grant or bundle.artifact_phase_counter is not qualification.counter
+            or qualification.counter.source_scope != "LOCAL_FIXTURE" or not _artifact_phase_fixture_mock_binding_v1(qualification)):
+        raise ValueError("actual local fixture installation qualification is unavailable or foreign")
+    policy = bundle.installation_policy
+    counter = qualification.counter
+    client = qualification.authority_client
+    session = client._transport._sessions.get(bundle.tls_profile.profile_id)
+    workflow = bundle.artifact_draft.phase_model_workflow
+    if (bundle.installation_policy is not qualification.base_bundle.installation_policy
+            or bundle.artifact_draft is not qualification.base_bundle.artifact_draft
+            or bundle.tls_profile is not qualification.base_bundle.tls_profile
+            or Path(bundle.tls_profile.client_private_key).parent != qualification.profile_directory
+            or client._selection.profile_id != bundle.tls_profile.profile_id
+            or (counter.namespace, counter.installation_id, counter.manifest_digest, counter.profile_id) != (
+                policy.namespace, policy.installation_id, policy.manifest_digest, bundle.tls_profile.profile_id)
+            or (client_grant.authority_id, client_grant.installation_id, client_grant.manifest_digest,
+                client_grant.administrator_holder) != (policy.expected_authority_id, policy.installation_id,
+                    policy.manifest_digest, policy.administrator_holder)
+            or (counter.provider_id, counter.model_id, counter.provider_config_digest, counter.template_version) != (
+                workflow.provider_id, workflow.model_id, workflow.provider_config_digest, workflow.template_version)
+            or (workflow.work_kind, workflow.purpose, workflow.template_version) != (
+                "artifact_draft_v1", "consolidation", counter.template_version)
+            or session is None or session.binding != client_grant.channel_binding_sha256 or session.writer.is_closing()
+            or session.reader.at_eof()
+            or client._v2_handshake is None or not client._v2_handshake.valid_pairing()
+            or client_grant.channel_binding_sha256 != client._v2_handshake.channel_binding_sha256
+            or client_grant.subject != client._v2_handshake.installation_identity_ref
+            or client._package_root != qualification.package_root):
+        raise ValueError("fixture qualification changed its actual namespace/package/channel grant")
+    import hashlib
+    from ..authority_service.linux_installation_security_v1 import opened_installed_file_v1
+    with opened_installed_file_v1(qualification.package_root / "release-manifest.json") as fd:
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != policy.manifest_digest:
+                raise ValueError("fixture qualification protected package manifest changed")
+    with opened_installed_file_v1(qualification.profile_directory / "profile.json") as fd:
+        payload = _read_profile_json(fd)
+    if canonical_digest(payload) != qualification.protected_profile_digest:
+        raise ValueError("fixture qualification protected profile changed")
+    for path, expected in ((counter.executable, counter.program_sha256),
+            (counter.tokenizer_path, counter.tokenizer_sha256), (counter.applicability_path, counter.applicability_sha256)):
+        with opened_installed_file_v1(path) as fd:
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
+                    raise ValueError("fixture qualification protected counter asset changed")
+    return qualification
+
+
+def _artifact_phase_fixture_graph_database_path_v1(store):
+    with store._lock:
+        rows = tuple(row for row in store._db.execute("PRAGMA database_list") if row[1] == "main")
+    if len(rows) != 1 or not rows[0][2]:
+        raise ValueError("fixture components require their actual persistent Graph database")
+    return Path(rows[0][2]).resolve(strict=True)
+
+
+def _require_artifact_phase_fixture_components_v1(qualification):
+    from ..graph_coordinator import GraphCoordinator
+    from ..graph_store import ProductionGraphStore
+    from ..graph_worker import GraphWorker
+    from ..runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+    graph, runtime = qualification.graph, qualification.model_runtime
+    if (type(graph) is not GraphCoordinator or type(runtime) is not InstalledArtifactDraftModelRuntimeV1
+            or type(qualification.graph_store) is not ProductionGraphStore
+            or type(qualification.worker) is not GraphWorker or qualification.worker._closed
+            or runtime.graph is not graph or runtime.bundle is not qualification.bundle
+            or runtime.worker is not qualification.worker or runtime.client_grant is not qualification.client_grant
+            or runtime.authority_client is not qualification.authority_client
+            or graph._GraphCoordinator__store is not qualification.graph_store
+            or qualification.graph_store._closed or qualification.graph_store._db is not qualification.graph_db or qualification.graph_db is None
+            or qualification.graph_db_path is None
+            or graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle is not qualification.bundle
+            or graph._GraphCoordinator__artifact_draft_model_runtime_v1 is not runtime):
+        raise ValueError("actual local fixture Graph/database/runtime component registration changed")
+    graph._admin(runtime.bootstrap)
+    return qualification
+
+
+def require_artifact_phase_fixture_qualification_v1(bundle, *, client_grant):
+    qualification = _require_artifact_phase_fixture_registration_v1(bundle, client_grant=client_grant)
+    if qualification.graph is None:
+        if _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.get() is not qualification:
+            raise ValueError("local fixture components require their actual bootstrap registration")
+    else:
+        _require_artifact_phase_fixture_components_v1(qualification)
+    return qualification
+
+
+def _bind_artifact_phase_fixture_components_on_graph_v1(actual_graph, qualification, expected_graph, bootstrap, runtime):
+    from ..graph_coordinator import GraphCoordinator
+    from ..runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+    from ..graph_worker import GraphWorker
+    _require_artifact_phase_fixture_registration_v1(qualification.bundle, client_grant=qualification.client_grant)
+    if (type(actual_graph) is not GraphCoordinator or actual_graph is not expected_graph
+            or type(runtime) is not InstalledArtifactDraftModelRuntimeV1
+            or runtime.graph is not actual_graph or runtime.bootstrap is not bootstrap
+            or runtime.bundle is not qualification.bundle or type(runtime.worker) is not GraphWorker
+            or actual_graph._GraphCoordinator__artifact_draft_model_runtime_v1 is not runtime
+            or qualification.graph is not None):
+        raise ValueError("fixture component binding requires its original actual installed worker/runtime")
+    actual_graph._admin(bootstrap)
+    store = actual_graph._GraphCoordinator__store
+    for name, value in (("graph", actual_graph), ("graph_store", store), ("graph_db", store._db),
+            ("graph_db_path", _artifact_phase_fixture_graph_database_path_v1(store)), ("worker", runtime.worker), ("model_runtime", runtime)):
+        object.__setattr__(qualification, name, value)
+    _require_artifact_phase_fixture_components_v1(qualification)
+
+
+async def bind_artifact_phase_local_fixture_components_v1(qualification, *, graph, bootstrap, model_runtime):
+    """Register finite installed components on their actual ordinary GraphWorker."""
+    from ..runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+    if type(qualification) is not _ArtifactPhaseFixtureInstallationV1 or type(model_runtime) is not InstalledArtifactDraftModelRuntimeV1:
+        raise TypeError("actual private fixture qualification and installed runtime required")
+    await model_runtime.worker.call(_bind_artifact_phase_fixture_components_on_graph_v1,
+        qualification, graph, bootstrap, model_runtime)
+
+
+def _artifact_phase_fixture_registered_component_v1(bundle):
+    qualification = _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(bundle))
+    if type(qualification) is not _ArtifactPhaseFixtureInstallationV1 or qualification.graph is None:
+        return False
+    require_artifact_phase_fixture_qualification_v1(bundle, client_grant=qualification.client_grant)
+    return True
+
+
+def _artifact_phase_fixture_observer_from_protected_payload_v1(payload):
+    raw = payload.get("artifact_phase_fixture_observer")
+    if raw is None:
+        return None, None, None
+    pins = _exact_object(raw, frozenset({"schema", "source_scope", "observer_id",
+        "observer_version", "asset_ref", "asset_sha256"}), "fixture observer installation")
+    if (pins["schema"] != "sylanne.artifact-phase-fixture-observer-installation.v1"
+            or pins["source_scope"] != "LOCAL_FIXTURE"):
+        raise ValueError("fixture observer requires its explicit local installation scope")
+    from ..authority_service.linux_installation_security_v1 import opened_installed_file_v1
+    from ..runtime.artifact_phase_postconditions_v1 import artifact_phase_fixture_observer_from_asset_v1
+    import hashlib
+    asset = Path(pins["asset_ref"])
+    if not asset.is_absolute() or asset.resolve(strict=True) != asset:
+        raise ValueError("fixture observer requires its actual canonical protected asset")
+    with opened_installed_file_v1(asset) as descriptor:
+        asset_bytes = _read_fd_bounded(descriptor, _MAX_MATERIAL_BYTES)
+    digest = hashlib.sha256(asset_bytes).hexdigest()
+    if digest != pins["asset_sha256"]:
+        raise ValueError("fixture observer protected asset differs from its installation pin")
+    spec = artifact_phase_fixture_observer_from_asset_v1(asset_ref=str(asset),
+        asset_bytes=asset_bytes, expected_digest=digest)
+    if (spec.observer_id, spec.observer_version, spec.source_scope) != (
+            pins["observer_id"], pins["observer_version"], pins["source_scope"]):
+        raise ValueError("fixture observer protected identity differs from its installation pin")
+    return spec, asset, digest
+
+
+def require_artifact_phase_fixture_observer_v1(bundle, *, client_grant):
+    qualification = require_artifact_phase_fixture_qualification_v1(bundle, client_grant=client_grant)
+    from ..runtime.artifact_phase_postconditions_v1 import ArtifactPhaseFixtureObserverV1
+    from ..authority_service.linux_installation_security_v1 import opened_installed_file_v1
+    import hashlib
+    if (type(qualification.observer_spec) is not ArtifactPhaseFixtureObserverV1
+            or qualification.observer_spec.source_scope != "LOCAL_FIXTURE"
+            or qualification.observer_spec.asset_ref != str(qualification.observer_asset)
+            or qualification.observer_spec.asset_digest != qualification.observer_asset_digest):
+        raise ValueError("actual protected fixture observer installation is unavailable")
+    with opened_installed_file_v1(qualification.profile_directory / "profile.json") as descriptor:
+        payload = _read_profile_json(descriptor)
+    if canonical_digest(payload) != qualification.protected_profile_digest:
+        raise ValueError("fixture observer protected installation profile changed")
+    with opened_installed_file_v1(qualification.observer_asset) as descriptor:
+        asset_bytes = _read_fd_bounded(descriptor, _MAX_MATERIAL_BYTES)
+    if hashlib.sha256(asset_bytes).hexdigest() != qualification.observer_asset_digest:
+        raise ValueError("fixture observer protected asset changed")
+    return qualification.observer_spec
+
+
+def readonly_artifact_phase_fixture_observer_v1(bundle):
+    """Read the already installed observer snapshot; issue no observation grant."""
+    qualification = _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(bundle))
+    if (type(qualification) is not _ArtifactPhaseFixtureInstallationV1
+            or qualification.bundle is not bundle):
+        raise ValueError("actual protected fixture observer installation is unavailable")
+    return require_artifact_phase_fixture_observer_v1(bundle, client_grant=qualification.client_grant)
+
+
+@contextmanager
+def artifact_phase_local_fixture_scope_v1(qualification):
+    if type(qualification) is not _ArtifactPhaseFixtureInstallationV1:
+        raise TypeError("actual opaque local fixture installation qualification required")
+    require_artifact_phase_fixture_qualification_v1(qualification.bundle, client_grant=qualification.client_grant)
+    token = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.set(qualification)
+    try:
+        yield qualification.bundle
+    finally:
+        _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.reset(token)
+
+
+def revoke_artifact_phase_local_fixture_qualification_v1(qualification):
+    record = _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1.get(id(qualification))
+    if (type(qualification) is not _ArtifactPhaseFixtureInstallationV1 or record is None
+            or record[0] is not qualification or record[1] != qualification.qualification_ref
+            or _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(qualification.bundle)) is not qualification):
+        raise ValueError("only the actual local fixture qualification can be revoked")
+    del _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1[id(qualification.bundle)]
+    del _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1[id(qualification)]
+
+
+async def load_artifact_phase_local_fixture_bundle_v1(profile_id, *, profile_root, package_root, data_dir,
+        provider_client, mock_transport):
+    """Protected local-only installation; its real paired client remains caller-owned.
+
+    This issuer creates the actual mTLS client itself. InstallationGrantV2 is
+    channel identity, not a caller-supplied signed grant or a model permission.
+    """
+    import asyncio
+    import hashlib
+    import httpx
+    from openai import AsyncOpenAI
+    from uuid import uuid4
+    from ..model_broker.artifact_phase_count_v1 import (artifact_phase_counter_policy_from_payload_v1,
+        FIXTURE_PROVIDER, FIXTURE_MODEL, FIXTURE_RULE_ID, FIXTURE_RULE_DIGEST)
+    from ..runtime_contracts import InstallationGrantV2, NamespaceBootstrapV2
+    from .authority_client import AuthorityClient, AuthoritySelection
+    from .mtls_transport import MtlsAuthorityTransport
+    from .installed_package import verify_installed_backend_runtime_v1
+    from ..authority_service.linux_installation_security_v1 import opened_installed_file_v1
+    _check_profile_id(profile_id)
+    if platform.system() != "Linux" or os.name != "posix" or os.geteuid() == 0:
+        raise AuthorityProfileUnavailable("local phase fixture needs its protected ordinary Linux installation process")
+    root, profile_directory, data = Path(package_root), Path(profile_root) / profile_id, Path(data_dir)
+    if not root.is_absolute() or root.resolve(strict=True) != root or not data.is_absolute():
+        raise ValueError("local phase fixture requires its actual canonical installed package/data paths")
+    if (type(provider_client) is not AsyncOpenAI or type(mock_transport) is not httpx.MockTransport
+            or type(provider_client._client) is not httpx.AsyncClient or provider_client._client._transport is not mock_transport
+            or provider_client._client.is_closed
+            or any(value is not None and value is not mock_transport for value in provider_client._client._mounts.values())):
+        raise ValueError("local phase fixture requires its actual bounded MockTransport SDK client")
+    with _opened_profile(profile_directory, "Linux", signing_key=True,
+            reverse_material=_reverse_material_present(profile_directory)) as files:
+        payload = _read_profile_json(files["profile.json"])
+        counter = artifact_phase_counter_policy_from_payload_v1(payload.get("artifact_phase_counter"), allow_local_fixture=True)
+        if (counter is None or counter.source_scope != "LOCAL_FIXTURE"
+                or (counter.provider_id, counter.model_id, counter.model_revision, counter.encoding_rule_id,
+                    counter.encoding_rule_sha256) != (FIXTURE_PROVIDER, FIXTURE_MODEL, "1", FIXTURE_RULE_ID, FIXTURE_RULE_DIGEST)):
+            raise ValueError("local fixture issuer cannot qualify a production or foreign counter/model/rule")
+        # Counter permission is absent while the ordinary policy/TLS/key parser
+        # establishes the real protected installation. No fixture is relabelled.
+        base_payload = {key: value for key, value in payload.items() if key != "artifact_phase_fixture_observer"}
+        base_payload["artifact_phase_counter"] = None
+        observer_spec, observer_asset, observer_asset_digest = _artifact_phase_fixture_observer_from_protected_payload_v1(payload)
+        policy = _policy_from_payload(base_payload)
+        prepared = _prepared_ssl_context(files, "Linux")
+        profile = _profile_from_payload(profile_id, profile_directory, base_payload, prepared)
+        reverse = _reverse_handoff_from_payload(base_payload, profile_directory, policy,
+            material_present=_reverse_material_present(profile_directory))
+        base = AdminInstallationBundle(profile, policy,
+            _checked_signing_key(_read_fd_bounded(files[_D11_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D11"),
+            _checked_signing_key(_read_fd_bounded(files[_D02_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D02"),
+            ingress_clock=_ingress_clock_from_payload(base_payload), ingress_encoding=_ingress_encoding_from_payload(base_payload),
+            workbench_origin=_workbench_origin_from_payload(base_payload), ingress_model=_ingress_model_from_payload(base_payload),
+            d03_arrival=_d03_arrival_from_payload(base_payload), model_workflows=_model_workflows_from_payload(base_payload),
+            d04_encoding_baseline=_d04_baseline_from_payload(base_payload), d06_first_ingress_c02=_d06_c02_from_payload(base_payload),
+            d03_self_identity_projection=_d03_projection_from_payload(base_payload), d06_source_correction=_d06_source_correction_from_payload(base_payload),
+            reverse_handoff=reverse, d06_private_reply_source=_d06_private_reply_source_from_payload(base_payload),
+            d07_attention=_d07_attention_from_payload(base_payload), private_reply_dispatch=_private_reply_dispatch_from_payload(base_payload),
+            d13_precompression=_d13_precompression_from_payload(base_payload, policy), d04_semantic_drive=_d04_semantic_drive_from_payload(base_payload, policy),
+            d13_paid_precompression=_d13_paid_precompression_from_payload(base_payload, policy),
+            d13_wire_policy=_d13_wire_policy_from_payload(base_payload, policy), d13_wire_counter=_d13_wire_counter_from_payload(base_payload),
+            d04_joint_numeric=_d04_joint_numeric_from_payload(base_payload, policy), package_selection=getattr(files, "selected_package", None),
+            foreground=_foreground_from_payload(base_payload), artifact_draft=_artifact_draft_from_payload(base_payload),
+            provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(base_payload), d06_recall=_d06_recall_from_payload(base_payload))
+        from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+        if (type(base.artifact_draft) not in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}
+                or (base.artifact_draft.phase_model_workflow.work_kind, base.artifact_draft.phase_model_workflow.purpose) != (
+                    "artifact_draft_v1", "consolidation")
+                or (counter.namespace, counter.installation_id, counter.manifest_digest, counter.profile_id,
+                    counter.provider_id, counter.model_id, counter.provider_config_digest, counter.template_version) != (
+                    policy.namespace, policy.installation_id, policy.manifest_digest, profile_id,
+                    base.artifact_draft.phase_model_workflow.provider_id, base.artifact_draft.phase_model_workflow.model_id,
+                    base.artifact_draft.phase_model_workflow.provider_config_digest, base.artifact_draft.phase_model_workflow.template_version)):
+            raise ValueError("local fixture counter differs from actual protected installation/phase selection")
+        with opened_installed_file_v1(root / "release-manifest.json") as fd:
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != policy.manifest_digest:
+                    raise ValueError("local fixture protected manifest differs from installation")
+        checked = await asyncio.to_thread(verify_installed_backend_runtime_v1, root, policy.manifest_digest)
+        if not checked.verified or checked.runtime_scope != "backend-local-alpha2-acceptance":
+            raise ValueError("local fixture requires the actually qualified local alpha2 backend package")
+        transport = MtlsAuthorityTransport({profile_id: profile})
+        client = AuthorityClient(AuthoritySelection(profile_id), package_root=root, data_dir=data, transport=transport)
+        qualification = None
+        try:
+            status = await AuthorityClient.status_v2(client)
+            if status.state != "paired":
+                raise AuthorityProfileUnavailable("local fixture actual Authority channel is not paired")
+            grant = await AuthorityClient.installation_grant_v2(client)
+            if (type(grant) is not InstallationGrantV2 or (grant.authority_id, grant.installation_id,
+                    grant.manifest_digest, grant.administrator_holder) != (policy.expected_authority_id,
+                    policy.installation_id, policy.manifest_digest, policy.administrator_holder)):
+                raise ValueError("local fixture actual issuer returned another installation grant")
+            request, handshake, _ = await AuthorityClient._model_installation_context(client, base, grant)
+            namespace = await MtlsAuthorityTransport.v2_namespace_bootstrap(transport, request, handshake, policy.namespace)
+            if (type(namespace) is not NamespaceBootstrapV2 or (namespace.authority_id, namespace.namespace,
+                    namespace.authority_namespace) != (grant.authority_id, policy.namespace, policy.authority_namespace)):
+                raise ValueError("local fixture actual Authority namespace mapping differs")
+            qualification = _ArtifactPhaseFixtureInstallationV1(_ARTIFACT_PHASE_FIXTURE_ISSUER_V1,
+                qualification_ref="artifact-phase-local-fixture-qualification:" + uuid4().hex,
+                base_bundle=base, counter=counter, authority_client=client, client_grant=grant,
+                provider_client=provider_client, mock_transport=mock_transport, package_root=root,
+                profile_directory=profile_directory, protected_profile_digest=canonical_digest(payload),
+                observer_spec=observer_spec, observer_asset=observer_asset, observer_asset_digest=observer_asset_digest)
+            _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1[id(qualification)] = (qualification, qualification.qualification_ref, counter.digest, qualification.protected_profile_digest)
+            token = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.set(qualification)
+            try:
+                bundle = replace(base, artifact_phase_counter=counter)
+                object.__setattr__(qualification, "bundle", bundle)
+                _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1[id(bundle)] = qualification
+            finally:
+                _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.reset(token)
+            token = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.set(qualification)
+            try:
+                require_artifact_phase_fixture_qualification_v1(bundle, client_grant=grant)
+            finally:
+                _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.reset(token)
+            return bundle, qualification
+        except BaseException:
+            # Failure never leaves a live partially qualified namespace/channel.
+            if qualification is not None:
+                _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1.pop(id(qualification), None)
+                if qualification.bundle is not None:
+                    _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.pop(id(qualification.bundle), None)
+            await transport.close()
+            raise
+
+
+def _require_artifact_phase_counter_binding_v1(counter, installation, artifact):
+    from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+    if (type(counter) is not ArtifactPhaseCountPolicyV1
+            or type(installation) is not AdminInstallationPolicy
+            or type(artifact) not in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}):
+        raise ValueError("phase counter requires its actual production installation and V3 artifact policy")
+    if counter.source_scope == "LOCAL_FIXTURE":
+        qualification = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.get()
+        record = None if qualification is None else _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1.get(id(qualification))
+        if (record is None or record[0] is not qualification or record[1] != qualification.qualification_ref
+                or record[2] != counter.digest or counter is not qualification.counter or installation is not qualification.base_bundle.installation_policy
+                or artifact is not qualification.base_bundle.artifact_draft
+                or not _artifact_phase_fixture_mock_binding_v1(qualification)):
+            raise ValueError("production bundle cannot enable an unqualified LOCAL_FIXTURE phase counter")
+    workflow = artifact.phase_model_workflow
+    if (counter.namespace, counter.installation_id, counter.manifest_digest, counter.provider_id,
+            counter.model_id, counter.provider_config_digest, counter.template_version) != (
+            installation.namespace, installation.installation_id, installation.manifest_digest,
+            workflow.provider_id, workflow.model_id, workflow.provider_config_digest, workflow.template_version):
+        raise ValueError("phase counter changed installed namespace/package/provider/model/template selection")
+
+
+def _method_measurement_policy_from_payload_v1(payload):
+    from ..runtime.d11_method_observation_v1 import method_measurement_policy_from_payload_v1
+    return method_measurement_policy_from_payload_v1(payload.get("method_measurement_policy"))
+
+
+def _artifact_phase_counter_from_payload(payload, policy):
+    raw = payload.get("artifact_phase_counter")
+    if raw is None:
+        return None
+    from ..model_broker.artifact_phase_count_v1 import artifact_phase_counter_policy_from_payload_v1
+    counter = artifact_phase_counter_policy_from_payload_v1(raw)
+    _require_artifact_phase_counter_binding_v1(counter, policy, _artifact_draft_for_policy_from_payload_v1(payload, policy))
+    return counter
+
+
 def _d13_wire_counter_from_payload(payload):
+    raw = payload.get("d13_wire_counter")
+    if raw is None:
+        return None
+    if type(payload.get("d13_wire_policy")) is dict and payload["d13_wire_policy"].get("schema")=="sylanne3.d13.installed-core-wire-policy.v7":
+        raise ValueError("V7 Core full-wire counter does not accept a Host executable counter")
     from ..authority_service.d13_installed_counter_v1 import installed_d13_counter_from_payload_v1
-    counter = installed_d13_counter_from_payload_v1(payload.get("d13_wire_counter"))
-    if counter is not None and payload.get("d13_wire_policy") is None:
+    counter = installed_d13_counter_from_payload_v1(raw)
+    if payload.get("d13_wire_policy") is None:
         raise ValueError("installed D13 counter requires its signed full-wire policy")
     return counter
 
 
 def _d13_wire_policy_from_payload(payload, policy):
-    from ..authority_service.d13_wire_evidence_v1 import installed_d13_wire_policy_from_payload_v1
-    configured = installed_d13_wire_policy_from_payload_v1(payload.get("d13_wire_policy"))
-    if configured is None:
+    raw = payload.get("d13_wire_policy")
+    if raw is None:
         return None
+    from ..authority_service.d13_wire_evidence_v1 import installed_d13_wire_policy_from_payload_v1
     workflows = _model_workflows_from_payload(payload)
+    if type(raw) is dict and raw.get("schema") == "sylanne3.d13.installed-core-wire-policy.v7":
+        from .model_workflows_v7 import AdminModelWorkflowsV7
+        from ..authority_service.d13_core_counter_contract_v1 import installed_d13_wire_policy_from_payload_v7
+        from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION
+        if type(workflows) is not AdminModelWorkflowsV7 or workflows.natural_generation is None or workflows.natural_generation.template_version != TEMPLATE_VERSION:
+            raise ValueError("D13 Core wire V7 requires the actual named V7 natural workflow")
+        configured = installed_d13_wire_policy_from_payload_v7(raw)
+    elif type(raw) is dict and raw.get("schema") == "sylanne3.d13.installed-wire-policy.v6":
+        from .model_workflows_v6 import AdminModelWorkflowsV6
+        from ..authority_service.d13_wire_evidence_v6 import installed_d13_wire_policy_from_payload_v6
+        from ..model_broker.natural_reply_history_v6 import TEMPLATE_VERSION
+        if type(workflows) is not AdminModelWorkflowsV6 or workflows.natural_generation is None or workflows.natural_generation.template_version != TEMPLATE_VERSION:
+            raise ValueError("D13 wire V6 requires the actual named V6 natural workflow")
+        configured = installed_d13_wire_policy_from_payload_v6(raw)
+    else:
+        configured = installed_d13_wire_policy_from_payload_v1(raw)
     main = workflows.natural_generation if workflows is not None else None
     actual = configured.installation
     if main is None or (actual.installation_id, actual.provider_id, actual.model_id,
@@ -1070,7 +2096,7 @@ def _d13_wire_policy_from_payload(payload, policy):
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff", "foreground", "artifact_draft", "provider_billing_policy_v1", "d06_recall", "astrbot_namespace_v1", "artifact_phase_counter", "artifact_phase_fixture_observer", "method_measurement_policy"}
     )
 
 
@@ -1120,23 +2146,23 @@ def _workbench_origin_from_payload(payload: dict[str, object]) -> str | None:
     if type(payload.get("schema")) is not int or payload["schema"] != 2:
         raise ValueError("workbench origin requires profile schema 2")
     if type(value) is not str or len(value) > 253:
-        raise ValueError("workbench origin must be a canonical HTTPS origin")
+        raise ValueError("workbench origin must be a canonical HTTP or HTTPS origin")
     try:
         parsed = urlsplit(value)
         host = parsed.hostname
         port = parsed.port
-        if (parsed.scheme != "https" or host is None or parsed.username is not None
+        if (parsed.scheme not in {"http", "https"} or host is None or parsed.username is not None
                 or parsed.password is not None or parsed.path or parsed.query
                 or parsed.fragment or "%" in host
                 or (port is not None and not 1 <= port <= 65535)):
-            raise ValueError("workbench origin must be a canonical HTTPS origin")
+            raise ValueError("workbench origin must be a canonical HTTP or HTTPS origin")
         _endpoint_name(host)
         canonical_host = f"[{host}]" if ":" in host else host.lower()
-        canonical = "https://" + canonical_host + (f":{port}" if port is not None else "")
+        canonical = parsed.scheme + "://" + canonical_host + (f":{port}" if port is not None else "")
     except (ValueError, TypeError) as exc:
-        raise ValueError("workbench origin must be a canonical HTTPS origin") from exc
+        raise ValueError("workbench origin must be a canonical HTTP or HTTPS origin") from exc
     if canonical != value:
-        raise ValueError("workbench origin must be a canonical HTTPS origin")
+        raise ValueError("workbench origin must be a canonical HTTP or HTTPS origin")
     return value
 
 
@@ -1363,6 +2389,26 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
     raw_value = payload["model_workflows"]
     if type(raw_value) is not dict:
         raise ValueError("model workflows must be an object")
+    if raw_value.get("version") == 7:
+        if not {"foreground","artifact_draft"}<=set(payload):
+            raise ValueError("version7 workflows require explicit foreground and artifact policy objects")
+        from .model_workflows_v7 import model_workflows_v7_from_payload
+        return model_workflows_v7_from_payload(raw_value)
+    if raw_value.get("version") == 6:
+        if not {"foreground", "artifact_draft"} <= set(payload):
+            raise ValueError("version-6 workflows require their explicit foreground and artifact policy objects")
+        from .model_workflows_v6 import model_workflows_v6_from_payload
+        return model_workflows_v6_from_payload(raw_value)
+    if raw_value.get("version") == 5:
+        if not {"foreground", "artifact_draft"} <= set(payload):
+            raise ValueError("version-5 workflows require their explicit foreground and artifact policy objects")
+        from .model_workflows_v5 import model_workflows_v5_from_payload
+        return model_workflows_v5_from_payload(raw_value)
+    if raw_value.get("version") == 4:
+        if not {"foreground", "artifact_draft"} <= set(payload):
+            raise ValueError("version-4 workflows require their explicit policy objects")
+        from .model_workflows_v4 import model_workflows_v4_from_payload
+        return model_workflows_v4_from_payload(raw_value)
     if raw_value.get("version") == 3:
         from .model_workflows_v3 import model_workflows_v3_from_payload
         return model_workflows_v3_from_payload(raw_value)
@@ -1387,6 +2433,164 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
             "required_capabilities": tuple(item["required_capabilities"]),
         })
     return AdminModelWorkflowsV2(raw["version"], **workflows)
+
+
+def foreground_policy_from_payload_v1(raw):
+    from dataclasses import fields
+    values = dict(_exact_object(raw, {f.name for f in fields(AdminForegroundPolicyV1)}, "foreground policy"))
+    deadline = dict(_exact_object(values["deadline_policy"],
+        {f.name for f in fields(AdminForegroundDeadlinePolicyV1)}, "foreground deadline policy"))
+    if deadline["natural"] is not None:
+        deadline["natural"] = AdminForegroundNaturalDeadlinePolicyV1(**_exact_object(deadline["natural"],
+            {f.name for f in fields(AdminForegroundNaturalDeadlinePolicyV1)}, "natural deadline policy"))
+    values["deadline_policy"] = AdminForegroundDeadlinePolicyV1(**deadline)
+    return AdminForegroundPolicyV1(**values)
+
+
+def d06_recall_policy_from_payload_v1(raw):
+    from dataclasses import fields
+    values = dict(_exact_object(raw, {field.name for field in fields(AdminD06RecallPolicyV1)}, "D06 recall policy"))
+    if type(values["profiles"]) is not list:
+        raise ValueError("D06 recall profiles must be an explicit array")
+    values["profiles"] = tuple(AdminD06RecallProfileV1(**_exact_object(profile,
+        {field.name for field in fields(AdminD06RecallProfileV1)}, "D06 recall profile")) for profile in values["profiles"])
+    return AdminD06RecallPolicyV1(**values)
+
+
+def _d06_recall_from_payload(payload):
+    if "d06_recall" not in payload:
+        return None
+    if _foreground_from_payload(payload) is None:
+        raise ValueError("D06 recall requires explicit installed foreground configuration")
+    return d06_recall_policy_from_payload_v1(payload["d06_recall"])
+
+
+def artifact_draft_policy_from_payload_v1(raw):
+    from dataclasses import fields
+    from .model_workflows_v4 import model_workflow_v4_from_payload
+    if type(raw) is dict and raw.get("schema") == "sylanne.artifact-draft-policy.v4":
+        from .artifact_draft_paired_policy_v4 import artifact_draft_paired_policy_v4_from_payload
+        return artifact_draft_paired_policy_v4_from_payload(raw)
+    policy_type = ({"sylanne.artifact-draft-policy.v2": AdminArtifactDraftPolicyV2,
+        "sylanne.artifact-draft-policy.v3": AdminArtifactDraftPolicyV3}.get(raw.get("schema"), AdminArtifactDraftPolicyV1)
+        if isinstance(raw, dict) else AdminArtifactDraftPolicyV1)
+    values = dict(_exact_object(raw, {f.name for f in fields(policy_type)}, "artifact draft policy"))
+    if policy_type in {AdminArtifactDraftPolicyV2, AdminArtifactDraftPolicyV3}:
+        values["standing_scope"] = artifact_standing_scope_from_payload_v2(values["standing_scope"])
+    values["model_workflow"] = model_workflow_v4_from_payload(values["model_workflow"])
+    if policy_type is AdminArtifactDraftPolicyV3:
+        values["phase_model_workflow"] = model_workflow_v4_from_payload(values["phase_model_workflow"])
+    scope = values["tool_scope"]
+    scope_type = (AdminArtifactDraftToolScopeV2
+        if isinstance(scope, dict) and scope.get("schema") == "sylanne.artifact-draft-tool-scope.v2"
+        else AdminArtifactDraftToolScopeV1)
+    scope = dict(_exact_object(scope, {f.name for f in fields(scope_type)}, "draft tool scope"))
+    if scope_type is AdminArtifactDraftToolScopeV2:
+        if type(scope["operations"]) is not list:
+            raise ValueError("draft v2 operations must be the exact JSON array")
+        scope["operations"] = tuple(scope["operations"])
+    values["tool_scope"] = scope_type(**scope)
+    values["body_policy"] = AdminArtifactDraftBodyPolicyV1(**_exact_object(values["body_policy"],
+        {f.name for f in fields(AdminArtifactDraftBodyPolicyV1)}, "draft Body policy"))
+    if values["observation_policy"] is not None:
+        values["observation_policy"] = AdminArtifactDraftObservationPolicyV1(**_exact_object(values["observation_policy"],
+            {f.name for f in fields(AdminArtifactDraftObservationPolicyV1)}, "draft observation policy"))
+    return policy_type(**values)
+
+
+def require_installed_artifact_target_v2(policy, root, target):
+    """Intersect current signed Root parameters with the installed tool policy.
+
+    Predecessor authenticity remains independently checked by the existing
+    selection/readback readers. A V2 policy alone cannot authorize replacement.
+    """
+    from ..runtime.d11_artifact_draft_contract_v1 import DraftRootCapabilityV1, DraftFileTargetV1
+    from ..runtime_contracts import canonical_digest; from ..domains.d01.production_operations_v1 import plain_v1
+    from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, select_paired_tool_scope_v3
+    if (type(policy) not in {AdminArtifactDraftPolicyV1,AdminArtifactDraftPolicyV2,AdminArtifactDraftPolicyV3,AdminArtifactDraftPairedPolicyV4}
+            or type(root) is not DraftRootCapabilityV1 or type(target) is not DraftFileTargetV1):
+        raise ValueError("installed draft policy and actual typed root/target required")
+    if type(policy) is AdminArtifactDraftPairedPolicyV4:
+        if root.filenames != (target.filename,):
+            raise ValueError("paired target requires its exact signed single-file Root")
+        scope = select_paired_tool_scope_v3(policy, target.filename)
+    else:
+        scope = policy.tool_scope
+    if (root.resource_id != scope.resource_id or root.filenames != (scope.filename,)
+            or target.root_resource_id != scope.resource_id or target.filename != scope.filename
+            or target.root_registration_ref != root.registration_ref
+            or target.root_registration_digest != canonical_digest(plain_v1(root))
+            or target.root_identity != root.root_identity
+            or target.max_bytes > min(root.max_bytes, scope.max_file_bytes)):
+        raise ValueError("draft target exceeds the intersection of installed and registered root scope")
+    if type(scope) is AdminArtifactDraftToolScopeV1:
+        if target.mode != "create":
+            raise ValueError("installed create-only policy does not authorize replacement")
+    elif target.mode == "replace":
+        if not 1 <= target.expected_prior_version < scope.maximum_artifact_version:
+            raise ValueError("verified replacement exceeds the installed finite version boundary")
+    elif target.mode != "create":
+        raise ValueError("unregistered draft effect mode")
+    return target
+
+
+def _provider_billing_policy_from_payload_v1(payload):
+    if "provider_billing_policy_v1" not in payload:
+        return None
+    return provider_billing_policy_from_wire_v1(payload["provider_billing_policy_v1"])
+
+
+def _foreground_for_policy_from_payload_v1(payload, policy):
+    if "foreground" not in payload:
+        if "artifact_draft" in payload:
+            raise ValueError("draft configuration requires explicit foreground policy")
+        return None
+    if type(payload["model_workflows"]["version"]) is not int or payload["model_workflows"]["version"] not in {4, 5, 6}:
+        raise ValueError("foreground requires an explicit supported workflow container")
+    if "d11.foreground_cycle.v1" not in policy.root_grant.allowed_work_kinds:
+        raise ValueError("foreground requires its explicit installed root work kind")
+    return foreground_policy_from_payload_v1(payload["foreground"])
+
+
+def _foreground_from_payload(payload):
+    if "foreground" not in payload:
+        if "artifact_draft" in payload:
+            raise ValueError("draft configuration requires explicit foreground policy")
+        return None
+    return _foreground_for_policy_from_payload_v1(payload, _policy_from_payload(payload))
+
+
+def _artifact_draft_for_policy_from_payload_v1(payload, policy):
+    if "artifact_draft" not in payload:
+        return None
+    foreground = _foreground_for_policy_from_payload_v1(payload, policy)
+    from .model_workflows_v4 import AdminModelWorkflowsV4
+    from .model_workflows_v5 import AdminModelWorkflowsV5
+    from .model_workflows_v6 import AdminModelWorkflowsV6
+    from .model_workflows_v7 import AdminModelWorkflowsV7
+    workflows = _model_workflows_from_payload(payload)
+    if type(workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+        raise ValueError("draft requires version-4 workflows")
+    if payload["artifact_draft"] is None:
+        if workflows.artifact_draft is not None or foreground.deadline_policy.draft_mode is not None:
+            raise ValueError("unconfigured draft cannot retain its workflow or deadline mode")
+        return None
+    configured = artifact_draft_policy_from_payload_v1(payload["artifact_draft"])
+    if (configured.model_workflow != workflows.artifact_draft
+            or foreground.deadline_policy.draft_mode != "signed_scope_intersection_v1"):
+        raise ValueError("draft policy, C4 slot and signed-scope deadline differ")
+    required = {"artifact_draft_v1", "d10.life.artifact_draft.v1"}
+    if configured.observation_policy is not None:
+        required.add("d11.life.artifact_observation.v1")
+    if not required <= set(policy.root_grant.allowed_work_kinds):
+        raise ValueError("draft requires its explicit installed root work kinds")
+    return configured
+
+
+def _artifact_draft_from_payload(payload):
+    if "artifact_draft" not in payload:
+        return None
+    return _artifact_draft_for_policy_from_payload_v1(payload, _policy_from_payload(payload))
 
 
 def _d06_private_reply_source_from_payload(
@@ -1438,7 +2642,11 @@ def _d13_paid_precompression_from_payload(
                         "D13 paid precompression")
     workflows = _model_workflows_from_payload(payload)
     from .model_workflows_v3 import AdminModelWorkflowsV3
-    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+    from .model_workflows_v4 import AdminModelWorkflowsV4
+    from .model_workflows_v5 import AdminModelWorkflowsV5
+    from .model_workflows_v6 import AdminModelWorkflowsV6
+    from .model_workflows_v7 import AdminModelWorkflowsV7
+    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
             or type(workflows.reply) is not AdminModelWorkflowV2
             or "d13.precompress.paid.v1"
                not in policy.root_grant.allowed_work_kinds):
@@ -1468,6 +2676,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     if (type(payload.get("schema")) is not int or payload["schema"] != 2
             or not _valid_schema2_fields(payload)):
         raise ValueError("administrator installation policy requires profile schema 2")
+    if payload.get("artifact_phase_fixture_observer") is not None:
+        raise ValueError("fixture observer installation requires its private protected qualification issuer")
     _ingress_clock_from_payload(payload)
     encoding = _ingress_encoding_from_payload(payload)
     arrival = _d03_arrival_from_payload(payload)
@@ -1485,6 +2695,11 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
                            "installation policy")
     namespace = _exact_object(values["namespace"], frozenset({"bot_id", "persona_id"}),
                               "installation namespace")
+    if "astrbot_namespace_v1" in payload:
+        from .identity import astrbot_namespace_from_configuration_v1
+        declared = astrbot_namespace_from_configuration_v1(payload["astrbot_namespace_v1"])
+        if NamespaceId(**namespace) != declared:
+            raise ValueError("installed profile changed its configured AstrBot namespace identity")
     lease = _exact_object(values["root_lease"], _LEASE_FIELDS, "root lease")
     grant = _exact_object(values["root_grant"], _GRANT_FIELDS, "root grant")
     if values["expected_authority_id"] != payload["expected_authority_id"]:
@@ -1578,7 +2793,9 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
                                   workflows.natural_review,
                                   workflows.appraisal, workflows.d07_cognition,
                                   workflows.contact_generation, workflows.contact_review,
-                                  getattr(workflows, "life_content", None)) if item is not None):
+                                  getattr(workflows, "life_content", None),
+                                  getattr(workflows, "life_numeric", None),
+                                  getattr(workflows, "d07_relationship_cognition", None)) if item is not None):
             if workflow.work_kind not in policy.root_grant.allowed_work_kinds:
                 raise ValueError("model workflow lacks its own root grant work kind")
             if any(amount > policy.root_grant.max_ceiling.get(name, 0)
@@ -1590,6 +2807,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
             raise ValueError("encoding workflow exceeds installed encoding quote")
     _d13_precompression_from_payload(payload, policy)
     _d13_paid_precompression_from_payload(payload, policy)
+    _artifact_phase_counter_from_payload(payload, policy)
+    _method_measurement_policy_from_payload_v1(payload)
     return policy
 
 
@@ -1615,6 +2834,7 @@ def _load_profile_from_root(profile_id: str, profile_root: Path,
 
 
 def _build_transport_from_root(profile_id: str, profile_root: Path) -> MtlsAuthorityTransport:
+    from .mtls_transport import MtlsAuthorityTransport
     profile = _load_profile_from_root(profile_id, profile_root, prepare_tls=True)
     if platform.system() in {"Linux", "Darwin"} and profile.prepared_ssl_context is None:
         raise AuthorityProfileUnavailable("verified TLS context was not prepared")
@@ -1622,6 +2842,7 @@ def _build_transport_from_root(profile_id: str, profile_root: Path) -> MtlsAutho
 
 
 def _build_windows_admin_transport(profile_id: str) -> MtlsAuthorityTransport:
+    from .mtls_transport import MtlsAuthorityTransport
     from .windows_profile_security import programdata_profile_root
 
     profile_dir = programdata_profile_root() / profile_id
@@ -1761,7 +2982,13 @@ def _load_installation_bundle_from_root(
                                     _d13_wire_policy_from_payload(payload, policy),
                                     _d13_wire_counter_from_payload(payload),
                                     _d04_joint_numeric_from_payload(payload, policy),
-                                    package_selection=getattr(files, 'selected_package', None))
+                                     package_selection=getattr(files, 'selected_package', None),
+                                     foreground=_foreground_from_payload(payload),
+                                     artifact_draft=_artifact_draft_from_payload(payload),
+                                      provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(payload),
+                                      d06_recall=_d06_recall_from_payload(payload),
+                                      artifact_phase_counter=_artifact_phase_counter_from_payload(payload, policy),
+                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload))
 
 
 def _load_windows_installation_bundle(
@@ -1806,7 +3033,13 @@ def _load_windows_installation_bundle(
                                     _d13_paid_precompression_from_payload(payload, policy),
                                     _d13_wire_policy_from_payload(payload, policy),
                                     _d13_wire_counter_from_payload(payload),
-                                    _d04_joint_numeric_from_payload(payload, policy))
+                                     _d04_joint_numeric_from_payload(payload, policy),
+                                     foreground=_foreground_from_payload(payload),
+                                     artifact_draft=_artifact_draft_from_payload(payload),
+                                      provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(payload),
+                                      d06_recall=_d06_recall_from_payload(payload),
+                                      artifact_phase_counter=_artifact_phase_counter_from_payload(payload, policy),
+                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -1885,6 +3118,10 @@ def load_admin_c04_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
+    "load_artifact_phase_local_fixture_bundle_v1", "require_artifact_phase_fixture_qualification_v1",
+    "require_artifact_phase_fixture_observer_v1", "readonly_artifact_phase_fixture_observer_v1",
+    "artifact_phase_local_fixture_scope_v1", "bind_artifact_phase_local_fixture_components_v1",
+    "revoke_artifact_phase_local_fixture_qualification_v1",
     "AdminD03ArrivalPolicy", "AdminD03SelfIdentityProjectionPolicy", "AdminD04EncodingBaselinePolicy", "AdminD06FirstIngressC02Policy", "AdminD06SourceCorrectionPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
     "AdminModelWorkflowV2", "AdminModelWorkflowsV2",
     "AdminD06PrivateReplySourcePolicy",
@@ -1893,7 +3130,8 @@ __all__ = (
     "AdminPrivateReplyDispatchPolicy",
     "AdminD13PrecompressionPolicyV1",
     "AdminD13PaidPrecompressionPolicyV1",
-    "AdminInstallationBundle",
+    "AdminInstallationBundle", "AdminArtifactDraftPolicyV3",
+    "is_installed_life_numeric_slot_v1", "is_installed_artifact_draft_slot_v1", "is_installed_artifact_draft_phase_slot_v2",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",

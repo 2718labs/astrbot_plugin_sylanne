@@ -103,7 +103,7 @@ def install_d02_production_schema_v1(db):
 
 
 class InstalledD02ProductionReadersV1:
-    def __init__(self, *, issuer, body_quote_authority, role_clock_reader):
+    def __init__(self, *, issuer, body_quote_authority, role_clock_reader, installed_bundle=None):
         from ..host.installed_d04_semantic_mapping_v3 import InstalledD04SemanticMappingReaderV3
         if (type(issuer) is not D11BudgetJobIssuer or type(body_quote_authority) is not D02BodyQuoteAuthority
                 or type(role_clock_reader) is not InstalledD04SemanticMappingReaderV3):
@@ -111,6 +111,7 @@ class InstalledD02ProductionReadersV1:
         self.issuer = issuer
         self.body_quote_authority = body_quote_authority
         self.role_clock_reader = role_clock_reader
+        self.installed_bundle = installed_bundle
 
     def install_policy(self, db, *, frame, policy):
         """W01's fixed administrator-policy installation, never a data command."""

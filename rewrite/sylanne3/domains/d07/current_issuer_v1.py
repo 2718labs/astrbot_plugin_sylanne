@@ -191,6 +191,42 @@ def issue_current_recollection_interpretation_v3(
             or type(installed_policy) is not InstalledCurrentInterpretationPolicyV3
             or not binding_digest or not execution_id or activation_generation < 1):
         raise ValueError("current D07 issuer requires installed typed originals")
+    return _issue_current_recollection_interpretation_checked_v3(
+        work, result, selection, source_heads, interpretation_originals, installed_policy,
+        binding_digest=binding_digest, execution_id=execution_id, activation_generation=activation_generation,
+        adoption_original=adoption_original, paid_original=paid_original)
+
+
+def issue_current_recollection_interpretation_v4(
+    work: AssociationWorkInputV3, result: AssociationWorkResultV3,
+    selection: SelectionTicket, source_heads: tuple[GraphHeadV3, ...],
+    interpretation_originals: tuple[GraphHeadV3, ...],
+    installed_policy: InstalledCurrentInterpretationPolicyV3, *,
+    binding_digest: str, execution_id: str, activation_generation: int,
+    adoption_original: AdoptedInterpretationOriginalV1 | None = None,
+    paid_original: PaidCognitiveAdoptionOriginalV1 | None = None,
+) -> IssuedCurrentInterpretationV3:
+    from ...runtime.c04_direct_seed_v4 import AssociationWorkInputV4, AssociationWorkResultV4
+    if (type(work) is not AssociationWorkInputV4 or type(result) is not AssociationWorkResultV4
+            or type(installed_policy) is not InstalledCurrentInterpretationPolicyV3
+            or not binding_digest or not execution_id or activation_generation < 1):
+        raise ValueError("current Self C04 issuer requires exact installed V4 originals")
+    return _issue_current_recollection_interpretation_checked_v3(
+        work, result, selection, source_heads, interpretation_originals, installed_policy,
+        binding_digest=binding_digest, execution_id=execution_id, activation_generation=activation_generation,
+        adoption_original=adoption_original, paid_original=paid_original)
+
+
+def _issue_current_recollection_interpretation_checked_v3(
+    work: AssociationWorkInputV3, result: AssociationWorkResultV3,
+    selection: SelectionTicket, source_heads: tuple[GraphHeadV3, ...],
+    interpretation_originals: tuple[GraphHeadV3, ...],
+    installed_policy: InstalledCurrentInterpretationPolicyV3, *,
+    binding_digest: str, execution_id: str, activation_generation: int,
+    adoption_original: AdoptedInterpretationOriginalV1 | None = None,
+    paid_original: PaidCognitiveAdoptionOriginalV1 | None = None,
+) -> IssuedCurrentInterpretationV3:
+    from ...runtime.c04_result_adoption_v3 import select_c04_result_v3
     result.validate_input(work)
     _, expected = select_c04_result_v3(work, result, focus_epoch=work.selection_ticket.focus_epoch)
     if selection != expected.selection_ticket or len(selection.selected_candidate_ids) != 1:

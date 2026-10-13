@@ -9,6 +9,7 @@ from ..runtime_contracts import canonical_digest
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1, production_read_plan_v1
 from .d08_source_note_action_v1 import require_source_note_action_original_v1
 from .d11_life_contract_v1 import LifeBodyComponentContractV1, WORK_KIND
+from .d11_artifact_draft_contract_v1 import WORK_KIND as DRAFT_WORK_KIND
 from .issuers import ResourceQuote
 
 
@@ -26,6 +27,11 @@ class PrepareSourceNoteBodyRequestV1:
                 or type(self.body_policy_version) is not int or self.body_policy_version < 1
                 or type(self.cpu_ceiling_ms) is not int or not 1 <= self.cpu_ceiling_ms <= 60000):
             raise ValueError("Life Body preparation requires fixed installed policies and a finite CPU ceiling")
+
+
+@dataclass(frozen=True, slots=True)
+class PrepareArtifactDraftBodyRequestV1(PrepareSourceNoteBodyRequestV1):
+    """Explicit registered draft Body variant; source-note requests stay V1."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +88,7 @@ def _refs(namespace, activity, operation):
         AtomKey(owner, "d02.settlement.v1", "life-body:" + tag))
 
 
-def read_plan_source_note_body_v1(db, *, namespace, activity_id, operation_id, request, now_utc):
+def read_plan_source_note_body_v1(db, *, namespace, activity_id, operation_id, request, now_utc, installed_readers=None):
     from .d11_life_product_adapter_v1 import life_inventory_read_inputs_v1, raw_life_original_v1, LIFE_CURRENT_TYPES
     from .d11_life_scope_v1 import life_scope_from_action_v1
     row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
@@ -90,7 +96,9 @@ def read_plan_source_note_body_v1(db, *, namespace, activity_id, operation_id, r
     if row is None or row[1] != 1:
         raise MissingProductionOriginalV1("current_source_note_body_root")
     action = json.loads(row[0])
-    root = raw_life_original_v1(db, namespace, "source_note_action", "life-root:" + action["identity"]["operation_id"])
+    draft = type(request) is PrepareArtifactDraftBodyRequestV1
+    root = raw_life_original_v1(db, namespace, "draft_action" if draft else "source_note_action",
+        ("life-draft-root:" if draft else "life-root:") + action["identity"]["operation_id"])
     if root is None:
         raise MissingProductionOriginalV1("actual_source_note_body_root_original")
     scope = life_scope_from_action_v1(db, namespace=namespace, action_ref=request.action_intent_ref,
@@ -99,6 +107,16 @@ def read_plan_source_note_body_v1(db, *, namespace, activity_id, operation_id, r
     keys += [AtomKey.from_token(root["project_ref"]), AtomKey.from_token(root["recipe_ref"])]
     roots += [root["input_source_ref"]]
     keys += [AtomKey.from_token(request.action_intent_ref), *_refs(namespace, activity_id, operation_id)]
+    if not draft and root.get("schema") == "d08.selected-source-note-action-original.v2":
+        from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+        selected = require_source_note_action_original_v1(db, namespace=namespace,
+            action_intent_ref=request.action_intent_ref, issuer=installed_readers.issuer)
+        actual = read_adopted_domain_operation_v1(db, namespace, selected.action_operation_id)
+        if actual is None or actual["operation_kind"] != "prepare_selected_source_note_action_v2":
+            raise MissingProductionOriginalV1("actual_selected_SourceNote_Body_readplan")
+        keys += [version.key for version in actual["read_versions"]]
+        roots += [version.key.token for version in actual["read_versions"] if version.key.type_name == "memory.source"]
+        originals += ["life-root:" + selected.action_operation_id, selected.action_operation_id]
     return production_read_plan_v1(LIFE_CURRENT_TYPES, keys,
         roots, (*originals, request.action_intent_ref, request.effect_policy_ref))
 
@@ -107,8 +125,19 @@ def stage_prepare_source_note_body_in_transaction_v1(db, *, frame, request, inst
     read = CurrentDomainReadV1(frame)
     read.check(db)
     ns, identity = frame.envelope.authority.namespace, frame.envelope.identity
-    root = require_source_note_action_original_v1(db, namespace=ns, action_intent_ref=request.action_intent_ref,
-        issuer=installed_readers.issuer)
+    if type(request) not in {PrepareSourceNoteBodyRequestV1, PrepareArtifactDraftBodyRequestV1}:
+        raise TypeError("exact registered source-note or artifact-draft Body request required")
+    draft = type(request) is PrepareArtifactDraftBodyRequestV1
+    if draft:
+        from .d08_life_admission_v1 import require_draft_action_root_v1
+        root = require_draft_action_root_v1(db, namespace=ns, action_intent_ref=request.action_intent_ref,
+            issuer=installed_readers.issuer)
+    else:
+        root = require_source_note_action_original_v1(db, namespace=ns, action_intent_ref=request.action_intent_ref,
+            issuer=installed_readers.issuer, frame=frame,
+            installed_bundle=installed_readers.installed_bundle,
+            body_quote_authority=installed_readers.body_quote_authority)
+    work_kind = DRAFT_WORK_KIND if draft else WORK_KIND
     action = read.head(db, request.action_intent_ref, required=True)
     if (identity.operation_id != "d02-life-body:" + root.action_operation_id
             or (identity.activity_id, identity.effect_id) != (root.activity_id, root.effect_id)
@@ -120,7 +149,7 @@ def stage_prepare_source_note_body_in_transaction_v1(db, *, frame, request, inst
             read.source_family(db, (root.input_source_ref,), purpose=purpose, audience=audience)
     policy = installed_readers.body_quote_authority.policy(db, ns, request.body_policy_id, request.body_policy_version)
     profile, state, reservations = installed_readers._current_body(db, read, policy.profile.profile_id)
-    if policy.work_kind != WORK_KIND or profile != policy.profile:
+    if policy.work_kind != work_kind or profile != policy.profile:
         raise ValueError("Life Body policy does not price the actual installed source-note component")
     row = db.execute("SELECT policy_ref,revision,kind,payload_json,payload_digest,signature FROM graph_d02_production_policies_v1 "
         "WHERE bot=? AND persona=? AND policy_ref=? AND kind='effect' ORDER BY revision DESC LIMIT 1",
@@ -128,28 +157,34 @@ def stage_prepare_source_note_body_in_transaction_v1(db, *, frame, request, inst
     if row is None:
         raise MissingProductionOriginalV1("actual_source_note_body_effect_policy")
     effect_policy, _ = installed_readers._policy(read, row)
-    if (effect_policy.profile_id, effect_policy.work_kind, effect_policy.component_id) != (profile.profile_id, WORK_KIND, policy.component.component_id):
+    if (effect_policy.profile_id, effect_policy.work_kind, effect_policy.component_id) != (profile.profile_id, work_kind, policy.component.component_id):
         raise ValueError("Life Body effect policy and original quoted component differ")
     reservation_key, settlement_key = _refs(ns, identity.activity_id, identity.operation_id)
     if read.head(db, reservation_key).revision or read.head(db, settlement_key).revision:
         raise ValueError("Life Body reservation identity is already adopted")
     quote = ResourceQuote("resource-quote:life-body:" + canonical_digest((ns, identity.operation_id)), 1,
         *ns.as_tuple, identity.activity_id, identity.operation_id, identity.effect_id, frame.envelope.parent_budget_lease_ref,
-        WORK_KIND, "graph:" + canonical_digest(frame.snapshot), frame.envelope.deadline_utc,
+        work_kind, "graph:" + canonical_digest(frame.snapshot), frame.envelope.deadline_utc,
         "resource:life-body:" + identity.operation_id, None, (), (settlement_key.token,),
         {"cpu_ms": request.cpu_ceiling_ms}, None, frame.envelope.deadline_utc)
     domain = BodyDomain()
-    body = domain.quote_work(profile, state, identity.activity_id, WORK_KIND, 0.0, (policy.component,), valid_until=policy.valid_until)
+    body = domain.quote_work(profile, state, identity.activity_id, work_kind, 0.0, (policy.component,), valid_until=policy.valid_until)
     body = replace(body, quote_id="body-quote:" + canonical_digest({"namespace": list(ns.as_tuple),
         "operation_id": identity.operation_id, "policy_id": policy.policy_id, "policy_version": policy.version}))
     reservation = domain.reserve_work(state, reservations, body, reservation_key.name, identity.effect_id)
     write = domain.reservation_write(ns, identity.activity_id, reservation)
-    primary = stage_result_v1(frame, "d02", "prepare_source_note_body", request, writes=(write,),
+    primary = stage_result_v1(frame, "d02", "prepare_artifact_draft_body" if draft else "prepare_source_note_body", request, writes=(write,),
         provenance={"life_body_root_action_ref": root.action_intent_ref, "life_body_root_action_digest": root.action_intent_digest,
             "life_body_resource_quote": quote, "life_body_quote": body, "life_body_effect_policy": effect_policy},
         proposal_schema="d02.proposal.v1", proposal_hash=domain.descriptor.request_schema_hash)
     domain.validate(primary.proposals[0], frame.snapshot)
     return LifeBodyPreparationStageV1(primary, request, root, quote, body, reservation, effect_policy)
+
+
+def stage_prepare_artifact_draft_body_in_transaction_v1(db, *, frame, request, installed_readers):
+    if type(request) is not PrepareArtifactDraftBodyRequestV1:
+        raise TypeError("explicit artifact-draft Body request required")
+    return stage_prepare_source_note_body_in_transaction_v1(db, frame=frame, request=request, installed_readers=installed_readers)
 
 
 def issue_life_body_quotes_before_cas_v1(db, *, frame, staged, installed_readers):
@@ -192,7 +227,11 @@ def require_life_body_preparation_v1(db, *, prepared, issuer, resource_issuer, b
         raise MissingProductionOriginalV1("actual_signed_life_body_preparation")
     raw, operation = saved
     original = life_body_preparation_original_from_wire_v1(raw)
-    root = require_source_note_action_original_v1(db, namespace=b.namespace, action_intent_ref=prepared.plan.action_intent.ref, issuer=issuer)
+    if prepared.plan.recipe_id == "artifact_draft_v1":
+        from .d08_life_admission_v1 import require_draft_action_root_v1
+        root = require_draft_action_root_v1(db, namespace=b.namespace, action_intent_ref=prepared.plan.action_intent.ref, issuer=issuer)
+    else:
+        root = require_source_note_action_original_v1(db, namespace=b.namespace, action_intent_ref=prepared.plan.action_intent.ref, issuer=issuer)
     if (operation != original.body_prepare_operation_id or original.action_operation_id != b.operation_id
             or (original.action_intent_ref, original.action_intent_digest, original.activity_id, original.effect_id) !=
                 (root.action_intent_ref, root.action_intent_digest, b.activity_id, b.effect_id)):
@@ -217,3 +256,34 @@ def require_life_body_preparation_v1(db, *, prepared, issuer, resource_issuer, b
             or quote.ceiling.get("cpu_ms", 0) < b.cpu_ceiling_ms):
         raise ValueError("Life Body original quote identity or explicit CPU ceiling differs")
     return original
+
+
+def read_current_draft_body_component_contract_v1(db,*,frame,action_intent_ref,issuer,resource_issuer,body_quote_authority):
+    """Read real B after Action A, without a placeholder final plan/prepared."""
+    from .d08_life_admission_v1 import require_draft_action_root_v1
+    from .d11_life_preparation_v1 import _read
+    from .d04_root_original_store_v1 import _receipt
+    root=require_draft_action_root_v1(db,namespace=frame.envelope.authority.namespace,action_intent_ref=action_intent_ref,issuer=issuer)
+    operation="d02-life-body:"+root.action_operation_id
+    raw=_read(db,issuer=issuer,namespace=frame.envelope.authority.namespace,kind="life_body_preparation",ref="life-body:"+operation)
+    if raw is None:raise MissingProductionOriginalV1("actual_draft_body_B_before_final_plan_C")
+    original=life_body_preparation_original_from_wire_v1(raw[0]);receipt=_receipt(db,frame.envelope.authority.namespace,operation)
+    if (raw[1]!=operation or original.action_operation_id!=root.action_operation_id
+            or original.action_intent_digest!=root.action_intent_digest or canonical_digest(receipt)!=original.receipt_digest
+            or len(receipt.write_versions)!=1 or (receipt.write_versions[0].key.token,receipt.write_versions[0].revision)!=
+                (original.reservation_ref,original.reservation_revision)):
+        raise ValueError("draft Body B lost its exact actual A/reservation CAS")
+    read=CurrentDomainReadV1(frame);read.check(db)
+    reservation=read.head(db,original.reservation_ref,required=True)
+    if (reservation.revision,canonical_digest(reservation.value))!=(original.reservation_revision,original.reservation_digest):
+        raise ValueError("draft Body B reservation changed before final plan")
+    quote=resource_issuer.original_signed_quote(db,original.resource_quote_ref,original.resource_quote_version)
+    body=body_quote_authority.original_body_quote(db,original.body_quote_ref,original.body_quote_version,quote,operation)
+    if (quote.work_kind!=DRAFT_WORK_KIND or body.work_kind!=DRAFT_WORK_KIND
+            or canonical_digest(quote)!=original.resource_quote_digest or canonical_digest(body)!=original.body_quote_digest
+            or (quote.activity_id,quote.effect_id,quote.operation_id)!=(root.activity_id,root.effect_id,operation)
+            or frame.now_utc>=min(quote.valid_until_utc,body.valid_until)):
+        raise ValueError("draft Body B actual quote/work/deadline changed")
+    return LifeBodyComponentContractV1(*(getattr(original,name) for name in (
+        "body_quote_ref","body_quote_version","body_quote_digest","resource_quote_ref","resource_quote_version",
+        "resource_quote_digest","reservation_ref","settlement_ref","component_id","effect_policy_ref","body_prepare_operation_id")))

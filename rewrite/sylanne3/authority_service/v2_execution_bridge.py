@@ -16,18 +16,21 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
+from types import MappingProxyType
 
 from ..runtime_journal import RecoveryConstraintFootprint
 from .contract import AuthorityUnavailable, JournalHead, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
+    CurrentEffectReadV2, HandoffStartV2,
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
     PendingMutationV2, canonical_bytes,
     canonical_digest,
     DispatchHandoffContextV1, DispatchGraphClaimReceiptV1, OwnerDispatchWitnessV1,
     AuthorityDispatchSnapshotV1, AuthorityUnresolvedEffectV1,
-    AuthorityCurrentEffectSnapshotV2,
+    AuthorityCurrentEffectSnapshotV2,NaturalFinalAuthorityOwnerStateV4,
+    AuthorityNaturalFinalEffectObservationV4,NaturalFinalEffectObservationReadV4,
     PlatformObservationV1, PlatformObservationV2, decode_bytes, from_wire, to_wire,
 )
 from .v2_dispatch_admission_epoch import current_admission_stamp_in_tx
@@ -54,6 +57,48 @@ _HANDOFF_RECEIPT_DDL = """CREATE TABLE authority_execution_handoff_graph_receipt
             ) STRICT"""
 
 
+_NATURAL_FINAL_OBSERVATION_DDL_V4 = """CREATE TABLE authority_natural_final_observations_v4 (
+    authority_namespace TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    observation_kind TEXT NOT NULL,
+    permit_digest TEXT NOT NULL,
+    original_bytes BLOB NOT NULL,
+    original_digest TEXT NOT NULL,
+    PRIMARY KEY(authority_namespace,operation_id,observation_kind)
+) STRICT"""
+
+
+NATURAL_FINAL_OBSERVATION_TABLE_V4 = "authority_natural_final_observations_v4"
+NATURAL_FINAL_OBSERVATION_DDL_MAP_V4 = MappingProxyType({
+    NATURAL_FINAL_OBSERVATION_TABLE_V4: _NATURAL_FINAL_OBSERVATION_DDL_V4,
+    **{NATURAL_FINAL_OBSERVATION_TABLE_V4+"_no_"+action.lower():
+        "CREATE TRIGGER "+NATURAL_FINAL_OBSERVATION_TABLE_V4+"_no_"+action.lower()+
+        " BEFORE "+action+" ON "+NATURAL_FINAL_OBSERVATION_TABLE_V4+
+        " BEGIN SELECT RAISE(ABORT,'natural final observation original is immutable'); END"
+        for action in ("UPDATE","DELETE")},
+})
+
+
+def require_natural_final_observation_schema_v4(db):
+    """The exact Core original table and both installed immutable triggers."""
+    for name,ddl in NATURAL_FINAL_OBSERVATION_DDL_MAP_V4.items():
+        kind="table" if name==NATURAL_FINAL_OBSERVATION_TABLE_V4 else "trigger"
+        if db.execute("SELECT sql FROM sqlite_master WHERE type=? AND name=?",(kind,name)).fetchone()!=(ddl,):
+            raise AuthorityUnavailable("natural final observation original schema/immutable trigger differs")
+
+
+def install_natural_final_observation_schema_v4(db):
+    if not db.in_transaction:
+        raise AuthorityUnavailable("natural final observation schema requires the actual Core transaction")
+    for name,ddl in NATURAL_FINAL_OBSERVATION_DDL_MAP_V4.items():
+        kind="table" if name==NATURAL_FINAL_OBSERVATION_TABLE_V4 else "trigger"
+        row=db.execute("SELECT sql FROM sqlite_master WHERE type=? AND name=?",(kind,name)).fetchone()
+        if row is None:db.execute(ddl)
+        elif row!=(ddl,):
+            raise AuthorityUnavailable("natural final observation original schema/immutable trigger differs")
+    require_natural_final_observation_schema_v4(db)
+
+
 class PlatformObservationVerifierUnavailable(AuthorityUnavailable):
     """A V2 handoff cannot begin without its installed observation verifier."""
 
@@ -66,100 +111,8 @@ class PreparedExecutionObservationV2:
     result: tuple[MutationReceiptV2, FencePermitV2] | None
 
 
-@dataclass(frozen=True, slots=True)
-class CurrentEffectReadV2:
-    """Content-free Authority evidence including the original observed outcome."""
-
-    authority_id: str
-    namespace: str
-    effect_id: str
-    activation_generation: int
-    state: str  # absent, unresolved, or observed
-    execution_head_seq: int
-    execution_head_digest: str
-    effect_seq: int | None = None
-    append_id: str | None = None
-    append_digest: str | None = None
-    mutation_id: str | None = None
-    observation_id: str | None = None
-    observation_outcome: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class HandoffStartV2:
-    """One durable Authority start bound to a current dispatch fence.
-
-    The business graph's independently durable claim is named, not reproduced.
-    This receipt alone cannot authorize a platform adapter to send.
-    """
-
-    handoff_id: str
-    operation_id: str
-    effect_id: str
-    namespace: str
-    claim_digest: str
-    binding_digest: str
-    graph_claim_ref: str
-    permit: FencePermitV2
-    replay: bool = False
-    graph_claim_receipt: DispatchGraphClaimReceiptV1 | None = None
-
-    def __post_init__(self) -> None:
-        for name in ("handoff_id", "operation_id", "effect_id", "namespace",
-                     "graph_claim_ref"):
-            identifier(getattr(self, name), name)
-        if type(self.replay) is not bool:
-            raise ValueError("handoff replay must be an exact boolean")
-        if not self.replay and self.graph_claim_receipt is None:
-            raise ValueError("new handoff start requires a graph claim receipt")
-        if self.graph_claim_receipt is not None and (
-                type(self.graph_claim_receipt) is not DispatchGraphClaimReceiptV1
-                or self.graph_claim_receipt.graph_claim_ref != self.graph_claim_ref
-                or self.graph_claim_receipt.context_digest != canonical_digest(
-                    DispatchHandoffContextV1(
-                        permit=self.permit,
-                        claimed_receipt_digest=self.claim_digest,
-                        binding_digest=self.binding_digest,
-                        handoff_id=self.handoff_id))):
-            raise ValueError("handoff graph receipt identity differs")
-        if (type(self.permit) is not FencePermitV2
-                or self.permit.operation != "dispatch"
-                or self.permit.operation_id != self.operation_id
-                or self.permit.effect_id != self.effect_id
-                or self.permit.namespace != self.namespace
-                or any(type(value) is not str or not value.startswith("sha256:")
-                       or len(value) != 71
-                       or any(ch not in "0123456789abcdef" for ch in value[7:])
-                       for value in (
-                           self.claim_digest, self.binding_digest))):
-            raise ValueError("handoff start identity is invalid")
-
-    def to_wire(self) -> dict[str, object]:
-        return {"handoff_id": self.handoff_id, "operation_id": self.operation_id,
-                "effect_id": self.effect_id, "namespace": self.namespace,
-                "claim_digest": self.claim_digest,
-                "binding_digest": self.binding_digest,
-                "graph_claim_ref": self.graph_claim_ref,
-                "permit": to_wire(self.permit), "replay": self.replay,
-                "graph_claim_receipt": (to_wire(self.graph_claim_receipt)
-                                        if self.graph_claim_receipt is not None else None)}
-
-    @classmethod
-    def from_wire(cls, value: object) -> "HandoffStartV2":
-        if type(value) is not dict or set(value) != {
-                "handoff_id", "operation_id", "effect_id", "namespace",
-                "claim_digest", "binding_digest", "graph_claim_ref", "permit",
-                "replay", "graph_claim_receipt"}:
-            raise ValueError("handoff start wire fields differ")
-        permit = from_wire(value["permit"])
-        receipt = (from_wire(value["graph_claim_receipt"])
-                   if value["graph_claim_receipt"] is not None else None)
-        result = cls(**{key: item for key, item in value.items()
-                        if key not in ("permit", "graph_claim_receipt")},
-                     permit=permit, graph_claim_receipt=receipt)
-        if result.to_wire() != value:
-            raise ValueError("handoff start wire is not canonical")
-        return result
 
 
 def handoff_start_digest_v2(start: HandoffStartV2) -> str:
@@ -183,7 +136,8 @@ class AuthorityV2ExecutionBridge:
                  owner_tickets: AuthorityV2OwnerTicketStore | None = None,
                  owner_installation_id: str | None = None,
                  v2_dispatch_verifier=None,
-                 internal_work_terminal_verifier=None):
+                 internal_work_terminal_verifier=None,
+                 current_foreground_reply_scope_observer=None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -226,6 +180,10 @@ class AuthorityV2ExecutionBridge:
             identifier(owner_installation_id, "owner_installation_id")
         self._owner_tickets = owner_tickets
         self._owner_installation_id = owner_installation_id
+        self._contact_p2_service_v1 = None
+        self._current_foreground_reply_scope_observer_v1 = None
+        if current_foreground_reply_scope_observer is not None:
+            self.install_current_foreground_reply_scope_observer_v1(current_foreground_reply_scope_observer)
         if (internal_work_terminal_verifier is not None and
                 not callable(internal_work_terminal_verifier)):
             raise AuthorityUnavailable("installed internal work terminal verifier is invalid")
@@ -245,6 +203,56 @@ class AuthorityV2ExecutionBridge:
                 db.execute(_HANDOFF_RECEIPT_DDL)
             elif stored != (_HANDOFF_RECEIPT_DDL,):
                 raise AuthorityUnavailable("handoff graph receipt schema differs")
+            install_natural_final_observation_schema_v4(db)
+
+    def install_contact_p2_service_v1(self, service):
+        from .contact_p2_service_v1 import InstalledContactP2ServiceV1
+        if (type(service) is not InstalledContactP2ServiceV1
+                or service.policy.core is not self.core or service.policy.fences.fences is not self.fences
+                or service.policy.tickets is not self._owner_tickets
+                or service.policy.fences.namespace != self.namespace
+                or service.policy.installation_id != self._owner_installation_id
+                or self._contact_p2_service_v1 not in (None,service)):
+            raise AuthorityUnavailable("Contact P2 service crossed its actual installed Core/Owner/fences")
+        self._contact_p2_service_v1 = service
+
+    def install_current_foreground_reply_scope_observer_v1(self, observer):
+        from .current_foreground_activity_v1 import InstalledCurrentForegroundActivityV1
+        if (type(observer) is not InstalledCurrentForegroundActivityV1
+                or observer.self_identity._core is not self.core
+                or observer.self_identity._fences.fences is not self.fences
+                or observer.self_identity._fences.deletion is not self.deletion
+                or observer.self_identity._fences.execution is not self.journal
+                or observer.self_identity._fences.namespace != self.namespace
+                or observer.self_identity._installation_id != self._owner_installation_id
+                or self._current_foreground_reply_scope_observer_v1 is not None):
+            raise AuthorityUnavailable("message reply observer crossed its actual installed Core/fences")
+        self._current_foreground_reply_scope_observer_v1 = observer
+
+    def _observe_message_prepare_reply_scope_v1(self, permit, footprint):
+        observer = self._current_foreground_reply_scope_observer_v1
+        if observer is None:
+            return None
+        return observer.observe_current_reply_scope_for_message_prepare_v1(
+            namespace=self.namespace, permit=permit, footprint=footprint)
+
+    def _observe_message_claim_reply_scope_v1(self, binding):
+        observer = self._current_foreground_reply_scope_observer_v1
+        if observer is None:
+            return None
+        if type(binding) is ExecutionBindingV1:
+            return None
+        if type(binding) is not ExecutionBindingV2:
+            raise AuthorityUnavailable("message reply observer requires its actual typed binding")
+        return observer.observe_current_reply_scope_for_message_claim_v1(binding)
+
+    def _require_message_reply_scope_in_tx_v1(self, db, scope, permit):
+        if scope is None:
+            return
+        from .owner_stop_reply_v1 import require_reply_scope_not_stopped_in_tx_v1
+        require_reply_scope_not_stopped_in_tx_v1(db,
+            authority_namespace=self.namespace, installation_id=self._owner_installation_id,
+            activation_generation=permit.generation, actual_cycle_identity=scope, action="message_claim")
 
     def install_internal_work_terminal_verifier(self, verifier) -> None:
         """Bind the installed C04 signer exactly once before serving work."""
@@ -520,64 +528,70 @@ class AuthorityV2ExecutionBridge:
                             "WHERE namespace=? AND state='pending' LIMIT 1",
                             (self.namespace,)).fetchone():
                         raise AuthorityUnavailable("pending execution mutation blocks effect read")
-                    matching = []
-                    for row in self._verified_dispatch_rows(rows, execution_head.journal_id):
-                        pending = decode_bytes(row[4])
-                        if pending.permit.effect_id == effect_id:
-                            matching.append((row, pending))
-                    effect = db.execute(
-                        "SELECT state,conflict_keys_json,execution_seq "
-                        "FROM authority_effects WHERE namespace=? AND effect_id=?",
-                        (self.namespace, effect_id)).fetchone()
-                    common = dict(authority_id=self.core._id(db),
-                                  namespace=self.namespace, effect_id=effect_id,
-                                  activation_generation=owner[1],
-                                  execution_head_seq=execution_head.seq,
-                                  execution_head_digest=execution_head.digest)
-                    if effect is None and not matching:
-                        return CurrentEffectReadV2(state="absent", **common)
-                    if effect is None or not matching:
-                        raise AuthorityUnavailable("effect index and append history differ")
-                    if (effect[0] != "unresolved" or type(effect[2]) is not int
-                            or effect[2] != matching[-1][0][0]
-                            or matching[0][1].phase != "prepared"):
-                        raise AuthorityUnavailable("effect index or phase history differs")
-                    operation_id = matching[0][1].permit.operation_id
-                    allowed_next = {"prepared": {"claimed"},
-                                    "claimed": {"observed"},
-                                    "observed": {"observed"}}
-                    previous_phase = None
-                    for entry, pending in matching:
-                        permit = pending.permit
-                        if (permit.authority_id != common["authority_id"]
-                                or permit.namespace != self.namespace
-                                or permit.generation != owner[1]
-                                or permit.operation_id != operation_id
-                                or (previous_phase is not None and pending.phase
-                                    not in allowed_next[previous_phase])):
-                            raise AuthorityUnavailable("effect activation or phase chain differs")
-                        mutation = self._load_mutation_locked(
-                            db, pending, permit.subject)
-                        completed = self._completed_result(mutation)
-                        if (completed is None or completed[0].durable_state != "committed"
-                                or completed[0].after_anchor.execution_seq != entry[0]
-                                or completed[0].after_anchor.execution_digest != entry[6]):
-                            raise AuthorityUnavailable("effect append lacks committed Authority evidence")
-                        previous_phase = pending.phase
-                    entry, pending = matching[-1]
-                    mutation = self._load_mutation_locked(
-                        db, pending, pending.permit.subject)
-                    if effect[1] != mutation[5]:
-                        raise AuthorityUnavailable("effect conflict evidence differs")
-                    return CurrentEffectReadV2(
-                        state="observed" if pending.phase == "observed" else "unresolved",
-                        effect_seq=entry[0], append_id=entry[3],
-                        append_digest=entry[6], mutation_id=entry[1],
-                        observation_id=(pending.platform_observation.observation_id
-                                        if pending.phase == "observed" else None),
-                        observation_outcome=(pending.platform_observation.outcome
-                                             if pending.phase == "observed" else None),
-                        **common)
+                    return self._read_current_effect_locked_v4(db,effect_id=effect_id,execution_head=execution_head,
+                        execution_rows=rows,owner=owner)
+
+    def _read_current_effect_locked_v4(self,db,*,effect_id,execution_head,execution_rows,owner):
+        """Actual target index plus full verified journal join in the caller's Core transaction."""
+        matching = []
+        for row in self._verified_dispatch_rows(execution_rows, execution_head.journal_id):
+            pending = decode_bytes(row[4])
+            if pending.permit.effect_id == effect_id:
+                matching.append((row, pending))
+        effect = db.execute(
+            "SELECT state,conflict_keys_json,execution_seq "
+            "FROM authority_effects WHERE namespace=? AND effect_id=?",
+            (self.namespace, effect_id)).fetchone()
+        common = dict(authority_id=self.core._id(db),
+                      namespace=self.namespace, effect_id=effect_id,
+                      activation_generation=owner[1],
+                      execution_head_seq=execution_head.seq,
+                      execution_head_digest=execution_head.digest)
+        if effect is None and not matching:
+            return CurrentEffectReadV2(state="absent", **common)
+        if effect is None or not matching:
+            raise AuthorityUnavailable("effect index and append history differ")
+        if (effect[0] != "unresolved" or type(effect[2]) is not int
+                or effect[2] != matching[-1][0][0]
+                or matching[0][1].phase != "prepared"):
+            raise AuthorityUnavailable("effect index or phase history differs")
+        operation_id = matching[0][1].permit.operation_id
+        allowed_next = {"prepared": {"claimed"},
+                        "claimed": {"observed"},
+                        "observed": {"observed"}}
+        previous_phase = None
+        for entry, pending in matching:
+            permit = pending.permit
+            if (permit.authority_id != common["authority_id"]
+                    or permit.namespace != self.namespace
+                    or permit.generation != owner[1]
+                    or permit.operation_id != operation_id
+                    or (previous_phase is not None and pending.phase
+                        not in allowed_next[previous_phase])):
+                raise AuthorityUnavailable("effect activation or phase chain differs")
+            mutation = self._load_mutation_locked(
+                db, pending, permit.subject)
+            completed = self._completed_result(mutation)
+            if (completed is None or completed[0].durable_state != "committed"
+                    or completed[0].after_anchor.execution_seq != entry[0]
+                    or completed[0].after_anchor.execution_digest != entry[6]):
+                raise AuthorityUnavailable("effect append lacks committed Authority evidence")
+            previous_phase = pending.phase
+        entry, pending = matching[-1]
+        mutation = self._load_mutation_locked(
+            db, pending, pending.permit.subject)
+        if effect[1] != mutation[5]:
+            raise AuthorityUnavailable("effect conflict evidence differs")
+        return CurrentEffectReadV2(
+            state="observed" if pending.phase == "observed" else "unresolved",
+            effect_seq=entry[0], append_id=entry[3],
+            append_digest=entry[6], mutation_id=entry[1],
+            observation_id=(pending.platform_observation.observation_id
+                            if pending.phase == "observed" else None),
+            observation_outcome=(pending.platform_observation.outcome
+                                 if pending.phase == "observed" else None),
+            **common)
+
 
     @staticmethod
     def _require_v2_mode_locked(db) -> None:
@@ -859,6 +873,7 @@ class AuthorityV2ExecutionBridge:
             raise AuthorityUnavailable("D08 dispatch verification failed") from exc
         if verified is not True:
             raise AuthorityUnavailable("D08 dispatch verification denied")
+        reply_scope = self._observe_message_prepare_reply_scope_v1(permit, footprint)
         pending = self._build_pending(permit, mutation_id, footprint)
         with self.deletion.freeze_writes():
             deletion_head = self.deletion.verified_head()
@@ -877,6 +892,7 @@ class AuthorityV2ExecutionBridge:
                     if mutation is not None:
                         self._load_mutation_locked(db, pending, subject)
                         return pending
+                    self._require_message_reply_scope_in_tx_v1(db, reply_scope, permit)
                     self._check_core_owner(db, permit)
                     self._check_fence_locked(db, permit, subject)
                     if db.execute("SELECT 1 FROM authority_permits WHERE namespace=? LIMIT 1",
@@ -899,6 +915,11 @@ class AuthorityV2ExecutionBridge:
         if permit.subject != subject or permit.namespace != self.namespace:
             raise AuthorityUnavailable("claim subject or namespace differs")
         self.core._require(credential, "execution", self.namespace, permit.holder)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                already_appended = self.journal.inspect_expected(pending).first_append is not None
+        reply_scope = (None if already_appended
+                       else self._observe_message_claim_reply_scope_v1(binding))
         with self.deletion.freeze_writes():
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
@@ -929,6 +950,7 @@ class AuthorityV2ExecutionBridge:
                         return pending
                     if inspection.following_count != 1:
                         raise AuthorityUnavailable("prepared append is no longer current")
+                    self._require_message_reply_scope_in_tx_v1(db, reply_scope, permit)
                     self._check_core_owner(db, permit)
                     self._check_fence_locked(db, permit, subject)
                     effect = db.execute(
@@ -1105,6 +1127,17 @@ class AuthorityV2ExecutionBridge:
                            pending.permit.holder)
         with self.deletion.freeze_writes():
             with self.journal.freeze_writes():
+                already_appended = self.journal.inspect_expected(pending).first_append is not None
+        reply_scope = None
+        if not already_appended and pending.phase == "prepared":
+            with self.core._tx() as db:
+                mutation = self._load_mutation_locked(db, pending, subject)
+                footprint = self.fences._decode_footprint(pending, mutation[11])
+            reply_scope = self._observe_message_prepare_reply_scope_v1(pending.permit, footprint)
+        elif not already_appended and pending.phase == "claimed":
+            reply_scope = self._observe_message_claim_reply_scope_v1(pending.binding)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
                     with self.core._tx() as current_db:
@@ -1119,6 +1152,9 @@ class AuthorityV2ExecutionBridge:
                     mutation = self._load_mutation_locked(db, pending, subject)
                     if mutation[4] != "pending" or mutation[5] == "null":
                         raise AuthorityUnavailable("verified pending mutation is absent")
+                    self._require_message_reply_scope_in_tx_v1(db, reply_scope, pending.permit)
+                # Stop acceptance shares this deletion/journal writer guard;
+                # keep it through the independent journal transaction COMMIT.
                 return self.journal.append_once_guarded(pending)
 
     def reconcile_mutation(self, *, credential, subject: str,
@@ -1540,30 +1576,75 @@ class AuthorityV2ExecutionBridge:
                         self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 execution_head, execution_rows = self.journal._scan_locked()
                 with self.core._tx() as db:
-                    self._require_v2_mode_locked(db)
-                    self.fences._check_schema(db)
-                    self._check_deletion_locked(db, deletion_head)
-                    self._check_execution_head_locked(db, execution_head)
-                    owner = self.core._row(db, self.namespace)
-                    if (owner[2] != "active" or owner[0] != permit.holder
-                            or owner[1] != permit.generation
-                            or owner[3] is not None or owner[4] is not None):
-                        raise AuthorityUnavailable("write fence owner is not current")
-                    anchor = self.core._anchor(db, self.namespace, owner)
-                    if (anchor != permit.pinned_anchor
-                            or anchor.authority_id != permit.authority_id):
-                        raise AuthorityUnavailable("write fence pinned anchor is stale")
-                    self._check_fence_locked(db, permit, subject)
-                    effects = self._unresolved_effects_locked(
-                        db, permit=permit, execution_rows=execution_rows)
-                    return AuthorityCurrentEffectSnapshotV2(
-                        authority_id=permit.authority_id,
-                        namespace=self.namespace,
-                        anchor=anchor,
-                        permit_digest=canonical_digest(permit),
-                        execution_head_seq=execution_head.seq,
-                        execution_head_digest=execution_head.digest,
-                        coverage="complete", unresolved_effects=effects)
+                    return self._current_write_fence_effect_snapshot_locked_v4(db,permit=permit,subject=subject,
+                        deletion_head=deletion_head,execution_head=execution_head,execution_rows=execution_rows)
+
+    def _current_write_fence_effect_snapshot_locked_v4(self,db,*,permit,subject,deletion_head,execution_head,execution_rows):
+        self._require_v2_mode_locked(db)
+        self.fences._check_schema(db)
+        self._check_deletion_locked(db, deletion_head)
+        self._check_execution_head_locked(db, execution_head)
+        owner = self.core._row(db, self.namespace)
+        if (owner[2] != "active" or owner[0] != permit.holder
+                or owner[1] != permit.generation
+                or owner[3] is not None or owner[4] is not None):
+            raise AuthorityUnavailable("write fence owner is not current")
+        anchor = self.core._anchor(db, self.namespace, owner)
+        if (anchor != permit.pinned_anchor
+                or anchor.authority_id != permit.authority_id):
+            raise AuthorityUnavailable("write fence pinned anchor is stale")
+        self._check_fence_locked(db, permit, subject)
+        effects = self._unresolved_effects_locked(
+            db, permit=permit, execution_rows=execution_rows)
+        return AuthorityCurrentEffectSnapshotV2(
+            authority_id=permit.authority_id,
+            namespace=self.namespace,
+            anchor=anchor,
+            permit_digest=canonical_digest(permit),
+            execution_head_seq=execution_head.seq,
+            execution_head_digest=execution_head.digest,
+            coverage="complete", unresolved_effects=effects)
+
+
+    def read_natural_final_effect_observation_v4(self,*,credential,subject,installation_id,permit,effect_id):
+        """Capture natural-final target and negative inventory in one actual Core transaction."""
+        identifier(subject,"subject");identifier(installation_id,"installation_id");identifier(effect_id,"effect_id")
+        if (type(permit) is not FencePermitV2 or permit.operation!="write" or permit.namespace!=self.namespace
+                or permit.subject!=subject or self._owner_installation_id is not None and self._owner_installation_id!=installation_id):
+            raise AuthorityUnavailable("natural final observation requires actual installed ordinary write fence")
+        self.core._require(credential,"write",self.namespace,permit.holder)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head=self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db,namespace=self.namespace)
+                execution_head,execution_rows=self.journal._scan_locked()
+                with self.core._tx() as db:
+                    require_natural_final_observation_schema_v4(db)
+                    snapshot=self._current_write_fence_effect_snapshot_locked_v4(db,permit=permit,subject=subject,
+                        deletion_head=deletion_head,execution_head=execution_head,execution_rows=execution_rows)
+                    owner=self.core._row(db,self.namespace)
+                    current=self._read_current_effect_locked_v4(db,effect_id=effect_id,execution_head=execution_head,
+                        execution_rows=execution_rows,owner=owner)
+                    if current.state!="absent":
+                        raise AuthorityUnavailable("natural final original requires actual absent target")
+                    active=tuple(row[0] for row in db.execute("SELECT operation_id FROM authority_v2_fences WHERE namespace=? AND state='active' ORDER BY operation_id",(self.namespace,)))
+                    pending=tuple(row[0] for row in db.execute("SELECT mutation_id FROM authority_v2_mutations WHERE namespace=? AND state='pending' ORDER BY mutation_id",(self.namespace,)))
+                    value=AuthorityNaturalFinalEffectObservationV4(permit.authority_id,installation_id,self.namespace,
+                        permit.operation_id,effect_id,permit,snapshot.anchor,execution_head.journal_id,
+                        execution_head.seq,execution_head.digest,deletion_head,
+                        NaturalFinalAuthorityOwnerStateV4(owner[0],owner[1],owner[2],owner[3],owner[4],owner[5],owner[9],owner[13]),
+                        active,pending,current,snapshot)
+                    encoded=canonical_bytes(value);digest=canonical_digest(value);permit_digest=canonical_digest(permit)
+                    key=(self.namespace,permit.operation_id,value.observation_kind)
+                    old=db.execute("SELECT permit_digest,original_bytes,original_digest FROM authority_natural_final_observations_v4 WHERE authority_namespace=? AND operation_id=? AND observation_kind=?",key).fetchone()
+                    expected=(permit_digest,encoded,digest)
+                    if old is None:
+                        db.execute("INSERT INTO authority_natural_final_observations_v4 VALUES(?,?,?,?,?,?)",(*key,*expected))
+                    elif old!=expected:
+                        raise AuthorityUnavailable("same-fence natural final observation original changed")
+                    return NaturalFinalEffectObservationReadV4(value,value.original_ref,digest)
 
     def begin_handoff(self, *, credential, subject: str,
                       claimed_receipt: MutationReceiptV2,
@@ -1717,6 +1798,12 @@ class AuthorityV2ExecutionBridge:
             raise AuthorityUnavailable("trusted final handoff authorizer is unavailable")
         if self._owner_tickets is None or self._owner_installation_id is None:
             raise AuthorityUnavailable("current Owner dispatch authorization is unavailable")
+        contact_selector = None
+        contact_capsule = None
+        if binding.origin.proactive_contact is True:
+            if self._contact_p2_service_v1 is None:
+                raise AuthorityUnavailable("installed Contact P2 current policy service is absent")
+            contact_selector = self._contact_p2_service_v1.read_graph_selector_v1(binding)
         # Check the P2 head, live fence, unresolved effect and exact claim
         # before leaving any durable graph reservation. Release all freezes
         # before the graph callback to avoid GraphWorker/Authority deadlock.
@@ -1741,12 +1828,23 @@ class AuthorityV2ExecutionBridge:
                     admission_snapshot = self._dispatch_snapshot_locked(
                         db, context=context, owner_witness=owner_witness,
                         execution_rows=execution_rows)
+                    if contact_selector is not None:
+                        contact_capsule = self._contact_p2_service_v1.read_current_contact_policy_for_dispatch_in_tx_v1(
+                            db,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                            owner_witness=owner_witness,authority_snapshot=admission_snapshot,selector=contact_selector)
         # External business graph transaction MUST be atomic and idempotent by
         # handoff_id. No Core, deletion, or execution journal lock is held here.
         try:
-            graph_receipt = self._final_handoff_authorizer(
-                context, binding, claimed_receipt, owner_witness,
-                admission_snapshot)
+            if contact_capsule is None:
+                graph_receipt = self._final_handoff_authorizer(
+                    context, binding, claimed_receipt, owner_witness, admission_snapshot)
+            else:
+                from .reverse_handoff import ReverseGraphClaimClient
+                client = getattr(self._final_handoff_authorizer,"__self__",None)
+                if type(client) is not ReverseGraphClaimClient:
+                    raise AuthorityUnavailable("Contact P2 needs the actual installed reverse channel")
+                graph_receipt = client.claim_contact_v1(context,binding,claimed_receipt,
+                    owner_witness,admission_snapshot,contact_capsule)
         except Exception as exc:
             raise AuthorityUnavailable("final business graph handoff denied") from exc
         # graph_version names an atom revision; graph_epoch is the namespace
@@ -1760,6 +1858,9 @@ class AuthorityV2ExecutionBridge:
                 or graph_receipt.graph_access_epoch < binding.admission_access_epoch
                 or graph_receipt.graph_deletion_epoch < binding.admission_deletion_epoch):
             raise AuthorityUnavailable("final graph claim receipt identity differs")
+        if contact_capsule is not None:
+            contact_selector = self._contact_p2_service_v1.read_graph_selector_v1(binding,
+                claim_receipt=graph_receipt,expected_capsule=contact_capsule)
         with self.deletion.freeze_writes():
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
@@ -1785,6 +1886,10 @@ class AuthorityV2ExecutionBridge:
                         execution_rows=execution_rows)
                     if current_snapshot != admission_snapshot:
                         raise AuthorityUnavailable("Authority admission changed during graph claim")
+                    if contact_capsule is not None:
+                        self._contact_p2_service_v1.require_same_contact_policy_after_claim_in_tx_v1(
+                            db,capsule=contact_capsule,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                            owner_witness=current_owner,authority_snapshot=current_snapshot,selector=contact_selector)
                     if db.execute(
                         "SELECT 1 FROM authority_execution_handoff_starts_v1 "
                         "WHERE operation_id=? OR handoff_id=?",

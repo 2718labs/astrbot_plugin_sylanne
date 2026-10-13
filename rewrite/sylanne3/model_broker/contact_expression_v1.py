@@ -10,8 +10,8 @@ from .natural_reply import (NaturalReplyInstallationV2, NaturalReplyMessageV2,
     _unique_fields, validate_expression_output_units_v2)
 from .natural_review import _ISSUE_CODES
 
-GENERATION_TEMPLATE_VERSION = "sylanne.d09.contact_generation.v1"
-REVIEW_TEMPLATE_VERSION = "sylanne.d09.contact_review.v1"
+from ..runtime_contracts import CONTACT_GENERATION_WORKFLOW_V1 as GENERATION_TEMPLATE_VERSION
+from ..runtime_contracts import CONTACT_REVIEW_WORKFLOW_V1 as REVIEW_TEMPLATE_VERSION
 INPUT_SCHEMA = "sylanne.d09.contact_generation_input.v1"
 OUTPUT_SCHEMA = "sylanne.d09.contact_generation_output.v1"
 REVIEW_INPUT_SCHEMA = "sylanne.d09.contact_review_input.v1"

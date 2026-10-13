@@ -148,6 +148,10 @@ def issue_installed_life_worker_v2(runtime,scope,guard,owner):
     from ..graph_coordinator import OwnerLeaseBindingV1
     from ..host.v2_fence_port import V2FencePort
     from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+    from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+    from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+    from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+    from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
     from ..runtime_contracts import FenceScope
     from ..model_broker.internal_life_content_v1 import WORK_KIND
@@ -160,7 +164,7 @@ def issue_installed_life_worker_v2(runtime,scope,guard,owner):
         raise ValueError('Life worker has no authenticated installation port')
     bundle=assembly.admin_bundle;grant=port.installation_grant
     policy=bundle.installation_policy
-    if (type(bundle.model_workflows) is not AdminModelWorkflowsV3 or bundle.model_workflows.life_content is None
+    if (type(bundle.model_workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7) or bundle.model_workflows.life_content is None
             or bundle.model_workflows.life_content.work_kind!=WORK_KIND
             or WORK_KIND not in policy.root_grant.allowed_work_kinds
             or (grant.authority_id,grant.installation_id,grant.manifest_digest,grant.administrator_holder)!=

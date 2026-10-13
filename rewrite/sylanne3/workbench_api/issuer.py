@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from ..runtime.lifecycle_operations_v1 import D12PrerequisiteUnavailable, D12OperationPending
+from ..runtime.local_module_admission_v1 import LocalModuleAdmissionDeniedV1
 from ..contracts import StaleRead
 from ..authority_service.v2_contract import (
     DeletionMutationReceiptV1, FencePermitV2, deletion_scope_digest,
@@ -147,6 +148,251 @@ class GraphWorkbenchIssuer:
         if package_maintenance_port is not None and type(package_maintenance_port) is not InstalledD12PackageWorkbenchPortV2:
             raise TypeError("actual paired package maintenance port required")
         self._package_maintenance_port = package_maintenance_port
+
+    def read_owner_artifact_project_context_options(self, *, session: AuthenticatedSession,
+            scope: str, purpose: str, audience: str) -> Mapping[str, Any]:
+        if (not session.allows(scope, "workbench.read", purpose, audience)
+                or not session.allows(scope, "workbench.create", purpose, audience)):
+            return _unavailable("authority_unavailable")
+        grant = self._resolve(session, scope, purpose, audience, domains=("d03", "d08", "d10", "d11", "d12"))
+        if grant is None or "workbench.create" not in grant.capabilities:
+            return _unavailable("authority_unavailable")
+        try:
+            projection = self._coordinator.read_current_owner_artifact_project_context_choices_v1(
+                grant.authority, grant.lease)
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "project_context_basis_changed", "retryable": True}}
+        except PermissionError:
+            raise
+        except (ValueError, RuntimeError, LookupError):
+            return _unavailable("project_context_unavailable")
+        if (type(projection) is not dict
+                or projection.get("schema") != "d03.owner-artifact-project-context-options.v1"
+                or projection.get("namespace") != asdict(grant.authority.namespace)):
+            return _unavailable("project_context_unavailable")
+        return {"status": "ready", "projection": projection}
+
+    def read_owner_material_source_status_v1(self, *, session, scope, purpose, audience, input_data):
+        if (audience!='owner' or purpose!='workbench_view'
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or not session.owner_session_token or not session.allows(scope,'workbench.read',purpose,audience)):
+            return _unavailable('owner_material_read_authority_unavailable')
+        grant=self._resolve(session,scope,purpose,audience,domains=('d06','d11'))
+        if grant is None or 'workbench.read' not in grant.capabilities:
+            return _unavailable('owner_material_read_authority_unavailable')
+        return {'status':'ready','projection':self._coordinator.read_owner_material_source_status_v1(
+            grant.authority,grant.lease,**input_data)}
+
+    def read_owner_source_note_task_v1(self, *, session, scope, purpose, audience, input_data, options):
+        if (audience != 'owner' or purpose != 'workbench_view'
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or not session.owner_session_token or not session.allows(scope,'workbench.read',purpose,audience)):
+            return _unavailable('owner_source_note_task_read_authority_unavailable')
+        grant=self._resolve(session,scope,purpose,audience,
+            domains=('d02','d03','d06','d08','d10','d11') if options else ('d08','d11'))
+        if grant is None or 'workbench.read' not in grant.capabilities:
+            return _unavailable('owner_source_note_task_read_authority_unavailable')
+        if options:
+            projection=self._coordinator.read_owner_source_note_task_options_v1(grant.authority,grant.lease,**input_data)
+        else:
+            projection=self._coordinator.read_owner_source_note_task_status_v1(grant.authority,grant.lease,**input_data)
+        return {'status':'ready','projection':projection}
+
+    def read_owner_project_artifact_v1(self, *, session, scope, purpose, audience, input_data, options=False):
+        if (audience != "owner" or purpose != "workbench_view"
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or not session.owner_session_token
+                or not session.allows(scope, "workbench.read", purpose, audience)):
+            return _unavailable("artifact_read_authority_unavailable")
+        grant = self._resolve(session, scope, purpose, audience, domains=("d08", "d10", "d11", "d12"))
+        if grant is None or "workbench.read" not in grant.capabilities:
+            return _unavailable("artifact_read_authority_unavailable")
+        try:
+            if options:
+                projection = self._coordinator.read_owner_project_artifact_options_v1(
+                    grant.authority, grant.lease, project_ref=input_data['project_ref'])
+            else:
+                from ..runtime.d12_owner_artifact_read_v1 import OwnerArtifactReadRequestV1
+                port = self._coordinator._GraphCoordinator__content_fence_v2
+                request = OwnerArtifactReadRequestV1(namespace=grant.authority.namespace,
+                    installation_id=port.installation_grant.installation_id, **input_data)
+                projection = self._coordinator.read_owner_project_artifact_v1(grant.authority, grant.lease, request=request)
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "artifact_version_changed", "retryable": False}}
+        except PermissionError:
+            raise
+        except (ValueError, RuntimeError, LookupError):
+            return _unavailable("artifact_current_read_unavailable")
+        return {"status": "ready", "projection": projection}
+
+    def read_project_control_context_v1(self, *, session, scope, purpose, audience, project_ref):
+        return self._read_project_control_context_v1(version=1, session=session,
+            scope=scope, purpose=purpose, audience=audience, project_ref=project_ref)
+
+    def read_project_control_context_v2(self, *, session, scope, purpose, audience, project_ref):
+        return self._read_project_control_context_v1(version=2, session=session,
+            scope=scope, purpose=purpose, audience=audience, project_ref=project_ref)
+
+    def _read_project_control_context_v1(self, *, session, scope, purpose, audience, project_ref, version):
+        if (audience != "owner" or purpose != "workbench_user_action"
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or not session.owner_session_token
+                or not session.allows(scope, "workbench.read", purpose, audience)
+                or not session.allows(scope, "workbench.control", purpose, audience)):
+            return _unavailable("project_control_authority_unavailable")
+        grant = self._resolve(session, scope, purpose, audience, domains=("d08", "d10", "d11", "d12"))
+        if grant is None or "workbench.control" not in grant.capabilities:
+            return _unavailable("project_control_authority_unavailable")
+        try:
+            reader = (self._coordinator.read_project_control_context_v1 if version == 1
+                else self._coordinator.read_project_control_context_v2)
+            projection = reader(grant.authority, grant.lease, project_ref=project_ref)
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "project_control_basis_changed", "retryable": True}}
+        except PermissionError:
+            raise
+        except (ValueError, RuntimeError, LookupError):
+            return _unavailable("project_control_context_unavailable")
+        return {"status": "ready", "projection": projection}
+
+    def execute_project_control_v1(self, *, session, action, scope, purpose, audience, operation_id, input_data):
+        from ..runtime.d08_project_control_v1 import PauseProjectRequestV1, ResumeProjectRequestV1
+        if (audience != "owner" or purpose != "workbench_user_action"
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or not session.owner_session_token
+                or not session.allows(scope, "workbench.control", purpose, audience)):
+            return _unavailable("project_control_authority_unavailable")
+        grant = self._resolve(session, scope, purpose, audience, domains=("d08", "d10", "d11", "d12"))
+        if grant is None or "workbench.control" not in grant.capabilities:
+            return _unavailable("project_control_authority_unavailable")
+        request_type = PauseProjectRequestV1 if action == "pause_project_v1" else ResumeProjectRequestV1
+        request = request_type(**input_data)
+        try:
+            commit = self._coordinator.pause_project_v1 if action == "pause_project_v1" else self._coordinator.resume_project_v1
+            original = commit(grant.authority, grant.lease, request=request, operation_id=operation_id)
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "project_control_basis_changed", "retryable": False}}
+        except PermissionError:
+            raise
+        except Exception:
+            return {"status": "unavailable", "problem": {"code": "project_control_outcome_unknown", "retryable": False}}
+        if type(original) is not dict or original.get("operation_id") != operation_id:
+            return _unavailable("project_control_original_unavailable")
+        return {"status": "ready", "receipt": {"schema": "d12.project-control-receipt.v1",
+            "operation_id": operation_id, "action": action, "input_digest": canonical_digest(dict(input_data)),
+            "original_digest": canonical_digest(original), "original": original}}
+
+    def read_source_correction_context_v1(self, *, session, scope, purpose, audience, source_id):
+        if (audience != "owner" or purpose != "workbench_user_action"
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or not session.owner_session_token
+                or not session.allows(scope, "workbench.read", purpose, audience)
+                or not session.allows(scope, "workbench.correct", purpose, audience)):
+            return _unavailable("source_correction_policy_unavailable")
+        grant = self._resolve(session, scope, purpose, audience, domains=("d06", "d07", "d12"))
+        if grant is None or "workbench.correct" not in grant.capabilities:
+            return _unavailable("source_correction_policy_unavailable")
+        from ..graph_worker import GraphStorageWorkV3
+        try:
+            projection = self._coordinator.read_source_correction_context_v1(
+                grant.authority, grant.lease, source_id=source_id)
+        except (StaleRead, PermissionError, ValueError, RuntimeError, LookupError) as error:
+            return self._source_correction_error_v3(error)
+        if type(projection) is GraphStorageWorkV3:
+            return projection.map_terminal_v3("issuer", self._source_correction_result_v3,
+                                              self._source_correction_error_v3)
+        return self._source_correction_result_v3(projection)
+
+    @staticmethod
+    def _source_correction_result_v3(projection):
+        return {"status": "ready", "projection": projection}
+
+    @staticmethod
+    def _source_correction_error_v3(error):
+        from ..graph_worker import GraphStorageContinuationRequiredV3
+        if isinstance(error, GraphStorageContinuationRequiredV3):
+            return {"status": "unavailable", "problem": {
+                "code": "async_graph_worker_required", "retryable": False}}
+        if isinstance(error, StaleRead):
+            return {"status": "stale", "problem": {
+                "code": "source_correction_basis_changed", "retryable": True}}
+        if isinstance(error, PermissionError):
+            raise error
+        if isinstance(error, (ValueError, RuntimeError, LookupError)):
+            return _unavailable("source_correction_context_unavailable")
+        raise error
+
+    def read_configuration_draft(self, *, session: AuthenticatedSession, scope: str,
+                                 purpose: str, audience: str) -> Mapping[str, Any]:
+        if (not session.allows(scope, "workbench.read", purpose, audience)
+                or not session.allows(scope, "workbench.create", purpose, audience)):
+            return _unavailable("authority_unavailable")
+        grant = self._resolve(session, scope, purpose, audience)
+        if grant is None or "workbench.create" not in grant.capabilities:
+            return _unavailable("authority_unavailable")
+        read = getattr(self._scheme_port, "read_current_configuration_draft_v1", None)
+        if not callable(read):
+            return _unavailable("creator_configuration_unavailable")
+        try:
+            projection = read(grant.authority, grant.lease)
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "draft_current_basis_changed"}}
+        except PermissionError:
+            raise
+        except (D12SchemeHold, ValueError, RuntimeError, LookupError):
+            return _unavailable("creator_configuration_unavailable")
+        if type(projection) is not dict or projection.get("schema") != "d12.creator-configuration.v1":
+            return _unavailable("creator_configuration_unavailable")
+        from ..installation_policy import AdminInstallationPolicy
+        policy = self._correction_installation_policy
+        projection = {**projection, "budget_ref": (
+            policy.root_lease.lease_id if type(policy) is AdminInstallationPolicy
+            and policy.namespace == grant.authority.namespace else None)}
+        fields = set(projection["fields"])
+        head_available = projection["active_head_revision"] > 0
+        def allowed(capability, method):
+            return (capability in grant.capabilities
+                    and session.allows(scope, capability, purpose, audience)
+                    and callable(getattr(self._scheme_port, method, None)))
+        projection["action_permissions"] = {
+            "save": allowed("workbench.create", "save_current_creator_draft_for_operation_v1"),
+            "compile": allowed("workbench.compile", "compile_current_scheme_for_operation_v1"),
+            "preview": head_available and fields <= {"d07.attention_policy", "d09.expression_policy"}
+                and allowed("workbench.experiment", "preview_current_scheme_for_operation_v1"),
+            "activate": head_available and fields == {"d09.expression_policy"}
+                and allowed("workbench.activate", "adopt_current_scheme_for_operation_v1"),
+        }
+        from .creator_configuration_v1 import creator_field_templates_v1
+        projection["field_templates"] = creator_field_templates_v1(grant.authority.namespace)
+        return {"status": "ready", "projection": projection}
+
+    def save_creator_draft(self, *, session: AuthenticatedSession, scope: str,
+                          purpose: str, audience: str, operation_id: str,
+                          input_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not session.allows(scope, "workbench.create", purpose, audience):
+            return _unavailable("authority_unavailable")
+        grant = self._resolve(session, scope, purpose, audience)
+        if grant is None or "workbench.create" not in grant.capabilities:
+            return _unavailable("authority_unavailable")
+        save = getattr(self._scheme_port, "save_current_creator_draft_for_operation_v1", None)
+        if not callable(save):
+            return _unavailable("creator_configuration_unavailable")
+        try:
+            receipt = save(grant.authority, grant.lease, operation_id=operation_id, **dict(input_data))
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "draft_current_basis_changed"}}
+        except D12SchemeHold as exc:
+            return _unavailable(exc.code)
+        except PermissionError:
+            raise
+        except LocalModuleAdmissionDeniedV1 as exc:
+            return _module_disabled(exc)
+        except (ValueError, RuntimeError, LookupError):
+            return _unavailable("creator_draft_save_unconfirmed")
+        from .creator_configuration_v1 import valid_creator_save_receipt_v1
+        if not valid_creator_save_receipt_v1(receipt, operation_id, input_data):
+            return _unavailable("creator_draft_save_unconfirmed")
+        return {"status": "ready", "receipt": receipt}
 
     def read_creator_draft(self, *, session: AuthenticatedSession, scope: str,
                            draft_ref: str, purpose: str, audience: str,
@@ -421,6 +667,7 @@ class GraphWorkbenchIssuer:
             "correct_source_claim": callable(getattr(self._coordinator, "commit_source_correction_v1", None))
                                     and self._correction_installation_policy is not None
                                     and self._correction_admin_policy is not None,
+            "read_source_correction_context_v1": callable(getattr(self._coordinator, "read_source_correction_context_v1", None)),
             "revoke_source_access": callable(getattr(self._coordinator, "revoke_source_access_v1", None)),
             "run_experiment": self._backend_route_installed("run_experiment")
                               or (callable(getattr(scheme, "preview_current_scheme_for_operation_v1", None))
@@ -441,6 +688,9 @@ class GraphWorkbenchIssuer:
         from .domain_operations_v1 import ACTIONS as DOMAIN_ACTIONS
         routes.update({action: callable(getattr(self._coordinator, "run_current_domain_operation_v1", None))
             for action in DOMAIN_ACTIONS})
+        routes.update({action: callable(getattr(self._coordinator, action, None))
+            for action in ("pause_project_v1", "resume_project_v1", "read_project_control_context_v1", "read_project_control_context_v2",
+                "read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1")})
         routes["d02_fixed_work_policy"] = callable(getattr(self._coordinator, "adopt_current_fixed_body_work_policy_v1", None))
         routes["d07_cognition_budget"] = callable(getattr(self._coordinator, "allocate_current_d07_cognition_budget_v1", None))
         routes["d03_context_catalogue"] = callable(getattr(self._coordinator, "adopt_current_context_catalogue_v1", None))
@@ -459,6 +709,9 @@ class GraphWorkbenchIssuer:
     def execute(self, *, session: AuthenticatedSession, action: str, scope: str,
                 purpose: str, audience: str, operation_id: str,
                 input_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        if action in {"pause_project_v1", "resume_project_v1"}:
+            return self.execute_project_control_v1(session=session, action=action, scope=scope,
+                purpose=purpose, audience=audience, operation_id=operation_id, input_data=input_data)
         if action == "d03_context_catalogue":
             from .context_catalogue_v1 import execute_context_catalogue_v1
             return execute_context_catalogue_v1(self, session=session, scope=scope, purpose=purpose,
@@ -661,6 +914,8 @@ class GraphWorkbenchIssuer:
             raise
         except StaleRead:
             return {"status": "stale", "problem": {"code": "backend_operation_basis_changed"}}
+        except LocalModuleAdmissionDeniedV1 as exc:
+            return _module_disabled(exc)
         except Exception:
             # An interrupted command may already have committed. The producer
             # must resume/read by the same operation identity on the next call.
@@ -857,6 +1112,8 @@ class GraphWorkbenchIssuer:
             return {"status": "stale", "problem": {"code": "experiment_current_basis_changed"}}
         except PermissionError:
             raise
+        except LocalModuleAdmissionDeniedV1 as exc:
+            return _module_disabled(exc)
         except (ValueError, RuntimeError, LookupError):
             return _unavailable("experiment_current_transaction_unavailable")
         return {"status": "ready", "receipt": {
@@ -1032,6 +1289,8 @@ class GraphWorkbenchIssuer:
             return {"status": "stale", "problem": {"code": "scheme_current_basis_changed"}}
         except PermissionError:
             raise
+        except LocalModuleAdmissionDeniedV1 as exc:
+            return _module_disabled(exc)
         except (ValueError, RuntimeError, LookupError):
             return _unavailable("scheme_current_transaction_unavailable")
 
@@ -1416,6 +1675,12 @@ class GraphWorkbenchIssuer:
                              f"{grant.authority.namespace.persona_id}")):
             return None
         return grant
+
+
+def _module_disabled(exc):
+    modules = ", ".join(value.upper() for value in exc.disabled_modules)
+    return {"status": "unavailable", "problem": {"code": "local_module_disabled", "retryable": False,
+        "message": f"本机模块 {modules} 已关闭新工作。请在插件配置页开启并重载后再创建新操作。"}}
 
 
 def _unavailable(code: str) -> Mapping[str, Any]:

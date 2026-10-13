@@ -32,6 +32,37 @@ from ..d04 import AffectProvider, AffectScheme, FeelingState, MoodField
 from ..d06 import CandidateSet, SelectionTicket
 
 
+METHOD_CONDITION_SCHEMA_V1 = "d07.method-condition.v1"
+METHOD_CONDITION_IDS_V1 = (
+    "structure_explicit", "materials_complete", "tone_multiple_legal_readings",
+    "long_draft", "local_sample_permitted", "budget_deadline_feasible",
+    "short_draft", "immediate_full_draft", "fact_permission_gap",
+)
+
+
+def method_condition_question_v1(goal_ref, goal_revision, condition_id):
+    """The goal revision is semantic scope, never a prose or numeric heuristic."""
+    if (AtomKey.from_token(goal_ref).type_name != "d08.goal.v1"
+            or type(goal_revision) is not int or goal_revision < 1
+            or condition_id not in METHOD_CONDITION_IDS_V1):
+        raise ValueError("method condition requires an exact registered goal scope")
+    from ...runtime_contracts import canonical_serialize
+    return canonical_serialize({"schema": METHOD_CONDITION_SCHEMA_V1,
+        "goal_ref": goal_ref, "goal_revision": goal_revision, "condition_id": condition_id})
+
+
+def decode_method_condition_question_v1(question):
+    try:
+        value = json.loads(question)
+        if (type(value) is not dict or set(value) != {"schema", "goal_ref", "goal_revision", "condition_id"}
+                or value["schema"] != METHOD_CONDITION_SCHEMA_V1
+                or method_condition_question_v1(value["goal_ref"], value["goal_revision"], value["condition_id"]) != question):
+            return None
+        return value
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 _CATEGORIES = ("required", "interaction", "background")
 _CONCERN_STATES = frozenset({"open", "waiting", "parked", "resolved", "relinquished"})
 _WORKING_KINDS = frozenset({
@@ -133,6 +164,60 @@ class EvidenceStatus(Enum):
     REFUTED = "refuted"
     CONFLICTED = "conflicted"
     INSUFFICIENT = "insufficient"
+
+
+@dataclass(frozen=True)
+class IngressRecallNeedV1:
+    """Persisted routing facts; none of these fields authorizes an action or recall."""
+
+    c02_operation_id: str
+    source_ref: str
+    source_revision: int
+    source_digest: str
+    focus_ref: str
+    focus_revision: int
+    attention_ticket_ref: str
+    attention_ticket_revision: int
+    cycle_job_ref: str
+    cancel_generation: int
+    responsibility_ref: str
+    responsibility_digest: str
+    policy_ref: str
+    policy_version: int
+    policy_digest: str
+    deadline_utc: float
+    triggers: tuple[str, ...]
+    required_checks: tuple[str, ...]
+    missing_items: tuple[str, ...]
+    known_entity_ref: str | None
+    routing: str
+
+    def __post_init__(self):
+        from ..d06 import TriggerKind
+        for name in ("c02_operation_id", "source_ref", "focus_ref", "attention_ticket_ref", "cycle_job_ref", "responsibility_ref", "policy_ref"):
+            _nonempty(getattr(self, name), name)
+        for name in ("source_revision", "focus_revision", "attention_ticket_revision", "policy_version"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError("recall need lost its exact positive predecessor")
+        _nonnegative_int(self.cancel_generation, "cancel_generation")
+        for name in ("source_digest", "responsibility_digest", "policy_digest"):
+            value = getattr(self, name)
+            if type(value) is not str or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError("recall need digest must be lowercase SHA-256")
+        if type(self.deadline_utc) not in (int, float) or not math.isfinite(self.deadline_utc):
+            raise ValueError("recall need requires its original absolute deadline")
+        for name in ("triggers", "required_checks", "missing_items"):
+            values = getattr(self, name)
+            _names(values, name)
+            if len(values) > 64 or len(set(values)) != len(values):
+                raise ValueError("recall need facts must be unique and bounded")
+        mandatory = {item.value for item in TriggerKind if item is not TriggerKind.OPTIONAL_ASSOCIATION}
+        if not set(self.triggers) <= mandatory or self.routing not in {"no_search", "semantic_route_required", "required_checks", "partial"}:
+            raise ValueError("unknown finite recall routing fact")
+        if self.known_entity_ref is not None:
+            _nonempty(self.known_entity_ref, "known_entity_ref")
+        if self.routing == "no_search" and (self.triggers or self.required_checks or self.missing_items):
+            raise ValueError("greeting routing cannot override mandatory or unknown facts")
 
 
 @dataclass(frozen=True)
@@ -289,7 +374,7 @@ def attention_ticket_key(namespace, ticket_id: str) -> AtomKey:
 
 
 def _read_focus_attention_ticket(
-    snapshot: GraphSnapshot, namespace, *, now: float | None,
+    snapshot: GraphSnapshot, namespace, *, now: float | None, prepared_inventory=None, prepared_full_read=None, db=None,
 ) -> CurrentAttentionTicketReadV1 | None:
     """Resolve the focus's exact ticket and source atoms.
 
@@ -299,10 +384,37 @@ def _read_focus_attention_ticket(
     """
     from ...runtime_contracts import NamespaceId
 
-    if (type(snapshot) is not GraphSnapshot or type(namespace) is not NamespaceId
+    if prepared_inventory is not None and prepared_full_read is not None:
+        return None
+    if prepared_full_read is not None:
+        from ...runtime.current_graph_full_read_v3 import (PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3,
+            require_bound_graph_full_read_proof_for_db_v3,CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3)
+        if type(prepared_full_read) not in(PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3):
+            return None
+        actual=require_bound_graph_full_read_proof_for_db_v3(db,namespace,
+            required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3}))
+        if actual is not prepared_full_read or snapshot is not actual.projection:
+            return None
+    if prepared_inventory is not None:
+        from ...runtime.dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3, PreparedCurrentDispatchSuccessorInventoryV3
+        if type(prepared_inventory) not in (PreparedCurrentDispatchInventoryV3,PreparedCurrentDispatchSuccessorInventoryV3):
+            return None
+        prepared_inventory.require_current(db,namespace,prepared_inventory.query,snapshot)
+    if (prepared_inventory is None and prepared_full_read is None and type(snapshot) is not GraphSnapshot or type(namespace) is not NamespaceId
             or (now is not None and
                 (type(now) not in (int, float) or not math.isfinite(now)))):
         return None
+    if prepared_full_read is not None:
+        from ...runtime.current_graph_full_read_v3 import require_bound_graph_full_source_metadata_v3
+        source_reader=lambda key:require_bound_graph_full_source_metadata_v3(db,namespace,key)
+    elif prepared_inventory is not None:
+        source_reader=lambda key:prepared_inventory.source_metadata(db,namespace,prepared_inventory.query,key,require_grant=False)
+    else:source_reader=snapshot.get
+    return _qualify_focus_attention_values_v3(snapshot,namespace,now=now,source_reader=source_reader)
+
+
+def _qualify_focus_attention_values_v3(snapshot,namespace,*,now,source_reader):
+    """Pure focus/ticket identity and expiry; callers establish read authority."""
     focus_key = AtomKey(Owner("persona", *namespace.as_tuple),
                         "d07.focus.v1", namespace.persona_id)
     focus_atom = snapshot.get(focus_key)
@@ -343,7 +455,7 @@ def _read_focus_attention_ticket(
             if ((key.owner.bot, key.owner.persona) != namespace.as_tuple
                     or key.type_name != "memory.source"):
                 return None
-            atom = snapshot.get(key)
+            atom=source_reader(key)
             if atom is None or not atom.valid or atom.revision < 1:
                 return None
             versions.append(GraphVersion(key, atom.revision))

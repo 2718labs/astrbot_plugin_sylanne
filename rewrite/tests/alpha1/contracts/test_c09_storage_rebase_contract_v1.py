@@ -132,3 +132,20 @@ def test_d02_cost_and_graph_read_state_are_explicit():
     assert SanitizedGraphReadV1(key, "erased", None, digest("certificate")).status == "erased"
     with pytest.raises(ValueError, match="erased read"):
         SanitizedGraphReadV1(key, "erased", digest("old-body"), digest("certificate"))
+
+
+def test_streamed_graph_file_sha256_matches_full_bytes_at_boundaries(tmp_path):
+    """Only controlled bytes: chunk boundaries and a file over the request arena."""
+    import hashlib
+    from sylanne3.runtime.c09_graph_rebase_candidate_v1 import _stream_file_sha256_v1
+
+    block = bytes(range(256)) * 256
+    for size in (0, 65535, 65536, 65537, 8 * 1024 * 1024 + 1):
+        path = tmp_path / ("graph-hash-fixture-" + str(size) + ".bytes")
+        full_blocks, remainder = divmod(size, len(block))
+        with path.open("wb") as stream:
+            for _ in range(full_blocks):
+                stream.write(block)
+            stream.write(block[:remainder])
+        assert path.stat().st_size == size
+        assert _stream_file_sha256_v1(path) == hashlib.sha256(path.read_bytes()).hexdigest()

@@ -35,6 +35,7 @@ class InstalledC09OriginalVerifierV1:
         self.authority_namespace = execution_reader.namespace
         self.authority_id = authority_id_in_tx_v1(core_db)
         self.journal, self.business, self.kind = execution_reader, business_db, kind
+        self.original_core_db=core_db
         self.resource_issuer, self.body_authority = factory.resource_issuer, factory.body_authority
         model = (config.natural_model_authorities_v2 or {}).get(self.authority_namespace)
         if (model is None or self.authority_id != control.authority_id
@@ -44,8 +45,9 @@ class InstalledC09OriginalVerifierV1:
         self.historical_recipe = None
         if kind in {"offline_tick", "life"}:
             bundle = model.installation_bundle
-            work_kind = "d10.offline_observed_tick.v1" if kind == "offline_tick" else "d10.life.source_note.v1"
-            if bundle is None or work_kind not in bundle.installation_policy.root_grant.allowed_work_kinds:
+            work_kinds = {"d10.offline_observed_tick.v1"} if kind == "offline_tick" else {
+                "d10.life.source_note.v1", "d10.life.artifact_draft.v1"}
+            if bundle is None or not work_kinds.intersection(bundle.installation_policy.root_grant.allowed_work_kinds):
                 raise AuthorityUnavailable("C09 offline installation policy absent")
             self._key = hmac.new(bundle.d11_signing_key,
                 b"sylanne.authority.d11-offline-signing.v1" if kind == "offline_tick" else b"sylanne.authority.d11-life-signing.v1", hashlib.sha256).digest()
@@ -54,7 +56,21 @@ class InstalledC09OriginalVerifierV1:
                 installation = (config.c04_installations_v3 or {}).get(self.authority_namespace)
                 if installation is None:
                     raise AuthorityUnavailable("C09 installed Life package absent")
-                self.life_build = read_installed_d11_life_build_v1(installation.package_root, installation.formal_manifest_sha256)
+                from ..runtime.d11_artifact_draft_contract_v1 import RECIPE_ID as DRAFT_RECIPE
+                self.life_builds = {
+                    "d10.source-note.v1": read_installed_d11_life_build_v1(
+                        installation.package_root, installation.formal_manifest_sha256)}
+                if "d10.life.artifact_draft.v1" in bundle.installation_policy.root_grant.allowed_work_kinds:
+                    self.life_builds[DRAFT_RECIPE] = read_installed_d11_life_build_v1(
+                        installation.package_root, installation.formal_manifest_sha256,
+                        recipe_id=DRAFT_RECIPE)
+                self.life_build = self.life_builds["d10.source-note.v1"]
+                self.life_manifest_digest = installation.formal_manifest_sha256
+                self.life_package_files = None
+                if bundle.package_selection is not None:
+                    from .d12_package_files_v2 import InstalledPackageSelectionFilesV2
+                    self.life_package_files = InstalledPackageSelectionFilesV2(
+                        control_directory="/etc/sylanne/maintenance")
             return
         installations = config.c04_installations_v2 if algorithm == "d06.association_activation.v2" else config.c04_installations_v3
         installation = (installations or {}).get(self.authority_namespace)
@@ -64,14 +80,19 @@ class InstalledC09OriginalVerifierV1:
         if len(key) != 32 or installation.component_key_path.resolve().is_relative_to(installation.package_root.resolve()):
             raise AuthorityUnavailable("C09 protected signing material differs")
         if kind == "internal":
-            from ..host.installed_d06_build import verify_d06_algorithm_build, ENTRY_PATH, ENTRY_PATH_V3, KERNEL_PATH
+            from ..host.installed_d06_build import (
+                verify_d06_algorithm_build, ENTRY_PATH, ENTRY_PATH_V3, ENTRY_PATH_V4, KERNEL_PATH)
             from .. import memory_association
-            from ..domains.d06 import c04_work_algorithm_v3, c04_work_input_v2
+            from ..domains.d06 import c04_work_algorithm_v3, c04_work_algorithm_v4, c04_work_input_v2
             from pathlib import Path
             build = verify_d06_algorithm_build(installation.package_root, installation.formal_manifest_sha256,
                 require_backend_runtime=True, algorithm_id=algorithm)
-            entry = c04_work_input_v2 if algorithm == "d06.association_activation.v2" else c04_work_algorithm_v3
-            entry_path = ENTRY_PATH if algorithm == "d06.association_activation.v2" else ENTRY_PATH_V3
+            versions = {
+                "d06.association_activation.v2": (c04_work_input_v2, ENTRY_PATH),
+                "d06.association_activation.v3": (c04_work_algorithm_v3, ENTRY_PATH_V3),
+                "d06.association_activation.direct_seed.v4": (c04_work_algorithm_v4, ENTRY_PATH_V4),
+            }
+            entry, entry_path = versions[algorithm]
             if (Path(entry.__file__).resolve() != (installation.package_root / entry_path).resolve()
                     or Path(memory_association.__file__).resolve() != (installation.package_root / KERNEL_PATH).resolve()):
                 raise AuthorityUnavailable("C09 loaded internal algorithm differs from installed package")
@@ -206,21 +227,43 @@ class InstalledC09OriginalVerifierV1:
     def verify_life_journal_row_v1(self, journal, row):
         from .d11_life_journal_v1 import decode_life_row_v1
         from ..runtime.d11_life_contract_v1 import life_to_wire_v1
+        if self.kind != "life":
+            raise AuthorityUnavailable("C09 Life original needs its installed Life verifier")
         binding, claim, terminal = decode_life_row_v1(journal, row)
-        if (self.kind != "life" or binding.namespace != self.namespace
+        if (binding.namespace != self.namespace
                 or binding.authority_namespace != self.authority_namespace or binding.authority_id != self.authority_id
-                or binding.installation_id != self.installation_id
-                or any(getattr(binding, name) != value for name, value in self.life_build.items())):
+                or binding.installation_id != self.installation_id):
             raise AuthorityUnavailable("C09 Life original differs from installed authority/build")
+        key = self._key
+        if binding.manifest_digest == self.life_manifest_digest:
+            build = self.life_builds.get(binding.recipe_id)
+            if build is None or any(getattr(binding, name) != value for name, value in build.items()):
+                raise AuthorityUnavailable("C09 Life original differs from its registered recipe build")
+        else:
+            from ..host.installed_d11_life_build_v1 import (
+                read_registered_historical_d11_life_build_v1,
+                read_registered_historical_d11_life_key_v1)
+            if self.life_package_files is None or claim is None:
+                raise AuthorityUnavailable("C09 Life historical registered package and actual claim unavailable")
+            read_registered_historical_d11_life_build_v1(self.life_package_files, binding=binding)
+            key = read_registered_historical_d11_life_key_v1(
+                self.life_package_files, binding=binding, claim=claim)
         for original in (claim, terminal):
             if original is None:
                 continue
             payload = life_to_wire_v1(original)
             signature = payload.pop("signature")
-            expected = hmac.new(self._key, canonical_serialize(payload).encode(), hashlib.sha256).hexdigest()
+            expected = hmac.new(key, canonical_serialize(payload).encode(), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(signature, expected):
                 raise AuthorityUnavailable("C09 Life signed original differs")
         return binding, claim, terminal
+
+    def verify_draft_self_bridge_original_v2(self,gate):
+        from .c09_life_recovery_originals_v1 import require_original_draft_self_bridge_core_v2
+        if self.kind!="life" or gate.binding.namespace!=self.namespace or gate.binding.installation_id!=self.installation_id:
+            raise AuthorityUnavailable("C09 draft self bridge crossed installed passive verifier")
+        require_original_draft_self_bridge_core_v2(self.original_core_db,gate=gate)
+        return gate
 
     def verify_installed_terminal(self, binding, claim, terminal):
         from .internal_work_contract import InternalWorkTerminalV2, claim_internal_work_v1, canonical_json
@@ -239,10 +282,43 @@ class InstalledC09OriginalVerifierV1:
             return False
         if terminal.status == "failed":
             return True
-        if self.installed_algorithm_id == "d06.association_activation.v3":
-            from .installed_c04_executor_v3 import decode_completed_c04_output_v3
-            decode_completed_c04_output_v3(binding, terminal)
+        if self.installed_algorithm_id in {
+                "d06.association_activation.v3", "d06.association_activation.direct_seed.v4"}:
+            from .installed_c04_executor_v3 import decode_completed_c04_output_v3, decode_completed_c04_output_v4
+            decoder = (decode_completed_c04_output_v4
+                       if self.installed_algorithm_id == "d06.association_activation.direct_seed.v4"
+                       else decode_completed_c04_output_v3)
+            decoder(binding, terminal)
         payload = AuthorityInternalWorkService._component_payload(binding, terminal).encode()
         return (terminal.component_receipt_ref == "internal-work:component:" + binding.binding_digest
             and hmac.compare_digest(hashlib.sha256(payload).hexdigest(), terminal.component_receipt_digest)
             and hmac.compare_digest(hmac.new(self._key, payload, hashlib.sha256).hexdigest(), terminal.component_receipt_signature))
+
+
+class InstalledC09D13OriginalVerifierV1:
+    """Actual D13 component verifier over frozen rows; no begin or reconcile."""
+    def __init__(self,session,execution_reader):
+        from .c09_paged_capture_control_v2 import C09PagedCaptureSessionV2
+        from .c09_execution_connection_v1 import C09ExecutionOriginalsConnectionV1
+        if type(session) is not C09PagedCaptureSessionV2 or type(execution_reader) is not C09ExecutionOriginalsConnectionV1:
+            raise AuthorityUnavailable('actual installed C09 D13 original verifier required')
+        session.require_current();counter=session.require_installed_d13_counter_service_v1()
+        work=counter.internal_work;algorithm='d13.full_http_counter.v1'
+        if (not work.installed_runtime_verified or work.installed_builds.get(algorithm)!=counter.worker.program_sha256
+                or work.journal.journal_id!=execution_reader.journal_id
+                or execution_reader.namespace!=session.scope.authority_namespace):
+            raise AuthorityUnavailable('frozen D13 originals crossed installed algorithm/build/journal/namespace')
+        from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+        session.require_d13_runtime_qualification_v3(counter,current_c09_sql_meter_v2())
+        self.session,self.counter,self.journal=session,counter,execution_reader
+        self.installed_algorithm_id=algorithm;self.installed_build_digest=counter.worker.program_sha256
+        self.installed_runtime_verified=True
+    def verify_installed_terminal(self,binding,claim,terminal):
+        self.session.require_current()
+        from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+        self.session.require_d13_runtime_qualification_v3(self.counter,current_c09_sql_meter_v2())
+        if (binding.namespace!=self.session.scope.authority_namespace
+                or binding.algorithm_ref!=self.installed_algorithm_id
+                or binding.algorithm_build_digest!=self.installed_build_digest):
+            return False
+        return self.counter.internal_work.verify_installed_terminal(binding,claim,terminal)

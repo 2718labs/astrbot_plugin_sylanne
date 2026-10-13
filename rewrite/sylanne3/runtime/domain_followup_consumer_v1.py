@@ -2,6 +2,7 @@
 from dataclasses import dataclass, replace, asdict
 import json
 import time
+from .domain_background_read_v3 import (background_point_v3,background_json_loads_v3,bind_background_reads_v3)
 
 from ..contracts import canonical_json, Event, Scope
 from ..graph_store import GraphStore
@@ -29,6 +30,8 @@ class _BackgroundFollowupV1:
     parent_budget: str
     operation_id: str
     observed_epoch: int
+    prior_receipt: object = None
+    causal_original_digest: str | None = None
 
 
 def require_background_followup_v1(value, graph, authority, operation_id):
@@ -65,9 +68,14 @@ def _observe_owner(graph, authority, scope):
 
 
 def _event(db, namespace, dedupe, issuer):
-    row = db.execute('SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state,receipt_json '
-        'FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?',
-        (*namespace.as_tuple, dedupe)).fetchone()
+    specialized=db.execute("SELECT event_kind FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?",(*namespace.as_tuple,dedupe)).fetchone()
+    if specialized is not None and specialized[0] in {"artifact_task_wait_registered","artifact_task_amendment_adopted"}:
+        raise ValueError("artifact task events require their actual Self continuation consumer")
+    row=background_point_v3(db,table='graph_domain_production_outbox_v1',
+        columns=('causal_operation_id','receiver_domain','event_kind','original_ref','original_digest','state','receipt_json'),
+        key_columns=('bot','persona','dedupe_key'),key=(*namespace.as_tuple,dedupe),
+        legacy_reader=lambda:db.execute('SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state,receipt_json '
+            'FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?',(*namespace.as_tuple,dedupe)).fetchone())
     if row is None or row[5] not in {'pending','waiting','completed'}:
         raise ValueError('actual background outbox original is unavailable')
     original = read_adopted_domain_operation_v1(db, namespace, row[0])
@@ -79,7 +87,7 @@ def _event(db, namespace, dedupe, issuer):
         raise ValueError('background outbox identity changed')
     from .domain_production_followups_v1 import verify_current_followup_trigger_v1
     verify_current_followup_trigger_v1(db, namespace, event, original, issuer)
-    return event, original, row[5], None if row[6] is None else json.loads(row[6])
+    return event, original, row[5], None if row[6] is None else background_json_loads_v3(row[6])
 
 
 def _resolve(graph, db, event, authority, owner, scope, now):
@@ -117,7 +125,7 @@ def validate_followup_command_in_transaction_v1(value, graph, db, scope, owner, 
 
 def _save_disposition(graph, db, issued, resolution, result):
     event = issued.event
-    old = _event(db, issued.authority.namespace, event.dedupe_key, graph._GraphCoordinator__d11_issuer)[3]
+    old = issued.prior_receipt if issued.causal_original_digest is not None else _event(db, issued.authority.namespace, event.dedupe_key, graph._GraphCoordinator__d11_issuer)[3]
     completed = [] if old is None else list(old['completed_commands'])
     command_digest = None if issued.command is None else canonical_digest(issued.command)
     structural = (issued.command is not None and issued.command.operation_kind == 'encode_structured_experience'
@@ -138,7 +146,7 @@ def _save_disposition(graph, db, issued, resolution, result):
     _, epoch = graph._v2_graph_stamp(issued.authority.namespace)
     receipt = {'schema':'sylanne.domain-followup-disposition.v1','resolver_version':RESOLVER,
         'dedupe_key':event.dedupe_key,'causal_operation_id':event.causal_operation_id,
-        'causal_original_digest':read_adopted_domain_operation_v1(db,issued.authority.namespace,event.causal_operation_id)['original_digest'],
+        'causal_original_digest':issued.causal_original_digest or read_adopted_domain_operation_v1(db,issued.authority.namespace,event.causal_operation_id)['original_digest'],
         'trigger_original_digest':event.trigger_original.original_digest,
         'manifest_digest':graph._GraphCoordinator__content_fence_v2.installation_grant.manifest_digest,
         'state':state,'observed_epoch':epoch.revision,'completed_commands':completed,
@@ -156,7 +164,7 @@ def finish_followup_command_in_transaction_v1(value, graph, db, resolution, resu
     return _save_disposition(graph,db,value,resolution,result)
 
 
-def consume_current_domain_followup_v1(graph, bootstrap, bundle, *, dedupe_key):
+def _consume_legacy_domain_followup_v1(graph, bootstrap, bundle, *, dedupe_key):
     graph._admin(bootstrap)
     ns, store, port = bundle.installation_policy.namespace, graph._GraphCoordinator__store, graph._GraphCoordinator__content_fence_v2
     assembly = graph._GraphCoordinator__d04_installed_joint_assembly
@@ -244,3 +252,119 @@ def consume_current_domain_followup_v1(graph, bootstrap, bundle, *, dedupe_key):
             request_digest=canonical_digest((RESOLVER,event.dedupe_key,op)),domains=(event.receiver_domain,),
             capability='workbench.read',commit=commit,fence_context=context,background_original=issued)
     finally:_ACTIVE.pop(id(issued),None)
+
+
+
+def consume_current_domain_followup_v1(graph,bootstrap,bundle,*,dedupe_key):
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(graph._GraphCoordinator__store._db)is None:
+        return _consume_legacy_domain_followup_v1(graph,bootstrap,bundle,dedupe_key=dedupe_key)
+    from .domain_background_read_v3 import prepare_domain_background_read_v3,raise_background_work_error_v3
+    from .first_ingress_v2 import trusted_upper
+    graph._admin(bootstrap)
+    now=trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+    work=prepare_domain_background_read_v3(graph,bootstrap,bundle,kind='followup',
+        operation_id='domain-followup:'+dedupe_key[:48],deadline_utc=now+60,dedupe_key=dedupe_key)
+    work.map_terminal_v3('issuer',lambda prepared:finish_background_followup_preparation_v3(graph,prepared),raise_background_work_error_v3)
+    return work
+
+
+def prepare_background_followup_data_v3(reader):
+    graph,db,ns=reader.graph,reader.db,reader.namespace
+    event,original,state,prior=_event(db,ns,reader.dedupe_key,graph._GraphCoordinator__d11_issuer)
+    if state=='completed':return (event,original,state,prior,None,None,None,None)
+    if reader.kind=='followup'and prior is not None and prior['observed_epoch']==reader.graph_stamp[1].revision:
+        return (event,original,'unchanged',prior,None,None,None,None)
+    frame,resolution=_resolve(graph,db,event,reader.authority,reader.owner,reader.fence.scope,reader.now)
+    done=set()if prior is None else {item['command_digest']for item in prior['completed_commands']}
+    command=next((c for c in resolution.commands if canonical_digest(c)not in done),None)
+    op='domain-consume:'+canonical_digest((ns,event.dedupe_key,RESOLVER,
+        canonical_digest(command)if command is not None else None,frame.snapshot.epochs[0].revision))[:48]
+    child_frame=None
+    if reader.kind=='followup_child':
+        from .domain_background_read_v3 import require_background_followup_handoff_v3
+        handoff=require_background_followup_handoff_v3(reader.handoff,graph,reader.bundle)
+        if (event.causal_operation_id!=handoff.causal_operation_id or event.trigger_original!=handoff.trigger_original
+                or original['original_digest']!=handoff.causal_original_digest or command!=handoff.command):
+            raise ValueError('followup child proposal changed under its independently observed current inputs')
+        if command is not None:
+            from .domain_production_read_plans_v1 import read_plan_current_domain_operation_v1
+            from .domain_production_contracts_v1 import ProductionOperationLimitsV1
+            from ..runtime_contracts import OperationIdentity
+            operation=installed_operation_v1(command.operation_kind)
+            authority=replace(reader.authority,audience=command.audience_refs or (command.audience_ref,))
+            plan=read_plan_current_domain_operation_v1(db,namespace=ns,activity_id=command.activity_id,
+                domain=operation.domain,operation_kind=operation.operation_kind,request=command.request,
+                operation_id=op,now_utc=reader.now,audiences=authority.audience)
+            envelope=replace(frame.envelope,identity=OperationIdentity(op,None,command.activity_id,command.operation_kind,
+                canonical_digest(command.request),frame.envelope.identity.canonical_input_digest),authority=authority)
+            child_frame=freeze_domain_production_frame_v1(graph,db,envelope=envelope,current_owner=reader.owner,
+                scope=reader.fence.scope,plan=plan,now_utc=reader.now,observed_originals=frame.observed_originals,
+                limits=ProductionOperationLimitsV1())
+    return event,original,state,prior,frame,resolution,command,(op,child_frame)
+
+
+def finish_background_followup_preparation_v3(graph,prepared):
+    from .domain_background_read_v3 import (PreparedBackgroundOperationV3,BackgroundFollowupProgressV3,
+        BackgroundFollowupChildHandoffV3,background_followup_progress_v3)
+    if type(prepared)is not PreparedBackgroundOperationV3:raise TypeError('actual background preparation result required')
+    prepared.require_v3(graph);reader=prepared.owner
+    event,original,state,prior,frame,resolution,command,child=prepared.local_result
+    if state=='completed':return background_followup_progress_v3('completed',prior,None)
+    if state=='unchanged':return background_followup_progress_v3('unchanged',prior,None)
+    if reader.kind=='followup'and command is not None:
+        handoff=BackgroundFollowupChildHandoffV3.from_prepared_v3(prepared,event,original,command,reader.owner.principal)
+        return background_followup_progress_v3('child_ready',None,handoff)
+    op,_=child
+    authority=reader.authority
+    if command is not None:authority=replace(authority,audience=command.audience_refs or (command.audience_ref,))
+    issued=_BackgroundFollowupV1(graph,event,authority,reader.owner,command,original['payload']['parent_budget'],op,
+        frame.snapshot.epochs[0].revision,prior,original['original_digest'])
+    _ACTIVE[id(issued)]=issued
+    try:
+        with bind_background_reads_v3(reader,db=reader.db):
+            if command is not None:
+                if command.operation_kind not in('recheck_action','prepare_contact','encode_structured_experience'):
+                    raise ValueError('followup child has no installed exact pure receiver')
+                result=graph._GraphCoordinator__domain_production_runtime_v1.run_current(authority,None,
+                    operation_kind=command.operation_kind,request=command.request,operation_id=op,
+                    activity_id=command.activity_id,audience_ref=command.audience_ref,
+                    parent_budget_lease_ref=issued.parent_budget,_background_followup=issued)
+                return background_followup_progress_v3('child_completed',result,None)
+            def commit(db,metadata,epoch,now,owner,scope):
+                current_frame,current_resolution=validate_followup_command_in_transaction_v1(issued,graph,db,scope,owner,now)
+                completed=set()if prior is None else {i['command_digest']for i in prior['completed_commands']}
+                if any(canonical_digest(c)not in completed for c in current_resolution.commands):
+                    raise ValueError('followup became ready; derive a fresh actual child proposal')
+                candidate=GraphCandidate(Event(Scope(*reader.namespace.as_tuple,'domain.followup.v1'),op,now,RESOLVER,
+                    {'dedupe_key':event.dedupe_key,'causal_original_digest':event.trigger_original.original_digest}),
+                    current_frame.snapshot.versions,(),(epoch,))
+                store=reader.store
+                receipt=GraphStore._graph_commit_in_transaction(store,candidate,_capability=graph._GraphCoordinator__graph_capability)
+                if receipt.status!='committed':raise ValueError('followup read event CAS failed')
+                store.cas_graph_recovery_metadata(metadata,metadata.requirements,_capability=graph._GraphCoordinator__graph_capability)
+                row=db.execute('SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?',reader.namespace.as_tuple).fetchone()
+                sequence=(0 if row is None else row[0])+1
+                db.execute('INSERT INTO graph_bundle_sequence VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET last_seq=excluded.last_seq',(*reader.namespace.as_tuple,sequence))
+                db.execute('INSERT INTO graph_bundle_operations(bot,persona,operation_id,digest,activity_id,effect_id,commit_seq,receipt_json) VALUES(?,?,?,?,?,NULL,?,?)',
+                    (*reader.namespace.as_tuple,op,canonical_digest(candidate),'domain.followup.v1',sequence,canonical_json({'ledger_refs':[],'outbox_refs':[]})))
+                return _save_disposition(graph,db,issued,current_resolution,{})
+            result=graph._owner_domain_write_v3(authority,None,operation_id=op,
+                request_digest=canonical_digest((RESOLVER,event.dedupe_key,op)),domains=(event.receiver_domain,),
+                capability='workbench.read',commit=commit,background_original=issued)
+            return background_followup_progress_v3('waiting',result,None)
+    finally:_ACTIVE.pop(id(issued),None)
+
+
+def consume_background_followup_child_v3(graph,bootstrap,bundle,*,handoff):
+    from .domain_background_read_v3 import prepare_domain_background_read_v3,require_background_followup_handoff_v3,raise_background_work_error_v3
+    from .first_ingress_v2 import trusted_upper
+    handoff=require_background_followup_handoff_v3(handoff,graph,bundle)
+    graph._admin(bootstrap)
+    now=trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+    work=prepare_domain_background_read_v3(graph,bootstrap,bundle,kind='followup_child',
+        operation_id='domain-followup-child:'+canonical_digest((handoff.namespace,handoff.dedupe_key,canonical_digest(handoff.command)))[:48],
+        deadline_utc=now+60,dedupe_key=handoff.dedupe_key)
+    work.state.handoff=handoff
+    work.map_terminal_v3('issuer',lambda prepared:finish_background_followup_preparation_v3(graph,prepared),raise_background_work_error_v3)
+    return work

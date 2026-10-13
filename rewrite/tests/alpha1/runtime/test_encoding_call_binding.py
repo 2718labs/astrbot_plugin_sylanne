@@ -30,10 +30,10 @@ SOURCE = SourceRecord("source-1", "source text", "speaker-1", "reported",
 
 
 def _request(*, call_id="call-1", payload=None, max_output_tokens=128,
-             source=SOURCE):
+             source=SOURCE, template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION):
     source_id = source.source_id
     source_ref = source_key(*NAMESPACE.as_tuple, source_id).token
-    expected_payload, template_digest = build_first_ingress_encoding_payload(source)
+    expected_payload, template_digest = build_first_ingress_encoding_payload(source, template_version=template_version)
     envelope = CommandEnvelope(
         "sylanne.runtime.v1",
         OperationIdentity("activity-1", None, "attempt-1", "encode",
@@ -159,3 +159,70 @@ def test_bare_source_id_is_not_a_graph_source_ref():
     )
     with pytest.raises(ValueError, match="source or budget identity"):
         _binding(replace(request, envelope=envelope))
+
+
+def _v2_task_result(source):
+    import json
+    return {"text": json.dumps({
+        "schema": "sylanne.d06.first_ingress_encoding_output.v2",
+        "event_summary": "用户要求先存初稿，收到真实更正后存终稿。",
+        "quoted_details": [], "possible_meanings": [], "possible_feelings": [],
+        "task_intent": {"kind": "draft_then_corrected_revision", "filename": "draft.txt",
+                        "source_quote": source.text},
+    }, ensure_ascii=False)}
+
+
+def test_v2_encoding_binding_retains_exact_version_through_sqlite_reopen(tmp_path):
+    from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
+    source = replace(SOURCE, text="先保存 draft.txt 初稿，等我的更正后再保存终稿。")
+    request = _request(source=source, template_version=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION)
+    binding = prepare_binding(NAMESPACE, "task-job", source, 1, 1, "budget-1", "operation-1", request,
+        prompt_template_version=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION,
+        provider_config_ref="admin-config-1", provider_config_digest="b" * 64)
+    path = tmp_path / "task-binding.db"
+    with sqlite3.connect(path) as db:
+        install_schema(db)
+        assert insert_binding(db, binding) == binding
+    with sqlite3.connect(path) as db:
+        restored = load_binding(db, NAMESPACE, "task-job")
+        assert restored == binding
+        assert restored.request["prompt_template_version"] == FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
+        assert restored.model_request_digest == request.digest
+        assert restored.request["payload"] != _request(source=source).payload
+    with pytest.raises(ValueError, match="template"):
+        _binding(request, source=source)  # V1 binding cannot consume a V2 request.
+
+
+def test_v2_task_candidate_remains_non_authorizing_and_version_bound():
+    from sylanne3.model_broker.first_ingress_encoding import (
+        FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION, parse_artifact_task_intent_v1,
+        parse_first_ingress_encoding_result,
+    )
+    source = replace(SOURCE, text="先保存 draft.txt 初稿，等我的更正后再保存终稿。")
+    result = _v2_task_result(source)
+    candidate = parse_artifact_task_intent_v1(result, source)
+    assert (candidate.kind, candidate.filename, candidate.source_quote) == (
+        "draft_then_corrected_revision", "draft.txt", source.text)
+    memory = parse_first_ingress_encoding_result(result, source,
+        template_version=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION)
+    assert memory.event_summary
+    assert set(candidate.__dataclass_fields__) == {"kind", "filename", "source_quote", "schema"}
+    with pytest.raises(ValueError, match="frozen template version"):
+        parse_first_ingress_encoding_result(result, source,
+            template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("kind", "execute_anything"), ("filename", "foreign.txt"),
+    ("source_quote", "没有在原消息中出现的权限声明"),
+])
+def test_v2_task_candidate_rejects_unregistered_kind_or_unquoted_source(field, value):
+    import json
+    from sylanne3.model_broker.first_ingress_encoding import parse_artifact_task_intent_v1
+    source = replace(SOURCE, text="先保存 draft.txt 初稿，等我的更正后再保存终稿。")
+    result = _v2_task_result(source)
+    assert parse_artifact_task_intent_v1(result, source).kind == "draft_then_corrected_revision"
+    raw = json.loads(result["text"])
+    raw["task_intent"][field] = value
+    with pytest.raises(ValueError):
+        parse_artifact_task_intent_v1({"text": json.dumps(raw, ensure_ascii=False)}, source)

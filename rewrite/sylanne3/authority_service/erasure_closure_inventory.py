@@ -335,7 +335,7 @@ class AuthorityErasureClosureInventory:
                 or receipt.pending != pending
                 or (pending.source_phase, pending.target_phase) !=
                    ("pending", "accepted")
-                or pending.evidence.issuer_id != "authority-pinned-graph-barrier-v1"
+                or pending.evidence.issuer_id not in {"authority-pinned-graph-barrier-v1","authority-pinned-graph-barrier-v2"}
                 or pending.deletion_operation_id != run.operation_id
                 or canonical_digest(receipt) != run.accepted_receipt_digest
                 or pending.evidence.scope_digest.removeprefix("sha256:")

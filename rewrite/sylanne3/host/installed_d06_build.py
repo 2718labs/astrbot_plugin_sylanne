@@ -16,7 +16,21 @@ ENTRY_PATH = "rewrite/sylanne3/domains/d06/c04_work_input_v2.py"
 KERNEL_PATH = "rewrite/sylanne3/memory_association.py"
 ALGORITHM_ID_V3 = "d06.association_activation.v3"
 ENTRY_PATH_V3 = "rewrite/sylanne3/domains/d06/c04_work_algorithm_v3.py"
+ALGORITHM_ID_V4 = "d06.association_activation.direct_seed.v4"
+ENTRY_PATH_V4 = "rewrite/sylanne3/domains/d06/c04_work_algorithm_v4.py"
 _SOURCES = {
+    ALGORITHM_ID_V4: (
+        ENTRY_PATH_V4, KERNEL_PATH, ENTRY_PATH_V3,
+        "rewrite/sylanne3/runtime/c04_direct_seed_v4.py",
+        "rewrite/sylanne3/runtime/c04_self_scope_v4.py",
+        "rewrite/sylanne3/runtime/c04_v3_contracts.py",
+        "rewrite/sylanne3/domains/d06/c04_work_input_v2.py",
+        "rewrite/sylanne3/runtime/d06_ingress_c03_selection_v1.py",
+        "rewrite/sylanne3/runtime/c04_association_graph_collector_v2.py",
+        "rewrite/sylanne3/runtime/c04_frozen_association_original_v3.py",
+        "rewrite/sylanne3/runtime/c04_cpu_quote_policy.py",
+        "rewrite/sylanne3/runtime/c04_prepare_service_v3.py",
+    ),
     ALGORITHM_ID: (ENTRY_PATH, KERNEL_PATH),
     ALGORITHM_ID_V3: (
         ENTRY_PATH_V3, KERNEL_PATH,
@@ -50,7 +64,7 @@ def verify_d06_algorithm_build(
     if require_formal and installed.build_mode != "formal-alpha1":
         raise ValueError("formal D06 build binding requires a formal-alpha1 package")
     if require_backend_runtime and installed.runtime_scope not in {
-        "formal-alpha1", "backend-production-acceptance",
+        "formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance",
     }:
         raise ValueError("D06 production runtime qualification is unavailable")
     manifest_bytes = (package_root / "release-manifest.json").read_bytes()
@@ -62,7 +76,7 @@ def verify_d06_algorithm_build(
         raise ValueError("installed package file list is absent")
     sources = []
     source_paths = _SOURCES[algorithm_id]
-    if algorithm_id == ALGORITHM_ID_V3:
+    if algorithm_id in {ALGORITHM_ID_V3, ALGORITHM_ID_V4}:
         # V3 executes authored/legacy codecs, current D04 projections and the
         # fixed D07 code-policy. Bind every installed runtime module's bytes so
         # dynamic imports and future pure dependencies cannot evade the build pin.
@@ -109,10 +123,13 @@ def verify_d06_algorithm_build(
         "status": ("formal_package_bytes_only" if installed.build_mode == "formal-alpha1"
                    else "backend_acceptance_package_bytes_only"
                    if installed.runtime_scope == "backend-production-acceptance"
+                   else "local_alpha2_package_bytes_only"
+                   if installed.build_mode == "alpha2-candidate" and installed.runtime_scope == "backend-local-alpha2-acceptance"
                    else "diagnostic_installed_source_only"),
         "runtime_scope": installed.runtime_scope,
     }
 
 
 __all__ = ["ALGORITHM_ID", "ENTRY_PATH", "KERNEL_PATH",
-           "ALGORITHM_ID_V3", "ENTRY_PATH_V3", "verify_d06_algorithm_build"]
+           "ALGORITHM_ID_V3", "ENTRY_PATH_V3", "ALGORITHM_ID_V4", "ENTRY_PATH_V4",
+           "verify_d06_algorithm_build"]

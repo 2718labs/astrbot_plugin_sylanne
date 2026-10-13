@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..runtime_storage_v3 import read_graph_row_v3, read_graph_rows_v3
+
 from dataclasses import dataclass
 from fractions import Fraction
 import json
@@ -113,11 +115,7 @@ def read_current_d04_numeric_sources_v2(
     if observed != candidate:
         raise CouplingSnapshotHold("numeric source coupling snapshot changed")
     namespace = candidate.namespace
-    rows = db.execute(
-        "SELECT token,revision,value,valid FROM graph_atoms "
-        "WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT ?",
-        namespace.as_tuple + (TYPE_NAME, max_drive_rows + 1),
-    ).fetchall()
+    rows = read_graph_rows_v3(db, ('token', 'revision', 'value', 'valid'), where='bot=? AND persona=? AND type_name=?', parameters=(namespace.as_tuple + (TYPE_NAME, max_drive_rows + 1))[:-1], history=False, order_by=('token',), limit=(namespace.as_tuple + (TYPE_NAME, max_drive_rows + 1))[-1])
     if len(rows) > max_drive_rows:
         raise CouplingSnapshotHold("numeric drive enumeration exceeds complete page")
     drives = {}
@@ -164,8 +162,7 @@ def read_current_d04_numeric_sources_v2(
         key = AtomKey.from_token(ref)
         if NamespaceId.from_key(key) != namespace:
             raise CouplingSnapshotHold("numeric input dependency crosses namespace")
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                         (ref,)).fetchone()
+        row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(ref,), history=False)
         if row is None or row[0] != revision or row[2] != 1:
             raise CouplingSnapshotHold("numeric input dependency is absent or stale")
         value = json.loads(row[1])
@@ -284,11 +281,7 @@ def read_current_d04_numeric_sources(
     if (requested.type_name != TYPE_NAME or requested.owner.kind != "persona"
             or NamespaceId.from_key(requested) != namespace):
         raise CouplingSnapshotHold("numeric drive ref crosses namespace or type")
-    rows = db.execute(
-        "SELECT token,revision,value,valid FROM graph_atoms "
-        "WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT ?",
-        namespace.as_tuple + (TYPE_NAME, max_drive_rows + 1),
-    ).fetchall()
+    rows = read_graph_rows_v3(db, ('token', 'revision', 'value', 'valid'), where='bot=? AND persona=? AND type_name=?', parameters=(namespace.as_tuple + (TYPE_NAME, max_drive_rows + 1))[:-1], history=False, order_by=('token',), limit=(namespace.as_tuple + (TYPE_NAME, max_drive_rows + 1))[-1])
     if len(rows) > max_drive_rows:
         raise CouplingSnapshotHold("numeric drive enumeration exceeds complete page")
     drives = {}
@@ -322,8 +315,7 @@ def read_current_d04_numeric_sources(
         key = AtomKey.from_token(ref)
         if NamespaceId.from_key(key) != namespace:
             raise CouplingSnapshotHold("numeric input dependency crosses namespace")
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                         (ref,)).fetchone()
+        row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(ref,), history=False)
         if row is None or row[0] != revision or row[2] != 1:
             raise CouplingSnapshotHold("numeric input dependency is absent or stale")
         value = json.loads(row[1])
@@ -348,8 +340,7 @@ def read_current_d04_numeric_sources(
             or source.parent_source_ids):
         raise CouplingSnapshotHold("numeric drive source requires complete ancestry")
     head_key = source_correction_head_key(namespace, source.source_id)
-    head_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                          (head_key.token,)).fetchone()
+    head_row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(head_key.token,), history=False)
     if head_row is not None:
         raise CouplingSnapshotHold("numeric drive source has a correction head")
     snapshot = GraphSnapshot((source_atom, access_atom, GraphAtom(head_key, 0, {}, False)),

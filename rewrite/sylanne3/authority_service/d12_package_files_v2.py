@@ -286,28 +286,12 @@ class InstalledPackageSelectionFilesV2:
 
     @staticmethod
     def verify_registered_package_v2(package):
-        if type(package) is not RegisteredPackageV2: raise TypeError("registered package required")
-        root = Path(package.package_root)
-        fd = _protected_directory(root); os.close(fd)
-        # Every descendant must also be protected, not merely the top directory.
-        for directory, dirs, files in os.walk(root, followlinks=False):
-            for name in dirs + files:
-                path = Path(directory) / name
-                info = path.lstat()
-                if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
-                        or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
-                        or stat.S_ISREG(info.st_mode) and info.st_nlink != 1):
-                    raise AuthorityUnavailable("registered package contains unprotected object")
-                from .linux_installation_security_v1 import _check
-                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-                if stat.S_ISDIR(info.st_mode): flags |= os.O_DIRECTORY
-                item_fd = os.open(path, flags)
-                try: _check(item_fd, directory=stat.S_ISDIR(info.st_mode))
-                finally: os.close(item_fd)
-        result = verify_installed_backend_runtime_v1(root, package.manifest_sha256)
+        _require_registered_package_protection_v2(package)
+        result = verify_installed_backend_runtime_v1(Path(package.package_root), package.manifest_sha256)
         if not result.verified or result.package_version != package.package_version:
             raise AuthorityUnavailable("registered package bytes/platform/catalogue are not qualified")
         return result
+
 
     def _switch_after_supervisor_authorization_v2(self, *, expected, desired):
         """Internal only: outer supervisor owns durable authorization and drain."""
@@ -335,3 +319,23 @@ class InstalledPackageSelectionFilesV2:
         finally:
             if lock_fd is not None: os.close(lock_fd)
             os.close(directory_fd)
+
+def _require_registered_package_protection_v2(package):
+    if type(package) is not RegisteredPackageV2: raise TypeError("registered package required")
+    root = Path(package.package_root)
+    fd = _protected_directory(root); os.close(fd)
+    # Every descendant must also be protected, not merely the top directory.
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = Path(directory) / name
+            info = path.lstat()
+            if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+                    or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
+                    or stat.S_ISREG(info.st_mode) and info.st_nlink != 1):
+                raise AuthorityUnavailable("registered package contains unprotected object")
+            from .linux_installation_security_v1 import _check
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            if stat.S_ISDIR(info.st_mode): flags |= os.O_DIRECTORY
+            item_fd = os.open(path, flags)
+            try: _check(item_fd, directory=stat.S_ISDIR(info.st_mode))
+            finally: os.close(item_fd)

@@ -5,13 +5,12 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 
 
 FORBIDDEN_NAMES = {".env", "credentials.json", "secrets.json"}
 FORBIDDEN_SUFFIXES = {".log", ".pyc", ".pem", ".key", ".sqlite", ".sqlite3"}
-SOURCE_ID = "webui-heritage"
-BUILD_OUTPUT = Path("webui-heritage/dist/index.html")
+SOURCE_ID = "workbench-src/prototype-v6"
+BUILD_OUTPUT = Path("workbench-src/prototype-v6/singlefile/index.html")
 RESOURCE_FILES = {Path("index.html"), Path("workbench-manifest.json")}
 
 
@@ -21,33 +20,30 @@ def prepare(project_root: Path) -> None:
     build_output = root / BUILD_OUTPUT
     destination = root / "resources" / "workbench"
     if source.is_symlink() or not source.is_dir():
-        raise ValueError("workbench source must be the declared webui-heritage directory")
-    if any(path.is_symlink() for path in (source / "dist", build_output)) or not build_output.is_file():
-        raise FileNotFoundError("webui-heritage build output dist/index.html is missing or unsafe")
+        raise ValueError("workbench source must be the declared prototype-v6 directory")
+    if any(path.is_symlink() for path in (source / "singlefile", build_output)) or not build_output.is_file():
+        raise FileNotFoundError("prototype-v6 singlefile/index.html is missing or unsafe")
     if not destination.is_dir() or destination.is_symlink():
         raise FileNotFoundError("tracked workbench resource directory is missing or unsafe")
-
-    tracked = subprocess.check_output(
-        ["git", "ls-files", "-z", "--", "resources/workbench"], cwd=root,
-    )
-    tracked_files = {
-        Path(path.decode("utf-8")).relative_to("resources/workbench")
-        for path in tracked.split(b"\0") if path
-    }
-    if RESOURCE_FILES - tracked_files:
-        raise ValueError("built workbench output targets must already be tracked resources")
 
     for item in destination.rglob("*"):
         if item.is_symlink():
             raise ValueError(f"unsafe workbench resource symlink: {item.relative_to(destination)}")
         if item.is_file():
             relative = item.relative_to(destination)
-            if relative not in tracked_files and relative not in RESOURCE_FILES:
+            if relative not in RESOURCE_FILES:
                 raise ValueError(f"untracked file in workbench resource directory: {relative}")
 
     data = build_output.read_bytes()
+    receipt = json.loads((source / "singlefile" / "package-receipt.json").read_text(encoding="utf-8"))
+    if (receipt["buildMode"] != "same-origin-api-enabled"
+            or receipt["sha256"] != hashlib.sha256(data).hexdigest()
+            or receipt["bytes"] != len(data)
+            or not receipt["embeddedGlbByteIdentical"]
+            or not receipt["embeddedOfficialLogoByteIdentical"]):
+        raise ValueError("final same-origin workbench receipt differs from build bytes")
     if not data.strip():
-        raise ValueError("webui-heritage build output is empty")
+        raise ValueError("prototype-v6 singlefile build output is empty")
     files = [{"path": "index.html", "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}]
     manifest = {
         "schema_version": "sylanne.workbench-assets.v1",

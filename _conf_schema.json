@@ -1,14 +1,190 @@
 {
   "enabled": {
-    "description": "启用 Sylanne 3 完整运行时",
+    "description": "本机运行许可",
     "type": "bool",
     "default": false,
-    "hint": "默认关闭。启用后监听平台全部消息；只有运行时状态为 ready 且身份与权限校验通过时才会处理消息。"
+    "hint": "默认关闭。本机开启且独立 Authority 实际 enabled 为 true 时才允许启动业务。这里不修改 Authority 设置；工作台的安装设置单独控制 Authority 许可并在下次重启生效，均不解除领域 HOLD。"
   },
   "authority_profile": {
-    "description": "管理员 Authority 配置档 ID",
+    "description": "已安装 Authority 配置档",
     "type": "string",
     "default": "default",
-    "hint": "仅填写已由系统管理员预先安装的配置档标识符：1–64 个字符，以字母或数字开头，其余可用字母、数字、点、下划线或连字符。服务器地址、CA、客户端密钥及 Authority 身份由管理员在主机上配置，不要填入聊天插件配置。"
+    "hint": "仅选择已由系统管理员正式登记的 profile ID；填写名称不是授权。服务器地址、证书、密钥和实际安装身份由管理员维护，不能填在这里。未安装时可打开工作台查看安全的安装状态。"
+  },
+  "model_selection": {
+    "description": "WebUI 模型选择意图（版本 1）",
+    "type": "object",
+    "invisible": true,
+    "items": {
+      "version": {
+        "type": "int",
+        "default": 1,
+        "invisible": true
+      },
+      "auxiliary_provider_id": {
+        "type": "string",
+        "default": "",
+        "invisible": true
+      },
+      "overrides": {
+        "type": "object",
+        "invisible": true,
+        "items": {
+          "encode": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "context_reply": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "natural_generation": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "natural_review": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "appraisal": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "d07_cognition": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "contact_generation": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "contact_review": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "life_content": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "life_numeric": {
+            "type": "string",
+            "default": "",
+            "invisible": true
+          }
+        }
+      }
+    }
+  },
+  "llm_provider_id": {
+    "description": "主 LLM 对话模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "从 AstrBot 已启用的对话模型中选择。留空明确表示未选择，不自动采用第一个模型。当前 provider、模型名与配置摘要须匹配正式安装登记的 reply 主模型；不匹配时业务保持阻断，Owner 管理登录仍可使用。此选择不改变已安装的独立工作流、预算或调用资格。"
+  },
+  "webui": {
+    "description": "独立 WebUI 入口",
+    "type": "object",
+    "hint": "保存后重载插件生效。打开插件卡片的 WebUI 查看实际监听状态；Docker 映射 2718:2718。高级设置位于 WebUI。",
+    "items": {
+      "enabled": {
+        "description": "启用独立 WebUI",
+        "type": "bool",
+        "default": true
+      },
+      "bind": {
+        "description": "监听地址",
+        "type": "string",
+        "default": "0.0.0.0",
+        "hint": "0.0.0.0 用于容器端口映射；浏览器使用宿主机地址。"
+      },
+      "port": {
+        "description": "监听端口",
+        "type": "int",
+        "default": 2718,
+        "hint": "Docker 需要映射此容器端口。HTTPS 复用 AstrBot 已配置证书；未配置 TLS 时仅提供前端和监听状态。"
+      }
+    }
+  },
+  "modules": {
+    "description": "D01–D13 模块开关",
+    "type": "object",
+    "hint": "限制本机接收各模块的新工作，保存后重载插件生效。开启仍须满足实际安装、身份、预算和当前性条件；已有工作的终态、结算、恢复及安全维护保留。高级参数在 WebUI 设置。",
+    "items": {
+      "d01": {
+        "description": "D01 主体与人格",
+        "type": "bool",
+        "default": true
+      },
+      "d02": {
+        "description": "D02 身体与需求",
+        "type": "bool",
+        "default": true
+      },
+      "d03": {
+        "description": "D03 世界与情境",
+        "type": "bool",
+        "default": true
+      },
+      "d04": {
+        "description": "D04 情绪与调节",
+        "type": "bool",
+        "default": true
+      },
+      "d05": {
+        "description": "D05 社会关系",
+        "type": "bool",
+        "default": true
+      },
+      "d06": {
+        "description": "D06 记忆系统",
+        "type": "bool",
+        "default": true
+      },
+      "d07": {
+        "description": "D07 注意与认知",
+        "type": "bool",
+        "default": true
+      },
+      "d08": {
+        "description": "D08 动机与执行",
+        "type": "bool",
+        "default": true
+      },
+      "d09": {
+        "description": "D09 对话与表达",
+        "type": "bool",
+        "default": true
+      },
+      "d10": {
+        "description": "D10 生活与主动行为",
+        "type": "bool",
+        "default": true
+      },
+      "d11": {
+        "description": "D11 运行内核与宿主",
+        "type": "bool",
+        "default": true
+      },
+      "d12": {
+        "description": "D12 工作台与交付",
+        "type": "bool",
+        "default": true
+      },
+      "d13": {
+        "description": "D13 短期上下文",
+        "type": "bool",
+        "default": true
+      }
+    }
   }
 }

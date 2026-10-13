@@ -36,12 +36,16 @@ from .first_ingress_v2 import trusted_upper
 
 
 def _read_signed(db, namespace, kind, ref, issuer):
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone()
+    from .domain_background_read_v3 import (background_point_v3,background_json_loads_v3,
+        background_json_matches_v3,background_json_digest_v3,background_typed_original_digest_v3)
+    row=background_point_v3(db,table=TABLE,columns=('producing_operation_id','payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'),key=(*namespace.as_tuple,kind,ref),
+        legacy_reader=lambda:db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone())
     if row is None:
         return None
-    raw = json.loads(row[1])
-    if canonical_serialize(raw) != row[1] or canonical_digest(raw) != row[2]:
+    raw = background_json_loads_v3(row[1])
+    if not background_json_matches_v3(row[1],raw) or background_json_digest_v3(row[1],raw) != row[2]:
         raise ValueError("offline continuation original bytes changed")
     issuer._signer.verify(SIGN_KIND, canonical_serialize((namespace, kind, ref, row[2])), row[3])
     return row[0], raw
@@ -173,6 +177,7 @@ def offline_target_requirements_v1(witness):
 
 def _frame(graph, db, bridge, prepared, scope, authority, owner, observation, now):
     """Fixed finite read plan, including all frozen inputs and absent targets."""
+    from .domain_background_read_v3 import background_graph_head_v3,background_json_loads_v3
     binding = prepared.binding
     if (scope.permit != bridge.permit or scope.pinned_anchor != bridge.after_anchor
             or scope.graph_revision != bridge.before_graph_revision
@@ -187,8 +192,8 @@ def _frame(graph, db, bridge, prepared, scope, authority, owner, observation, no
     atoms = []
     for key in sorted(keys, key=lambda item: item.token):
         graph._GraphCoordinator__store._registry.spec(key.type_name)
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
-        atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])) if row else GraphAtom(key, 0, {}, False))
+        row=background_graph_head_v3(db,binding.namespace,key)
+        atoms.append(GraphAtom(key,row[0],background_json_loads_v3(row[1]),bool(row[2]),_canonical_original=row[1]) if row else GraphAtom(key, 0, {}, False))
     snapshot = GraphSnapshot(tuple(atoms), (scope.graph_epoch,))
     versions = dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
         "AND ref='current' AND kind IN ('scheme','operator','policy')", binding.namespace.as_tuple))
@@ -224,10 +229,11 @@ def adopt_current_offline_tick_v1(graph, bootstrap, *, namespace, prepared_origi
     if type(port) is not V2FencePort:
         raise TypeError("offline adoption needs the actual installed paired port")
     with store._lock:
-        rows = store._db.execute("SELECT original_ref FROM " + TABLE +
-            " WHERE bot=? AND persona=? AND kind='adoption_bridge' "
-            "AND json_extract(payload_json,'$.binding.prepared_original_ref')=?",
-            (*namespace.as_tuple, prepared_original_ref)).fetchall()
+        from .domain_background_read_v3 import background_offline_lifecycle_lookup_v3
+        rows=background_offline_lifecycle_lookup_v3(store._db,namespace,kind='adoption_bridge',field='prepared_original_ref',
+            value=prepared_original_ref,legacy_reader=lambda:store._db.execute("SELECT original_ref FROM " + TABLE +
+                " WHERE bot=? AND persona=? AND kind='adoption_bridge' AND json_extract(payload_json,'$.binding.prepared_original_ref')=?",
+                (*namespace.as_tuple,prepared_original_ref)).fetchall())
         if len(rows) > 1:
             raise ValueError("offline preparation has conflicting adoption identities")
         saved_bridge = _read_signed(store._db, namespace, "adoption_bridge", rows[0][0], issuer) if rows else None
@@ -317,15 +323,17 @@ def adopt_current_offline_tick_v1(graph, bootstrap, *, namespace, prepared_origi
                 receipt = graph._commit_domain_bundle_fenced(bundle, local_lease, in_transaction=True, now_utc=now,
                     v2_write=(before, epoch, finish_id, finish_digest, canonical_serialize(to_wire(gate.permit))),
                     domain_production_issuance_v1=witness)
-                original = record_offline_tick_terminal_after_cas_v1(db, issuer=issuer, staged=staged, graph_receipt=receipt)
-                result = {"schema": "d11.offline-tick-adoption-receipt.v1", "operation_id": receipt.operation_id,
-                    "binding_digest": binding.digest, "terminal_digest": canonical_digest(plain_v1(gate.terminal)),
-                    "bridge_digest": gate.qualification_digest, "original_ref": original.original_ref,
-                    "original_digest": original.original_digest, "graph_receipt_digest": canonical_digest(receipt),
-                    "status": gate.terminal.status, "source_refs": list(staged.source_refs),
-                    "actual_cpu_ms": gate.terminal.actual_cpu_ms}
-                _record_signed(db, binding, "adoption_bridge", offline_bridge_to_wire_v1(gate), issuer)
-                _record_signed(db, binding, "adoption_receipt", result, issuer)
+                from .domain_background_read_v3 import bind_fresh_offline_after_cas_v3
+                with bind_fresh_offline_after_cas_v3(db,receipt):
+                    original = record_offline_tick_terminal_after_cas_v1(db, issuer=issuer, staged=staged, graph_receipt=receipt)
+                    result = {"schema": "d11.offline-tick-adoption-receipt.v1", "operation_id": receipt.operation_id,
+                        "binding_digest": binding.digest, "terminal_digest": canonical_digest(plain_v1(gate.terminal)),
+                        "bridge_digest": gate.qualification_digest, "original_ref": original.original_ref,
+                        "original_digest": original.original_digest, "graph_receipt_digest": canonical_digest(receipt),
+                        "status": gate.terminal.status, "source_refs": list(staged.source_refs),
+                        "actual_cpu_ms": gate.terminal.actual_cpu_ms}
+                    _record_signed(db, binding, "adoption_bridge", offline_bridge_to_wire_v1(gate), issuer)
+                    _record_signed(db, binding, "adoption_receipt", result, issuer)
                 db.commit()
                 committed = True
             except BaseException:
@@ -375,6 +383,7 @@ def validate_offline_adoption_composite_v1(db, *, gate, result, adopted, require
     Signature and independent Authority authentication stay in the installed
     reader above; inventory never grants permission from these structural joins.
     """
+    from .domain_background_read_v3 import background_point_v3,background_history_v3,background_json_loads_v3,background_json_matches_v3
     from .budget import _settlement_binding
     from ..runtime_contracts import CommitReceipt, SnapshotRequirementsV2
     from ..graph_store import GraphStore
@@ -388,19 +397,20 @@ def validate_offline_adoption_composite_v1(db, *, gate, result, adopted, require
         raise ValueError("offline final actual terminal/adopted original differs")
     validate_adopted_offline_tick_history_v1(db, adopted)
     receipt = _decode_json(adopted.graph_receipt_json, CommitReceipt)
-    event = db.execute("SELECT reads,revisions,epoch_revision,invalidated FROM graph_events "
-        "WHERE bot=? AND persona=? AND session=? AND event_id=?",
-        (*namespace.as_tuple, binding.activity_id, operation_id)).fetchone()
-    fence = db.execute("SELECT permit_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,"
-        "finish_request_id,finish_request_digest FROM graph_bundle_fences_v2 WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, operation_id)).fetchone()
+    event=background_point_v3(db,table='graph_events',columns=('reads','revisions','epoch_revision','invalidated'),
+        key_columns=('bot','persona','session','event_id'),key=(*namespace.as_tuple,binding.activity_id,operation_id),legacy_reader=lambda:db.execute(
+            "SELECT reads,revisions,epoch_revision,invalidated FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+            (*namespace.as_tuple,binding.activity_id,operation_id)).fetchone())
+    fence=background_point_v3(db,table='graph_bundle_fences_v2',columns=('permit_json','pre_graph_revision','pre_graph_epoch','post_graph_revision','post_graph_epoch','finish_request_id','finish_request_digest'),
+        key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation_id),legacy_reader=lambda:db.execute(
+            "SELECT permit_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,finish_request_id,finish_request_digest FROM graph_bundle_fences_v2 WHERE bot=? AND persona=? AND operation_id=?",(*namespace.as_tuple,operation_id)).fetchone())
     if (event is None or receipt.read_versions != GraphStore._version_rows(event[0])
             or receipt.write_versions != GraphStore._version_rows(event[1])
             or receipt.invalidated_epochs != (NamespaceEpoch(*namespace.as_tuple, event[2]),)
-            or json.loads(event[3]) != [] or event[2] != gate.before_graph_epoch + 1
-            or fence != (canonical_serialize(to_wire(gate.permit)), gate.before_graph_revision, gate.before_graph_epoch,
-                gate.before_graph_revision + 1, gate.before_graph_epoch + 1, gate.permit.operation_id + ":committed",
-                "sha256:" + canonical_digest((gate.qualification_digest, "committed")))):
+            or background_json_loads_v3(event[3]) != [] or event[2] != gate.before_graph_epoch + 1
+            or fence is None or not background_json_matches_v3(fence[0],to_wire(gate.permit))
+            or fence[1:]!=(gate.before_graph_revision,gate.before_graph_epoch,gate.before_graph_revision+1,
+                gate.before_graph_epoch+1,gate.permit.operation_id+':committed','sha256:'+canonical_digest((gate.qualification_digest,'committed')))):
         raise ValueError("offline final actual event/fence is not the exact atomic bridge")
     actual = None if terminal.status == "unknown" else {"thread_cpu_ms": terminal.actual_cpu_ms}
     settle = db.execute("SELECT digest,lease_id,resolution_binding_json FROM runtime_budget_operations "
@@ -415,9 +425,8 @@ def validate_offline_adoption_composite_v1(db, *, gate, result, adopted, require
         budget_phase="settle", prior_unknown_ref=None, execution_revoked=True)
     cost_write = cost_settlement_graph_write(cost)
     revisions = {version.key.token: version.revision for version in receipt.write_versions}
-    row = db.execute("SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?",
-        (cost_write.key.token, revisions.get(cost_write.key.token))).fetchone()
-    if row != (canonical_serialize(cost_write.value), 1, operation_id):
+    row=background_history_v3(db,cost_write.key.token,revisions.get(cost_write.key.token),columns=('value','valid','event_id'))
+    if row is None or row[1:]!=(1,operation_id) or not background_json_matches_v3(row[0],cost_write.value):
         raise ValueError("offline actual full cost is absent from its composite event")
     expected = {"schema": "d11.offline-tick-adoption-receipt.v1", "operation_id": operation_id,
         "binding_digest": binding.digest, "terminal_digest": canonical_digest(plain_v1(terminal)),

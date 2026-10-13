@@ -41,25 +41,37 @@ ROOT_FILE_ALLOWLIST = (
     "__init__.py",
     "main.py",
     "_runtime_bootstrap.py",
+    "_restart_required.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
     "README.md",
     "LICENSE",
     "logo.png",
+    "pages/workbench/index.html",
     "rewrite/__init__.py",
     "requirements-authority.txt",
     "scripts/alpha1/install_linux.py",
     "scripts/alpha1/authority_linux_service.py",
     "scripts/alpha1/authority_linux_admin.py",
     "scripts/alpha1/authority_linux_control.py",
+    "scripts/alpha1/authority_linux_management.py",
     "scripts/alpha1/authority_linux_maintain.py",
     "scripts/alpha1/stage_linux_package.py",
     "scripts/alpha1/install_linux_cohort_v2.py",
     "scripts/alpha1/linux_startup_shims_v2.py",
+    "scripts/alpha1/root_process_launcher.py",
+    "scripts/alpha1/authority_linux_root_lifetime.py",
     "docs/install/linux-alpha1-lifecycle.md",
+    "docs/install/linux-alpha2-server.md",
+    "docs/install/webui-configuration.md",
 )
-REQUIRED_ROOT_FILES = frozenset(ROOT_FILE_ALLOWLIST)
+# New delivery documentation is included in builds; historical ZIPs retain
+# their original required-member set and are never rewritten.
+REQUIRED_ROOT_FILES = frozenset(ROOT_FILE_ALLOWLIST) - {
+    "docs/install/linux-alpha2-server.md", "docs/install/webui-configuration.md",
+    "scripts/alpha1/authority_linux_root_lifetime.py",
+}
 TARGETS = {
     "windows": "sylanne3_kernel.dll",
     "linux": "libsylanne3_kernel.so",
@@ -628,7 +640,7 @@ def _snapshot_workspace_inventory(root: Path, baseline: dict) -> tuple[dict, dic
     old = {row["path"]: row for row in baseline["files"]}
     paths = set(old) | set(ROOT_FILE_ALLOWLIST)
     roots = ("rewrite/sylanne3", "rewrite/tests", "rewrite/host_tests", "rewrite/tools", "rewrite/native/src",
-             "scripts", "docs", "resources", "webui-src", "webui-heritage/src")
+             "scripts", "docs", "resources", "webui-src", "webui-heritage/src", "workbench-src/prototype-v6")
     excluded = {"node_modules", "__pycache__", ".git", ".venv", "target", "build"}
     for relative in roots:
         directory = root / relative
@@ -1023,8 +1035,8 @@ def _verify_live_backend_catalogue(project_root: Path, payload: dict[str, bytes]
 def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, formal: bool,
                              frozen_test_snapshot: bool = False) -> None:
     """Bind the packaged workbench to W11's self-contained Vue build output."""
-    source = project_root / "webui-heritage"
-    build_output = project_root / "webui-heritage" / "dist" / "index.html"
+    source = project_root / "workbench-src" / "prototype-v6"
+    build_output = project_root / "workbench-src" / "prototype-v6" / "singlefile" / "index.html"
     prefix = "resources/workbench/"
     packaged = {path.removeprefix(prefix): content for path, content in payload.items()
                 if path.startswith(prefix)}
@@ -1035,8 +1047,8 @@ def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, f
         raise ValueError("packaged workbench source or manifest is missing")
     manifest = _strict_json_object(packaged["workbench-manifest.json"], "workbench manifest")
     if (manifest.get("schema_version") != "sylanne.workbench-assets.v1"
-            or manifest.get("source") != "webui-heritage"
-            or manifest.get("build_output") != "webui-heritage/dist/index.html"):
+            or manifest.get("source") != "workbench-src/prototype-v6"
+            or manifest.get("build_output") != "workbench-src/prototype-v6/singlefile/index.html"):
         raise ValueError("packaged workbench manifest has the wrong source")
     rows = manifest.get("files")
     if not isinstance(rows, list) or not rows:
@@ -1046,7 +1058,7 @@ def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, f
         raise ValueError("packaged workbench manifest has duplicate or invalid entries")
     if set(packaged) - {"workbench-manifest.json"} != {"index.html"}:
         raise ValueError("packaged workbench file set differs from the built output")
-    if (source / "dist").is_symlink() or build_output.is_symlink():
+    if (source / "singlefile").is_symlink() or build_output.is_symlink():
         raise ValueError("webui-heritage build output is missing or unsafe")
     relative = "index.html"
     _validate_member_path(relative)
@@ -1185,6 +1197,7 @@ def build_package(
     cpu_features: tuple[str, ...] = (),
     source_handoff_manifest: Path | str | None = None,
     snapshot_alpha1_test: bool = False,
+    alpha2_candidate: bool = False,
     handoff_archive_sha256: str | None = None,
     snapshot_evidence: Path | str | None = None,
 ) -> Path:
@@ -1192,12 +1205,21 @@ def build_package(
 
     root = Path(project_root).resolve()
     from sylanne3.host.alpha1_test_snapshot_v1 import MODE as TEST_MODE, SCHEMA as TEST_SCHEMA, qualify_test_snapshot_v1
-    if snapshot_alpha1_test and (allow_dirty_dev_probe or backend_only_dev_probe or backend_only_alpha1 or backend_alpha1_candidate):
+    from sylanne3.host.alpha1_test_snapshot_v1 import (
+        ALPHA2_MODE, ALPHA2_VERSION, ALPHA2_SCHEMA, ALPHA2_SPECIFICATION,
+        qualify_alpha2_candidate_v1, validate_alpha2_candidate_manifest_v1, validate_test_snapshot_manifest_v1)
+    if snapshot_alpha1_test and alpha2_candidate:
+        raise ValueError("alpha1 snapshot and alpha2 candidate are separate identities")
+    snapshot_build = snapshot_alpha1_test or alpha2_candidate
+    snapshot_version = ALPHA2_VERSION if alpha2_candidate else FORMAL_VERSION
+    if alpha2_candidate:
+        TEST_MODE, TEST_SCHEMA = ALPHA2_MODE, ALPHA2_SCHEMA
+    if snapshot_build and (allow_dirty_dev_probe or backend_only_dev_probe or backend_only_alpha1 or backend_alpha1_candidate):
         raise ValueError("alpha1 test snapshot has its own explicit independent build mode")
-    if snapshot_alpha1_test and (source_handoff_manifest is None or snapshot_evidence is None
+    if snapshot_build and (source_handoff_manifest is None or snapshot_evidence is None
             or type(handoff_archive_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}",handoff_archive_sha256) is None):
         raise ValueError("test snapshot requires actual handoff provenance and scoped verification evidence")
-    candidate_build = backend_alpha1_candidate or snapshot_alpha1_test
+    candidate_build = backend_alpha1_candidate or snapshot_build
     if backend_only_dev_probe and not allow_dirty_dev_probe:
         raise ValueError("backend-only candidate requires non-release dev-probe mode")
     if backend_only_alpha1 and (allow_dirty_dev_probe or backend_only_dev_probe):
@@ -1250,8 +1272,8 @@ def build_package(
         )
     version = _read_version(root)
     formal = not (allow_dirty_dev_probe or candidate_build)
-    if snapshot_alpha1_test and version != FORMAL_VERSION:
-        raise ValueError("alpha1 test snapshot requires actual source metadata version 3.0.0-alpha1")
+    if snapshot_build and version != snapshot_version:
+        raise ValueError("candidate requires its exact source metadata version " + snapshot_version)
     if formal and version != FORMAL_VERSION:
         raise RuntimeError(
             f"formal alpha1 requires metadata version {FORMAL_VERSION!r}; found {version!r}"
@@ -1264,7 +1286,7 @@ def build_package(
         backend_candidate=candidate_build,
     )
     if not (backend_only_dev_probe or backend_only_alpha1 or backend_alpha1_candidate):
-        _verify_workbench_source(root, payload, formal=formal, frozen_test_snapshot=snapshot_alpha1_test)
+        _verify_workbench_source(root, payload, formal=formal, frozen_test_snapshot=snapshot_build)
     if backend_only_alpha1:
         _verify_live_backend_catalogue(root, payload)
     if candidate_build:
@@ -1323,7 +1345,7 @@ def build_package(
     )
     if handoff is not None:
         manifest["source"]["handoff_snapshot"] = handoff
-    if snapshot_alpha1_test:
+    if snapshot_build:
         from sylanne3.runtime_contracts import canonical_digest
         from sylanne3.host.alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
         baseline = _strict_json_object(Path(source_handoff_manifest).read_bytes(), "handoff manifest")
@@ -1342,15 +1364,22 @@ def build_package(
             raise ValueError("test snapshot evidence is unbounded")
         evidence = _strict_json_object(evidence_bytes, "actual test evidence")
         manifest["build_mode"] = TEST_MODE
-        manifest["candidate_scope"] = "alpha1-test"
-        manifest["backend_qualification"] = qualify_test_snapshot_v1(manifest["backend_qualification"])
-        manifest["test_snapshot"] = {"schema": TEST_SCHEMA, "label": "Embodiment-3.0.0-alpha1 test snapshot",
+        manifest["candidate_scope"] = "alpha2-local" if alpha2_candidate else "alpha1-test"
+        manifest["backend_qualification"] = (qualify_alpha2_candidate_v1(manifest["backend_qualification"])
+            if alpha2_candidate else qualify_test_snapshot_v1(manifest["backend_qualification"]))
+        manifest["test_snapshot"] = {"schema": TEST_SCHEMA, "label": ("Sylanne 3.0.0-alpha2 local candidate" if alpha2_candidate
+                else "Embodiment-3.0.0-alpha1 test snapshot"),
             "handoff_archive_sha256": handoff_archive_sha256, "handoff_manifest_sha256": handoff["handoff_manifest_sha256"],
             "source_inventory_sha256": manifest["source_inventory"]["sha256"], "native_sha256": manifest["native"]["sha256"],
             "engineering_source_inventory": workspace_inventory, "engineering_source_delta": workspace_delta,
             "source_delta": {"added": added, "changed": changed, "removed": handoff["deleted_baseline_files"]},
             "verification_evidence": evidence, "verification_evidence_digest": canonical_digest(evidence), "public_release": False}
-        validate_test_snapshot_manifest_v1(manifest)
+        if alpha2_candidate:
+            from copy import deepcopy
+            manifest["test_snapshot"]["specification"] = deepcopy(ALPHA2_SPECIFICATION)
+            validate_alpha2_candidate_manifest_v1(manifest)
+        else:
+            validate_test_snapshot_manifest_v1(manifest)
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         + "\n"
@@ -1362,28 +1391,24 @@ def build_package(
     platform_suffix = f"{target_os}-{target_arch}"
     if target_libc is not None:
         platform_suffix += f"-{target_libc}"
-    if snapshot_alpha1_test:
-        platform_suffix += "-alpha1-test-snapshot"
+    if snapshot_build:
+        platform_suffix += "-alpha2-candidate" if alpha2_candidate else "-alpha1-test-snapshot"
     elif backend_alpha1_candidate:
         platform_suffix += "-backend-alpha1-candidate"
     elif backend_only_dev_probe or backend_only_alpha1:
         platform_suffix += "-backend-only"
     package = destination / f"astrbot_plugin_sylanne-{version}-{platform_suffix}.zip"
-    temporary = package.with_suffix(package.suffix + ".tmp")
-    try:
-        with zipfile.ZipFile(
-            temporary,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=9,
-            strict_timestamps=True,
-        ) as archive:
-            for path, content in sorted(payload.items()):
-                archive.writestr(_zip_info(path), content, compresslevel=9)
-        os.replace(temporary, package)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    # A frozen candidate and an interrupted first build are both originals.
+    # Exclusive creation keeps either intact instead of replacing a ZIP.
+    with zipfile.ZipFile(
+        package,
+        mode="x",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+        strict_timestamps=True,
+    ) as archive:
+        for path, content in sorted(payload.items()):
+            archive.writestr(_zip_info(path), content, compresslevel=9)
 
     verify_package(package)
     return package
@@ -1461,22 +1486,27 @@ def verify_package(package: Path | str) -> None:
                 raise ValueError("ReleaseManifest source identity is invalid")
             mode = manifest.get("build_mode")
             version = manifest.get("package_version")
-            if mode not in {"dev-probe", "formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"} or not isinstance(
+            if mode not in {"dev-probe", "formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"} or not isinstance(
                 version, str
             ):
                 raise ValueError("ReleaseManifest build identity is invalid")
             scope = manifest.get("candidate_scope")
-            if scope is not None and not (mode == "snapshot-alpha1-test" and scope == "alpha1-test") and (scope != "backend-only"
+            if scope is not None and not (mode == "snapshot-alpha1-test" and scope == "alpha1-test") and not (mode == "alpha2-candidate" and scope == "alpha2-local") and (scope != "backend-only"
                                       or any(path.startswith("resources/workbench/") for path in listed)):
                 raise ValueError("ReleaseManifest candidate scope is invalid")
             if mode == "snapshot-alpha1-test":
                 from sylanne3.host.alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
                 validate_test_snapshot_manifest_v1(manifest)
+            elif mode == "alpha2-candidate":
+                if not set(ROOT_FILE_ALLOWLIST).issubset(listed):
+                    raise ValueError("alpha2 candidate is missing required installation entries")
+                from sylanne3.host.alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1
+                validate_alpha2_candidate_manifest_v1(manifest)
             if ((mode == "backend-alpha1-candidate" and scope != "backend-only")
                     or (mode == "formal-alpha1" and scope not in {None, "backend-only"})
                     or (mode == "dev-probe" and scope not in {None, "backend-only"})):
                 raise ValueError("ReleaseManifest mode and candidate scope differ")
-            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"} or _D04_TANH_READOUT_PATH in listed:
+            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"} or _D04_TANH_READOUT_PATH in listed:
                 readout_resources = {
                     member: archive.read(member)
                     for member in (_D04_ASSET_PATH, _D04_TANH_READOUT_PATH)
@@ -1512,7 +1542,7 @@ def verify_package(package: Path | str) -> None:
                     raise ValueError("D04 interval projection policy manifest binding is invalid")
             elif "interval_projection_policy" in manifest:
                 raise ValueError("D04 interval projection policy binding lacks asset")
-            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"} or _D04_JOINT_OUTPUT_POLICY_PATH in listed:
+            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"} or _D04_JOINT_OUTPUT_POLICY_PATH in listed:
                 joint_resources = {
                     member: archive.read(member)
                     for member in (_D04_ASSET_PATH, _D04_TANH_READOUT_PATH,
@@ -1530,12 +1560,12 @@ def verify_package(package: Path | str) -> None:
                     raise ValueError("D04 joint output policy manifest binding is invalid")
             elif "joint_state_output_policy" in manifest:
                 raise ValueError("D04 joint output policy binding lacks asset")
-            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"}:
+            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
                 semantic_path = "resources/catalogue/d04-semantic-mapping-profile.v3.json"
                 if semantic_path not in listed or manifest.get("semantic_mapping_profile") != _d04_semantic_profile_binding(
                         {semantic_path: archive.read(semantic_path)}):
                     raise ValueError("D04 semantic profile manifest binding is invalid")
-            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"}:
+            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
                 if not FORMAL_BACKEND_SOURCE.issubset(listed):
                     raise ValueError("formal alpha1 manifest is missing backend runtime source")
                 if scope == "backend-only":
@@ -1588,15 +1618,16 @@ def verify_package(package: Path | str) -> None:
                     }
                     _validate_formal_resources(
                         resources, backend_only=scope == "backend-only",
-                        backend_candidate=mode in {"backend-alpha1-candidate", "snapshot-alpha1-test"},
+                        backend_candidate=mode in {"backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"},
                     )
-                    if mode in {"backend-alpha1-candidate", "snapshot-alpha1-test"}:
+                    if mode in {"backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
                         qualifier = manifest.get("backend_qualification")
                         schema = qualifier.get("schema") if type(qualifier) is dict else None
                         versions = {
                             "sylanne.backend-alpha1-candidate-qualification.v1": 1,
                             "sylanne.backend-alpha1-candidate-qualification.v2": 2,
                             "sylanne.alpha1-test-snapshot-qualification.v1": 2,
+                            "sylanne.alpha2-local-qualification.v1": 2,
                         }
                         if schema not in versions:
                             raise ValueError("backend candidate qualification schema is invalid")
@@ -1605,6 +1636,9 @@ def verify_package(package: Path | str) -> None:
                         if mode == "snapshot-alpha1-test":
                             from sylanne3.host.alpha1_test_snapshot_v1 import qualify_test_snapshot_v1
                             expected_qualification = qualify_test_snapshot_v1(expected_qualification)
+                        elif mode == "alpha2-candidate":
+                            from sylanne3.host.alpha1_test_snapshot_v1 import qualify_alpha2_candidate_v1
+                            expected_qualification = qualify_alpha2_candidate_v1(expected_qualification)
                         if manifest.get("backend_qualification") != expected_qualification:
                             raise ValueError("backend candidate qualification binding is invalid")
                         if versions[schema] == 2:
@@ -1701,7 +1735,7 @@ def verify_package(package: Path | str) -> None:
                 "bytes": listed[native_path].get("bytes"),
             }:
                 raise ValueError("ReleaseManifest native binding is inconsistent")
-            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"}:
+            if mode in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
                 _verify_native_target(archive.read(native_path), target_os, target_arch)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"invalid ZIP archive: {path}") from exc
@@ -1753,6 +1787,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--backend-alpha1-candidate", action="store_true",
         help="installable backend-only alpha1 development candidate; not a release",
     )
+    parser.add_argument("--alpha2-candidate", action="store_true",
+        help="independent v3 alpha2 local candidate with pinned source and actual scoped evidence")
     parser.add_argument("--snapshot-alpha1-test", action="store_true",
         help="pinned Embodiment alpha1 test snapshot with existing W09 and honest handoff provenance")
     parser.add_argument("--handoff-archive-sha256")
@@ -1777,10 +1813,11 @@ def main(argv: list[str] | None = None) -> int:
             cpu_features=tuple(args.cpu_feature),
             source_handoff_manifest=args.source_handoff_manifest,
             snapshot_alpha1_test=args.snapshot_alpha1_test,
+            alpha2_candidate=args.alpha2_candidate,
             handoff_archive_sha256=args.handoff_archive_sha256,
             snapshot_evidence=args.snapshot_evidence,
         )
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (FileNotFoundError, FileExistsError, RuntimeError, ValueError) as exc:
         print(f"package build rejected: {exc}", file=sys.stderr)
         return 2
     print(

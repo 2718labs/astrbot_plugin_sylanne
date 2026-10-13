@@ -8,11 +8,8 @@ opens the page; it neither proves an Owner principal nor revokes this binding.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-import hashlib
-import hmac
 import re
-import secrets
+from dataclasses import dataclass
 from threading import RLock
 from typing import Callable, Protocol
 
@@ -27,9 +24,7 @@ from .http_transport import (
     PluginRequest, VerifiedOwnerPairing,
 )
 from .service import AuthenticatedSession
-
-
-_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+from .installation_owner_sessions_v1 import InstallationOwnerSessionsV1
 
 
 class OwnerSessionAuthorityPort(Protocol):
@@ -63,10 +58,6 @@ class _Binding:
     session_id: str
 
 
-@dataclass(frozen=True, slots=True)
-class _Pending:
-    username: str
-    challenge: OwnerSessionLoginChallengeV1
 
 
 class BoundOwnerSessions:
@@ -87,7 +78,7 @@ class BoundOwnerSessions:
                  worker: GraphWorker, bootstrap: object,
                  owner_actor: Callable[[OwnerPrincipalV1, NamespaceId], str | None],
                  namespace: NamespaceId, authority_id: str,
-                 installation_id: str, origin: str, operation_status_port=None, package_maintenance_port=None) -> None:
+                 installation_id: str, origin: str, operation_status_port=None, package_maintenance_port=None, identity=None, reply_control_port=None) -> None:
         if (not all(callable(getattr(authority, name, None)) for name in (
                 "begin_owner_session", "accept_owner_session", "describe_owner_session",
                 "logout_owner_session"))
@@ -97,6 +88,13 @@ class BoundOwnerSessions:
                 or not all(type(value) is str and value for value in (
                     authority_id, installation_id, origin))):
             raise TypeError("trusted Owner session dependencies are required")
+        if reply_control_port is not None:
+            from ..host.owner_stop_reply_port_v1 import InstalledOwnerStopReplyPortV1
+            if (type(reply_control_port) is not InstalledOwnerStopReplyPortV1
+                    or reply_control_port.namespace != namespace
+                    or reply_control_port.bundle.installation_policy.installation_id != installation_id):
+                raise TypeError("actual installed Owner reply control port required")
+        self._reply_control_port = reply_control_port
         self._operation_status_port = operation_status_port
         from ..host.d12_package_workbench_port_v2 import InstalledD12PackageWorkbenchPortV2
         if package_maintenance_port is not None and type(package_maintenance_port) is not InstalledD12PackageWorkbenchPortV2:
@@ -111,11 +109,16 @@ class BoundOwnerSessions:
         self._authority_id = authority_id
         self._installation_id = installation_id
         self._origin = origin
-        self._secret = secrets.token_bytes(32)
         self._lock = RLock()
-        self._bindings: dict[bytes, _Binding] = {}
-        self._revoked: set[bytes] = set()
-        self._pending: dict[str, _Pending] = {}
+        self._bindings: dict[bytes, _Binding] = {}  # Only actors proved by a current Graph read.
+        self._identity = (InstallationOwnerSessionsV1(authority=authority,
+            namespace=namespace, authority_id=authority_id, installation_id=installation_id, origin=origin)
+            if identity is None else identity)
+        if (type(self._identity) is not InstallationOwnerSessionsV1
+                or self._identity.namespace != namespace or self._identity.origin != origin
+                or self._identity._installation_id != installation_id
+                or self._identity._authority_id != authority_id):
+            raise ValueError("D12 adapter and Owner identity installation differ")
 
     @property
     def origin(self) -> str:
@@ -125,18 +128,11 @@ class BoundOwnerSessions:
     def namespace(self) -> NamespaceId:
         return self._namespace
 
-    def _key(self, token: str) -> bytes:
-        if type(token) is not str or _TOKEN.fullmatch(token) is None:
-            raise ValueError("invalid Owner session token")
-        return hmac.new(self._secret, token.encode("ascii"), hashlib.sha256).digest()
+    def _key(self, token):
+        return self._identity._key(token)
 
-    def _request_matches(self, request: OwnerSessionLoginRequestV1) -> bool:
-        return (type(request) is OwnerSessionLoginRequestV1
-                and request.authority_id == self._authority_id
-                and request.authority_namespace == self._authority_namespace
-                and request.installation_id == self._installation_id
-                and request.dashboard_origin == self._origin
-                and request.audience == "owner")
+    def _request_matches(self, request):
+        return self._identity._request_matches(request)
 
     async def _current_view(self, principal: OwnerPrincipalV1, *, token: str,
                             request: OwnerSessionLoginRequestV1
@@ -196,119 +192,81 @@ class BoundOwnerSessions:
                 and "workbench_view" in binding.purposes
                 and "owner" in binding.audiences)
 
-    async def begin_signed_login(self, *, request: PluginRequest,
-                                 login_request: OwnerSessionLoginRequestV1
-                                 ) -> OwnerSessionLoginChallengeV1:
-        """Start an Authority challenge for this authenticated Dashboard user."""
-        if not self._origin.startswith("https://"):
-            raise RuntimeError("HTTPS is required for Owner login")
-        username = request.username
-        if (type(username) is not str or not username
-                or request.headers.get("origin") != self._origin
-                or not self._request_matches(login_request)):
-            raise ValueError("authenticated Owner login request is required")
-        challenge = await asyncio.to_thread(
-            self._authority.begin_owner_session,
-            namespace=self._namespace, authority_namespace=self._authority_namespace,
-            request=login_request)
-        if (type(challenge) is not OwnerSessionLoginChallengeV1
-                or challenge.request != login_request):
-            raise RuntimeError("Authority Owner login challenge differs")
-        with self._lock:
-            if len(self._pending) >= 128:
-                self._pending.pop(next(iter(self._pending)))
-            self._pending[challenge.nonce] = _Pending(username, challenge)
-        return challenge
+    async def begin_signed_login(self, *, request, login_request):
+        return await self._identity.begin_signed_login(request=request, login_request=login_request)
 
-    async def complete_signed_login(self, *, request: PluginRequest,
-                                    challenge: OwnerSessionLoginChallengeV1,
-                                    signature: bytes) -> str:
-        """Accept one actual Authority signature, then bind its new token locally."""
-        if not self._origin.startswith("https://"):
-            raise RuntimeError("HTTPS is required for Owner login")
-        username = request.username
-        if (type(username) is not str or not username
-                or request.headers.get("origin") != self._origin
-                or type(challenge) is not OwnerSessionLoginChallengeV1
-                or not self._request_matches(challenge.request)
-                or type(signature) is not bytes):
-            raise ValueError("authenticated signed Owner login is required")
-        with self._lock:
-            pending = self._pending.get(challenge.nonce)
-            if pending is None or pending.username != username or pending.challenge != challenge:
-                raise ValueError("Owner challenge must belong to the same Dashboard user")
-            del self._pending[challenge.nonce]
-        token = await asyncio.to_thread(
-            self._authority.accept_owner_session,
-            namespace=self._namespace, authority_namespace=self._authority_namespace,
+    async def complete_signed_login(self, *, request, challenge, signature):
+        token = await self._identity.complete_signed_login(request=request,
             challenge=challenge, signature=signature)
-        try:
-            described = await asyncio.to_thread(
-                self._authority.describe_owner_session,
-                namespace=self._namespace, authority_namespace=self._authority_namespace,
-                token=token)
-            if described != challenge.request or not self._request_matches(described):
-                raise RuntimeError("accepted Owner session identity differs")
-            actor, view = await self._current_view(
-                described.principal, token=token, request=described)
-            if not self._view_matches(described, actor, view):
-                raise RuntimeError("accepted Owner session differs from current graph grant")
-            key = self._key(token)
-            with self._lock:
-                if key in self._revoked or key in self._bindings:
-                    raise RuntimeError("Owner session was already bound or revoked")
-                self._bindings[key] = _Binding(
-                    username, actor, described, "owner:" + key.hex())
-        except Exception:
-            try:
-                await asyncio.to_thread(
-                    self._authority.logout_owner_session,
-                    namespace=self._namespace, authority_namespace=self._authority_namespace,
-                    request=challenge.request, token=token)
-            except Exception:
-                pass  # The bearer was never returned or bound to W11.
-            raise
+        if await self.resolve_current_owner_session(username=request.username, owner_session_token=token) is None:
+            await self._identity.revoke_bound_session(username=request.username, owner_session_token=token)
+            raise RuntimeError("accepted Owner session differs from current graph grant")
         return token
 
-    async def resolve_current_owner_session(self, *, username: str,
-                                            owner_session_token: str) -> VerifiedOwnerPairing | None:
-        try:
-            key = self._key(owner_session_token)
-        except ValueError:
-            return None
-        with self._lock:
-            binding = self._bindings.get(key)
-        if binding is None or binding.username != username:
+    async def resolve_current_owner_session(self, *, username, owner_session_token):
+        identity = await self._identity.resolve_current_identity(username=username,
+            owner_session_token=owner_session_token)
+        if identity is None:
             return None
         try:
-            actor, view = await self._current_view(
-                binding.request.principal, token=owner_session_token,
-                request=binding.request)
-            if actor != binding.actor_id or not self._view_matches(binding.request, actor, view):
-                return None
-            described = await asyncio.to_thread(
-                self._authority.describe_owner_session,
-                namespace=self._namespace, authority_namespace=self._authority_namespace,
-                token=owner_session_token)
+            actor, view = await self._current_view(identity.request.principal,
+                token=owner_session_token, request=identity.request)
         except (RuntimeError, ValueError, TypeError, PermissionError):
             return None
-        if described != binding.request or not self._request_matches(described):
+        if not self._view_matches(identity.request, actor, view):
             return None
+        if await self._identity.resolve_current_identity(username=username,
+                owner_session_token=owner_session_token) != identity:
+            return None
+        key = self._key(owner_session_token)
+        binding = _Binding(username, actor, identity.request, identity.session_id)
         with self._lock:
-            if self._bindings.get(key) != binding:
-                return None
+            self._bindings[key] = binding
         graph = view.graph_binding
         scope = f"{self._namespace.bot_id}/{self._namespace.persona_id}"
-        session = AuthenticatedSession(
-            binding.actor_id, binding.session_id,
-            {scope: graph.capabilities}, {scope: graph.audiences},
-            {scope: graph.purposes}, host_username=binding.username,
-            owner_session_token=owner_session_token,
-            owner_session_request=binding.request)
-        return VerifiedOwnerPairing(session, described.principal, view.authority_guard)
+        session = AuthenticatedSession(actor, identity.session_id,
+            {scope: graph.capabilities}, {scope: graph.audiences}, {scope: graph.purposes},
+            host_username=username, owner_session_token=owner_session_token,
+            owner_session_request=identity.request)
+        return VerifiedOwnerPairing(session, identity.request.principal, view.authority_guard)
+
+    async def resolve_current_reply_control_session(self, *, username, owner_session_token):
+        """Resolve metadata control directly through current Owner identity and Core."""
+        port = self._reply_control_port
+        if port is None:
+            return None
+        identity = await self._identity.resolve_current_identity(
+            username=username, owner_session_token=owner_session_token)
+        if identity is None:
+            return None
+        try:
+            # The installed inverse actor binding is content-free; keep its
+            # synchronous port on the actual Graph worker, without a read fence.
+            actor = await self._worker.call(
+                lambda _graph: self._owner_actor(identity.request.principal, self._namespace))
+            if type(actor) is not str or not actor:
+                return None
+            scope = "/".join(self._namespace.as_tuple)
+            session = AuthenticatedSession(actor, identity.session_id,
+                {scope: frozenset({"workbench.control"})},
+                {scope: frozenset({"owner"})},
+                {scope: frozenset({"workbench_user_action"})},
+                host_username=username, owner_session_token=owner_session_token,
+                owner_session_request=identity.request)
+            # The actual service verifies the current control grant as well as
+            # signed Owner credentials; the local session DTO is not authority.
+            await port.list_owner_reply_controls_v1(session=session)
+        except (RuntimeError, ValueError, TypeError, PermissionError):
+            return None
+        if await self._identity.resolve_current_identity(
+                username=username, owner_session_token=owner_session_token) != identity:
+            return None
+        return session
 
     async def resolve_current_package_status_session(self,*,username,owner_session_token,operation_id,purpose):
         """Explicit exact-operation auth after package admission closes."""
+        if await self._identity.resolve_current_identity(username=username, owner_session_token=owner_session_token) is None:
+            return None
         from uuid import UUID
         port=self._package_maintenance_port
         if port is None or purpose not in {"audit","workbench_view"}:return None
@@ -318,7 +276,7 @@ class BoundOwnerSessions:
         except (ValueError,TypeError,AttributeError):return None
         with self._lock:
             binding=self._bindings.get(key)
-            if binding is None or binding.username!=username or key in self._revoked:return None
+            if binding is None or binding.username!=username:return None
         if not self._request_matches(binding.request):return None
         scope="/".join(self._namespace.as_tuple)
         session=AuthenticatedSession(binding.actor_id,binding.session_id,
@@ -329,7 +287,9 @@ class BoundOwnerSessions:
             await asyncio.to_thread(port.read_session_package_operation_v2,session=session,scope=scope,operation_id=operation_id)
         except (RuntimeError,ValueError,TypeError,PermissionError,LookupError):return None
         with self._lock:
-            if self._bindings.get(key)!=binding or key in self._revoked:return None
+            if self._bindings.get(key)!=binding:return None
+        if await self._identity.resolve_current_identity(username=username, owner_session_token=owner_session_token) is None:
+            return None
         return session
 
     async def resolve_current_operation_status_session(self, *, username: str,
@@ -339,6 +299,8 @@ class BoundOwnerSessions:
         This is selected by the explicit status action before ordinary session
         resolution. It is never an error fallback or a content-capability lease.
         """
+        if await self._identity.resolve_current_identity(username=username, owner_session_token=owner_session_token) is None:
+            return None
         port = self._operation_status_port
         if (port is None or not callable(getattr(port, "read_session_operation_status_v1", None))
                 or type(original_ref) is not str
@@ -351,7 +313,7 @@ class BoundOwnerSessions:
             return None
         with self._lock:
             binding = self._bindings.get(key)
-            if binding is None or binding.username != username or key in self._revoked:
+            if binding is None or binding.username != username:
                 return None
         if not self._request_matches(binding.request):
             return None
@@ -369,27 +331,20 @@ class BoundOwnerSessions:
         if original.namespace != self._namespace or original.original_ref != original_ref:
             return None
         with self._lock:
-            if self._bindings.get(key) != binding or key in self._revoked:
+            if self._bindings.get(key) != binding:
                 return None
+        if await self._identity.resolve_current_identity(username=username, owner_session_token=owner_session_token) is None:
+            return None
         return session
 
-    async def revoke_bound_session(self, *, username: str, owner_session_token: str) -> bool:
-        """Local logout locks W11 immediately; Authority logout follows."""
+    async def revoke_bound_session(self, *, username, owner_session_token):
         try:
             key = self._key(owner_session_token)
         except ValueError:
             return False
         with self._lock:
-            binding = self._bindings.get(key)
-            if binding is None or binding.username != username:
-                return False
-            del self._bindings[key]
-            self._revoked.add(key)
-        await asyncio.to_thread(
-            self._authority.logout_owner_session,
-            namespace=self._namespace, authority_namespace=self._authority_namespace,
-            request=binding.request, token=owner_session_token)
-        return True
+            self._bindings.pop(key, None)
+        return await self._identity.revoke_bound_session(username=username, owner_session_token=owner_session_token)
 
 
 __all__ = ("BoundOwnerSessions", "OwnerSessionAuthorityPort")

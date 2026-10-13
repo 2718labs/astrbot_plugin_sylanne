@@ -6,7 +6,7 @@ before committing domain proposals, jobs, outbox, and originals together.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
 
@@ -155,26 +155,66 @@ class CurrentOperationFrameV1:
     schema: str = SCHEMA
 
     def __post_init__(self) -> None:
-        if (self.schema != SCHEMA or type(self.envelope) is not CommandEnvelope
-                or type(self.snapshot) is not GraphSnapshot
-                or type(self.owner_guard) is not ProductionOwnerGuardV1
-                or type(self.limits) is not ProductionOperationLimitsV1):
-            raise TypeError("installed production frame fields must be typed")
+        if self.schema != SCHEMA:
+            raise TypeError("installed production frame schema differs")
+        _validate_current_frame_fields_v1(self)
         if (type(self.now_utc) not in {float, int} or not math.isfinite(self.now_utc)
                 or self.now_utc >= self.envelope.deadline_utc):
             raise ValueError("production frame time is invalid or expired")
-        if (type(self.activation_generation) is not int or self.activation_generation < 1
-                or self.activation_generation != self.envelope.authority.activation_generation):
-            raise ValueError("production frame generation differs from its command")
-        _typed(self.query_coverage, ProductionQueryCoverageV1, "query coverage")
-        _typed(self.installed_policy_refs, ProductionPolicyRefV1, "installed policies")
-        _typed(self.observed_originals, ProductionOriginalRefV1, "observed originals")
-        ns = self.envelope.authority.namespace
-        if (len(self.snapshot.atoms) > self.limits.max_graph_heads
-                or any(NamespaceId.from_key(atom.key) != ns for atom in self.snapshot.atoms)
-                or any(page.epoch.namespace != ns for page in self.query_coverage)
-                or any(len(page.row_versions) > self.limits.max_query_rows for page in self.query_coverage)):
-            raise ValueError("production frame exceeds current namespace/read limits")
+
+
+def _validate_current_frame_fields_v1(frame):
+    if (type(frame.envelope) is not CommandEnvelope or type(frame.snapshot) is not GraphSnapshot
+            or type(frame.owner_guard) is not ProductionOwnerGuardV1
+            or type(frame.limits) is not ProductionOperationLimitsV1):
+        raise TypeError("installed production frame fields must be typed")
+    if (type(frame.activation_generation) is not int or frame.activation_generation < 1
+            or frame.activation_generation != frame.envelope.authority.activation_generation):
+        raise ValueError("production frame generation differs from its command")
+    _typed(frame.query_coverage, ProductionQueryCoverageV1, "query coverage")
+    _typed(frame.installed_policy_refs, ProductionPolicyRefV1, "installed policies")
+    _typed(frame.observed_originals, ProductionOriginalRefV1, "observed originals")
+    ns = frame.envelope.authority.namespace
+    if (len(frame.snapshot.atoms) > frame.limits.max_graph_heads
+            or any(NamespaceId.from_key(atom.key) != ns for atom in frame.snapshot.atoms)
+            or any(page.epoch.namespace != ns for page in frame.query_coverage)
+            or any(len(page.row_versions) > frame.limits.max_query_rows for page in frame.query_coverage)):
+        raise ValueError("production frame exceeds current namespace/read limits")
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentOwnerStopProjectionFrameV1(CurrentOperationFrameV1):
+    issuance: object = field(kw_only=True, repr=False, compare=False)
+    schema: str = "d11.owner-stop-projection-frame.v1"
+
+    def __post_init__(self):
+        if self.schema != "d11.owner-stop-projection-frame.v1":
+            raise TypeError("exact Stop projection metadata frame required")
+        _validate_current_frame_fields_v1(self)
+        if type(self.now_utc) not in {float, int} or not math.isfinite(self.now_utc):
+            raise ValueError("Stop projection observation time must be finite")
+        require_owner_stop_projection_frame_v1(self)
+
+
+def require_owner_stop_projection_frame_v1(frame):
+    from .foreground_activity_issuance_v1 import require_owner_stop_projection_issuance_v1
+    if type(frame) is not CurrentOwnerStopProjectionFrameV1:
+        raise TypeError("actual private Stop metadata frame required")
+    issued = frame.issuance
+    observed = require_owner_stop_projection_issuance_v1(issued, issued.graph, issued.scope)
+    authority, identity = frame.envelope.authority, frame.envelope.identity
+    if (identity.phase != "owner_stop_reply_v1" or authority.issuer_domain != "d11"
+            or identity.operation_id != observed.initial_original.operation_id
+            or authority.namespace != observed.request.namespace or authority.actor != observed.owner_actor_ref
+            or frame.activation_generation != observed.permit.generation
+            or frame.owner_guard != ProductionOwnerGuardV1(observed.owner_grant_ref,
+                observed.owner_grant_revision, observed.owner_grant_digest,
+                observed.owner_authorization.authorization_head.removeprefix("sha256:"))
+            or frame.snapshot.versions != observed.read_versions
+            or len(frame.snapshot.epochs) != 1 or frame.snapshot.epochs[0] != issued.scope.graph_epoch
+            or set(frame.envelope.input_refs) != {observed.initial_original.original_ref}):
+        raise ValueError("Stop metadata frame changed its actual private Owner/permit/read scope")
+    return observed
 
 
 @dataclass(frozen=True, slots=True)

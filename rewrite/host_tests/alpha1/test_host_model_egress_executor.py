@@ -60,6 +60,86 @@ from sylanne3.runtime.original_model_result_context import OriginalModelResultCo
 from sylanne3.runtime_contracts import InstallationGrantV2, canonical_digest
 
 
+def _numeric_installed_adapter(host):
+    from sylanne3.host.model_workflows_v3 import AdminModelWorkflowsV3
+    from sylanne3.model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION
+    bundle, encoder, replier = host.v2_adapters()
+    numeric = replace(encoder._admin_model, work_kind=WORK_KIND, template_version=TEMPLATE_VERSION)
+    policy = replace(bundle.installation_policy, root_grant=replace(bundle.installation_policy.root_grant,
+        allowed_work_kinds=(*bundle.installation_policy.root_grant.allowed_work_kinds, WORK_KIND)))
+    bundle = replace(bundle, installation_policy=policy,
+        model_workflows=AdminModelWorkflowsV3(3, encoder._admin_model, replier._admin_model, life_numeric=numeric))
+    adapter = AstrBotModelProvider(context=host.context, host_loop=host.adapter._host_loop,
+        trusted_umo=model_fixture.UMO, descriptor=replace(host.descriptor, purposes=frozenset({'consolidation'})),
+        admin_model=numeric, installation_bundle=bundle)
+    return bundle, adapter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mutation', ('installed', 'equal_copy', 'unknown', 'foreign_bundle', 'wrong_config'))
+async def test_life_numeric_executor_requires_exact_installed_slot(mutation):
+    host = model_fixture.AstrBotModelCallTests(methodName='test_one_http_request_on_host_loop_with_usage')
+    await host.asyncSetUp()
+    try:
+        bundle, adapter = _numeric_installed_adapter(host)
+        _intent, _anchor, _permit, _admission, grant, authority = fixture_values(host, model_fixture.call_request())
+        if mutation == 'equal_copy':
+            adapter._admin_model = replace(adapter._admin_model)
+        elif mutation == 'unknown':
+            adapter._admin_model = replace(adapter._admin_model, work_kind='unknown.numeric')
+        elif mutation == 'foreign_bundle':
+            bundle = replace(bundle)
+        elif mutation == 'wrong_config':
+            from sylanne3.host.authority_profile import installed_model_config_ref
+            model = adapter._admin_model
+            adapter._admin_model = replace(model, provider_config_digest='f' * 64,
+                provider_config_ref=installed_model_config_ref(model.provider_id, model.model_id, 'f' * 64))
+        if mutation == 'installed':
+            executor = HostModelEgressExecutor(authority=authority, bundle=bundle, grant=grant, adapter=adapter)
+            assert executor._adapter._admin_model is bundle.model_workflows.life_numeric
+            assert executor._bundle is adapter._installation_bundle
+        else:
+            with pytest.raises(ValueError):
+                HostModelEgressExecutor(authority=authority, bundle=bundle, grant=grant, adapter=adapter)
+        assert host.requests == []
+    finally:
+        await host.asyncTearDown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mutation', ('installed', 'unknown_slot', 'wrong_kind', 'wrong_purpose', 'wrong_template', 'wrong_config'))
+async def test_v3_numeric_profile_decodes_only_the_formal_contract(mutation):
+    from dataclasses import fields
+    from sylanne3.host.model_workflows_v3 import AdminModelWorkflowsV3, model_workflows_v3_from_payload
+    host = model_fixture.AstrBotModelCallTests(methodName='test_one_http_request_on_host_loop_with_usage')
+    await host.asyncSetUp()
+    try:
+        bundle, _adapter = _numeric_installed_adapter(host)
+        raw = {'version': 3}
+        for name in ('encode', 'reply', 'life_numeric'):
+            model = getattr(bundle.model_workflows, name)
+            row = {field.name: getattr(model, field.name) for field in fields(model)}
+            row.update(audiences=list(model.audiences), required_capabilities=list(model.required_capabilities),
+                       quote_ceiling=dict(model.quote_ceiling))
+            raw[name] = row
+        if mutation == 'unknown_slot':
+            raw['unknown_numeric'] = raw['life_numeric']
+        elif mutation != 'installed':
+            field = {'wrong_kind': 'work_kind', 'wrong_purpose': 'purpose', 'wrong_template': 'template_version',
+                     'wrong_config': 'provider_config_ref'}[mutation]
+            raw['life_numeric'][field] = 'wrong'
+        if mutation == 'installed':
+            decoded = model_workflows_v3_from_payload(raw)
+            assert type(decoded) is AdminModelWorkflowsV3 and decoded == bundle.model_workflows
+            assert decoded.life_numeric is not bundle.model_workflows.life_numeric
+        else:
+            with pytest.raises(ValueError):
+                model_workflows_v3_from_payload(raw)
+        assert host.requests == []
+    finally:
+        await host.asyncTearDown()
+
+
 def fixture_values(host, request):
     original = model_intent(
         call_id=request.call_id, operation_id=request.identity.operation_id,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from ..host.owner_issue_orchestration import FirstOwnerIssueOrchestrator
 from ..host.owner_revoke_orchestration import OwnerRevokeOrchestrator
 from ..host.v2_fence_port import V2FencePort

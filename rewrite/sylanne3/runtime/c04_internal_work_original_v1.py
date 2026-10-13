@@ -7,6 +7,7 @@ resource settlement.
 
 from __future__ import annotations
 
+
 from dataclasses import asdict, dataclass
 import json
 import re
@@ -68,7 +69,18 @@ class C04InternalWorkPreparedV1:
         return canonical_digest(asdict(self))
 
 
-def _transaction(db: sqlite3.Connection) -> None:
+def _transaction(db: sqlite3.Connection, *, original_read=False) -> None:
+    if original_read and type(db) is not sqlite3.Connection:
+        from ..authority_service.c09_paged_recovery_facts_v2 import _BoundedReadConnectionV2,_C09ReadonlyPointMeterV3
+        from .c09_paged_sql_v2 import current_c09_sql_meter_v2,C09SqlByteMeterV2
+        if type(db) is not _BoundedReadConnectionV2 or type(db.db) is not sqlite3.Connection or not db.db.in_transaction:
+            raise RuntimeError("actual bounded C09 original read transaction required")
+        actual=current_c09_sql_meter_v2()
+        borrowed=db.meter.parent if type(db.meter) is _C09ReadonlyPointMeterV3 else db.meter
+        if type(actual) is not C09SqlByteMeterV2 or borrowed is not actual:
+            raise RuntimeError("C09 original read must borrow the actual active caller quantum")
+        borrowed.require_available(0)
+        return
     if type(db) is not sqlite3.Connection or not db.in_transaction:
         raise RuntimeError("W01 BEGIN IMMEDIATE transaction required")
 
@@ -121,15 +133,16 @@ def read_c04_internal_work_prepared_v1(
     db: sqlite3.Connection, namespace: NamespaceId, operation_id: str,
 ) -> C04InternalWorkPreparedV1 | None:
     """Reread exact typed bytes; W01 must separately check current heads."""
-    _transaction(db)
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    _transaction(db, original_read=True)
     if type(namespace) is not NamespaceId or type(operation_id) is not str:
         raise TypeError("typed namespace and operation identity required")
-    row = db.execute(
+    row = _producer_original_point_v3(db, table='graph_c04_internal_work_prepared_v1', columns=('binding_digest', 'prepared_digest', 'prepared_json'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, operation_id)), legacy_reader=lambda: db.execute(
         "SELECT binding_digest,prepared_digest,prepared_json "
         "FROM graph_c04_internal_work_prepared_v1 "
         "WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, operation_id),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         return None
     try:

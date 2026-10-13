@@ -11,7 +11,7 @@ import json
 from ..domains.d08 import GoalExecutionProvider
 from ..domains.d09 import ClaimKind, ClaimUse
 from ..domains.d09.natural_batch import (
-    NATURAL_BATCH_SCHEMA_V2, validate_natural_verified_batch_value_v2,
+    NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3, validate_natural_verified_batch_value, natural_batch_segment_count,
 )
 from ..graph_store import GraphStore
 from ..graph_types import AtomKey, GraphWrite
@@ -49,19 +49,28 @@ def _graph_stamp(db, namespace: NamespaceId):
 
 
 def recover_natural_dispatch_candidate_in_transaction_v2(
-        db, namespace: NamespaceId, operation_id: str,
+        db, namespace: NamespaceId, operation_id: str, *, prepared_history=None,
 ) -> NaturalDispatchCandidateRecoveryV2 | None:
     """Rebuild four V2 writes from the original event and immutable history."""
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise NaturalDispatchCurrentHold("pinned graph transaction is required")
-    row = db.execute(
-        "SELECT activity_id,effect_id,receipt_json FROM "
-        "graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    data = json.loads(row[2]).get("natural_dispatch_candidate")
+    if prepared_history is None:
+        row = db.execute(
+            "SELECT activity_id,effect_id,receipt_json FROM "
+            "graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        data = json.loads(row[2]).get("natural_dispatch_candidate")
+    else:
+        from .dispatch_initial_source_read_v3 import PreparedNaturalHistoryV3
+        if type(prepared_history)is not PreparedNaturalHistoryV3:raise TypeError('actual private natural history required')
+        metadata=db.execute('SELECT activity_id,effect_id FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',
+            (*namespace.as_tuple,operation_id)).fetchone()
+        if metadata is None:return None
+        row=(*metadata,None)
+        data=prepared_history.receipt_v3(db,namespace,operation_id).get("natural_dispatch_candidate")
     if data is None:
         return None
     if (type(data) is not dict
@@ -87,18 +96,24 @@ def recover_natural_dispatch_candidate_in_transaction_v2(
                 or item[1] < 1 or revisions.get(item[0]) != item[1]):
             raise NaturalDispatchCurrentHold("natural dispatch write version differs")
         key = AtomKey.from_token(item[0])
-        if key.type_name != types[position]:
+        if (key.type_name != types[position]
+                and not (position == 3 and key.type_name == NATURAL_BATCH_SCHEMA_V3)):
             raise NaturalDispatchCurrentHold("natural dispatch graph type differs")
-        history = db.execute(
-            "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
-            "AND event_bot=? AND event_persona=? AND event_session=? "
-            "AND event_id=?",
-            (item[0], item[1]) + namespace.as_tuple + (row[0], operation_id),
-        ).fetchone()
+        if prepared_history is None:
+            history = db.execute(
+                "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
+                "AND event_bot=? AND event_persona=? AND event_session=? "
+                "AND event_id=?",
+                (item[0], item[1]) + namespace.as_tuple + (row[0], operation_id),
+            ).fetchone()
+        else:
+            from .dispatch_initial_source_read_v3 import PreparedNaturalHistoryV3
+            if type(prepared_history)is not PreparedNaturalHistoryV3:raise TypeError('actual private natural history required')
+            history=prepared_history.read_history_json_v3(db,namespace,item[0],item[1],row[0],operation_id)
         if history is None or history[1] != 1:
             raise NaturalDispatchCurrentHold("natural dispatch history is absent")
         writes.append(("d09" if position == 3 else "d08",
-                       GraphWrite(key, json.loads(history[0]))))
+                       GraphWrite(key, json.loads(history[0])if prepared_history is None else history[0])))
     action = next(spec for spec in GoalExecutionProvider().register_types()
                   if spec.name == "d08.action_intent.v1").validator(
                       writes[0][1].value)
@@ -130,7 +145,7 @@ def recover_natural_dispatch_candidate_in_transaction_v2(
 
 
 def read_current_natural_dispatch_segment_in_transaction_v2(
-        db, namespace: NamespaceId, request, *, now_utc: float,
+        db, namespace: NamespaceId, request, *, now_utc: float, prepared_inventory=None,
 ) -> tuple[GraphDispatchTextSegmentV1, NaturalDispatchCandidateEvidenceV2] | None:
     """Revalidate the committed batch and current scoped reads in one snapshot."""
     from ..dispatch_runtime import DispatchRequest
@@ -151,39 +166,52 @@ def read_current_natural_dispatch_segment_in_transaction_v2(
         return None
     receipt = load_admission(db, namespace, row[0])
     recovered = recover_natural_dispatch_candidate_in_transaction_v2(
-        db, namespace, request.operation_id)
+        db, namespace, request.operation_id,
+        prepared_history=None if prepared_inventory is None else prepared_inventory.natural_history)
     if receipt is None or recovered is None:
         raise NaturalDispatchCurrentHold("natural dispatch admission or batch is absent")
     admission, evidence = receipt.admission, recovered.evidence
     if (admission.request_digest != canonical_digest(request)
             or admission.candidate_digest != evidence.digest
             or admission.batch_digest != evidence.batch_digest
-            or admission.segment_index != 0
+            or admission.segment_index != request.segment_index
             or request.segment_index != 0 or request.segment_count != 1
             or admission.payload_digest != request.payload_digest
             or admission.dispatch_generation != request.dispatch_generation
             or admission.graph_incarnation != recovered.graph_incarnation
             or receipt.graph_epoch != recovered.graph_epoch
             or request.payload_ref != natural_dispatch_segment_payload_ref_v2(
-                evidence.batch_ref, 0)
+                evidence.batch_ref, request.segment_index)
             or (request.operation_id, request.effect_id,
                 request.payload_digest) != (
                 evidence.operation_id, evidence.effect_id,
                 evidence.payload_digest)):
         raise NaturalDispatchCurrentHold("natural dispatch admission differs")
     batch_ref, batch_revision = recovered.write_versions[3]
-    batch_row = db.execute(
-        "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
-        "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-        (batch_ref, batch_revision) + namespace.as_tuple + (
-            request.activity_id, request.operation_id),
-    ).fetchone()
+    if prepared_inventory is None:
+        batch_row = db.execute(
+            "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
+            "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
+            (batch_ref, batch_revision) + namespace.as_tuple + (
+                request.activity_id, request.operation_id),
+        ).fetchone()
+    else:
+        batch_row = prepared_inventory.natural_history.read_history_json_v3(db,namespace,batch_ref,batch_revision,request.activity_id,request.operation_id)
     if batch_row is None or batch_row[1] != 1:
         raise NaturalDispatchCurrentHold("committed natural batch is unavailable")
-    batch = json.loads(batch_row[0])
-    validate_natural_verified_batch_value_v2(batch)
+    batch = json.loads(batch_row[0]) if prepared_inventory is None else batch_row[0]
+    validate_natural_verified_batch_value(batch)
+    from .natural_dispatch_claim_v2 import (
+        NaturalDispatchClaimHold, require_natural_action_uncancelled_v3,
+    )
+    try:
+        require_natural_action_uncancelled_v3(db, namespace, evidence, request.cancel_epoch)
+    except NaturalDispatchClaimHold as exc:
+        raise NaturalDispatchCurrentHold(str(exc)) from exc
     segment = batch["segment"]
     if (batch_ref != evidence.batch_ref
+            or request.segment_index != batch["segment"]["position"]
+            or request.segment_count != natural_batch_segment_count(batch)
             or batch["batch_digest"] != evidence.batch_digest
             or batch["paid_review"]["receipt_digest"]
                != evidence.paid_review_digest
@@ -224,7 +252,8 @@ def read_current_natural_dispatch_segment_in_transaction_v2(
     if len(parent_rows) != 1:
         raise NaturalDispatchCurrentHold("natural original scoped proof is absent")
     original = read_original_preparation(
-        db, namespace, parent_rows[0][0], "generation")
+        db, namespace, parent_rows[0][0], "generation",
+        prepared_originals=None if prepared_inventory is None else prepared_inventory.natural_originals)
     if (original is None or original.state != "terminal"
             or original.seal.original_operation_id !=
                evidence.generation_original_operation_id):
@@ -232,7 +261,7 @@ def read_current_natural_dispatch_segment_in_transaction_v2(
     try:
         proof = read_original_scoped_query_proof_v2(db, original)
         assert_natural_scoped_query_current_v2(
-            db, proof, now_utc=now_utc)
+            db, proof, now_utc=now_utc,prepared_inventory=prepared_inventory)
     except (NaturalScopedQueryHold, ValueError) as exc:
         raise NaturalDispatchCurrentHold(
             "natural social or source predicate changed") from exc

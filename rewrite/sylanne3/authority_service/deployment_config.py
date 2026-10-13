@@ -9,6 +9,10 @@ policy and verifier implementations when it constructs this object.
 from __future__ import annotations
 
 from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -102,18 +106,23 @@ class InstalledNaturalModelAuthorityV2:
     """Administrator-installed model signing authority and exact mTLS reader."""
 
     d11_issuer: D11BudgetJobIssuer
-    workflows: AdminModelWorkflowsV2
+    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6
     observer_peer: tuple[str, str]
     installation_bundle: object | None = None
 
     def __post_init__(self) -> None:
         if (type(self.d11_issuer) is not D11BudgetJobIssuer
-                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or self.workflows.natural_generation is None
                 or self.workflows.natural_review is None
                 or type(self.observer_peer) is not tuple
                 or len(self.observer_peer) != 2):
             raise AuthorityUnavailable("installed natural model authority is incomplete")
+        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+            from ..host.authority_profile import AdminInstallationBundle
+            if (type(self.installation_bundle) is not AdminInstallationBundle
+                    or self.installation_bundle.model_workflows is not self.workflows):
+                raise AuthorityUnavailable("V4 model Authority needs its exact installed bundle/workflow objects")
         if self.installation_bundle is not None:
             from ..host.authority_profile import AdminInstallationBundle
             if (type(self.installation_bundle) is not AdminInstallationBundle
@@ -207,6 +216,7 @@ class AuthorityDeploymentConfig:
     c09_storage_v1: InstalledC09AuthorityV1 | None = None
     c09_maintenance_factory: Callable | None = None
     c09_storage_v2: InstalledC09AuthorityV2 | None = None
+    d13_counter_assets_v1: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for name in ("authority_db", "deletion_db", "graph_db", "instance_lock"):
@@ -317,6 +327,19 @@ class AuthorityDeploymentConfig:
                 raise AuthorityUnavailable("installed C04 V3 namespace or pin differs")
             object.__setattr__(self, "c04_installations_v3",
                                MappingProxyType(dict(c04_v3)))
+        counter_assets = self.d13_counter_assets_v1
+        if counter_assets is not None:
+            from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV1
+            if not isinstance(counter_assets, Mapping) or not counter_assets:
+                raise AuthorityUnavailable("installed D13 counter assets require exact namespace coverage")
+            for namespace, item in counter_assets.items():
+                if (namespace not in namespaces or type(item) is not InstalledD13CounterAssetsV1
+                        or not any(mapped == namespace and graph_ns == item.namespace
+                            and self.installations_v2[(peer, profile)].installation_id == item.installation_id
+                            and self.installations_v2[(peer, profile)].manifest_digest == item.package_manifest_sha256
+                            for (peer, profile, graph_ns), mapped in self.namespace_bindings_v2.items())):
+                    raise AuthorityUnavailable("installed D13 counter assets cross namespace, installation or package")
+            object.__setattr__(self, "d13_counter_assets_v1", MappingProxyType(dict(counter_assets)))
         if self.c09_storage_v2 is not None:
             if (type(self.c09_storage_v2) is not InstalledC09AuthorityV2
                     or self.c09_storage_v1 is not None
@@ -382,7 +405,7 @@ def load_installed_asset_config_v1(
         "bind_host", "bind_port", "tls", "execution_journals",
         "installations_v2", "namespace_bindings_v2", "reverse_handoff",
     }
-    optional_c04_fields = {"c04_installations_v2", "c04_installations_v3", "c09_storage_v1", "c09_storage_v2"}
+    optional_c04_fields = {"c04_installations_v2", "c04_installations_v3", "c09_storage_v1", "c09_storage_v2", "d13_counter_assets_v1"}
     if (type(value) is not dict or not fields <= set(value) or
             not set(value).issubset(fields | optional_c04_fields)):
         raise AuthorityUnavailable("installed asset manifest fields differ")
@@ -479,6 +502,19 @@ def load_installed_asset_config_v1(
             c04_v3[namespace] = InstalledC04AuthorityV3(
                 row["package_root"], row["formal_manifest_sha256"],
                 row["component_key_path"])
+    counter_assets = None
+    if "d13_counter_assets_v1" in manifest:
+        from dataclasses import fields as dataclass_fields
+        from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV1
+        counter_assets = {}
+        required = {field.name for field in dataclass_fields(InstalledD13CounterAssetsV1)}
+        for raw in records("d13_counter_assets_v1"):
+            row = _record(raw, required | {"authority_namespace"}, "D13 counter assets")
+            namespace = row.pop("authority_namespace")
+            graph_ns = _record(row["namespace"], {"bot_id", "persona_id"}, "D13 Graph namespace")
+            if type(namespace) is not str or namespace in counter_assets:
+                raise AuthorityUnavailable("installed D13 counter namespace repeats")
+            counter_assets[namespace] = InstalledD13CounterAssetsV1(**{**row, "namespace": NamespaceId(**graph_ns)})
     c09 = None
     c09_v2 = None
     if "c09_storage_v1" in manifest and "c09_storage_v2" in manifest:
@@ -506,7 +542,8 @@ def load_installed_asset_config_v1(
         publisher_manifest_verifier, utc_clock,
         local_administrator_credential, c04_installations_v2=c04,
         c04_installations_v3=c04_v3, c09_storage_v1=c09,
-        c09_maintenance_factory=c09_maintenance_factory, c09_storage_v2=c09_v2)
+        c09_maintenance_factory=c09_maintenance_factory, c09_storage_v2=c09_v2,
+        d13_counter_assets_v1=counter_assets)
 
 
 __all__ = ("ASSET_MANIFEST_SCHEMA", "AuthorityCoreVerifiers",

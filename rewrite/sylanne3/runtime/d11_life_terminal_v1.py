@@ -1,4 +1,7 @@
 """W01 terminal bundle from an authenticated installed Life observation."""
+
+from .d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
+from .d11_life_contract_v1 import D11DraftExecutionBindingV1, life_work_kind_v1
 from dataclasses import dataclass
 import json
 import weakref
@@ -9,9 +12,10 @@ from ..domains.d08.execution import ActionOutcome, GoalExecutionProvider, _decod
 from ..domains.d08.production_operations_v1 import observed_action_outcome_key_v1
 from ..graph_types import AtomKey, GraphWrite, Owner, owner_grant_key
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1, production_read_plan_v1
-from .d11_life_contract_v1 import (D11LifeClaimV1, D11LifeTerminalV1, WORK_KIND, life_to_wire_v1,
+from .d11_life_contract_v1 import (D11LifeExecutionBindingV1, D11LifeClaimV1, D11LifeTerminalV1, WORK_KIND, life_to_wire_v1,
     life_adoption_operation_id_v1, life_job_result_binding_v1, validate_life_job_result_binding_v1)
 from .d11_life_preparation_v1 import D11LifePreparedV1, read_prepared_life_v1, life_ids_from_binding_v1, TABLE, SIGN_KIND, _record, _read
+from .d11_life_preparation_v1 import D11DraftPreparedV1
 from .d11_life_source_note_v1 import verify_durable_life_artifact_v1, mark_life_artifact_adopted_v1
 from .d11_life_graph_types_v1 import life_fact_writes_v1, life_role_segment_key_v1
 from .budget import settle_budget
@@ -59,12 +63,12 @@ def require_observed_life_terminal_v1(observation):
 
 def observe_current_life_terminal_v1(port, prepared):
     from ..host.d11_life_port_v1 import InstalledD11LifePortV1
-    if type(port) is not InstalledD11LifePortV1 or type(prepared) is not D11LifePreparedV1:
+    if type(port) is not InstalledD11LifePortV1 or type(prepared) not in {D11LifePreparedV1, D11DraftPreparedV1}:
         raise TypeError("actual installed Life port and signed prepared original required")
     claim, terminal = port.read_d11_life_original_v1(binding=prepared.binding)
     if claim is None or terminal is None:
         raise MissingProductionOriginalV1("actual_independent_life_terminal_after_once_claim")
-    if (type(claim) is not D11LifeClaimV1 or type(terminal) is not D11LifeTerminalV1
+    if (type(claim) not in LIFE_CLAIM_TYPES or type(terminal) not in LIFE_TERMINAL_TYPES
             or terminal.claim != claim or terminal.binding != prepared.binding or terminal.payload.prepared_digest != prepared.digest):
         raise ValueError("Life paired actual terminal differs from frozen preparation")
     return ObservedLifeTerminalV1(_KEY, port, prepared, claim, terminal)
@@ -144,13 +148,17 @@ def stage_current_life_terminal_in_transaction_v1(db, *, frame, request, install
     action, _ = _plan_current(db, read, p.plan)
     from .d08_life_admission_v1 import require_current_life_action_admission_v1
     require_current_life_action_admission_v1(db,prepared=p,reader=installed_readers.admission_reader,now_utc=frame.now_utc,frame=frame)
-    artifact = verify_durable_life_artifact_v1(db, p, digest=terminal.payload.artifact_digest,
-        length=terminal.payload.artifact_length) if terminal.status == "completed" else None
+    if terminal.status == "completed" and type(b) is D11DraftExecutionBindingV1:
+        from .d11_life_adoption_v1 import require_draft_terminal_readback_v1
+        artifact = require_draft_terminal_readback_v1(prepared=p, terminal=terminal)
+    else:
+        artifact = verify_durable_life_artifact_v1(db, p, digest=terminal.payload.artifact_digest,
+            length=terminal.payload.artifact_length) if terminal.status == "completed" else None
     job = get_job(db, b.job_id)
     job_atom = read.head(db, job_graph_write(job).key, required=True)
     if (job_atom.revision != p.job_projection_revision or canonical_serialize(job_atom.value) != p.job_projection_json
             or (job.operation_id, job.activity_id, job.effect_id, job.work_kind, job.fence, job.cancel_epoch) !=
-                (b.operation_id, b.activity_id, b.effect_id, WORK_KIND, b.job_fence, b.job_cancel_epoch)):
+                (b.operation_id, b.activity_id, b.effect_id, life_work_kind_v1(b), b.job_fence, b.job_cancel_epoch)):
         raise ValueError("Life adopted original job differs from actual claim")
     fact_writes = life_fact_writes_v1(p, observation.claim, terminal, artifact)
     job_result = None
@@ -160,7 +168,7 @@ def stage_current_life_terminal_in_transaction_v1(db, *, frame, request, install
             raise ValueError("Life result artifact is not its first immutable version")
         job_result = life_job_result_binding_v1(terminal,
             artifact_graph_digest=canonical_digest(artifact_write.value))["result_ref"]
-    actual = None if terminal.status == "unknown" else {"thread_cpu_ms": terminal.actual_cpu_ms}
+    actual = None if terminal.actual_cpu_ms is None else {"thread_cpu_ms": terminal.actual_cpu_ms}
     settle_budget(db, b.parent_budget_lease_ref, b.reservation_operation_id, b.reservation_digest, actual, execution_revoked=True)
     if job.phase != "running" or (job.lease_holder, job.lease_expires_utc) != (b.job_holder, b.job_lease_expires_utc):
         raise ValueError("Life actual consumed worker lease changed")
@@ -217,7 +225,8 @@ def record_life_terminal_after_cas_v1(db, *, issuer, staged, graph_receipt):
             artifact_graph_digest=canonical_digest(artifact_write.value), artifact_revision=versions[b.artifact_ref])
         validate_life_job_result_members_v1(job_result_binding, terminal=staged.terminal,
             artifact_value=artifact_write.value, artifact_revision=versions[b.artifact_ref], job_value=job_write.value)
-        mark_life_artifact_adopted_v1(db, b, graph_receipt.operation_id)
+        if type(b) is D11LifeExecutionBindingV1:
+            mark_life_artifact_adopted_v1(db, b, graph_receipt.operation_id)
     value = {"schema": "d11.adopted-life-original.v4", "namespace": plain_v1(b.namespace),
         "result_ref": b.artifact_ref, "producing_operation_id": graph_receipt.operation_id,
         "job_result_binding": job_result_binding,
@@ -238,7 +247,7 @@ def validate_life_job_result_members_v1(value, *, terminal, artifact_value, arti
     from .d11_types import RuntimeJobValue
     b = terminal.binding
     result_ref = validate_life_job_result_binding_v1(value, terminal=terminal)
-    artifact_binding = validate_life_graph_value_v1("d11.life_artifact.v1", artifact_value)
+    artifact_binding = validate_life_graph_value_v1(AtomKey.from_token(b.artifact_ref).type_name, artifact_value)
     if (artifact_binding != b or value != life_job_result_binding_v1(terminal,
             artifact_graph_digest=canonical_digest(artifact_value), artifact_revision=artifact_revision)
             or (artifact_value["artifact_digest"], artifact_value["artifact_length"]) !=
@@ -248,7 +257,7 @@ def validate_life_job_result_members_v1(value, *, terminal, artifact_value, arti
     if ((job.bot_id, job.persona_id, job.activity_id, job.effect_id, job.job_id, job.operation_id,
             job.phase, job.work_kind, job.fence, job.cancel_epoch, job.result_ref, job.usage_digest) !=
             (*b.namespace.as_tuple, b.activity_id, b.effect_id, b.job_id, b.operation_id,
-                "completed", WORK_KIND, b.job_fence, b.job_cancel_epoch, result_ref,
+                "completed", life_work_kind_v1(b), b.job_fence, b.job_cancel_epoch, result_ref,
                 canonical_digest({"thread_cpu_ms": terminal.actual_cpu_ms}))):
         raise ValueError("Life result mapping differs from its actual job member")
     return result_ref
@@ -267,7 +276,7 @@ def validate_current_life_job_result_v1(job, *, adopted):
     if ((job.bot_id, job.persona_id, job.activity_id, job.effect_id, job.job_id, job.operation_id,
             job.phase, job.work_kind, job.fence, job.cancel_epoch, job.result_ref) !=
             (*b.namespace.as_tuple, b.activity_id, b.effect_id, b.job_id, b.operation_id,
-                "completed", WORK_KIND, b.job_fence, b.job_cancel_epoch, result_ref)
+                "completed", life_work_kind_v1(b), b.job_fence, b.job_cancel_epoch, result_ref)
             or canonical_serialize(job.usage) != canonical_serialize({"thread_cpu_ms": terminal.actual_cpu_ms})):
         raise ValueError("Life current SQL job differs from its authenticated completed result")
     return result_ref
@@ -292,6 +301,7 @@ def read_adopted_life_original_v1(db, *, namespace, result_ref, issuer):
 
 def validate_adopted_life_member_history_v1(db, *, value, namespace, result_ref, producing_operation_id):
     """Read-only structural joins; callers independently authenticate signatures."""
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     fields = {"schema", "namespace", "result_ref", "producing_operation_id", "prepared_digest", "terminal", "source_refs", "graph_receipt_json", "write_commitments"}
     current = value.get("schema") in {"d11.adopted-life-original.v2","d11.adopted-life-original.v3", "d11.adopted-life-original.v4"}
     if set(value) != fields | ({"job_result_binding"} if current else set()):
@@ -307,8 +317,8 @@ def validate_adopted_life_member_history_v1(db, *, value, namespace, result_ref,
     receipt = _decode_json(value["graph_receipt_json"], CommitReceipt)
     if receipt.status != "committed" or receipt.operation_id != producing_operation_id or producing_operation_id != life_adoption_operation_id_v1(terminal.binding):
         raise ValueError("Life adopted original receipt differs")
-    actual = db.execute("SELECT digest,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, receipt.operation_id)).fetchone()
+    actual = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'commit_seq'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, receipt.operation_id)), legacy_reader=lambda: db.execute("SELECT digest,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, receipt.operation_id)).fetchone())
     if actual != (receipt.operation_digest, receipt.commit_seq):
         raise ValueError("Life historical receipt differs from actual committed operation")
     versions = {v.key.token: v.revision for v in receipt.write_versions}
@@ -318,7 +328,7 @@ def validate_adopted_life_member_history_v1(db, *, value, namespace, result_ref,
         raise ValueError("Life adopted original receipt write membership differs")
     members = {}
     for row in value["write_commitments"]:
-        history = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (row["ref"], row["revision"])).fetchone()
+        history = _producer_original_point_v3(db, table='graph_history', columns=('event_id', 'value', 'valid'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((row['ref'], row['revision'])), legacy_reader=lambda: db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (row["ref"], row["revision"])).fetchone())
         if history is None or history[0] != producing_operation_id or history[2] != 1 or canonical_digest(json.loads(history[1])) != row["digest"]:
             raise ValueError("Life adopted original immutable member history differs")
         members[row["ref"]] = json.loads(history[1])

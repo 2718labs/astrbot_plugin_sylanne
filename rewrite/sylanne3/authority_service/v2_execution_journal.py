@@ -112,7 +112,7 @@ class ExpectedAppendInspectionV2:
 class AuthorityV2ExecutionJournal:
     def __init__(self, path, *, namespace: str, journal_id: str, create: bool = False,
                  _redaction_core=None, _redaction_credential=None,
-                 installed_storage_reader=None):
+                 installed_storage_reader=None, selected_storage=None, storage_context=None, maintenance_basis=None):
         identifier(namespace, "namespace")
         identifier(journal_id, "journal_id")
         self._maintenance_seal_digest: str | None = None
@@ -123,7 +123,8 @@ class AuthorityV2ExecutionJournal:
             from .c09_storage_control_v1 import InstalledC09StorageReaderV1
             if not isinstance(installed_storage_reader, InstalledC09StorageReaderV1) or create:
                 raise AuthorityUnavailable("installed C09 journal reader required")
-            context = installed_storage_reader.read_verified_current_storage_v1()
+            context = (storage_context if selected_storage is not None or maintenance_basis is not None
+                else installed_storage_reader.read_verified_current_storage_v1())
             member = next(m for m in context.manifest["members"] if m["role"] == "execution")
             if (member["resolved_path"], member["incarnation_or_journal_id"], member["namespace"]) != (str(Path(path).resolve()), journal_id, namespace):
                 raise AuthorityUnavailable("journal outside current C09 manifest")
@@ -168,6 +169,21 @@ class AuthorityV2ExecutionJournal:
             if (mode.lower() != "wal"
                     or self._db.execute("PRAGMA synchronous").fetchone()[0] < 2):
                 raise AuthorityUnavailable("v2 execution journal lacks FULL WAL durability")
+            self._runtime_storage_v3 = None
+            if selected_storage is not None and maintenance_basis is not None:
+                raise AuthorityUnavailable("business selection and maintenance basis are mutually exclusive")
+            if maintenance_basis is not None:
+                from ..runtime_storage_v3 import install_selected_maintenance_storage_v3
+                from .daemon import _bootstrap_control_quantum_v3
+                with _bootstrap_control_quantum_v3(maintenance_basis.basis.control):
+                    self._runtime_storage_v3 = install_selected_maintenance_storage_v3(
+                        self._db,role="execution",basis=maintenance_basis)
+                return
+            elif selected_storage is not None:
+                from ..runtime_storage_v3 import install_selected_runtime_storage_v3
+                self._runtime_storage_v3 = install_selected_runtime_storage_v3(
+                    self._db,role="execution",selected=selected_storage,context=storage_context)
+                return
             with self._transaction():
                 existing = self._objects()
                 if not existing:
@@ -204,6 +220,13 @@ class AuthorityV2ExecutionJournal:
             "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
 
     def _check_schema(self) -> None:
+        selected = getattr(self,'_c09_selected_journal_proof_v3',None)
+        if selected is not None:
+            from .c09_graph_application_v1 import SelectedC09JournalProofV3
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            if type(selected) is not SelectedC09JournalProofV3:
+                raise AuthorityUnavailable('actual private selected execution schema proof required')
+            return selected.require_schema_locked(self,'execution',meter=current_c09_sql_meter_v2())
         objects = self._objects()
         if objects not in (_OBJECTS, _OBJECTS_V4, _OBJECTS_V4_LEGACY):
             raise AuthorityUnavailable("legacy, mixed or malformed v2 execution schema")
@@ -699,6 +722,8 @@ class AuthorityV2ExecutionJournal:
     def close(self) -> None:
         with self._lock:
             if self._db is not None:
+                runtime=getattr(self,"_runtime_storage_v3",None)
+                if runtime is not None:runtime.close()
                 self._db.close()
                 self._db = None
 

@@ -45,10 +45,16 @@ def _mapping_original(db, namespace, saved):
     if (_mapping_dict(mapping) != value or mapping.version != body["revision"]
             or mapping.policy_ref != "d11.owner-explicit-role-clock.v1"):
         raise ValueError("D11 registered role clock changed or lacks current original")
-    rows = db.execute("SELECT digest,mapping_id,version,mapping_json FROM runtime_clock_operations WHERE operation_id=?",
-        (body["clock_operation_id"],)).fetchall()
+    from .domain_background_read_v3 import _active_v3,background_point_v3,background_json_loads_v3
+    if _active_v3(db)is not None:
+        actual=background_point_v3(db,table='runtime_clock_operations',columns=('digest','mapping_id','version','mapping_json'),
+            key_columns=('operation_id',),key=(body['clock_operation_id'],),legacy_reader=lambda:None)
+        rows=() if actual is None else (actual,)
+    else:
+        rows = db.execute("SELECT digest,mapping_id,version,mapping_json FROM runtime_clock_operations WHERE operation_id=?",
+            (body["clock_operation_id"],)).fetchall()
     if (len(rows) != 1 or rows[0][:3] != (body["clock_operation_digest"], mapping.mapping_id, mapping.version)
-            or json.loads(rows[0][3]) != value):
+            or background_json_loads_v3(rows[0][3]) != value):
         raise ValueError("D11 registered role clock operation original differs")
     return mapping
 

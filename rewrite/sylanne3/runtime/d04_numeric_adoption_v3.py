@@ -93,6 +93,9 @@ class _D04NumericCommitWitnessV3:
     before_metadata: object
     before_epoch: object
     target_requirements: object
+    graph: object
+    scope: object
+    now_utc: float
 
 
 # Only the installed orchestrator issues these after a concrete mTLS gate
@@ -107,6 +110,7 @@ def require_current_numeric_commit_witness_v3(graph, db, bundle, witness):
     from ..authority_service.d04_numeric_claim_bridge_v3 import D04NumericAdoptionBridgeV3
     from .d04_appraisal_driver_v3 import require_current_read_rows_v3
     if (type(witness) is not _D04NumericCommitWitnessV3 or _COMMIT_WITNESSES.get(id(witness)) is not witness
+            or witness.graph is not graph or db is not graph._GraphCoordinator__store._db
             or not db.in_transaction or bundle != witness.candidate.bundle
             or type(witness.terminal) is not D04NumericTerminalV3
             or type(witness.bridge) is not D04NumericAdoptionBridgeV3
@@ -244,7 +248,8 @@ def adopt_post_c02_joint_numeric_v3(graph, bootstrap, bundle, *, operation_id):
                 if not runtime_writes:
                     raise ValueError("D04 numeric cost exists without its atomic adoption")
                 candidate = build_current_numeric_adoption_v3(graph, db, ready, product, runtime_writes)
-                witness = _D04NumericCommitWitnessV3(ready, product, candidate, bridge.terminal, bridge, before, epoch, target)
+                witness = _D04NumericCommitWitnessV3(ready, product, candidate, bridge.terminal, bridge, before, epoch, target,
+                    graph, scope, now)
                 _COMMIT_WITNESSES[id(witness)] = witness
                 finish_id = bridge.permit.operation_id + ":committed"
                 finish_digest = "sha256:" + canonical_digest((bridge.qualification_digest, "committed"))

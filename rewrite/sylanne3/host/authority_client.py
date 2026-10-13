@@ -7,16 +7,19 @@ from pathlib import Path
 import re
 from typing import Protocol
 
-from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
+from .authority_transport_contract import (
+    AUTHORITY_PROTOCOL, AUTHORITY_V2_PROTOCOL, REQUIRED_AUTHORITY_CAPABILITIES,
+    PublisherPackageIdentity, AuthorityProvisioningRequest, AuthorityHandshake,
+    AuthorityEnrollmentGrant, AuthorityCapabilityGrant,
+)
 from ..authority_service.v2_contract import DeletionMutationReceiptV1, FencePermitV2
 from ..authority_service.current_accepted_erasure_read import CurrentAcceptedErasureV1
 from ..authority_service.internal_work_contract import (
     InternalWorkBindingV1, InternalWorkTerminalProofV1,
 )
-from ..authority_service.internal_work_service import (
+from ..authority_service.internal_work_contract import (
     AuthorityInternalWorkVerifiedReceiptV1, InternalWorkJournalInspectionV1,
 )
-from ..authority_service.v2_migration_rpc import SCHEMA as MIGRATION_RPC_SCHEMA
 from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
@@ -63,24 +66,6 @@ from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from ..runtime_contracts import InstallationGrantV2
 
 
-AUTHORITY_PROTOCOL = "sylanne3.authority.v1"
-REQUIRED_AUTHORITY_CAPABILITIES = frozenset(
-    {
-        "activate_target",
-        "admit_dispatch",
-        "begin_content_operation",
-        "begin_transfer",
-        "check",
-        "current",
-        "current_anchor",
-        "end_content_operation",
-        "observe_deletion_head",
-        "observe_execution_head",
-        "recover_transfer",
-        "revoke_source",
-        "verify_current",
-    }
-)
 _PROFILE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -97,108 +82,10 @@ class AuthoritySelection:
 
 
 @dataclass(frozen=True)
-class PublisherPackageIdentity:
-    """Observed package bytes; the companion authority decides whether to trust them."""
-
-    manifest_sha256: str
-
-    def __post_init__(self) -> None:
-        if not _SHA256.fullmatch(self.manifest_sha256):
-            raise ValueError("publisher manifest digest must be lowercase SHA-256")
-
-
-@dataclass(frozen=True)
-class AuthorityProvisioningRequest:
-    protocol: str
-    profile_id: str
-    plugin_name: str
-    host_api_version: str
-    package_root: Path
-    data_dir: Path
-    publisher_package: PublisherPackageIdentity
-
-    def __post_init__(self) -> None:
-        if self.protocol != AUTHORITY_PROTOCOL:
-            raise ValueError("unsupported authority protocol")
-        if not _PROFILE.fullmatch(self.profile_id):
-            raise ValueError("invalid authority profile")
-        if self.plugin_name != "astrbot_plugin_sylanne":
-            raise ValueError("authority request targets the wrong plugin")
-        if self.host_api_version != "4.28.1":
-            raise ValueError("authority request host API is not the tested version")
-        if not self.package_root.is_absolute() or not self.data_dir.is_absolute():
-            raise ValueError("authority request paths must be absolute")
-
-
-@dataclass(frozen=True)
-class AuthorityHandshake:
-    """Authenticated companion response, separate from publisher package trust."""
-
-    state: str
-    installation_authority_id: str = ""
-    installation_identity_ref: str = ""
-    channel_binding_sha256: str = ""
-    publisher_trusted: bool = False
-
-    def valid_pairing(self) -> bool:
-        return (
-            self.state == "paired"
-            and bool(self.installation_authority_id)
-            and bool(self.installation_identity_ref)
-            and _SHA256.fullmatch(self.channel_binding_sha256) is not None
-            and self.publisher_trusted is True
-        )
-
-
-@dataclass(frozen=True)
 class AuthorityClientStatus:
     state: str
     authority_id: str = ""
     detail: str = ""
-
-
-@dataclass(frozen=True)
-class AuthorityEnrollmentGrant:
-    """A paired-installation fact that cannot open a Sylanne runtime."""
-
-    grant_id: str
-    authority_id: str
-    installation_identity_ref: str
-    capabilities: tuple[str, ...]
-
-    def valid_for(self, handshake: AuthorityHandshake) -> bool:
-        return (
-            bool(self.grant_id)
-            and self.authority_id == handshake.installation_authority_id
-            and self.installation_identity_ref == handshake.installation_identity_ref
-            and self.capabilities == ("enrollment",)
-        )
-
-
-@dataclass(frozen=True)
-class AuthorityCapabilityGrant:
-    """Runtime authority facts used to construct local authenticated adapters."""
-
-    grant_id: str
-    authority_id: str
-    installation_identity_ref: str
-    activation_generation: int
-    revocation_epoch: int
-    capabilities: tuple[str, ...]
-
-    def valid_for(self, handshake: AuthorityHandshake) -> bool:
-        return (
-            bool(self.grant_id)
-            and self.authority_id == handshake.installation_authority_id
-            and self.installation_identity_ref == handshake.installation_identity_ref
-            and type(self.activation_generation) is int
-            and self.activation_generation >= 0
-            and type(self.revocation_epoch) is int
-            and self.revocation_epoch >= 0
-            and bool(self.capabilities)
-            and tuple(sorted(set(self.capabilities))) == self.capabilities
-            and REQUIRED_AUTHORITY_CAPABILITIES.issubset(self.capabilities)
-        )
 
 
 class AuthorityTransport(Protocol):
@@ -232,8 +119,12 @@ class AuthorityTransport(Protocol):
                                    handshake: AuthorityHandshake,
                                    command: dict[str, object]) -> object: ...
 
+    async def model_capacity_reconcile_v1(self, request, handshake, grant, *, namespace,
+                                           holder, expected_anchor, draft=None,
+                                           close_prepared=False): ...
+
     async def model_prepare_fenced_v1(self, request, handshake, grant, *, namespace,
-                                      holder, draft, expected_anchor): ...
+                                      holder, draft, expected_anchor, _on_dispatch=None): ...
 
     async def model_admit_dispatch_once_v1(self, request, handshake, grant, *, namespace,
                                            holder, intent, expected_anchor,
@@ -244,7 +135,7 @@ class AuthorityTransport(Protocol):
 
     async def model_admit_dispatch_once_v2(self, request, handshake, grant, *, namespace,
                                            holder, intent, expected_anchor, model_request,
-                                           host_incarnation): ...
+                                           host_incarnation, _on_dispatch=None): ...
 
     async def model_complete_observed_v2(self, request, handshake, grant, *, namespace,
                                          holder, intent, expected_anchor, admission,
@@ -261,6 +152,10 @@ class AuthorityTransport(Protocol):
 
     async def model_result_read_recover_finish_v1(self, request, handshake, grant,
                                                     *, namespace, read_request): ...
+
+    async def artifact_draft_model_result_read_v1(self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def artifact_draft_model_result_read_v2(self, request, handshake, grant, *, namespace, read_request): ...
 
     async def worker_model_result_read_v1(self, request, handshake, grant,
                                            *, namespace, read_request): ...
@@ -463,6 +358,7 @@ class AuthorityClient:
 
     async def migration_command_v2(self, command: dict[str, object]) -> object:
         """Use the paired management channel; server-installed facts authorize stages."""
+        from ..authority_service.v2_migration_rpc import SCHEMA as MIGRATION_RPC_SCHEMA
         if (type(command) is not dict or command.get("schema") != MIGRATION_RPC_SCHEMA
                 or self._transport is None):
             raise RuntimeError("authority migration command is invalid")
@@ -569,11 +465,21 @@ class AuthorityClient:
             raise RuntimeError("C04 V3 inspection differs from installed binding")
         return await self._execute_c04_original_rpc_v3(bundle,grant,method="c04_inspect_v3",binding=binding)
 
+    async def c04_execute_v4(self, bundle, grant: InstallationGrantV2, *, binding: InternalWorkBindingV1):
+        if type(binding) is not InternalWorkBindingV1 or binding.algorithm_ref != "d06.association_activation.direct_seed.v4":
+            raise RuntimeError("C04 V4 execution differs from installed binding")
+        return await self._execute_c04_original_rpc_v3(bundle,grant,method="c04_execute_v4",binding=binding)
+
+    async def c04_inspect_v4(self, bundle, grant: InstallationGrantV2, *, binding: InternalWorkBindingV1):
+        if type(binding) is not InternalWorkBindingV1 or binding.algorithm_ref != "d06.association_activation.direct_seed.v4":
+            raise RuntimeError("C04 V4 inspection differs from installed binding")
+        return await self._execute_c04_original_rpc_v3(bundle,grant,method="c04_inspect_v4",binding=binding)
+
     async def _execute_c04_original_rpc_v3(self,bundle,grant,*,method,**originals):
         """Fresh exact installed channel, preserving each once-only C04 original."""
         from dataclasses import asdict
         from .mtls_transport import MtlsAuthorityTransport, AuthorityChannelUnavailable
-        if method not in {"c04_execute_v3","c04_inspect_v3","c04_terminal_verify_v1","internal_accounting_v1"}:
+        if method not in {"c04_execute_v3","c04_inspect_v3","c04_execute_v4","c04_inspect_v4","c04_terminal_verify_v1","internal_accounting_v1"}:
             raise ValueError("unregistered fixed C04 original RPC")
         request,policy=await self._d04_installation_context_v3(bundle,grant)
         for attempt in range(2):
@@ -587,7 +493,7 @@ class AuthorityClient:
                 return await getattr(transport,method)(request,handshake,current,
                     namespace=policy.authority_namespace,**originals)
             except AuthorityChannelUnavailable:
-                if attempt or method=="c04_execute_v3":raise
+                if attempt or method in {"c04_execute_v3","c04_execute_v4"}:raise
             finally:await transport.close()
         raise RuntimeError("C04 original RPC remains unresolved")
 
@@ -732,15 +638,25 @@ class AuthorityClient:
             raise RuntimeError("authority model installation binding is invalid")
         return request, handshake, policy
 
+    async def model_capacity_reconcile_v1(
+        self, bundle, grant: InstallationGrantV2, *, expected_anchor: RestoreAnchor,
+        draft: ModelEgressDraftV1 | None = None, close_prepared: bool = False,
+    ) -> dict[str, object]:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_capacity_reconcile_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, expected_anchor=expected_anchor,
+            draft=draft, close_prepared=close_prepared)
+
     async def model_prepare_fenced_v1(
         self, bundle, grant: InstallationGrantV2, *, draft: ModelEgressDraftV1,
-        expected_anchor: RestoreAnchor,
+        expected_anchor: RestoreAnchor, _on_dispatch=None,
     ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
         request, handshake, policy = await self._model_installation_context(bundle, grant)
         return await self._transport.model_prepare_fenced_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             holder=policy.administrator_holder, draft=draft,
-            expected_anchor=expected_anchor)
+            expected_anchor=expected_anchor, _on_dispatch=_on_dispatch)
 
     async def model_admit_dispatch_once_v1(
         self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
@@ -765,7 +681,7 @@ class AuthorityClient:
     async def model_admit_dispatch_once_v2(
         self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
         expected_anchor: RestoreAnchor, model_request: ModelCallRequest,
-        host_incarnation: str,
+        host_incarnation: str, _on_dispatch=None,
     ) -> tuple[ModelEgressRecoveryV1, FencePermitV2, ModelAdmissionV2]:
         request, handshake, policy = await self._model_installation_context(bundle, grant)
         if model_request.envelope.authority.namespace != policy.namespace:
@@ -774,7 +690,46 @@ class AuthorityClient:
             request, handshake, grant, namespace=policy.authority_namespace,
             holder=policy.administrator_holder, intent=intent,
             expected_anchor=expected_anchor, model_request=model_request,
-            host_incarnation=host_incarnation)
+            host_incarnation=host_incarnation, _on_dispatch=_on_dispatch)
+
+    async def bind_observed_d13_provider_http_v1(self,bundle,grant,*,intent,admission,content):
+        from .model_workflows_v7 import AdminModelWorkflowsV7
+        from ..authority_service.v2_model_egress_wire import to_wire as model_to_wire
+        from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
+        from ..authority_service.d13_provider_http_admission_v1 import DOMAIN
+        from ..runtime_contracts import canonical_serialize
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        import base64,hashlib
+        if (type(bundle.model_workflows) is not AdminModelWorkflowsV7
+                or type(content) is not bytes or not 0<len(content)<=65536):
+            raise RuntimeError('actual installed bounded V7 SDK HTTP capture required')
+        request,handshake,policy=await self._model_installation_context(bundle,grant)
+        result=await self._transport._content_rpc(request,handshake,'bind_observed_d13_provider_http_v1',
+            {'namespace':policy.authority_namespace,'holder':policy.administrator_holder,
+                'intent':model_to_wire(intent),'admission':model_to_wire(admission),
+                'http_content_base64':base64.b64encode(content).decode('ascii')},protocol=AUTHORITY_V2_PROTOCOL)
+        if type(result) is not dict or set(result)!={'binding','channel_binding_sha256'} or result['channel_binding_sha256']!=handshake.channel_binding_sha256:
+            raise RuntimeError('provider HTTP binding crossed its authenticated channel')
+        original=result['binding']
+        if type(original) is not dict or set(original)!={'original_digest','payload','signature'}:
+            raise RuntimeError('closed original provider HTTP binding required')
+        value=original['payload']
+        required={'schema','phase','authority_namespace','installation_id','authority_id','call_id','admission_id',
+            'request_digest','provider_config_digest','template_digest','http_digest','http_bytes','counter_operation_id',
+            'frame_intent_digest','counter_evidence_digest','expires_at_utc','model_intent_digest','observed_at_utc'}
+        if (type(value) is not dict or set(value)!=required or value['schema']!='sylanne3.d13.provider-http-binding.v1'
+                or value['phase']!='observed_before_send'
+                or (value['authority_namespace'],value['installation_id'],value['authority_id'])!=(policy.authority_namespace,grant.installation_id,grant.authority_id)
+                or (value['call_id'],value['admission_id'],value['request_digest'],value['provider_config_digest'])!=(intent.call_id,admission.admission_id,intent.request_digest,intent.provider_config_digest)
+                or value['http_digest']!=hashlib.sha256(content).hexdigest() or value['http_bytes']!=len(content)
+                or value['model_intent_digest']!=canonical_digest(intent)):
+            raise RuntimeError('actual provider HTTP binding differs from this original model admission')
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(bundle.d13_wire_policy.counter_public_key_hex)).verify(
+            base64.b64decode(original['signature'],validate=True),DOMAIN+canonical_serialize(value).encode('utf-8'))
+        encoded=canonical_serialize({'payload':value,'signature':original['signature']}).encode('utf-8')
+        if hashlib.sha256(encoded).hexdigest()!=original['original_digest']:
+            raise RuntimeError('provider HTTP original digest differs')
+        return original
 
     async def model_complete_observed_v2(
         self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
@@ -978,6 +933,26 @@ class AuthorityClient:
                    (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
             raise RuntimeError("contact result recovery installed original differs")
         return await self._transport.contact_model_result_recover_finish_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def artifact_draft_model_result_read_v1(self, bundle, grant, *, read_request):
+        from ..authority_service.d11_artifact_draft_model_v1 import ArtifactDraftModelResultReadRequestV1
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ArtifactDraftModelResultReadRequestV1
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("artifact draft result installed original differs")
+        return await self._transport.artifact_draft_model_result_read_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def artifact_draft_model_result_read_v2(self, bundle, grant, *, read_request):
+        from ..authority_service.d11_artifact_draft_model_v1 import ArtifactDraftModelResultReadRequestV2
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ArtifactDraftModelResultReadRequestV2
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("artifact draft result installed original differs")
+        return await self._transport.artifact_draft_model_result_read_v2(request, handshake, grant,
             namespace=policy.authority_namespace, read_request=read_request)
 
     async def internal_life_model_result_read_v2(self, bundle, grant, *, read_request):

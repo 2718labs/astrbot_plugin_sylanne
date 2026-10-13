@@ -6,6 +6,8 @@ The strings in CommandEnvelope are audit assertions, never authentication.
 
 from __future__ import annotations
 
+from .runtime_contracts import namespace_ref
+
 from dataclasses import dataclass, asdict, fields, replace
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -19,6 +21,9 @@ from typing import TYPE_CHECKING, Mapping, Protocol
 from types import SimpleNamespace
 
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
+from .runtime_storage_v3 import (
+    read_graph_head_v3, runtime_storage_operation_v3, runtime_storage_quantum_v3,
+)
 from .graph_store import (
     DeletionDependencyEdge, DeletionHistoryRow, GraphStore, ProductionGraphStore,
 )
@@ -32,7 +37,7 @@ from .memory_types import SourceRecord, access_key, source_key, validate_access
 from .runtime_contracts import (
     AuthorityContext, CommitReceipt, ContentFencePortV2, DomainBundle, FenceScope,
     NamespaceId, ProductAdvanceEvidenceV1, SourceQualification, VersionGuard,
-    canonical_digest, canonical_serialize,
+    canonical_digest, canonical_serialize, PERSISTENT_JOB_REF_KIND,
 )
 from .runtime.restore_anchor import (
     ExecutionJournalPort, SnapshotRequirements, validate_restore,
@@ -44,7 +49,7 @@ from .runtime.budget import (
 from .runtime.jobs import (
     PersistentJob, acquire_job, cancel_job, create_job, get_job, plan_job_acquire,
 )
-from .runtime.d11_types import reconcile_runtime_write
+from .runtime.d11_types import job_graph_write, reconcile_runtime_write
 from .runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from .runtime.dispatch_admission import (
     DispatchAdmissionV1, DispatchAdmissionReceiptV1,
@@ -62,6 +67,7 @@ from .runtime.dispatch_candidate import (
 from .authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerPrincipalV1,
 )
+from .runtime.local_module_admission_v1 import LocalModuleAdmissionV1
 
 if TYPE_CHECKING:
     from .runtime.reply_entity_route_v2 import CurrentReplyEntityRouteBindingV2
@@ -194,16 +200,19 @@ class _PreparedDispatchFinalClaimV1:
     installation_id: str
     route_port: object
     issuer_id: str
+    prepared_inventory: object = None
 
     def __call__(self, graph, context, binding, claimed, witness, snapshot):
         if (graph is not self.graph or claimed != self.claimed
                 or context.handoff_id != self.handoff_id
                 or witness.guard.installation_id != self.installation_id):
             raise UnavailableGuard("prepared final claim identity differs; HOLD")
-        return graph._commit_dispatch_final_claim_v1(
-            context, binding, claimed, witness, snapshot,
-            self.route_port, self.issuer_id, frozen_clock=self.clock,
-            frozen_installation_id=self.installation_id)
+        from .runtime.dispatch_current_inventory_v3 import bind_prepared_dispatch_inventory_v3
+        with bind_prepared_dispatch_inventory_v3(self.prepared_inventory,graph._GraphCoordinator__store._db):
+            return graph._commit_dispatch_final_claim_v1(
+                context, binding, claimed, witness, snapshot,
+                self.route_port, self.issuer_id, frozen_clock=self.clock,
+                frozen_installation_id=self.installation_id, prepared_inventory=self.prepared_inventory)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +226,7 @@ class _InstalledDispatchFinalClaimWriterV1:
     def __call__(self, *args, **kwargs):
         raise UnavailableGuard("final claim needs same-handoff clock preparation; HOLD")
 
-    def prepare_for_handoff(self, graph, claimed, handoff_id: str):
+    def prepare_for_handoff(self, graph, claimed, handoff_id: str, *, prepared_inventory=None):
         from .authority_service.v2_contract import MutationReceiptV2
         from .host.v2_fence_port import VerifiedIngressClockV2
         from .runtime.first_ingress_v2 import trusted_upper
@@ -240,7 +249,7 @@ class _InstalledDispatchFinalClaimWriterV1:
         trusted_upper(clock)
         return _PreparedDispatchFinalClaimV1(
             graph, claimed, handoff_id, clock, grant.installation_id,
-            self.route_port, self.issuer_id)
+            self.route_port, self.issuer_id, prepared_inventory)
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +262,7 @@ class _PreparedNaturalDispatchFinalClaimV2:
     installation_id: str
     route_port: object
     issuer_id: str
+    prepared_inventory: object = None
 
     def __call__(self, graph, context, binding, claimed, witness, snapshot):
         if (graph is not self.graph or claimed != self.claimed
@@ -260,10 +270,12 @@ class _PreparedNaturalDispatchFinalClaimV2:
                 or binding.operation_id != self.original_operation_id
                 or witness.guard.installation_id != self.installation_id):
             raise UnavailableGuard("natural prepared claim identity differs; HOLD")
-        return graph._commit_natural_dispatch_final_claim_v2(
-            context, binding, claimed, witness, snapshot,
-            self.route_port, self.issuer_id, frozen_clock=self.clock,
-            frozen_installation_id=self.installation_id)
+        from .runtime.dispatch_current_inventory_v3 import bind_prepared_dispatch_inventory_v3
+        with bind_prepared_dispatch_inventory_v3(self.prepared_inventory,graph._GraphCoordinator__store._db):
+            return graph._commit_natural_dispatch_final_claim_v2(
+                context, binding, claimed, witness, snapshot,
+                self.route_port, self.issuer_id, frozen_clock=self.clock,
+                frozen_installation_id=self.installation_id, prepared_inventory=self.prepared_inventory)
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,7 +291,7 @@ class _InstalledNaturalDispatchFinalClaimWriterV2:
 
     def prepare_natural_for_handoff(
             self, graph, claimed, handoff_id: str,
-            original_operation_id: str):
+            original_operation_id: str, *, prepared_inventory=None):
         from .authority_service.v2_contract import MutationReceiptV2
         from .host.v2_fence_port import VerifiedIngressClockV2
         from .runtime.first_ingress_v2 import trusted_upper
@@ -301,7 +313,7 @@ class _InstalledNaturalDispatchFinalClaimWriterV2:
         trusted_upper(clock)
         return _PreparedNaturalDispatchFinalClaimV2(
             graph, claimed, handoff_id, original_operation_id, clock,
-            grant.installation_id, self.route_port, self.issuer_id)
+            grant.installation_id, self.route_port, self.issuer_id, prepared_inventory)
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,12 +391,17 @@ class CompleteProjectionSnapshotV1:
     owner_kind: str
     audience: str
     purpose: str
+    trusted_now_utc: float | None
     _seal: object
 
     def __init__(self, namespace, epoch, activation_generation, view_type,
-                 type_names, owner_kind, audience, purpose, *, _seal=None):
+                 type_names, owner_kind, audience, purpose, *, _seal=None, trusted_now_utc=None):
         if _seal is not _COMPLETE_PROJECTION_SEAL:
             raise TypeError("complete projection proofs are coordinator-issued")
+        if trusted_now_utc is not None:
+            from math import isfinite
+            if type(trusted_now_utc) is not float or not isfinite(trusted_now_utc):
+                raise ValueError("projection time requires the actual finite trusted clock upper bound")
         object.__setattr__(self, "namespace", namespace)
         object.__setattr__(self, "epoch", epoch)
         object.__setattr__(self, "activation_generation", activation_generation)
@@ -393,6 +410,7 @@ class CompleteProjectionSnapshotV1:
         object.__setattr__(self, "owner_kind", owner_kind)
         object.__setattr__(self, "audience", audience)
         object.__setattr__(self, "purpose", purpose)
+        object.__setattr__(self, "trusted_now_utc", trusted_now_utc)
         object.__setattr__(self, "_seal", _seal)
 
 
@@ -451,15 +469,6 @@ def budget_operation_digest(envelope, lease_id: str,
         "lease_id": lease_id,
         "ceiling": ceiling,
     })
-
-
-def namespace_ref(namespace: NamespaceId) -> str:
-    """Bounded content-free identity shared by independent authorities."""
-    if not isinstance(namespace, NamespaceId):
-        raise TypeError("namespace must be NamespaceId")
-    return "ns:sha256:" + hashlib.sha256(
-        canonical_json(list(namespace.as_tuple)).encode("utf-8")
-    ).hexdigest()
 
 
 def _operation_capability_ref(namespace: NamespaceId, actor: str,
@@ -1019,6 +1028,62 @@ class D04CurrentJointOutputOriginalReadV1:
     status: str = "current_owner_fenced_complete_joint_output_v2"
 
 
+@dataclass(slots=True)
+class _V2ReadFenceStateV3:
+    authority: AuthorityContext
+    scope: FenceScope
+    metadata: object
+    epoch: object
+    owner_principal: object
+    owner_binding: object
+    owner_session_proof: object
+    durable_read_key: str | None
+    fence_observer: object
+    fence_observation: object = None
+    observed_guard: object = None
+    observed_owner: object = None
+
+
+@dataclass(slots=True)
+class _SourceCorrectionStorageWorkStateV3:
+    authority: AuthorityContext
+    owner_lease: object
+    source_id: str
+    fence: _V2ReadFenceStateV3
+    reader: object
+    phase: str = "read"
+
+
+@dataclass(slots=True)
+class _OwnerMaterialSourceWriteWorkStateV3:
+    command: object
+    fence: object
+    phase: str = "command"
+    prepared: object = None
+    input_witness: object = None
+    scope: object = None
+    owner: object = None
+    guard: object = None
+    owner_session_proof: object = None
+    metadata: object = None
+    epoch: object = None
+    request_digest: str | None = None
+    finish_id: str | None = None
+    finish_digest: str | None = None
+    context: object = None
+    result: object = None
+    commit_started: bool = False
+    authority_lease_released: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _BorrowedNaturalFullReadStampV3:
+    """Observed original scope stamp; it does not issue an Authority permit."""
+    scope: object
+    metadata: object
+    epoch: object
+
+
 class GraphCoordinator:
     """One in-process authority over a GraphStore's business SQLite connection.
 
@@ -1026,6 +1091,10 @@ class GraphCoordinator:
     no GraphStore or bootstrap reference. Registration and guard mutation are
     setup/administrative operations, not user-supplied command fields.
     """
+
+    @property
+    def local_module_admission(self):
+        return self.__local_module_admission
 
     def __init__(self, store: GraphStore, bootstrap: object, *,
                  deletion_journal=None, migration_authority=None,
@@ -1052,9 +1121,11 @@ class GraphCoordinator:
                  life_d04_before_capture_policy=None,
                  body_quote_authority=None, c04_cpu_quote_authority=None,
                  c04_algorithm_build_digest=None,
+                 c04_direct_seed_build_digest=None,
                  d04_installed_joint_assembly=None,
                  d04_installed_joint_output_policy=None,
-                 c04_authority_port_v3=None, d13_natural_wire_port=None, d04_appraisal_result_port=None):
+                 c04_authority_port_v3=None, d13_natural_wire_port=None, d04_appraisal_result_port=None,
+                 local_module_admission: LocalModuleAdmissionV1 | None = None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -1071,8 +1142,14 @@ class GraphCoordinator:
                 raise UnavailableGuard("production recovery and activation authority required")
         self.__store = store
         self.__bootstrap = bootstrap
+        self.__c09_source_plan_resources_v2 = None
+        self.__c09_source_plan_cell_reader_v2 = None
+        if local_module_admission is not None and type(local_module_admission) is not LocalModuleAdmissionV1:
+            raise TypeError("coordinator requires the frozen native module admission")
+        self.__local_module_admission = local_module_admission or LocalModuleAdmissionV1()
         from .runtime.domain_production_runtime_v1 import InstalledDomainOperationRuntimeV1
         self.__domain_production_runtime_v1 = InstalledDomainOperationRuntimeV1(self, bootstrap)
+        self.__artifact_draft_model_runtime_v1 = None
         self.__deletion_journal = deletion_journal
         self.__migration_authority = migration_authority
         self.__restore_authority = restore_authority
@@ -1104,6 +1181,7 @@ class GraphCoordinator:
             if type(c04_cpu_quote_authority) is not C04InternalCpuQuotePolicyAuthorityV1:
                 raise TypeError("installed C04 CPU quote authority must be typed")
         self.__c04_cpu_quote_authority = c04_cpu_quote_authority
+        self.__d13_counter_cpu_quote_authority_v1 = None
         if (c04_algorithm_build_digest is not None
                 and (type(c04_algorithm_build_digest) is not str
                      or len(c04_algorithm_build_digest) != 64
@@ -1111,6 +1189,12 @@ class GraphCoordinator:
                             for character in c04_algorithm_build_digest))):
             raise TypeError("installed C04 algorithm build digest must be exact")
         self.__c04_algorithm_build_digest = c04_algorithm_build_digest
+        if (c04_direct_seed_build_digest is not None
+                and (type(c04_direct_seed_build_digest) is not str
+                     or len(c04_direct_seed_build_digest) != 64
+                     or any(char not in "0123456789abcdef" for char in c04_direct_seed_build_digest))):
+            raise TypeError("installed direct-seed C04 build digest must be exact")
+        self.__c04_direct_seed_build_digest = c04_direct_seed_build_digest
         if d04_installed_joint_assembly is not None:
             from .host.v2_installation import V2InstallationAssembly
 
@@ -1311,6 +1395,78 @@ class GraphCoordinator:
             store, *namespace.as_tuple, _capability=self.__graph_capability)
         return metadata, epoch
 
+    def _begin_read_fence_v3(self, authority, *, operation_id,
+            owner_principal=None, owner_binding=None, owner_session_proof=None,
+            durable_read_key=None, fence_observer=None):
+        store, port, namespace = self.__store, self.__content_fence_v2, authority.namespace
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if target.namespace != namespace or target.activation_generation != authority.activation_generation:
+            raise UnavailableGuard("v2 graph recovery identity or generation differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("v2 graph recovery anchor differs")
+        if durable_read_key is not None:
+            self._recover_stage_candidate_read(namespace, durable_read_key, metadata, epoch, anchor)
+            self._record_stage_candidate_read(
+                namespace, durable_read_key, operation_id, metadata, epoch, anchor)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=authority.activation_generation,
+            operation="read", operation_id=operation_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace,
+            authority.activation_generation, "read", operation_id,
+            permit, anchor, epoch, metadata.graph_revision)
+        state = _V2ReadFenceStateV3(
+            authority, scope, metadata, epoch, owner_principal, owner_binding,
+            owner_session_proof, durable_read_key, fence_observer)
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("v2 read permit changed")
+            if fence_observer is not None:
+                state.fence_observation = fence_observer(scope)
+            if owner_principal is not None or owner_binding is not None:
+                state.observed_guard, state.observed_owner = self._owner_binding_in_fence(
+                    authority, scope, owner_principal, owner_binding, owner_session_proof)
+            return state
+        except BaseException:
+            self._finish_read_fence_v3(state)
+            raise
+
+    def _validate_read_fence_v3(self, state):
+        """Validate the same admitted read; never acquire a replacement fence."""
+        port, scope = self.__content_fence_v2, state.scope
+        if port.validate_fence(scope) != scope.permit:
+            raise UnavailableGuard("v2 read permit changed")
+        if (state.fence_observer is not None
+                and state.fence_observer(scope) != state.fence_observation):
+            raise UnavailableGuard("v2 Authority observation changed during read")
+        if state.owner_principal is not None or state.owner_binding is not None:
+            current_guard, _ = self._owner_binding_in_fence(
+                state.authority, scope, state.owner_principal, state.observed_owner,
+                state.owner_session_proof)
+            if current_guard != state.observed_guard:
+                raise UnavailableGuard("Owner Authority guard changed during read")
+        with self.__store._lock:
+            if self._v2_graph_stamp(state.authority.namespace) != (state.metadata, state.epoch):
+                raise UnavailableGuard("v2 graph recovery stamp changed")
+        if port.validate_fence(scope) != scope.permit:
+            raise UnavailableGuard("v2 read permit changed")
+
+    def _finish_read_fence_v3(self, state):
+        scope = state.scope
+        self.__content_fence_v2.finish_fence(
+            scope, request_id="finish:" + scope.operation_id,
+            request_digest="sha256:" + canonical_digest({
+                "operation_id": scope.operation_id,
+                "permit_token": scope.permit.token, "action": "finish_read",
+            }))
+        if state.durable_read_key is not None:
+            self._close_stage_candidate_read(
+                state.authority.namespace, state.durable_read_key, scope.operation_id)
+
     def _read_v2(self, authority: AuthorityContext, reader, *,
                  owner_principal=None,
                  owner_binding: OwnerLeaseBindingV1 | None = None,
@@ -1318,91 +1474,469 @@ class GraphCoordinator:
                  owner_session_proof: tuple[str, object] | None = None,
                  final_check=None, return_recovery_context: bool = False,
                  durable_read_key: str | None = None,
-                 fence_observer=None):
+                 fence_observer=None, natural_parent_original_id=None):
         """Keep every Authority RPC outside the business graph lock."""
         if owner_view and owner_principal is None:
             raise ValueError("Owner view requires an expected principal")
-        store = self.__store
-        namespace = authority.namespace
-        port = self.__content_fence_v2
+        store, namespace = self.__store, authority.namespace
+        operation_id = "graph-read-" + secrets.token_hex(16)
         try:
-            with store._lock:
-                metadata, epoch = self._v2_graph_stamp(namespace)
-            target = metadata.requirements
-            if target.namespace != namespace or target.activation_generation != authority.activation_generation:
-                raise UnavailableGuard("v2 graph recovery identity or generation differs")
-            anchor = port.current_anchor(
-                namespace=namespace, authority_namespace=target.authority_namespace)
-            if not self._anchor_matches(target, anchor):
-                raise UnavailableGuard("v2 graph recovery anchor differs")
-            if durable_read_key is not None:
-                self._recover_stage_candidate_read(
-                    namespace, durable_read_key, metadata, epoch, anchor)
-            operation_id = "graph-read-" + secrets.token_hex(16)
-            if durable_read_key is not None:
-                self._record_stage_candidate_read(
-                    namespace, durable_read_key, operation_id, metadata, epoch,
-                    anchor)
-            permit = port.begin_fence(
-                namespace=namespace, authority_namespace=target.authority_namespace,
-                holder=self.__holder, generation=authority.activation_generation,
-                operation="read", operation_id=operation_id, expected_anchor=anchor)
-            scope = FenceScope(namespace, target.authority_namespace,
-                               authority.activation_generation, "read", operation_id,
-                               permit, anchor, epoch, metadata.graph_revision)
-            try:
-                if port.validate_fence(scope) != permit:
-                    raise UnavailableGuard("v2 read permit changed")
-                fence_observation = (fence_observer(scope)
-                                     if fence_observer is not None else None)
-                if owner_principal is not None or owner_binding is not None:
-                    observed_guard, observed_owner = self._owner_binding_in_fence(
-                        authority, scope, owner_principal, owner_binding,
-                        owner_session_proof)
-                with store._lock:
-                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                        raise UnavailableGuard("v2 graph recovery stamp changed")
-                    result = reader()
-                if port.validate_fence(scope) != permit:
-                    raise UnavailableGuard("v2 read permit changed")
-                if (fence_observer is not None
-                        and fence_observer(scope) != fence_observation):
-                    raise UnavailableGuard("v2 Authority observation changed during read")
-                if owner_principal is not None or owner_binding is not None:
-                    current_guard, _ = self._owner_binding_in_fence(
-                        authority, scope, owner_principal, observed_owner,
-                        owner_session_proof)
-                    if current_guard != observed_guard:
-                        raise UnavailableGuard("Owner Authority guard changed during read")
-                with store._lock:
-                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                        raise UnavailableGuard("v2 graph recovery stamp changed")
-                if port.validate_fence(scope) != permit:
-                    raise UnavailableGuard("v2 read permit changed")
-                if final_check is not None:
-                    with store._lock:
-                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                            raise UnavailableGuard("v2 graph recovery stamp changed")
-                        final_check(result)
-                if owner_view:
-                    return CurrentOwnerViewV1(observed_guard, observed_owner)
-                if return_recovery_context:
-                    return result, anchor, metadata, epoch
-                return result
-            finally:
-                port.finish_fence(
-                    scope, request_id="finish:" + operation_id,
-                    request_digest="sha256:" + canonical_digest({
-                        "operation_id": operation_id, "permit_token": permit.token,
-                        "action": "finish_read",
-                    }))
-                if durable_read_key is not None:
-                    self._close_stage_candidate_read(
-                        namespace, durable_read_key, operation_id)
+            with runtime_storage_operation_v3(store._db, operation_id=operation_id):
+                state = self._begin_read_fence_v3(
+                    authority, operation_id=operation_id, owner_principal=owner_principal,
+                    owner_binding=owner_binding, owner_session_proof=owner_session_proof,
+                    durable_read_key=durable_read_key, fence_observer=fence_observer)
+                try:
+                    from contextlib import ExitStack
+                    with ExitStack() as natural_context:
+                        if natural_parent_original_id is not None:
+                            from .runtime.natural_producer_qualification_v1 import host_natural_producer_context_v1
+                            natural_context.enter_context(host_natural_producer_context_v1(
+                                self, scope=state.scope,
+                                parent_original_id=natural_parent_original_id, phase="frozen"))
+                        with store._lock, runtime_storage_quantum_v3(store._db):
+                            if self._v2_graph_stamp(namespace) != (state.metadata, state.epoch):
+                                raise UnavailableGuard("v2 graph recovery stamp changed")
+                            result = reader()
+                    self._validate_read_fence_v3(state)
+                    if final_check is not None:
+                        with store._lock, runtime_storage_quantum_v3(store._db):
+                            if self._v2_graph_stamp(namespace) != (state.metadata, state.epoch):
+                                raise UnavailableGuard("v2 graph recovery stamp changed")
+                            final_check(result)
+                    if owner_view:
+                        return CurrentOwnerViewV1(state.observed_guard, state.observed_owner)
+                    if return_recovery_context:
+                        return result, state.scope.pinned_anchor, state.metadata, state.epoch
+                    return result
+                finally:
+                    self._finish_read_fence_v3(state)
         except UnavailableGuard:
             raise
         except Exception as exc:
             raise UnavailableGuard("v2 content authority is unavailable") from exc
+
+    def _prepare_current_dispatch_inventory_v3(self, authority, lease, **actual):
+        from .runtime.dispatch_current_inventory_v3 import prepare_current_dispatch_inventory_v3
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is None:
+            return None  # Explicit legacy layout keeps its original full-row reader.
+        return prepare_current_dispatch_inventory_v3(self,authority,lease,**actual)
+
+    def _prepare_runtime_storage_work_v3(self, authority, lease, *, source_id):
+        from .graph_worker import (
+            require_graph_storage_work_admission_v3, create_graph_storage_work_v3,
+        )
+        from .runtime_storage_v3 import (
+            begin_runtime_storage_operation_v3, bind_runtime_storage_operation_v3,
+            finish_runtime_storage_operation_v3, runtime_storage_v3,
+        )
+        from .runtime.source_correction_read_v3 import SourceCorrectionContextReadV3
+        # A synchronous caller cannot start a fence that it cannot continue.
+        require_graph_storage_work_admission_v3(self)
+        handle = runtime_storage_v3(self.__store._db)
+        operation_id = "graph-read-" + secrets.token_hex(16)
+        operation = begin_runtime_storage_operation_v3(
+            self.__store._db, operation_id=operation_id, deadline_utc=None)
+        fence = None
+        try:
+            with bind_runtime_storage_operation_v3(operation, self.__store._db):
+                fence = self._begin_read_fence_v3(
+                    authority, operation_id=operation_id,
+                    owner_binding=self.__owner_leases.get(lease),
+                    owner_session_proof=self.__owner_session_proofs.get(lease))
+                reader = SourceCorrectionContextReadV3(
+                    self.__store._db, namespace=authority.namespace,
+                    source_id=source_id, storage_lease=operation,
+                    read_scope=fence.scope, graph_stamp=(fence.metadata, fence.epoch))
+            state = _SourceCorrectionStorageWorkStateV3(
+                authority, lease, source_id, fence, reader)
+            return create_graph_storage_work_v3(
+                self, kind="source_correction_context_v3",
+                operation_id=operation_id, selection_digest=handle.selection_digest,
+                deadline_utc=None, state=state, operation=operation)
+        except BaseException:
+            try:
+                if fence is not None:
+                    self._finish_read_fence_v3(fence)
+            finally:
+                finish_runtime_storage_operation_v3(operation)
+            raise
+
+    def _prepare_current_method_operation_v3(self, runtime, authority, lease, *, operation_kind,
+            request, operation_id, activity_id, audience_ref, parent_budget_lease_ref, request_digest,
+            background_followup=None, background_host_lifecycle=None, background_offline=None):
+        from .graph_worker import require_graph_storage_work_admission_v3, create_graph_storage_work_v3
+        from .runtime_storage_v3 import (begin_runtime_storage_operation_v3,
+            bind_runtime_storage_operation_v3, finish_runtime_storage_operation_v3)
+        from .runtime.current_method_learning_read_v3 import (begin_current_method_learning_read_v3,
+            attach_current_method_learning_work_v3)
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.first_ingress_v2 import trusted_upper
+        require_graph_storage_work_admission_v3(self)
+        installed = installed_operation_v1(operation_kind)
+        background = background_followup or background_host_lifecycle or background_offline
+        if background is None:
+            self._authorize(lease, authority, frozenset({installed.domain}), owner_read=True)
+            owner = self.__owner_leases.get(lease)
+            session = self.__owner_session_proofs.get(lease)
+            if owner is None or session is None or installed.capability not in owner.capabilities:
+                raise AuthorityDenied("actual current Owner method capability/session required")
+        else:
+            from .runtime.domain_background_issuance_v1 import require_background_issuance_v1
+            owner = require_background_issuance_v1(background, self, authority, operation_id)
+            session = None
+            if installed.capability not in owner.capabilities:
+                raise AuthorityDenied("actual background method capability required")
+        clock = self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
+        now = trusted_upper(clock)
+        seconds = 60.0
+        if installed.domain == "d07" and self.__d07_execution_service_v1 is not None:
+            workflow = self.__d07_execution_service_v1.bundle.model_workflows.d07_cognition
+            if workflow is not None:
+                seconds = 2.0 * workflow.timeout_seconds + 30.0
+        operation = begin_runtime_storage_operation_v3(self.__store._db, operation_id, now + seconds)
+        fence = None
+        try:
+            with bind_runtime_storage_operation_v3(operation, self.__store._db):
+                read_id = "method-read:" + canonical_digest(("method-domain-input-read.v3",
+                    authority.namespace, operation_id, request_digest))[:48]
+                if background is None:
+                    fence = self._begin_read_fence_v3(authority, operation_id=read_id,
+                        owner_binding=owner, owner_session_proof=session)
+                    guard, actual_owner = fence.observed_guard, fence.observed_owner
+                else:
+                    from .runtime.domain_background_issuance_v1 import observe_background_owner_v1
+                    fence = self._begin_read_fence_v3(authority, operation_id=read_id,
+                        fence_observer=lambda scope: observe_background_owner_v1(background, self, authority, scope))
+                    guard, actual_owner = fence.fence_observation
+                reader = begin_current_method_learning_read_v3(self, operation, fence, runtime=runtime,
+                    authority=authority, lease=lease, operation_kind=operation_kind, request=request,
+                    operation_id=operation_id, activity_id=activity_id, audience_ref=audience_ref,
+                    parent_budget_lease_ref=parent_budget_lease_ref, request_digest=request_digest,
+                    owner_binding=actual_owner, owner_guard=guard, session_proof=session, initial_now_utc=now)
+                reader.initial_clock = clock
+                reader.initial_monotonic_deadline = time.monotonic() + seconds
+                reader.background_followup = background_followup
+                reader.background_host_lifecycle = background_host_lifecycle
+                reader.background_offline = background_offline
+            work = create_graph_storage_work_v3(self, kind="current_method_learning_read_v3",
+                operation_id=operation_id, selection_digest=operation.selection_digest,
+                deadline_utc=operation.deadline_utc, state=reader, operation=operation)
+            attach_current_method_learning_work_v3(reader, work)
+            return work
+        except BaseException:
+            try:
+                if fence is not None:
+                    self._finish_read_fence_v3(fence)
+            finally:
+                finish_runtime_storage_operation_v3(operation)
+            raise
+
+    def _complete_current_method_operation_v3(self, reader, proof):
+        from .runtime.current_method_learning_read_v3 import bind_prepared_method_learning_read_v3
+        reader.work._require_invocation(self)
+        if (reader.work.state is not reader or proof.owner is not reader
+                or not reader.inputs_sealed or not reader.read_finished or not reader.business_started
+                or reader.runtime is not self.__domain_production_runtime_v1):
+            raise AuthorityDenied("method final WRITE requires its actual originating Work and sealed inputs")
+        with bind_prepared_method_learning_read_v3(proof, self, self.__store._db):
+            return reader.runtime.run_current(reader.authority, reader.lease,
+                operation_kind=reader.operation_kind, request=reader.request,
+                operation_id=reader.operation_id, activity_id=reader.activity_id,
+                audience_ref=reader.audience_ref, parent_budget_lease_ref=reader.parent_budget_lease_ref,
+                _background_followup=reader.background_followup,
+                _background_host_lifecycle=reader.background_host_lifecycle,
+                _background_offline=reader.background_offline, _method_inputs_v3=proof)
+
+    def _prepare_borrowed_method_operation_v3(self, *, runtime, selector, operation, request, issued,
+            scope, metadata, epoch, anchor, request_digest, attempt_id, permit_json,
+            private_reads, external_originals):
+        from .graph_worker import require_graph_storage_work_admission_v3, create_graph_storage_work_v3
+        from .runtime_storage_v3 import (begin_runtime_storage_operation_v3,
+            bind_runtime_storage_operation_v3, finish_runtime_storage_operation_v3)
+        from .runtime.current_method_learning_read_v3 import (begin_current_method_learning_read_in_scope_v3,
+            attach_current_method_learning_work_v3)
+        from .runtime.foreground_activity_issuance_v1 import (
+            _IssuedForegroundActivityV1, require_foreground_activity_issuance_v1)
+        from .runtime.owner_source_note_task_issuance_v1 import (
+            _IssuedOwnerSourceNoteTaskV1, require_owner_source_note_task_issuance_v1)
+        from .runtime.first_ingress_v2 import trusted_upper
+        require_graph_storage_work_admission_v3(self)
+        if type(issued) is _IssuedForegroundActivityV1:
+            evidence = require_foreground_activity_issuance_v1(issued, self, scope)
+            authorized_deadline = selector.requested_deadline_utc
+        elif type(issued) is _IssuedOwnerSourceNoteTaskV1:
+            evidence = require_owner_source_note_task_issuance_v1(issued, self, scope)
+            authorized_deadline = evidence.authorization.cause.original_deadline_utc
+        else:
+            raise AuthorityDenied("borrowed method needs the actual active typed Self issuance")
+        now = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        deadline = min(authorized_deadline,
+            datetime.fromisoformat(evidence.valid_until_utc.replace("Z", "+00:00")).timestamp())
+        if now >= deadline:
+            raise UnavailableGuard("borrowed method original deadline expired")
+        retained_operation = begin_runtime_storage_operation_v3(self.__store._db, selector.operation_id, deadline)
+        retained_lifetime = None
+        try:
+            with bind_runtime_storage_operation_v3(retained_operation, self.__store._db):
+                reader = begin_current_method_learning_read_in_scope_v3(self, retained_operation,
+                    runtime=runtime, issued=issued, operation_kind=operation.operation_kind,
+                    request=request, selector=selector, initial_now_utc=now)
+            work = create_graph_storage_work_v3(self, kind="current_method_learning_read_v3",
+                operation_id=selector.operation_id, selection_digest=retained_operation.selection_digest,
+                deadline_utc=deadline, state=reader, operation=retained_operation)
+            attach_current_method_learning_work_v3(reader, work)
+            retained_lifetime = private_reads.pop_all()
+            reader.write_context = dict(runtime=runtime, selector=selector, operation=operation,
+                request=request, issued=issued, scope=scope, metadata=metadata, epoch=epoch,
+                anchor=anchor, request_digest=request_digest, attempt_id=attempt_id,
+                permit_json=permit_json, private_reads=retained_lifetime, external_originals=external_originals)
+            work.adopt_request_lifetime_v3(retained_lifetime)
+            return work
+        except BaseException:
+            try:
+                if retained_lifetime is not None:
+                    retained_lifetime.close()
+            finally:
+                finish_runtime_storage_operation_v3(retained_operation)
+            raise
+
+    def _validate_borrowed_method_scope_v3(self, reader):
+        from .runtime.current_method_learning_read_v3 import BorrowedMethodLearningReadV3
+        from .runtime.foreground_activity_issuance_v1 import (
+            _IssuedForegroundActivityV1, require_foreground_activity_issuance_v1, reobserve_foreground_activity_v1)
+        from .runtime.owner_source_note_task_issuance_v1 import (
+            _IssuedOwnerSourceNoteTaskV1, require_owner_source_note_task_issuance_v1, reobserve_owner_source_note_task_v1)
+        from .runtime.first_ingress_v2 import trusted_upper
+        if (type(reader) is not BorrowedMethodLearningReadV3 or reader.work.state is not reader
+                or reader.graph is not self or reader.runtime is not self.__domain_production_runtime_v1):
+            raise AuthorityDenied("actual originating borrowed method Work required")
+        reader.work._require_invocation(self)
+        if self.__store._db.in_transaction:
+            raise UnavailableGuard("borrowed Self observation must precede Graph SQL")
+        scope = reader.issued.scope
+        if type(reader.issued) is _IssuedForegroundActivityV1:
+            observed = require_foreground_activity_issuance_v1(reader.issued, self, scope)
+            reobserve_foreground_activity_v1(reader.issued, self, scope)
+        elif type(reader.issued) is _IssuedOwnerSourceNoteTaskV1:
+            observed = require_owner_source_note_task_issuance_v1(reader.issued, self, scope)
+            reobserve_owner_source_note_task_v1(reader.issued, self, scope)
+        else:
+            raise AuthorityDenied("borrowed method lost its exact installed Self issuer")
+        if (observed != reader.evidence or self.__content_fence_v2.validate_fence(scope) != scope.permit
+                or self._v2_graph_stamp(reader.namespace) != reader.graph_stamp):
+            raise UnavailableGuard("borrowed method original Self/Owner/permit/stamp changed")
+        now = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        if now >= reader.operation.deadline_utc:
+            raise UnavailableGuard("borrowed method original deadline expired")
+
+    def _advance_borrowed_method_learning_plan_v3(self, reader):
+        from .runtime.current_method_learning_read_v3 import read_bound_method_budget_grant_v3
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.domain_production_contracts_v1 import ProductionOriginalRefV1
+        from .runtime.first_ingress_v2 import trusted_upper
+        self._validate_borrowed_method_scope_v3(reader)
+        clock = self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
+        now = trusted_upper(clock)
+        db = self.__store._db
+        with self.__store._lock, runtime_storage_quantum_v3(db):
+            db.execute("BEGIN")
+            try:
+                handled, grant = read_bound_method_budget_grant_v3(db, reader.parent_budget_lease_ref)
+                if not handled or now >= min(grant.valid_until_utc, reader.operation.deadline_utc):
+                    raise AuthorityDenied("borrowed method original parent grant expired")
+                plan, requests, readers = reader.runtime.read_current_borrowed_operation_plan_v3(db,
+                    operation=installed_operation_v1(reader.operation_kind), request=reader.request,
+                    issued=reader.issued, scope=reader.issued.scope, now_utc=reader.initial_now_utc)
+            finally:
+                db.rollback()
+        originals = list(reader.write_context["external_originals"])
+        originals.append(ProductionOriginalRefV1("d11.restore_anchor",
+            "restore-anchor:" + canonical_digest(reader.issued.scope.pinned_anchor),
+            canonical_digest(reader.issued.scope.pinned_anchor)))
+        port = self.__c04_authority_port_v3
+        if requests and port is None:
+            raise UnavailableGuard("borrowed method lacks its actual independent C04 reader")
+        from .runtime.c04_product_lifecycle_v3 import c04_terminal_proof_from_inspection_v3
+        for requested in requests:
+            proof = c04_terminal_proof_from_inspection_v3(port.inspect(requested.binding))
+            if proof is None:
+                continue
+            verified = port.verify_terminal(proof)
+            if (verified.proof_digest != canonical_digest(proof)
+                    or requested.component_proof_digest != verified.proof_digest
+                    or requested.terminal_receipt_ref != verified.terminal_receipt_ref
+                    or requested.terminal_receipt_digest != verified.terminal_receipt_digest):
+                raise UnavailableGuard("borrowed method independent C04 paid original changed")
+            originals.extend((ProductionOriginalRefV1("d11.internal_component", requested.component_ref, verified.proof_digest),
+                ProductionOriginalRefV1("d11.internal_cost", verified.terminal_receipt_ref, verified.terminal_receipt_digest)))
+        reader.seal_plan_v3(plan, installed_readers=readers, observed_originals=tuple(originals))
+
+    def _complete_borrowed_method_operation_v3(self, reader, proof):
+        from .runtime.current_method_learning_read_v3 import PreparedBorrowedMethodDomainInputsV3
+        self._validate_borrowed_method_scope_v3(reader)
+        if (type(proof) is not PreparedBorrowedMethodDomainInputsV3 or proof.owner is not reader
+                or not reader.inputs_sealed or not reader.business_started):
+            raise AuthorityDenied("borrowed method requires its actual sealed original inputs")
+        context = reader.write_context
+        if (context["issued"] is not reader.issued or context["selector"] != reader.selector
+                or context["request"] != reader.request or context["scope"] is not reader.issued.scope):
+            raise AuthorityDenied("borrowed method changed its original fixed compiler continuation")
+        return self._continue_current_self_write_v3(**context)
+
+    def _advance_current_method_learning_plan_v3(self, reader):
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.current_method_learning_read_v3 import read_bound_method_budget_grant_v3
+        from .runtime.domain_production_contracts_v1 import ProductionOriginalRefV1
+        from .runtime_contracts import (CommandEnvelope, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
+            SourceQualification, VersionGuard)
+        from .runtime.first_ingress_v2 import trusted_upper
+        installed = installed_operation_v1(reader.operation_kind)
+        clock_now = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        if clock_now >= reader.operation.deadline_utc:
+            raise UnavailableGuard("method preparation original deadline expired")
+        db = self.__store._db
+        with self.__store._lock, runtime_storage_quantum_v3(db) as meter:
+            db.execute("BEGIN")
+            try:
+                handled, grant = read_bound_method_budget_grant_v3(db, reader.parent_budget_lease_ref)
+                if not handled or grant.valid_until_utc <= clock_now:
+                    raise AuthorityDenied("actual signed method parent grant is unavailable or expired")
+                lease = meter.read_fixed_row(db, "runtime_budget_leases", ("bot_id", "persona_id", "currency", "state"),
+                    "lease_id=?", (reader.parent_budget_lease_ref,))
+                if lease != (*reader.namespace.as_tuple, grant.currency, "active"):
+                    raise AuthorityDenied("method parent lease namespace/currency/state differs")
+                versions = {}
+                for kind in ("scheme", "operator", "policy"):
+                    row = meter.read_fixed_row(db, "graph_guard_versions", ("version",),
+                        "bot=? AND persona=? AND ref='current' AND kind=?", (*reader.namespace.as_tuple, kind))
+                    if row is not None:
+                        versions[kind] = row[0]
+                if set(versions) != {"scheme", "operator", "policy"}:
+                    raise UnavailableGuard("method material needs actual current guard versions")
+                deadline = min(reader.operation.deadline_utc, grant.valid_until_utc)
+                if reader.operation_kind == "prepare_personal_candidates_v1":
+                    from .runtime.d02_artifact_phase_price_v1 import original_personal_phase_count_deadline_v1
+                    counted = original_personal_phase_count_deadline_v1(reader.runtime, operation_id=reader.operation_id)
+                    if counted is not None:
+                        deadline = min(deadline, counted)
+                if clock_now >= deadline:
+                    raise UnavailableGuard("method material original deadline expired")
+                plan, requests = reader.runtime.read_current_operation_plan_v3(db, operation=installed,
+                    request=reader.request, operation_id=reader.operation_id, activity_id=reader.activity_id,
+                    audience_ref=reader.audience_ref, scope=reader.fence.scope,
+                    owner_guard=reader.owner_guard, now_utc=reader.initial_now_utc)
+                envelope = CommandEnvelope(RUNTIME_SCHEMA,
+                    OperationIdentity(reader.activity_id, None, reader.operation_id, reader.operation_kind,
+                        reader.operation_id, canonical_digest({"input_refs": []})), reader.authority,
+                    VersionGuard((), (QueryEpoch(reader.namespace, "namespace", reader.graph_stamp[1].revision),),
+                        reader.owner_binding.access_epoch, reader.owner_binding.delete_epoch,
+                        self.__store._registry.catalogue_hash, versions["scheme"], versions["operator"],
+                        versions["policy"], (), (), ()),
+                    SourceQualification((), "derived", None, reader.initial_now_utc, "inference",
+                        "ineligible", None, "not_applicable"), (), reader.parent_budget_lease_ref, deadline,
+                    reader.initial_monotonic_deadline - (reader.operation.deadline_utc - deadline),
+                    "domain-current:" + reader.operation_id, ())
+            finally:
+                db.rollback()
+        originals = [ProductionOriginalRefV1("d11.restore_anchor",
+            "restore-anchor:" + canonical_digest(reader.fence.scope.pinned_anchor),
+            canonical_digest(reader.fence.scope.pinned_anchor)),
+            ProductionOriginalRefV1("d11.trusted_tick", "d11-tick:" + reader.operation_id,
+                canonical_digest(reader.initial_clock.sample))]
+        port = self.__c04_authority_port_v3
+        if requests and port is None:
+            raise UnavailableGuard("method selected inputs lack the actual paired original reader")
+        from .runtime.c04_product_lifecycle_v3 import c04_terminal_proof_from_inspection_v3
+        for requested in requests:
+            proof = c04_terminal_proof_from_inspection_v3(port.inspect(requested.binding))
+            if proof is None:
+                continue
+            verified = port.verify_terminal(proof)
+            if (verified.proof_digest != canonical_digest(proof)
+                    or requested.component_proof_digest != verified.proof_digest
+                    or requested.terminal_receipt_ref != verified.terminal_receipt_ref
+                    or requested.terminal_receipt_digest != verified.terminal_receipt_digest):
+                raise UnavailableGuard("method independent C04 terminal differs from its paid original")
+            originals.extend((ProductionOriginalRefV1("d11.internal_component", requested.component_ref, verified.proof_digest),
+                ProductionOriginalRefV1("d11.internal_cost", verified.terminal_receipt_ref, verified.terminal_receipt_digest)))
+        reader.seal_plan_v3(plan, envelope=envelope, observed_originals=tuple(originals))
+
+    def _advance_runtime_storage_work_v3(self, work):
+        if work.kind == "current_method_learning_read_v3":
+            from .runtime.current_method_learning_read_v3 import advance_current_method_learning_read_v3
+            return advance_current_method_learning_read_v3(self, work)
+        if work.kind == "domain_background_read_v3":
+            from .runtime.domain_background_read_v3 import advance_domain_background_read_v3
+            return advance_domain_background_read_v3(self, work)
+        if work.kind == "d13_standby_read_v3":
+            from .runtime.d13_standby_read_v3 import advance_d13_standby_read_v3
+            return advance_d13_standby_read_v3(self, work)
+        if work.kind == "dispatch_inventory_prepare_v3":
+            from .runtime.dispatch_current_inventory_v3 import advance_current_dispatch_inventory_v3
+            return advance_current_dispatch_inventory_v3(self,work)
+        if work.kind == "owner_material_source_write_v3":
+            return self._advance_owner_material_source_work_v3(work)
+        from .graph_worker import GraphStorageStepV3
+        from .runtime_storage_v3 import bind_runtime_storage_operation_v3
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        state = work.state
+        with bind_runtime_storage_operation_v3(work.operation, self.__store._db):
+            self._authorize(state.owner_lease, state.authority,
+                frozenset({"d06", "d07", "d12"}), owner_read=True)
+            self._validate_read_fence_v3(state.fence)
+            if state.phase == "read":
+                with self.__store._lock:
+                    state.reader.advance()
+                self._validate_read_fence_v3(state.fence)
+                if state.reader.complete:
+                    state.phase = "final"
+                return GraphStorageStepV3("progress")
+            with self.__store._lock, runtime_storage_quantum_v3(self.__store._db):
+                if self._v2_graph_stamp(state.authority.namespace) != (
+                        state.fence.metadata, state.fence.epoch):
+                    raise UnavailableGuard("v2 graph recovery stamp changed")
+                _source_family_current_sql_v1(
+                    self.__store._db, namespace=state.authority.namespace,
+                    roots=(source_key(*state.authority.namespace.as_tuple, state.source_id).token,),
+                    purpose="context", audiences=("owner",),
+                    streaming_qualified=state.reader.qualification,
+                    streaming_scope=state.fence.scope,
+                    streaming_graph_stamp=(state.fence.metadata, state.fence.epoch))
+                result = state.reader.context
+            self._validate_read_fence_v3(state.fence)
+            return GraphStorageStepV3("complete", result)
+
+    def _finish_runtime_storage_work_v3(self, work, error):
+        if work.kind == "current_method_learning_read_v3":
+            from .runtime.current_method_learning_read_v3 import finish_current_method_learning_read_v3
+            return finish_current_method_learning_read_v3(self, work, error)
+        if work.kind == "domain_background_read_v3":
+            from .runtime.domain_background_read_v3 import finish_domain_background_read_v3
+            return finish_domain_background_read_v3(self, work, error)
+        if work.kind == "d13_standby_read_v3":
+            from .runtime.d13_standby_read_v3 import finish_d13_standby_read_v3
+            return finish_d13_standby_read_v3(self, work, error)
+        if work.kind == "dispatch_inventory_prepare_v3":
+            from .runtime.dispatch_current_inventory_v3 import finish_current_dispatch_inventory_v3
+            return finish_current_dispatch_inventory_v3(self,work,error)
+        if work.kind == "owner_material_source_write_v3":
+            return self._finish_owner_material_source_work_v3(work, error)
+        from .runtime_storage_v3 import finish_runtime_storage_operation_v3
+        state = work.state
+        try:
+            self._finish_read_fence_v3(state.fence)
+        except BaseException:
+            state.reader = None
+            finish_runtime_storage_operation_v3(work.operation)
+            raise
+        state.reader = None
+        if error is None:
+            # The real result remains charged through Host serialization.
+            work.result_lease = work.operation
+        else:
+            finish_runtime_storage_operation_v3(work.operation)
 
     @staticmethod
     def _provision_row(db, namespace: NamespaceId):
@@ -1817,10 +2351,7 @@ class GraphCoordinator:
             proof = OwnerGraphCommitProofV1(
                 namespace, row[0], row[1], row[2], row[3], row[4],
                 1, row[5], row[6], row[7])
-            atom = store._db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (key.token,),
-            ).fetchone()
+            atom = read_graph_head_v3(store._db, key.token)
             if (row[8] != canonical_json(asdict(proof)) or atom is None
                     or atom != (1, canonical_json(grant_value), 1)):
                 raise UnavailableGuard("durable Owner issue receipt differs from graph")
@@ -2062,10 +2593,7 @@ class GraphCoordinator:
                     or permit.generation != 1 or permit.pinned_anchor != anchor):
                 raise UnavailableGuard("durable Owner issue fence identity differs")
             with store._lock:
-                atom = store._db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (owner_grant_key(*namespace.as_tuple).token,),
-                ).fetchone()
+                atom = read_graph_head_v3(store._db, owner_grant_key(*namespace.as_tuple).token)
                 access = store._db.execute(
                     "SELECT access_epoch FROM graph_authority_epochs "
                     "WHERE bot=? AND persona=?", namespace.as_tuple,
@@ -2292,10 +2820,7 @@ class GraphCoordinator:
                 "SELECT value FROM graph_history WHERE token=? AND revision=1",
                 (key.token,),
             ).fetchone()
-            current = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (key.token,),
-            ).fetchone()
+            current = read_graph_head_v3(db, key.token)
             if original is None or current is None or current[2] != 1:
                 raise UnavailableGuard("Owner grant original or head is missing")
             grant = json.loads(original[0])
@@ -2491,10 +3016,7 @@ class GraphCoordinator:
             try:
                 if self._v2_graph_stamp(namespace) != (metadata, epoch):
                     raise StaleRead("Owner revoke graph changed")
-                row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (owner_grant_key(*namespace.as_tuple).token,),
-                ).fetchone()
+                row = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
                 if (row is None or row[0] != 1 or row[2] != 1
                         or row[1] != canonical_json({**expected,
                             "grant_revision": 1, "state": "pending_authority"})):
@@ -2735,10 +3257,7 @@ class GraphCoordinator:
                 namespace.as_tuple,
             ).fetchone()
             grant_key = owner_grant_key(*namespace.as_tuple)
-            grant_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (grant_key.token,),
-            ).fetchone()
+            grant_row = read_graph_head_v3(db, grant_key.token)
             owner_proof_row = db.execute(
                 "SELECT operation_id,request_digest,grant_id,grant_digest,"
                 "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -2870,14 +3389,8 @@ class GraphCoordinator:
                 Owner("persona", *namespace.as_tuple),
                 "d01.persona_plan.v1", receipt.plan_id)
             resource_key = role_resources_key(namespace, receipt.plan_id)
-            plan_row = store._db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (plan_key.token,),
-            ).fetchone()
-            resource_row = store._db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (resource_key.token,),
-            ).fetchone()
+            plan_row = read_graph_head_v3(store._db, plan_key.token)
+            resource_row = read_graph_head_v3(store._db, resource_key.token)
         if plan_row is None or resource_row is None:
             raise UnavailableGuard("committed role atoms are incomplete")
         try:
@@ -3120,10 +3633,7 @@ class GraphCoordinator:
         with store._lock:
             metadata, epoch = self._v2_graph_stamp(namespace)
             db = store._db
-            grant_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (grant_key.token,),
-            ).fetchone()
+            grant_row = read_graph_head_v3(db, grant_key.token)
             proof_row = db.execute(
                 "SELECT operation_id,request_digest,grant_id,grant_digest,"
                 "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -3206,6 +3716,7 @@ class GraphCoordinator:
                     canonical_json(asdict(target)), canonical_json(asdict(anchor)))
         if intent is not None and intent[:5] != identity:
             if saved is None and rejection is None:
+                self.__local_module_admission.require_v1(('d01', 'd11', 'd12'), "commit_role_initialization_v2")
                 self.reject_unresolvable_role_initialization_v2(
                     namespace=namespace, operation_id=operation_id,
                     request_digest=request_digest, principal=principal,
@@ -3266,18 +3777,9 @@ class GraphCoordinator:
                     or permit.generation != 1 or permit.pinned_anchor != anchor):
                 raise UnavailableGuard("durable role initialization receipt differs")
             with store._lock:
-                plan_row = store._db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (plan_write.key.token,),
-                ).fetchone()
-                activation_row = store._db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (activation_key.token,),
-                ).fetchone()
-                resource_row = store._db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (resource_write.key.token,),
-                ).fetchone()
+                plan_row = read_graph_head_v3(store._db, plan_write.key.token)
+                activation_row = read_graph_head_v3(store._db, activation_key.token)
+                resource_row = read_graph_head_v3(store._db, resource_write.key.token)
                 committed_guard = OwnerAuthorizationGuardV1(
                     target.authority_id, grant.value["installation_id"], namespace,
                     1, receipt.owner_authorization_head, 0, 0)
@@ -3450,10 +3952,7 @@ class GraphCoordinator:
                     namespace.as_tuple,
                 ).fetchone() != intent:
                     raise UnavailableGuard("role durable intent changed")
-                current_grant = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (grant_key.token,),
-                ).fetchone()
+                current_grant = read_graph_head_v3(db, grant_key.token)
                 current_access = db.execute(
                     "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
                     "WHERE bot=? AND persona=?", namespace.as_tuple,
@@ -3549,17 +4048,26 @@ class GraphCoordinator:
 
         store = self.__store
         db = store._db
+        from .runtime.domain_background_read_v3 import (
+            BackgroundJSONColumnV3, background_json_loads_v3,
+            read_bound_background_graph_attachment_v3,
+            read_bound_background_graph_type_rows_v3)
+
+        def current_head(key):
+            handled, row = read_bound_background_graph_attachment_v3(
+                db, table="graph_atoms", columns=("revision", "value", "valid"),
+                key_columns=("token", "bot", "persona"),
+                key=(key.token, *namespace.as_tuple))
+            return row if handled else read_graph_head_v3(db, key.token)
+
         epoch = GraphStore.graph_epoch(
             store, *namespace.as_tuple, _capability=self.__graph_capability)
         activation_key = _activation_key(namespace)
         grant_key = owner_grant_key(*namespace.as_tuple)
-        activation_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (activation_key.token,),
-        ).fetchone()
+        activation_row = current_head(activation_key)
         if activation_row is None or activation_row[2] != 1:
             raise UnavailableGuard("active D01 role head is absent")
-        activation = json.loads(activation_row[1])
+        activation = background_json_loads_v3(activation_row[1])
         if type(activation) is not dict or type(activation.get("plan_id")) is not str:
             raise UnavailableGuard("active D01 role head is invalid")
         from .graph_types import AtomKey, Owner
@@ -3567,40 +4075,48 @@ class GraphCoordinator:
                            "d01.persona_plan.v1", activation["plan_id"])
         atoms = []
         for key in (activation_key, plan_key, grant_key):
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (key.token,),
-            ).fetchone()
+            row = current_head(key)
             if row is None:
                 raise UnavailableGuard("active role graph atoms are incomplete")
-            atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])))
+            original = row[1] if type(row[1]) is BackgroundJSONColumnV3 else None
+            atoms.append(GraphAtom(
+                key, row[0], background_json_loads_v3(row[1]), bool(row[2]),
+                _canonical_original=original))
         try:
             role = PersonaDomain.resolve_active_role(
                 GraphSnapshot(tuple(atoms), (epoch,)), namespace=namespace,
                 current_guard=guard)
         except (TypeError, ValueError) as exc:
             raise UnavailableGuard("active role differs from Owner guard") from exc
-        saved_role = db.execute(
-            "SELECT receipt_json FROM graph_role_init_receipts_v1 "
-            "WHERE bot=? AND persona=?", namespace.as_tuple,
-        ).fetchone()
+        handled, saved_role = read_bound_background_graph_attachment_v3(
+            db, table="graph_role_init_receipts_v1", columns=("receipt_json",),
+            key_columns=("bot", "persona"), key=namespace.as_tuple)
+        if not handled:
+            saved_role = db.execute(
+                "SELECT receipt_json FROM graph_role_init_receipts_v1 "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
         if saved_role is None:
             raise UnavailableGuard("D01 role has no durable initialization receipt")
-        data = json.loads(saved_role[0])
+        data = background_json_loads_v3(saved_role[0])
         if (type(data) is not dict or data.get("head_id") != role.head_id
                 or data.get("owner_grant_id") != atoms[2].value["grant_id"]
                 or data.get("owner_authorization_head") != guard.authorization_head):
             raise UnavailableGuard("D01 initialization receipt differs from active role")
-        rows = db.execute(
-            "SELECT token,revision,value FROM graph_atoms "
-            "WHERE bot=? AND persona=? AND type_name='d03.role_binding' "
-            "AND valid=1 ORDER BY token", namespace.as_tuple,
-        ).fetchall()
+        handled, rows = read_bound_background_graph_type_rows_v3(
+            db, namespace, "d03.role_binding", ("token", "revision", "value"),
+            valid_only=True)
+        if not handled:
+            rows = db.execute(
+                "SELECT token,revision,value FROM graph_atoms "
+                "WHERE bot=? AND persona=? AND type_name='d03.role_binding' "
+                "AND valid=1 ORDER BY token", namespace.as_tuple,
+            ).fetchall()
         versions = []
         bindings = []
         for token, revision, encoded in rows:
             key = AtomKey.from_token(token)
-            value = json.loads(encoded)
+            value = background_json_loads_v3(encoded)
             try:
                 binding = RoleBinding(**{
                     **value, "norm_refs": tuple(value["norm_refs"]),
@@ -3805,10 +4321,7 @@ class GraphCoordinator:
             metadata, epoch = self._v2_graph_stamp(namespace)
             db = store._db
             grant_key = owner_grant_key(*namespace.as_tuple)
-            grant_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (grant_key.token,),
-            ).fetchone()
+            grant_row = read_graph_head_v3(db, grant_key.token)
             proof_row = db.execute(
                 "SELECT operation_id,request_digest,grant_id,grant_digest,"
                 "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -4023,10 +4536,7 @@ class GraphCoordinator:
                 for key, expected_value in (
                         *((item.key, item.value) for item in source_writes),
                         (write_key, value)):
-                    atom = store._db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (key.token,),
-                    ).fetchone()
+                    atom = read_graph_head_v3(store._db, key.token)
                     if atom != (1, canonical_json(expected_value), 1):
                         raise UnavailableGuard("durable scene source or binding atom differs")
             observed, state = port.get_fence_operation(
@@ -4053,6 +4563,7 @@ class GraphCoordinator:
                 token=owner_session_token, request=owner_session_request,
                 capability="workbench.bind_scene")
             return receipt
+        self.__local_module_admission.require_v1(('d03', 'd11', 'd12'), "commit_scene_binding_v2")
         # This command only creates the first binding for a scene. D03's
         # no_applicable_binding can also describe a revoked or out-of-window
         # valid atom; accepting a second one would make the scene unreadable.
@@ -4519,10 +5030,7 @@ class GraphCoordinator:
                         or guard.minimum_revocation_epoch != 0):
                     raise UnavailableGuard("current Owner authorization differs")
                 activation_key = _activation_key(namespace)
-                activation_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (activation_key.token,),
-                ).fetchone()
+                activation_row = read_graph_head_v3(db, activation_key.token)
                 if activation_row is None or activation_row[2] != 1:
                     raise UnavailableGuard("active role head is absent")
                 activation = json.loads(activation_row[1])
@@ -4533,10 +5041,7 @@ class GraphCoordinator:
                         owner_grant_key(*namespace.as_tuple))
                 atoms = []
                 for key in keys:
-                    row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (key.token,),
-                    ).fetchone()
+                    row = read_graph_head_v3(db, key.token)
                     if row is None:
                         raise UnavailableGuard("active role graph atoms are incomplete")
                     atoms.append(GraphAtom(
@@ -5032,6 +5537,550 @@ class GraphCoordinator:
             authority, lambda: None, owner_principal=expected_principal,
             owner_view=True, owner_session_proof=proof)
 
+    def read_owner_project_artifact_v1(self, authority, lease, *, request):
+        """One actual Authority file read, inside the existing current Owner fence."""
+        from .runtime.d12_owner_artifact_read_v1 import (OwnerArtifactReadRequestV1,
+            OwnerArtifactReadObservationV1, result_to_wire_v1)
+        self._authorize(lease, authority, frozenset({'d08', 'd10', 'd11', 'd12'}), owner_read=True)
+        owner = self.__owner_leases.get(lease)
+        proof = self.__owner_session_proofs.get(lease)
+        port = self.__content_fence_v2
+        if (type(request) is not OwnerArtifactReadRequestV1 or request.namespace != authority.namespace
+                or request.installation_id != port.installation_grant.installation_id
+                or type(owner) is not OwnerLeaseBindingV1 or proof is None
+                or 'workbench.read' not in owner.capabilities
+                or authority.purpose != 'workbench_view' or authority.audience != ('owner',)):
+            raise AuthorityDenied('artifact read requires this actual current Owner lease and paired installation')
+        captured = []
+        def observe(scope):
+            previous = None if not captured else captured[0].read_binding
+            actual = port.observe_owner_artifact_for_fence_v1(scope=scope, request=request,
+                owner_actor_id=authority.actor, owner_session_token=proof[0],
+                owner_session_request=proof[1], expected_binding=previous)
+            if (type(actual) is not OwnerArtifactReadObservationV1
+                    or actual.read_binding.request_digest != request.digest
+                    or actual.read_binding.permit_digest != canonical_digest(scope.permit)):
+                raise UnavailableGuard('artifact observation crossed the actual read request/fence')
+            if not captured:
+                if actual.result is None:
+                    raise UnavailableGuard('artifact Authority did not read a complete verified file')
+                captured.append(actual.result)
+            elif actual.result is not None:
+                raise UnavailableGuard('artifact verification cannot reopen the file or substitute another result')
+            return actual.read_binding.current_commitment
+        def read():
+            if not captured:
+                raise UnavailableGuard('artifact current read observation absent')
+            result = captured[0]
+            metadata, epoch = self._v2_graph_stamp(authority.namespace)
+            binding = result.read_binding
+            if (binding.graph_incarnation != metadata.requirements.graph_incarnation
+                    or binding.graph_revision != metadata.graph_revision or binding.graph_epoch != epoch.revision
+                    or binding.current_owner_head.namespace != authority.namespace
+                    or binding.current_owner_head.authorization_head != owner.authorization_head
+                    or binding.current_owner_head.authorization_revision != owner.authorization_revision):
+                raise UnavailableGuard('artifact current Owner/Graph stamp changed before projection')
+            return result_to_wire_v1(result, public=True)
+        return self._read_v2(authority, read, owner_binding=owner,
+            owner_session_proof=proof, fence_observer=observe)
+
+    def read_owner_project_artifact_options_v1(self, authority, lease, *, project_ref):
+        """Bounded real version selectors; body remains behind its private reader."""
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        from .runtime.d11_life_terminal_v1 import read_adopted_life_original_v1
+        from .runtime.d11_life_preparation_v1 import read_prepared_life_v1
+        from .runtime.d11_life_adoption_v1 import require_draft_terminal_readback_v1
+        from .runtime.d11_life_contract_v1 import life_from_wire_v1, D11LifeTerminalV1, D11DraftTerminalV1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.d10_life_progress_provenance_v1 import validate_life_progress_provenance_history_v1
+        from .domains.d10.production_operations_v1 import LifeProgressHeadV1
+        self._authorize(lease, authority, frozenset({'d08', 'd10', 'd11', 'd12'}), owner_read=True)
+        ns = authority.namespace
+        owner = self.__owner_leases.get(lease)
+        if (type(owner) is not OwnerLeaseBindingV1 or 'workbench.read' not in owner.capabilities
+                or authority.purpose != 'workbench_view' or authority.audience != ('owner',)
+                or self._parse_ref(project_ref, ns).type_name != 'd10.life_project.v1'):
+            raise AuthorityDenied('artifact options require the actual current Owner project scope')
+        def read():
+            db = self.__store._db
+            db.execute('BEGIN')
+            try:
+                project = db.execute('SELECT valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
+                    (project_ref, *ns.as_tuple)).fetchone()
+                if project != (1,):
+                    raise UnavailableGuard('artifact project unavailable')
+                rows = db.execute("SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
+                    "AND type_name='d10.life_progress.v1' AND valid=1 AND json_extract(value,'$.project_ref')=? "
+                    "AND json_extract(value,'$.step')='artifact_draft_v1' ORDER BY token LIMIT 33",
+                    (*ns.as_tuple, project_ref)).fetchall()
+                if len(rows) > 32:
+                    raise UnavailableGuard('artifact version options exceed the bounded current project read')
+                items = []
+                for token, revision, encoded in rows:
+                    value = json.loads(encoded)
+                    value['receipt_refs'] = tuple(value['receipt_refs'])
+                    value['source_refs'] = tuple(value['source_refs'])
+                    progress = LifeProgressHeadV1(**value)
+                    adopted = read_adopted_life_original_v1(db, namespace=ns,
+                        result_ref=progress.artifact_ref, issuer=self.__d11_issuer)
+                    if adopted is None:
+                        raise UnavailableGuard('artifact version lacks its actual signed adoption')
+                    terminal = life_from_wire_v1(adopted['terminal'], D11LifeTerminalV1)
+                    if type(terminal) is not D11DraftTerminalV1:
+                        raise UnavailableGuard('artifact version has another execution recipe')
+                    prepared = read_prepared_life_v1(db, binding=terminal.binding, issuer=self.__d11_issuer)
+                    if prepared is None or prepared.plan.project.ref != project_ref:
+                        raise UnavailableGuard('artifact preparation belongs to another project')
+                    witness = require_draft_terminal_readback_v1(prepared=prepared, terminal=terminal)
+                    birth = db.execute('SELECT event_id FROM graph_history WHERE token=? AND revision=?',
+                        (token, revision)).fetchone()
+                    production = None if birth is None else read_adopted_domain_operation_v1(db, ns, birth[0])
+                    if production is None:
+                        raise UnavailableGuard('artifact progress lacks its actual W01 original')
+                    validate_life_progress_provenance_history_v1(db, prepared=prepared,
+                        terminal=terminal, progress=progress, production=production)
+                    roots = tuple(dict.fromkeys((prepared.plan.input_source.ref, *prepared.plan.content.source_refs)))
+                    _source_family_current_sql_v1(db, namespace=ns, roots=roots,
+                        purpose='context', audiences=('owner',))
+                    items.append({'progress_ref': token, 'artifact_ref': terminal.binding.artifact_ref,
+                        'artifact_version': witness.version, 'content_digest': witness.content_digest,
+                        'content_length_bytes': witness.content_length})
+                return {'schema': 'd12.owner-artifact-options.v1', 'namespace': asdict(ns),
+                    'project_ref': project_ref, 'items': items}
+            finally:
+                db.rollback()
+        return self._read_v2(authority, read, owner_binding=owner,
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+
+    def submit_owner_source_note_task_v1(self, authority, lease, *, request, operation_id):
+        from .runtime.owner_source_note_task_contract_v1 import owner_source_note_task_ids_v1
+        from .runtime.d07_life_project_focus_v1 import FocusLifeProjectRequestV1,_keys
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .domains.d01.production_operations_v1 import plain_v1
+        import math
+        preparation=self._prepare_owner_source_note_submission_v1(authority,lease,request=request,operation_id=operation_id)
+        if 'existing' in preparation:return preparation['existing']
+        ns=authority.namespace;ids=owner_source_note_task_ids_v1(ns,operation_id)
+        public_digest=canonical_digest({'request':plain_v1(request)})
+        focus_id='owner-note-focus:'+canonical_digest((ns,operation_id,public_digest))[:40]
+        ticket_key,focus_key=_keys(ns,focus_id)
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:original=read_adopted_domain_operation_v1(db,ns,focus_id)
+            finally:db.rollback()
+        if original is None:
+            seconds=min(600,math.floor(preparation['deadline_utc']-preparation['observed_utc']))
+            if seconds<1:raise UnavailableGuard('Owner SourceNote original submission interval is exhausted')
+            focused=self.run_current_domain_operation_v1(authority,lease,operation_kind='focus_life_project',
+                request=FocusLifeProjectRequestV1(request.project_ref,request.body_source_ref,
+                    preparation['cpu_ceiling_ms'],seconds),operation_id=focus_id,activity_id=ids['activity_id'],
+                audience_ref='owner',parent_budget_lease_ref=preparation['parent_budget_lease_ref'])
+            if focused.get('coverage')!='complete':
+                return {'status':'owner_focus_held','operation_id':operation_id,'focus_operation_id':focus_id,
+                    'missing_inputs':focused.get('missing_inputs',())}
+        now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                original=read_adopted_domain_operation_v1(db,ns,focus_id)
+                ticket=db.execute('SELECT value,valid FROM graph_atoms WHERE token=?',(ticket_key.token,)).fetchone()
+                focus=db.execute('SELECT value,valid FROM graph_atoms WHERE token=?',(focus_key.token,)).fetchone()
+                if (original is None or original['operation_kind']!='focus_life_project'
+                        or original['payload']['authority']['actor']!=authority.actor or ticket is None or ticket[1]!=1
+                        or focus is None or focus[1]!=1):
+                    raise UnavailableGuard('Owner submission lost its actual stable Focus producer')
+                ticket_value=json.loads(ticket[0]);focus_value=json.loads(focus[0])
+                if (ticket_value['concern_ref']!=request.project_ref or ticket_value['causal_root']!=request.body_source_ref
+                        or ticket_value['valid_until']<=now or not ticket_value['eligible'] or not ticket_value['resources_available']
+                        or focus_value['primary_ticket_ref']!=ticket_key.token):
+                    raise UnavailableGuard('Owner submission original Focus expired or was replaced; no refresh authorized')
+            finally:db.rollback()
+        result=self.run_current_domain_operation_v1(authority,lease,operation_kind='submit_owner_source_note_task_v1',
+            request=request,operation_id=operation_id,activity_id=ids['activity_id'],audience_ref='owner',
+            parent_budget_lease_ref=preparation['parent_budget_lease_ref'])
+        if result.get('coverage')!='complete':
+            return {'status':'focus_saved_task_not_saved','operation_id':operation_id,'focus_operation_id':focus_id,
+                'missing_inputs':result.get('missing_inputs',())}
+        return result
+
+    def _prepare_owner_source_note_submission_v1(self, authority, lease, *, request, operation_id):
+        from .runtime.owner_source_note_task_v1 import (install_owner_source_note_task_readers_v1,
+            stage_submit_owner_source_note_task_v1,read_plan_owner_source_note_task_v1)
+        from .runtime.owner_source_note_task_contract_v1 import OwnerSourceNoteTaskAuthorizationV2,owner_source_note_task_ids_v1
+        from .runtime.domain_production_frame_v1 import freeze_domain_production_frame_v1
+        from .runtime.domain_production_read_plans_v1 import read_current_domain_original_refs_v1,read_current_domain_policy_refs_v1
+        from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime_contracts import OperationIdentity,SourceQualification,QueryEpoch,VersionGuard,CommandEnvelope,RUNTIME_SCHEMA
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .domains.d01.production_operations_v1 import plain_v1
+        import time
+        self._authorize(lease,authority,frozenset({'d02','d03','d06','d07','d08','d10','d11'}),owner_read=True)
+        owner=self.__owner_leases.get(lease)
+        if (type(owner) is not OwnerLeaseBindingV1 or 'workbench.create' not in owner.capabilities
+                or authority.audience!=('owner',) or 'context' not in owner.purposes):
+            raise AuthorityDenied('Owner submission preparation requires its actual current Owner create binding')
+        ns=authority.namespace;observed={}
+        clock=self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
+        def observe(scope):
+            guard,current=self._owner_binding_in_fence(authority,scope,None,owner,self.__owner_session_proofs.get(lease))
+            observed.update(scope=scope,guard=guard,owner=owner)
+            return guard
+        def read():
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                prior=read_adopted_domain_operation_v1(db,ns,operation_id)
+                if prior is not None:
+                    if (prior['operation_kind']!='submit_owner_source_note_task_v1'
+                            or prior['payload']['request']!=plain_v1(request)
+                            or prior['payload']['authority']['actor']!=authority.actor):
+                        raise EventConflict('Owner submission changed its original request or actor')
+                    saved=db.execute('SELECT receipt_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',
+                        (*ns.as_tuple,operation_id)).fetchone()
+                    if saved is None or saved[0] is None:raise UnavailableGuard('Owner submit original acknowledgment remains unconfirmed')
+                    return {'existing':json.loads(saved[0])}
+                now=trusted_upper(clock)
+                readers=install_owner_source_note_task_readers_v1(self,scope=observed['scope'],
+                    owner_guard=observed['guard'],owner_binding=observed['owner'])
+                bundle=readers.installed_bundle;root=bundle.installation_policy.root_grant
+                versions=dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? AND ref='current' AND kind IN ('scheme','operator','policy')",ns.as_tuple).fetchall())
+                if set(versions)!={'scheme','operator','policy'}:raise UnavailableGuard('Owner submission installed guard versions unavailable')
+                ids=owner_source_note_task_ids_v1(ns,operation_id)
+                context=replace(authority,issuer_domain='d08',purpose='context',provider_policy_ref=root.policy_ref)
+                deadline=min(now+60,root.valid_until_utc)
+                envelope=CommandEnvelope(RUNTIME_SCHEMA,OperationIdentity(ids['activity_id'],None,operation_id,
+                    'submit_owner_source_note_task_v1',operation_id,canonical_digest({'input_refs':[]})),context,
+                    VersionGuard((),(QueryEpoch(ns,'namespace',observed['scope'].graph_epoch.revision),),
+                        owner.access_epoch,owner.delete_epoch,self.__store._registry.catalogue_hash,
+                        versions['scheme'],versions['operator'],versions['policy'],(),(),()),
+                    SourceQualification((),'derived',None,now,'inference','ineligible',None,'not_applicable'),
+                    (),root.lease_id,deadline,time.monotonic()+deadline-now,'owner-submit-preparation:'+operation_id,())
+                plan=read_plan_owner_source_note_task_v1(db,namespace=ns,request=request,operation_id=operation_id)
+                policies=read_current_domain_policy_refs_v1(db,namespace=ns,plan=plan,installed_readers=readers)
+                originals=read_current_domain_original_refs_v1(db,namespace=ns,plan=plan,installed_readers=readers)
+                frame=freeze_domain_production_frame_v1(self,db,envelope=envelope,current_owner=observed['owner'],
+                    scope=observed['scope'],plan=plan,now_utc=now,observed_originals=originals,installed_policy_refs=policies)
+                stage=stage_submit_owner_source_note_task_v1(db,frame=frame,request=request,installed_readers=readers)
+                auth=decode_typed_production_value_v1(json.loads(stage.original_payload_json)['provenance']['owner_task_authorization'],
+                    OwnerSourceNoteTaskAuthorizationV2)
+                return {'cpu_ceiling_ms':auth.body_policy.cpu_ceiling_ms,'deadline_utc':auth.cause.original_deadline_utc,
+                    'parent_budget_lease_ref':auth.cause.parent_budget_lease_ref,'observed_utc':now}
+            finally:db.rollback()
+        return self._read_v2(authority,read,owner_binding=owner,owner_session_proof=self.__owner_session_proofs.get(lease),
+            fence_observer=observe)
+
+    def read_owner_material_source_status_v1(self, authority, lease, *, owner_operation_id, input_digest):
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        self._authorize(lease,authority,frozenset({'d06','d11'}),owner_read=True)
+        owner=self.__owner_leases.get(lease);ns=authority.namespace
+        if (type(owner) is not OwnerLeaseBindingV1 or 'workbench.read' not in owner.capabilities
+                or authority.purpose!='workbench_view' or authority.audience!=('owner',)):
+            raise AuthorityDenied('Owner material status requires the actual current Owner view')
+        now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        def read():
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                result={'schema':'d12.owner-material-source-status.v1','namespace':asdict(ns),
+                    'owner_operation_id':owner_operation_id,'input_digest':input_digest,'state':'not_found',
+                    'source_ref':None,'source_id':None,'source_revision':None,'observed_utc':now}
+                original=read_adopted_domain_operation_v1(db,ns,owner_operation_id)
+                if original is None:
+                    attempt=db.execute('SELECT 1 FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',
+                        (*ns.as_tuple,owner_operation_id)).fetchone()
+                    if attempt is not None:result['state']='unknown'
+                    return result
+                request=original['payload']['request']
+                if (original['operation_kind']!='admit_owner_material_source_v1'
+                        or canonical_digest({'request':{'text':request['text']}})!=input_digest):
+                    result['state']='conflict';return result
+                if original['payload']['authority']['actor']!=authority.actor:
+                    raise AuthorityDenied('Owner material status belongs to another actual Owner')
+                source_id=canonical_digest(('d06.owner-material-source.v1',ns,owner_operation_id))
+                key=source_key(*ns.as_tuple,source_id)
+                row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+                    (*ns.as_tuple,key.token)).fetchone()
+                if row is None or row[2]!=1:
+                    raise UnavailableGuard('Owner material original has no current retained Source')
+                value=json.loads(row[1])
+                if (value['source_id']!=source_id or value['text']!=request['text']
+                        or value['speaker_id']!=authority.actor or value['audiences']!=['owner']
+                        or value['purposes']!=['context','consolidation']):
+                    raise UnavailableGuard('Owner material Source differs from its actual admission')
+                for purpose in ('context','consolidation'):
+                    _source_family_current_sql_v1(db,namespace=ns,roots=(key.token,),purpose=purpose,audiences=('owner',))
+                result.update(state='accepted',source_ref=key.token,source_id=source_id,source_revision=row[0])
+                return result
+            finally:db.rollback()
+        return self._read_v2(authority,read,owner_binding=owner,
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+
+    def read_owner_source_note_task_options_v1(self, authority, lease, *, project_ref):
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.d02_production_operations_v1 import SettledBodyEffectPolicyV1
+        from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+        from .runtime.d11_life_contract_v1 import RECIPE_ID
+        self._authorize(lease,authority,frozenset({'d02','d03','d06','d08','d10','d11'}),owner_read=True)
+        owner=self.__owner_leases.get(lease)
+        ns=authority.namespace
+        if (type(owner) is not OwnerLeaseBindingV1 or 'workbench.read' not in owner.capabilities
+                or authority.purpose!='workbench_view' or authority.audience!=('owner',)
+                or self._parse_ref(project_ref,ns).type_name!='d10.life_project.v1'):
+            raise AuthorityDenied('Owner task options require the actual current Owner project view')
+        now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        def read():
+            db=self.__store._db
+            db.execute('BEGIN')
+            try:
+                row=db.execute('SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND token=? AND valid=1',
+                    (*ns.as_tuple,project_ref)).fetchone()
+                if row is None or json.loads(row[0])['reality']!='real_execution' or json.loads(row[0])['next_step']!='source_note':
+                    raise UnavailableGuard('Owner SourceNote project unavailable')
+                def inventory(kind):
+                    rows=db.execute('SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? AND valid=1 ORDER BY token LIMIT 33',
+                        (*ns.as_tuple,kind)).fetchall()
+                    if len(rows)>32:raise UnavailableGuard('Owner task options inventory exceeds its complete bound')
+                    return [(ref,json.loads(value)) for ref,value in rows]
+                recipes=[ref for ref,v in inventory('d10.activity_recipe.v1') if v=={'recipe_id':RECIPE_ID,'version':1,
+                    'reality':'real_execution','allowed_steps':['source_note'],'preemptible':True}]
+                targets={v['entity_id']:ref for ref,v in inventory('d03.entity_anchor') if v['status']=='active'}
+                roles=[(ref,v) for ref,v in inventory('d03.role_binding') if v['status']=='active'
+                    and v['subject_persona_ref']=='persona:'+ns.persona_id and v['target_entity_ref'] in targets
+                    and now>=v['effective_from'] and (v['effective_until'] is None or now<v['effective_until'])]
+                sources=inventory('memory.source')
+                policies=db.execute("SELECT policy_id,version FROM d02_fixed_body_policies_v1 WHERE bot=? AND persona=? AND status='active' ORDER BY policy_id,version LIMIT 33",ns.as_tuple).fetchall()
+                if len(policies)>32:raise UnavailableGuard('Owner task Body policy inventory exceeds its complete bound')
+                effect_rows=db.execute("SELECT p.policy_ref,p.revision,p.payload_json,p.payload_digest,p.signature FROM graph_d02_production_policies_v1 p WHERE bot=? AND persona=? AND kind='effect' AND revision=(SELECT MAX(q.revision) FROM graph_d02_production_policies_v1 q WHERE q.bot=p.bot AND q.persona=p.persona AND q.policy_ref=p.policy_ref AND q.kind=p.kind) ORDER BY p.policy_ref LIMIT 33",ns.as_tuple).fetchall()
+                if len(effect_rows)>32:raise UnavailableGuard('Owner task effect policy inventory exceeds its complete bound')
+                effects=[]
+                for ref,rev,payload,digest,signature in effect_rows:
+                    self.__d11_issuer._signer.verify('d11.d02-production-policy.v1',payload,signature)
+                    wire=json.loads(payload)
+                    if canonical_digest(wire)!=digest:raise UnavailableGuard('Owner task effect policy commitment changed')
+                    value=decode_typed_production_value_v1(wire,SettledBodyEffectPolicyV1)
+                    if value.namespace!=ns or value.policy_ref!=ref or value.revision!=rev:
+                        raise UnavailableGuard('Owner task effect policy scope changed')
+                    effects.append(value)
+                assembly=self.__d04_installed_joint_assembly
+                if assembly is None:raise UnavailableGuard('Owner task installed Root unavailable')
+                root=self.__d11_issuer.current_budget_grant(db,assembly.admin_bundle.installation_policy.root_lease.lease_id)
+                if root!=assembly.admin_bundle.installation_policy.root_grant:
+                    raise UnavailableGuard('Owner task original Root changed')
+                items=[];bounds=[]
+                for pid,version in policies:
+                    policy=self.__body_quote_authority.policy(db,ns,pid,version)
+                    if policy.work_kind!='d10.life.source_note.v1' or policy.valid_until<=now:continue
+                    for effect in effects:
+                        if (effect.profile_id,effect.work_kind,effect.component_id)!=(policy.profile.profile_id,policy.work_kind,policy.component.component_id):continue
+                        for role_ref,role in roles:
+                            for source_ref,source in sources:
+                                roots=tuple(dict.fromkeys((source_ref,*role['source_refs'])))
+                                if not {'context','consolidation'}<=set(source['purposes']) or 'owner' not in source['audiences']:continue
+                                from .memory_types import access_key
+                                from .domains.d06 import source_correction_head_key
+                                access_row=db.execute('SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+                                    (*ns.as_tuple,access_key(*ns.as_tuple,source['source_id']).token)).fetchone()
+                                correction=db.execute('SELECT revision FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+                                    (*ns.as_tuple,source_correction_head_key(ns,source['source_id']).token)).fetchone()
+                                if access_row is None or access_row[1]!=1 or correction is not None:continue
+                                access=json.loads(access_row[0])
+                                if (access['source_id']!=source['source_id'] or access['status']!='active'
+                                        or not {'context','consolidation'}<=set(access['purposes'])
+                                        or 'owner' not in access['audiences']):continue
+                                for purpose in ('context','consolidation'):
+                                    _source_family_current_sql_v1(db,namespace=ns,roots=roots,purpose=purpose,audiences=('owner',))
+                                for recipe_ref in recipes:
+                                    items.append({'body_source_ref':source_ref,'recipe_ref':recipe_ref,
+                                        'target_entity_ref':targets[role['target_entity_ref']],'role_binding_ref':role_ref,
+                                        'body_policy_id':pid,'body_policy_version':version,'effect_policy_ref':effect.policy_ref})
+                                    bounds.append(min(root.valid_until_utc,policy.valid_until,
+                                        role['effective_until'] if role['effective_until'] is not None else root.valid_until_utc))
+                                    if len(items)>32:raise UnavailableGuard('Owner task compatible options exceed the complete bound')
+                return {'schema':'d12.owner-source-note-task-options.v1','namespace':asdict(ns),'project_ref':project_ref,
+                    'observed_utc':now,'deadline_upper_bound_utc':min(bounds) if bounds else None,'items':items}
+            finally:db.rollback()
+        return self._read_v2(authority,read,owner_binding=owner,
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+
+    def read_owner_source_note_task_status_v1(self, authority, lease, *, owner_operation_id, input_digest):
+        from .runtime.owner_source_note_task_contract_v1 import (owner_source_note_task_ids_v1,
+            OwnerSourceNoteTaskContinuationV2)
+        from .runtime.owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+        from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.d11_types import runtime_job_key
+        from .runtime.jobs import get_job
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        self._authorize(lease, authority, frozenset({'d08','d11'}), owner_read=True)
+        owner = self.__owner_leases.get(lease)
+        if (type(owner) is not OwnerLeaseBindingV1 or 'workbench.read' not in owner.capabilities
+                or authority.purpose != 'workbench_view' or authority.audience != ('owner',)):
+            raise AuthorityDenied('Owner task status requires its actual current Owner view')
+        ns = authority.namespace
+        observed = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        observation={}
+        def observe(scope):
+            guard,current_owner=self._owner_binding_in_fence(authority,scope,None,owner,
+                self.__owner_session_proofs.get(lease))
+            db=self.__store._db
+            with self.__store._lock:
+                db.execute('BEGIN')
+                try:
+                    original=read_adopted_domain_operation_v1(db,ns,owner_operation_id)
+                    auth=None
+                    if original is not None and original['operation_kind']=='submit_owner_source_note_task_v1':
+                        from .runtime.owner_source_note_task_contract_v1 import OwnerSourceNoteTaskAuthorizationV2
+                        auth=decode_typed_production_value_v1(original['payload']['provenance']['owner_task_authorization'],
+                            OwnerSourceNoteTaskAuthorizationV2)
+                        if auth.cause.owner_actor_ref!=authority.actor:
+                            raise AuthorityDenied('Owner Native status belongs to another actual Owner')
+                        _source_family_current_sql_v1(db,namespace=ns,roots=auth.source_refs,
+                            purpose='context',audiences=('owner',))
+                finally:db.rollback()
+            if auth is not None:
+                from .runtime.owner_source_note_native_observation_v1 import read_owner_source_note_native_observation_v1
+                native=read_owner_source_note_native_observation_v1(self,self.__bootstrap,
+                    authorization_original_ref=auth.original_ref)
+                observation['native']=native
+            else:native=None
+            return guard,native
+        def read():
+            db = self.__store._db
+            db.execute('BEGIN')
+            try:
+                projection = {'schema':'d12.owner-source-note-task-status.v1','namespace':asdict(ns),
+                    'owner_operation_id':owner_operation_id,'input_digest':input_digest,'state':'not_found',
+                    'job_id':None,'job_phase':None,'step':None,'wait_reason':None,'pending_effect_refs':[],
+                    'original_deadline_utc':None,'observed_utc':observed}
+                original = read_adopted_domain_operation_v1(db,ns,owner_operation_id)
+                if original is None:
+                    attempt = db.execute('SELECT 1 FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',
+                        (*ns.as_tuple,owner_operation_id)).fetchone()
+                    if attempt is not None:projection['state']='unknown'
+                    else:
+                        focus_id='owner-note-focus:'+canonical_digest((ns,owner_operation_id,input_digest))[:40]
+                        focus_original=read_adopted_domain_operation_v1(db,ns,focus_id)
+                        if focus_original is not None:
+                            if (focus_original['operation_kind']!='focus_life_project'
+                                    or focus_original['payload']['authority']['actor']!=authority.actor):
+                                raise AuthorityDenied('Owner partial submission Focus belongs to another actor or operation')
+                            projection['state']='focus_saved_task_not_saved'
+                            projection['wait_reason']='owner_focus_saved_task_not_saved:'+focus_id
+                    return projection
+                request = original['payload']['request']
+                public_request = {key:value for key,value in request.items() if key != '$type'}
+                if (original['operation_kind'] != 'submit_owner_source_note_task_v1'
+                        or canonical_digest({'request':public_request}) != input_digest):
+                    projection['state']='conflict'
+                    return projection
+                from .runtime.owner_source_note_task_contract_v1 import OwnerSourceNoteTaskAuthorizationV2
+                auth = decode_typed_production_value_v1(original['payload']['provenance']['owner_task_authorization'],
+                    OwnerSourceNoteTaskAuthorizationV2)
+                saved = read_owner_source_note_task_authorization_v2(db,namespace=ns,
+                    original_ref=auth.original_ref,issuer=self.__d11_issuer)
+                if saved is None or saved[0] != auth or auth.cause.owner_actor_ref != authority.actor:
+                    raise AuthorityDenied('Owner task status lost its actual same-Owner signed producer')
+                _source_family_current_sql_v1(db,namespace=ns,roots=auth.source_refs,
+                    purpose='context',audiences=('owner',))
+                projection['original_deadline_utc']=auth.cause.original_deadline_utc
+                ids=owner_source_note_task_ids_v1(ns,owner_operation_id)
+                job=get_job(db,ids['job_id'])
+                if job is None:
+                    projection['state']='pending_start'
+                    return projection
+                key=runtime_job_key(*ns.as_tuple,ids['activity_id'],ids['job_id'])
+                row=db.execute('SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+                    (*ns.as_tuple,key.token)).fetchone()
+                if row is None or row[1]!=1:
+                    raise UnavailableGuard('Owner task status current job projection is absent')
+                continuation=decode_typed_production_value_v1(job.continuation,OwnerSourceNoteTaskContinuationV2)
+                if (continuation.authorization_original_ref!=auth.original_ref
+                        or continuation.authorization_original_digest!=auth.digest
+                        or job.activity_id!=ids['activity_id'] or job.bot_id!=ns.bot_id or job.persona_id!=ns.persona_id):
+                    raise UnavailableGuard('Owner task status job belongs to another signed task')
+                from .runtime.d11_types import job_graph_write
+                if json.loads(row[0])!=job_graph_write(job).value:
+                    raise UnavailableGuard('Owner task status SQL job and Graph projection differ')
+                projection.update(job_id=job.job_id,job_phase=job.phase,step=continuation.step,
+                    wait_reason=continuation.wait_reason,pending_effect_refs=list(continuation.pending_effect_refs))
+                projection['state']=('active' if job.phase in {'queued','running'} else job.phase
+                    if job.phase in {'waiting','draining','completed','failed','cancelled'} else 'unknown')
+                native=observation.get('native')
+                if job.phase=='running' and native is not None and native.state!='not_prepared':
+                    if native.state=='unknown':projection['state']='unknown'
+                    elif native.state=='failed':projection['state']='failed'
+                    elif not native.adoption_finished:projection['state']='waiting'
+                    if not native.adoption_finished:
+                        projection['pending_effect_refs']=[native.effect_id]
+                        projection['wait_reason']=native.reason_code or 'native_original_'+native.state
+                    # Native completion precedes independent Goal/Plan settlement;
+                    # parent completed is the only complete-task status.
+                return projection
+            finally:
+                db.rollback()
+        return self._read_v2(authority,read,owner_binding=owner,
+            owner_session_proof=self.__owner_session_proofs.get(lease),fence_observer=observe)
+
+    def read_source_correction_context_v1(self, authority, lease, *, source_id):
+        """Read exact current correction selectors under the existing Owner fence."""
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        from .memory_types import SourceRecord, InterpretationRecord, interpretation_key
+        self._authorize(lease, authority, frozenset({"d06", "d07", "d12"}), owner_read=True)
+        if authority.issuer_domain != "d12" or authority.audience != ("owner",):
+            raise AuthorityDenied("source correction context requires current Owner scope")
+        ns = authority.namespace
+        key = source_key(*ns.as_tuple, source_id)
+        source_ref = key.token
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is not None:
+            return self._prepare_runtime_storage_work_v3(
+                authority, lease, source_id=source_id)
+        def read():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                _source_family_current_sql_v1(db, namespace=ns, roots=(source_ref,),
+                    purpose="context", audiences=("owner",))
+                row = db.execute("SELECT revision,value FROM graph_atoms WHERE token=? AND bot=? AND persona=? AND valid=1",
+                    (source_ref, *ns.as_tuple)).fetchone()
+                if row is None:
+                    raise UnavailableGuard("correction Source unavailable")
+                record = SourceRecord.from_dict(json.loads(row[1]))
+                if key != source_key(*ns.as_tuple, record.source_id):
+                    raise AuthorityDenied("correction Source identity differs")
+                rows = db.execute("SELECT a.token,a.revision,a.value FROM graph_atoms a "
+                    "WHERE a.bot=? AND a.persona=? AND a.type_name='memory.interpretation' AND a.valid=1 "
+                    "AND EXISTS (SELECT 1 FROM json_each(a.value,'$.source_ids') j WHERE j.value=?) "
+                    "ORDER BY a.token LIMIT 101", (*ns.as_tuple, record.source_id)).fetchall()
+                if len(rows) > 100:
+                    raise UnavailableGuard("correction target page exceeds its bounded contract")
+                targets = []
+                for token, revision, encoded in rows:
+                    item = InterpretationRecord.from_dict(json.loads(encoded))
+                    if AtomKey.from_token(token) != interpretation_key(*ns.as_tuple, item.interpretation_id):
+                        raise AuthorityDenied("correction target canonical identity differs")
+                    refs = tuple(source_key(*ns.as_tuple, source_id).token for source_id in item.source_ids)
+                    _source_family_current_sql_v1(db, namespace=ns, roots=refs,
+                        purpose="context", audiences=("owner",))
+                    targets.append({"target_ref": token, "revision": revision,
+                        "digest": canonical_digest(json.loads(encoded)), "claim": item.claim})
+                epochs = db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
+                    ns.as_tuple).fetchone()
+                if epochs is None:
+                    raise UnavailableGuard("correction current authority epochs unavailable")
+                return {"schema": "d12.source-correction-context.v1", "namespace": asdict(ns),
+                    "source_refs": [source_ref], "source_revision": row[0],
+                    "source_digest": canonical_digest(json.loads(row[1])), "targets": targets,
+                    "access_epoch": epochs[0], "deletion_epoch": epochs[1]}
+            finally:
+                db.rollback()
+        return self._read_v2(authority, read, owner_binding=self.__owner_leases.get(lease),
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+
     def commit_source_correction_v1(
             self, *, request, actor_id: str, principal: OwnerPrincipalV1,
             purpose: str, audience: str, installation_policy, admin_policy,
@@ -5227,10 +6276,7 @@ class GraphCoordinator:
                             if len(atoms) >= 512:
                                 raise UnavailableGuard("source correction closure exceeds bound")
                             store._validate_key(key)
-                            row = db.execute(
-                                "SELECT revision,value,valid FROM graph_atoms "
-                                "WHERE token=?", (key.token,),
-                            ).fetchone()
+                            row = read_graph_head_v3(db, key.token)
                             atoms[key] = (GraphAtom(
                                 key, row[0], json.loads(row[1]), bool(row[2]))
                                 if row else GraphAtom(key, 0, {}, False))
@@ -5560,10 +6606,7 @@ class GraphCoordinator:
                     "SELECT value FROM graph_atoms WHERE token=? AND valid=1",
                     (access_key(*namespace.as_tuple, source_id).token,),
                 ).fetchone()
-                media_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (media.token,),
-                ).fetchone()
+                media_row = read_graph_head_v3(db, media.token)
                 if (source_row is None or access_row is None or media_row is None
                         or media_row[0] != 1 or media_row[2] != 1):
                     raise UnavailableGuard("current media source is absent")
@@ -5610,10 +6653,7 @@ class GraphCoordinator:
                            != current_c09_source_read_versions_v1(
                                db, namespace, source_id)):
                     raise StaleRead("media source or access changed")
-                row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (media.token,),
-                ).fetchone()
+                row = read_graph_head_v3(db, media.token)
                 if (row is None or row[0] != 1 or row[2] != 1
                         or json.loads(row[1]) != result.value
                         or read_media_blobs(db, namespace, source_id, result.value)
@@ -6212,8 +7252,3268 @@ class GraphCoordinator:
         """Legacy C04 preparation cannot freeze an executable V2 input."""
         raise UnavailableGuard("C04 V1 preparation is non-executable; HOLD")
 
+    def _read_saved_foreground_receipt_v1(self, selector):
+        """Disclose a durable result only through a fresh actual self/Source read."""
+        from .runtime.foreground_activity_issuance_v1 import (
+            foreground_receipt_read_for_fence_v1, read_foreground_receipt_in_transaction_v1)
+        store, port, namespace = self.__store, self.__content_fence_v2, selector.namespace
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        anchor = port.current_anchor(namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("foreground receipt current recovery anchor differs; HOLD")
+        operation_id = "foreground-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=target.activation_generation, operation="read",
+            operation_id=operation_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace, target.activation_generation,
+            "read", operation_id, permit, anchor, epoch, metadata.graph_revision)
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("foreground receipt read permit changed; HOLD")
+            with foreground_receipt_read_for_fence_v1(self, scope=scope, operation_id=selector.operation_id,
+                    source_ref=selector.plan_source_ref, purpose=selector.purpose, audiences=selector.audiences) as issued:
+                with store._lock:
+                    db = store._db
+                    db.execute("BEGIN")
+                    try:
+                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                            raise StaleRead("foreground receipt current graph stamp changed")
+                        result = read_foreground_receipt_in_transaction_v1(db, graph=self, issued=issued)
+                        db.execute("COMMIT")
+                    except BaseException:
+                        if db.in_transaction:
+                            db.rollback()
+                        raise
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("foreground receipt read permit changed before disclosure; HOLD")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("foreground receipt graph changed before disclosure")
+        finally:
+            port.finish_fence(scope, request_id="finish:" + operation_id,
+                request_digest="sha256:" + canonical_digest({"operation_id": operation_id,
+                    "permit_token": permit.token, "action": "finish_read"}))
+        return result
+
+    def install_artifact_draft_model_runtime_v1(self, bootstrap, runtime):
+        from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+        self._admin(bootstrap)
+        assembly = self.__d04_installed_joint_assembly
+        if (type(runtime) is not InstalledArtifactDraftModelRuntimeV1 or runtime.graph is not self
+                or assembly is None or runtime.bundle is not assembly.admin_bundle
+                or runtime.issuer is not self.__d11_issuer or self.__artifact_draft_model_runtime_v1 is not None):
+            raise ValueError("artifact model runtime must be the unique actual installed worker/paired client")
+        self.__artifact_draft_model_runtime_v1 = runtime
+
+    def _current_artifact_draft_runtime_v1(self, bootstrap, bundle):
+        from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+        self._admin(bootstrap)
+        runtime = self.__artifact_draft_model_runtime_v1
+        if (type(runtime) is not InstalledArtifactDraftModelRuntimeV1 or runtime.graph is not self
+                or runtime.bundle is not bundle or runtime.issuer is not self.__d11_issuer):
+            raise UnavailableGuard("actual installed artifact model worker/paired client required; HOLD")
+        return runtime
+
+    def seal_current_artifact_draft_model_call_v1(self, bootstrap, bundle, *, prepared, intent, permit):
+        from .runtime.d11_artifact_draft_model_v1 import seal_artifact_draft_model_call_v1
+        from .authority_service.d11_artifact_draft_model_v1 import read_current_artifact_draft_model_graph_v1
+        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        from .authority_service.v2_contract import FencePermitV2
+        from .runtime.first_ingress_v2 import trusted_upper
+        runtime = self._current_artifact_draft_runtime_v1(bootstrap, bundle)
+        if type(intent) is not ModelEgressIntentV1 or type(permit) is not FencePermitV2:
+            raise TypeError("artifact seal requires its actual paired Core model intent/permit")
+        namespace, store, port = bundle.installation_policy.namespace, self.__store, self.__content_fence_v2
+        def require_current():
+            actual, state = port.get_fence_operation(namespace=namespace, authority_namespace=intent.namespace,
+                operation_id=intent.operation_id)
+            anchor = port.current_anchor(namespace=namespace, authority_namespace=intent.namespace)
+            if (actual != permit or state != "active" or permit.operation != "model_egress"
+                    or anchor != permit.pinned_anchor or permit.subject != intent.subject
+                    or permit.token != intent.fence_token or permit.revision != intent.fence_revision
+                    or permit.fence_epoch != intent.fence_epoch):
+                raise UnavailableGuard("artifact actual paired model permit is no longer current; HOLD")
+        require_current()
+        now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                metadata, epoch = self._v2_graph_stamp(namespace)
+                if (metadata.graph_revision, epoch.revision) != (intent.graph_revision, intent.graph_epoch):
+                    raise StaleRead("artifact Graph changed before sealing the actual model original")
+                current, _, _ = read_current_artifact_draft_model_graph_v1(db, intent, runtime.issuer, now,
+                    installed_bundle=bundle, allow_unsealed_prepare=True)
+                if current != prepared:
+                    raise StaleRead("artifact seal differs from its actual prepared/acquired worker original")
+                original = seal_artifact_draft_model_call_v1(db, prepared=current, intent=intent, permit=permit,
+                    issuer=runtime.issuer, metadata=metadata, epoch=epoch)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        require_current()
+        return {"status": "sealed", "job_id": prepared.job_id, "original_ref": original.original_ref}
+
+    def reconcile_current_artifact_draft_model_cost_v1(self, bootstrap, bundle, *, prepared):
+        from .runtime.d11_artifact_draft_model_v1 import record_artifact_draft_paid_after_cost_cas_v1
+        runtime = self._current_artifact_draft_runtime_v1(bootstrap, bundle)
+        fact = runtime.read_cached_cost_fact_v1(prepared.job_id)
+        commit = self._commit_original_model_cost_v1(bootstrap, prepared.namespace, fact.intent,
+            quote_id=prepared.quote_id, quote_version=1, work_kind="artifact_draft_v1")
+        actual = replace(commit, status="committed")
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                record_artifact_draft_paid_after_cost_cas_v1(db, prepared=prepared, fact=fact,
+                    commit=actual, issuer=runtime.issuer)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        return actual
+
+    def record_current_artifact_draft_model_result_v1(self, bootstrap, bundle, *, prepared):
+        from .runtime.d11_artifact_draft_model_v1 import record_artifact_draft_paid_after_cost_cas_v1
+        from .authority_service.d11_artifact_draft_model_v1 import read_current_artifact_draft_model_graph_v1
+        from .authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
+        from .authority_service.v2_contract import FencePermitV2
+        from .runtime.first_ingress_v2 import trusted_upper
+        runtime = self._current_artifact_draft_runtime_v1(bootstrap, bundle)
+        result, paid = runtime.read_cached_adoption_originals_v1(prepared)
+        fact = runtime.read_cached_cost_fact_v1(prepared.job_id)
+        port, namespace = self.__content_fence_v2, prepared.namespace
+        rr = result.request
+        delivered, state = port.get_fence_operation(namespace=namespace,
+            authority_namespace=rr.authority_namespace, operation_id=rr.read_attempt_id)
+        if (type(delivered) is not FencePermitV2 or state != "finished"
+                or (delivered.authority_id, delivered.namespace, delivered.subject, delivered.holder,
+                    delivered.generation, delivered.operation, delivered.operation_id) !=
+                   (runtime.client_grant.authority_id, rr.authority_namespace, runtime.client_grant.subject,
+                    runtime.client_grant.administrator_holder, prepared.activation_generation, "read", rr.read_attempt_id)
+                or rr.installation_id != runtime.client_grant.installation_id or rr.namespace != namespace):
+            raise UnavailableGuard("artifact original delivery read is not independently confirmed finished; HOLD")
+        now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+        token, capability = self.grant(bootstrap, actor=prepared.worker_subject, issuer_domain="d11",
+            namespace=namespace, domains=("d11",), activation_generation=prepared.activation_generation,
+            operation_id="artifact-result-archive:" + prepared.call_id)
+        authority = AuthorityContext(prepared.worker_subject, "d11", capability, namespace,
+            tuple(sorted(self.__leases[token][5])), "consolidation", prepared.audiences,
+            "artifact-result-archive.v1", prepared.activation_generation)
+        fresh_read = []
+        def observe(scope):
+            current, observed = port.get_current_background_owner_authority_for_fence_v1(namespace=namespace,
+                authority_namespace=scope.authority_namespace, permit=scope.permit)
+            if (type(current) is not D12CurrentOwnerAuthorityV1 or observed != scope.permit
+                    or current.target_admission is not None
+                    or current.guard.authorization_head.removeprefix("sha256:") != prepared.owner_guard.owner_head_digest):
+                raise UnavailableGuard("artifact archive lost its independently current upstream Owner; HOLD")
+            if not fresh_read:
+                fresh_read.append((scope.operation_id, canonical_digest(scope.permit)))
+            return current.guard
+        def archive():
+            db = self.__store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                owner = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                    (prepared.owner_guard.grant_ref, *namespace.as_tuple)).fetchone()
+                if (owner is None or owner[2] != 1 or owner[0] != prepared.owner_guard.grant_revision
+                        or canonical_digest(json.loads(owner[1])) != prepared.owner_guard.grant_digest):
+                    raise StaleRead("artifact archive actual Graph Owner grant differs from its original prepared guard")
+                current, _, _ = read_current_artifact_draft_model_graph_v1(db, fact.intent, runtime.issuer, now,
+                    installed_bundle=bundle, allow_accounted_result=True)
+                if current != prepared:
+                    raise StaleRead("artifact paired result differs from the actual current prepared worker")
+                original = record_artifact_draft_paid_after_cost_cas_v1(db, prepared=current, fact=fact,
+                    commit=paid, issuer=runtime.issuer, result=result)
+                db.commit()
+                return original
+            except BaseException:
+                db.rollback()
+                raise
+        try:
+            self._authorize(token, authority, frozenset({"d11"}), owner_read=True)
+            original = self._read_v2(authority, archive, fence_observer=observe)
+        finally:
+            self.release_authority_lease(bootstrap, token)
+        return {"status": "recorded", "job_id": prepared.job_id, "paid_original_ref": original.original_ref,
+            "historical_delivery_read_attempt_id": rr.read_attempt_id,
+            "current_archive_read_operation_id": fresh_read[0][0], "current_archive_read_permit_digest": fresh_read[0][1]}
+
+    def project_current_owner_stop_reply_v1(self, bootstrap, installed_bundle, *, original_ref, operation_id):
+        """One metadata-only W01 attempt for an already accepted Owner stop intent."""
+        from .host.authority_profile import AdminInstallationBundle
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .runtime.foreground_activity_issuance_v1 import owner_stop_projection_for_fence_v1, reobserve_owner_stop_projection_v1
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.domain_production_commit_v1 import commit_installed_domain_operation_v1
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime_contracts import AuthorityContext, CommandEnvelope, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA, SourceQualification, VersionGuard
+        from .runtime.restore_anchor import RestoreAnchor
+        from datetime import datetime
+        self._admin(bootstrap)
+        assembly = self.__d04_installed_joint_assembly
+        runtime, store, port = self.__domain_production_runtime_v1, self.__store, self.__content_fence_v2
+        if (type(installed_bundle) is not AdminInstallationBundle or assembly is None
+                or assembly.admin_bundle is not installed_bundle or runtime is None or port is None):
+            raise UnavailableGuard("Stop projection requires its actual installed assembly; HOLD")
+        namespace = installed_bundle.installation_policy.namespace
+        attempt_id = "owner-stop-projection:" + operation_id
+        request_digest = canonical_digest(("w01.owner-stop-projection.v1", namespace, operation_id, original_ref))
+        query = ("SELECT request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,permit_json,receipt_json "
+            "FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?")
+        key = (*namespace.as_tuple, operation_id)
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            saved = store._db.execute(query, key).fetchone()
+        target = metadata.requirements
+        anchor = port.current_anchor(namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("Stop projection current C09 anchor differs; HOLD")
+        if saved is not None and saved[:2] != (request_digest, attempt_id):
+            raise EventConflict("Stop projection changed its original accepted intent")
+        if saved is None:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("Stop projection Graph changed before original intent")
+                    db.execute("INSERT INTO graph_owner_domain_attempts_v3(bot,persona,operation_id,request_digest,"
+                        "attempt_id,anchor_json,graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?)",
+                        (*key, request_digest, attempt_id, canonical_json(asdict(anchor)), metadata.graph_revision, epoch.revision))
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+        if saved is not None and saved[6] is not None:
+            from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN")
+                try:
+                    adopted = read_adopted_domain_operation_v1(db, namespace, operation_id)
+                    result = json.loads(saved[6])
+                    if (adopted is None or (adopted["domain"], adopted["operation_kind"]) != ("d11", "owner_stop_reply_v1")
+                            or adopted["payload"]["provenance"]["stop_original_ref"] != original_ref
+                            or (result["original_digest"], result["receipt_digest"]) != (
+                                adopted["original_digest"], canonical_digest(adopted["receipt"]))):
+                        raise EventConflict("Stop projection saved ACK differs from its actual adopted original")
+                finally:
+                    db.rollback()
+            permit, state = port.get_fence_operation(namespace=namespace,
+                authority_namespace=target.authority_namespace, operation_id=attempt_id)
+        else:
+            observed_attempt = port.observe_content_write_attempt_v1(namespace=namespace,
+                authority_namespace=target.authority_namespace, operation_id=attempt_id, expected_anchor=anchor)
+            permit, state = observed_attempt.permit, observed_attempt.state
+            if saved is not None and (RestoreAnchor(**json.loads(saved[2])) != anchor
+                    or saved[3:5] != (metadata.graph_revision, epoch.revision)):
+                old_anchor = RestoreAnchor(**json.loads(saved[2]))
+                if (saved[5] is not None or state != "absent" or permit is not None
+                        or (old_anchor.authority_id, old_anchor.namespace, old_anchor.activation_generation) != (
+                            anchor.authority_id, anchor.namespace, anchor.activation_generation)):
+                    raise UnavailableGuard("Stop projection unresolved original Graph stamp changed; HOLD")
+                with store._lock:
+                    db = store._db
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if self._v2_graph_stamp(namespace) != (metadata, epoch) or db.execute(query, key).fetchone() != saved:
+                            raise StaleRead("Stop projection negative observation or original attempt changed")
+                        db.execute("UPDATE graph_owner_domain_attempts_v3 SET anchor_json=?,graph_revision=?,graph_epoch=? "
+                            "WHERE bot=? AND persona=? AND operation_id=? AND permit_json IS NULL AND receipt_json IS NULL",
+                            (canonical_json(asdict(anchor)), metadata.graph_revision, epoch.revision, *key))
+                        saved = db.execute(query, key).fetchone()
+                        db.commit()
+                    except BaseException:
+                        if db.in_transaction:
+                            db.rollback()
+                        raise
+        if saved is not None and saved[5] is not None and permit != from_wire(json.loads(saved[5])):
+            raise UnavailableGuard("Stop projection original permit is unconfirmed; HOLD")
+        if saved is not None and saved[6] is not None:
+            if type(permit) is not FencePermitV2 or state not in {"active", "finished"}:
+                raise UnavailableGuard("Stop projection committed original permit is unconfirmed; HOLD")
+            old_scope = FenceScope(namespace, permit.namespace, permit.generation, "write", attempt_id, permit,
+                RestoreAnchor(**json.loads(saved[2])), NamespaceEpoch(*namespace.as_tuple, saved[4]), saved[3])
+            if state == "active":
+                port.finish_fence(old_scope, request_id="finish:" + attempt_id,
+                    request_digest="sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
+                        "operation_id": operation_id, "request_digest": request_digest, "permit_token": permit.token}))
+            return {"status": "already_projected", "operation_id": operation_id}
+        if state == "absent" and permit is None:
+            permit = port.begin_fence(namespace=namespace, authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation, operation="write",
+                operation_id=attempt_id, expected_anchor=anchor, retain_on_unknown=True)
+            state = "active"
+        if (type(permit) is not FencePermitV2 or state != "active" or permit.operation_id != attempt_id
+                or permit.operation != "write" or permit.holder != self.__holder or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("Stop projection original fence outcome is unconfirmed; HOLD")
+        scope = FenceScope(namespace, target.authority_namespace, target.activation_generation, "write",
+            attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("Stop projection actual permit changed; HOLD")
+        permit_json = canonical_json(to_wire(permit))
+        with store._lock:
+            store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? WHERE bot=? AND persona=? "
+                "AND operation_id=? AND attempt_id=? AND permit_json IS NULL", (permit_json, *key, attempt_id))
+        with owner_stop_projection_for_fence_v1(self, scope=scope, original_ref=original_ref) as issued:
+            observed = reobserve_owner_stop_projection_v1(issued)
+            if observed.initial_original.operation_id != operation_id:
+                raise EventConflict("Stop projection actual accepted operation differs")
+            token, capability = self.grant(bootstrap, actor=observed.owner_actor_ref, issuer_domain="d11",
+                namespace=namespace, domains=("d11",), purposes=("workbench_user_action",), audiences=("owner",),
+                activation_generation=scope.generation, operation_id=operation_id)
+            runtime._active_owner_stop_projection_v1 = issued
+            try:
+                now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+                with store._lock:
+                    db = store._db
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                            raise StaleRead("Stop projection actual Graph changed before W01")
+                        cycle = get_job(db, AtomKey.from_token(observed.request.cycle_job_ref).name)
+                        deadline = datetime.fromisoformat(cycle.deadline_utc.replace("Z", "+00:00")).timestamp()
+                        versions = dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
+                            "AND ref='current' AND kind IN ('scheme','operator','policy')", namespace.as_tuple).fetchall())
+                        if set(versions) != {"scheme", "operator", "policy"}:
+                            raise UnavailableGuard("Stop projection current version heads are absent; HOLD")
+                        authority = AuthorityContext(observed.owner_actor_ref, "d11", capability, namespace,
+                            tuple(sorted(self.__leases[token][5])), "workbench_user_action", ("owner",),
+                            "owner-stop:" + operation_id, scope.generation)
+                        envelope = CommandEnvelope(RUNTIME_SCHEMA, OperationIdentity(cycle.activity_id, None,
+                            operation_id, "owner_stop_reply_v1", operation_id, canonical_digest({"input_refs": []})),
+                            authority, VersionGuard((), (QueryEpoch(namespace, "namespace", epoch.revision),), 0, 0,
+                                store._registry.catalogue_hash, versions["scheme"], versions["operator"], versions["policy"], (), (), ()),
+                            SourceQualification((), "derived", None, now, "inference", "ineligible", None, "not_applicable"),
+                            (), cycle.budget_ref, deadline, time.monotonic() + deadline - now, "owner-stop:" + operation_id, ())
+                        operation = installed_operation_v1("owner_stop_reply_v1")
+                        frame, stage, readers = runtime.compile_owner_stop_projection_in_transaction_v1(db,
+                            operation=operation, request=observed.request, envelope=envelope, scope=scope, now_utc=now)
+                        result = commit_installed_domain_operation_v1(runtime, db, operation=operation, request=observed.request,
+                            frame=frame, stage=stage, readers=readers, scope=scope, owner=None,
+                            guard=observed.owner_authorization, metadata=metadata, epoch=epoch, process_lease=token)
+                        db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? WHERE bot=? AND persona=? "
+                            "AND operation_id=? AND attempt_id=? AND receipt_json IS NULL", (canonical_json(result), *key, attempt_id))
+                        if db.execute("SELECT changes()").fetchone() != (1,):
+                            raise EventConflict("Stop projection original receipt raced")
+                        db.execute("COMMIT")
+                    except BaseException:
+                        if db.in_transaction:
+                            db.rollback()
+                        raise
+            finally:
+                runtime._active_owner_stop_projection_v1 = None
+                self.release_authority_lease(bootstrap, token)
+        port.finish_fence(scope, request_id="finish:" + attempt_id,
+            request_digest="sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
+                "operation_id": operation_id, "request_digest": request_digest, "permit_token": permit.token}))
+        return {"status": "projected", "operation_id": operation_id}
+
+    def _foreground_domain_write_v1(self, runtime, *, selector, operation, request):
+        from .authority_service.current_foreground_activity_v1 import (ForegroundActivityRequestV1,
+            ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2)
+        if type(selector) not in {ForegroundActivityRequestV1, ForegroundActivityRequestV2,
+                ForegroundActivityPreparationParentRequestV2}:
+            raise AuthorityDenied('foreground requires its exact registered selector')
+        return self._durable_self_domain_write_v1(runtime, selector=selector, operation=operation, request=request)
+
+    def cancel_owner_source_note_task_v1(self, authority, lease, *, owner_operation_id):
+        from .runtime.cancel_owner_source_note_task_v1 import (CancelOwnerSourceNoteTaskRequestV1,
+            owner_source_note_task_cancel_operation_id_v1)
+        from .runtime.owner_source_note_task_contract_v1 import owner_source_note_task_ids_v1
+        from .runtime.owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+        from .runtime.owner_source_note_task_contract_v1 import OwnerSourceNoteTaskAuthorizationV2
+        self._authorize(lease,authority,frozenset({'d11'}),owner_read=True)
+        owner=self.__owner_leases.get(lease)
+        if (type(owner) is not OwnerLeaseBindingV1 or 'workbench.control' not in owner.capabilities
+                or authority.purpose!='workbench_user_action' or authority.audience!=('owner',)):
+            raise AuthorityDenied('Owner task cancel requires its actual current Owner control session')
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                original=read_adopted_domain_operation_v1(db,authority.namespace,owner_operation_id)
+                if original is None or original['operation_kind']!='submit_owner_source_note_task_v1':
+                    raise UnavailableGuard('Owner task cancellation original submit is absent')
+                auth=decode_typed_production_value_v1(original['payload']['provenance']['owner_task_authorization'],
+                    OwnerSourceNoteTaskAuthorizationV2)
+                saved=read_owner_source_note_task_authorization_v2(db,namespace=authority.namespace,
+                    original_ref=auth.original_ref,issuer=self.__d11_issuer)
+                if saved is None or saved[0]!=auth or auth.cause.owner_actor_ref!=authority.actor:
+                    raise AuthorityDenied('Owner task cancellation belongs to another actual Owner')
+            finally:db.rollback()
+        ids=owner_source_note_task_ids_v1(authority.namespace,owner_operation_id)
+        return self.run_current_domain_operation_v1(authority,lease,operation_kind='cancel_owner_source_note_task_v1',
+            request=CancelOwnerSourceNoteTaskRequestV1(owner_operation_id),
+            operation_id=owner_source_note_task_cancel_operation_id_v1(authority.namespace,owner_operation_id),
+            activity_id=ids['activity_id'],audience_ref='owner',parent_budget_lease_ref=auth.cause.parent_budget_lease_ref)
+
+    def drive_owner_source_note_task_v1(self, bootstrap, installed_bundle, *, authorization_original_ref):
+        from .runtime.owner_source_note_task_driver_v1 import drive_owner_source_note_task_v1
+        return drive_owner_source_note_task_v1(self,bootstrap,installed_bundle,
+            authorization_original_ref=authorization_original_ref)
+
+    def create_owner_source_note_task_v1(self, bootstrap, installed_bundle, *, authorization_original_ref):
+        from .runtime.owner_source_note_task_contract_v1 import (CreateOwnerSourceNoteTaskRequestV1,
+            owner_source_note_task_ids_v1)
+        from .runtime.owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+        self._admin(bootstrap)
+        ns=installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                saved=read_owner_source_note_task_authorization_v2(db,namespace=ns,
+                    original_ref=authorization_original_ref,issuer=self.__d11_issuer)
+                if saved is None:raise UnavailableGuard('actual Owner task authorization is missing')
+                ids=owner_source_note_task_ids_v1(ns,saved[0].cause.owner_operation_id)
+            finally:db.rollback()
+        request=CreateOwnerSourceNoteTaskRequestV1(authorization_original_ref)
+        selector=self._owner_source_note_task_selector_v1(bootstrap,installed_bundle,
+            authorization_original_ref=authorization_original_ref,operation_kind='create_owner_source_note_task_v1',
+            request=request,operation_id=ids['create_operation_id'])
+        return self.__domain_production_runtime_v1.run_owner_source_note_task_current_v1(selector=selector,
+            operation_kind=selector.operation_kind,request=request)
+
+    def acquire_owner_source_note_task_v1(self, bootstrap, installed_bundle, *, authorization_original_ref):
+        from .runtime.owner_source_note_task_contract_v1 import (AcquireOwnerSourceNoteTaskRequestV1,
+            owner_source_note_task_ids_v1)
+        from .runtime.owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+        from .runtime.jobs import get_job
+        from .runtime.d11_types import runtime_job_key
+        from .domains.d03.self_perspective import self_mapping_key
+        self._admin(bootstrap)
+        ns=installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                saved=read_owner_source_note_task_authorization_v2(db,namespace=ns,
+                    original_ref=authorization_original_ref,issuer=self.__d11_issuer)
+                if saved is None:raise UnavailableGuard('actual Owner task authorization is missing')
+                ids=owner_source_note_task_ids_v1(ns,saved[0].cause.owner_operation_id)
+                job=get_job(db,ids['job_id'])
+                mapping=db.execute('SELECT value,valid FROM graph_atoms WHERE token=?',(self_mapping_key(ns).token,)).fetchone()
+                if job is None or mapping is None or mapping[1]!=1:
+                    raise UnavailableGuard('actual Owner task or current Self mapping missing')
+                holder=json.loads(mapping[0])['self_entity_ref']
+                job_ref=runtime_job_key(*ns.as_tuple,ids['activity_id'],ids['job_id']).token
+            finally:db.rollback()
+        request=AcquireOwnerSourceNoteTaskRequestV1(job_ref,holder,60)
+        operation_id='owner-note-acquire:'+canonical_digest((ids['job_id'],job.fence,job.cancel_epoch))[:40]
+        selector=self._owner_source_note_task_selector_v1(bootstrap,installed_bundle,
+            authorization_original_ref=authorization_original_ref,operation_kind='acquire_owner_source_note_task_v1',
+            request=request,operation_id=operation_id)
+        return self.__domain_production_runtime_v1.run_owner_source_note_task_current_v1(selector=selector,
+            operation_kind=selector.operation_kind,request=request)
+
+    def _owner_source_note_task_selector_v1(self, bootstrap, installed_bundle, *, authorization_original_ref,
+            operation_kind, request, operation_id):
+        self._admin(bootstrap)
+        from .authority_service.current_owner_source_note_task_v1 import (
+            OwnerTaskActivityRequestV1,owner_task_typed_command_digest_v1)
+        from .runtime.owner_source_note_task_contract_v1 import owner_source_note_task_ids_v1
+        from .runtime.owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.d11_types import runtime_job_key
+        from .runtime.jobs import get_job
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard('Owner task requires its exact actual installed bundle')
+        ns=installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db=self.__store._db
+            db.execute('BEGIN')
+            try:
+                saved=read_owner_source_note_task_authorization_v2(db,namespace=ns,
+                    original_ref=authorization_original_ref,issuer=self.__d11_issuer)
+                if saved is None:raise UnavailableGuard('actual signed Owner task submission missing')
+                auth=saved[0];ids=owner_source_note_task_ids_v1(ns,auth.cause.owner_operation_id)
+                key=runtime_job_key(*ns.as_tuple,ids['activity_id'],ids['job_id'])
+                head=db.execute('SELECT revision FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
+                job=get_job(db,ids['job_id'])
+                op=installed_operation_v1(operation_kind)
+                return OwnerTaskActivityRequestV1(ns,auth.cause.installation_id,auth.original_ref,auth.digest,
+                    operation_id,operation_kind,owner_task_typed_command_digest_v1(op,request),key.token,
+                    0 if head is None else head[0],0 if job is None else job.cancel_epoch)
+            finally:db.rollback()
+
+    def _read_saved_owner_task_receipt_v1(self, selector):
+        from .runtime.owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                saved=read_owner_source_note_task_authorization_v2(db,namespace=selector.namespace,
+                    original_ref=selector.authorization_original_ref,issuer=self.__d11_issuer)
+                if saved is None or saved[0].digest!=selector.authorization_original_digest:
+                    raise UnavailableGuard('Owner task receipt lost its actual signed authorization')
+                auth=saved[0]
+            finally:db.rollback()
+        # Existing narrow read mechanism verifies actual current Self/Owner/C09,
+        # historical command actor, Source closure and exact durable receipt.
+        from types import SimpleNamespace
+        read_selector=SimpleNamespace(namespace=selector.namespace,operation_id=selector.operation_id,
+            plan_source_ref=auth.request.body_source_ref,purpose='consolidation',audiences=auth.cause.audiences)
+        return self._read_saved_foreground_receipt_v1(read_selector)
+
+    def _owner_task_domain_write_v1(self, runtime, *, selector, operation, request):
+        from .authority_service.current_owner_source_note_task_v1 import OwnerTaskActivityRequestV1, OwnerTaskActivityValuesChildRequestV1
+        if type(selector) not in {OwnerTaskActivityRequestV1,OwnerTaskActivityValuesChildRequestV1}:
+            raise AuthorityDenied('Owner task requires its exact independently qualified selector')
+        return self._durable_self_domain_write_v1(runtime, selector=selector, operation=operation, request=request)
+
+    def _durable_self_domain_write_v1(self, runtime, *, selector, operation, request):
+        """Fixed W01 consumer of independently issued foreground facts and one durable attempt."""
+        from .authority_service.current_foreground_activity_v1 import (
+            ForegroundActivityRequestV1, ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2,
+            foreground_fence_operation_id_v1, foreground_fence_operation_id_v2, foreground_typed_command_digest_v1)
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .runtime.domain_production_runtime_v1 import InstalledDomainOperationRuntimeV1
+        from .runtime.foreground_activity_issuance_v1 import (
+            foreground_activity_for_fence_v1, reobserve_foreground_activity_v1)
+        from .runtime.restore_anchor import RestoreAnchor
+        from .authority_service.current_owner_source_note_task_v1 import (
+            OwnerTaskActivityRequestV1, OwnerTaskActivityValuesChildRequestV1, owner_task_fence_operation_id_v1, owner_task_typed_command_digest_v1)
+        from .runtime.owner_source_note_task_issuance_v1 import (
+            owner_source_note_task_for_fence_v1, reobserve_owner_source_note_task_v1)
+        owner_task = type(selector) in {OwnerTaskActivityRequestV1,OwnerTaskActivityValuesChildRequestV1}
+        typed_digest = owner_task_typed_command_digest_v1 if owner_task else foreground_typed_command_digest_v1
+        issue = owner_source_note_task_for_fence_v1 if owner_task else foreground_activity_for_fence_v1
+        reobserve = reobserve_owner_source_note_task_v1 if owner_task else reobserve_foreground_activity_v1
+        read_receipt = self._read_saved_owner_task_receipt_v1 if owner_task else self._read_saved_foreground_receipt_v1
+        if (type(runtime) is not InstalledDomainOperationRuntimeV1
+                or runtime is not self.__domain_production_runtime_v1 or runtime.graph is not self
+                or type(selector) not in {ForegroundActivityRequestV1, ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2, OwnerTaskActivityRequestV1,OwnerTaskActivityValuesChildRequestV1}
+                or selector.operation_kind != operation.operation_kind
+                or selector.request_digest != typed_digest(operation, request)):
+            raise AuthorityDenied("foreground requires its actual installed runtime and exact registered command")
+        store, port, namespace = self.__store, self.__content_fence_v2, selector.namespace
+        if not isinstance(store, ProductionGraphStore) or port is None:
+            raise UnavailableGuard("foreground installed production fence unavailable; HOLD")
+        operation_id, request_digest = selector.operation_id, canonical_digest(selector)
+        attempt_id = (owner_task_fence_operation_id_v1(selector) if owner_task else
+            foreground_fence_operation_id_v1(selector) if type(selector) is ForegroundActivityRequestV1
+            else foreground_fence_operation_id_v2(selector))
+        attempt_prefix = ("owner-task-domain-" if owner_task else "foreground-domain-"
+            if type(selector) is ForegroundActivityRequestV1 else "foreground-domain-v2-")
+        columns = "request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,permit_json,receipt_json"
+        query = "SELECT " + columns + " FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?"
+        key = (*namespace.as_tuple, operation_id)
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            saved = store._db.execute(query, key).fetchone()
+        target = metadata.requirements
+        # A committed original may have advanced its cycle. Finish only its old
+        # permit, then independently qualify a narrow read; never re-admit create.
+        if saved is not None and saved[6] is not None:
+            from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+            from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN")
+                try:
+                    original = read_adopted_domain_operation_v1(db, namespace, operation_id)
+                    if (original is None or original["domain"] != operation.domain
+                            or original["operation_kind"] != operation.operation_kind
+                            or decode_typed_production_value_v1(original["payload"]["request"], operation.request_type) != request
+                            or saved[1] != attempt_prefix + saved[0][:48]):
+                        raise EventConflict("foreground committed replay changed its actual original command/attempt")
+                    db.rollback()
+                except BaseException:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+            # The original selector's full digest remains the fence identity.
+            # Current job revisions affect disclosure, never rewrite that identity.
+            attempt_id = saved[1]
+            anchor = RestoreAnchor(**json.loads(saved[2]))
+            observed, state = port.get_fence_operation(namespace=namespace,
+                authority_namespace=anchor.namespace, operation_id=attempt_id)
+            permit = None if saved[5] is None else from_wire(json.loads(saved[5]))
+            if (type(permit) is not FencePermitV2 or observed != permit or state not in {"active", "finished"}
+                    or permit.operation_id != attempt_id or permit.operation != "write"
+                    or permit.holder != self.__holder or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("foreground committed original permit is unconfirmed; HOLD")
+            scope = FenceScope(namespace, anchor.namespace, permit.generation, "write", attempt_id,
+                permit, anchor, NamespaceEpoch(*namespace.as_tuple, saved[4]), saved[3])
+            if state == "active":
+                original_finish_digest = "sha256:" + canonical_digest({"schema": "w01.owner-task-domain-write.v1" if owner_task else "w01.foreground-domain-write.v1",
+                    "operation_id": operation_id, "request_digest": saved[0], "permit_token": permit.token})
+                port.finish_fence(scope, request_id="finish:" + attempt_id,
+                    request_digest=original_finish_digest)
+            return read_receipt(selector)
+        if saved is not None and saved[:2] != (request_digest, attempt_id):
+            raise EventConflict("foreground unresolved operation changed its original selector")
+        anchor = port.current_anchor(namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("foreground recovery anchor differs; HOLD")
+        if saved is not None:
+            if (RestoreAnchor(**json.loads(saved[2])) != anchor
+                    or saved[3:5] != (metadata.graph_revision, epoch.revision)):
+                raise UnavailableGuard("foreground unresolved original graph stamp changed; HOLD")
+        else:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("foreground graph changed before original intent")
+                    db.execute("INSERT INTO graph_owner_domain_attempts_v3(bot,persona,operation_id,request_digest,"
+                        "attempt_id,anchor_json,graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?)",
+                        (*key, request_digest, attempt_id, canonical_json(asdict(anchor)), metadata.graph_revision, epoch.revision))
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+        # Inspect first even after a lost begin ACK. Absence permits only the
+        # same fixed identity; uncertainty never selects a replacement attempt.
+        observed_attempt = port.observe_content_write_attempt_v1(namespace=namespace,
+            authority_namespace=target.authority_namespace, operation_id=attempt_id, expected_anchor=anchor)
+        permit, state = observed_attempt.permit, observed_attempt.state
+        if saved is not None and saved[5] is not None:
+            if permit != from_wire(json.loads(saved[5])) or state != "active":
+                raise UnavailableGuard("foreground original saved permit is not active; HOLD")
+        elif state == "absent" and permit is None:
+            permit = port.begin_fence(namespace=namespace, authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation, operation="write",
+                operation_id=attempt_id, expected_anchor=anchor, retain_on_unknown=True)
+            state = "active"
+        if (type(permit) is not FencePermitV2 or state != "active" or permit.operation_id != attempt_id
+                or permit.operation != "write" or permit.holder != self.__holder or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("foreground original write outcome is unconfirmed; HOLD")
+        scope = FenceScope(namespace, target.authority_namespace, target.activation_generation,
+            "write", attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("foreground original write permit changed; HOLD")
+        permit_json = canonical_json(to_wire(permit))
+        with store._lock:
+            store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? WHERE bot=? AND persona=? "
+                "AND operation_id=? AND attempt_id=? AND permit_json IS NULL", (permit_json, *key, attempt_id))
+        from contextlib import ExitStack
+        with ExitStack() as private_reads:
+            issued = private_reads.enter_context(issue(self, scope=scope, request=selector))
+            reobserve(issued, self, scope)
+            from .runtime.domain_structured_self_observation_v1 import observe_structured_self_identity_v1
+            external_originals = (observe_structured_self_identity_v1(self, namespace=namespace,
+                operation_id=operation_id, scope=scope, owner_guard=issued.evidence.owner_guard),)
+            from .runtime.current_method_learning_read_v3 import METHOD_INPUT_OPERATIONS_V3
+            from .runtime_storage_v3 import runtime_storage_v3
+            values = dict(runtime=runtime, selector=selector, operation=operation, request=request, issued=issued,
+                scope=scope, metadata=metadata, epoch=epoch, anchor=anchor, request_digest=request_digest,
+                attempt_id=attempt_id, permit_json=permit_json, private_reads=private_reads,
+                external_originals=external_originals)
+            if (operation.operation_kind in METHOD_INPUT_OPERATIONS_V3
+                    and runtime_storage_v3(store._db) is not None):
+                return self._prepare_borrowed_method_operation_v3(**values)
+            return self._continue_current_self_write_v3(**values)
+
+    def _continue_current_self_write_v3(self, *, runtime, selector, operation, request, issued,
+            scope, metadata, epoch, anchor, request_digest, attempt_id, permit_json,
+            private_reads, external_originals):
+        """The original fixed compiler/CAS/finish suffix under the same issuance."""
+        from .runtime.owner_source_note_task_issuance_v1 import _IssuedOwnerSourceNoteTaskV1
+        from .runtime.domain_production_commit_v1 import (
+            foreground_domain_finish_digest_v1, owner_task_domain_finish_digest_v1)
+        from .runtime.first_ingress_v2 import trusted_upper
+        owner_task = type(issued) is _IssuedOwnerSourceNoteTaskV1
+        finish_digest = owner_task_domain_finish_digest_v1 if owner_task else foreground_domain_finish_digest_v1
+        read_receipt = self._read_saved_owner_task_receipt_v1 if owner_task else self._read_saved_foreground_receipt_v1
+        store, port, namespace = self.__store, self.__content_fence_v2, selector.namespace
+        operation_id, key = selector.operation_id, (*namespace.as_tuple, selector.operation_id)
+        query = ("SELECT request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,permit_json,receipt_json "
+            "FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?")
+        c03_search = None
+        if not owner_task and operation.operation_kind == "select_ingress_recall_seed_v1":
+            from .runtime.d06_ingress_c03_read_v1 import read_ingress_c03_for_foreground_v1
+            c03_search = private_reads.enter_context(read_ingress_c03_for_foreground_v1(
+                self, issued=issued, scope=scope, request=request,
+                bundle=self.__d07_execution_service_v1.bundle))
+        self_c04_environment = None
+        if not owner_task and operation.operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"}:
+            from .runtime.c04_ingress_preparation_v4 import observe_self_c04_environment_v4
+            self_c04_environment = private_reads.enter_context(observe_self_c04_environment_v4(
+                self, issued=issued, scope=scope, request=request, operation_kind=operation.operation_kind))
+        life_inventory = None
+        if operation.operation_kind == "prepare_life":
+            from .host.d11_life_port_v1 import InstalledD11LifePortV1
+            life_inventory = InstalledD11LifePortV1(port).read_d11_life_execution_inventory_v1(
+                namespace=scope.authority_namespace, permit=scope.permit)
+        if not owner_task and operation.operation_kind == "acquire_artifact_draft_model_v2":
+            from .runtime.d02_artifact_phase_price_v1 import artifact_phase_counts_for_foreground_fence_v2
+            frozen_now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+            private_reads.enter_context(artifact_phase_counts_for_foreground_fence_v2(runtime,
+                issued=issued, operation=operation, request=request, scope=scope,
+                external_originals=external_originals, now_utc=frozen_now))
+        if not owner_task and operation.operation_kind == "quote_current_method_choices_v1":
+            from .runtime.d02_method_readiness_v1 import method_readiness_counts_for_foreground_fence_v1
+            frozen_now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+            private_reads.enter_context(method_readiness_counts_for_foreground_fence_v1(runtime,
+                issued=issued, operation=operation, request=request, scope=scope,
+                external_originals=external_originals, now_utc=frozen_now))
+        now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                original = db.execute(query, key).fetchone()
+                if (original != (request_digest, attempt_id, canonical_json(asdict(anchor)),
+                        metadata.graph_revision, epoch.revision, permit_json, None)
+                        or self._v2_graph_stamp(namespace) != (metadata, epoch)):
+                    raise StaleRead("foreground original attempt or graph changed before write")
+                runtime._active_life_execution_inventory_v1 = life_inventory
+                runtime._active_ingress_c03_read_v1 = c03_search
+                runtime._active_self_c04_environment_v4 = self_c04_environment
+                try:
+                    compiler = (runtime._compile_and_commit_owner_task_in_transaction_v1 if owner_task
+                        else runtime._compile_and_commit_foreground_in_transaction_v1)
+                    result = compiler(db, selector=selector,
+                        issued=issued, operation=operation, request=request, scope=scope,
+                        metadata=metadata, epoch=epoch, now_utc=now, external_originals=external_originals)
+                finally:
+                    runtime._active_life_execution_inventory_v1 = None
+                    runtime._active_ingress_c03_read_v1 = None
+                    runtime._active_self_c04_environment_v4 = None
+                db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? WHERE bot=? AND persona=? "
+                    "AND operation_id=? AND attempt_id=? AND receipt_json IS NULL", (canonical_json(result), *key, attempt_id))
+                if db.execute("SELECT changes()").fetchone() != (1,):
+                    raise EventConflict("foreground original receipt raced")
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+        # A failed compile/SQL/transport leaves this same attempt queryable.
+        # Never finish from finally or label an uncertain commit as no work.
+        port.finish_fence(scope, request_id="finish:" + attempt_id,
+            request_digest=finish_digest(selector, scope.permit))
+        return read_receipt(selector)
+
+    def _post_c02_foreground_selector_v1(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, operation_kind, request):
+        """Selectors come from actual committed input/job/root facts, without issuing authority."""
+        self._admin(bootstrap)
+        from .host.authority_profile import AdminInstallationBundle
+        from .authority_service.current_foreground_activity_v1 import ForegroundActivityRequestV1, foreground_typed_command_digest_v1
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, _adopted_c02_v1
+        from .runtime.ingress_observation import read_committed_ingress_identity
+        from .runtime.jobs import get_job
+        from .runtime.d11_types import runtime_job_key
+        from .memory_types import SourceRecord
+        if (type(installed_bundle) is not AdminInstallationBundle
+                or self.__d04_installed_joint_assembly is None
+                or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle):
+            raise UnavailableGuard("foreground caller needs the actual installed production bundle; HOLD")
+        policy, operation = installed_bundle.installation_policy, installed_operation_v1(operation_kind)
+        ns = policy.namespace
+        policy_now = None
+        if operation_kind == "input:register_artifact_phase_postcondition_policy_v1":
+            from .runtime.first_ingress_v2 import trusted_upper
+            policy_now = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                root = self.__d11_issuer.current_budget_grant(db, policy.root_lease.lease_id)
+                if root != policy.root_grant or "d11.foreground_cycle.v1" not in root.allowed_work_kinds:
+                    raise UnavailableGuard("actual installed root has no foreground activity allowance; HOLD")
+                _adopted_c02_v1(db, ns, c02_operation_id)
+                row = db.execute("SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                    (*ns.as_tuple, source_ref)).fetchone()
+                if row is None or row[1] != 1:
+                    raise UnavailableGuard("foreground cue actual current Source is absent; HOLD")
+                source = SourceRecord.from_dict(json.loads(row[0]))
+                ingress = read_committed_ingress_identity(db, ns, source.source_id)
+                if ingress is None:
+                    raise UnavailableGuard("foreground cue lacks its actual original admitted ingress; HOLD")
+                identity = json.loads(ingress.identity_json)
+                if identity["visibility"] != "private":
+                    raise UnavailableGuard("foreground private reply cycle has another original audience; HOLD")
+                activity_id, job_id = foreground_cycle_ids_v1(ns, c02_operation_id)
+                key = runtime_job_key(*ns.as_tuple, activity_id, job_id)
+                head = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
+                revision = 0 if head is None else head[0]
+                job = None if head is None else get_job(db, job_id)
+                archived = db.execute("SELECT seal_json FROM graph_first_ingress_c02_committed_seals_v2 "
+                    "WHERE bot=? AND persona=? AND operation_id=?", (*ns.as_tuple, c02_operation_id)).fetchone()
+                if archived is None:
+                    raise UnavailableGuard("foreground input lacks its actual immutable C02 deadline; HOLD")
+                seal = json.loads(archived[0])
+                original_deadline = min(root.valid_until_utc, seal["root_grant_valid_until_utc"], seal["business_deadline_utc"])
+                deadline = original_deadline if job is None else datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp()
+                root_ref = None
+                purpose = "context"
+                if operation_kind == "create_source_note_foreground_cycle_v1":
+                    from .runtime.source_note_foreground_v1 import CreateSourceNoteForegroundCycleRequestV1
+                    from .runtime.source_note_task_authorization_v1 import read_source_note_task_authorization_v1, NOTE_WORK_KIND
+                    if type(request) is not CreateSourceNoteForegroundCycleRequestV1 or job is not None:
+                        raise UnavailableGuard("SourceNote initial responsibility cannot replace an existing foreground cycle; HOLD")
+                    saved_note = read_source_note_task_authorization_v1(db, namespace=ns,
+                        original_ref=request.authorization_original_ref, issuer=self.__d11_issuer)
+                    if saved_note is None:
+                        raise UnavailableGuard("actual signed Owner SourceNote task authorization is missing; HOLD")
+                    note = saved_note[0]
+                    if (note.request.c02_operation_id, note.request.source_ref, note.parent_budget_lease_ref) != (
+                            c02_operation_id, source_ref, root.lease_id) or NOTE_WORK_KIND not in root.allowed_work_kinds:
+                        raise UnavailableGuard("SourceNote task differs from its actual C02/cue/original allowed root; HOLD")
+                    deadline = min(note.original_deadline_utc, original_deadline)
+                    if deadline != note.original_deadline_utc:
+                        raise UnavailableGuard("SourceNote authorization exceeds the original sealed C02 deadline; HOLD")
+                    purpose = "consolidation"
+                elif operation_kind == "create_foreground_cycle_v2":
+                    from .runtime.foreground_cycle_v1 import CreateForegroundCycleRequestV2
+                    from .runtime.c09_life_originals_v1 import read_foreground_post_c02_cause_original_v1
+                    from .runtime.d11_life_preparation_v1 import _read
+                    from .runtime.d11_artifact_draft_contract_v1 import DraftRootCapabilityV1, draft_from_wire_v1
+                    if type(request) is not CreateForegroundCycleRequestV2 or installed_bundle.foreground is None:
+                        raise UnavailableGuard("explicit installed foreground responsibility is not configured; HOLD")
+                    root_ref = request.draft_root_registration_ref
+                    if root_ref is None:
+                        natural = installed_bundle.foreground.deadline_policy.natural
+                        if natural is None:
+                            raise UnavailableGuard("explicit natural causal window is not configured; HOLD")
+                        cause = read_foreground_post_c02_cause_original_v1(db, namespace=ns, issuer=self.__d11_issuer,
+                            original_ref=request.cause_original_ref)
+                        deadline = min(cause.cause_frozen_at_utc + natural.window_seconds, root.valid_until_utc)
+                    else:
+                        signed = _read(db, issuer=self.__d11_issuer, namespace=ns, kind="draft_root_capability", ref=root_ref)
+                        if signed is None:
+                            raise UnavailableGuard("actual adopted draft root setup is missing; HOLD")
+                        capability_root = draft_from_wire_v1(signed[0], DraftRootCapabilityV1)
+                        deadline = min(datetime.fromisoformat(capability_root.valid_until_utc.replace("Z", "+00:00")).timestamp(), root.valid_until_utc)
+                        purpose = "consolidation"
+                elif operation_kind == "derive_ingress_artifact_task_scope_v1":
+                    from .runtime.ingress_artifact_task_scope_v1 import standing_artifact_policy_v1
+                    standing=standing_artifact_policy_v1(installed_bundle)
+                    purpose="consolidation"
+                    deadline=min(original_deadline,source.recorded_at+standing.root_window_seconds,standing.valid_until_utc)
+                    from .runtime.c1_artifact_task_intent_v1 import read_c1_task_intent_original_v1
+                    from .runtime.ingress_artifact_task_scope_v1 import active_task_objectives_v1
+                    intent=read_c1_task_intent_original_v1(db,namespace=ns,c02_operation_id=c02_operation_id,issuer=self.__d11_issuer)
+                    if intent is not None and intent.intent.kind=="continue":
+                        tool=installed_bundle.artifact_draft.tool_scope
+                        from .host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4,select_paired_tool_scope_v3
+                        if type(installed_bundle.artifact_draft) is AdminArtifactDraftPairedPolicyV4:
+                            tool=select_paired_tool_scope_v3(installed_bundle.artifact_draft,intent.intent.filename)
+                        targets=[obj for obj in active_task_objectives_v1(db,ns,self.__d11_issuer)
+                            if (obj.root_resource_id,obj.filename)==(tool.resource_id,tool.filename)]
+                        if len(targets)!=1:raise UnavailableGuard("unique actual unfinished task is absent; HOLD")
+                        from .host.authority_profile import AdminArtifactStandingScopeV2, AdminArtifactStandingScopeV3
+                        if type(standing) not in {AdminArtifactStandingScopeV2, AdminArtifactStandingScopeV3}:
+                            deadline=min(deadline,targets[0].valid_until_utc)
+                        # This selector issues no authorization. Approved-scope candidates
+                        # must subsequently pass the Authority's current Owner/Source/
+                        # waiting-checkpoint and prospective generation qualification.
+                elif job is not None:
+                    from .runtime.foreground_cycle_v1 import ForegroundCycleContinuationV2, foreground_cycle_from_wire_v1
+                    from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+                    from .runtime.source_note_foreground_v1 import ForegroundSourceNoteContinuationV1
+                    active_continuation = foreground_cycle_from_wire_v1(job.continuation)
+                    if type(active_continuation) in {ForegroundCycleContinuationV2, ForegroundSourceNoteContinuationV1}:
+                        responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns, job=job, issuer=self.__d11_issuer)
+                        root_ref = responsibility.root_registration_ref
+                        purpose = "consolidation" if type(active_continuation) is ForegroundSourceNoteContinuationV1 or root_ref is not None else "context"
+                if operation_kind in {"create_foreground_cycle_v2", "create_source_note_foreground_cycle_v1"}:
+                    from .runtime.foreground_cycle_v1 import foreground_deadline_utc_v1
+                    deadline = foreground_deadline_utc_v1(deadline)
+                create = operation_kind in {"create_foreground_cycle", "create_foreground_cycle_v2", "derive_ingress_artifact_task_scope_v1", "create_source_note_foreground_cycle_v1"}
+                if create:
+                    revision, cancel, holder, fence, expires = 0, 0, None, None, None
+                else:
+                    if job is None:
+                        raise UnavailableGuard("foreground continuation requires its actual existing cycle; HOLD")
+                    cancel, holder, fence, expires = job.cancel_epoch, job.lease_holder, job.fence, job.lease_expires_utc
+                operation_id = "foreground-op:" + canonical_digest((ns, c02_operation_id, operation_kind, request))[:40]
+                if operation_kind == "prepare_ingress_recall_need_v1":
+                    from .runtime.d06_ingress_recall_v1 import ingress_recall_need_operation_id_v1
+                    operation_id = ingress_recall_need_operation_id_v1(ns, c02_operation_id)
+                elif operation_kind == "adopt_current_task_no_search_v1":
+                    from .runtime.d07_task_history_v1 import task_no_search_operation_id_v1
+                    operation_id = task_no_search_operation_id_v1(ns, c02_operation_id)
+                elif operation_kind == "quote_current_method_choices_v1":
+                    from .runtime.d02_method_readiness_v1 import method_readiness_operation_id_v1
+                    from .runtime.d08_personal_candidate_v1 import CurrentArtifactTaskChoiceRequestV2, _readonly_current_artifact_task_choice_basis_v2
+                    basis = _readonly_current_artifact_task_choice_basis_v2(db, namespace=ns,
+                        request=CurrentArtifactTaskChoiceRequestV2(request.task), issuer=self.__d11_issuer)
+                    operation_id = method_readiness_operation_id_v1(request.task, basis[4])
+                elif operation_kind == "select_ingress_recall_seed_v1":
+                    from .runtime.d06_ingress_c03_selection_v1 import ingress_c03_selection_operation_id_v1
+                    operation_id = ingress_c03_selection_operation_id_v1(ns, c02_operation_id)
+                elif operation_kind == "prepare_ingress_recall_model_v1":
+                    from .runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
+                    operation_id = ingress_recall_model_ids_v1(ns, c02_operation_id)["prepare"]
+                elif operation_kind == "acquire_ingress_recall_model_v1":
+                    from .runtime.d07_ingress_recall_acquisition_v1 import ingress_recall_acquire_operation_id_v1
+                    operation_id = ingress_recall_acquire_operation_id_v1(ns, c02_operation_id)
+                elif operation_kind in {"prepare_ingress_recall_result_read_v1", "finish_ingress_recall_model_v1", "adopt_ingress_recall_model_v1"}:
+                    from .runtime.d07_ingress_recall_result_v1 import ingress_recall_result_operation_id_v1
+                    operation_id = ingress_recall_result_operation_id_v1(ns, c02_operation_id, operation_kind)
+                if operation_kind == "await_existing_artifact_revision_v1":
+                    from .runtime.artifact_wait_checkpoint_v1 import artifact_wait_operation_id_v1
+                    operation_id = artifact_wait_operation_id_v1(request.selector)
+                if operation_kind in {"select_existing_artifact_continuation_v1", "revise_existing_artifact_v1"}:
+                    from .runtime.artifact_continuation_originals_v1 import artifact_continuation_operation_id_v1
+                    operation_id = artifact_continuation_operation_id_v1(request.selector,
+                        revision=operation_kind == "revise_existing_artifact_v1")
+                note_continuation = (job is not None and job.continuation.get("schema") == "d11.foreground-source-note-continuation.v1")
+                if operation_kind in {"prepare_personal_candidates_v1", "select_personal_step_v2"} and note_continuation:
+                    from .runtime.d08_personal_candidate_v1 import ConsumePersonalDecisionRequestV1
+                    from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+                    if operation_kind == "prepare_personal_candidates_v1":
+                        operation_id = "source-note-candidates:" + canonical_digest((ns, c02_operation_id, request))[:40]
+                    else:
+                        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+                        from .domains.d08.personal_candidate_v1 import PreparedPersonalCandidateSetV1
+                        actual_prepared = read_adopted_domain_operation_v1(db, ns, request.prepared_candidates_operation_id)
+                        if actual_prepared is None or actual_prepared["operation_kind"] != "prepare_personal_candidates_v1":
+                            raise UnavailableGuard("SourceNote selection lacks its actual preparation; HOLD")
+                        frozen = decode_typed_production_value_v1(actual_prepared["payload"]["provenance"]["prepared_candidates"], PreparedPersonalCandidateSetV1)
+                        operation_id = frozen.selection_operation_id
+                elif operation_kind in {"input:register_artifact_task_text_extent", "prepare_personal_candidates_v1", "select_personal_step_v2"}:
+                    from .runtime.d08_personal_candidate_v1 import (CurrentArtifactTaskChoiceRequestV2, artifact_task_choice_ids_v2,
+                        _readonly_current_artifact_task_choice_basis_v2)
+                    from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+                    task = artifact_draft_task_selector_v1(ns, c02_operation_id=c02_operation_id, root_registration_ref=root_ref)
+                    basis = _readonly_current_artifact_task_choice_basis_v2(db, namespace=ns,
+                        request=CurrentArtifactTaskChoiceRequestV2(task), issuer=self.__d11_issuer)
+                    choice_ids = artifact_task_choice_ids_v2(task, basis[4])
+                    operation_id = choice_ids[{"input:register_artifact_task_text_extent": "extent",
+                        "prepare_personal_candidates_v1": "prepare", "select_personal_step_v2": "select"}[operation_kind]]
+                internal_material = None
+                internal_parent = None
+                internal_slot = None
+                if operation_kind in {"input:freeze_artifact_candidate_preparation_v1", "input:freeze_values", "evaluate_values"} and not note_continuation:
+                    from .runtime.d08_personal_candidate_v1 import (CurrentArtifactTaskChoiceRequestV2,
+                        readonly_current_artifact_task_choice_material_v2)
+                    from .runtime.artifact_phase_postconditions_v1 import (require_candidate_preparation_parent_handle_v1,
+                        artifact_candidate_preparation_parent_operation_id_v1, artifact_candidate_preparation_parent_ref_v1,
+                        PREPARATION_PARENT_KIND_V1, _original as read_preparation_original)
+                    from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+                    from .domains.d01.production_operations_v1 import plain_v1
+                    task = artifact_draft_task_selector_v1(ns, c02_operation_id=c02_operation_id, root_registration_ref=root_ref)
+                    internal_material = readonly_current_artifact_task_choice_material_v2(db, namespace=ns,
+                        request=CurrentArtifactTaskChoiceRequestV2(task), issuer=self.__d11_issuer)
+                    require_candidate_preparation_parent_handle_v1(self, task=task,
+                        material_digest=canonical_digest(plain_v1(internal_material)))
+                    if operation_kind == "input:freeze_artifact_candidate_preparation_v1":
+                        from .runtime.artifact_phase_postconditions_v1 import FreezeArtifactCandidatePreparationRequestV1
+                        if type(request) is not FreezeArtifactCandidatePreparationRequestV1 or request.task != task:
+                            raise AuthorityDenied("parent start changed its actual bounded task")
+                        operation_id = artifact_candidate_preparation_parent_operation_id_v1(task, internal_material.plan_head)
+                    else:
+                        internal_slot = "freeze" if operation_kind == "input:freeze_values" else "evaluate"
+                        actual_request = internal_material.freeze_request if internal_slot == "freeze" else internal_material.evaluate_request
+                        if type(request) is not type(actual_request) or request != actual_request:
+                            raise AuthorityDenied("internal child changed its actual parent material")
+                        internal_parent, _ = read_preparation_original(db, namespace=ns, kind=PREPARATION_PARENT_KIND_V1,
+                            ref=artifact_candidate_preparation_parent_ref_v1(task, internal_material.plan_head), issuer=self.__d11_issuer)
+                        operation_id = dict(internal_material.ids)[internal_slot]
+                if operation_kind == "input:register_artifact_phase_postcondition_policy_v1":
+                    from .runtime.artifact_phase_postconditions_v1 import (readonly_current_artifact_phase_policy_basis_v1,
+                        artifact_phase_policy_registration_operation_id_v1)
+                    from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+                    from .domains.d03.self_perspective import SelfIdentityMapping, self_mapping_key
+                    if job is None:
+                        raise UnavailableGuard("Policy identity requires its actual current task cycle; HOLD")
+                    responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns,
+                        job=job, issuer=self.__d11_issuer)
+                    mapping_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (self_mapping_key(ns).token,)).fetchone()
+                    if responsibility is None or mapping_row is None or mapping_row[1] != 1:
+                        raise UnavailableGuard("Policy identity lost actual Self/Owner responsibility; HOLD")
+                    mapping = SelfIdentityMapping(**json.loads(mapping_row[0]))
+                    if mapping.status != "active":
+                        raise UnavailableGuard("Policy identity requires the actual active Self; HOLD")
+                    access_epoch, delete_epoch = db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                        "WHERE bot=? AND persona=?", ns.as_tuple).fetchone()
+                    value = readonly_current_artifact_phase_policy_basis_v1(db, namespace=ns, request=request,
+                        issuer=self.__d11_issuer, bundle=installed_bundle, owner_guard=responsibility.owner_guard,
+                        now_utc=policy_now, parent_budget_lease_ref=job.budget_ref, actor_ref=mapping.self_entity_ref,
+                        purpose=purpose, audiences=(identity["conversation_ref"],), access_epoch=access_epoch, delete_epoch=delete_epoch)
+                    operation_id = artifact_phase_policy_registration_operation_id_v1(value)
+                if operation_kind == "create_artifact_task_plan_v1":
+                    from .runtime.d08_personal_plan_v1 import artifact_task_initial_plan_operation_id_v1
+                    operation_id = artifact_task_initial_plan_operation_id_v1(request.task)
+                elif operation_kind == "create_artifact_task_project_v1":
+                    from .runtime.d10_project_checkpoint_v1 import artifact_task_project_operation_id_v1
+                    operation_id = artifact_task_project_operation_id_v1(request.task)
+                elif operation_kind == "initialize_artifact_task_project_checkpoint_v1":
+                    from .runtime.d10_project_checkpoint_v1 import artifact_task_checkpoint_initialization_operation_id_v1
+                    operation_id = artifact_task_checkpoint_initialization_operation_id_v1(request.task)
+                elif operation_kind == "activate_artifact_task_project_checkpoint_v1":
+                    from .runtime.d10_project_checkpoint_v1 import artifact_task_checkpoint_activation_operation_id_v1
+                    operation_id = artifact_task_checkpoint_activation_operation_id_v1(request.selector)
+                elif operation_kind == "revise_artifact_task_plan_v2":
+                    from .runtime.d08_personal_plan_v1 import artifact_task_plan_revision_operation_id_v2
+                    operation_id = artifact_task_plan_revision_operation_id_v2(request.task)
+                elif operation_kind == "activate_artifact_task_project_checkpoint_v2":
+                    from .runtime.d10_project_checkpoint_v1 import artifact_task_checkpoint_activation_operation_id_v2
+                    operation_id = artifact_task_checkpoint_activation_operation_id_v2(request.selector)
+                elif operation_kind == "register_artifact_task_milestone_v2":
+                    from .runtime.artifact_task_observer_v1 import artifact_task_milestone_registration_operation_id_v2
+                    operation_id = artifact_task_milestone_registration_operation_id_v2(request.selector)
+                if operation_kind in {"prepare_artifact_draft_model_v2", "acquire_artifact_draft_model_v2", "adopt_artifact_draft_content_v2"}:
+                    from .model_broker.artifact_draft_v1 import artifact_draft_model_ids_v2
+                    phase_ids = artifact_draft_model_ids_v2(request.selector)
+                    operation_id = phase_ids[{"prepare_artifact_draft_model_v2": "prepare",
+                        "acquire_artifact_draft_model_v2": "acquire", "adopt_artifact_draft_content_v2": "adopt"}[operation_kind]]
+                elif operation_kind == "register_artifact_phase_postcondition_contract_v1":
+                    from .runtime.artifact_phase_postconditions_v1 import artifact_phase_contract_registration_operation_id_v1
+                    operation_id = artifact_phase_contract_registration_operation_id_v1(request.selector)
+                elif operation_kind == "observe_artifact_phase_postconditions_v1":
+                    from .runtime.artifact_phase_postconditions_v1 import artifact_phase_assessment_operation_id_v1
+                    operation_id = artifact_phase_assessment_operation_id_v1(request.selector)
+                elif operation_kind == "verify_artifact_draft_phase_v2":
+                    from .model_broker.artifact_draft_v1 import artifact_draft_phase_original_ref_v2
+                    operation_id = artifact_draft_phase_original_ref_v2(request.selector) + ":verify"
+                elif operation_kind == "wake_artifact_draft_cycle_v2":
+                    from .runtime.foreground_cycle_v1 import artifact_draft_phase_wake_operation_id_v2
+                    operation_id = artifact_draft_phase_wake_operation_id_v2(request.selector)
+                if operation_kind in {"prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content"}:
+                    from .model_broker.artifact_draft_v1 import artifact_draft_model_ids_v1
+                    ids = artifact_draft_model_ids_v1(request.selector)
+                    operation_id = ids[{"prepare_artifact_draft_model": "prepare", "acquire_artifact_draft_model": "acquire",
+                        "adopt_artifact_draft_content": "adopt"}[operation_kind]]
+                elif operation_kind == "propose_artifact_draft_phase_action_v2":
+                    from .model_broker.artifact_draft_v1 import artifact_draft_file_ids_v2
+                    operation_id = artifact_draft_file_ids_v2(request.selector)["action_operation"]
+                elif operation_kind == "input:register_artifact_phase_draft_plan_v2":
+                    from .runtime.d11_life_product_adapter_v1 import artifact_phase_draft_plan_registration_operation_id_v2
+                    operation_id = artifact_phase_draft_plan_registration_operation_id_v2(request.selector)
+                elif operation_kind in {"propose_artifact_draft_action", "prepare_artifact_draft_body"}:
+                    from .model_broker.artifact_draft_v1 import artifact_draft_file_ids_v1
+                    ids = artifact_draft_file_ids_v1(ns, c02_operation_id=c02_operation_id, root_registration_ref=root_ref)
+                    if operation_kind == "prepare_artifact_draft_body":
+                        from .runtime.d08_life_admission_v1 import require_draft_action_root_v1
+                        body_root = require_draft_action_root_v1(db, namespace=ns,
+                            action_intent_ref=request.action_intent_ref, issuer=self.__d11_issuer)
+                        if body_root.activity_id != activity_id:
+                            raise UnavailableGuard("Body Action root has another actual cycle; HOLD")
+                        operation_id = "d02-life-body:" + body_root.action_operation_id
+                    else:
+                        operation_id = ids["action_operation"]
+                elif operation_kind == "prepare_selected_source_note_action_v2":
+                    from .runtime.d08_source_note_action_v1 import selected_source_note_binding_from_originals_v2
+                    frozen, selected_note, selected_original = selected_source_note_binding_from_originals_v2(db, namespace=ns, request=request)
+                    future_note = selected_note.future_identity
+                    if job is None or not note_continuation or future_note.activity_id != activity_id or future_note.parent_budget_lease_ref != root.lease_id:
+                        raise UnavailableGuard("selected SourceNote dispatcher changed its actual task/activity/root; HOLD")
+                    operation_id = future_note.action_operation_id
+                    deadline = future_note.deadline_utc
+                    if deadline > datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp():
+                        raise UnavailableGuard("selected SourceNote future deadline exceeds its original cycle; HOLD")
+                elif operation_kind == "prepare_life":
+                    operation_id = request.prepare_operation_id
+                elif operation_kind == "input:register_artifact_draft_plan_v3":
+                    from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+                    operation_id = "artifact-draft-plan-register:" + artifact_draft_task_selector_v1(ns,
+                        c02_operation_id=c02_operation_id, root_registration_ref=root_ref).digest[:40]
+                if operation_kind in {"input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"} and job is not None:
+                    from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+                    from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+                    final_plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
+                    if type(final_plan) is ForegroundCallPlanV2:
+                        from .runtime.d11_artifact_draft_content_v1 import artifact_method_final_operation_ids_v2
+                        from .runtime.artifact_task_observer_v1 import artifact_task_milestone_original_ref_v2, read_current_artifact_task_milestone_v2
+                        final_phase = final_plan.phase_group.selector
+                        read_current_artifact_task_milestone_v2(db, namespace=ns,
+                            original_ref=artifact_task_milestone_original_ref_v2(final_phase), issuer=self.__d11_issuer)
+                        final_ids = artifact_method_final_operation_ids_v2(final_phase)
+                        operation_id = final_ids[{"input:register_life_outcome_v2": "outcome_register", "advance_life": "advance",
+                            "settle_project_checkpoint": "project_settle", "settle_personal_goal": "goal"}[operation_kind]]
+                if operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"}:
+                    from .runtime.c04_ingress_preparation_v4 import _selection
+                    from .runtime.c04_self_scope_v4 import ingress_c04_ids_v4
+                    selected, original, _ = _selection(db, ns, request)
+                    ids = ingress_c04_ids_v4(ns, c02_operation_id, original["original_digest"])
+                    activity_id = selected.child_activity_id
+                    operation_id = ids["prepare" if operation_kind == "prepare_ingress_c04_v1" else "adopt"]
+                    purpose = selected.purpose
+                if internal_material is not None:
+                    from .authority_service.current_foreground_activity_v1 import (ForegroundActivityRequestV2,
+                        ForegroundActivityPreparationParentRequestV2)
+                    from .runtime.artifact_phase_postconditions_v1 import ArtifactPreparationChildSelectorV1
+                    values = dict(namespace=ns, installation_id=policy.installation_id, ingress_operation_id=identity["operation_id"],
+                        c02_operation_id=c02_operation_id, cue_source_ref=source_ref, plan_source_ref=source_ref, cycle_job_ref=key.token,
+                        expected_cycle_revision=revision, expected_cancel_generation=cancel, activity_id=activity_id,
+                        operation_id=operation_id, operation_kind=operation_kind,
+                        request_digest=foreground_typed_command_digest_v1(operation, request), parent_budget_lease_ref=root.lease_id,
+                        purpose=purpose, audiences=(identity["conversation_ref"],), requested_deadline_utc=deadline,
+                        plan_ref=internal_material.plan_head.key.token, draft_root_registration_ref=root_ref,
+                        worker_holder=holder, worker_fence=fence, worker_lease_expires_utc=expires)
+                    if internal_parent is None:
+                        selector = ForegroundActivityPreparationParentRequestV2(**values, preparation_task=internal_material.selector)
+                    else:
+                        selector = ForegroundActivityRequestV2(**values,
+                            preparation_child=ArtifactPreparationChildSelectorV1(internal_parent.original_ref, internal_slot),
+                            preparation_parent_digest=internal_parent.digest)
+                else:
+                    selector = ForegroundActivityRequestV1(ns, policy.installation_id, identity["operation_id"], c02_operation_id,
+                        source_ref, source_ref, key.token, revision, cancel, activity_id, operation_id, operation_kind,
+                        foreground_typed_command_digest_v1(operation, request), root.lease_id,
+                        purpose, (identity["conversation_ref"],), deadline, draft_root_registration_ref=root_ref,
+                        worker_holder=holder, worker_fence=fence, worker_lease_expires_utc=expires)
+                db.rollback()
+                return selector
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+
+    def prepare_post_c02_artifact_task_scope_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Derive the actual initial task scope and Goal without creating or acquiring a cycle."""
+        self._admin(bootstrap)
+        from .host.authority_profile import AdminInstallationBundle
+        if (type(installed_bundle) is not AdminInstallationBundle
+                or self.__d04_installed_joint_assembly is None
+                or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle):
+            raise UnavailableGuard("initial task scope needs its actual installed production bundle; HOLD")
+        from .runtime.d11_life_preparation_v1 import TABLE
+        ns = installed_bundle.installation_policy.namespace
+        from .host.authority_profile import AdminArtifactDraftPolicyV2, AdminArtifactDraftPolicyV3
+        from .runtime.c1_artifact_task_intent_v1 import read_c1_task_intent_original_v1
+        from .runtime.ingress_artifact_task_scope_v1 import DeriveIngressArtifactTaskScopeRequestV1,OPERATION
+        task_request=None
+        from .host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+        if type(installed_bundle.artifact_draft) in {AdminArtifactDraftPolicyV2, AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}:
+            with self.__store._lock:
+                db=self.__store._db;db.execute("BEGIN")
+                try:
+                    intent=read_c1_task_intent_original_v1(db,namespace=ns,
+                        c02_operation_id=c02_operation_id,issuer=self.__d11_issuer)
+                    existing=db.execute("SELECT 1 FROM "+TABLE+" WHERE bot=? AND persona=? "
+                        "AND kind='draft_root_capability' AND json_extract(payload_json,'$.source_ref')=?",
+                        (*ns.as_tuple,source_ref)).fetchone()
+                finally:db.rollback()
+            if intent is not None and existing is None:
+                task_request=DeriveIngressArtifactTaskScopeRequestV1(c02_operation_id,source_ref)
+        if task_request is not None:
+            task_selector=self._post_c02_foreground_selector_v1(bootstrap,installed_bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref,operation_kind=OPERATION,request=task_request)
+            return self.__domain_production_runtime_v1.run_foreground_current(selector=task_selector,
+                operation_kind=OPERATION,request=task_request)
+        return None
+
+    def prepare_post_c02_foreground_cycle_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Live admitted C02 caller; the private actual self kernel grants the write."""
+        from .runtime.foreground_cycle_v1 import CreateForegroundCycleRequestV2, foreground_post_c02_cause_ref_v1
+        from .runtime.foreground_call_plan_v1 import foreground_reply_budget_ids_v1
+        from .runtime.d11_life_preparation_v1 import TABLE, _read
+        ns = installed_bundle.installation_policy.namespace
+        child_id = foreground_reply_budget_ids_v1(ns, c02_operation_id)[0]
+        self.prepare_post_c02_artifact_task_scope_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? "
+                    "AND kind='draft_root_capability' AND json_extract(payload_json,'$.source_ref')=? LIMIT 2",
+                    (*ns.as_tuple, source_ref)).fetchall()
+                if len(rows) > 1:
+                    raise UnavailableGuard("one task Source has conflicting root setup originals; HOLD")
+                root_ref = rows[0][0] if rows else None
+                if root_ref is not None:
+                    _read(db, issuer=self.__d11_issuer, namespace=ns, kind="draft_root_capability", ref=root_ref)
+            finally:
+                db.rollback()
+        request = CreateForegroundCycleRequestV2(c02_operation_id, source_ref, child_id,
+            cause_original_ref=root_ref or foreground_post_c02_cause_ref_v1(ns, c02_operation_id), draft_root_registration_ref=root_ref)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, operation_kind="create_foreground_cycle_v2", request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=selector.operation_kind, request=request)
+
+    def prepare_source_note_foreground_cycle_v1(self, bootstrap, installed_bundle, *, authorization_original_ref,
+            c02_operation_id, source_ref):
+        """Initial-only actual Owner task authorization consumed by the independent Self kernel."""
+        self._admin(bootstrap)
+        from .host.authority_profile import AdminInstallationBundle
+        if (type(installed_bundle) is not AdminInstallationBundle
+                or self.__d04_installed_joint_assembly is None
+                or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle):
+            raise UnavailableGuard("SourceNote initial dispatcher needs its actual installed production bundle; HOLD")
+        from .runtime.source_note_foreground_v1 import CreateSourceNoteForegroundCycleRequestV1, OPERATION
+        from .runtime.source_note_task_authorization_v1 import read_source_note_task_authorization_v1
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db; db.execute("BEGIN")
+            try:
+                saved = read_source_note_task_authorization_v1(db, namespace=ns,
+                    original_ref=authorization_original_ref, issuer=self.__d11_issuer)
+                if saved is None or (saved[0].request.c02_operation_id, saved[0].request.source_ref) != (c02_operation_id, source_ref):
+                    raise UnavailableGuard("SourceNote initial dispatcher requires its exact actual Owner C02/task authorization; HOLD")
+            finally:
+                db.rollback()
+        request = CreateSourceNoteForegroundCycleRequestV1(authorization_original_ref)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=OPERATION, request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=OPERATION, request=request)
+
+    def prepare_selected_source_note_action_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref,
+            decision_ref, prepared_candidates_operation_id):
+        self._admin(bootstrap)
+        from .runtime.d08_personal_candidate_v1 import ConsumePersonalDecisionRequestV1
+        request = ConsumePersonalDecisionRequestV1(decision_ref, prepared_candidates_operation_id)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, operation_kind="prepare_selected_source_note_action_v2", request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=selector.operation_kind, request=request)
+
+    def acquire_post_c02_foreground_cycle_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        self._admin(bootstrap)
+        from .runtime.foreground_cycle_v1 import AcquireForegroundCycleRequestV1, foreground_cycle_ids_v1
+        from .runtime.d11_types import runtime_job_key
+        from .runtime.jobs import get_job
+        from .domains.d03.self_perspective import self_mapping_key
+        ns = installed_bundle.installation_policy.namespace
+        activity_id, job_id = foreground_cycle_ids_v1(ns, c02_operation_id)
+        with self.__store._lock:
+            db = self.__store._db
+            job = get_job(db, job_id)
+            row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (self_mapping_key(ns).token,)).fetchone()
+            if row is None or row[1] != 1:
+                raise UnavailableGuard("foreground worker requires its actual registered self mapping; HOLD")
+            self_ref = json.loads(row[0])["self_entity_ref"]
+        if job.phase == "running":
+            if job.lease_holder != self_ref:
+                raise UnavailableGuard("foreground worker belongs to another original holder; HOLD")
+            return self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref)
+        generation = installed_bundle.model_workflows.natural_generation
+        review = installed_bundle.model_workflows.natural_review
+        if generation is None or review is None:
+            raise UnavailableGuard("foreground worker requires actual installed reply workflows; HOLD")
+        lease_seconds = min(3600, int(generation.timeout_seconds + review.timeout_seconds + 120))
+        request = AcquireForegroundCycleRequestV1(runtime_job_key(*ns.as_tuple, activity_id, job_id).token,
+            self_ref, lease_seconds)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, operation_kind="acquire_foreground_cycle", request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=selector.operation_kind, request=request)
+
+    def _read_post_c02_foreground_cycle_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """A current narrow read of the actual last cycle operation; no acquisition or creation."""
+        self._admin(bootstrap)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+        from .runtime.jobs import get_job
+        ns = installed_bundle.installation_policy.namespace
+        _, job_id = foreground_cycle_ids_v1(ns, c02_operation_id)
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                job = get_job(db, job_id)
+                original = read_adopted_domain_operation_v1(db, ns, job.operation_id)
+                if original is None or original["operation_kind"] not in {"create_foreground_cycle", "create_foreground_cycle_v2"}:
+                    raise UnavailableGuard("foreground current read lacks its actual immutable creation variant; HOLD")
+                operation_kind = original["operation_kind"]
+                request = decode_typed_production_value_v1(original["payload"]["request"],
+                    installed_operation_v1(operation_kind).request_type)
+                db.rollback()
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, operation_kind=operation_kind, request=request)
+        # The immutable creation receipt carries no new action authority. A
+        # current independently fenced Source/self read controls disclosure.
+        return self._read_saved_foreground_receipt_v1(selector)
+
+    def checkpoint_post_c02_foreground_wait_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        self._admin(bootstrap)
+        from .runtime.foreground_cycle_v1 import (CheckpointForegroundCycleRequestV1, CheckpointForegroundCycleRequestV2,
+            ForegroundCycleContinuationV2, ForegroundWaitV1,
+            foreground_cycle_ids_v1, foreground_cycle_from_wire_v1, read_observed_foreground_call_plan_v1)
+        from .runtime.jobs import get_job
+        from .runtime.d11_types import runtime_job_key
+        from .runtime_contracts import QueryEpoch, VersionedRef
+        from .runtime.source_note_foreground_v1 import (ForegroundSourceNoteContinuationV1,
+            CheckpointSourceNoteForegroundCycleRequestV1)
+        ns = installed_bundle.installation_policy.namespace
+        activity_id, job_id = foreground_cycle_ids_v1(ns, c02_operation_id)
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                job = get_job(db, job_id)
+                before = foreground_cycle_from_wire_v1(job.continuation)
+                _, epoch = self._v2_graph_stamp(ns)
+                if job.phase != "running" or job.lease_holder is None:
+                    raise UnavailableGuard("foreground waiting must checkpoint its actual running worker; HOLD")
+                source = db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?", (source_ref,)).fetchone()
+                if source is None or source[1] != 1:
+                    raise UnavailableGuard("foreground waiting current original Source is absent; HOLD")
+                if type(before) in {ForegroundCycleContinuationV2, ForegroundSourceNoteContinuationV1}:
+                    from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+                    responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns,
+                        job=job, issuer=self.__d11_issuer)
+                    if responsibility is None:
+                        raise UnavailableGuard("foreground waiting lacks its actual responsibility Owner; HOLD")
+                    observed = read_observed_foreground_call_plan_v1(db, namespace=ns, continuation=before,
+                        issuer=self.__d11_issuer, installed_bundle=installed_bundle, owner_guard=responsibility.owner_guard)
+                else:
+                    observed = read_observed_foreground_call_plan_v1(db, namespace=ns, continuation=before, issuer=self.__d11_issuer)
+                wait = ForegroundWaitV1("d08", "personal_step_requires_current_final_admission",
+                    (VersionedRef(source_ref, source[0]),), QueryEpoch(ns, "namespace", epoch.revision), before.stage_cursor)
+                current = replace(before, call_plan=observed, wait=wait)
+                request_type = (CheckpointSourceNoteForegroundCycleRequestV1 if type(current) is ForegroundSourceNoteContinuationV1 else
+                    CheckpointForegroundCycleRequestV2 if type(current) is ForegroundCycleContinuationV2 else CheckpointForegroundCycleRequestV1)
+                operation_kind = ("checkpoint_source_note_foreground_cycle_v1" if request_type is CheckpointSourceNoteForegroundCycleRequestV1 else
+                    "checkpoint_foreground_cycle_v2" if request_type is CheckpointForegroundCycleRequestV2 else "checkpoint_foreground_cycle")
+                request = request_type(runtime_job_key(*ns.as_tuple, activity_id, job_id).token,
+                    job.lease_holder, job.fence, current)
+                db.rollback()
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, operation_kind=operation_kind, request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=selector.operation_kind, request=request)
+
+    def read_current_post_c02_foreground_mode_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        self._admin(bootstrap)
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .runtime.jobs import get_job
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db,
+                    namespace=ns, job=cycle, issuer=self.__d11_issuer)
+                mode = ("legacy" if responsibility is None else "draft"
+                    if responsibility.root_registration_ref is not None else "natural")
+                db.rollback()
+                return {"schema": "d11.foreground-mode.v1", "mode": mode,
+                    "cycle_job_id": cycle.job_id, "cycle_phase": cycle.phase}
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+
+    def read_current_post_c02_artifact_draft_resume_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Read exact durable selectors through the current self/Source reader."""
+        self._admin(bootstrap)
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1, artifact_draft_model_ids_v1
+        from .runtime.d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1
+        from .runtime.d11_life_preparation_v1 import _read
+        from .runtime.jobs import get_job
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                continuation = foreground_cycle_from_wire_v1(cycle.continuation)
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns,
+                    job=cycle, issuer=self.__d11_issuer)
+                if (responsibility is None or responsibility.root_registration_ref is None
+                        or continuation.source_ref != source_ref):
+                    raise UnavailableGuard("actual signed draft responsibility is not configured for this cycle; HOLD")
+                selector = artifact_draft_task_selector_v1(ns, c02_operation_id=c02_operation_id,
+                    root_registration_ref=responsibility.root_registration_ref)
+                ids = artifact_draft_model_ids_v1(selector)
+                prepared = read_artifact_draft_prepared_v1(db, namespace=ns, issuer=self.__d11_issuer, selector=selector)
+                from .runtime.d11_artifact_draft_model_v1 import read_artifact_draft_frozen_v1
+                frozen = None if prepared is None else read_artifact_draft_frozen_v1(db, prepared=prepared, issuer=self.__d11_issuer)
+                model = None if prepared is None else get_job(db, prepared.job_id)
+                originals = {kind: _read(db, issuer=self.__d11_issuer, namespace=ns, kind=kind, ref=ids[name])
+                    for kind, name in (("c4_request", "request"), ("c4_call", "call"), ("c4_paid", "paid"),
+                        ("c4_result", "result"), ("c4_adopted", "adopt"))}
+                if prepared is None and any(value is not None for value in originals.values()):
+                    raise UnavailableGuard("draft resume lost the original prepared selector; HOLD")
+                dedupe = None if prepared is None else canonical_digest((ns, prepared.operation_id, "d11", "artifact_draft_model_queued"))
+                queued = None if dedupe is None else db.execute("SELECT state FROM graph_domain_production_outbox_v1 "
+                    "WHERE bot=? AND persona=? AND dedupe_key=?", (*ns.as_tuple, dedupe)).fetchone()
+                result = {"schema": "d11.artifact-draft-resume.v1", "c02_operation_id": c02_operation_id,
+                    "source_ref": source_ref, "root_registration_ref": selector.root_registration_ref,
+                    "selector": selector, "cycle_job_id": cycle.job_id, "cycle_phase": cycle.phase,
+                    "cycle_cancel_generation": cycle.cancel_epoch, "cycle_deadline_utc": cycle.deadline_utc,
+                    "model_job_id": ids["job"], "model_phase": None if model is None else model.phase,
+                    "model_lease_holder": None if model is None else model.lease_holder,
+                    "model_lease_expires_utc": None if model is None else model.lease_expires_utc,
+                    "model_cancel_generation": None if model is None else model.cancel_epoch,
+                    "prepared": prepared is not None, "target_mode": None if frozen is None else frozen.target.mode,
+                    "request_sealed": originals["c4_request"] is not None,
+                    "call_sealed": originals["c4_call"] is not None, "paid": originals["c4_paid"] is not None,
+                    "result": originals["c4_result"] is not None, "adopted": originals["c4_adopted"] is not None,
+                    "queued_dedupe_key": dedupe, "queued_state": None if queued is None else queued[0]}
+                db.rollback()
+                return result
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+
+    def create_current_post_c02_artifact_task_plan_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        return self.run_current_post_c02_artifact_task_setup_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind="create_artifact_task_plan_v1")
+
+    def run_current_post_c02_artifact_task_setup_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref, operation_kind):
+        """Derive closed task setup selectors from the actual signed responsibility."""
+        from .runtime.d08_personal_plan_v1 import CreateCurrentArtifactTaskPlanRequestV1, ReviseCurrentArtifactTaskPlanRequestV2
+        from .runtime.d10_project_checkpoint_v1 import (CreateCurrentArtifactTaskProjectRequestV1,
+            InitializeCurrentArtifactTaskProjectCheckpointRequestV1)
+        constructors = {"create_artifact_task_plan_v1": CreateCurrentArtifactTaskPlanRequestV1,
+            "revise_artifact_task_plan_v2": ReviseCurrentArtifactTaskPlanRequestV2,
+            "create_artifact_task_project_v1": CreateCurrentArtifactTaskProjectRequestV1,
+            "initialize_artifact_task_project_checkpoint_v1": InitializeCurrentArtifactTaskProjectCheckpointRequestV1}
+        if operation_kind not in constructors:
+            raise ValueError("unregistered artifact task setup operation")
+        from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.jobs import get_job
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db,
+                    namespace=namespace, job=cycle, issuer=self.__d11_issuer)
+                if responsibility is None or responsibility.root_registration_ref is None:
+                    raise UnavailableGuard("initial TaskPlan requires its actual registered artifact responsibility; HOLD")
+                task = artifact_draft_task_selector_v1(namespace, c02_operation_id=c02_operation_id,
+                    root_registration_ref=responsibility.root_registration_ref)
+            finally:
+                db.rollback()
+        request = constructors[operation_kind](task)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref,
+            operation_kind=operation_kind, request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=operation_kind, request=request)
+
+    def read_current_post_c02_artifact_task_choice_material_v3(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, complete=False):
+        """Read closed selectors from the current signed task, never caller bindings."""
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("task choice requires its actual installed bundle; HOLD")
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.d08_personal_candidate_v1 import (install_personal_candidate_readers_v1,
+            CurrentArtifactTaskChoiceRequestV2, read_current_artifact_task_predecision_requests_v2,
+            read_current_artifact_task_choice_material_v2)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+        from .runtime.jobs import get_job
+        runtime = self.__domain_production_runtime_v1
+        readers = getattr(runtime, "_personal_candidate_readers_v1", None)
+        if readers is None:
+            readers = install_personal_candidate_readers_v1(graph=self, bootstrap=bootstrap, bundle=installed_bundle)
+            runtime._personal_candidate_readers_v1 = readers
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                job = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=namespace,
+                    job=job, issuer=self.__d11_issuer)
+                if responsibility is None or responsibility.source_ref != source_ref or responsibility.root_registration_ref is None:
+                    raise UnavailableGuard("task choice lost its actual Source/Root responsibility; HOLD")
+                task = artifact_draft_task_selector_v1(namespace, c02_operation_id=c02_operation_id,
+                    root_registration_ref=responsibility.root_registration_ref)
+                request = CurrentArtifactTaskChoiceRequestV2(task)
+                read = read_current_artifact_task_choice_material_v2 if complete else read_current_artifact_task_predecision_requests_v2
+                return read(db, namespace=namespace, request=request, installed_readers=readers)
+            finally:
+                db.rollback()
+
+    def prepare_current_post_c02_artifact_task_structure_v3(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref):
+        """Prepare current declared task structures without selecting an Owner role."""
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .runtime.jobs import get_job
+        from .runtime.d11_life_preparation_v1 import _read
+        from .runtime.ingress_artifact_task_scope_v1 import (IngressArtifactTaskScopeOriginalV1,
+            task_scope_ref_v1, _decode, require_task_scope_archive_v1)
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=namespace,
+                    job=cycle, issuer=self.__d11_issuer)
+                if responsibility is None or responsibility.source_ref != source_ref or responsibility.root_registration_ref is None:
+                    raise UnavailableGuard("task structure lost its actual Source/Root responsibility; HOLD")
+                scope_ref = task_scope_ref_v1(responsibility.root_registration_ref)
+                saved = _read(db, issuer=self.__d11_issuer, namespace=namespace, kind="artifact_task_scope", ref=scope_ref)
+                if saved is None:
+                    raise UnavailableGuard("task structure requires its actual signed TaskScope; HOLD")
+                task_scope = _decode(saved[0], IngressArtifactTaskScopeOriginalV1)
+                from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+                producer = read_adopted_domain_operation_v1(db, namespace, saved[1])
+                require_task_scope_archive_v1(db, namespace=namespace, root=task_scope.root, producer=producer)
+            finally:
+                db.rollback()
+        arguments = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
+        if task_scope.task_kind == "continue":
+            operations = ("revise_artifact_task_plan_v2",)
+        elif task_scope.task_kind == "draft_then_corrected_revision":
+            operations = ("create_artifact_task_plan_v1", "create_artifact_task_project_v1",
+                "initialize_artifact_task_project_checkpoint_v1")
+        else:
+            return {"status": "single_artifact_task", **arguments}
+        adopted = None
+        for operation_kind in operations:
+            adopted = self.run_current_post_c02_artifact_task_setup_v1(bootstrap, installed_bundle,
+                operation_kind=operation_kind, **arguments)
+            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
+                return {"status": "held", "operation_kind": operation_kind, "original": adopted, **arguments}
+        return {"status": "task_structure_prepared", "original": adopted, **arguments}
+
+    def prepare_current_post_c02_artifact_phase_amendment_v3(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref):
+        """Revise the stable Plan only through the signed ordinary amendment producer."""
+        return self.run_current_post_c02_artifact_task_setup_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind="revise_artifact_task_plan_v2")
+
+    def prepare_current_post_c02_artifact_phase_choice_v3(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref):
+        """Run the bounded approved preparation and select its actual immutable Decision."""
+        from .runtime.d08_personal_candidate_v1 import CurrentArtifactTaskChoiceRequestV2
+        from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelReadersV1
+        from .runtime.artifact_phase_postconditions_v1 import (FreezeArtifactCandidatePreparationRequestV1,
+            candidate_preparation_parent_for_graph_v1, install_artifact_phase_postcondition_readers_v1)
+        from .domains.d08.personal_candidate_v1 import SelectCurrentPersonalStepRequestV2
+        arguments = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
+        runtime = self.__domain_production_runtime_v1
+        def commit(operation_kind, request):
+            selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+                operation_kind=operation_kind, request=request, **arguments)
+            adopted = runtime.run_foreground_current(selector=selector, operation_kind=operation_kind, request=request)
+            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
+                raise UnavailableGuard("artifact preparation stopped at its actual incomplete " + operation_kind + "; HOLD")
+            return adopted
+        pre = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, installed_bundle, **arguments)
+        commit("input:register_artifact_task_text_extent", pre.extent_request)
+        pre = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, installed_bundle, **arguments)
+        for request in pre.policy_requests:
+            commit("input:register_artifact_phase_postcondition_policy_v1", request)
+        material = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, installed_bundle,
+            complete=True, **arguments)
+        # New method facts are a prospective prerequisite, before either D01 child.
+        # Old task encoders retain their original path and template commitments.
+        with self.__store._lock:
+            encoded_version = self.__store._db.execute("SELECT json_extract(evidence_json,'$.c1_task_result_v1.template_version') "
+                "FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?",
+                (*installed_bundle.installation_policy.namespace.as_tuple,c02_operation_id)).fetchone()
+        from .model_broker.first_ingress_encoding import (FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION,
+            FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION)
+        if encoded_version is not None and encoded_version[0] in {FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION,FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION}:
+            from .runtime.d02_method_readiness_v1 import QuoteCurrentMethodChoicesRequestV1, method_readiness_operation_id_v1
+            from .runtime.d07_method_conditions_v1 import AdoptCurrentC1MethodConditionsRequestV1
+            from .runtime.ingress_artifact_task_scope_v1 import task_scope_ref_v1
+            commit("quote_current_method_choices_v1",QuoteCurrentMethodChoicesRequestV1(material.selector))
+            commit("adopt_current_c1_method_conditions_v1",AdoptCurrentC1MethodConditionsRequestV1(c02_operation_id,
+                task_scope_ref_v1(material.selector.root_registration_ref),material.goal_head.key.token,material.goal_head.revision,
+                method_readiness_operation_id_v1(material.selector,material.plan_head)))
+        model_readers = InstalledArtifactDraftModelReadersV1(self.__d11_issuer, installed_bundle,
+            self.__artifact_draft_model_runtime_v1)
+        postconditions = install_artifact_phase_postcondition_readers_v1(graph=self, bootstrap=bootstrap,
+            bundle=installed_bundle, model_readers=model_readers)
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                parent_pipeline = candidate_preparation_parent_for_graph_v1(self,
+                    request=CurrentArtifactTaskChoiceRequestV2(material.selector), installed_readers=postconditions)
+            finally:
+                db.rollback()
+        with parent_pipeline:
+            parent = commit("input:freeze_artifact_candidate_preparation_v1",
+                FreezeArtifactCandidatePreparationRequestV1(material.selector))
+            freeze = commit("input:freeze_values", material.freeze_request)
+            evaluated = commit("evaluate_values", material.evaluate_request)
+            prepared = commit("prepare_personal_candidates_v1", material.prepare_request)
+            selected = commit("select_personal_step_v2", SelectCurrentPersonalStepRequestV2(
+                material.plan_head.key.token, material.goal_head.key.token, dict(material.ids)["prepare"]))
+        phase = self.read_current_post_c02_artifact_phase_resume_v2(bootstrap, installed_bundle, **arguments)
+        if phase is None:
+            raise UnavailableGuard("actual adopted method Decision has no current phase group; HOLD")
+        return {"status": "selected", "selector": phase["selector"], "parent": parent,
+            "freeze": freeze, "evaluation": evaluated, "preparation": prepared, "selection": selected}
+
+    def _read_current_artifact_task_checkpoint_activation_v1(self, db, *, namespace, phase):
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.d10_project_checkpoint_v1 import (artifact_task_checkpoint_activation_operation_id_v1,
+            artifact_task_checkpoint_initialization_operation_id_v1, require_artifact_task_checkpoint_original_v1,
+            readonly_current_artifact_task_checkpoint_activation_facts_v1)
+        from .domains.d10.project_checkpoint_v1 import project_checkpoint_key_v1
+        from .runtime.d01_production_operations_v1 import MissingProductionOriginalV1
+        from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
+        first_phase = replace(phase, phase_index=0,
+            phase_kind=artifact_draft_phase_sequence_v2(phase.method_ref)[0],
+            prev_phase_original_ref=None, prev_phase_original_digest=None)
+        from .runtime.d08_personal_plan_v1 import (artifact_task_plan_revision_operation_id_v2,
+            require_artifact_task_plan_revision_original_v2)
+        revision = read_adopted_domain_operation_v1(db, namespace,
+            artifact_task_plan_revision_operation_id_v2(phase.task))
+        if revision is not None:
+            from .runtime.d10_project_checkpoint_v1 import (artifact_task_checkpoint_activation_operation_id_v2,
+                readonly_current_artifact_task_checkpoint_activation_facts_v2)
+            _, checkpoint = require_artifact_task_plan_revision_original_v2(db, namespace=namespace, original=revision)
+            active = read_adopted_domain_operation_v1(db, namespace,
+                artifact_task_checkpoint_activation_operation_id_v2(first_phase))
+            if active is not None:
+                readonly_current_artifact_task_checkpoint_activation_facts_v2(db, namespace=namespace,
+                    selector=first_phase, issuer=self.__d11_issuer)
+                return True
+            key = project_checkpoint_key_v1(namespace, checkpoint.project_ref)
+            row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                (*namespace.as_tuple, key.token)).fetchone()
+            if (checkpoint.state != "waiting" or checkpoint.next_step is not None
+                    or row != (checkpoint.revision, canonical_serialize(asdict(checkpoint)), 1)):
+                raise MissingProductionOriginalV1("actual_current_amended_waiting_task_checkpoint")
+            return False
+        actual = read_adopted_domain_operation_v1(db, namespace,
+            artifact_task_checkpoint_activation_operation_id_v1(first_phase))
+        if actual is not None:
+            readonly_current_artifact_task_checkpoint_activation_facts_v1(db, namespace=namespace,
+                selector=first_phase, issuer=self.__d11_issuer)
+            return True
+        initial = read_adopted_domain_operation_v1(db, namespace,
+            artifact_task_checkpoint_initialization_operation_id_v1(phase.task))
+        if initial is None:
+            raise MissingProductionOriginalV1("actual_signed_initial_task_checkpoint")
+        checkpoint, _ = require_artifact_task_checkpoint_original_v1(db, namespace=namespace, original=initial)
+        key = project_checkpoint_key_v1(namespace, checkpoint.project_ref)
+        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+            (*namespace.as_tuple, key.token)).fetchone()
+        if (checkpoint.state != "waiting" or checkpoint.next_step is not None
+                or row != (1, canonical_serialize(asdict(checkpoint)), 1)):
+            raise MissingProductionOriginalV1("actual_current_initial_waiting_task_checkpoint")
+        return False
+
+    def read_current_post_c02_artifact_phase_resume_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Read the actual selected phase and its signed once originals."""
+        self._admin(bootstrap)
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1
+        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV1, ForegroundCallPlanV2
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .runtime.d11_artifact_draft_model_v1 import (read_artifact_draft_prepared_v2,
+            read_artifact_draft_frozen_v2, require_current_artifact_phase_group_v2)
+        from .runtime.d11_life_preparation_v1 import _read
+        from .runtime.jobs import get_job
+        from .model_broker.artifact_draft_v1 import (artifact_draft_model_ids_v2, artifact_draft_phase_original_ref_v2,
+            artifact_draft_phase_sequence_v2)
+        ns = installed_bundle.installation_policy.namespace
+        from .runtime.first_ingress_v2 import trusted_upper
+        current_now = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                continuation = foreground_cycle_from_wire_v1(cycle.continuation)
+                if type(continuation.call_plan) is ForegroundCallPlanV1:
+                    return None
+                if type(continuation.call_plan) is not ForegroundCallPlanV2:
+                    raise UnavailableGuard("unregistered artifact phase call plan; HOLD")
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db,
+                    namespace=ns, job=cycle, issuer=self.__d11_issuer)
+                group = continuation.call_plan.phase_group
+                require_current_artifact_phase_group_v2(db, namespace=ns, group=group, issuer=self.__d11_issuer)
+                phase = group.selector
+                if (responsibility is None or continuation.source_ref != source_ref
+                        or phase.task.namespace != ns or phase.task.c02_operation_id != c02_operation_id
+                        or phase.task.root_registration_ref != responsibility.root_registration_ref):
+                    raise UnavailableGuard("actual phase task/Source/responsibility differs; HOLD")
+                complete = len(group.completed_phase_originals) == len(artifact_draft_phase_sequence_v2(phase.method_ref))
+                checkpoint_activated = self._read_current_artifact_task_checkpoint_activation_v1(db,
+                    namespace=ns, phase=phase)
+                from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+                from .runtime.d08_personal_plan_v1 import artifact_task_plan_revision_operation_id_v2
+                amended = read_adopted_domain_operation_v1(db, ns, artifact_task_plan_revision_operation_id_v2(phase.task)) is not None
+                checkpoint_activation_operation = ("activate_artifact_task_project_checkpoint_v2" if amended
+                    else "activate_artifact_task_project_checkpoint_v1")
+                from .runtime.artifact_phase_postconditions_v1 import CONTRACT_KIND, artifact_phase_postcondition_contract_ref_v1
+                contract_ref = artifact_phase_postcondition_contract_ref_v1(phase)
+                contract = _read(db, issuer=self.__d11_issuer, namespace=ns, kind=CONTRACT_KIND, ref=contract_ref)
+                if not phase.generation:
+                    from .runtime.d11_artifact_draft_content_v1 import read_current_artifact_phase_check_inputs_v2
+                    check_request, assessment = read_current_artifact_phase_check_inputs_v2(db, namespace=ns,
+                        selector=phase, issuer=self.__d11_issuer, now_utc=current_now,
+                        owner_guard=responsibility.owner_guard, installed_bundle=installed_bundle)
+                    ref = artifact_draft_phase_original_ref_v2(phase) + ":verified"
+                    verified = _read(db, issuer=self.__d11_issuer, namespace=ns, kind="c4_phase_verified", ref=ref)
+                    if verified is not None:
+                        from .runtime.d11_artifact_draft_content_v1 import read_current_artifact_phase_verified_v2
+                        read_current_artifact_phase_verified_v2(db, namespace=ns, selector=phase, issuer=self.__d11_issuer)
+                    return {"schema": "d11.artifact-draft-phase-resume.v2", "selector": phase,
+                        "c02_operation_id": c02_operation_id, "source_ref": source_ref, "generation": False,
+                        "cycle_job_id": cycle.job_id, "cycle_phase": cycle.phase,
+                        "cycle_cancel_generation": cycle.cancel_epoch, "verified": verified is not None,
+                        "phase_group_complete": complete, "checkpoint_activated": checkpoint_activated, "contract_registered": contract is not None,
+                        "assessment_registered": assessment is not None, "assessment_request": check_request,
+                        "assessment_statuses": () if assessment is None else tuple(row.status for row in assessment.results)}
+                ids = artifact_draft_model_ids_v2(phase)
+                prepared = read_artifact_draft_prepared_v2(db, namespace=ns, selector=phase, issuer=self.__d11_issuer)
+                frozen = None if prepared is None else read_artifact_draft_frozen_v2(db, prepared=prepared, issuer=self.__d11_issuer)
+                job = None if prepared is None else get_job(db, prepared.job_id)
+                originals = {name: _read(db, issuer=self.__d11_issuer, namespace=ns,
+                    kind="c4_phase_" + kind, ref=ids[name]) for kind, name in
+                    (("request", "request"), ("call", "call"), ("paid", "paid"), ("result", "result"), ("adopted", "adopt"))}
+                verified_ref = artifact_draft_phase_original_ref_v2(phase) + ":verified"
+                verified = _read(db, issuer=self.__d11_issuer, namespace=ns, kind="c4_phase_verified", ref=verified_ref)
+                if prepared is None and any(value is not None for value in originals.values()):
+                    raise UnavailableGuard("phase originals lost actual prepared selector; HOLD")
+                return {"schema": "d11.artifact-draft-phase-resume.v2", "selector": phase,
+                    "c02_operation_id": c02_operation_id, "source_ref": source_ref,
+                    "cycle_job_id": cycle.job_id, "cycle_phase": cycle.phase,
+                    "cycle_cancel_generation": cycle.cancel_epoch, "cycle_deadline_utc": cycle.deadline_utc,
+                    "model_job_id": ids["job"], "model_phase": None if job is None else job.phase,
+                    "model_cancel_generation": None if job is None else job.cancel_epoch,
+                    "prepared": prepared is not None, "target_mode": None if frozen is None else frozen.target.mode,
+                    "request_sealed": originals["request"] is not None, "call_sealed": originals["call"] is not None,
+                    "paid": originals["paid"] is not None, "result": originals["result"] is not None,
+                    "adopted": originals["adopt"] is not None, "verified": verified is not None,
+                    "phase_group_complete": complete, "generation": True, "checkpoint_activated": checkpoint_activated,
+                    "checkpoint_activation_operation": checkpoint_activation_operation, "contract_registered": contract is not None}
+            finally:
+                db.rollback()
+
+    def run_current_post_c02_artifact_phase_operation_v2(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, operation_kind):
+        """Derive an exact phase command from its currently selected original."""
+        from .runtime.d11_artifact_draft_model_v1 import (PrepareArtifactDraftModelRequestV2,
+            AcquireArtifactDraftModelRequestV2, read_artifact_draft_prepared_v2)
+        from .runtime.d11_artifact_draft_content_v1 import AdoptArtifactDraftContentRequestV2, VerifyArtifactDraftPhaseRequestV2
+        from .runtime.d08_personal_plan_v1 import ProposeCurrentArtifactPhaseActionRequestV2
+        from .runtime.d02_life_body_preparation_v1 import PrepareArtifactDraftBodyRequestV1
+        from .runtime.domain_production_inputs_v1 import RegisterCurrentPhaseDraftFilePlanInputRequestV2
+        from .runtime.d11_life_product_adapter_v1 import artifact_phase_draft_plan_ref_v2
+        from .runtime.d11_life_preparation_v1 import PrepareCurrentLifeRequestV1
+        from .model_broker.artifact_draft_v1 import artifact_draft_file_ids_v2, artifact_draft_phase_original_ref_v2
+        from .runtime.foreground_cycle_v1 import WakeArtifactDraftCycleRequestV2
+        from .runtime.d10_project_checkpoint_v1 import (ActivateCurrentArtifactTaskProjectCheckpointRequestV1,
+            ActivateCurrentArtifactTaskProjectCheckpointRequestV2)
+        from .runtime.artifact_task_observer_v1 import RegisterCurrentArtifactTaskMilestoneRequestV2
+        constructors = {"register_artifact_task_milestone_v2": RegisterCurrentArtifactTaskMilestoneRequestV2,
+            "activate_artifact_task_project_checkpoint_v1": ActivateCurrentArtifactTaskProjectCheckpointRequestV1,
+            "activate_artifact_task_project_checkpoint_v2": ActivateCurrentArtifactTaskProjectCheckpointRequestV2,
+            "prepare_artifact_draft_model_v2": PrepareArtifactDraftModelRequestV2,
+            "acquire_artifact_draft_model_v2": AcquireArtifactDraftModelRequestV2,
+            "adopt_artifact_draft_content_v2": AdoptArtifactDraftContentRequestV2,
+            "propose_artifact_draft_phase_action_v2": ProposeCurrentArtifactPhaseActionRequestV2,
+            "input:register_artifact_phase_draft_plan_v2": RegisterCurrentPhaseDraftFilePlanInputRequestV2}
+        if operation_kind not in {*constructors, "wake_artifact_draft_cycle_v2", "prepare_artifact_draft_body", "prepare_life", "verify_artifact_draft_phase_v2", "register_artifact_phase_postcondition_contract_v1", "observe_artifact_phase_postconditions_v1"}:
+            raise ValueError("unregistered installed artifact phase operation")
+        actual = self.read_current_post_c02_artifact_phase_resume_v2(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        if actual is None:
+            raise UnavailableGuard("actual current artifact phase is absent; HOLD")
+        if not actual["generation"] and operation_kind not in {"observe_artifact_phase_postconditions_v1", "verify_artifact_draft_phase_v2", "register_artifact_task_milestone_v2"}:
+            raise UnavailableGuard("actual check phase cannot perform a generation operation; HOLD")
+        phase = actual["selector"]
+        if operation_kind == "register_artifact_phase_postcondition_contract_v1":
+            from .runtime.artifact_phase_postconditions_v1 import RegisterArtifactPhasePostconditionContractRequestV1
+            from .runtime.d11_artifact_draft_model_v1 import _read_artifact_phase_selected_originals_v2
+            from .domains.d08.personal_candidate_v1 import ArtifactPhaseCandidateBindingV3
+            with self.__store._lock:
+                db = self.__store._db
+                db.execute("BEGIN")
+                try:
+                    _, chosen, _ = _read_artifact_phase_selected_originals_v2(db, selector=phase, issuer=self.__d11_issuer)
+                    if type(chosen.binding) is not ArtifactPhaseCandidateBindingV3:
+                        raise UnavailableGuard("selected method lacks its preregistered policy; HOLD")
+                    request = RegisterArtifactPhasePostconditionContractRequestV1(phase, chosen.binding.postcondition_policy_ref)
+                finally:
+                    db.rollback()
+        elif operation_kind in {"observe_artifact_phase_postconditions_v1", "verify_artifact_draft_phase_v2"}:
+            from .runtime.d11_life_contract_v1 import draft_artifact_ref_v1
+            from .runtime.artifact_phase_postconditions_v1 import artifact_phase_assessment_original_ref_v1
+            if operation_kind == "observe_artifact_phase_postconditions_v1":
+                request = actual["assessment_request"]
+            else:
+                if phase.generation:
+                    file_ref = draft_artifact_ref_v1(phase.task.namespace, artifact_draft_file_ids_v2(phase)["effect"])
+                else:
+                    file_ref = actual["assessment_request"].file_result_ref
+                refs = () if phase.generation else (artifact_phase_assessment_original_ref_v1(phase),)
+                request = VerifyArtifactDraftPhaseRequestV2(phase, file_ref, refs)
+        elif operation_kind == "wake_artifact_draft_cycle_v2":
+            with self.__store._lock:
+                db = self.__store._db
+                db.execute("BEGIN")
+                try:
+                    prepared = read_artifact_draft_prepared_v2(db, namespace=phase.task.namespace,
+                        selector=phase, issuer=self.__d11_issuer)
+                    if prepared is None:
+                        raise UnavailableGuard("phase wake lost actual original preparation; HOLD")
+                    request = WakeArtifactDraftCycleRequestV2(phase,
+                        canonical_digest((phase.task.namespace, prepared.operation_id, "d11", "artifact_draft_phase_model_queued")))
+                finally:
+                    db.rollback()
+        elif operation_kind == "prepare_artifact_draft_body":
+            configured = installed_bundle.artifact_draft.body_policy
+            ids = artifact_draft_file_ids_v2(phase)
+            request = PrepareArtifactDraftBodyRequestV1(ids["action"], configured.policy_ref,
+                configured.policy_version, configured.effect_component_policy_ref, configured.cpu_ceiling_ms)
+        elif operation_kind == "prepare_life":
+            request = PrepareCurrentLifeRequestV1(artifact_phase_draft_plan_ref_v2(phase),
+                artifact_draft_phase_original_ref_v2(phase) + ":file-prepare")
+        else:
+            request = constructors[operation_kind](phase)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref,
+            operation_kind=operation_kind, request=request)
+        result = self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=operation_kind, request=request)
+        if operation_kind == "wake_artifact_draft_cycle_v2":
+            acquired = self.acquire_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref)
+            return {"wake": result, "acquisition": acquired}
+        return result
+
+    def checkpoint_current_artifact_phase_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Advance only one actual signed verification through the original checkpoint."""
+        actual = self.read_current_post_c02_artifact_phase_resume_v2(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        if actual is None:
+            raise UnavailableGuard("actual artifact phase group is absent; HOLD")
+        from .runtime.foreground_cycle_v1 import (foreground_cycle_ids_v1, foreground_cycle_from_wire_v1,
+            derive_actual_completed_artifact_phase_plan_v2, CheckpointForegroundCycleRequestV2)
+        from .runtime.jobs import get_job
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                job = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                continuation = foreground_cycle_from_wire_v1(job.continuation)
+                updated = derive_actual_completed_artifact_phase_plan_v2(db, namespace=ns,
+                    continuation=continuation, issuer=self.__d11_issuer)
+                if updated == continuation.call_plan:
+                    return {"status": "no_new_verified_phase", "selector": actual["selector"]}
+                if job.phase != "running" or job.cancel_epoch or job.lease_holder is None:
+                    raise UnavailableGuard("phase checkpoint requires its actual live uncancelled cycle; HOLD")
+                request = CheckpointForegroundCycleRequestV2(actual["selector"].task.cycle_job_ref,
+                    job.lease_holder, job.fence, replace(continuation, call_plan=updated))
+            finally:
+                db.rollback()
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref,
+            operation_kind="checkpoint_foreground_cycle_v2", request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind="checkpoint_foreground_cycle_v2", request=request)
+
+    def _read_saved_artifact_method_final_request_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref, operation_kind):
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1
+        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+        from .runtime.d11_artifact_draft_content_v1 import artifact_method_final_operation_ids_v2
+        from .runtime.artifact_task_observer_v1 import artifact_task_milestone_original_ref_v2, read_current_artifact_task_milestone_v2
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.domain_production_registry_v1 import installed_operation_v1
+        from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+        from .runtime.jobs import get_job
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                job = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
+                if type(plan) is not ForegroundCallPlanV2:
+                    return None
+                phase = plan.phase_group.selector
+                ids = artifact_method_final_operation_ids_v2(phase)
+                original = read_adopted_domain_operation_v1(db, namespace,
+                    ids[{"input:register_life_outcome_v2": "outcome_register", "advance_life": "advance",
+                        "settle_project_checkpoint": "project_settle", "settle_personal_goal": "goal"}[operation_kind]])
+                if original is None:
+                    return None
+                milestone = read_current_artifact_task_milestone_v2(db, namespace=namespace,
+                    original_ref=artifact_task_milestone_original_ref_v2(phase), issuer=self.__d11_issuer)
+                operation = installed_operation_v1(operation_kind)
+                if (original["domain"], original["operation_kind"]) != (operation.domain, operation_kind):
+                    raise UnavailableGuard("saved method settlement changed its exact producer; HOLD")
+                if original["payload"]["owner_guard"] != asdict(milestone.owner_guard):
+                    raise UnavailableGuard("saved method settlement changed its actual Owner; HOLD")
+                return decode_typed_production_value_v1(original["payload"]["request"], operation.request_type)
+            finally:
+                db.rollback()
+
+    def run_current_post_c02_artifact_method_final_operation_v2(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, operation_kind):
+        """Derive ordinary final requests solely from the signed completed method."""
+        allowed = {"input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"}
+        if operation_kind not in allowed:
+            raise ValueError("unregistered artifact method final operation")
+        replay = self._read_saved_artifact_method_final_request_v2(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation_kind)
+        if replay is not None:
+            selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation_kind, request=replay)
+            return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+                operation_kind=operation_kind, request=replay)
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1
+        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+        from .runtime.jobs import get_job
+        from .runtime.artifact_task_observer_v1 import artifact_task_milestone_original_ref_v2, read_current_artifact_task_milestone_v2
+        from .runtime.d11_artifact_draft_content_v1 import (artifact_method_final_operation_ids_v2,
+            actual_artifact_phase_content_selector_v2)
+        from .runtime.d11_life_terminal_v1 import read_adopted_life_original_v1
+        from .runtime.d11_life_contract_v1 import RegisteredLifeOutcomeV2, D11LifeTerminalV1, life_from_wire_v1
+        from .runtime.domain_production_inputs_v1 import RegisterCurrentLifeOutcomeInputRequestV2
+        from .runtime.d11_life_preparation_v1 import read_registered_life_plan_v2
+        from .domains.d10.production_operations_v1 import AdvanceCurrentLifeRequestV1
+        from .runtime.d10_project_checkpoint_v1 import SettleCurrentProjectCheckpointRequestV1
+        from .runtime.d08_personal_plan_v1 import SettleCurrentPersonalGoalRequestV1
+        from .domains.d10.project_checkpoint_v1 import project_checkpoint_key_v1
+        from .runtime.d11_types import runtime_cost_settlement_key
+        from .domains.d08.production_operations_v1 import observed_action_outcome_key_v1
+        from .domains.d08.execution import _decode_intent
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                continuation = foreground_cycle_from_wire_v1(cycle.continuation)
+                if type(continuation.call_plan) is not ForegroundCallPlanV2:
+                    raise UnavailableGuard("method finalization has no actual phase group; HOLD")
+                phase = continuation.call_plan.phase_group.selector
+                milestone = read_current_artifact_task_milestone_v2(db, namespace=namespace,
+                    original_ref=artifact_task_milestone_original_ref_v2(phase), issuer=self.__d11_issuer)
+                if milestone.selector != phase or milestone.ordered_phase_originals != continuation.call_plan.phase_group.completed_phase_originals:
+                    raise UnavailableGuard("method finalization changed its actual completed prefix; HOLD")
+                content_phase = actual_artifact_phase_content_selector_v2(db, namespace=namespace,
+                    selector=phase, issuer=self.__d11_issuer)
+                if content_phase.phase_kind != "full":
+                    raise UnavailableGuard("method finalization requires its actual full file; HOLD")
+                final_ids = artifact_method_final_operation_ids_v2(phase)
+                actual = read_adopted_life_original_v1(db, namespace=namespace,
+                    result_ref=milestone.file_result_ref, issuer=self.__d11_issuer)
+                if actual is None or canonical_digest(actual) != milestone.file_result_digest:
+                    raise UnavailableGuard("method finalization lost its actual completed file original; HOLD")
+                terminal = life_from_wire_v1(actual["terminal"], D11LifeTerminalV1)
+                if terminal.status != "completed" or terminal.binding.effect_id != milestone.readback.effect_id:
+                    raise UnavailableGuard("method finalization crossed its actual file effect; HOLD")
+                progress_ref = AtomKey(Owner("activity", *namespace.as_tuple, terminal.binding.activity_id),
+                    "d10.life_progress.v1", terminal.binding.effect_id).token
+                if operation_kind == "input:register_life_outcome_v2":
+                    plan = read_registered_life_plan_v2(db, namespace=namespace, issuer=self.__d11_issuer,
+                        original_ref=terminal.binding.plan_original_ref)
+                    if plan is None:
+                        raise UnavailableGuard("method outcome lost its actual registered file plan; HOLD")
+                    action_key = AtomKey.from_token(plan.action_intent.ref)
+                    row = db.execute("SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                        (*namespace.as_tuple, action_key.token)).fetchone()
+                    if row is None or row[1] != 1:
+                        raise UnavailableGuard("method outcome lost its actual adopted Action; HOLD")
+                    action = _decode_intent(json.loads(row[0]))
+                    request = RegisterCurrentLifeOutcomeInputRequestV2(final_ids["outcome_ref"],
+                        RegisteredLifeOutcomeV2(plan_original_ref=terminal.binding.plan_original_ref,
+                            action_outcome_ref=observed_action_outcome_key_v1(action_key, action).token,
+                            start_original_ref=terminal.claim.original_ref, terminal_original_ref=terminal.original_ref,
+                            artifact_ref=terminal.binding.artifact_ref, artifact_digest=terminal.payload.artifact_digest,
+                            paid_cost_refs=(runtime_cost_settlement_key(*namespace.as_tuple, terminal.binding.activity_id,
+                                terminal.binding.reservation_operation_id).token,)))
+                elif operation_kind == "advance_life":
+                    request = AdvanceCurrentLifeRequestV1(milestone.project_ref, final_ids["outcome_ref"])
+                elif operation_kind == "settle_project_checkpoint":
+                    key = project_checkpoint_key_v1(namespace, milestone.project_ref)
+                    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                        (*namespace.as_tuple, key.token)).fetchone()
+                    if row is None or row[2] != 1 or json.loads(row[1])["plan_ref"] != phase.plan_ref:
+                        raise UnavailableGuard("method project settlement lost its actual checkpoint; HOLD")
+                    request = SettleCurrentProjectCheckpointRequestV1(milestone.project_ref, phase.plan_ref,
+                        progress_ref, None, row[0])
+                else:
+                    rows = tuple(db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                        (*namespace.as_tuple, ref)).fetchone() for ref in (milestone.goal_ref, phase.plan_ref))
+                    if any(row is None or row[2] != 1 for row in rows):
+                        raise UnavailableGuard("method Goal settlement lost actual control heads; HOLD")
+                    plan_value = json.loads(rows[1][1])
+                    if (plan_value["goal_ref"], plan_value["goal_revision"]) != (milestone.goal_ref, rows[0][0]):
+                        raise UnavailableGuard("method Goal settlement changed current Goal/Plan pairing; HOLD")
+                    request = SettleCurrentPersonalGoalRequestV1(milestone.goal_ref, phase.plan_ref,
+                        progress_ref, rows[0][0], rows[1][0])
+            finally:
+                db.rollback()
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation_kind, request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=operation_kind, request=request)
+
+    def read_current_artifact_method_finalization_progress_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Readonly completion checkpoint, never an execution permit."""
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("method progress requires its actual installation; HOLD")
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1
+        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+        from .runtime.jobs import get_job
+        from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
+        from .runtime.d11_artifact_draft_content_v1 import read_current_artifact_phase_verified_v2
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                job = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
+                if type(plan) is not ForegroundCallPlanV2:
+                    return None
+                group = plan.phase_group
+                if len(group.completed_phase_originals) != len(artifact_draft_phase_sequence_v2(group.selector.method_ref)):
+                    return None
+                verified = read_current_artifact_phase_verified_v2(db, namespace=namespace,
+                    selector=group.selector, issuer=self.__d11_issuer)
+                if not verified.method_qualified or group.completed_phase_originals[-1] != (verified.original_ref, verified.digest):
+                    raise UnavailableGuard("method progress changed actual complete final check; HOLD")
+                from .runtime.artifact_task_observer_v1 import (artifact_task_milestone_original_ref_v2,
+                    artifact_task_milestone_registration_operation_id_v2, read_current_artifact_task_milestone_v2)
+                from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+                milestone_adoption = read_adopted_domain_operation_v1(db, namespace,
+                    artifact_task_milestone_registration_operation_id_v2(group.selector))
+                registered = None
+                if milestone_adoption is not None:
+                    milestone = read_current_artifact_task_milestone_v2(db, namespace=namespace,
+                        original_ref=artifact_task_milestone_original_ref_v2(group.selector), issuer=self.__d11_issuer)
+                    if milestone.selector != group.selector or milestone.ordered_phase_originals != group.completed_phase_originals:
+                        raise UnavailableGuard("saved method milestone changed its actual complete group; HOLD")
+                    registered = {"coverage": "complete", "receipt": asdict(milestone_adoption["receipt"]),
+                        "produced_originals": ({"kind": "d11.life_artifact_task_milestone_v2",
+                            "original_ref": milestone.original_ref, "original_digest": milestone.digest},)}
+                return {"status": "artifact_phase_check_verified", "selector": group.selector,
+                    "registered_milestone": registered, "c02_operation_id": c02_operation_id, "source_ref": source_ref}
+            finally:
+                db.rollback()
+
+    def read_current_completed_artifact_method_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Disclose one actual completed history receipt without issuing any new work."""
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("completed method disclosure requires its actual installation; HOLD")
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1
+        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .runtime.d11_artifact_draft_content_v1 import (artifact_method_settlement_operation_id_v2,
+            read_current_completed_artifact_method_history_v2)
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.jobs import get_job
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
+                continuation = foreground_cycle_from_wire_v1(cycle.continuation)
+                if type(continuation.call_plan) is not ForegroundCallPlanV2:
+                    return None
+                phase = continuation.call_plan.phase_group.selector
+                original = read_adopted_domain_operation_v1(db, namespace, artifact_method_settlement_operation_id_v2(phase))
+                if original is None:
+                    return None
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db,
+                    namespace=namespace, job=cycle, issuer=self.__d11_issuer)
+                if responsibility is None or responsibility.source_ref != source_ref:
+                    raise UnavailableGuard("completed method disclosure lost its actual responsibility Source; HOLD")
+                history, receipt = read_current_completed_artifact_method_history_v2(db,
+                    namespace=namespace, selector=phase, issuer=self.__d11_issuer,
+                    owner_guard=responsibility.owner_guard, installed_bundle=installed_bundle)
+                return {"status": "artifact_method_settlement_history", "history_state": history.state,
+                    "selector": phase, "original_receipt": receipt, "history": history,
+                    "c02_operation_id": c02_operation_id, "source_ref": source_ref}
+            finally:
+                db.rollback()
+
+    def read_protected_artifact_task_reply_state_v1(self,bootstrap,installed_bundle,*,c02_operation_id):
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("task reply observation requires its actual installed bundle")
+        from .runtime.artifact_task_wait_consumer_v1 import protected_task_reply_state_v1
+        with self.__store._lock:
+            db=self.__store._db;db.execute("BEGIN")
+            try:return protected_task_reply_state_v1(db,namespace=installed_bundle.installation_policy.namespace,c02_operation_id=c02_operation_id)
+            finally:db.rollback()
+
+    def discover_registered_artifact_task_waits_v1(self,bootstrap,installed_bundle):
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("task wait discovery requires its actual installed bundle")
+        from .runtime.artifact_task_wait_consumer_v1 import discover_registered_task_waits_v1
+        with self.__store._lock:
+            db=self.__store._db;db.execute("BEGIN")
+            try:return discover_registered_task_waits_v1(db,namespace=installed_bundle.installation_policy.namespace,issuer=self.__d11_issuer)
+            finally:db.rollback()
+
+    def discover_waiting_artifact_task_messages_v1(self,bootstrap,installed_bundle,*,initial_c02_operation_id):
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("task message recheck requires its actual installed bundle")
+        from .runtime.artifact_task_wait_consumer_v1 import discover_waiting_task_messages_v1
+        with self.__store._lock:
+            db=self.__store._db;db.execute("BEGIN")
+            try:
+                return discover_waiting_task_messages_v1(db,namespace=installed_bundle.installation_policy.namespace,
+                    initial_c02_operation_id=initial_c02_operation_id,issuer=self.__d11_issuer)
+            finally:db.rollback()
+
+    def discover_current_artifact_draft_resumes_v1(self, bootstrap, installed_bundle):
+        from .runtime.artifact_continuation_originals_v1 import artifact_control_keys_for_task_v1
+        """Bounded metadata inventory of existing prepared tasks; never create a new cycle."""
+        from .model_broker.artifact_draft_v1 import artifact_draft_from_wire_v1, ArtifactDraftTaskSelectorV1
+        from .runtime.d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.d08_personal_plan_v1 import artifact_goal_plan_keys_v1
+        from .domains.d10.project_checkpoint_v1 import project_checkpoint_key_v1
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("artifact resume discovery requires its actual installation; HOLD")
+        ns, result = installed_bundle.installation_policy.namespace, []
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                for (job_id,) in db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
+                        "AND work_kind='artifact_draft_v1' ORDER BY job_id LIMIT 129", ns.as_tuple).fetchall():
+                    job = get_job(db, job_id)
+                    task = artifact_draft_from_wire_v1(job.continuation["selector"], ArtifactDraftTaskSelectorV1)
+                    prepared = read_artifact_draft_prepared_v1(db, namespace=ns, issuer=self.__d11_issuer, selector=task)
+                    if prepared is None:
+                        raise UnavailableGuard("artifact resume lacks its actual prepared original; HOLD")
+                    cycle = get_job(db, foreground_cycle_ids_v1(ns, task.c02_operation_id)[1])
+                    if cycle.cancel_epoch or cycle.phase in {"cancelled", "failed", "completed", "draining"}:
+                        continue
+                    keys = artifact_control_keys_for_task_v1(db, namespace=ns, c02_operation_id=task.c02_operation_id, root_registration_ref=task.root_registration_ref)
+                    checkpoint = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
+                        (project_checkpoint_key_v1(ns, keys[2].token).token,)).fetchone()
+                    if checkpoint is not None and checkpoint[1] == 1 and json.loads(checkpoint[0])["state"] == "completed":
+                        continue
+                    from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+                    result.append({"c02_operation_id": task.c02_operation_id,
+                        "source_ref": foreground_cycle_from_wire_v1(cycle.continuation).source_ref})
+                    if len(result) == 3:
+                        break
+                return tuple(result)
+            finally:
+                db.rollback()
+
+    def prepare_current_post_c02_recall_need_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Ordinary installed entry into the actual privately issued Self need producer."""
+        self._admin(bootstrap)
+        from .runtime.d06_ingress_recall_v1 import (PrepareIngressRecallNeedRequestV1,
+            read_adopted_ingress_recall_need_v1, NEED_OPERATION)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.d11_types import runtime_job_key
+        from .host.authority_profile import AdminD06RecallPolicyV1
+        from .domains.d01.production_operations_v1 import plain_v1
+        policy = installed_bundle.d06_recall
+        if type(policy) is not AdminD06RecallPolicyV1:
+            raise UnavailableGuard("explicit installed ingress recall policy is absent; HOLD")
+        ns = installed_bundle.installation_policy.namespace
+        activity, job_id = foreground_cycle_ids_v1(ns, c02_operation_id)
+        request = PrepareIngressRecallNeedRequestV1(c02_operation_id, source_ref,
+            runtime_job_key(*ns.as_tuple, activity, job_id).token, policy.policy_digest)
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=NEED_OPERATION, request=request)
+        result = self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=NEED_OPERATION, request=request)
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                need = read_adopted_ingress_recall_need_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                if need is None:
+                    raise UnavailableGuard("recall need lacks its actual W01 adopted original; HOLD")
+                return {"receipt": result, "need": plain_v1(need)}
+            finally:
+                db.rollback()
+
+    def run_current_post_c02_task_no_search_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Probe metadata under current access; only actual v4 candidates enter D07 W01."""
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.d07_task_history_v1 import (probe_task_no_search_metadata_v1,
+            task_no_search_operation_id_v1, read_adopted_task_no_search_v1, OPERATION)
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .domains.d01.production_operations_v1 import plain_v1
+        namespace = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db; db.execute("BEGIN")
+            try:
+                probe = probe_task_no_search_metadata_v1(db, namespace=namespace,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref)
+            finally:
+                db.rollback()
+        if probe.status == "not_applicable":
+            return plain_v1(probe)
+        request = probe.request
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=OPERATION, request=request)
+        receipt = self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=OPERATION, request=request)
+        with self.__store._lock:
+            db.execute("BEGIN")
+            try:
+                original = read_adopted_domain_operation_v1(db, namespace, task_no_search_operation_id_v1(namespace,c02_operation_id))
+                if original is None:
+                    raise UnavailableGuard("task no-search has no actual W01 result; HOLD")
+                if original["payload"]["coverage"] != "complete":
+                    return {"status":"held","receipt":receipt,"missing_inputs":original["payload"]["missing_inputs"]}
+                provenance = original["payload"]["provenance"]
+                if "task_no_search_decision" in provenance:
+                    from .runtime.d07_task_history_v1 import CurrentTaskNoSearchDecisionV1
+                    from .runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+                    decision = decode_typed_production_value_v1(provenance["task_no_search_decision"],CurrentTaskNoSearchDecisionV1)
+                    return {"status":"not_applicable","decision":plain_v1(decision),"receipt":receipt}
+                adopted = read_adopted_task_no_search_v1(db,namespace=namespace,c02_operation_id=c02_operation_id)
+                if adopted is None:
+                    raise UnavailableGuard("task no-search lost its exact adopted proof; HOLD")
+                value, origin = adopted
+                return {"status":"no_search","need":plain_v1(value.need),"receipt":receipt,
+                    "original_ref":"d07-current:"+origin["original_digest"][:48],"original_digest":origin["original_digest"]}
+            finally:
+                db.rollback()
+
+    def run_current_post_c02_ingress_recall_model_operation_v1(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, operation_kind):
+        """Only registered Self C3 preparation/acquisition from the original ordinary ingress."""
+        self._admin(bootstrap)
+        from .runtime.d06_ingress_recall_v1 import read_adopted_ingress_recall_need_v1
+        from .runtime.d07_ingress_recall_preparation_v1 import PrepareIngressRecallModelRequestV1, OPERATION
+        from .runtime.d07_ingress_recall_acquisition_v1 import ACQUIRE_OPERATION
+        from .runtime.d07_ingress_recall_result_v1 import OPERATIONS
+        if operation_kind not in {OPERATION, ACQUIRE_OPERATION, *OPERATIONS}:
+            raise ValueError("Self C3 caller cannot select another business operation")
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                need = read_adopted_ingress_recall_need_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                if need is None or need.source_ref != source_ref:
+                    raise UnavailableGuard("Self C3 lacks its actual ordinary ingress Need; HOLD")
+                request = PrepareIngressRecallModelRequestV1(c02_operation_id, source_ref,
+                    need.cycle_job_ref, need.policy_digest, canonical_digest(need))
+            finally:
+                db.rollback()
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation_kind, request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=operation_kind, request=request)
+
+    def select_current_post_c02_ingress_recall_seed_v1(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref):
+        """One registered C03 selection from an actual adopted Self routing original."""
+        self._admin(bootstrap)
+        from .runtime.d06_ingress_c03_read_v1 import SelectIngressRecallSeedRequestV1, OPERATION
+        from .runtime.d06_ingress_c03_selection_v1 import read_adopted_ingress_c03_selection_v1
+        from .runtime.d06_ingress_recall_v1 import read_adopted_ingress_recall_need_v1
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                need = read_adopted_ingress_recall_need_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                if need is None or need.source_ref != source_ref:
+                    raise UnavailableGuard("C03 lacks its actual current ingress Need; HOLD")
+                request = SelectIngressRecallSeedRequestV1(c02_operation_id, source_ref, need.cycle_job_ref,
+                    need.policy_digest, canonical_digest(need))
+            finally:
+                db.rollback()
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=OPERATION, request=request)
+        receipt = self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=OPERATION, request=request)
+        with self.__store._lock:
+            db.execute("BEGIN")
+            try:
+                saved = read_adopted_ingress_c03_selection_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                if saved is None:
+                    raise UnavailableGuard("C03 selection has no actual adopted metadata receipt; HOLD")
+                value, original, bridge = saved
+                from .domains.d01.production_operations_v1 import plain_v1
+                return {"receipt": receipt, "selection": plain_v1(value),
+                    "original_ref": "d06-current:" + original["original_digest"][:48],
+                    "original_digest": original["original_digest"], "query_commit_bridge": bridge}
+            finally:
+                db.rollback()
+
+    def discover_original_ingress_recall_resumes_v1(self, bootstrap, installed_bundle):
+        """Bounded old-parent selectors; never create a parent or a C3 job."""
+        self._admin(bootstrap)
+        if (self.__d04_installed_joint_assembly is None
+                or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle):
+            raise UnavailableGuard("recall recovery requires the actual installed assembly; HOLD")
+        from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+        from .runtime.d06_ingress_recall_v1 import read_adopted_ingress_recall_need_v1
+        from .runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
+        from .runtime.d07_execution_v1 import read_prepared_d07_execution_v1, D07IngressRecallPreparedV1
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                from .runtime.natural_reply_job_v2 import read_original_preparation as _read_natural_preparation
+                rows = db.execute("SELECT continuation_json FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
+                    "AND work_kind='d11.foreground_cycle.v1' AND phase IN ('queued','running','waiting') "
+                    "AND COALESCE(json_extract(continuation_json,'$.schema'),'')<>"
+                    "'d11.owner-source-note-task-continuation.v2' "
+                    "AND cancel_epoch=0 ORDER BY job_id LIMIT 17", ns.as_tuple).fetchall()
+                if len(rows) > 16:
+                    raise UnavailableGuard("original recall continuation inventory exceeds one bounded page; HOLD")
+                result = []
+                for (encoded,) in rows:
+                    parent = foreground_cycle_from_wire_v1(json.loads(encoded))
+                    need = read_adopted_ingress_recall_need_v1(db, namespace=ns,
+                        c02_operation_id=parent.c02_operation_id)
+                    if need is None:
+                        continue
+                    ids = ingress_recall_model_ids_v1(ns, parent.c02_operation_id)
+                    prepared = read_prepared_d07_execution_v1(db, self.__d11_issuer, ns, ids["job"])
+                    if prepared is None:
+                        continue
+                    if (type(prepared) is not D07IngressRecallPreparedV1
+                            or prepared.c02_operation_id != parent.c02_operation_id
+                            or prepared.cycle_job_ref != need.cycle_job_ref or need.source_ref != parent.source_ref):
+                        raise ValueError("original recall recovery crossed its actual C02/Source/parent")
+                    if _read_natural_preparation(db, ns, parent.c02_operation_id, "generation") is not None:
+                        continue
+                    result.append({"c02_operation_id": parent.c02_operation_id, "source_ref": parent.source_ref})
+                return tuple(result)
+            finally:
+                db.rollback()
+
+    def read_current_ingress_recall_resume_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
+        """Qualify disclosure through the existing current Source/Self read protocol."""
+        self._read_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.d06_ingress_recall_v1 import read_adopted_ingress_recall_need_v1
+        from .runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
+        from .runtime.d07_execution_v1 import read_prepared_d07_execution_v1, D07IngressRecallPreparedV1
+        from .runtime.d07_ingress_recall_result_v1 import read_adopted_ingress_recall_routing_v1
+        from .runtime.d06_ingress_c03_selection_v1 import read_adopted_ingress_c03_selection_v1
+        from .runtime.c04_self_scope_v4 import ingress_c04_ids_v4
+        from .runtime.c04_internal_work_original_v1 import read_c04_internal_work_prepared_v1
+        from .runtime.jobs import get_job
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                need = read_adopted_ingress_recall_need_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                ids = ingress_recall_model_ids_v1(ns, c02_operation_id)
+                prepared = read_prepared_d07_execution_v1(db, self.__d11_issuer, ns, ids["job"])
+                if (need is None or type(prepared) is not D07IngressRecallPreparedV1
+                        or need.source_ref != source_ref or prepared.cycle_job_ref != need.cycle_job_ref
+                        or prepared.c02_operation_id != c02_operation_id):
+                    raise UnavailableGuard("cold recall requires the actual original Self C3 preparation; HOLD")
+                parent = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                routing = read_adopted_ingress_recall_routing_v1(db, namespace=ns,
+                    c02_operation_id=c02_operation_id, issuer=self.__d11_issuer)
+                selection = read_adopted_ingress_c03_selection_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                c04 = None
+                if selection is not None:
+                    c04_ids = ingress_c04_ids_v4(ns, c02_operation_id, selection[1]["original_digest"])
+                    c04 = read_c04_internal_work_prepared_v1(db, ns, c04_ids["prepare"])
+                return {"need": need, "prepared": prepared, "routing": routing, "selection": selection,
+                    "c04_prepared": c04, "parent_phase": parent.phase, "c3_job": get_job(db, prepared.job_id)}
+            finally:
+                db.rollback()
+
+    def run_current_post_c02_ingress_c04_operation_v4(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, operation_kind):
+        """The actual C03 selection chooses one fixed Self C04 prepare/adopt command."""
+        self._admin(bootstrap)
+        from .runtime.c04_self_scope_v4 import PrepareIngressC04RequestV1, PREPARE_OPERATION
+        from .runtime.c04_ingress_preparation_v4 import ADOPT_OPERATION
+        from .runtime.d06_ingress_c03_selection_v1 import read_adopted_ingress_c03_selection_v1
+        if operation_kind not in {PREPARE_OPERATION, ADOPT_OPERATION}:
+            raise ValueError("unregistered Self C04 operation")
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                actual = read_adopted_ingress_c03_selection_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                if actual is None:
+                    raise UnavailableGuard("Self C04 needs its actual adopted C03 selection; HOLD")
+                value, original, _ = actual
+                if value.cue_source_ref != source_ref or value.selected_source_ref is None:
+                    raise UnavailableGuard("Self C04 has no actual positive historical selection; HOLD")
+                request = PrepareIngressC04RequestV1(c02_operation_id, value.cycle_job_ref, source_ref,
+                    "d06-current:" + original["original_digest"][:48], canonical_digest(value),
+                    installed_bundle.d06_recall.policy_digest)
+            finally:
+                db.rollback()
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref,
+            operation_kind=operation_kind, request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=operation_kind, request=request)
+
+    def advance_current_post_c02_ingress_c04_v4(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref):
+        """Inspect the original claim, execute at most once, settle actual cost, then adopt."""
+        self._admin(bootstrap)
+        from .runtime.c04_self_scope_v4 import ingress_c04_ids_v4
+        from .runtime.c04_ingress_preparation_v4 import ADOPT_OPERATION
+        from .runtime.c04_internal_work_original_v1 import read_c04_internal_work_prepared_v1
+        from .runtime.c04_product_lifecycle_v3 import c04_terminal_proof_from_inspection_v3
+        from .runtime.d06_ingress_c03_selection_v1 import read_adopted_ingress_c03_selection_v1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                actual = read_adopted_ingress_c03_selection_v1(db, namespace=ns, c02_operation_id=c02_operation_id)
+                if actual is None or actual[0].cue_source_ref != source_ref:
+                    raise UnavailableGuard("Self C04 advance lost its actual C03 parent; HOLD")
+                value, original, _ = actual
+                ids = ingress_c04_ids_v4(ns, c02_operation_id, original["original_digest"])
+                prepared = read_c04_internal_work_prepared_v1(db, ns, ids["prepare"])
+                adopted = read_adopted_domain_operation_v1(db, ns, ids["adopt"])
+                if adopted is not None:
+                    if adopted["operation_kind"] != ADOPT_OPERATION:
+                        raise ValueError("Self C04 adopted original changed its producer")
+                    return {"status": "recollection_adopted", "operation_id": ids["adopt"],
+                        "receipt_digest": canonical_digest(adopted["receipt"]), "replayed": True}
+                if prepared is None:
+                    raise UnavailableGuard("Self C04 actual frozen preparation is absent; HOLD")
+            finally:
+                db.rollback()
+        port = self.__c04_authority_port_v3
+        if port is None:
+            raise UnavailableGuard("Self C04 installed independent Authority port is absent; HOLD")
+        observed = port.inspect(prepared.binding)
+        proof = c04_terminal_proof_from_inspection_v3(observed)
+        if proof is None and observed.claim is None:
+            self.__local_module_admission.require_v1(("d02", "d03", "d04", "d06", "d07", "d11"),
+                "self_c04:first_native_claim")
+            observed = port.execute(prepared.binding)
+            proof = c04_terminal_proof_from_inspection_v3(observed)
+        if proof is None:
+            return {"status": "original_native_terminal_unknown", "operation_id": ids["prepare"],
+                "binding_digest": prepared.binding.binding_digest}
+        cost = self.reconcile_historical_c04_cost_v1(bootstrap, ns, ids["prepare"])
+        if proof.terminal.status != "completed" or cost["body_gap"] is not None:
+            closure = self.reconcile_historical_c04_cost_v1(bootstrap, ns, ids["prepare"], close_job=True)
+            return {"status": "native_terminal_not_adoptable", "cost": closure,
+                "binding_digest": prepared.binding.binding_digest}
+        adopted = self.run_current_post_c02_ingress_c04_operation_v4(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=ADOPT_OPERATION)
+        return {"status": "recollection_adopted", "operation_id": ids["adopt"],
+            "binding_digest": prepared.binding.binding_digest, "cost": cost, "adoption": adopted}
+
+    def run_current_post_c02_artifact_draft_operation_v1(self, bootstrap, installed_bundle, *,
+            c02_operation_id, source_ref, operation_kind):
+        """Closed task requests from the actual adopted responsibility and IDs."""
+        self._admin(bootstrap)
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1, WakeArtifactDraftCycleRequestV1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+        from .runtime.d11_artifact_draft_model_v1 import (PrepareArtifactDraftModelRequestV1,
+            AcquireArtifactDraftModelRequestV1, read_artifact_draft_prepared_v1)
+        from .runtime.d11_artifact_draft_content_v1 import AdoptArtifactDraftContentRequestV1
+        from .runtime.d08_personal_plan_v1 import ComposeCurrentArtifactGoalPlanRequestV1, ProposeCurrentArtifactActionRequestV1, artifact_draft_action_keys_v1
+        from .runtime.d10_project_checkpoint_v1 import CreateCurrentArtifactProjectRequestV1
+        from .runtime.d02_life_body_preparation_v1 import PrepareArtifactDraftBodyRequestV1
+        from .runtime.d11_life_preparation_v1 import PrepareCurrentLifeRequestV1
+        from .runtime.d10_project_checkpoint_v1 import InitializeCurrentProjectCheckpointRequestV1
+        from .runtime.jobs import get_job
+        continuation_operations = {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1", "revise_existing_artifact_v1"}
+        from .runtime.artifact_continuation_originals_v1 import (
+            discover_existing_artifact_continuation_request_v1, read_selected_artifact_continuation_request_v1,
+            artifact_control_keys_for_task_v1)
+        if operation_kind == "prepare_artifact_draft_model":
+            for predecessor_operation in ("await_existing_artifact_revision_v1",
+                                          "select_existing_artifact_continuation_v1"):
+                predecessor = self.run_current_post_c02_artifact_draft_operation_v1(
+                    bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
+                    source_ref=source_ref, operation_kind=predecessor_operation)
+                if predecessor.get("status") == "no_existing_artifact":
+                    break
+                if (predecessor.get("coverage") != "complete"
+                        or predecessor.get("receipt", {}).get("status") != "committed"):
+                    return predecessor
+        if operation_kind == "propose_artifact_draft_action":
+            from .host.authority_profile import AdminArtifactDraftPolicyV2
+            if type(installed_bundle.artifact_draft) is AdminArtifactDraftPolicyV2:
+                role_result=self.run_current_post_c02_artifact_draft_operation_v1(bootstrap,installed_bundle,
+                    c02_operation_id=c02_operation_id,source_ref=source_ref,operation_kind="prepare_artifact_draft_project_context")
+                if role_result.get("status") != "current_project_role" and (
+                        role_result.get("coverage") != "complete"
+                        or role_result.get("receipt", {}).get("status") != "committed"):
+                    return role_result
+        constructors = {"prepare_artifact_draft_model": PrepareArtifactDraftModelRequestV1,
+            "acquire_artifact_draft_model": AcquireArtifactDraftModelRequestV1,
+            "adopt_artifact_draft_content": AdoptArtifactDraftContentRequestV1}
+        post_content = {"compose_artifact_goal_plan": ComposeCurrentArtifactGoalPlanRequestV1,
+            "create_artifact_project": CreateCurrentArtifactProjectRequestV1,
+            "propose_artifact_draft_action": ProposeCurrentArtifactActionRequestV1}
+        if operation_kind not in {*constructors, *post_content, *continuation_operations, "prepare_artifact_draft_project_context", "prepare_artifact_draft_body", "wake_artifact_draft_cycle_v1",
+                "input:register_artifact_draft_plan_v3", "prepare_life", "initialize_project_checkpoint",
+                "input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"}:
+            raise ValueError("artifact caller accepts only its fixed installed task operations")
+        ns = installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns,
+                    job=cycle, issuer=self.__d11_issuer)
+                if (responsibility is None or responsibility.root_registration_ref is None
+                        or responsibility.source_ref != source_ref):
+                    raise UnavailableGuard("artifact task has no actual adopted signed draft responsibility; HOLD")
+                task = artifact_draft_task_selector_v1(ns, c02_operation_id=c02_operation_id,
+                    root_registration_ref=responsibility.root_registration_ref)
+                if operation_kind in continuation_operations:
+                    if operation_kind in {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1"}:
+                        request = discover_existing_artifact_continuation_request_v1(db, namespace=ns,
+                            selector=task, issuer=self.__d11_issuer)
+                        if request is None:
+                            db.rollback()
+                            return {"status": "no_existing_artifact", "mode": "create"}
+                    else:
+                        selected = read_selected_artifact_continuation_request_v1(db, namespace=ns, selector=task)
+                        if selected is None:
+                            raise UnavailableGuard("amendment lacks actual adopted artifact selection; HOLD")
+                        request = selected[0]
+                elif operation_kind == "wake_artifact_draft_cycle_v1":
+                    prepared = read_artifact_draft_prepared_v1(db, namespace=ns, issuer=self.__d11_issuer, selector=task)
+                    if prepared is None:
+                        raise UnavailableGuard("artifact terminal wake lacks its actual queued preparation; HOLD")
+                    request = WakeArtifactDraftCycleRequestV1(task,
+                        canonical_digest((ns, prepared.operation_id, "d11", "artifact_draft_model_queued")))
+                elif operation_kind in post_content:
+                    if operation_kind == "propose_artifact_draft_action":
+                        from .runtime.d03_life_project_context_v1 import life_project_context_keys_v1
+                        from .runtime.d08_personal_plan_v1 import artifact_goal_plan_keys_v1
+                        project_key = artifact_control_keys_for_task_v1(db, namespace=ns, c02_operation_id=c02_operation_id,
+                            root_registration_ref=responsibility.root_registration_ref)[2]
+                        for context_key in life_project_context_keys_v1(ns, project_key.token):
+                            context = db.execute("SELECT valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                                (context_key.token, *ns.as_tuple)).fetchone()
+                            if context != (1,):
+                                raise UnavailableGuard("artifact Action awaits its actual adopted project role; HOLD")
+                    request = post_content[operation_kind](c02_operation_id, responsibility.root_registration_ref)
+                elif operation_kind == "prepare_artifact_draft_project_context":
+                    from .runtime.d03_life_project_context_v1 import PrepareArtifactDraftProjectContextRequestV1,life_project_context_keys_v1
+                    from .runtime.ingress_artifact_task_scope_v1 import standing_artifact_policy_v1
+                    standing=standing_artifact_policy_v1(installed_bundle)
+                    keys=artifact_control_keys_for_task_v1(db,namespace=ns,c02_operation_id=c02_operation_id,
+                        root_registration_ref=responsibility.root_registration_ref)
+                    contexts=tuple(db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                        (key.token,*ns.as_tuple)).fetchone() for key in life_project_context_keys_v1(ns,keys[2].token))
+                    if all(row is not None and row[1]==1 for row in contexts):
+                        role=json.loads(contexts[1][0])
+                        if (role["social_role"],tuple(role["norm_refs"]))!=(standing.social_role,standing.norm_refs):
+                            raise UnavailableGuard("actual project role differs from the installed standing choice; HOLD")
+                        db.rollback();return {"status":"current_project_role"}
+                    request=PrepareArtifactDraftProjectContextRequestV1(keys[2].token,keys[3].token,
+                        source_ref,standing.social_role,standing.norm_refs)
+                elif operation_kind == "prepare_artifact_draft_body":
+                    configured = installed_bundle.artifact_draft.body_policy
+                    action_key = artifact_draft_action_keys_v1(ns, c02_operation_id=c02_operation_id,
+                        root_registration_ref=responsibility.root_registration_ref)[0]
+                    request = PrepareArtifactDraftBodyRequestV1(action_key.token, configured.policy_ref,
+                        configured.policy_version, configured.effect_component_policy_ref, configured.cpu_ceiling_ms)
+                elif operation_kind == "initialize_project_checkpoint":
+                    from .runtime.d08_personal_plan_v1 import artifact_goal_plan_keys_v1
+                    keys = artifact_goal_plan_keys_v1(ns, c02_operation_id=c02_operation_id,
+                        root_registration_ref=responsibility.root_registration_ref)
+                    request = InitializeCurrentProjectCheckpointRequestV1(keys[2].token, keys[1].token)
+                elif operation_kind == "prepare_life":
+                    request = PrepareCurrentLifeRequestV1("artifact-draft-final-plan:" + task.digest[:40],
+                        "artifact-draft-life-prepare:" + task.digest[:40])
+                elif operation_kind == "input:register_artifact_draft_plan_v3":
+                    request = self._build_current_artifact_draft_plan_request_v1(db, installed_bundle, task, cycle)
+                elif operation_kind in {"input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"}:
+                    from .runtime.d08_personal_plan_v1 import artifact_goal_plan_keys_v1, SettleCurrentPersonalGoalRequestV1
+                    from .runtime.d10_project_checkpoint_v1 import SettleCurrentProjectCheckpointRequestV1
+                    from .domains.d10.production_operations_v1 import AdvanceCurrentLifeRequestV1
+                    from .runtime.domain_production_inputs_v1 import RegisterCurrentLifeOutcomeInputRequestV2
+                    from .runtime.d11_life_contract_v1 import RegisteredLifeOutcomeV2, D11LifeTerminalV1, life_from_wire_v1
+                    from .runtime.d11_life_preparation_v1 import read_registered_life_plan_v2
+                    from .runtime.d11_life_terminal_v1 import read_adopted_life_original_v1
+                    from .runtime.d11_types import runtime_cost_settlement_key
+                    from .domains.d08.production_operations_v1 import observed_action_outcome_key_v1
+                    from .domains.d08.execution import _decode_intent
+                    from .model_broker.artifact_draft_v1 import artifact_draft_file_ids_v1
+                    from .runtime.d11_life_contract_v1 import draft_artifact_ref_v1
+                    ids = artifact_draft_file_ids_v1(ns, c02_operation_id=c02_operation_id, root_registration_ref=task.root_registration_ref)
+                    keys = artifact_control_keys_for_task_v1(db, namespace=ns, c02_operation_id=c02_operation_id, root_registration_ref=task.root_registration_ref)
+                    progress_ref = AtomKey(Owner("activity", *ns.as_tuple, ids["activity_id"]), "d10.life_progress.v1", ids["effect"]).token
+                    outcome_ref = "artifact-draft-outcome:" + task.digest[:40]
+                    if operation_kind == "advance_life":
+                        request = AdvanceCurrentLifeRequestV1(keys[2].token, outcome_ref)
+                    elif operation_kind == "settle_project_checkpoint":
+                        from .runtime.d11_life_adoption_v1 import require_draft_terminal_readback_v1
+                        from .runtime.d11_life_preparation_v1 import read_prepared_life_v1
+                        actual = read_adopted_life_original_v1(db, namespace=ns,
+                            result_ref=draft_artifact_ref_v1(ns, ids["effect"]), issuer=self.__d11_issuer)
+                        if actual is None:
+                            raise UnavailableGuard("checkpoint requires actual same-effect file adoption; HOLD")
+                        terminal = life_from_wire_v1(actual["terminal"], D11LifeTerminalV1)
+                        prepared = read_prepared_life_v1(db, binding=terminal.binding, issuer=self.__d11_issuer)
+                        if prepared is None:
+                            raise UnavailableGuard("checkpoint requires actual same-effect preparation; HOLD")
+                        require_draft_terminal_readback_v1(prepared=prepared, terminal=terminal)
+                        from .domains.d10.project_checkpoint_v1 import project_checkpoint_key_v1
+                        checkpoint_key = project_checkpoint_key_v1(ns, keys[2].token)
+                        checkpoint_row = db.execute(
+                            "SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                            (checkpoint_key.token, *ns.as_tuple)).fetchone()
+                        if checkpoint_row is None or checkpoint_row[2] != 1:
+                            raise UnavailableGuard("checkpoint settlement needs the actual current control head; HOLD")
+                        checkpoint_value = json.loads(checkpoint_row[1])
+                        if checkpoint_value["revision"] != checkpoint_row[0] or checkpoint_value["plan_ref"] != keys[1].token:
+                            raise ValueError("checkpoint settlement control revision or plan differs")
+                        request = SettleCurrentProjectCheckpointRequestV1(keys[2].token, keys[1].token,
+                            progress_ref, None, checkpoint_row[0])
+                    elif operation_kind == "settle_personal_goal":
+                        control_rows = tuple(db.execute(
+                            "SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                            (key.token, *ns.as_tuple)).fetchone() for key in keys[:2])
+                        if any(row is None or row[2] != 1 for row in control_rows):
+                            raise UnavailableGuard("goal settlement needs actual current Goal and Plan heads; HOLD")
+                        goal_value, plan_value = (json.loads(row[1]) for row in control_rows)
+                        if (goal_value["revision"] != control_rows[0][0]
+                                or plan_value["revision"] != control_rows[1][0]
+                                or plan_value["goal_ref"] != keys[0].token
+                                or plan_value["goal_revision"] != control_rows[0][0]):
+                            raise ValueError("goal settlement current Goal/Plan revisions differ")
+                        request = SettleCurrentPersonalGoalRequestV1(keys[0].token, keys[1].token,
+                            progress_ref, control_rows[0][0], control_rows[1][0])
+                    else:
+                        plan = read_registered_life_plan_v2(db, namespace=ns, issuer=self.__d11_issuer,
+                            original_ref="artifact-draft-final-plan:" + task.digest[:40])
+                        if plan is None:
+                            raise UnavailableGuard("draft outcome requires its actual registered plan; HOLD")
+                        adopted = read_adopted_life_original_v1(db, namespace=ns,
+                            result_ref=draft_artifact_ref_v1(ns, ids["effect"]), issuer=self.__d11_issuer)
+                        if adopted is None:
+                            raise UnavailableGuard("draft outcome requires actual same-effect adoption; HOLD")
+                        terminal = life_from_wire_v1(adopted["terminal"], D11LifeTerminalV1)
+                        action_key = AtomKey.from_token(plan.action_intent.ref)
+                        action_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (action_key.token,)).fetchone()
+                        if action_row is None or action_row[1] != 1:
+                            raise UnavailableGuard("draft outcome requires its actual adopted Action; HOLD")
+                        action = _decode_intent(json.loads(action_row[0]))
+                        request = RegisterCurrentLifeOutcomeInputRequestV2(outcome_ref,
+                            RegisteredLifeOutcomeV2(plan_original_ref=terminal.binding.plan_original_ref,
+                                action_outcome_ref=observed_action_outcome_key_v1(action_key, action).token,
+                                start_original_ref=terminal.claim.original_ref, terminal_original_ref=terminal.original_ref,
+                                artifact_ref=terminal.binding.artifact_ref, artifact_digest=terminal.payload.artifact_digest,
+                                paid_cost_refs=(runtime_cost_settlement_key(*ns.as_tuple, terminal.binding.activity_id,
+                                    terminal.binding.reservation_operation_id).token,)))
+                else:
+                    request = constructors[operation_kind](task)
+                db.rollback()
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+        selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation_kind, request=request)
+        result = self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind=operation_kind, request=request)
+        if operation_kind == "wake_artifact_draft_cycle_v1":
+            acquisition = self.acquire_post_c02_foreground_cycle_v1(bootstrap, installed_bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref)
+            return {"wake": result, "acquisition": acquisition}
+        return result
+
+    def _build_current_artifact_draft_plan_request_v1(self, db, installed_bundle, task, cycle):
+        """Build candidate C from adopted content/A/B; the actual input compiler rechecks every member."""
+        from .runtime.artifact_continuation_originals_v1 import artifact_control_keys_for_task_v1
+        from .model_broker.artifact_draft_v1 import artifact_draft_model_ids_v1, artifact_draft_file_ids_v1
+        from .runtime.d11_life_preparation_v1 import _read
+        from .runtime.d11_artifact_draft_content_v1 import ArtifactDraftContentAdoptionV1, artifact_draft_content_from_wire_v1
+        from .runtime.d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
+        from .runtime.d08_personal_plan_v1 import artifact_goal_plan_keys_v1, artifact_draft_action_keys_v1
+        from .runtime.d08_life_admission_v1 import require_draft_action_root_v1
+        from .runtime.d02_life_body_preparation_v1 import life_body_preparation_original_from_wire_v1
+        from .runtime.d11_life_contract_v1 import LifeBodyComponentContractV1, LifeInputRefV1
+        from .runtime.domain_production_inputs_v1 import RegisterCurrentDraftFilePlanInputRequestV3
+        from .memory_types import access_key
+        from datetime import datetime, timezone
+        ns = task.namespace
+        ids = artifact_draft_file_ids_v1(ns, c02_operation_id=task.c02_operation_id,
+            root_registration_ref=task.root_registration_ref)
+        raw = _read(db, issuer=self.__d11_issuer, namespace=ns, kind="c4_adopted", ref=artifact_draft_model_ids_v1(task)["adopt"])
+        if raw is None:
+            raise UnavailableGuard("final plan C requires actual adopted C4 content; HOLD")
+        content = artifact_draft_content_from_wire_v1(raw[0], ArtifactDraftContentAdoptionV1)
+        keys = artifact_control_keys_for_task_v1(db, namespace=ns, c02_operation_id=task.c02_operation_id, root_registration_ref=task.root_registration_ref)
+        action_key = artifact_draft_action_keys_v1(ns, c02_operation_id=task.c02_operation_id, root_registration_ref=task.root_registration_ref)[0]
+        root = require_draft_action_root_v1(db, namespace=ns, action_intent_ref=action_key.token, issuer=self.__d11_issuer)
+        body_raw = _read(db, issuer=self.__d11_issuer, namespace=ns, kind="life_body_preparation", ref="life-body:d02-life-body:" + root.action_operation_id)
+        if body_raw is None:
+            raise UnavailableGuard("final plan C requires actual adopted Body B; HOLD")
+        body = life_body_preparation_original_from_wire_v1(body_raw[0])
+        contract = LifeBodyComponentContractV1(*(getattr(body, name) for name in (
+            "body_quote_ref", "body_quote_version", "body_quote_digest", "resource_quote_ref", "resource_quote_version",
+            "resource_quote_digest", "reservation_ref", "settlement_ref", "component_id", "effect_policy_ref", "body_prepare_operation_id")))
+        quote = self.__d02_issuer.original_signed_quote(db, body.resource_quote_ref, body.resource_quote_version)
+        grant = self.__d11_issuer.current_budget_grant(db, cycle.budget_ref)
+        deadline = min(datetime.fromisoformat(content.original_deadline_utc.replace("Z", "+00:00")).timestamp(),
+            quote.valid_until_utc, grant.valid_until_utc)
+        def frozen(key):
+            row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?", (key.token, *ns.as_tuple)).fetchone()
+            if row is None or row[2] != 1:
+                raise UnavailableGuard("final plan C lost an actual adopted input; HOLD")
+            return LifeInputRefV1(key.token, row[0], canonical_digest(json.loads(row[1])))
+        source_key = AtomKey.from_token(content.task_source.ref)
+        plan = RegisteredDraftFilePlanV3(frozen(keys[2]), frozen(keys[3]), frozen(action_key), frozen(source_key),
+            frozen(access_key(*ns.as_tuple, source_key.owner.subject)), root.activity_id, root.effect_id, ids["attempt"],
+            root.action_operation_id, ids["execution_call"], content.activity_scope_ref, content.activity_scope_digest,
+            root.audiences, cycle.budget_ref, installed_bundle.artifact_draft.body_policy.cpu_ceiling_ms,
+            datetime.fromtimestamp(deadline, timezone.utc).isoformat().replace("+00:00", "Z"), content.algorithm_build_digest,
+            content.postcondition_build_digest, canonical_serialize(asdict(contract)), content.target, content.content)
+        return RegisterCurrentDraftFilePlanInputRequestV3("artifact-draft-final-plan:" + task.digest[:40], plan)
+
+    def read_current_owner_artifact_project_context_choices_v1(self, authority, lease):
+        """Current Owner read of exact project selectors and the actually adopted catalogue."""
+        from .runtime.d12_current_domain_selection_v1 import read_current_domain_selection_v1
+        from .runtime.d12_domain_scheme_compile_v1 import CONTEXT_SCHEME_FIELD, D12ContextSchemeCandidateV1
+        from .runtime.d12_compiled_candidate_store_v1 import verify_d12_domain_candidate_v1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.d03_life_project_context_v1 import life_project_context_keys_v1
+        from .runtime.d11_artifact_draft_content_v1 import artifact_draft_content_from_wire_v1, ArtifactDraftContentAdoptionV1
+        from .runtime.d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1
+        from .authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+        self._authorize(lease, authority, frozenset({"d03", "d08", "d10", "d11", "d12"}), owner_read=True)
+        ns = authority.namespace
+        owner_binding = self.__owner_leases.get(lease)
+        def read():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                version, _, receipt = read_current_domain_selection_v1(db, ns, domain="d03", field_name=CONTEXT_SCHEME_FIELD)
+                if receipt is None:
+                    raise UnavailableGuard("Owner project choice requires an actual adopted context catalogue; HOLD")
+                row = db.execute("SELECT candidate_json,candidate_sha256 FROM graph_d12_domain_candidates_v1 "
+                    "WHERE bot=? AND persona=? AND candidate_ref=?", (*ns.as_tuple, receipt.candidate_ref)).fetchone()
+                if row is None or hashlib.sha256(row[0].encode()).hexdigest() != row[1]:
+                    raise UnavailableGuard("Owner project choice current catalogue original differs; HOLD")
+                raw = json.loads(row[0])
+                if raw.pop("$type", None) != "sylanne3.runtime.d12_domain_scheme_compile_v1.D12ContextSchemeCandidateV1":
+                    raise ValueError("Owner project choice has another catalogue type")
+                namespace = raw.pop("namespace")
+                if namespace.pop("$type", None) != "sylanne3.runtime_contracts.NamespaceId":
+                    raise ValueError("Owner project catalogue has another namespace type")
+                for name in ("field_names", "roles", "norms"):
+                    raw[name] = tuple(raw[name])
+                candidate = D12ContextSchemeCandidateV1(namespace=NamespaceId(**namespace), **raw)
+                if canonical_serialize(candidate) != row[0] or not verify_d12_domain_candidate_v1(db, ns, candidate, receipt):
+                    raise ValueError("Owner project choice catalogue selection lost its actual adoption")
+                items = []
+                operations = db.execute("SELECT h.event_id FROM graph_atoms a JOIN graph_history h "
+                    "ON h.token=a.token AND h.revision=a.revision AND h.valid=1 "
+                    "JOIN graph_domain_production_originals_v1 o ON o.bot=a.bot AND o.persona=a.persona AND o.operation_id=h.event_id "
+                    "WHERE a.bot=? AND a.persona=? AND a.type_name='d10.life_project.v1' AND a.valid=1 "
+                    "AND ((o.domain='d10' AND o.operation_kind IN ('create_artifact_project','create_artifact_task_project_v1')) "
+                    "OR (o.domain='d08' AND o.operation_kind='revise_existing_artifact_v1')) "
+                    "ORDER BY a.token LIMIT 65", ns.as_tuple).fetchall()
+                if len(operations) > 64:
+                    raise UnavailableGuard("Owner project choice requires a bounded project page; HOLD")
+                for (operation_id,) in operations:
+                    original = read_adopted_domain_operation_v1(db, ns, operation_id)
+                    provenance = original["payload"]["provenance"]
+                    if (original["domain"], original["operation_kind"]) == ("d10", "create_artifact_task_project_v1"):
+                        from .runtime.d10_project_checkpoint_v1 import require_artifact_task_project_original_v1
+                        from .model_broker.artifact_draft_v1 import artifact_draft_from_wire_v1, ArtifactDraftTaskSelectorV1
+                        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+                        from .memory_types import SourceRecord
+                        basis = require_artifact_task_project_original_v1(db, namespace=ns, original=original)
+                        task = artifact_draft_from_wire_v1(basis["task"], ArtifactDraftTaskSelectorV1)
+                        project_ref = basis["project_ref"]
+                        source_ref = basis["source_head"]["key"]
+                        source_row = read_graph_head_v3(db, source_ref)
+                        if (source_row is None or source_row[2] != 1 or source_row[0] != basis["source_head"]["revision"]
+                                or canonical_digest(json.loads(source_row[1])) != basis["source_digest"]):
+                            raise UnavailableGuard("Owner task project choice lost its actual current Source; HOLD")
+                        audiences = SourceRecord.from_dict(json.loads(source_row[1])).audiences
+                        if (len(audiences) != 1 or owner_binding is None
+                                or not {"context", "consolidation"} <= set(owner_binding.purposes)
+                                or not set(audiences) <= set(owner_binding.audiences)):
+                            raise AuthorityDenied("Owner task project choice exceeds its current Source purpose/audience scope")
+                        for source_purpose in ("context", "consolidation"):
+                            _source_family_current_sql_v1(db, namespace=ns, roots=(source_ref,),
+                                purpose=source_purpose, audiences=audiences)
+                        cycle = get_job(db, foreground_cycle_ids_v1(ns, task.c02_operation_id)[1])
+                        if cycle is None:
+                            raise UnavailableGuard("Owner task project choice lost its actual cycle; HOLD")
+                        role_key = life_project_context_keys_v1(ns, project_ref)[1]
+                        role = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (role_key.token,)).fetchone()
+                        binding = None if role is None or role[1] != 1 else json.loads(role[0])
+                        items.append({"project_ref": project_ref, "recipe_ref": basis["recipe_ref"],
+                            "source_ref": source_ref, "c02_operation_id": task.c02_operation_id,
+                            "activity_id": cycle.activity_id, "audience_ref": audiences[0],
+                            "parent_budget_lease_ref": cycle.budget_ref,
+                            "binding_ref": role_key.token if binding is not None else None,
+                            "social_role": None if binding is None else binding["social_role"],
+                            "norm_refs": [] if binding is None else binding["norm_refs"]})
+                        continue
+                    if (original["domain"], original["operation_kind"]) == ("d08", "revise_existing_artifact_v1"):
+                        content = provenance["content_adoption"]
+                        provenance = {"artifact_project_ref": provenance["basis"]["project_ref"],
+                            "artifact_recipe_ref": provenance["basis"]["recipe_ref"],
+                            "artifact_content_adoption": content, "draft_task_source_ref": content["task_source"]["ref"],
+                            "draft_content_ref": content["content"]["content"]["ref"]}
+                    project_ref = provenance["artifact_project_ref"]
+                    from .runtime.d10_project_checkpoint_v1 import _artifact_project_original_v1
+                    if _artifact_project_original_v1(db, namespace=ns, project_ref=project_ref) != original:
+                        raise ValueError("Owner project choice differs from actual current producing member")
+                    head = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (project_ref,)).fetchone()
+                    if head is None or head[1] != 1:
+                        continue
+                    adoption = artifact_draft_content_from_wire_v1(provenance["artifact_content_adoption"], ArtifactDraftContentAdoptionV1)
+                    prepared = read_artifact_draft_prepared_v1(db, namespace=ns, issuer=self.__d11_issuer, selector=adoption.selector)
+                    if prepared is None or len(prepared.audiences) != 1:
+                        raise UnavailableGuard("Owner project choice lost its actual task audience; HOLD")
+                    if (owner_binding is None or not {"context", "consolidation"} <= set(owner_binding.purposes)
+                            or not set(prepared.audiences) <= set(owner_binding.audiences)):
+                        raise AuthorityDenied("Owner project choice metadata exceeds its actual current Source purpose/audience scope")
+                    for source_purpose in ("context", "consolidation"):
+                        _source_family_current_sql_v1(db, namespace=ns,
+                            roots=(provenance["draft_task_source_ref"], provenance["draft_content_ref"]),
+                            purpose=source_purpose, audiences=prepared.audiences)
+                    role_key = life_project_context_keys_v1(ns, project_ref)[1]
+                    role = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (role_key.token,)).fetchone()
+                    binding = None if role is None or role[1] != 1 else json.loads(role[0])
+                    items.append({"project_ref": project_ref, "recipe_ref": provenance["artifact_recipe_ref"],
+                        "source_ref": provenance["draft_task_source_ref"], "c02_operation_id": adoption.selector.c02_operation_id,
+                        "activity_id": prepared.activity_id, "audience_ref": prepared.audiences[0],
+                        "parent_budget_lease_ref": prepared.parent_budget_lease_ref,
+                        "binding_ref": role_key.token if binding is not None else None,
+                        "social_role": None if binding is None else binding["social_role"],
+                        "norm_refs": [] if binding is None else binding["norm_refs"]})
+                return {"schema": "d03.owner-artifact-project-context-options.v1", "namespace": asdict(ns),
+                    "catalogue": {"head_ref": version.key.token, "head_revision": version.revision,
+                        "candidate_ref": receipt.candidate_ref, "roles": list(candidate.roles), "norms": list(candidate.norms)},
+                    "items": items}
+            finally:
+                db.rollback()
+        return self._read_v2(authority, read, owner_binding=owner_binding,
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+
+    def configure_current_owner_artifact_project_context_v1(self, bootstrap, installed_bundle, authority, lease, *,
+            c02_operation_id, source_ref, social_role, norm_refs, operation_id):
+        """Adopt the Owner's explicit catalogue choice for this exact existing project."""
+        from .runtime.d03_life_project_context_v1 import AdoptOwnerArtifactProjectContextRequestV1
+        from .memory_types import SourceRecord
+        from .runtime.d08_personal_plan_v1 import artifact_goal_plan_keys_v1
+        from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard("project role choice requires its actual installation; HOLD")
+        ns = installed_bundle.installation_policy.namespace
+        if authority.namespace != ns:
+            raise AuthorityDenied("project role choice crossed its actual Owner namespace")
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                cycle = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
+                responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns, job=cycle, issuer=self.__d11_issuer)
+                if responsibility is None or responsibility.root_registration_ref is None or responsibility.source_ref != source_ref:
+                    raise UnavailableGuard("project role choice has no actual adopted task responsibility; HOLD")
+                from .runtime.artifact_continuation_originals_v1 import artifact_control_keys_for_task_v1
+                keys = artifact_control_keys_for_task_v1(db, namespace=ns, c02_operation_id=c02_operation_id,
+                    root_registration_ref=responsibility.root_registration_ref)
+                request = AdoptOwnerArtifactProjectContextRequestV1(keys[2].token, keys[3].token,
+                    source_ref, social_role, norm_refs)
+                from .runtime.d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1
+                from .model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+                from .runtime.d10_project_checkpoint_v1 import (artifact_task_project_operation_id_v1,
+                    require_artifact_task_project_original_v1)
+                from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+                task = artifact_draft_task_selector_v1(ns, c02_operation_id=c02_operation_id,
+                    root_registration_ref=responsibility.root_registration_ref)
+                project_original = read_adopted_domain_operation_v1(db, ns, artifact_task_project_operation_id_v1(task))
+                if project_original is not None:
+                    basis = require_artifact_task_project_original_v1(db, namespace=ns, original=project_original)
+                    if (basis['project_ref'], basis['recipe_ref'], basis['source_head']['key']) != (keys[2].token, keys[3].token, source_ref):
+                        raise UnavailableGuard("Owner project choice changed the actual initial task project; HOLD")
+                    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                        (*ns.as_tuple, source_ref)).fetchone()
+                    if (row is None or row[2] != 1 or row[0] != basis['source_head']['revision']
+                            or canonical_digest(json.loads(row[1])) != basis['source_digest']):
+                        raise UnavailableGuard("Owner initial project choice lost its current actual Source; HOLD")
+                    audiences = SourceRecord.from_dict(json.loads(row[1])).audiences
+                else:
+                    prepared = read_artifact_draft_prepared_v1(db, namespace=ns, issuer=self.__d11_issuer, selector=task)
+                    if prepared is None:
+                        raise UnavailableGuard("Owner project choice requires its actual source audience; HOLD")
+                    audiences = prepared.audiences
+                if len(audiences) != 1:
+                    raise UnavailableGuard("Owner project choice requires its exact private source audience; HOLD")
+                db.rollback()
+            except BaseException:
+                if db.in_transaction:
+                    db.rollback()
+                raise
+        return self.__domain_production_runtime_v1.run_current(authority, lease,
+            operation_kind="adopt_owner_artifact_project_context_v1", request=request, operation_id=operation_id,
+            activity_id=cycle.activity_id, audience_ref=audiences[0], parent_budget_lease_ref=cycle.budget_ref)
+
+    def _read_project_control_bundle_v1(self, authority, lease, *, project_ref, version=1):
+        from .runtime.d08_project_control_v1 import project_control_context_v1
+        from .runtime.d12_project_control_context_v2 import project_control_context_v2
+        if type(version) is not int or version not in (1, 2):
+            raise ValueError("project control context accepts only its named v1/v2 read")
+        context_reader = project_control_context_v1 if version == 1 else project_control_context_v2
+        from .runtime.first_ingress_v2 import trusted_upper
+        self._authorize(lease, authority, frozenset({'d08', 'd10', 'd11', 'd12'}), owner_read=True)
+        binding = self.__owner_leases.get(lease)
+        if type(binding) is not OwnerLeaseBindingV1 or 'workbench.control' not in binding.capabilities:
+            raise AuthorityDenied('project control requires the current signed Owner control capability')
+        assembly = self.__d04_installed_joint_assembly
+        if assembly is None or assembly.admin_bundle is None:
+            raise UnavailableGuard('project control requires its actual installed source/clock context')
+        now = trusted_upper(self.__content_fence_v2.read_ingress_clock(assembly.admin_bundle.ingress_clock))
+        def read():
+            db = self.__store._db
+            db.execute('BEGIN')
+            try:
+                metadata, _ = self._v2_graph_stamp(authority.namespace)
+                return context_reader(db, namespace=authority.namespace,
+                    project_ref=project_ref, owner_binding=binding, issuer=self.__d11_issuer,
+                    now_utc=now, graph_revision=metadata.graph_revision)
+            finally:
+                db.rollback()
+        return self._read_v2(authority, read, owner_binding=binding,
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+
+    def read_project_control_context_v1(self, authority, lease, *, project_ref):
+        context, _ = self._read_project_control_bundle_v1(authority, lease, project_ref=project_ref)
+        return context
+
+    def read_project_control_context_v2(self, authority, lease, *, project_ref):
+        context, _ = self._read_project_control_bundle_v1(authority, lease, project_ref=project_ref, version=2)
+        return context
+
+    def _run_project_control_v1(self, authority, lease, *, request, operation_id, operation_kind):
+        from .runtime.d08_project_control_v1 import PauseProjectRequestV1, ResumeProjectRequestV1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .domains.d01.production_operations_v1 import plain_v1
+        if type(request) is not (PauseProjectRequestV1 if operation_kind == 'pause_project_v1' else ResumeProjectRequestV1):
+            raise TypeError('project control accepts only its registered closed selectors')
+        context, audiences = self._read_project_control_bundle_v1(authority, lease, project_ref=request.project_ref)
+        if request.plan_ref != context['plan_ref']:
+            raise StaleRead('project Plan selector changed; read and choose its actual context')
+        assembly = self.__d04_installed_joint_assembly
+        # This Owner administration uses the existing installed Root lease. The
+        # domain producer independently checks the original project budget on resume.
+        result = self.__domain_production_runtime_v1.run_current(authority, lease,
+            operation_kind=operation_kind, request=request, operation_id=operation_id,
+            activity_id=AtomKey.from_token(request.plan_ref).owner.subject,
+            audience_ref=audiences[0], parent_budget_lease_ref=assembly.installation_policy.root_grant.lease_id)
+        binding = self.__owner_leases.get(lease)
+        def read_original():
+            db = self.__store._db
+            db.execute('BEGIN')
+            try:
+                original = read_adopted_domain_operation_v1(db, authority.namespace, operation_id)
+                if (original is None or original['operation_kind'] != operation_kind
+                        or original['payload']['identity']['operation_id'] != result['operation_id']
+                        or original['payload']['request'] != plain_v1(request)):
+                    raise UnavailableGuard('project control has no matching actual adopted W01 original')
+                return plain_v1(original)
+            finally:
+                db.rollback()
+        actual = self._read_v2(authority, read_original, owner_binding=binding,
+            owner_session_proof=self.__owner_session_proofs.get(lease))
+        return {**result, 'actual_original': actual}
+
+    def pause_project_v1(self, authority, lease, *, request, operation_id):
+        return self._run_project_control_v1(authority, lease, request=request,
+            operation_id=operation_id, operation_kind='pause_project_v1')
+
+    def resume_project_v1(self, authority, lease, *, request, operation_id):
+        return self._run_project_control_v1(authority, lease, request=request,
+            operation_id=operation_id, operation_kind='resume_project_v1')
+
+    def _prepare_owner_material_command_work_v3(self, command):
+        from .graph_worker import require_graph_storage_work_admission_v3, create_graph_storage_work_v3
+        from .runtime_storage_v3 import (begin_runtime_storage_operation_v3,
+            bind_runtime_storage_operation_v3, finish_runtime_storage_operation_v3)
+        from .runtime.owner_material_source_storage_v3 import OwnerMaterialCommandDigestV3
+        require_graph_storage_work_admission_v3(self)
+        if type(command) is not OwnerMaterialCommandDigestV3 or command.runtime.graph is not self:
+            raise AuthorityDenied("actual installed Owner material command producer required")
+        store, db = self.__store, self.__store._db
+        operation = begin_runtime_storage_operation_v3(db, command.operation_id, None)
+        fence = None
+        try:
+            with bind_runtime_storage_operation_v3(operation, db):
+                self._authorize(command.owner_lease, command.authority,
+                    frozenset({'d06'}), owner_read=True)
+                fence = self._begin_read_fence_v3(command.authority,
+                    operation_id="owner-material-read-" + secrets.token_hex(16),
+                    owner_binding=command.owner_binding,
+                    owner_session_proof=command.owner_session_proof)
+                clock = self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
+                with store._lock, runtime_storage_quantum_v3(db):
+                    db.execute("BEGIN")
+                    try:
+                        if self._v2_graph_stamp(command.authority.namespace) != (fence.metadata, fence.epoch):
+                            raise StaleRead("Owner material initial read stamp changed")
+                        command.bind_operation_v3(operation, clock=clock)
+                    finally:
+                        db.rollback()
+            operation.deadline_utc = command.deadline_utc
+            work = create_graph_storage_work_v3(self, kind="owner_material_source_write_v3",
+                operation_id=command.operation_id, selection_digest=operation.selection_digest,
+                deadline_utc=command.deadline_utc,
+                state=_OwnerMaterialSourceWriteWorkStateV3(command, fence), operation=operation)
+            command.bind_work_v3(work)
+            return work
+        except BaseException:
+            try:
+                if fence is not None:
+                    self._finish_read_fence_v3(fence)
+            finally:
+                finish_runtime_storage_operation_v3(operation)
+            raise
+
+    def _validate_owner_material_source_work_v3(self, state):
+        from time import monotonic
+        from .runtime.first_ingress_v2 import trusted_upper
+        command = state.command
+        clock = self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
+        if (trusted_upper(clock) >= command.deadline_utc
+                or monotonic() >= command.monotonic_deadline):
+            raise StaleRead("Owner material original UTC or monotonic deadline expired")
+        self._authorize(command.owner_lease, command.authority, frozenset({'d06'}), owner_read=True)
+        if (self.__owner_leases.get(command.owner_lease) is not command.owner_binding
+                or self.__owner_session_proofs.get(command.owner_lease) != command.owner_session_proof):
+            raise AuthorityDenied("Owner material original signed session changed")
+        if state.scope is None:
+            self._validate_read_fence_v3(state.fence)
+            return
+        if self.__content_fence_v2.validate_fence(state.scope) != state.scope.permit:
+            raise UnavailableGuard("Owner material original write fence changed")
+        guard, owner = self._owner_binding_in_fence(command.authority, state.scope,
+            state.owner.principal, state.owner, state.owner_session_proof)
+        if guard != state.guard or owner != state.owner:
+            raise AuthorityDenied("Owner material current Owner differs from frozen frame")
+        with self.__store._lock:
+            if self._v2_graph_stamp(command.authority.namespace) != (state.metadata, state.epoch):
+                raise StaleRead("Owner material original graph stamp changed")
+
+    def _advance_owner_material_source_work_v3(self, work):
+        from .graph_worker import GraphStorageStepV3
+        from .runtime_storage_v3 import bind_runtime_storage_operation_v3
+        from time import monotonic
+        from .runtime.first_ingress_v2 import trusted_upper
+        state, store = work.state, self.__store
+        command = state.command
+        with bind_runtime_storage_operation_v3(work.operation, store._db):
+            if state.phase == "command":
+                self._validate_owner_material_source_work_v3(state)
+                command.advance()
+                self._validate_owner_material_source_work_v3(state)
+                if command.complete:
+                    state.input_witness = command.input_witness_v3()
+                    state.phase = "owner"
+                return GraphStorageStepV3("progress")
+            if state.phase == "owner":
+                self._validate_owner_material_source_work_v3(state)
+                self._finish_read_fence_v3(state.fence)
+                state.fence = None
+                result = command.runtime.run_current(command.authority, command.owner_lease,
+                    operation_kind='admit_owner_material_source_v1', request=command.request,
+                    operation_id=command.operation_id, activity_id=command.activity_id,
+                    audience_ref=command.audience_ref, parent_budget_lease_ref=command.parent_budget_lease_ref,
+                    _owner_material_command_v3=command, _owner_material_work_v3=work)
+                if result is not work:
+                    state.result = result
+                    state.phase = "recovered"
+                    return GraphStorageStepV3("complete", result)
+                return GraphStorageStepV3("progress")
+            if state.phase == "prepare":
+                self._validate_owner_material_source_work_v3(state)
+                state.prepared.advance()
+                self._validate_owner_material_source_work_v3(state)
+                if state.prepared.phase == "sealed":
+                    state.input_witness = state.prepared.input_witness_v3()
+                    state.phase = "commit"
+                return GraphStorageStepV3("progress")
+            if state.phase == "commit":
+                self._validate_owner_material_source_work_v3(state)
+                prepared = state.prepared
+                clock = self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
+                envelope = prepared.frame.envelope
+                if (trusted_upper(clock) >= envelope.deadline_utc
+                        or monotonic() >= envelope.monotonic_deadline):
+                    raise StaleRead("Owner material frozen frame expired before W01")
+                from .runtime.domain_production_commit_v1 import commit_installed_domain_operation_v1
+                from .runtime.domain_production_registry_v1 import installed_operation_v1
+                with store._lock, runtime_storage_quantum_v3(store._db):
+                    db = store._db
+                    state.commit_started = True
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if self._v2_graph_stamp(command.authority.namespace) != (state.metadata, state.epoch):
+                            raise StaleRead("Owner material graph changed before W01")
+                        if self._owner_graph_binding_locked(command.authority, state.owner.principal,
+                                target_admission=state.owner.target_admission,
+                                storage_admission=state.owner.storage_admission,
+                                current_guard=state.guard) != state.owner:
+                            raise StaleRead("Owner material graph Owner changed before W01")
+                        result = commit_installed_domain_operation_v1(prepared.runtime, db,
+                            operation=installed_operation_v1('admit_owner_material_source_v1'),
+                            request=prepared.request, frame=prepared.frame,
+                            stage=prepared.sealed_stage_v3(), readers=prepared.readers,
+                            scope=state.scope, owner=state.owner, guard=state.guard,
+                            metadata=state.metadata, epoch=state.epoch,
+                            process_lease=prepared.process_lease,
+                            external_originals=prepared.external_originals)
+                        db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? "
+                            "WHERE bot=? AND persona=? AND operation_id=? AND receipt_json IS NULL",
+                            (canonical_json(result), *command.authority.namespace.as_tuple, command.operation_id))
+                        if db.execute("SELECT changes()").fetchone() != (1,):
+                            raise EventConflict("Owner material actual attempt receipt raced")
+                        db.execute("COMMIT")
+                    except BaseException:
+                        if db.in_transaction:
+                            db.rollback()
+                            # A completed rollback proves this W01 transaction did not commit.
+                            # A COMMIT exception after SQLite ended the transaction stays unknown.
+                            state.commit_started = False
+                        raise
+                state.result = result
+                state.phase = "finish"
+                return GraphStorageStepV3("progress")
+            if state.phase == "finish":
+                self.__content_fence_v2.finish_fence(state.scope,
+                    request_id=state.finish_id, request_digest=state.finish_digest)
+                state.phase = "committed"
+                return GraphStorageStepV3("complete", state.result)
+            raise RuntimeError("Owner material Work phase is not executable")
+
+    def _finish_owner_material_source_work_v3(self, work, error):
+        from .runtime_storage_v3 import bind_runtime_storage_operation_v3, finish_runtime_storage_operation_v3
+        from .runtime.owner_material_source_storage_v3 import (
+            finish_owner_source_preparation_v3, discard_owner_source_preparation_volatile_workspace_v3)
+        from .runtime.domain_production_originals_v1 import _receipt
+        state, store = work.state, self.__store
+        command, prepared = state.command, state.prepared
+        try:
+            # The admitted Core read must close even when selected storage can no longer bind.
+            if state.fence is not None:
+                self._finish_read_fence_v3(state.fence)
+                state.fence = None
+            with bind_runtime_storage_operation_v3(work.operation, store._db):
+                if prepared is not None:
+                    with store._lock, runtime_storage_quantum_v3(store._db):
+                        if state.result is not None:
+                            finish_owner_source_preparation_v3(prepared,
+                                receipt=_receipt(state.result['receipt']))
+                        elif error is not None and not state.commit_started:
+                            db = store._db
+                            prior = db.execute("SELECT request_digest,attempt_id,receipt_json FROM "
+                                "graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?",
+                                (*command.authority.namespace.as_tuple, command.operation_id)).fetchone()
+                            bundle = db.execute("SELECT 1 FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+                                (*command.authority.namespace.as_tuple, command.operation_id)).fetchone()
+                            if (not db.in_transaction and prior == (state.request_digest, state.scope.operation_id, None)
+                                    and bundle is None
+                                    and self._v2_graph_stamp(command.authority.namespace) == (state.metadata, state.epoch)):
+                                finish_owner_source_preparation_v3(prepared, error=error)
+                                from .authority_service.v2_contract import to_wire
+                                refusal = {'schema':'sylanne.owner-domain-write-refusal.v3','status':'held',
+                                    'operation_id':command.operation_id,'attempt_id':state.scope.operation_id,
+                                    'request_digest':state.request_digest,'reason_code':type(error).__name__,
+                                    'permit_digest':canonical_digest(to_wire(state.scope.permit)),
+                                    'anchor_digest':canonical_digest(asdict(state.scope.pinned_anchor)),
+                                    'graph_revision':state.metadata.graph_revision,'graph_epoch':state.epoch.revision}
+                                db.execute("BEGIN IMMEDIATE")
+                                try:
+                                    db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? "
+                                        "WHERE bot=? AND persona=? AND operation_id=? AND attempt_id=? AND receipt_json IS NULL",
+                                        (canonical_json(refusal), *command.authority.namespace.as_tuple,
+                                         command.operation_id, state.scope.operation_id))
+                                    if db.execute("SELECT changes()").fetchone() != (1,):
+                                        raise EventConflict("Owner material refusal receipt raced")
+                                    db.execute("COMMIT")
+                                except BaseException:
+                                    if db.in_transaction:db.rollback()
+                                    raise
+                                state.phase = 'aborted'
+                    if state.phase == 'aborted':
+                        self.__content_fence_v2.finish_fence(state.scope,
+                            request_id=state.finish_id,request_digest=state.finish_digest)
+        finally:
+            try:
+                if state.context is not None:
+                    state.context.close()
+                    state.context = None
+            finally:
+                try:
+                    if prepared is not None and not state.authority_lease_released:
+                        state.authority_lease_released = True
+                        self.release_authority_lease(prepared.runtime._bootstrap, prepared.process_lease)
+                finally:
+                    try:
+                        if prepared is not None:
+                            discard_owner_source_preparation_volatile_workspace_v3(prepared)
+                            state.prepared = None
+                    finally:
+                        command.streams.clear()
+                        command.work = None
+                        command.request = None
+                        command.owner_session_proof = None
+                        state.command = None
+                        if error is None:
+                            work.result_lease = work.operation
+                        else:
+                            finish_runtime_storage_operation_v3(work.operation)
+
     def _owner_domain_write_v3(self, authority, lease, *, operation_id,
-                               request_digest, domains, capability, commit, fence_context=None, background_original=None):
+                               request_digest, domains, capability, commit, fence_context=None, background_original=None,
+                               new_work_admission=None, storage_prepare=None, storage_work=None):
         """Keep a current Owner write and its original unknown attempt durable.
 
         ``commit`` is a W01-owned transaction implementation, never a public
@@ -6263,7 +10563,11 @@ class GraphCoordinator:
             if saved[6] is None and saved[3:5] != (metadata.graph_revision, epoch.revision):
                 raise UnavailableGuard("Owner domain unresolved graph stamp changed; HOLD")
         else:
-            with store._lock:
+            if new_work_admission is not None:
+                with store._lock:
+                    new_work_admission(store._db)
+            with store._lock, (runtime_storage_quantum_v3(store._db)
+                    if storage_prepare is not None else nullcontext()):
                 db = store._db
                 db.execute("BEGIN IMMEDIATE")
                 try:
@@ -6274,6 +10578,10 @@ class GraphCoordinator:
                                "graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?)",
                                namespace.as_tuple + (operation_id, request_digest, attempt_id,
                                canonical_json(asdict(anchor)), metadata.graph_revision, epoch.revision))
+                    if storage_prepare is not None:
+                        storage_work.state.command.persist_command_seed_in_transaction_v3(db,
+                            attempt_id=attempt_id, request_digest=request_digest,
+                            metadata=metadata, epoch=epoch, anchor=anchor)
                     db.execute("COMMIT")
                 except BaseException:
                     db.rollback()
@@ -6287,6 +10595,24 @@ class GraphCoordinator:
                 operation_id=attempt_id)
             if observed != permit or state not in {"active", "finished"}:
                 raise UnavailableGuard("Owner domain original permit differs; HOLD")
+        elif saved is not None:
+            # The begin reply may have been lost before its permit was saved.
+            # Inspect that original identity before considering any new RPC.
+            permit, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if state == "absent" and permit is None and saved[6] is None:
+                if new_work_admission is not None:
+                    with store._lock:
+                        new_work_admission(store._db)
+                permit = port.begin_fence(
+                    namespace=namespace, authority_namespace=target.authority_namespace,
+                    holder=self.__holder, generation=authority.activation_generation,
+                    operation="write", operation_id=attempt_id, expected_anchor=anchor,
+                    retain_on_unknown=True)
+                state = "active"
+            elif state not in {"active", "finished"}:
+                raise UnavailableGuard("Owner domain original begin outcome is unconfirmed; HOLD")
         else:
             permit = port.begin_fence(
                 namespace=namespace, authority_namespace=target.authority_namespace,
@@ -6356,6 +10682,8 @@ class GraphCoordinator:
             store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? "
                 "WHERE bot=? AND persona=? AND operation_id=? AND attempt_id=? AND permit_json IS NULL",
                 (canonical_json(to_wire(permit)), *namespace.as_tuple, operation_id, attempt_id))
+            if new_work_admission is not None:
+                new_work_admission(store._db)
         try:
             if background_original is None:
                 _guard, current_owner = self._owner_binding_in_fence(
@@ -6365,8 +10693,6 @@ class GraphCoordinator:
                 _guard, current_owner = observe_background_owner_v1(background_original, self, authority, scope)
                 if capability not in current_owner.capabilities:
                     raise AuthorityDenied("current background Owner capability is unavailable")
-            clock = port.read_ingress_clock(self.__scene_clock_policy)
-            now = trusted_upper(clock)
             context = (fence_context(scope, _guard, current_owner)
                        if fence_context is not None else nullcontext())
             contact_session_observation = None
@@ -6376,7 +10702,52 @@ class GraphCoordinator:
                     from .runtime.contact_owner_invocation_v3 import capture_contact_owner_invocation_v3
                     contact_session_observation = capture_contact_owner_invocation_v3(
                         contact_call, scope, owner, proof)
+            if storage_prepare is not None:
+                from contextlib import ExitStack
+                from .graph_worker import GraphStorageWorkV3
+                from .runtime.owner_material_source_storage_v3 import PreparedOwnerMaterialWriteV3
+                if (type(storage_work) is not GraphStorageWorkV3 or storage_work.coordinator is not self
+                        or storage_work.kind != "owner_material_source_write_v3"
+                        or storage_work.operation_id != operation_id
+                        or type(storage_work.state) is not _OwnerMaterialSourceWriteWorkStateV3):
+                    raise AuthorityDenied("Owner material preparation requires its original admitted Work")
+                work_state = storage_work.state
+                lifetime = ExitStack()
+                try:
+                    lifetime.enter_context(context)
+                    work_state.scope, work_state.owner, work_state.guard = scope, current_owner, _guard
+                    work_state.owner_session_proof = proof
+                    work_state.metadata, work_state.epoch = metadata, epoch
+                    work_state.request_digest = request_digest
+                    work_state.finish_id, work_state.finish_digest = finish_id, finish_digest
+                    with store._lock, runtime_storage_quantum_v3(store._db):
+                        db = store._db
+                        db.execute("BEGIN")
+                        try:
+                            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                                raise StaleRead("Owner material graph changed before preparation")
+                            if self._owner_graph_binding_locked(authority, owner.principal,
+                                    target_admission=current_owner.target_admission,
+                                    storage_admission=current_owner.storage_admission,
+                                    current_guard=_guard) != current_owner:
+                                raise StaleRead("Owner material current grant changed before preparation")
+                            prepared = storage_prepare(db, metadata, epoch,
+                                work_state.command.initial_now_utc, current_owner, scope)
+                            if type(prepared) is not PreparedOwnerMaterialWriteV3 or prepared.operation is not storage_work.operation:
+                                raise AuthorityDenied("Owner material preparation crossed its original operation")
+                            work_state.prepared = prepared
+                        finally:
+                            db.rollback()
+                    work_state.context = lifetime.pop_all()
+                    work_state.phase = "prepare"
+                    return storage_work
+                finally:
+                    lifetime.close()
             with context:
+                # Form a new frame from current time after acquiring its
+                # installed context; existing signed deadlines stay intact.
+                clock = port.read_ingress_clock(self.__scene_clock_policy)
+                now = trusted_upper(clock)
                 with store._lock:
                     db = store._db
                     # Save the real permit independently of the business transaction.
@@ -6498,6 +10869,9 @@ class GraphCoordinator:
             operation_kind=operation_kind, request=request, operation_id=operation_id,
             activity_id=activity_id, audience_ref=audience_ref,
             parent_budget_lease_ref=parent_budget_lease_ref)
+        from .graph_worker import GraphStorageWorkV3
+        if type(result) is GraphStorageWorkV3:
+            return result
         if result.get("outbox"):
             wake_followup = getattr(self, "_GraphCoordinator__domain_followup_wake_v1", None)
             if callable(wake_followup):
@@ -6518,6 +10892,11 @@ class GraphCoordinator:
                     if phase == "queued":
                         wake(job_id)
         return result
+
+    def _consume_current_contact_observation_v1(self, installed_writer, *, operation_id, effect_id):
+        from .runtime.contact_observation_v1 import consume_current_contact_observation_v1
+        return consume_current_contact_observation_v1(self,installed_writer,
+            operation_id=operation_id,effect_id=effect_id)
 
     def register_contact_dispatch_final_claim_writer_v3(self, bootstrap, *, route_port=None, issuer_id=None):
         from .runtime.contact_dispatch_host_v3 import register_contact_dispatch_final_claim_writer_v3
@@ -6777,7 +11156,9 @@ class GraphCoordinator:
         recorded = self._owner_domain_write_v3(
             authority, lease, operation_id="c04-prepare:" + operation_id,
             request_digest=request_digest, domains=("d02", "d04", "d06", "d07", "d11"),
-            capability="c04.internal_work.prepare", commit=commit)
+            capability="c04.internal_work.prepare", commit=commit,
+            new_work_admission=lambda db: self.__local_module_admission.require_v1(
+                ("d04", "d06", "d07", "d11"), "prepare_internal_work_v3"))
 
         def read():
             db = self.__store._db
@@ -6900,6 +11281,109 @@ class GraphCoordinator:
                 scope, request_id="finish:" + attempt_id,
                 request_digest="sha256:" + canonical_digest({
                     "action": "finish_c04_cpu_policy_install",
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                }))
+        return signature
+
+    def adopt_current_d13_counter_cpu_policy_v1(self, authority, lease, *, operation_id, policy):
+        signature=self.install_current_d13_counter_cpu_quote_policy_v1(self.__bootstrap,authority,lease,
+            operation_id=operation_id,policy=policy)
+        return {"operation_id":operation_id,"policy":asdict(policy),
+            "policy_digest":canonical_digest(policy),"signature_digest":canonical_digest(signature)}
+
+    def install_current_d13_counter_cpu_quote_policy_v1(
+            self, bootstrap: object, authority: AuthorityContext,
+            lease: object, *, operation_id: str, policy):
+        """Install a signed CPU ceiling under administrator and Owner authority."""
+        from .runtime.d13_counter_cpu_quote_policy_v1 import (
+            D13CounterCpuQuotePolicyV1, install_d13_counter_cpu_quote_schema_v1,
+        )
+        from .runtime.first_ingress_v2 import trusted_upper
+
+        self._admin(bootstrap)
+        if (type(authority) is not AuthorityContext
+                or authority.issuer_domain != "d12"
+                or type(policy) is not D13CounterCpuQuotePolicyV1
+                or policy.namespace != authority.namespace
+                or type(operation_id) is not str or not operation_id
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__d13_counter_cpu_quote_authority_v1 is None):
+            raise UnavailableGuard("installed D13 counter CPU policy authority unavailable")
+        self._authorize(lease, authority, frozenset(("d02", "d11")),
+                        owner_read=True)
+        owner = self.__owner_leases.get(lease)
+        owner_proof = self.__owner_session_proofs.get(lease)
+        if (owner is None or owner_proof is None
+                or "d13.counter.cpu_policy.install" not in owner.capabilities
+                or owner.actor != authority.actor
+                or owner.namespace != authority.namespace
+                or owner.purpose != authority.purpose
+                or authority.audience != (owner.audience,)):
+            raise UnavailableGuard("signed D13 counter CPU install Owner capability unavailable")
+        namespace = authority.namespace
+        port, store = self.__content_fence_v2, self.__store
+        assembly=self.__d04_installed_joint_assembly
+        from .host.model_workflows_v7 import AdminModelWorkflowsV7
+        if (assembly is None or type(assembly.admin_bundle.model_workflows) is not AdminModelWorkflowsV7
+                or policy.algorithm_ref != "d13.full_http_counter.v1"
+                or policy.valid_until_utc > assembly.installation_policy.root_grant.valid_until_utc
+                or policy.cpu_ms_ceiling > dict(assembly.installation_policy.root_grant.max_ceiling).get("cpu_ms",0)):
+            raise UnavailableGuard("D13 counter policy must fit the actual V7 Root and its unchanged limits")
+        if policy.installation_id != port.installation_grant.installation_id:
+            raise UnavailableGuard("D13 counter CPU policy installation differs")
+        request_digest = canonical_digest((namespace, operation_id, policy))
+        attempt_id = "d13-counter-cpu-policy-install-" + request_digest[:48]
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if (target.namespace != namespace
+                or target.activation_generation != authority.activation_generation):
+            raise StaleRead("D13 counter CPU policy activation changed")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("D13 counter CPU policy recovery anchor differs")
+        now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+        if policy.valid_until_utc <= now:
+            raise UnavailableGuard("D13 counter CPU policy expired")
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=authority.activation_generation,
+            operation="write", operation_id=attempt_id, expected_anchor=anchor,
+            retain_on_unknown=True)
+        if (permit is None or permit.operation != "write"
+                or permit.operation_id != attempt_id
+                or permit.pinned_anchor != anchor
+                or permit.holder != self.__holder):
+            raise UnavailableGuard("D13 counter CPU policy write permit differs")
+        scope = FenceScope(namespace, target.authority_namespace,
+                           authority.activation_generation, "write", attempt_id,
+                           permit, anchor, epoch, metadata.graph_revision)
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("D13 counter CPU policy write permit changed")
+            self._owner_binding_in_fence(
+                authority, scope, owner.principal, owner,
+                owner_session_proof=owner_proof)
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("D13 counter CPU policy graph changed")
+                    install_d13_counter_cpu_quote_schema_v1(db)
+                    signature = self.__d13_counter_cpu_quote_authority_v1.install_policy(
+                        db, policy)
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "action": "finish_d13_counter_cpu_policy_install",
                     "operation_id": attempt_id, "permit_token": permit.token,
                 }))
         return signature
@@ -7209,10 +11693,7 @@ class GraphCoordinator:
                         if len(atoms) >= 512:
                             raise UnavailableGuard("recollection source closure exceeds read bound")
                         store._validate_key(key)
-                        row = db.execute(
-                            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                            (key.token,),
-                        ).fetchone()
+                        row = read_graph_head_v3(db, key.token)
                         atoms[key] = (GraphAtom(key, row[0], json.loads(row[1]),
                                                 bool(row[2])) if row else
                                       GraphAtom(key, 0, {}, False))
@@ -7416,10 +11897,7 @@ class GraphCoordinator:
         metadata, graph_epoch = self._v2_graph_stamp(namespace)
         target = metadata.requirements
         db = store._db
-        atom = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*namespace.as_tuple).token,),
-        ).fetchone()
+        atom = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
         proof_row = db.execute(
             "SELECT operation_id,request_digest,grant_id,grant_digest,"
             "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -7530,7 +12008,7 @@ class GraphCoordinator:
         guard = guarded[0]
         if expected is not None:
             principal = expected.principal
-        with self.__store._lock:
+        with self.__store._lock, runtime_storage_quantum_v3(self.__store._db):
             metadata, epoch = self._v2_graph_stamp(authority.namespace)
             if (metadata.graph_revision != scope.graph_revision
                     or epoch != scope.graph_epoch):
@@ -7829,10 +12307,7 @@ class GraphCoordinator:
         if current_epoch != graph_epoch:
             raise StaleRead("current scene graph epoch changed")
         target = metadata.requirements
-        grant_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*namespace.as_tuple).token,),
-        ).fetchone()
+        grant_row = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
         proof_row = db.execute(
             "SELECT operation_id,request_digest,grant_id,grant_digest,"
             "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -7972,7 +12447,8 @@ class GraphCoordinator:
 
     def _check_guard(self, db, bundle: DomainBundle, *,
                      ingress_deadline_check=None,
-                     scene_owner_guard=None) -> GraphSnapshot:
+                     scene_owner_guard=None,
+                     domain_production_issuance_v1=None) -> GraphSnapshot:
         store = self.__store
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
@@ -7990,7 +12466,12 @@ class GraphCoordinator:
         # A namespace string flag cannot prove a particular worker still owns
         # its job. Runtime job identity/fence is checked inside the same commit.
         budget = get_budget_lease(db, envelope.parent_budget_lease_ref)
-        if (budget.state != "active" or
+        from .runtime.owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
+        stop_projection = type(getattr(domain_production_issuance_v1, "stage", None)) is OwnerStopReplyProjectionStageV1
+        if stop_projection:
+            from .runtime.domain_production_commit_v1 import require_owner_stop_projection_commit_v1
+            require_owner_stop_projection_commit_v1(domain_production_issuance_v1, self, db, bundle)
+        if (not stop_projection and budget.state != "active" or
                 (budget.bot_id, budget.persona_id) != namespace.as_tuple):
             raise UnavailableGuard("parent budget lease is unavailable for this namespace")
         epoch_row = db.execute(
@@ -8019,10 +12500,7 @@ class GraphCoordinator:
             if NamespaceId.from_key(read.key) != namespace:
                 raise AuthorityDenied("cross-namespace read")
             store._validate_key(read.key)
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (read.key.token,),
-            ).fetchone()
+            row = read_graph_head_v3(db, read.key.token)
             revision = row[0] if row else 0
             if revision != read.revision:
                 raise StaleRead("read version changed")
@@ -8036,6 +12514,16 @@ class GraphCoordinator:
                          or write.value.get("reality") == "host_observed")
                     for write in proposal.typed_writes)
                 for proposal in bundle.proposals)
+        if host_observed and domain_production_issuance_v1 is not None:
+            from .runtime.d06_life_numeric_context_v1 import LifeNumericContextStageV1
+            if type(getattr(domain_production_issuance_v1, "stage", None)) is LifeNumericContextStageV1:
+                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
+                # This exact private stage authenticates a completed internal
+                # execution from its durable Life terminal and Source lineage.
+                # Its host observation is not an external message ingress.
+                require_exact_life_numeric_context_issuance_v1(
+                    domain_production_issuance_v1, self, bundle)
+                host_observed = False
         if host_observed:
             from .runtime.ingress_observation import read_committed_ingress_identity
 
@@ -8097,10 +12585,7 @@ class GraphCoordinator:
             proof_row[3], proof_row[4], 1, proof_row[5], proof_row[6],
             proof_row[7],
         )
-        grant_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*namespace.as_tuple).token,),
-        ).fetchone()
+        grant_row = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
         if grant_row is None or grant_row[0] != 1 or grant_row[2] != 1:
             raise UnavailableGuard("first ingress current Owner grant is absent")
         grant = json.loads(grant_row[1])
@@ -8311,6 +12796,7 @@ class GraphCoordinator:
                 raise UnavailableGuard("paired ingress clock unavailable; HOLD") from exc
 
         if row is None:
+            self.__local_module_admission.require_v1(('d06', 'd11'), "commit_first_ingress_v2")
             reading, upper = read_clock()
             learned_at = upper
             deadline = min(
@@ -8445,10 +12931,7 @@ class GraphCoordinator:
                 if source_admission_v2 is not None:
                     with store._lock:
                         media_key = media_source_key(namespace, host.lineage.source_ref)
-                        media_row = store._db.execute(
-                            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                            (media_key.token,),
-                        ).fetchone()
+                        media_row = read_graph_head_v3(store._db, media_key.token)
                         expected_media = media_source_value(
                             source_admission_v2,
                             source_key(*namespace.as_tuple, host.lineage.source_ref).token,
@@ -9246,10 +13729,7 @@ class GraphCoordinator:
                 or job.work_kind != "d06.encode_source" or job.effect_id is not None):
             raise AuthorityDenied("job is not an installed first-ingress encoding job")
         job_key = runtime_job_key(*namespace.as_tuple, job.activity_id, job_id)
-        job_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (job_key.token,),
-        ).fetchone()
+        job_row = read_graph_head_v3(db, job_key.token)
         if (job_row is None or job_row[2] != 1
                 or json.loads(job_row[1]) != job_graph_write(job).value):
             raise UnavailableGuard("encoding job graph projection differs from durable job")
@@ -9271,14 +13751,8 @@ class GraphCoordinator:
         expected = ingress_ids(outbox.payload_ref)
         source_key_value = source_key(*namespace.as_tuple, outbox.payload_ref)
         access_key_value = access_key(*namespace.as_tuple, outbox.payload_ref)
-        source_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (source_key_value.token,),
-        ).fetchone()
-        access_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (access_key_value.token,),
-        ).fetchone()
+        source_row = read_graph_head_v3(db, source_key_value.token)
+        access_row = read_graph_head_v3(db, access_key_value.token)
         if (source_row is None or access_row is None
                 or source_row[2] != 1 or access_row[2] != 1):
             raise UnavailableGuard("encoding source or access is unavailable")
@@ -9810,10 +14284,7 @@ class GraphCoordinator:
                                     "d07.focus.v1", namespace.persona_id))
                     atoms = []
                     for key in keys:
-                        row = db.execute(
-                            "SELECT revision,value,valid FROM graph_atoms "
-                            "WHERE token=?", (key.token,),
-                        ).fetchone()
+                        row = read_graph_head_v3(db, key.token)
                         atoms.append(GraphAtom(
                             key, row[0], json.loads(row[1]), bool(row[2]))
                             if row else GraphAtom(key, 0, {}, False))
@@ -9848,10 +14319,7 @@ class GraphCoordinator:
                     current_policy = read_current_d07_attention_policy_v1(
                         db, namespace)
                     head_key = active_scheme_head_key(namespace)
-                    head_row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms "
-                        "WHERE token=?", (head_key.token,),
-                    ).fetchone()
+                    head_row = read_graph_head_v3(db, head_key.token)
                     if (head_row is None and
                             current_policy.active_head_ref.revision != 0):
                         raise UnavailableGuard("current D07 policy head changed")
@@ -10082,11 +14550,17 @@ class GraphCoordinator:
             namespace, final_operation_id)
         if recovered is None:
             raise UnavailableGuard("committed natural final is absent; HOLD")
+        batch_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
+                               (recovered.evidence.batch_ref,)).fetchone()
+        if batch_row is None or batch_row[1] != 1:
+            raise UnavailableGuard("natural final batch is absent; HOLD")
+        batch = json.loads(batch_row[0])
+        if (batch.get("schema") == "d09.natural_verified_segment_batch.v3"
+                and batch["semantic_manifest"]["selected_index"]
+                    != len(batch["semantic_manifest"]["segments"]) - 1):
+            raise UnavailableGuard("natural semantic reply still has unserved bubbles; HOLD")
         effect_id = recovered.evidence.effect_id
-        claim = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (dispatch_claim_key(namespace, effect_id).token,),
-        ).fetchone()
+        claim = read_graph_head_v3(db, dispatch_claim_key(namespace, effect_id).token)
         if claim is None or claim[0] != 1 or claim[2] != 1:
             raise UnavailableGuard("natural P2 graph claim is absent; HOLD")
         claim_value = json.loads(claim[1])
@@ -10349,10 +14823,7 @@ class GraphCoordinator:
                     focus_key = AtomKey(
                         Owner("persona", *namespace.as_tuple),
                         "d07.focus.v1", namespace.persona_id)
-                    focus_row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (focus_key.token,),
-                    ).fetchone()
+                    focus_row = read_graph_head_v3(db, focus_key.token)
                     if focus_row is None or focus_row[2] != 1:
                         raise UnavailableGuard("current natural focus is absent; HOLD")
                     focus_value = json.loads(focus_row[1])
@@ -10491,7 +14962,7 @@ class GraphCoordinator:
 
     def _qualified_reply_attention_locked(
             self, namespace: NamespaceId, source_ref: str,
-            now_utc: float, epoch: NamespaceEpoch):
+            now_utc: float, epoch: NamespaceEpoch, *, prepared_inventory=None, prepared_full_read=None):
         """Read the selected D07 ticket and complete D06 ancestry in one tx."""
         from .domains.d06 import source_correction_head_key
         from .domains.d07 import attention_ticket_key
@@ -10501,6 +14972,26 @@ class GraphCoordinator:
         from .memory_types import SourceRecord, access_key, source_key
 
         db = self.__store._db
+        from .runtime_storage_v3 import runtime_storage_v3
+        if (runtime_storage_v3(db) is not None and prepared_inventory is None
+                and prepared_full_read is None):
+            from .runtime.current_graph_full_read_v3 import (
+                CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3,
+                PreparedCurrentGraphFullReadV3, require_bound_graph_full_read_proof_for_db_v3,
+            )
+            actual=require_bound_graph_full_read_proof_for_db_v3(
+                db, namespace, required_families=frozenset({
+                    CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3}))
+            if type(actual) is PreparedCurrentGraphFullReadV3:
+                prepared_full_read=actual
+            else:
+                from .runtime.dispatch_current_inventory_v3 import (
+                    PreparedCurrentDispatchInventoryV3, PreparedCurrentDispatchSuccessorInventoryV3,
+                )
+                if type(actual) not in (
+                        PreparedCurrentDispatchInventoryV3, PreparedCurrentDispatchSuccessorInventoryV3):
+                    raise UnavailableGuard("reply input has no exact actual FULL issuer")
+                prepared_inventory=actual
         if not db.in_transaction:
             raise UnavailableGuard("qualified reply attention needs current graph tx")
         source_id = AtomKey.from_token(source_ref).owner.subject
@@ -10511,16 +15002,39 @@ class GraphCoordinator:
         ).fetchall()
         if len(ingress) != 1:
             raise UnavailableGuard("reply source has no unique original audience")
+        if prepared_full_read is not None:
+            from .runtime.current_graph_full_read_v3 import (
+                CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3,
+                require_bound_graph_full_read_proof_for_db_v3,
+            )
+            actual=require_bound_graph_full_read_proof_for_db_v3(
+                db, namespace, required_families=frozenset({
+                    CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3}))
+            if actual is not prepared_full_read:
+                raise UnavailableGuard("qualified D07 FULL reader differs from its actual Binder")
+            snapshot,query=self._dispatch_full_graph_snapshot_locked(namespace)
+            if query.revision!=epoch.revision:
+                raise StaleRead("qualified D07 FULL epoch changed")
+            qualified=read_qualified_focus_attention_ticket(
+                snapshot, namespace, now=now_utc, audience=ingress[0][0],
+                purpose="expression", prepared_full_read=prepared_full_read, db=db)
+            if qualified is None:
+                raise UnavailableGuard("qualified D07 attention is unavailable")
+            return snapshot,qualified.attention
+        if prepared_inventory is not None:
+            snapshot=prepared_inventory.require_current(db,namespace,prepared_inventory.query)
+            qualified=read_qualified_focus_attention_ticket(snapshot,namespace,now=now_utc,
+                audience=ingress[0][0],purpose="expression",prepared_inventory=prepared_inventory,db=db)
+            if qualified is None:
+                raise UnavailableGuard("qualified D07 attention is unavailable")
+            return snapshot,qualified.attention
         focus_key = AtomKey(Owner("persona", *namespace.as_tuple),
                             "d07.focus.v1", namespace.persona_id)
         atoms = {}
 
         def load(key):
             if key not in atoms:
-                row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (key.token,),
-                ).fetchone()
+                row = read_graph_head_v3(db, key.token)
                 atoms[key] = (GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
                               if row else GraphAtom(key, 0, {}, False))
             return atoms[key]
@@ -10565,7 +15079,7 @@ class GraphCoordinator:
 
     def _current_post_c02_reply_inputs_locked(
         self, namespace: NamespaceId, c02_operation_id: str,
-        source_ref: str, now_utc: float, epoch: NamespaceEpoch,
+        source_ref: str, now_utc: float, epoch: NamespaceEpoch, *, prepared_inventory=None, prepared_full_read=None,
     ):
         """Read original C02 and current D06/D07 atoms in this graph tx."""
         from .runtime.reply_model_job import (
@@ -10573,8 +15087,28 @@ class GraphCoordinator:
         )
 
         db = self.__store._db
+        from .runtime_storage_v3 import runtime_storage_v3
+        if (runtime_storage_v3(db) is not None and prepared_inventory is None
+                and prepared_full_read is None):
+            from .runtime.current_graph_full_read_v3 import (
+                CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3,
+                PreparedCurrentGraphFullReadV3, require_bound_graph_full_read_proof_for_db_v3,
+            )
+            actual=require_bound_graph_full_read_proof_for_db_v3(
+                db, namespace, required_families=frozenset({
+                    CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3}))
+            if type(actual) is PreparedCurrentGraphFullReadV3:
+                prepared_full_read=actual
+            else:
+                from .runtime.dispatch_current_inventory_v3 import (
+                    PreparedCurrentDispatchInventoryV3, PreparedCurrentDispatchSuccessorInventoryV3,
+                )
+                if type(actual) not in (
+                        PreparedCurrentDispatchInventoryV3, PreparedCurrentDispatchSuccessorInventoryV3):
+                    raise UnavailableGuard("reply input has no exact actual FULL issuer")
+                prepared_inventory=actual
         snapshot, attention = self._qualified_reply_attention_locked(
-            namespace, source_ref, now_utc, epoch)
+            namespace, source_ref, now_utc, epoch,prepared_inventory=prepared_inventory, prepared_full_read=prepared_full_read)
         c02_row = db.execute(
             "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
             "FROM graph_bundle_operations WHERE bot=? AND persona=? "
@@ -10601,11 +15135,11 @@ class GraphCoordinator:
             tuple(c02_detail["outbox_refs"]))
         return read_current_reply_model_inputs_v1(
             db, self.__d02_issuer, namespace, receipt,
-            source_ref, snapshot, attention)
+            source_ref, snapshot, attention,prepared_inventory=prepared_inventory, prepared_full_read=prepared_full_read)
 
     def _current_post_c02_reply_route_locked(
         self, namespace: NamespaceId, c02_operation_id: str,
-        source_ref: str, now_utc: float, epoch: NamespaceEpoch,
+        source_ref: str, now_utc: float, epoch: NamespaceEpoch, *, prepared_inventory=None, prepared_full_read=None,
     ):
         """Pair current C02/source/D07 with the original sealed private route."""
         from .runtime.reply_model_job import read_current_reply_route_manifest_v2
@@ -10614,10 +15148,66 @@ class GraphCoordinator:
         if not store._lock._is_owned() or not store._db.in_transaction:
             raise RuntimeError("reply route requires the held graph transaction")
         inputs = self._current_post_c02_reply_inputs_locked(
-            namespace, c02_operation_id, source_ref, now_utc, epoch)
+            namespace, c02_operation_id, source_ref, now_utc, epoch,prepared_inventory=prepared_inventory, prepared_full_read=prepared_full_read)
         route = read_current_reply_route_manifest_v2(
             store._db, namespace, inputs, source_ref)
         return inputs, route
+
+    def _prepare_full_read_then_call_v3(
+            self, authority, lease, read_contract, callback, *, deadline_utc,
+            c02_operation_id=None, source_ref=None):
+        """Prepare in an ordinary Work, then resume the original authorized entry."""
+        from .runtime.current_graph_full_read_v3 import (
+            prepare_current_graph_full_read_v3, bind_prepared_graph_full_read_v3,
+        )
+        import secrets
+        work=prepare_current_graph_full_read_v3(
+            self, authority, lease, read_contract=read_contract,
+            operation_id="full-read:"+secrets.token_hex(24), deadline_utc=deadline_utc,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        def completed(proof):
+            try:
+                with bind_prepared_graph_full_read_v3(proof, self, self.__store._db):
+                    return callback(proof)
+            finally:
+                proof.release_payload_v3()
+        def failed(error):
+            raise error
+        return work.map_terminal_v3("issuer", completed, failed)
+
+    def _require_natural_admin_full_read_scope_v3(
+            self, bootstrap, *, installed_bundle, scope, parent_original_id,
+            source_ref):
+        """Borrow the installed administrator's already authorized write scope."""
+        from .host.authority_profile import AdminInstallationBundle, AdminIngressClockPolicy
+        from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+        from .runtime.reply_model_job import source_key_from_ref
+        from .runtime.natural_producer_qualification_v1 import _host_stamp
+        self._admin(bootstrap)
+        if (not isinstance(self.__store, ProductionGraphStore) or self.__content_fence_v2 is None
+                or type(scope) is not FenceScope or scope.operation != "write"
+                or type(parent_original_id) is not str or not parent_original_id
+                or type(installed_bundle) is not AdminInstallationBundle
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy
+                or installed_bundle.ingress_clock != self.__scene_clock_policy
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or self.__d11_issuer.resource_issuer is not self.__d02_issuer
+                or installed_bundle.installation_policy.namespace != scope.namespace):
+            raise UnavailableGuard("natural FULL preparation installed authorities differ")
+        source_key_from_ref(source_ref, scope.namespace)
+        _host_stamp(self, scope)
+        return scope.namespace
+
+    def _validate_natural_admin_full_read_scope_v3(self, borrowed):
+        """Revalidate the same live borrowed scope without ending or replacing it."""
+        bootstrap, bundle, scope, parent, source = borrowed
+        namespace=self._require_natural_admin_full_read_scope_v3(
+            bootstrap, installed_bundle=bundle, scope=scope,
+            parent_original_id=parent, source_ref=source)
+        with self.__store._lock:
+            metadata,epoch=self._v2_graph_stamp(namespace)
+        return _BorrowedNaturalFullReadStampV3(scope,metadata,epoch)
 
     def _current_natural_generation_inputs_locked(
         self, namespace: NamespaceId, c02_operation_id: str,
@@ -10641,18 +15231,35 @@ class GraphCoordinator:
         context = registration[0] if registration is not None else None
         if type(context) is not ContextProvider:
             raise UnavailableGuard("installed D03 role resolver unavailable; HOLD")
-        inputs, route = self._current_post_c02_reply_route_locked(
-            namespace, c02_operation_id, source_ref, now_utc, epoch)
-        full, query = self._dispatch_full_graph_snapshot_locked(namespace)
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(db) is not None:
+            from .runtime.current_graph_full_read_v3 import (
+                CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3,
+                PreparedCurrentGraphFullReadV3, require_bound_graph_full_read_proof_for_db_v3,
+            )
+            proof=require_bound_graph_full_read_proof_for_db_v3(
+                db, namespace, required_families=frozenset({
+                    CURRENT_DISPATCH_FAMILY_V3, SOURCE_METADATA_FAMILY_V3}))
+            if type(proof) is not PreparedCurrentGraphFullReadV3:
+                raise UnavailableGuard("natural preparation requires its ordinary FULL producer")
+            inputs,route=self._current_post_c02_reply_route_locked(
+                namespace,c02_operation_id,source_ref,now_utc,epoch,prepared_full_read=proof)
+            snapshot,query=self._dispatch_full_graph_snapshot_locked(namespace)
+            if inputs.graph_snapshot is not snapshot:
+                raise StaleRead("natural input projection differs from its actual FULL reader")
+        else:
+            inputs, route = self._current_post_c02_reply_route_locked(
+                namespace, c02_operation_id, source_ref, now_utc, epoch)
+            full, query = self._dispatch_full_graph_snapshot_locked(namespace)
+            # The complete legacy snapshot is a different registered storage path.
+            atoms = {atom.key: atom for atom in full.atoms}
+            for atom in inputs.graph_snapshot.atoms:
+                if atom.key in atoms and atoms[atom.key] != atom:
+                    raise StaleRead("natural generation source closure changed")
+                atoms[atom.key] = atom
+            snapshot = GraphSnapshot(tuple(atoms.values()), full.epochs)
         if query.revision != epoch.revision:
             raise StaleRead("natural generation graph epoch changed")
-        # SQL's absence is a real D06 correction-head rev0 proof in this tx.
-        atoms = {atom.key: atom for atom in full.atoms}
-        for atom in inputs.graph_snapshot.atoms:
-            if atom.key in atoms and atoms[atom.key] != atom:
-                raise StaleRead("natural generation source closure changed")
-            atoms[atom.key] = atom
-        snapshot = GraphSnapshot(tuple(atoms.values()), full.epochs)
         binding = read_current_reply_entity_route_binding_v2(
             db, namespace, route, query, now_utc=now_utc)
         projection = read_current_dispatch_projection(db, namespace, snapshot, query)
@@ -10683,6 +15290,7 @@ class GraphCoordinator:
         source_ref: str, installed_bundle, now_utc: float,
         epoch: NamespaceEpoch, *, original_deadline: float | None = None,
         frozen_original=None, history_decision_out=None, history_preflight_out=None, history_preflight=None,
+        same_batch_prepared=None, core_frame=None,
     ):
         """Derive the first private source plan from current graph and budget."""
         from .domains.d06.qualified_expression import (
@@ -10717,14 +15325,32 @@ class GraphCoordinator:
         (inputs, route, binding, snapshot, query, role_read,
          boundary_read, scene, audience) = self._current_natural_generation_inputs_locked(
              namespace, c02_operation_id, source_ref, now_utc, epoch)
+        from .runtime.natural_producer_qualification_v1 import (
+            natural_basis_snapshot_v1, read_live_producer_candidates_v1,
+            frozen_natural_basis_candidates_v1, fresh_c04_report_candidate_v1,
+            producer_expression_unit_v1, source_expression_unit_v1, CANDIDATE_TYPES)
+        snapshot = natural_basis_snapshot_v1(db, namespace=namespace, snapshot=snapshot,
+            units=(() if frozen_original is None else frozen_original.input.plan.units))
         workflow = installed_bundle.model_workflows.natural_generation
         review = installed_bundle.model_workflows.natural_review
         if workflow is None or review is None:
             raise UnavailableGuard("both natural paid workflows must be installed; HOLD")
-        grant = self.__d11_issuer.current_budget_grant(
-            db, installed_bundle.installation_policy.root_lease.lease_id)
-        if (grant != installed_bundle.installation_policy.root_grant
-                or not {"natural_generation", "natural_review"}.issubset(
+        from .runtime.natural_reply_budget_v3 import (
+            resolve_natural_reply_budget_for_new_admission_v3,
+            read_natural_reply_original_budget_v3)
+        if frozen_original is None:
+            _budget, grant = resolve_natural_reply_budget_for_new_admission_v3(db, namespace=namespace,
+                c02_operation_id=c02_operation_id, source_ref=source_ref, issuer=self.__d11_issuer,
+                installed_bundle=installed_bundle, now_utc=now_utc)
+        else:
+            from .runtime.natural_reply_job_v2 import read_original_preparation
+            original_preparation = read_original_preparation(db, namespace, c02_operation_id, "generation")
+            if original_preparation is None or original_preparation.frozen != frozen_original:
+                raise UnavailableGuard("natural frozen scope lacks its actual original sealed generation; HOLD")
+            _budget, grant = read_natural_reply_original_budget_v3(db, namespace=namespace,
+                c02_operation_id=c02_operation_id, source_ref=source_ref, issuer=self.__d11_issuer,
+                installed_bundle=installed_bundle, original_preparation=original_preparation)
+        if (not {"natural_generation", "natural_review"}.issubset(
                     grant.allowed_work_kinds)
                 or route.conversation_ref not in workflow.audiences
                 or route.conversation_ref not in review.audiences):
@@ -10734,9 +15360,21 @@ class GraphCoordinator:
             role_read.valid_until, grant.valid_until_utc,
             (original_deadline if original_deadline is not None
              else now_utc + 300.0)) if value is not None)
-        if expiry <= now_utc + workflow.timeout_seconds + 1:
+        if expiry <= now_utc + (workflow.timeout_seconds + 1 if frozen_original is None else 0):
             raise UnavailableGuard("natural scope expires before paid generation")
         source = inputs.source.source
+        source_material = full_source_read = None
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(db) is not None:
+            from .runtime.current_graph_full_read_v3 import (
+                SOURCE_METADATA_FAMILY_V3,
+                require_bound_graph_full_read_proof_for_db_v3,
+            )
+            full_source_read = require_bound_graph_full_read_proof_for_db_v3(
+                db, namespace, required_families=frozenset({SOURCE_METADATA_FAMILY_V3}))
+            source_material = full_source_read.source_material
+            if source_material is None:
+                raise UnavailableGuard("natural expression requires its actual Source material Work")
         barrier = db.execute(
             "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
             "WHERE bot=? AND persona=?", namespace.as_tuple,
@@ -10744,12 +15382,11 @@ class GraphCoordinator:
         if barrier is None:
             raise UnavailableGuard("natural source barrier absent")
         candidate = prepare_qualified_expression_unit(
-            snapshot, namespace=namespace,
+            snapshot if full_source_read is None else full_source_read.projection, namespace=namespace,
             request=QualifiedExpressionRequest(
                 source_ref, "attributed_report", SourceTextSpan(0, len(source.text))),
             audiences=(route.conversation_ref,), access_epoch=barrier[0],
-            deletion_epoch=barrier[1], valid_until=expiry,
-        )
+            deletion_epoch=barrier[1], valid_until=expiry, prepared_source_material=source_material, prepared_full_read=full_source_read, db=db)
         source_versions = {row.key.token: row.revision
                            for row in candidate.read_versions}
         unit = QualifiedExpressionUnitV2(
@@ -10777,12 +15414,42 @@ class GraphCoordinator:
             evidence_span=(candidate.evidence_span.start,
                            candidate.evidence_span.end),
         )
+        if frozen_original is not None:
+            if expiry != frozen_original.input.plan.valid_until_utc:
+                raise UnavailableGuard("frozen natural original expiry changed; HOLD")
+            units = frozen_original.input.plan.units
+            candidates = frozen_natural_basis_candidates_v1(db, plan=frozen_original.input.plan,
+                snapshot=snapshot, access_epoch=barrier[0], deletion_epoch=barrier[1], now_utc=now_utc)
+        else:
+            producers = read_live_producer_candidates_v1(db, snapshot=snapshot,
+                audience_id=route.conversation_ref, expires_at_utc=expiry, now_utc=now_utc)
+            bounded_expiry = min((expiry, *(value.context.expires_at_utc for value in producers)))
+            if bounded_expiry != expiry:
+                expiry = bounded_expiry
+                if expiry <= now_utc + workflow.timeout_seconds + 1:
+                    raise UnavailableGuard("producer original expires before paid natural generation")
+                candidate = prepare_qualified_expression_unit(snapshot if full_source_read is None else full_source_read.projection, namespace=namespace,
+                    request=QualifiedExpressionRequest(source_ref, "attributed_report", SourceTextSpan(0, len(source.text))),
+                    audiences=(route.conversation_ref,), access_epoch=barrier[0],
+                    deletion_epoch=barrier[1], valid_until=expiry, prepared_source_material=source_material, prepared_full_read=full_source_read, db=db)
+                unit = source_expression_unit_v1(candidate, basis_id="basis:c02-report",
+                                                 audience_id=route.conversation_ref)
+                producers = read_live_producer_candidates_v1(db, snapshot=snapshot,
+                    audience_id=route.conversation_ref, expires_at_utc=expiry, now_utc=now_utc)
+            reports = tuple(value for value in fresh_c04_report_candidate_v1(
+                db, snapshot=snapshot, audience_id=route.conversation_ref,
+                expires_at_utc=expiry, access_epoch=barrier[0], deletion_epoch=barrier[1])
+                if value.qualification_digest != candidate.qualification_digest)
+            candidates = (candidate, *reports, *producers)
+            units = (unit, *(source_expression_unit_v1(value, basis_id="basis:c04-report",
+                        audience_id=route.conversation_ref) for value in reports),
+                     *(producer_expression_unit_v1(value) for value in producers))
         plan_id = natural_plan_id_v2(namespace, c02_operation_id, source_ref)
         plan_key = natural_plan_key_v2(
             namespace, inputs.c02_receipt.activity_id, plan_id)
         plan = NaturalExpressionPlanV2(
             namespace, VersionedRef(plan_key.token, 1), scene, audience,
-            ("reply",), ("paraphrase",), (), (unit,), expiry,
+            ("reply",), ("paraphrase",), (), units, expiry,
             inputs.c02_receipt.activity_id,
             post_c02_reply_operation_id(c02_operation_id, source_ref),
             natural_final_effect_id_v2(namespace, c02_operation_id, source_ref),
@@ -10795,6 +15462,12 @@ class GraphCoordinator:
             binding.binding_evidence_event_version,
             *binding.binding_scan_versions,
         )))
+        if len(candidates) > 1 or any(type(value) in CANDIDATE_TYPES for value in candidates):
+            basis_reads = tuple(row for value in candidates for row in (
+                value.context.read_versions if type(value) in CANDIDATE_TYPES else value.read_versions))
+            reads = tuple(dict.fromkeys((*reads, *basis_reads)))
+        if frozen_original is not None and plan != frozen_original.input.plan:
+            raise UnavailableGuard("frozen natural recovery changed its exact original plan")
         semantic = natural_route_semantic_digest_v2(binding)
         evidence = NaturalPlanPreparationEvidenceV2(
             c02_operation_id,
@@ -10809,7 +15482,8 @@ class GraphCoordinator:
                 "route": semantic,
                 "read_versions": sorted((row.key.token, row.revision)
                                         for row in reads),
-                "qualification": candidate.qualification_digest,
+                "qualification": (candidates[0].qualification_digest if len(candidates) == 1 else
+                    canonical_digest(tuple(value.qualification_digest for value in candidates))),
             }), semantic, grant.lease_id, grant.version,
             canonical_digest(grant),
             tuple(sorted(workflow.quote_ceiling.items())),
@@ -10818,13 +15492,13 @@ class GraphCoordinator:
         if frozen_original is None:
             plan_write, plan_reads = prepare_coordinator_natural_plan_write_v2(
                 plan=plan, evidence=evidence, snapshot=snapshot,
-                d06_candidates=(candidate,), access_epoch=barrier[0],
+                d06_candidates=candidates, access_epoch=barrier[0],
                 deletion_epoch=barrier[1], now_utc=now_utc,
             )
         else:
             adopted, plan_reads = verify_current_natural_plan_v2(
                 plan=plan, evidence=evidence, snapshot=snapshot,
-                d06_candidates=(candidate,), access_epoch=barrier[0],
+                d06_candidates=candidates, access_epoch=barrier[0],
                 deletion_epoch=barrier[1], now_utc=now_utc,
             )
             plan_write = GraphWrite(
@@ -10833,24 +15507,86 @@ class GraphCoordinator:
             FrozenNaturalReplyRequestV3, TEMPLATE_VERSION as V3_TEMPLATE_VERSION,
         )
         from .model_broker.natural_reply import FrozenNaturalReplyRequestV2
-        from .model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4, TEMPLATE_VERSION as V4_TEMPLATE_VERSION
+        from .model_broker.natural_reply_history_v4 import (
+            FrozenNaturalReplyRequestV4, TEMPLATE_VERSION as V4_TEMPLATE_VERSION,
+            TEMPLATE_VERSION_V5 as V5_TEMPLATE_VERSION,
+            INPUT_SCHEMA as V4_INPUT_SCHEMA, INPUT_SCHEMA_V5 as V5_INPUT_SCHEMA)
+        from .model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6,TEMPLATE_VERSION as V6_TEMPLATE_VERSION
+        from .model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,TEMPLATE_VERSION as V7_TEMPLATE_VERSION
         installation = NaturalReplyInstallationV2(
             installed_bundle.installation_policy.installation_id,
             workflow.provider_config_digest, workflow.provider_id,
             workflow.model_id, workflow.max_output_tokens)
-        if type(frozen_original) is FrozenNaturalReplyRequestV2:
+        if same_batch_prepared is not None:
+            from .runtime.natural_same_batch_history_v3 import verify_same_batch_history_v3
+            if (type(frozen_original) not in (FrozenNaturalReplyRequestV4,FrozenNaturalReplyRequestV6,FrozenNaturalReplyRequestV7)
+                    or (type(frozen_original) is FrozenNaturalReplyRequestV4 and frozen_original.input.schema != V5_INPUT_SCHEMA)
+                    or history_decision_out is not None or history_preflight_out is not None):
+                raise UnavailableGuard("same-batch continuation cannot create a new generation or cache activation")
+            from .runtime.natural_same_batch_history_v6 import verify_same_batch_history_v6
+            from .runtime.natural_same_batch_history_v7 import verify_same_batch_history_v7
+            verifier = verify_same_batch_history_v7 if type(frozen_original) is FrozenNaturalReplyRequestV7 else verify_same_batch_history_v6 if type(frozen_original) is FrozenNaturalReplyRequestV6 else verify_same_batch_history_v3
+            history_reads = verifier(db, issuer=self, prepared=same_batch_prepared,
+                namespace=namespace, parent_original_id=c02_operation_id, frozen=frozen_original,
+                now_utc=now_utc, max_slots=(installed_bundle.d13_wire_policy.max_slots if type(frozen_original) in (FrozenNaturalReplyRequestV6,FrozenNaturalReplyRequestV7)
+                    and installed_bundle.d13_wire_policy is not None else 256 if type(frozen_original) in (FrozenNaturalReplyRequestV6,FrozenNaturalReplyRequestV7) else
+                    self.__d13_precompression_policy.max_slots if self.__d13_precompression_policy is not None else 64))
+            frozen = frozen_original
+            reads = tuple(dict.fromkeys((*reads, *history_reads)))
+        elif type(frozen_original) is FrozenNaturalReplyRequestV2:
             # Old paid originals retain their V2 bytes and question reference.
             frozen = freeze_natural_reply_request_v2(
                 NaturalReplyInputV2(ContextReplyPartV1("question", evidence.source_ref,
                     VersionedRef(route.conversation_ref, audience.version), expiry, source.text),
                     plan, (), now_utc, expiry), installation)
-        elif type(frozen_original) is FrozenNaturalReplyRequestV4 or (frozen_original is None and workflow.template_version == V4_TEMPLATE_VERSION):
+        elif type(frozen_original) is FrozenNaturalReplyRequestV7 or (frozen_original is None and workflow.template_version == V7_TEMPLATE_VERSION):
+            from .runtime.installed_d13_natural_frame_v7 import freeze_current_natural_frame_v7
+            from .runtime.d13_natural_installed_ports_v7 import build_current_natural_d13_ports_v7
+            if history_preflight_out is not None or history_preflight is not None:
+                raise UnavailableGuard("V7 must use the independent settled Core count before generation")
+            metadata,_=self._v2_graph_stamp(namespace)
+            max_slots=installed_bundle.d13_wire_policy.max_slots
+            wire_port,paid_verifier=build_current_natural_d13_ports_v7(db,bundle=installed_bundle,
+                resource_issuer=self.__d02_issuer,budget_issuer=self.__d11_issuer,c02_operation_id=c02_operation_id,
+                plan=plan,activation_generation=metadata.requirements.activation_generation,original=frozen_original,
+                now_utc=now_utc,max_slots=max_slots)
+            frozen,history_reads,history_decision=freeze_current_natural_frame_v7(db,namespace=namespace,plan=plan,
+                question=ContextReplyPartV1('question',evidence.source_ref,audience,expiry,source.text),
+                installation=installation,now_utc=now_utc,expires_at_utc=expiry,
+                activation_generation=metadata.requirements.activation_generation,max_slots=max_slots,original=frozen_original,
+                installed_wire_port=wire_port,paid_verifier=paid_verifier,policy_digest=wire_port.policy_digest,frame=core_frame)
+            reads=tuple(dict.fromkeys((*reads,*history_reads)))
+            if history_decision.activation_writes and history_decision_out is None:
+                raise UnavailableGuard("V7 activation requires the first actual natural job W01 CAS")
+            if history_decision_out is not None:history_decision_out.append((history_decision,wire_port))
+        elif type(frozen_original) is FrozenNaturalReplyRequestV6 or (frozen_original is None and workflow.template_version == V6_TEMPLATE_VERSION):
+            from .runtime.installed_d13_natural_frame_v6 import freeze_current_natural_frame_v6
+            from .runtime.d13_natural_installed_ports_v6 import build_current_natural_d13_ports_v6
+            metadata, _ = self._v2_graph_stamp(namespace)
+            max_slots = installed_bundle.d13_wire_policy.max_slots if installed_bundle.d13_wire_policy is not None else 256
+            wire_port, paid_verifier = build_current_natural_d13_ports_v6(db,bundle=installed_bundle,
+                resource_issuer=self.__d02_issuer,budget_issuer=self.__d11_issuer,c02_operation_id=c02_operation_id,
+                plan=plan,activation_generation=metadata.requirements.activation_generation,original=frozen_original,
+                now_utc=now_utc,max_slots=max_slots)
+            frozen,history_reads,history_decision=freeze_current_natural_frame_v6(db,namespace=namespace,plan=plan,
+                question=ContextReplyPartV1('question',evidence.source_ref,audience,expiry,source.text),
+                installation=installation,now_utc=now_utc,expires_at_utc=expiry,
+                activation_generation=metadata.requirements.activation_generation,max_slots=max_slots,original=frozen_original,
+                installed_wire_port=wire_port,paid_verifier=paid_verifier,
+                policy_digest=(canonical_digest({'schema':'d13.raw-current-policy.v6','max_slots':max_slots}) if wire_port is None else wire_port.policy_digest),
+                preflight_out=history_preflight_out,preflight=history_preflight)
+            reads=tuple(dict.fromkeys((*reads,*history_reads)))
+            if history_decision.activation_writes and history_decision_out is None:
+                raise UnavailableGuard('v6 activation belongs only to the first actual natural job W01 CAS')
+            if history_decision_out is not None:
+                history_decision_out.append((history_decision,wire_port))
+        elif type(frozen_original) is FrozenNaturalReplyRequestV4 or (frozen_original is None and workflow.template_version in {V4_TEMPLATE_VERSION, V5_TEMPLATE_VERSION}):
             from .runtime.installed_d13_natural_frame_v4 import freeze_current_natural_frame_v4
             metadata, _ = self._v2_graph_stamp(namespace)
             from .runtime.d13_natural_installed_ports_v1 import build_current_natural_d13_ports_v1
             wire_port, paid_verifier = build_current_natural_d13_ports_v1(db, bundle=installed_bundle,
                 resource_issuer=self.__d02_issuer, budget_issuer=self.__d11_issuer,
-                c02_operation_id=c02_operation_id, original=frozen_original,
+                c02_operation_id=c02_operation_id, original=frozen_original, now_utc=now_utc,
                 max_slots=(self.__d13_precompression_policy.max_slots if self.__d13_precompression_policy is not None else 64))
             if wire_port is None:
                 wire_port = self.__d13_natural_wire_port
@@ -10861,7 +15597,9 @@ class GraphCoordinator:
                 activation_generation=metadata.requirements.activation_generation,
                 max_slots=(self.__d13_precompression_policy.max_slots if self.__d13_precompression_policy is not None else 64),
                 original=frozen_original, installed_wire_port=wire_port, paid_verifier=paid_verifier,
-                preflight_out=history_preflight_out, preflight=history_preflight)
+                preflight_out=history_preflight_out, preflight=history_preflight,
+                input_schema=(V5_INPUT_SCHEMA if workflow.template_version == V5_TEMPLATE_VERSION
+                    else V4_INPUT_SCHEMA))
             reads = tuple(dict.fromkeys((*reads, *history_reads)))
             if history_decision.activation_write is not None and history_decision_out is None:
                 raise UnavailableGuard("D13 standby activation is only allowed with first natural job CAS")
@@ -10886,15 +15624,17 @@ class GraphCoordinator:
         scoped = read_natural_scoped_query_proof_v2(
             db, natural_private_scope_from_binding_v2(binding, frozen),
             now_utc=now_utc)
-        assert_original_scoped_d06_projection_v2(scoped, frozen)
+        from .runtime.natural_scoped_query_proof_v2 import assert_current_natural_producer_scope_v1
+        assert_current_natural_producer_scope_v1(db, scoped, frozen, now_utc=now_utc,
+                                                read_versions=reads)
         return (plan_write, plan_reads, frozen, reads, query,
                 role_read.query_epoch, boundary_read.query_epoch,
-                barrier, scoped, candidate, snapshot)
+                barrier, scoped, candidates, snapshot)
 
     def _commit_natural_generation_locked(
         self, namespace: NamespaceId, c02_operation_id: str,
         source_ref: str, installed_bundle, now_utc: float,
-        metadata, epoch: NamespaceEpoch, *, history_preflight=None,
+        metadata, epoch: NamespaceEpoch, *, history_preflight=None, core_counted=None,
     ):
         """One held Authority write tx: adopted plan and original paid job."""
         from .domains.d08.natural_plan import decode_natural_plan_v2
@@ -10914,6 +15654,7 @@ class GraphCoordinator:
             raise UnavailableGuard("natural generation requires held write fence")
         if self._v2_graph_stamp(namespace) != (metadata, epoch):
             raise StaleRead("natural generation graph changed before adoption")
+        from .runtime.d13_natural_counter_preflight_v6 import D13NaturalWirePreflightV6
         history_decisions = []
         (plan_write, plan_reads, frozen, current_reads, _all_query,
          _role_query, _boundary_query, barrier, scoped, _candidate,
@@ -10921,13 +15662,18 @@ class GraphCoordinator:
             self._prepare_natural_generation_scope_locked(
                 namespace, c02_operation_id, source_ref, installed_bundle,
                 now_utc, epoch, history_decision_out=history_decisions,
-                original_deadline=(history_preflight.raw.input.plan.valid_until_utc if history_preflight is not None else None),
-                history_preflight=history_preflight))
+                original_deadline=(core_counted.frame.prospective_plan_deadline_utc if core_counted is not None else (history_preflight.pair.raw if type(history_preflight) is D13NaturalWirePreflightV6 else history_preflight.raw).input.plan.valid_until_utc if history_preflight is not None else None),
+                history_preflight=history_preflight,core_frame=(None if core_counted is None else core_counted.frame)))
         decision, history_wire_port = history_decisions[0] if history_decisions else (None, None)
-        activation_write = decision.activation_write if decision is not None else None
-        activation_expected = decision.activation_expected if decision is not None else None
-        if (activation_write is None) != (activation_expected is None):
-            raise UnavailableGuard("D13 activation write and CAS must be paired")
+        from .runtime.installed_d13_natural_frame_v6 import NaturalHistoryDecisionV6
+        from .runtime.installed_d13_natural_frame_v7 import NaturalHistoryDecisionV7
+        if type(decision) in (NaturalHistoryDecisionV6,NaturalHistoryDecisionV7):
+            activation_writes,activation_expected=decision.activation_writes,decision.activation_expected
+        else:
+            activation_writes=() if decision is None or decision.activation_write is None else (decision.activation_write,)
+            activation_expected=() if decision is None or decision.activation_expected is None else (decision.activation_expected,)
+        if len(activation_writes)!=len(activation_expected) or any(write.key!=expected.key for write,expected in zip(activation_writes,activation_expected)):
+            raise UnavailableGuard('D13 each activation write and actual CAS must be paired')
         plan = decode_natural_plan_v2(plan_write.value)
         job_id = natural_job_ids_v2(
             namespace, c02_operation_id, "generation")[0]
@@ -10943,9 +15689,9 @@ class GraphCoordinator:
             *current_reads, GraphVersion(plan_write.key, 1),
             GraphVersion(job_key, 1),
         )))
-        if activation_expected is not None:
-            original_reads = tuple(GraphVersion(version.key, activation_expected.revision + 1)
-                if version.key == activation_expected.key else version for version in original_reads)
+        if activation_expected:
+            targets={expected.key:expected.revision+1 for expected in activation_expected}
+            original_reads=tuple(GraphVersion(version.key,targets[version.key]) if version.key in targets else version for version in original_reads)
         query_epochs = tuple(QueryEpoch(namespace, scope, epoch.revision + 1)
                              for scope in ("all", "d03.role_binding",
                                            "d05.boundary"))
@@ -10971,8 +15717,9 @@ class GraphCoordinator:
         pre_reads = tuple(dict.fromkeys((
             *plan_reads, *current_reads, GraphVersion(job_key, 0),
         )))
-        if activation_write is not None:
-            pre_reads = tuple(version for version in pre_reads if version.key != activation_expected.key) + (activation_expected,)
+        if activation_writes:
+            keys={expected.key for expected in activation_expected}
+            pre_reads=tuple(version for version in pre_reads if version.key not in keys)+activation_expected
         event_digest = canonical_digest({
             "schema": "sylanne.natural-generation-adoption.v2",
             "plan": plan_write.value, "seal": asdict(seal),
@@ -10984,13 +15731,16 @@ class GraphCoordinator:
             pre_reads,
             (plan_write,
              GraphWrite(job_write.key, job_write.value, (plan_write.key,)),
-             *((activation_write,) if activation_write is not None else ())),
+             *activation_writes),
             (epoch,),
         )
         receipt = GraphStore._graph_commit_in_transaction(
             store, candidate, _capability=self.__graph_capability)
         if receipt.status != "committed":
             raise EventConflict("natural plan and job graph adoption failed")
+        if type(decision) in (NaturalHistoryDecisionV6,NaturalHistoryDecisionV7) and activation_writes:
+            from .runtime.d11_derived_cache_payload_v1 import record_derived_activations_v6
+            record_derived_activations_v6(db,decision.pair,graph_receipt=receipt,operation_id=job.operation_id)
         store.cas_graph_recovery_metadata(
             metadata, metadata.requirements,
             _capability=self.__graph_capability)
@@ -11199,6 +15949,22 @@ class GraphCoordinator:
             raise UnavailableGuard("natural review original could not be read back")
         return saved
 
+    def install_d13_counter_cpu_quote_authority_v1(self, bootstrap, authority):
+        from .runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
+        self._admin(bootstrap)
+        if type(authority) is not D13CounterCpuQuotePolicyAuthorityV1 or self.__d13_counter_cpu_quote_authority_v1 is not None:
+            raise ValueError("D13 counter CPU authority must be the unique actual installed instance")
+        self.__d13_counter_cpu_quote_authority_v1 = authority
+
+    def prepare_current_d13_counter_cpu_v1(self, bootstrap, bundle, *, instruction):
+        from .runtime.d13_counter_cpu_graph_v1 import prepare_current_d13_counter_cpu_v1
+        return prepare_current_d13_counter_cpu_v1(self, bootstrap, bundle, instruction=instruction)
+
+    def settle_current_d13_counter_cpu_v1(self, bootstrap, bundle, *, frame_intent_id, counter_operation_id, awaiting):
+        from .runtime.d13_counter_cpu_accounting_v1 import settle_current_d13_counter_cpu_v1
+        return settle_current_d13_counter_cpu_v1(self, bootstrap, bundle, frame_intent_id=frame_intent_id,
+            counter_operation_id=counter_operation_id, awaiting=awaiting)
+
     def prepare_post_c02_natural_generation_v2(
         self, bootstrap: object, namespace: NamespaceId,
         c02_operation_id: str, source_ref: str, installed_bundle,
@@ -11211,7 +15977,9 @@ class GraphCoordinator:
         )
         from .model_broker.natural_reply import TEMPLATE_VERSION
         from .model_broker.natural_reply_history_v3 import TEMPLATE_VERSION as V3_TEMPLATE_VERSION
-        from .model_broker.natural_reply_history_v4 import TEMPLATE_VERSION as V4_TEMPLATE_VERSION
+        from .model_broker.natural_reply_history_v4 import TEMPLATE_VERSION as V4_TEMPLATE_VERSION, TEMPLATE_VERSION_V5 as V5_TEMPLATE_VERSION
+        from .model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE_VERSION
+        from .model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE_VERSION
         from .runtime.first_ingress_v2 import trusted_upper
         from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
         from .runtime.natural_generation_issue_v2 import (
@@ -11242,7 +16010,7 @@ class GraphCoordinator:
         generation = getattr(workflows, "natural_generation", None)
         review = getattr(workflows, "natural_review", None)
         if (generation is None or review is None
-                or generation.template_version not in {TEMPLATE_VERSION, V3_TEMPLATE_VERSION, V4_TEMPLATE_VERSION}):
+                or generation.template_version not in {TEMPLATE_VERSION, V3_TEMPLATE_VERSION, V4_TEMPLATE_VERSION, V5_TEMPLATE_VERSION, V6_TEMPLATE_VERSION, V7_TEMPLATE_VERSION}):
             raise UnavailableGuard("natural paid workflows unavailable; HOLD")
         original_id = natural_job_ids_v2(
             namespace, c02_operation_id, "generation")[1]
@@ -11309,6 +16077,7 @@ class GraphCoordinator:
                 namespace, metadata, epoch, anchor, attempt[1], attempt[2],
                 attempt[3], attempt[4], "finish_natural_generation")
             return saved
+        self.__local_module_admission.require_v1(('d09', 'd11'), "prepare_post_c02_natural_generation_v2")
         ready = getattr(port, "natural_paid_consumer_ready_v2", None)
         try:
             consumer_ready = (callable(ready) and ready(
@@ -11317,6 +16086,23 @@ class GraphCoordinator:
             consumer_ready = False
         if not consumer_ready:
             raise UnavailableGuard("installed natural paid consumer unavailable; HOLD")
+        core_counted=None
+        if generation.template_version==V7_TEMPLATE_VERSION:
+            from .runtime.d13_natural_counter_preflight_v7 import count_before_natural_generation_v7
+            core_counted=count_before_natural_generation_v7(self,bootstrap,installed_bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref)
+            # Actual counter preparation and cost CAS advance Graph/Core anchors.
+            # Acquire the new generation fence from that completed state.
+            with store._lock:metadata,epoch=self._v2_graph_stamp(namespace)
+            target=metadata.requirements
+            frame=core_counted.frame
+            if (target.namespace!=namespace or target.activation_generation!=frame.activation_generation
+                    or target.authority_id!=frame.authority_id or target.authority_namespace!=frame.authority_namespace):
+                raise UnavailableGuard("V7 counter changed the installed generation identity")
+            anchor=port.current_anchor(namespace=namespace,authority_namespace=target.authority_namespace)
+            if not self._anchor_matches(target,anchor):
+                raise UnavailableGuard("V7 actual post-counter generation anchor differs")
+            now=trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
         if attempt is not None and attempt[5] == "committed":
             raise UnavailableGuard("committed natural original lacks job; HOLD")
         if attempt is not None and attempt[5] == "open":
@@ -11388,53 +16174,80 @@ class GraphCoordinator:
             anchor, epoch, metadata.graph_revision)
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("natural write fence stale; HOLD")
-        try:
-            counted_history = None
-            if generation.template_version == V4_TEMPLATE_VERSION and installed_bundle.d13_wire_counter is not None:
-                preflights = []
+        preparation_committed = False
+        def perform_preparation(full_read):
+            nonlocal now, saved, preparation_committed
+            now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+            from .runtime.current_graph_full_read_v3 import bind_prepared_graph_full_read_v3
+            with bind_prepared_graph_full_read_v3(full_read, self, db):
+                from .model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE_VERSION
+                counted_history = None
+                if generation.template_version in {V4_TEMPLATE_VERSION, V5_TEMPLATE_VERSION,V6_TEMPLATE_VERSION} and installed_bundle.d13_wire_counter is not None:
+                    preflights = []
+                    with store._lock:
+                        db.execute("BEGIN")
+                        try:
+                            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                                raise StaleRead("D13 preflight graph changed")
+                            self._prepare_natural_generation_scope_locked(namespace, c02_operation_id,
+                                source_ref, installed_bundle, now, epoch, history_preflight_out=preflights)
+                            db.commit()
+                        except BaseException:
+                            db.rollback()
+                            raise
+                    if preflights:
+                        if len(preflights) != 1:
+                            raise UnavailableGuard("D13 foreground preflight must select one original pair")
+                        from .runtime.d13_natural_counter_preflight_v1 import count_installed_d13_preflight_v1
+                        from .runtime.d13_natural_counter_preflight_v6 import D13NaturalWirePreflightV6,count_installed_d13_preflight_v6
+                        counter=count_installed_d13_preflight_v6 if type(preflights[0]) is D13NaturalWirePreflightV6 else count_installed_d13_preflight_v1
+                        counted_history=counter(db,graph_lock=store._lock,bundle=installed_bundle,preflight=preflights[0])
+                    now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+                    if port.validate_fence(scope) != permit:
+                        raise UnavailableGuard("D13 counting outlived the original write fence")
                 with store._lock:
-                    db.execute("BEGIN")
+                    db.execute("BEGIN IMMEDIATE")
                     try:
                         if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                            raise StaleRead("D13 preflight graph changed")
-                        self._prepare_natural_generation_scope_locked(namespace, c02_operation_id,
-                            source_ref, installed_bundle, now, epoch, history_preflight_out=preflights)
-                        db.commit()
+                            raise StaleRead("natural graph changed before write")
+                        if core_counted is not None:
+                            from .runtime.d13_natural_counter_preflight_v7 import record_counted_d13_preflight_v7
+                            record_counted_d13_preflight_v7(db,bundle=installed_bundle,counted=core_counted,now_utc=now)
+                        if counted_history is not None:
+                            from .runtime.d13_natural_counter_preflight_v1 import record_counted_d13_preflight_v1
+                            from .runtime.d13_natural_counter_preflight_v6 import D13CountedNaturalPreflightV6,record_counted_d13_preflight_v6
+                            importer=record_counted_d13_preflight_v6 if type(counted_history) is D13CountedNaturalPreflightV6 else record_counted_d13_preflight_v1
+                            importer(db,bundle=installed_bundle,counted=counted_history)
+                        saved = self._commit_natural_generation_locked(
+                            namespace, c02_operation_id, source_ref,
+                            installed_bundle, now, metadata, epoch,
+                            history_preflight=(None if counted_history is None else counted_history.preflight),core_counted=core_counted)
+                        db.execute(
+                            "UPDATE graph_natural_generation_attempts_v2 "
+                            "SET state='committed' WHERE bot=? AND persona=? "
+                            "AND original_operation_id=? AND attempt_id=?",
+                            namespace.as_tuple + (original_id, attempt_id),
+                        )
+                        db.execute("COMMIT")
+                        preparation_committed = True
                     except BaseException:
-                        db.rollback()
+                        db.execute("ROLLBACK")
                         raise
-                if preflights:
-                    if len(preflights) != 1:
-                        raise UnavailableGuard("D13 foreground preflight must select one original pair")
-                    from .runtime.d13_natural_counter_preflight_v1 import count_installed_d13_preflight_v1
-                    counted_history = count_installed_d13_preflight_v1(db, graph_lock=store._lock,
-                        bundle=installed_bundle, preflight=preflights[0])
-                now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
-                if port.validate_fence(scope) != permit:
-                    raise UnavailableGuard("D13 counting outlived the original write fence")
-            with store._lock:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                        raise StaleRead("natural graph changed before write")
-                    if counted_history is not None:
-                        from .runtime.d13_natural_counter_preflight_v1 import record_counted_d13_preflight_v1
-                        record_counted_d13_preflight_v1(db, bundle=installed_bundle, counted=counted_history)
-                    saved = self._commit_natural_generation_locked(
-                        namespace, c02_operation_id, source_ref,
-                        installed_bundle, now, metadata, epoch,
-                        history_preflight=(None if counted_history is None else counted_history.preflight))
-                    db.execute(
-                        "UPDATE graph_natural_generation_attempts_v2 "
-                        "SET state='committed' WHERE bot=? AND persona=? "
-                        "AND original_operation_id=? AND attempt_id=?",
-                        namespace.as_tuple + (original_id, attempt_id),
-                    )
-                    db.execute("COMMIT")
-                except BaseException:
-                    db.execute("ROLLBACK")
-                    raise
-        except BaseException:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("natural committed fence outcome unknown; HOLD")
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "action": "finish_natural_generation",
+                    "attempt_id": attempt_id,
+                    "permit_token": permit.token,
+                }))
+            return saved
+
+        def fail_preparation(error):
+            if preparation_committed:
+                # Preserve the committed original for its formal recovery path.
+                raise error
             try:
                 port.finish_fence(
                     scope, request_id="finish:" + attempt_id,
@@ -11453,22 +16266,40 @@ class GraphCoordinator:
                     )
             except Exception:
                 pass
-            raise
-        if port.validate_fence(scope) != permit:
-            raise UnavailableGuard("natural committed fence outcome unknown; HOLD")
-        port.finish_fence(
-            scope, request_id="finish:" + attempt_id,
-            request_digest="sha256:" + canonical_digest({
-                "action": "finish_natural_generation",
-                "attempt_id": attempt_id,
-                "permit_token": permit.token,
-            }))
-        return saved
+            raise error
+
+        def finish_preparation(full_read):
+            try:
+                return perform_preparation(full_read)
+            except BaseException as error:
+                return fail_preparation(error)
+            finally:
+                full_read.release_payload_v3()
+
+        from contextlib import ExitStack
+        from .runtime_storage_v3 import runtime_storage_v3
+        request_lifetime = ExitStack()
+        try:
+            if runtime_storage_v3(db) is None:
+                from .runtime.natural_producer_qualification_v1 import host_natural_producer_context_v1
+                with host_natural_producer_context_v1(
+                        self, scope=scope, parent_original_id=c02_operation_id, phase="prepare"):
+                    return perform_preparation(None)
+            from .runtime.current_graph_full_read_v3 import prepare_current_graph_full_read_in_natural_scope_v3
+            work=prepare_current_graph_full_read_in_natural_scope_v3(
+                self, bootstrap, installed_bundle=installed_bundle, scope=scope,
+                parent_original_id=c02_operation_id, source_ref=source_ref,
+                request_lifetime=request_lifetime, deadline_utc=None)
+            work.map_terminal_v3("issuer", finish_preparation, fail_preparation)
+            work.adopt_request_lifetime_v3(request_lifetime)
+            return work
+        except BaseException as error:
+            request_lifetime.close()
+            return fail_preparation(error)
 
     def prepare_post_c02_natural_review_v2(
         self, authority: AuthorityContext, lease: object,
-        parent_original_id: str, installed_bundle,
-    ):
+        parent_original_id: str, installed_bundle, *, _prepared_full_read=None):
         """Reserve an independent paid review from Authority's current text."""
         from .authority_service.v2_contract import FencePermitV2
         from .authority_service.contract import AuthorityUnavailable
@@ -11501,6 +16332,13 @@ class GraphCoordinator:
             consumer_ready = False
         if not consumer_ready:
             raise UnavailableGuard("installed natural review consumer unavailable; HOLD")
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is not None and _prepared_full_read is None:
+            from .runtime.current_graph_full_read_v3 import NATURAL_MODEL_FULL_READ_V3
+            return self._prepare_full_read_then_call_v3(
+                authority, lease, NATURAL_MODEL_FULL_READ_V3,
+                lambda proof: self.prepare_post_c02_natural_review_v2(authority, lease, parent_original_id, installed_bundle, _prepared_full_read=proof),
+                deadline_utc=None, c02_operation_id=parent_original_id)
         now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
         with store._lock:
             db = store._db
@@ -11559,6 +16397,7 @@ class GraphCoordinator:
                 namespace, metadata, epoch, anchor, attempt[1], attempt[2],
                 attempt[3], attempt[4], "finish_natural_review")
             return saved
+        self.__local_module_admission.require_v1(('d09', 'd11'), "prepare_post_c02_natural_review_v2")
         if attempt is not None and attempt[5] == "open":
             if (attempt[2] != canonical_json(asdict(anchor))
                     or attempt[3:5] !=
@@ -11689,27 +16528,30 @@ class GraphCoordinator:
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("natural review write fence stale; HOLD")
         try:
-            with store._lock:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                        raise StaleRead("natural review graph changed before write")
-                    saved = self._commit_natural_review_locked(
-                        namespace, parent_original_id, installed_bundle,
-                        content, now, metadata, epoch)
-                    changed = db.execute(
-                        "UPDATE graph_natural_review_attempts_v2 "
-                        "SET state='committed' WHERE bot=? AND persona=? "
-                        "AND parent_original_id=? AND attempt_id=? "
-                        "AND state='open'",
-                        namespace.as_tuple + (parent_original_id, attempt_id),
-                    ).rowcount
-                    if changed != 1:
-                        raise EventConflict("natural review write attempt differs")
-                    db.execute("COMMIT")
-                except BaseException:
-                    db.execute("ROLLBACK")
-                    raise
+            from .runtime.natural_producer_qualification_v1 import host_natural_producer_context_v1
+            with host_natural_producer_context_v1(self, scope=scope,
+                    parent_original_id=parent_original_id, phase="frozen"):
+                with store._lock:
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                            raise StaleRead("natural review graph changed before write")
+                        saved = self._commit_natural_review_locked(
+                            namespace, parent_original_id, installed_bundle,
+                            content, now, metadata, epoch)
+                        changed = db.execute(
+                            "UPDATE graph_natural_review_attempts_v2 "
+                            "SET state='committed' WHERE bot=? AND persona=? "
+                            "AND parent_original_id=? AND attempt_id=? "
+                            "AND state='open'",
+                            namespace.as_tuple + (parent_original_id, attempt_id),
+                        ).rowcount
+                        if changed != 1:
+                            raise EventConflict("natural review write attempt differs")
+                        db.execute("COMMIT")
+                    except BaseException:
+                        db.execute("ROLLBACK")
+                        raise
         except BaseException:
             port.finish_fence(
                 scope, request_id="abort:" + attempt_id,
@@ -11735,31 +16577,31 @@ class GraphCoordinator:
 
     def acquire_post_c02_natural_generation_v2(
         self, authority: AuthorityContext, lease: object,
-        c02_operation_id: str, installed_bundle, *, lease_seconds: int,
-    ):
+        c02_operation_id: str, installed_bundle, *, lease_seconds: int, _prepared_full_read=None):
         return self._acquire_post_c02_natural_stage_v2(
             authority, lease, c02_operation_id, installed_bundle,
-            lease_seconds=lease_seconds, stage="generation")
+            lease_seconds=lease_seconds, stage="generation", _prepared_full_read=_prepared_full_read)
 
     def acquire_post_c02_natural_review_v2(
         self, authority: AuthorityContext, lease: object,
-        parent_original_id: str, installed_bundle, *, lease_seconds: int,
-    ):
+        parent_original_id: str, installed_bundle, *, lease_seconds: int, _prepared_full_read=None):
         return self._acquire_post_c02_natural_stage_v2(
             authority, lease, parent_original_id, installed_bundle,
-            lease_seconds=lease_seconds, stage="review")
+            lease_seconds=lease_seconds, stage="review", _prepared_full_read=_prepared_full_read)
 
     def _acquire_post_c02_natural_stage_v2(
         self, authority: AuthorityContext, lease: object,
         c02_operation_id: str, installed_bundle, *,
-        lease_seconds: int, stage: str,
+        lease_seconds: int, stage: str, _prepared_full_read=None,
     ):
         """Acquire one sealed natural paid call under the current graph fence."""
         from .authority_service.v2_contract import FencePermitV2
         from .host.authority_profile import AdminInstallationBundle
         from .model_broker.broker import ModelCallRequest
         from .runtime.natural_original_v3 import natural_generation_template_digest
-        from .model_broker.natural_review import REVIEW_TEMPLATE_DIGEST
+        from .model_broker.natural_review import (
+            REVIEW_TEMPLATE_DIGEST, REVIEW_TEMPLATE_DIGEST_V2, INPUT_SCHEMA_V2,
+        )
         from .runtime.d11_types import job_graph_write
         from .runtime.first_ingress_v2 import trusted_upper
         from .runtime.natural_generation_issue_v2 import (
@@ -11798,6 +16640,15 @@ class GraphCoordinator:
                 namespace=namespace,
                 template_version=workflow.template_version) is not True:
             raise UnavailableGuard("natural paid consumer unavailable; HOLD")
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(store._db) is not None and _prepared_full_read is None:
+            from .runtime.current_graph_full_read_v3 import NATURAL_MODEL_FULL_READ_V3
+            return self._prepare_full_read_then_call_v3(
+                authority, lease, NATURAL_MODEL_FULL_READ_V3,
+                lambda proof: self._acquire_post_c02_natural_stage_v2(
+                    authority, lease, c02_operation_id, installed_bundle,
+                    lease_seconds=lease_seconds, stage=stage, _prepared_full_read=proof),
+                deadline_utc=None, c02_operation_id=c02_operation_id)
         with store._lock:
             db = store._db
             install_attempt_schema(db)
@@ -11873,6 +16724,7 @@ class GraphCoordinator:
                 acquire_row[2], acquire_row[3], acquire_row[4],
                 "finish_reply_acquire")
             return job, binding.request
+        self.__local_module_admission.require_v1(('d09', 'd11'), "_acquire_post_c02_natural_stage_v2")
         if saved.state != "queued" or job.phase != "queued":
             raise UnavailableGuard("natural original job is not queued")
         reading = port.read_ingress_clock(self.__scene_clock_policy)
@@ -11939,186 +16791,194 @@ class GraphCoordinator:
             raise UnavailableGuard("natural acquire fence stale; HOLD")
         now_text = datetime.fromtimestamp(now, timezone.utc).isoformat().replace(
             "+00:00", "Z")
-        with store._lock:
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                    raise StaleRead("natural graph changed before acquire")
-                current = read_original_preparation(
-                    db, namespace, c02_operation_id, stage)
-                if current != saved or get_job(db, job.job_id) != job:
-                    raise UnavailableGuard("natural original job changed; HOLD")
-                (plan_write, _plan_reads, _current_frozen, current_reads,
-                 _query, _role_query, _boundary_query, barrier, scoped,
-                 _candidate, _snapshot) = (
-                    self._prepare_natural_generation_scope_locked(
-                        namespace, c02_operation_id, generation.seal.source_ref,
-                        installed_bundle, now, epoch,
-                        original_deadline=generation.frozen.input.plan.valid_until_utc,
-                        frozen_original=generation.frozen))
-                if (_current_frozen.input.plan != generation.frozen.input.plan
-                        or generation.frozen.input.plan.plan_ref.ref
-                           != plan_write.key.token):
-                    raise UnavailableGuard("natural original plan changed; HOLD")
-                if read_original_scoped_query_proof_v2(db, generation) != scoped:
-                    raise UnavailableGuard("natural original private scope changed; HOLD")
-                if ((barrier[0], barrier[1])
-                        != (saved.access_epoch, saved.deletion_epoch)
-                        or now >= generation.frozen.input.expires_at_utc
-                        or (stage == "review" and (
-                            generation.state != "terminal"
-                            or saved.seal.generation_original_operation_id
-                               != generation.seal.original_operation_id
-                            or saved.seal.generation_output_digest
-                               != generation.terminal_output_digest))):
-                    raise StaleRead("natural source barrier or deadline changed")
-                quote_ref = job.operator_versions["resource_quote"]
-                quote_id, quote_version = quote_ref.rsplit(":", 1)
-                quote = self.__d02_issuer.original_signed_quote(
-                    db, quote_id, int(quote_version))
-                reservation = db.execute(
-                    "SELECT state FROM runtime_budget_reservations "
-                    "WHERE lease_id=? AND operation_id=?",
-                    (seal.parent_budget_lease_id,
-                     seal.reservation_operation_id),
-                ).fetchone()
-                if (reservation != ("reserved",)
-                        or quote.operation_id != seal.reservation_operation_id
-                        or get_budget_lease(db, job.budget_ref).state != "active"
-                        or self.__d11_issuer.current_budget_grant(
-                            db, job.budget_ref)
-                           != installed_bundle.installation_policy.root_grant):
-                    raise UnavailableGuard("natural original budget changed; HOLD")
-                planned = plan_job_acquire(
-                    job, authority.actor, now_utc=now_text,
-                    lease_seconds=lease_seconds)
-                acquired = acquire_job(
-                    db, job.job_id, authority.actor, now_utc=now_text,
-                    lease_seconds=lease_seconds)
-                if acquired != planned:
-                    raise UnavailableGuard("natural D11 acquire CAS differed")
-                worker = replace(authority, worker_fence=acquired.fence)
-                job_write = job_graph_write(acquired)
-                job_atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (job_write.key.token,),
-                ).fetchone()
-                if (job_atom is None or job_atom[2] != 1
-                        or job_atom[0] != 1):
-                    raise UnavailableGuard("natural graph job changed; HOLD")
-                reads = tuple(dict.fromkeys((
-                    *current_reads, GraphVersion(plan_write.key, 1),
-                    GraphVersion(job_write.key, 2),
-                )))
-                guard = VersionGuard(
-                    reads, tuple(QueryEpoch(namespace, scope,
-                                            epoch.revision + 1)
-                                 for scope in ("all", "d03.role_binding",
-                                               "d05.boundary")),
-                    barrier[0], barrier[1],
-                    store._registry.catalogue_hash,
-                    self._version(db, namespace, "scheme", "current"),
-                    self._version(db, namespace, "operator", "current"),
-                    self._version(db, namespace, "policy", "current"),
-                    (), (), (),
-                )
-                source_row = db.execute(
-                    "SELECT value FROM graph_atoms WHERE token=?",
-                    (generation.seal.source_ref,),
-                ).fetchone()
-                if source_row is None:
-                    raise UnavailableGuard("natural original source absent")
-                record = SourceRecord.from_dict(json.loads(source_row[0]))
-                qualification = SourceQualification(
-                    (generation.seal.source_ref,), "reported", record.occurred_at,
-                    record.recorded_at, "external_report", "qualified",
-                    None, "not_applicable")
-                identity = OperationIdentity(
-                    job.activity_id, None, attempt_id, "natural_" + stage,
-                    seal.acquire_operation_id,
-                    canonical_digest({"input_refs": [generation.seal.source_ref]}))
-                deadline = min(
-                    datetime.fromisoformat(
-                        acquired.lease_expires_utc.replace("Z", "+00:00")
-                    ).timestamp(),
-                    datetime.fromisoformat(
-                        acquired.deadline_utc.replace("Z", "+00:00")
-                    ).timestamp(),
-                )
-                envelope = CommandEnvelope(
-                    RUNTIME_SCHEMA, identity, worker, guard, qualification,
-                    (generation.seal.source_ref,), job.budget_ref, deadline,
-                    reading.monotonic_after_seconds + (deadline - now),
-                    "natural-" + stage + ":" + c02_operation_id,
-                    (c02_operation_id, seal.original_operation_id),
-                )
-                call = ModelCallRequest(
-                    envelope, seal.call_id, workflow.provider_id,
-                    workflow.model_id,
-                    frozenset(workflow.required_capabilities),
-                    workflow.privacy_tier, (natural_generation_template_digest(saved.frozen) if stage == "generation"
-                                            else REVIEW_TEMPLATE_DIGEST),
-                    json.loads(saved.frozen.canonical_wire),
-                    workflow.timeout_seconds, workflow.max_output_tokens)
-                bind_original_call(db, saved, acquired, call)
-                reconcile_runtime_write(db, job_write)
-                graph_candidate = GraphCandidate(
-                    Event(Scope(*namespace.as_tuple, job.activity_id),
-                          seal.acquire_operation_id, now, "domain_bundle",
-                          {"bundle_digest": request_digest}),
-                    (GraphVersion(job_write.key, 1), *current_reads,
-                     GraphVersion(plan_write.key, 1)),
-                    (GraphWrite(job_write.key, job_write.value,
-                                (plan_write.key,)),), (epoch,),
-                )
-                receipt = GraphStore._graph_commit_in_transaction(
-                    store, graph_candidate,
-                    _capability=self.__graph_capability)
-                if receipt.status != "committed":
-                    raise EventConflict("natural acquire graph CAS failed")
-                store.cas_graph_recovery_metadata(
-                    metadata, metadata.requirements,
-                    _capability=self.__graph_capability)
-                seq_row = db.execute(
-                    "SELECT last_seq FROM graph_bundle_sequence "
-                    "WHERE bot=? AND persona=?", namespace.as_tuple,
-                ).fetchone()
-                seq = (seq_row[0] if seq_row else 0) + 1
-                db.execute(
-                    "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
-                    "VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET "
-                    "last_seq=excluded.last_seq",
-                    namespace.as_tuple + (seq,),
-                )
-                db.execute(
-                    "INSERT INTO graph_bundle_operations"
-                    "(bot,persona,operation_id,digest,activity_id,effect_id,"
-                    "commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (
-                        seal.acquire_operation_id, request_digest,
-                        job.activity_id, None, seq,
-                        canonical_json({
-                            "c02_operation_id": c02_operation_id,
-                            "plan_ref": plan_write.key.token,
-                            "job_ref": job_write.key.token,
-                            "call_id": seal.call_id,
-                            "typed_request_digest": call.digest,
-                            "ledger_refs": [job_write.key.token],
-                            "outbox_refs": [],
-                        }),
-                    ),
-                )
-                db.execute(
-                    f"UPDATE {acquire_table} "
-                    "SET state='committed' WHERE bot=? AND persona=? "
-                    "AND acquire_operation_id=? AND attempt_id=?",
-                    namespace.as_tuple + (
-                        seal.acquire_operation_id, attempt_id),
-                )
-                db.execute("COMMIT")
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
+        from .runtime.natural_producer_qualification_v1 import host_natural_producer_context_v1
+        with host_natural_producer_context_v1(self, scope=scope,
+                parent_original_id=c02_operation_id, phase="frozen"):
+            with store._lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("natural graph changed before acquire")
+                    current = read_original_preparation(
+                        db, namespace, c02_operation_id, stage)
+                    if current != saved or get_job(db, job.job_id) != job:
+                        raise UnavailableGuard("natural original job changed; HOLD")
+                    (plan_write, _plan_reads, _current_frozen, current_reads,
+                     _query, _role_query, _boundary_query, barrier, scoped,
+                     _candidate, _snapshot) = (
+                        self._prepare_natural_generation_scope_locked(
+                            namespace, c02_operation_id, generation.seal.source_ref,
+                            installed_bundle, now, epoch,
+                            original_deadline=generation.frozen.input.plan.valid_until_utc,
+                            frozen_original=generation.frozen))
+                    if (_current_frozen.input.plan != generation.frozen.input.plan
+                            or generation.frozen.input.plan.plan_ref.ref
+                               != plan_write.key.token):
+                        raise UnavailableGuard("natural original plan changed; HOLD")
+                    if read_original_scoped_query_proof_v2(db, generation) != scoped:
+                        raise UnavailableGuard("natural original private scope changed; HOLD")
+                    if ((barrier[0], barrier[1])
+                            != (saved.access_epoch, saved.deletion_epoch)
+                            or now >= generation.frozen.input.expires_at_utc
+                            or (stage == "review" and (
+                                generation.state != "terminal"
+                                or saved.seal.generation_original_operation_id
+                                   != generation.seal.original_operation_id
+                                or saved.seal.generation_output_digest
+                                   != generation.terminal_output_digest))):
+                        raise StaleRead("natural source barrier or deadline changed")
+                    quote_ref = job.operator_versions["resource_quote"]
+                    quote_id, quote_version = quote_ref.rsplit(":", 1)
+                    quote = self.__d02_issuer.original_signed_quote(
+                        db, quote_id, int(quote_version))
+                    reservation = db.execute(
+                        "SELECT state FROM runtime_budget_reservations "
+                        "WHERE lease_id=? AND operation_id=?",
+                        (seal.parent_budget_lease_id,
+                         seal.reservation_operation_id),
+                    ).fetchone()
+                    from .runtime.natural_reply_budget_v3 import resolve_natural_reply_budget_for_original_admission_v3
+                    actual_budget, actual_grant = resolve_natural_reply_budget_for_original_admission_v3(db,
+                        namespace=namespace, c02_operation_id=generation.seal.c02_operation_id,
+                        source_ref=generation.seal.source_ref, issuer=self.__d11_issuer,
+                        installed_bundle=installed_bundle, now_utc=now, original_preparation=generation)
+                    if (reservation != ("reserved",)
+                            or quote.operation_id != seal.reservation_operation_id
+                            or actual_budget.lease_id != job.budget_ref or actual_budget.state != "active"
+                            or self.__d11_issuer.current_budget_grant(db, job.budget_ref) != actual_grant):
+                        raise UnavailableGuard("natural original budget changed; HOLD")
+                    planned = plan_job_acquire(
+                        job, authority.actor, now_utc=now_text,
+                        lease_seconds=lease_seconds)
+                    acquired = acquire_job(
+                        db, job.job_id, authority.actor, now_utc=now_text,
+                        lease_seconds=lease_seconds)
+                    if acquired != planned:
+                        raise UnavailableGuard("natural D11 acquire CAS differed")
+                    worker = replace(authority, worker_fence=acquired.fence)
+                    job_write = job_graph_write(acquired)
+                    job_atom = read_graph_head_v3(db, job_write.key.token)
+                    if (job_atom is None or job_atom[2] != 1
+                            or job_atom[0] != 1):
+                        raise UnavailableGuard("natural graph job changed; HOLD")
+                    reads = tuple(dict.fromkeys((
+                        *current_reads, GraphVersion(plan_write.key, 1),
+                        GraphVersion(job_write.key, 2),
+                    )))
+                    guard = VersionGuard(
+                        reads, tuple(QueryEpoch(namespace, scope,
+                                                epoch.revision + 1)
+                                     for scope in ("all", "d03.role_binding",
+                                                   "d05.boundary")),
+                        barrier[0], barrier[1],
+                        store._registry.catalogue_hash,
+                        self._version(db, namespace, "scheme", "current"),
+                        self._version(db, namespace, "operator", "current"),
+                        self._version(db, namespace, "policy", "current"),
+                        (), (), (),
+                    )
+                    source_row = db.execute(
+                        "SELECT value FROM graph_atoms WHERE token=?",
+                        (generation.seal.source_ref,),
+                    ).fetchone()
+                    if source_row is None:
+                        raise UnavailableGuard("natural original source absent")
+                    record = SourceRecord.from_dict(json.loads(source_row[0]))
+                    qualification = SourceQualification(
+                        (generation.seal.source_ref,), "reported", record.occurred_at,
+                        record.recorded_at, "external_report", "qualified",
+                        None, "not_applicable")
+                    identity = OperationIdentity(
+                        job.activity_id, None, attempt_id, "natural_" + stage,
+                        seal.acquire_operation_id,
+                        canonical_digest({"input_refs": [generation.seal.source_ref]}))
+                    deadline = min(
+                        datetime.fromisoformat(
+                            acquired.lease_expires_utc.replace("Z", "+00:00")
+                        ).timestamp(),
+                        datetime.fromisoformat(
+                            acquired.deadline_utc.replace("Z", "+00:00")
+                        ).timestamp(),
+                    )
+                    envelope = CommandEnvelope(
+                        RUNTIME_SCHEMA, identity, worker, guard, qualification,
+                        (generation.seal.source_ref,), job.budget_ref, deadline,
+                        reading.monotonic_after_seconds + (deadline - now),
+                        "natural-" + stage + ":" + c02_operation_id,
+                        (c02_operation_id, seal.original_operation_id),
+                    )
+                    call = ModelCallRequest(
+                        envelope, seal.call_id, workflow.provider_id,
+                        workflow.model_id,
+                        frozenset(workflow.required_capabilities),
+                        workflow.privacy_tier, (natural_generation_template_digest(saved.frozen) if stage == "generation"
+                                                else (REVIEW_TEMPLATE_DIGEST_V2
+                                                      if json.loads(saved.frozen.canonical_input)["schema"] == INPUT_SCHEMA_V2
+                                                      else REVIEW_TEMPLATE_DIGEST)),
+                        json.loads(saved.frozen.canonical_wire),
+                        workflow.timeout_seconds, workflow.max_output_tokens)
+                    bind_original_call(db, saved, acquired, call)
+                    reconcile_runtime_write(db, job_write)
+                    graph_candidate = GraphCandidate(
+                        Event(Scope(*namespace.as_tuple, job.activity_id),
+                              seal.acquire_operation_id, now, "domain_bundle",
+                              {"bundle_digest": request_digest}),
+                        (GraphVersion(job_write.key, 1), *current_reads,
+                         GraphVersion(plan_write.key, 1)),
+                        (GraphWrite(job_write.key, job_write.value,
+                                    (plan_write.key,)),), (epoch,),
+                    )
+                    receipt = GraphStore._graph_commit_in_transaction(
+                        store, graph_candidate,
+                        _capability=self.__graph_capability)
+                    if receipt.status != "committed":
+                        raise EventConflict("natural acquire graph CAS failed")
+                    store.cas_graph_recovery_metadata(
+                        metadata, metadata.requirements,
+                        _capability=self.__graph_capability)
+                    seq_row = db.execute(
+                        "SELECT last_seq FROM graph_bundle_sequence "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone()
+                    seq = (seq_row[0] if seq_row else 0) + 1
+                    db.execute(
+                        "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
+                        "VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET "
+                        "last_seq=excluded.last_seq",
+                        namespace.as_tuple + (seq,),
+                    )
+                    db.execute(
+                        "INSERT INTO graph_bundle_operations"
+                        "(bot,persona,operation_id,digest,activity_id,effect_id,"
+                        "commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            seal.acquire_operation_id, request_digest,
+                            job.activity_id, None, seq,
+                            canonical_json({
+                                "c02_operation_id": c02_operation_id,
+                                "plan_ref": plan_write.key.token,
+                                "job_ref": job_write.key.token,
+                                "call_id": seal.call_id,
+                                "typed_request_digest": call.digest,
+                                "acquire_utc": now,
+                                "lease_seconds": lease_seconds,
+                                "expected_fence": job.fence,
+                                "ledger_refs": [job_write.key.token],
+                                "outbox_refs": [],
+                            }),
+                        ),
+                    )
+                    db.execute(
+                        f"UPDATE {acquire_table} "
+                        "SET state='committed' WHERE bot=? AND persona=? "
+                        "AND acquire_operation_id=? AND attempt_id=?",
+                        namespace.as_tuple + (
+                            seal.acquire_operation_id, attempt_id),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("natural acquired fence outcome unknown; HOLD")
         port.finish_fence(
@@ -12190,10 +17050,7 @@ class GraphCoordinator:
                 if _current_frozen.input.plan != generation.frozen.input.plan:
                     raise UnavailableGuard("natural adopted plan changed; HOLD")
                 job_key = job_graph_write(job).key
-                atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (job_key.token,),
-                ).fetchone()
+                atom = read_graph_head_v3(db, job_key.token)
                 expected_reads = tuple(dict.fromkeys((
                     *current_reads, GraphVersion(plan_write.key, 1),
                     GraphVersion(job_key, 2),
@@ -12235,18 +17092,18 @@ class GraphCoordinator:
                     (seal.parent_budget_lease_id,
                      seal.reservation_operation_id),
                 ).fetchone()
+                from .runtime.natural_reply_budget_v3 import resolve_natural_reply_budget_for_original_admission_v3
+                actual_budget, actual_grant = resolve_natural_reply_budget_for_original_admission_v3(db,
+                    namespace=namespace, c02_operation_id=generation.seal.c02_operation_id,
+                    source_ref=generation.seal.source_ref, issuer=self.__d11_issuer,
+                    installed_bundle=installed_bundle, now_utc=now, original_preparation=generation)
                 if (reservation is None or reservation[1:] != (
                         canonical_json(dict(quote.ceiling)), "reserved")
                         or quote.operation_id != seal.reservation_operation_id
-                        or get_budget_lease(db, job.budget_ref).state != "active"
-                        or self.__d11_issuer.current_budget_grant(
-                            db, job.budget_ref)
-                           != installed_bundle.installation_policy.root_grant):
+                        or actual_budget.lease_id != job.budget_ref or actual_budget.state != "active"
+                        or self.__d11_issuer.current_budget_grant(db, job.budget_ref) != actual_grant):
                     raise UnavailableGuard("natural current budget changed; HOLD")
-                source_atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (generation.seal.source_ref,),
-                ).fetchone()
+                source_atom = read_graph_head_v3(db, generation.seal.source_ref)
                 access_key_value = access_key(
                     *namespace.as_tuple,
                     AtomKey.from_token(generation.seal.source_ref).owner.subject)
@@ -12269,7 +17126,8 @@ class GraphCoordinator:
                 raise
 
         (prepared, anchor, metadata, epoch) = self._read_v2(
-            authority, reader, return_recovery_context=True)
+            authority, reader, return_recovery_context=True,
+            natural_parent_original_id=parent_original_id)
         saved, request, reservation_digest, quote, sources, accesses, _, _, job = prepared
         target = metadata.requirements
         draft = ModelEgressDraftV1(
@@ -12468,7 +17326,7 @@ class GraphCoordinator:
 
     def read_natural_paid_review_request_v2(
         self, authority: AuthorityContext, lease: object,
-        parent_original_id: str, installed_bundle,
+        parent_original_id: str, installed_bundle, *, same_batch_prepared=None,
     ):
         """Reserve a fresh read of both original paid calls, without text.
 
@@ -12484,7 +17342,7 @@ class GraphCoordinator:
         from .runtime.natural_review_issue_v2 import install_review_attempt_schema
 
         generation_request = self.read_natural_generation_content_request_v2(
-            authority, lease, parent_original_id, installed_bundle)
+            authority, lease, parent_original_id, installed_bundle, same_batch_prepared=same_batch_prepared)
         review_request = self.read_natural_review_output_request_v2(
             authority, lease, parent_original_id, installed_bundle)
         review_output = self.read_natural_review_terminal_receipt_v2(
@@ -12552,6 +17410,7 @@ class GraphCoordinator:
     def _verify_natural_paid_review_current_locked(
         self, namespace: NamespaceId, parent_original_id: str,
         installed_bundle, paid, now_utc: float, epoch: NamespaceEpoch,
+        *, same_batch_prepared=None,
     ):
         """Recheck Authority's two paid outputs in this graph transaction.
 
@@ -12617,7 +17476,7 @@ class GraphCoordinator:
             namespace, parent_original_id, generation.seal.source_ref,
             installed_bundle, now_utc, epoch,
             original_deadline=generation.frozen.input.plan.valid_until_utc,
-                        frozen_original=generation.frozen)
+                        frozen_original=generation.frozen, same_batch_prepared=same_batch_prepared)
         if (frozen.input.plan != generation.frozen.input.plan
                 or read_original_scoped_query_proof_v2(db, generation) != scoped
                 or (paid.access_epoch, paid.delete_epoch) != barrier):
@@ -12638,7 +17497,10 @@ class GraphCoordinator:
             if ((item.revision == 0 and row is not None)
                     or (item.revision > 0 and row != (item.revision, 1))):
                 raise UnavailableGuard("natural paid graph read changed; HOLD")
-        required = (*plan_reads, *candidate.read_versions,
+        from .runtime.natural_producer_qualification_v1 import CANDIDATE_TYPES
+        basis_reads = tuple(row for value in candidate for row in (
+            value.context.read_versions if type(value) in CANDIDATE_TYPES else value.read_versions))
+        required = (*plan_reads, *basis_reads,
                     GraphVersion(plan_write.key, frozen.input.plan.plan_ref.version))
         if any(paid_versions.get(item.key.token) != item for item in required):
             raise UnavailableGuard("natural qualified read closure differs; HOLD")
@@ -12681,7 +17543,7 @@ class GraphCoordinator:
         expression_policy = read_current_d09_expression_policy_v1(db, namespace)
         mechanical = verify_current_qualified_natural_reply_v2(
             paid.generation_output, plan=frozen.input.plan,
-            current_snapshot=snapshot, d06_candidates=(candidate,),
+            current_snapshot=snapshot, d06_candidates=candidate,
             current_reads=paid.current_read_versions,
             access_epoch=barrier[0], deletion_epoch=barrier[1],
             now_utc=now_utc, expression_policy=expression_policy.policy)
@@ -12701,7 +17563,7 @@ class GraphCoordinator:
             plan=frozen.input.plan, adopted=adopted,
             generation_output=paid.generation_output,
             review=review_candidate, paid_receipt=paid.paid_receipt,
-            current_snapshot=snapshot, d06_candidates=(candidate,),
+            current_snapshot=snapshot, d06_candidates=candidate,
             current_reads=paid.current_read_versions,
             access_epoch=barrier[0], deletion_epoch=barrier[1],
             now_utc=now_utc, paid_verifier=TrustedPaidRead(),
@@ -12764,7 +17626,7 @@ class GraphCoordinator:
                 db.execute("ROLLBACK")
                 raise
 
-        return self._read_v2(authority, reader)
+        return self._read_v2(authority, reader, natural_parent_original_id=parent_original_id)
 
     def read_natural_original_progress_v2(
             self, authority: AuthorityContext, lease: object,
@@ -12961,9 +17823,221 @@ class GraphCoordinator:
 
         return self._read_v2(authority, reader)
 
+    def maintain_natural_batch_disposition_v1(self, bootstrap, namespace, parent_original_id):
+        """Only the installed private authority may compile one D09 metadata CAS."""
+        from .runtime.natural_same_batch_history_v3 import commit_natural_disposition_maintenance_v1
+        return commit_natural_disposition_maintenance_v1(self, bootstrap, namespace, parent_original_id)
+
+    def _natural_reply_segment_scope_locked(self, namespace, parent_original_id, segment_index):
+        """Resolve only the sealed complete output; never reselect a parent plan."""
+        from .runtime.natural_reply_job_v2 import read_original_preparation
+        from .domains.d09.natural_reply import (
+            NATURAL_REPLY_OUTPUT_SCHEMA_V3, natural_semantic_ranges_v3,
+            natural_segment_identity_v3,
+        )
+        db = self.__store._db
+        if not self.__store._lock._is_owned() or not db.in_transaction:
+            raise RuntimeError("natural segment identity needs the pinned graph transaction")
+        generation = read_original_preparation(db, namespace, parent_original_id, "generation")
+        if generation is None or generation.state != "terminal":
+            raise UnavailableGuard("natural complete generation original is absent; HOLD")
+        plan = generation.frozen.input.plan
+        if generation.seal.schema != "sylanne.d09.natural_generation_seal.v5":
+            if type(segment_index) is not int or segment_index != 0:
+                raise UnavailableGuard("legacy natural original has exactly one segment; HOLD")
+            return generation, None, plan.final_operation_id, plan.final_effect_id, 1
+        review = read_original_preparation(db, namespace, parent_original_id, "review")
+        if (review is None or review.state != "terminal"
+                or review.seal.schema != "sylanne.d09.natural_review_seal.v5"):
+            raise UnavailableGuard("complete semantic review original is absent; HOLD")
+        data = json.loads(review.frozen.canonical_input)
+        output = {"schema": data["generation_output_schema"], "body": data["body"],
+                  "units": data["units"], "semantic_segments": data["semantic_segments"]}
+        if (output["schema"] != NATURAL_REPLY_OUTPUT_SCHEMA_V3
+                or canonical_digest(output) != generation.terminal_output_digest
+                or review.seal.generation_output_digest != generation.terminal_output_digest):
+            raise UnavailableGuard("complete semantic output original differs; HOLD")
+        count = len(natural_semantic_ranges_v3(output))
+        operation_id, effect_id, _ = natural_segment_identity_v3(plan, output, segment_index)
+        return generation, output, operation_id, effect_id, count
+
+    def read_natural_reply_batch_identity_v3(self, authority, lease, parent_original_id):
+        """Return finite child identities from existing paid originals, without sending."""
+        self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}), owner_read=True)
+        def reader():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                first = self._natural_reply_segment_scope_locked(authority.namespace, parent_original_id, 0)
+                result = tuple(self._natural_reply_segment_scope_locked(
+                    authority.namespace, parent_original_id, index)[2:4] for index in range(first[4]))
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return self._read_v2(authority, reader)
+
+    def _natural_parent_stop_original_locked(self, namespace, generation):
+        from .runtime.natural_same_batch_history_v3 import read_parent_stop_original_v3
+        if not self.__store._lock._is_owned() or not self.__store._db.in_transaction:
+            raise RuntimeError("parent stop needs a pinned graph transaction")
+        return read_parent_stop_original_v3(self.__store._db, namespace, generation)
+
+    def read_natural_original_resume_witness_v3(self, authority, lease, parent_original_id, installed_bundle):
+        """Classify the actual durable continuation; hints never authorize a new parent."""
+        from datetime import datetime
+        from .runtime.natural_reply_job_v2 import read_original_preparation, read_original_call_binding
+        from .runtime.natural_same_batch_history_v3 import NaturalReplyResumeWitnessV3
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.budget import get_budget_lease
+        from .authority_service.v2_execution_bridge import CurrentEffectReadV2
+        self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}), owner_read=True)
+        namespace, port = authority.namespace, self.__content_fence_v2
+        now = trusted_upper(port.read_ingress_clock(self.__dispatch_clock_policy))
+        captured = []
+        def initial():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                generation = read_original_preparation(db, namespace, parent_original_id, "generation")
+                if generation is None:
+                    raise UnavailableGuard("no durable natural parent continuation; HOLD")
+                review = read_original_preparation(db, namespace, parent_original_id, "review")
+                identities = (() if review is None or review.state != "terminal" else tuple(
+                    self._natural_reply_segment_scope_locked(namespace, parent_original_id, index)[2:4]
+                    for index in range(self._natural_reply_segment_scope_locked(namespace, parent_original_id, 0)[4])))
+                db.execute("COMMIT")
+                return generation, identities
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        generation, identities = self._read_v2(authority, initial)
+        def observe(scope):
+            owner, own_permit = port.get_current_owner_guard_for_fence(namespace=namespace,
+                authority_namespace=scope.authority_namespace, permit=scope.permit)
+            if own_permit != scope.permit or owner.installation_id != installed_bundle.installation_policy.installation_id:
+                raise UnavailableGuard("natural original has no current Owner qualification; HOLD")
+            effects = tuple(port.read_current_effect(namespace=namespace,
+                authority_namespace=scope.authority_namespace, effect_id=effect_id) for _, effect_id in identities)
+            captured[:] = [scope, effects]
+            return owner, effects
+        def read():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                current = read_original_preparation(db, namespace, parent_original_id, "generation")
+                if current != generation or self._natural_parent_stop_original_locked(namespace, current) is not None:
+                    raise UnavailableGuard("natural parent continuation changed or was stopped; HOLD")
+                job = get_job(db, generation.seal.job_id)
+                binding = read_original_call_binding(db, generation)
+                deadline = min(generation.frozen.input.expires_at_utc,
+                    generation.frozen.input.plan.valid_until_utc,
+                    datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
+                    binding.request.envelope.deadline_utc if binding is not None else float("inf"))
+                budget = get_budget_lease(db, generation.seal.parent_budget_lease_id)
+                budget_grant = self.__d11_issuer.current_budget_grant(db, budget.lease_id)
+                if (now < generation.frozen.input.frozen_at_utc or now >= deadline
+                        or budget.state != "active" or budget_grant.valid_until_utc <= now
+                        or (budget.bot_id, budget.persona_id) != namespace.as_tuple
+                        or job.cancel_epoch != 0 or job.phase not in {"queued", "running", "completed"}
+                        or job.operation_id != generation.seal.original_operation_id
+                        or job.budget_ref != generation.seal.parent_budget_lease_id
+                        or generation.state == "acquired" and (binding is None or job.fence != binding.worker_fence)
+                        or generation.state == "terminal" and job.phase != "completed"):
+                    raise UnavailableGuard("natural original execution scope expired or its job/budget/fence changed; HOLD")
+                metadata, epoch = self._v2_graph_stamp(namespace)
+                self._current_post_c02_reply_route_locked(namespace, parent_original_id,
+                    generation.seal.source_ref, now, epoch)
+                effects = captured[1]
+                next_index, mode = 0, "resume-original-stages"
+                if identities:
+                    mode, next_index = "recovery-only", len(identities) - 1
+                    for index, ((operation_id, effect_id), effect) in enumerate(zip(identities, effects)):
+                        if (type(effect) is not CurrentEffectReadV2 or effect.effect_id != effect_id
+                                or effect.namespace != metadata.requirements.authority_namespace
+                                or effect.authority_id != metadata.requirements.authority_id
+                                or effect.activation_generation != metadata.requirements.activation_generation):
+                            raise UnavailableGuard("natural original current effect identity differs; HOLD")
+                        if effect.state == "absent":
+                            from .runtime.dispatch_graph_claim import dispatch_claim_key
+                            claimed = db.execute("SELECT 1 FROM graph_atoms WHERE token=?",
+                                (dispatch_claim_key(namespace, effect_id).token,)).fetchone()
+                            next_index, mode = index, "recovery-only" if claimed else "resume-original-child"
+                            break
+                        if effect.state != "observed" or effect.observation_outcome not in {"accepted", "delivered"}:
+                            next_index, mode = index, "recovery-only"
+                            break
+                result = NaturalReplyResumeWitnessV3(self, namespace, parent_original_id,
+                    generation.seal.original_operation_id, deadline, mode, next_index, identities)
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return self._read_v2(authority, read, fence_observer=observe)
+
+    def read_natural_dispatch_resume_witness_v3(self, authority, lease, operation_id, installed_bundle):
+        """Derive the parent from the committed candidate, never from a caller flag."""
+        self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}), owner_read=True)
+        def reader():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                recovered = self._get_natural_dispatch_candidate_evidence_locked(authority.namespace, operation_id)
+                if recovered is None:
+                    raise UnavailableGuard("natural original dispatch candidate is absent; HOLD")
+                rows = db.execute("SELECT parent_original_id FROM graph_natural_generation_preparations_v2 "
+                    "WHERE bot=? AND persona=? AND original_operation_id=?",
+                    (*authority.namespace.as_tuple, recovered.evidence.generation_original_operation_id)).fetchall()
+                if len(rows) != 1:
+                    raise UnavailableGuard("natural dispatch parent is ambiguous; HOLD")
+                db.execute("COMMIT")
+                return rows[0][0]
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        parent = self._read_v2(authority, reader)
+        return self.read_natural_original_resume_witness_v3(authority, lease, parent, installed_bundle)
+
+    def _prepare_natural_same_batch_read_v3(self, authority, lease, parent_original_id):
+        """Read independent immutable observation originals outside Graph SQL."""
+        from .runtime.natural_same_batch_history_v3 import (
+            NaturalSameBatchPreparedV3, same_batch_observation_hints_v3)
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        def hints_reader():
+            db = self.__store._db
+            db.execute("BEGIN")
+            try:
+                from .runtime.natural_same_batch_history_v6 import same_batch_observation_hints_v6
+                from .runtime.natural_same_batch_history_v7 import same_batch_observation_hints_v7
+                result=same_batch_observation_hints_v7(db,authority.namespace,parent_original_id)
+                if result is None:
+                    result=same_batch_observation_hints_v6(db,authority.namespace,parent_original_id)
+                if result is None:
+                    result=same_batch_observation_hints_v3(db,authority.namespace,parent_original_id)
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        hints = self._read_v2(authority, hints_reader)
+        if hints is None or not hints[2]:
+            return None
+        captured = []
+        def observe(scope):
+            originals = tuple(self.__content_fence_v2.read_current_observation_receipt_v1(
+                namespace=authority.namespace, authority_namespace=scope.authority_namespace,
+                effect_id=effect_id) for _, effect_id in hints[2])
+            captured[:] = [scope.permit, originals]
+            return originals
+        return self._read_v2(authority, lambda: NaturalSameBatchPreparedV3(
+            self, authority.namespace, parent_original_id, canonical_digest(hints[0]),
+            captured[0], captured[1]), fence_observer=observe)
+
     def commit_post_c02_natural_final_v2(
             self, authority: AuthorityContext, lease: object,
-            parent_original_id: str, installed_bundle) -> CommitReceipt:
+            parent_original_id: str, installed_bundle, *, segment_index: int = 0, _prepared_full_read=None) -> CommitReceipt:
         """Commit the reviewed natural reply and its dispatch admission once.
 
         Both paid outputs are read through the installed Authority port.  The
@@ -13011,32 +18085,74 @@ class GraphCoordinator:
                 or authority.purpose != "expression"
                 or type(parent_original_id) is not str or not parent_original_id):
             raise UnavailableGuard("natural final installation is unavailable; HOLD")
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is not None and _prepared_full_read is None:
+            from .runtime.current_graph_full_read_v3 import NATURAL_ROUTE_FULL_READ_V3
+            return self._prepare_full_read_then_call_v3(
+                authority, lease, NATURAL_ROUTE_FULL_READ_V3,
+                lambda proof: self.commit_post_c02_natural_final_v2(authority, lease, parent_original_id, installed_bundle, segment_index=segment_index, _prepared_full_read=proof),
+                deadline_utc=None, c02_operation_id=parent_original_id)
         namespace = authority.namespace
         recovered = self._recover_committed_natural_final_v2(
-            authority, parent_original_id, installed_bundle)
+            authority, parent_original_id, installed_bundle, segment_index=segment_index)
         if recovered is not None:
             return recovered
+        if segment_index == 0:
+            from .runtime.natural_same_batch_history_v3 import close_unprepared_natural_parent_window_v1
+            window = close_unprepared_natural_parent_window_v1(self, namespace, parent_original_id)
+            if window["status"] in {"original_window_closed", "original_window_finished"}:
+                recovered = self._recover_committed_natural_final_v2(authority,parent_original_id,installed_bundle,segment_index=segment_index)
+                if recovered is not None:
+                    return recovered
+                raise UnavailableGuard("natural original first-final window is finished; a new authorized original is required; HOLD")
         proposal_authority = replace(authority, purpose="proposal")
+        same_batch_prepared = self._prepare_natural_same_batch_read_v3(proposal_authority, lease, parent_original_id)
         paid_request = self.read_natural_paid_review_request_v2(
-            proposal_authority, lease, parent_original_id, installed_bundle)
-        clock = port.read_ingress_clock(self.__dispatch_clock_policy)
+            proposal_authority, lease, parent_original_id, installed_bundle,
+            same_batch_prepared=same_batch_prepared)
+        clock, clock_original = port.read_ingress_clock_with_original_v4(self.__dispatch_clock_policy)
         if type(clock) is not VerifiedIngressClockV2:
             raise UnavailableGuard("natural final paired clock is absent; HOLD")
-        now = trusted_upper(clock)
+        now = clock_original.upper_for('natural_basis')
         paid = paid_port(paid_request, now_utc=now)
+        def read_final_basis():
+            db = store._db
+            db.execute("BEGIN")
+            try:
+                _metadata, _epoch = self._v2_graph_stamp(namespace)
+                result = self._verify_natural_paid_review_current_locked(
+                    namespace, parent_original_id, installed_bundle, paid,
+                    now, _epoch, same_batch_prepared=same_batch_prepared)
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        full_final, _basis_anchor, basis_metadata, basis_epoch = self._read_v2(
+            proposal_authority, read_final_basis, return_recovery_context=True,
+            natural_parent_original_id=parent_original_id)
         with store._lock:
             metadata, epoch = self._v2_graph_stamp(namespace)
+            if (metadata, epoch) != (basis_metadata, basis_epoch):
+                raise StaleRead("natural final basis changed after its actual read fence")
             db = store._db
             db.execute("BEGIN")
             try:
                 if paid.request != paid_request:
                     raise UnavailableGuard("natural paid response differs; HOLD")
-                final = self._verify_natural_paid_review_current_locked(
-                    namespace, parent_original_id, installed_bundle, paid,
-                    now, epoch)
+                generation, semantic_output, expected_operation, expected_effect, segment_count = (
+                    self._natural_reply_segment_scope_locked(namespace, parent_original_id, segment_index))
+                if self._natural_parent_stop_original_locked(namespace, generation) is not None:
+                    raise UnavailableGuard("natural parent reply was durably stopped; HOLD")
+                from .domains.d09.natural_reply import select_natural_final_segment_v3
+                final = (select_natural_final_segment_v3(full_final, plan=generation.frozen.input.plan,
+                    generation_output=semantic_output, segment_index=segment_index)
+                    if semantic_output is not None else full_final)
                 material = final.material
                 if material is None:
                     raise UnavailableGuard("natural final material is absent; HOLD")
+                if (material.final_operation_id, material.final_effect_id) != (expected_operation, expected_effect):
+                    raise UnavailableGuard("natural child identity differs from the complete original; HOLD")
                 operation_id = material.final_operation_id
                 previous = self._get_operation_fenced(authority, operation_id,
                                                       v2=True)
@@ -13051,11 +18167,34 @@ class GraphCoordinator:
                 if call is None:
                     raise UnavailableGuard("natural generation call is absent; HOLD")
                 scoped = read_original_scoped_query_proof_v2(db, generation)
+                if segment_index > 0:
+                    from .domains.d09.natural_reply import natural_segment_identity_v3
+                    preceding_operation, preceding_effect, _ = natural_segment_identity_v3(
+                        generation.frozen.input.plan, semantic_output, segment_index - 1)
+                    preceding = self._get_natural_dispatch_candidate_evidence_locked(namespace, preceding_operation)
+                    if (preceding is None or preceding.evidence.effect_id != preceding_effect
+                            or preceding.evidence.generation_original_operation_id != generation.seal.original_operation_id
+                            or preceding.evidence.review_original_operation_id != paid.paid_receipt.review_original_operation_id):
+                        raise UnavailableGuard("preceding natural bubble original differs; HOLD")
                 db.execute("COMMIT")
             except BaseException:
                 db.execute("ROLLBACK")
                 raise
         target = metadata.requirements
+        predecessor = None
+        if segment_index > 0:
+            from .domains.d09.natural_reply import natural_segment_identity_v3
+            preceding_operation, preceding_effect, _ = natural_segment_identity_v3(
+                generation.frozen.input.plan, semantic_output, segment_index - 1)
+            predecessor = port.read_current_effect(namespace=namespace,
+                authority_namespace=target.authority_namespace, effect_id=preceding_effect)
+            if (type(predecessor) is not CurrentEffectReadV2 or predecessor.state != "observed"
+                    or predecessor.observation_outcome not in {"accepted", "delivered"}
+                    or not predecessor.observation_id or predecessor.effect_id != preceding_effect
+                    or predecessor.authority_id != target.authority_id
+                    or predecessor.namespace != target.authority_namespace
+                    or predecessor.activation_generation != target.activation_generation):
+                raise UnavailableGuard("preceding natural bubble is unobserved or UNKNOWN; HOLD")
         anchor = port.current_anchor(
             namespace=namespace,
             authority_namespace=target.authority_namespace)
@@ -13087,196 +18226,311 @@ class GraphCoordinator:
             namespace, target.authority_namespace,
             target.activation_generation, "write", attempt_id,
             permit, anchor, epoch, metadata.graph_revision)
-        if port.validate_fence(scope) != permit:
-            raise UnavailableGuard("natural final write fence changed; HOLD")
-        owner_guard, owner_permit = port.get_current_owner_guard_for_fence(
-            namespace=namespace,
-            authority_namespace=target.authority_namespace, permit=permit)
-        current_effect = port.read_current_effect(
-            namespace=namespace,
-            authority_namespace=target.authority_namespace,
-            effect_id=material.final_effect_id)
-        effect_snapshot = port.read_current_effect_snapshot_for_write_fence(
-            namespace=namespace,
-            authority_namespace=target.authority_namespace, permit=permit)
-        if (type(owner_guard) is not OwnerAuthorizationGuardV1
-                or owner_permit != permit
-                or type(current_effect) is not CurrentEffectReadV2
-                or current_effect.state != "absent"
-                or type(effect_snapshot) is not AuthorityCurrentEffectSnapshotV2
-                or effect_snapshot.coverage != "complete"
-                or effect_snapshot.permit_digest
-                   != authority_canonical_digest(permit)):
-            raise UnavailableGuard("natural final current Authority proof differs; HOLD")
-        finish_id = "finish:" + attempt_id
-        finish_digest = "sha256:" + canonical_digest({
-            "action": "finish_natural_final", "attempt_id": attempt_id,
-            "permit_token": permit.token,
-        })
-        with store._lock:
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                    raise StaleRead("natural final graph changed before commit")
-                final = self._verify_natural_paid_review_current_locked(
-                    namespace, parent_original_id, installed_bundle, paid,
-                    now, epoch)
-                if final.material != material:
-                    raise UnavailableGuard("natural final paid material changed; HOLD")
-                inputs, route = self._current_post_c02_reply_route_locked(
-                    namespace, parent_original_id, material.source_ref.ref,
-                    now, epoch)
-                snapshot, query = self._dispatch_full_graph_snapshot_locked(
-                    namespace)
-                barrier = self._deletion_epochs_locked(db, namespace)
-                grant = installed_bundle.installation_policy.root_grant
-                identity = OperationIdentity(
-                    material.final_activity_id, material.final_effect_id,
-                    "natural-final-attempt:" + canonical_digest({
-                        "operation_id": operation_id})[:40],
-                    "post_c02_reply_dispatch", operation_id,
-                    canonical_digest({"input_refs": [material.source_ref.ref]}))
-                job_ref, outbox_ref, _ = post_c02_dispatch_runtime_refs_v2(
-                    namespace, identity)
-                deadline = min(
-                    generation.frozen.input.plan.valid_until_utc,
-                    now + installed_bundle.private_reply_dispatch.deadline_after_seconds,
-                    grant.valid_until_utc)
-                if now >= deadline:
-                    raise UnavailableGuard("natural final deadline expired; HOLD")
-                quote = self.__d11_issuer.issue_private_reply_dispatch_quote_v2(
-                    db, policy=installed_bundle.private_reply_dispatch,
-                    namespace=namespace, identity=identity,
-                    parent_grant=grant, deadline_utc=deadline,
-                    graph_job_ref=job_ref, outbox_refs=(outbox_ref,),
-                    now_utc=now)
-                db.execute(
-                    "INSERT OR IGNORE INTO graph_guard_versions"
-                    "(bot,persona,kind,ref,version) VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + (
-                        "resource_lease", quote.quote_id, str(quote.version)))
-                base = call.request.envelope
-                expression_policy = read_current_d09_expression_policy_v1(
-                    db, namespace)
-                current_reads = {version.key: version
-                                 for version in snapshot.versions}
-                for version in material.current_reads:
-                    previous = current_reads.get(version.key)
-                    if previous is not None and previous != version:
-                        raise StaleRead("natural paid read differs from current graph")
-                    current_reads[version.key] = version
-                policy_head = expression_policy.active_head_ref
-                previous = current_reads.get(policy_head.key)
-                if previous is not None and previous != policy_head:
-                    raise StaleRead("natural expression policy head changed")
-                current_reads[policy_head.key] = policy_head
-                guard = replace(
-                    base.version_guard,
-                    read_versions=tuple(current_reads[key]
-                                        for key in sorted(current_reads,
-                                                          key=lambda item: item.token)),
-                    query_epochs=(query,), access_epoch=barrier[0],
-                    delete_epoch=barrier[1], focus_lease_versions=(),
-                    resource_lease_versions=(VersionedRef(
-                        quote.quote_id, quote.version),))
-                envelope = replace(
-                    base, identity=identity, authority=authority,
-                    version_guard=guard,
-                    input_refs=(material.source_ref.ref,),
-                    parent_budget_lease_ref=grant.lease_id,
-                    deadline_utc=deadline,
-                    monotonic_deadline=time.monotonic() + 60,
-                    causation=(parent_original_id,))
-                reserve_budget(
-                    db, grant.lease_id, operation_id,
-                    budget_operation_digest(
-                        envelope, grant.lease_id, dict(quote.ceiling)),
-                    quote.ceiling)
-                stage, checks, social, _d08, _original_binding, _staged_binding, projected = (
-                    self._stage_natural_final_pregrant_locked(
-                        envelope=envelope, final=final, route=route,
-                        original_scope_proof=scoped,
-                        budget_grant=grant, resource_quote=quote,
-                        scope=scope, current_effect=current_effect,
-                        effect_snapshot=effect_snapshot,
-                        expected_access_delete_epoch=barrier,
-                        now_utc=now))
-                if social.status != "checks_candidate":
-                    raise UnavailableGuard("natural final social checks absent; HOLD")
-                adopted = decode_natural_plan_v2(next(
-                    atom.value for atom in snapshot.atoms
-                    if atom.key.token ==
-                    generation.frozen.input.plan.plan_ref.ref))
-                granted = self._freeze_natural_final_grant_locked(
-                    final, generation.frozen.input.plan, adopted,
-                    stage, checks, now_utc=now)
-                job = replace(
-                    self.__d11_issuer.job_for(envelope, db, now_utc=now),
-                    phase="waiting", wake_condition={
-                        "kind": "post_c02_reply_host_takeover",
-                        "operation_id": operation_id})
-                create_job(
-                    db, job, "job:" + canonical_digest({
-                        "natural_final_operation_id": operation_id,
-                        "job_ref": job_ref})[:48], canonical_digest(job))
-                prepared = prepare_natural_final_bundle_v2(
-                    envelope=stage.proposal.envelope, final=final,
-                    candidate=granted, schema=stage.schema,
-                    checks=checks, staged_d08=stage.proposal,
-                    quote=quote, budget_grant=grant,
-                    pre_reserved_job=job, now_utc=now)
-                if prepared.bundle is None:
-                    raise UnavailableGuard("natural final bundle unavailable; HOLD")
-                bound = prepared.bundle
+        graph_identity = port.read_natural_current_graph_identity_v1(namespace=namespace,
+            authority_namespace=target.authority_namespace)
+        from .runtime.natural_disposition_write_barrier_v1 import natural_graph_barrier_for_store_v1
+        with natural_graph_barrier_for_store_v1(store, graph_identity):
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("natural final write fence changed; HOLD")
+            owner_guard, owner_permit = port.get_current_owner_guard_for_fence(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace, permit=permit)
+            effect_observation = port.read_natural_final_effect_observation_v4(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                permit=permit, effect_id=material.final_effect_id)
+            current_effect = effect_observation.current_effect
+            effect_snapshot = effect_observation.effect_snapshot
+            if (type(owner_guard) is not OwnerAuthorizationGuardV1
+                    or owner_permit != permit
+                    or type(current_effect) is not CurrentEffectReadV2
+                    or current_effect.state != "absent"
+                    or type(effect_snapshot) is not AuthorityCurrentEffectSnapshotV2
+                    or effect_snapshot.coverage != "complete"
+                    or effect_snapshot.permit_digest
+                       != authority_canonical_digest(permit)):
+                raise UnavailableGuard("natural final current Authority proof differs; HOLD")
+            roster_original = None
+            if semantic_output is not None and segment_index == 0:
+                roster_original = port.prepare_natural_roster_original_v1(scope=scope, paid_request=paid_request)
+                if roster_original.payload["storage_commitment"] != graph_identity.storage_commitment:
+                    raise UnavailableGuard("natural first roster crossed the held current C09 inode; HOLD")
+            finish_id = "finish:" + attempt_id
+            finish_digest = "sha256:" + canonical_digest({
+                "action": "finish_natural_final", "attempt_id": attempt_id,
+                "permit_token": permit.token,
+            })
+            from .runtime.natural_producer_qualification_v1 import host_natural_producer_context_v1
+            with host_natural_producer_context_v1(self, scope=scope,
+                    parent_original_id=parent_original_id, phase="frozen"):
+                with store._lock:
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                            raise StaleRead("natural final graph changed before commit")
+                        full_current = self._verify_natural_paid_review_current_locked(
+                            namespace, parent_original_id, installed_bundle, paid,
+                            now, epoch, same_batch_prepared=same_batch_prepared)
+                        if full_current != full_final or self._natural_parent_stop_original_locked(namespace, generation) is not None:
+                            raise UnavailableGuard("complete natural original changed or parent stopped; HOLD")
+                        final = (select_natural_final_segment_v3(full_current, plan=generation.frozen.input.plan,
+                            generation_output=semantic_output, segment_index=segment_index)
+                            if semantic_output is not None else full_current)
+                        if final.material != material:
+                            raise UnavailableGuard("natural final paid material changed; HOLD")
+                        inputs, route = self._current_post_c02_reply_route_locked(
+                            namespace, parent_original_id, material.source_ref.ref,
+                            now, epoch)
+                        snapshot, query = self._dispatch_full_graph_snapshot_locked(
+                            namespace)
+                        barrier = self._deletion_epochs_locked(db, namespace)
+                        from .runtime.natural_reply_budget_v3 import resolve_natural_reply_budget_for_original_admission_v3
+                        _budget, grant = resolve_natural_reply_budget_for_original_admission_v3(db,
+                            namespace=namespace, c02_operation_id=generation.seal.c02_operation_id,
+                            source_ref=generation.seal.source_ref, issuer=self.__d11_issuer,
+                            installed_bundle=installed_bundle, now_utc=now, original_preparation=generation)
+                        identity = OperationIdentity(
+                            material.final_activity_id, material.final_effect_id,
+                            "natural-final-attempt:" + canonical_digest({
+                                "operation_id": operation_id})[:40],
+                            "post_c02_reply_dispatch", operation_id,
+                            canonical_digest({"input_refs": [material.source_ref.ref]}))
+                        job_ref, outbox_ref, _ = post_c02_dispatch_runtime_refs_v2(
+                            namespace, identity)
+                        deadline = min(
+                            generation.frozen.input.plan.valid_until_utc,
+                            call.request.envelope.deadline_utc,
+                            datetime.fromisoformat(get_job(db, generation.seal.job_id).deadline_utc.replace("Z", "+00:00")).timestamp(),
+                            now + installed_bundle.private_reply_dispatch.deadline_after_seconds,
+                            grant.valid_until_utc)
+                        if now >= deadline:
+                            raise UnavailableGuard("natural final deadline expired; HOLD")
+                        quote = self.__d11_issuer.issue_private_reply_dispatch_quote_v2(
+                            db, policy=installed_bundle.private_reply_dispatch,
+                            namespace=namespace, identity=identity,
+                            parent_grant=grant, deadline_utc=deadline,
+                            graph_job_ref=job_ref, outbox_refs=(outbox_ref,),
+                            now_utc=now)
+                        db.execute(
+                            "INSERT OR IGNORE INTO graph_guard_versions"
+                            "(bot,persona,kind,ref,version) VALUES(?,?,?,?,?)",
+                            namespace.as_tuple + (
+                                "resource_lease", quote.quote_id, str(quote.version)))
+                        base = call.request.envelope
+                        expression_policy = read_current_d09_expression_policy_v1(
+                            db, namespace)
+                        current_reads = {version.key: version
+                                         for version in snapshot.versions}
+                        for version in material.current_reads:
+                            previous = current_reads.get(version.key)
+                            if previous is not None and previous != version:
+                                raise StaleRead("natural paid read differs from current graph")
+                            current_reads[version.key] = version
+                        policy_head = expression_policy.active_head_ref
+                        previous = current_reads.get(policy_head.key)
+                        if previous is not None and previous != policy_head:
+                            raise StaleRead("natural expression policy head changed")
+                        current_reads[policy_head.key] = policy_head
+                        guard = replace(
+                            base.version_guard,
+                            read_versions=tuple(current_reads[key]
+                                                for key in sorted(current_reads,
+                                                                  key=lambda item: item.token)),
+                            query_epochs=(query,), access_epoch=barrier[0],
+                            delete_epoch=barrier[1], focus_lease_versions=(),
+                            resource_lease_versions=(VersionedRef(
+                                quote.quote_id, quote.version),))
+                        envelope = replace(
+                            base, identity=identity, authority=authority,
+                            version_guard=guard,
+                            input_refs=(material.source_ref.ref,),
+                            parent_budget_lease_ref=grant.lease_id,
+                            deadline_utc=deadline,
+                            monotonic_deadline=min(base.monotonic_deadline,
+                                time.monotonic() + max(0.0, deadline - now)),
+                            causation=(parent_original_id,) + ((preceding_operation,) if predecessor is not None else ()))
+                        reserve_budget(
+                            db, grant.lease_id, operation_id,
+                            budget_operation_digest(
+                                envelope, grant.lease_id, dict(quote.ceiling)),
+                            quote.ceiling)
+                        stage, checks, social, _d08, _original_binding, _staged_binding, projected = (
+                            self._stage_natural_final_pregrant_locked(
+                                envelope=envelope, final=final, route=route,
+                                original_scope_proof=scoped,
+                                budget_grant=grant, resource_quote=quote,
+                                scope=scope, current_effect=current_effect,
+                                effect_snapshot=effect_snapshot,
+                                expected_access_delete_epoch=barrier,
+                                now_utc=now, semantic_segment=semantic_output is not None))
+                        if social.status != "checks_candidate":
+                            raise UnavailableGuard("natural final social checks absent; HOLD")
+                        adopted = decode_natural_plan_v2(next(
+                            atom.value for atom in snapshot.atoms
+                            if atom.key.token ==
+                            generation.frozen.input.plan.plan_ref.ref))
+                        granted = self._freeze_natural_final_grant_locked(
+                            final, generation.frozen.input.plan, adopted,
+                            stage, checks, now_utc=now, full_final=full_current,
+                            generation_output=semantic_output, segment_index=segment_index)
+                        job = replace(
+                            self.__d11_issuer.job_for(envelope, db, now_utc=now),
+                            phase="waiting", wake_condition={
+                                "kind": "post_c02_reply_host_takeover",
+                                "operation_id": operation_id})
+                        create_job(
+                            db, job, "job:" + canonical_digest({
+                                "natural_final_operation_id": operation_id,
+                                "job_ref": job_ref})[:48], canonical_digest(job))
+                        prepared = prepare_natural_final_bundle_v2(
+                            envelope=stage.proposal.envelope, final=final,
+                            candidate=granted, schema=stage.schema,
+                            checks=checks, staged_d08=stage.proposal,
+                            quote=quote, budget_grant=grant,
+                            pre_reserved_job=job, now_utc=now,
+                            semantic_plan=generation.frozen.input.plan if semantic_output is not None else None,
+                            generation_output=semantic_output, segment_index=segment_index)
+                        if prepared.bundle is None:
+                            raise UnavailableGuard("natural final bundle unavailable; HOLD")
+                        bound = prepared.bundle
+                        if semantic_output is not None:
+                            from .runtime.natural_same_batch_history_v3 import (
+                                read_natural_roster_head_v1,
+                                require_natural_roster_continuation_v1,
+                            )
+                            head = read_natural_roster_head_v1(db, namespace, parent_original_id)
+                            if head is None:
+                                if segment_index != 0:
+                                    raise UnavailableGuard("natural later child lacks its adopted whole roster; HOLD")
+                                from .domains.d09.natural_disposition_v1 import natural_disposition_from_wire_v1, natural_disposition_write_v1
+                                if roster_original is None or roster_original.kind != "roster_prepared":
+                                    raise UnavailableGuard("natural first roster lacks actual independent Core preparation; HOLD")
+                                roster_value = natural_disposition_from_wire_v1(roster_original.payload["expected_next_value"])
+                                if (roster_value.namespace != namespace or roster_value.parent_original_id != parent_original_id
+                                        or roster_value.whole_output_digest != generation.terminal_output_digest
+                                        or roster_value.creation_operation_id != operation_id):
+                                    raise UnavailableGuard("natural independent roster preparation differs from the actual first child; HOLD")
+                                roster = natural_disposition_write_v1(roster_value)
+                                roster_read = GraphVersion(roster.key, 0)
+                            else:
+                                roster = None
+                                roster_read = require_natural_roster_continuation_v1(db, namespace, parent_original_id, segment_index)
+                                if (head[2].whole_output_digest != generation.terminal_output_digest
+                                        or head[2].children[segment_index].operation_id != operation_id
+                                        or head[2].children[segment_index].effect_id != material.final_effect_id):
+                                    raise UnavailableGuard("natural adopted roster child identity differs; HOLD")
+                            refs = {v.key: v for v in bound.envelope.version_guard.read_versions}
+                            refs[roster_read.key] = roster_read
+                            roster_envelope = replace(bound.envelope, version_guard=replace(bound.envelope.version_guard,
+                                read_versions=tuple(refs[k] for k in sorted(refs, key=lambda k:k.token))))
+                            bound = replace(bound, envelope=roster_envelope, proposals=tuple(replace(proposal,
+                                envelope=roster_envelope,
+                                typed_writes=proposal.typed_writes + ((roster,) if roster is not None and proposal.domain == "d09" else ()))
+                                for proposal in bound.proposals))
 
-                def issue(db, graph_receipt, evidence, _admissions):
-                    runtime, binding, current_snapshot, current_query, projection = (
-                        self._reissue_natural_final_after_graph_locked(
-                            bundle=bound, final=final, paid=paid,
-                            candidate=evidence, stage=stage, scope=scope,
-                            route=route, original_scope_proof=scoped,
-                            budget_grant=grant, resource_quote=quote,
-                            current_effect=current_effect,
-                            effect_snapshot=effect_snapshot,
-                            provisional_checks=checks,
-                            projected_check_versions=projected,
-                            now_utc=now))
-                    admission, request = issue_natural_dispatch_admission_v2(
-                        db=db, bundle=bound, evidence=evidence,
-                        final=final, runtime=runtime, checks=checks,
-                        graph_receipt=graph_receipt, scope=scope,
-                        clock_reading=clock,
-                        clock_policy=self.__dispatch_clock_policy,
-                        owner_guard=owner_guard,
-                        current_effect=current_effect,
-                        effect_snapshot=effect_snapshot,
-                        route=binding, snapshot=current_snapshot,
-                        query=current_query, projection=projection,
-                        now_utc=now)
-                    insert_admission(db, admission, request)
-                    return admission, request
+                        def issue(db, graph_receipt, evidence, _admissions):
+                            budget_originals = []
+                            catalogue_originals = []
+                            runtime, binding, current_snapshot, current_query, projection, current_checks = (
+                                self._reissue_natural_final_after_graph_locked(
+                                    bundle=bound, final=final, paid=paid,
+                                    candidate=evidence, stage=stage, scope=scope,
+                                    route=route, original_scope_proof=scoped,
+                                    budget_grant=grant, resource_quote=quote,
+                                    current_effect=current_effect,
+                                    effect_snapshot=effect_snapshot,
+                                    provisional_checks=checks,
+                                    projected_check_versions=projected,
+                                    now_utc=now,
+                                    natural_budget_original_receiver=budget_originals.append,
+                                    natural_catalogue_original_receiver=catalogue_originals.append))
+                            if len(budget_originals) != 1 or len(catalogue_originals) != 1:
+                                raise UnavailableGuard('natural final actual budget/catalogue check originals absent')
+                            admission, request = issue_natural_dispatch_admission_v2(
+                                db=db, bundle=bound, evidence=evidence,
+                                final=final, runtime=runtime, checks=current_checks,
+                                graph_receipt=graph_receipt, scope=scope,
+                                clock_reading=clock,
+                                clock_policy=self.__dispatch_clock_policy,
+                                owner_guard=owner_guard,
+                                current_effect=current_effect,
+                                effect_snapshot=effect_snapshot,
+                                route=binding, snapshot=current_snapshot,
+                                query=current_query, projection=projection,
+                                now_utc=now)
+                            insert_admission(db, admission, request)
+                            from .runtime.natural_final_authorization_original_v3 import _capture_natural_final_authorization_original_v4
+                            original=_capture_natural_final_authorization_original_v4(
+                                coordinator=self,db=db,bundle=bound,evidence=evidence,graph_receipt=graph_receipt,
+                                scope=scope,clock_reading=clock,clock_policy=self.__dispatch_clock_policy,
+                                owner_guard=owner_guard,current_effect=current_effect,effect_snapshot=effect_snapshot,
+                                route=binding,snapshot=current_snapshot,query=current_query,projection=projection,
+                                checks=current_checks,now_utc=now,admission=admission,request=request,
+                                clock_original=clock_original,effect_observation=effect_observation,
+                                budget_original=budget_originals[0],catalogue_original=catalogue_originals[0])
+                            return admission, request, original
 
-                receipt = self._commit_domain_bundle_fenced(
-                    bound, lease, in_transaction=True,
-                    v2_write=(metadata, epoch, finish_id, finish_digest,
-                              canonical_json(to_wire(permit))),
-                    now_utc=now, dispatch_clock_reading=clock,
-                    natural_final_admission=issue)
-                db.execute("COMMIT")
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
+                        receipt = self._commit_domain_bundle_fenced(
+                            bound, lease, in_transaction=True,
+                            v2_write=(metadata, epoch, finish_id, finish_digest,
+                                      canonical_json(to_wire(permit))),
+                            now_utc=now, dispatch_clock_reading=clock,
+                             dispatch_clock_original=clock_original,
+                            natural_final_admission=issue,
+                            _prepared_full_read=_prepared_full_read,
+                            _full_read_write_scope=scope)
+                        db.execute("COMMIT")
+                    except BaseException:
+                        db.execute("ROLLBACK")
+                        raise
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("natural final permit changed after commit; HOLD")
+        if roster_original is not None:
+            port.confirm_natural_disposition_original_v1(scope=scope, original_ref=roster_original.original_ref)
         port.finish_fence(scope, request_id=finish_id,
                           request_digest=finish_digest)
         return receipt
 
+    def _confirm_natural_roster_head_v1(self, namespace, head, authority_namespace):
+        """Require independently committed birth and current metadata before P2."""
+        from .authority_service.v2_contract import from_wire
+        from .domains.d09.natural_disposition_v1 import natural_disposition_from_wire_v1
+        if head is None:
+            raise UnavailableGuard("natural dispatch has no adopted whole roster; HOLD")
+        value = head[2]
+        port = self.__content_fence_v2
+        seen = set()
+        for ref in (value.birth_original_ref, value.authority_original_ref):
+            if ref in seen:
+                continue
+            seen.add(ref)
+            prepared = port.read_natural_disposition_original_v1(namespace=namespace,
+                authority_namespace=authority_namespace, original_ref=ref)
+            expected = natural_disposition_from_wire_v1(prepared.payload["expected_next_value"])
+            if (prepared.kind not in {"roster_prepared", "maintenance_prepared"}
+                    or expected.namespace != namespace or expected.parent_original_id != value.parent_original_id
+                    or prepared.payload["roster_ref"] != head[0].token
+                    or ref == value.birth_original_ref and prepared.kind != "roster_prepared"
+                    or ref == value.authority_original_ref and expected != value):
+                raise UnavailableGuard("natural roster lacks its exact independent adopted Core payload; HOLD")
+            permit = from_wire(prepared.payload["permit"])
+            scope = FenceScope(namespace, authority_namespace, permit.generation, "write", permit.operation_id,
+                permit, permit.pinned_anchor, NamespaceEpoch(*namespace.as_tuple, prepared.payload["graph_epoch"]),
+                prepared.payload["graph_revision"])
+            confirmed = port.confirm_natural_disposition_original_v1(scope=scope, original_ref=prepared.original_ref)
+            if (confirmed.payload["prepared_original_digest"] != prepared.digest
+                    or confirmed.payload["next_payload_digest"] != prepared.payload["next_payload_digest"]):
+                raise UnavailableGuard("natural roster Core committed fact differs; HOLD")
+        current = port.plan_natural_disposition_maintenance_v1(namespace=namespace,
+            authority_namespace=authority_namespace, parent_original_id=value.parent_original_id)
+        if (current is None or current.request.roster_ref != head[0].token
+                or current.request.expected_revision != head[1]):
+            raise UnavailableGuard("natural roster is not the current independently committed head; HOLD")
+        return head
+
     def _recover_committed_natural_final_v2(
-            self, authority, parent_original_id, installed_bundle):
+            self, authority, parent_original_id, installed_bundle, *, segment_index=0):
         """Finish only the original committed natural write after a lost ACK."""
         from .authority_service.v2_contract import FencePermitV2, from_wire
-        from .runtime.natural_reply_job_v2 import read_original_preparation
 
         namespace = authority.namespace
         store, port = self.__store, self.__content_fence_v2
@@ -13284,17 +18538,15 @@ class GraphCoordinator:
             db = store._db
             db.execute("BEGIN")
             try:
-                generation = read_original_preparation(
-                    db, namespace, parent_original_id, "generation")
-                if generation is None:
+                from .runtime.natural_same_batch_history_v3 import read_natural_roster_head_v1
+                head = read_natural_roster_head_v1(db, namespace, parent_original_id)
+                if head is None:
                     db.execute("COMMIT")
                     return None
-                if generation.seal.installation_id != (
-                        installed_bundle.installation_policy.installation_id):
-                    raise UnavailableGuard(
-                        "natural final original installation differs; HOLD")
-                plan = generation.frozen.input.plan
-                operation_id = plan.final_operation_id
+                if (head[2].installation_id != installed_bundle.installation_policy.installation_id
+                        or type(segment_index) is not int or not 0 <= segment_index < len(head[2].children)):
+                    raise UnavailableGuard("natural final recovery adopted roster scope differs; HOLD")
+                operation_id = head[2].children[segment_index].operation_id
                 receipt = self._get_operation_fenced(
                     authority, operation_id, v2=True)
                 if receipt is None:
@@ -13308,8 +18560,16 @@ class GraphCoordinator:
                     "AND operation_id=?",
                     namespace.as_tuple + (operation_id,),
                 ).fetchone()
-                recovered = self._get_natural_dispatch_candidate_evidence_locked(
-                    namespace, operation_id)
+                candidate = db.execute("SELECT json_extract(receipt_json,'$.natural_dispatch_candidate.graph_epoch'),"
+                    "json_extract(receipt_json,'$.natural_dispatch_candidate.refs[3][0]'),"
+                    "json_extract(receipt_json,'$.natural_dispatch_candidate.refs[3][1]') "
+                    "FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (operation_id,)).fetchone()
+                lineage = None if candidate is None else db.execute("SELECT event_id,valid,"
+                    "json_extract(value,'$.paid_review.generation_original_operation_id'),"
+                    "json_extract(value,'$.paid_review.review_original_operation_id'),"
+                    "json_extract(value,'$.segment.payload_digest') FROM graph_history WHERE token=? AND revision=?",
+                    candidate[1:]).fetchone()
                 admission = db.execute(
                     "SELECT admission_ref FROM graph_dispatch_admissions "
                     "WHERE bot=? AND persona=? AND operation_id=? AND effect_id=?",
@@ -13318,10 +18578,9 @@ class GraphCoordinator:
                 if (row is None or row[0] != receipt.digest
                         or row[4:6] != (
                             row[2] + 1, row[3] + 1)
-                        or recovered is None or admission is None
-                        or recovered.graph_epoch != row[5]
-                        or recovered.evidence.generation_original_operation_id
-                           != generation.seal.original_operation_id
+                        or candidate is None or admission is None or candidate[0] != row[5]
+                        or lineage != (operation_id, 1, head[2].generation_original_operation_id,
+                            head[2].review_original_operation_id, head[2].children[segment_index].payload_digest)
                         or receipt.operation_id != operation_id):
                     raise UnavailableGuard(
                         "natural final committed recovery seal differs; HOLD")
@@ -13340,6 +18599,7 @@ class GraphCoordinator:
                 or permit.holder != self.__holder
                 or permit.namespace != metadata.requirements.authority_namespace):
             raise UnavailableGuard("natural final original permit differs; HOLD")
+        self._confirm_natural_roster_head_v1(namespace, head, metadata.requirements.authority_namespace)
         original, state = port.get_fence_operation(
             namespace=namespace,
             authority_namespace=metadata.requirements.authority_namespace,
@@ -13502,6 +18762,7 @@ class GraphCoordinator:
                 namespace, metadata, epoch, anchor, attempt[1], attempt[2],
                 attempt[3], attempt[4], "finish_reply_job")
             return saved
+        self.__local_module_admission.require_v1(('d09', 'd11'), "prepare_post_c02_reply_model_job_v1")
         if attempt is not None and attempt[5] == "committed":
             raise UnavailableGuard("reply committed fence lacks job; HOLD")
         if attempt is not None and attempt[5] == "open":
@@ -13819,6 +19080,7 @@ class GraphCoordinator:
                 namespace, metadata, epoch, anchor, attempt[1], attempt[2],
                 attempt[3], attempt[4], "finish_reply_job")
             return saved
+        self.__local_module_admission.require_v1(('d09', 'd11'), "prepare_post_c02_context_reply_model_job_v2")
         ready = getattr(port, "context_reply_paid_consumer_ready_v2", None)
         try:
             consumer_ready = (callable(ready) and ready(
@@ -14245,6 +19507,7 @@ class GraphCoordinator:
             try:
                 if self._v2_graph_stamp(namespace) != (metadata, epoch):
                     raise StaleRead("context reply graph changed before acquire intent")
+                self.__local_module_admission.require_v1(('d09', 'd11'), "acquire_post_c02_context_reply_model_job_v2")
                 if acquire_row is None:
                     attempt_id = "context-reply-acquire-" + secrets.token_hex(24)
                     db.execute(
@@ -14347,10 +19610,7 @@ class GraphCoordinator:
                     lease_seconds=lease_seconds)
                 worker_authority = replace(authority, worker_fence=planned.fence)
                 job_key = job_graph_write(job).key
-                job_atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (job_key.token,),
-                ).fetchone()
+                job_atom = read_graph_head_v3(db, job_key.token)
                 if (job_atom is None or job_atom[2] != 1
                         or json.loads(job_atom[1]) != job_graph_write(job).value):
                     raise ContextReplyJobHold("context reply graph job differs")
@@ -14768,10 +20028,7 @@ class GraphCoordinator:
                 if current != saved or running != job:
                     raise StaleRead("natural paid original changed")
                 before = job_graph_write(job)
-                atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (before.key.token,),
-                ).fetchone()
+                atom = read_graph_head_v3(db, before.key.token)
                 if (atom is None or atom[2] != 1
                         or json.loads(atom[1]) != before.value):
                     raise UnavailableGuard("natural paid graph job differs; HOLD")
@@ -14934,7 +20191,7 @@ class GraphCoordinator:
 
     def read_natural_generation_content_request_v2(
         self, authority: AuthorityContext, lease: object,
-        parent_original_id: str, installed_bundle, *, attempt: int = 1,
+        parent_original_id: str, installed_bundle, *, attempt: int = 1, same_batch_prepared=None,
     ):
         """Derive a review-only content request from the paid terminal row."""
         from .authority_service.v2_natural_generation_content_contract import (
@@ -15006,7 +20263,7 @@ class GraphCoordinator:
                     namespace, parent_original_id, seal.source_ref,
                     installed_bundle, now, epoch,
                     original_deadline=saved.frozen.input.plan.valid_until_utc,
-                    frozen_original=saved.frozen))
+                    frozen_original=saved.frozen, same_batch_prepared=same_batch_prepared))
                 if (output.status != "untrusted_content_candidate"
                         or output.request.original_operation_id !=
                            seal.original_operation_id
@@ -15050,7 +20307,7 @@ class GraphCoordinator:
                 db.execute("ROLLBACK")
                 raise
 
-        return self._read_v2(authority, reader)
+        return self._read_v2(authority, reader, natural_parent_original_id=parent_original_id)
 
     def complete_post_c02_context_reply_model_job_v2(
             self, authority: AuthorityContext, lease: object,
@@ -15246,10 +20503,7 @@ class GraphCoordinator:
                 if current != saved or running != job:
                     raise StaleRead("original V2 terminal original changed")
                 before = job_graph_write(job)
-                atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (before.key.token,),
-                ).fetchone()
+                atom = read_graph_head_v3(db, before.key.token)
                 if (atom is None or atom[2] != 1
                         or json.loads(atom[1]) != before.value):
                     raise ContextReplyJobHold("original V2 graph job differs")
@@ -15386,10 +20640,7 @@ class GraphCoordinator:
                             saved.frozen_request.input.conversation_ref,)):
                     raise ContextReplyJobHold("original V2 paid egress inputs changed")
                 job_key = job_graph_write(job).key
-                atom = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (job_key.token,),
-                ).fetchone()
+                atom = read_graph_head_v3(db, job_key.token)
                 if (atom is None or atom[2] != 1
                         or json.loads(atom[1]) != job_graph_write(job).value
                         or set(request.envelope.version_guard.read_versions)
@@ -15648,6 +20899,7 @@ class GraphCoordinator:
                 committed_attempt[2], committed_attempt[3],
                 "finish_reply_acquire")
             return saved.job
+        self.__local_module_admission.require_v1(('d09', 'd11'), "acquire_post_c02_reply_model_job_v1")
         if row[0] != "queued" or saved.job.phase != "queued":
             raise ReplyModelJobHold("reply job is not queued")
         target = metadata.requirements
@@ -16240,10 +21492,7 @@ class GraphCoordinator:
                 raise AuthorityDenied("original result acquire identity differs")
 
             job_key = runtime_job_key(*namespace.as_tuple, job.activity_id, job_id)
-            job_atom = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (job_key.token,),
-            ).fetchone()
+            job_atom = read_graph_head_v3(db, job_key.token)
             if (job_atom is None or job_atom[2] != 1
                     or json.loads(job_atom[1]) != job_graph_write(job).value):
                 raise UnavailableGuard("worker result job projection differs; HOLD")
@@ -16411,14 +21660,8 @@ class GraphCoordinator:
 
             source_key_value = source_key(*namespace.as_tuple, binding.source_id)
             access_key_value = access_key(*namespace.as_tuple, binding.source_id)
-            source_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (source_key_value.token,),
-            ).fetchone()
-            access_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (access_key_value.token,),
-            ).fetchone()
+            source_row = read_graph_head_v3(db, source_key_value.token)
+            access_row = read_graph_head_v3(db, access_key_value.token)
             dependency = db.execute(
                 "SELECT dependency_revision FROM graph_dependencies WHERE "
                 "dependent_token=? AND dependency_token=?",
@@ -17094,10 +22337,7 @@ class GraphCoordinator:
             raise UnavailableGuard("V3 recovery withdrawn row identity differs; HOLD")
 
         def proven_current_change(key, original_revision, *, access):
-            current = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (key.token,),
-            ).fetchone()
+            current = read_graph_head_v3(db, key.token)
             if current is None or current[0] <= original_revision:
                 return False
             withdrawn = current[2] == 0
@@ -17224,14 +22464,8 @@ class GraphCoordinator:
             raise UnavailableGuard("V3 recovery job graph history differs; HOLD")
         source_key_value = source_key(*namespace.as_tuple, binding.source_id)
         access_key_value = access_key(*namespace.as_tuple, binding.source_id)
-        source_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (source_key_value.token,),
-        ).fetchone()
-        access_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (access_key_value.token,),
-        ).fetchone()
+        source_row = read_graph_head_v3(db, source_key_value.token)
+        access_row = read_graph_head_v3(db, access_key_value.token)
         if (source_row is None or access_row is None
                 or (source_row[0], source_row[2]) != (
                     binding.source_revision, 1)
@@ -17985,14 +23219,8 @@ class GraphCoordinator:
                     or current_source != source_version
                     or current_access != access_version):
                 raise UnavailableGuard("encoding source or access changed; HOLD")
-            row = self.__store._db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (source_version.key.token,),
-            ).fetchone()
-            access_row = self.__store._db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (access_version.key.token,),
-            ).fetchone()
+            row = read_graph_head_v3(self.__store._db, source_version.key.token)
+            access_row = read_graph_head_v3(self.__store._db, access_version.key.token)
             if (access_row is None or access_row[0] != access_version.revision
                     or access_row[2] != 1):
                 raise UnavailableGuard("encoding current access changed; HOLD")
@@ -18118,9 +23346,7 @@ class GraphCoordinator:
         from .runtime.encoding_call_binding import (
             EncodingRequestIssueV2, prepare_binding,
         )
-        from .model_broker.first_ingress_encoding import (
-            FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
-        )
+        from .model_broker.first_ingress_encoding import encoding_template_version_v1
 
         context = self._first_ingress_encoding_issue_context(
             namespace, planned, outbox, source_version, access_version,
@@ -18145,7 +23371,7 @@ class GraphCoordinator:
         return prepare_binding(
             namespace, planned.job_id, context.source, source_version.revision,
             access_version.revision, planned.budget_ref, planned.operation_id,
-            request, prompt_template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+            request, prompt_template_version=encoding_template_version_v1(request.prompt_template_digest),
             provider_config_ref=issue.provider_config_ref,
             provider_config_digest=issue.provider_config_digest,
             production_context=context,
@@ -18807,6 +24033,8 @@ class GraphCoordinator:
                     raise UnavailableGuard("encoding source request was erased; HOLD")
             else:
                 job = None
+        if receipt is None and rejection is None:
+            self.__local_module_admission.require_v1(('d06', 'd11'), "acquire_first_ingress_encoding_job_v2")
         if erased is not None:
             raise UnavailableGuard("encoding request was erased; HOLD")
         if _require_baseline_v3 and (
@@ -19514,6 +24742,135 @@ class GraphCoordinator:
             raise UnavailableGuard("deletion access/delete epochs are unavailable")
         return row[0], row[1]
 
+    def install_current_c09_source_plan_resources_v2(self, bootstrap, control):
+        from pathlib import Path
+        from .authority_service.c09_paged_capture_control_v2 import InstalledC09PagedCaptureControlV2
+        from .runtime.c09_source_plan_barrier_v2 import install_c09_source_plan_barrier_schema_v2
+        from .runtime.c09_erasure_plan_original_v1 import install_c09_erasure_plan_schema_v2
+        from .runtime.c09_erasure_barrier_store_v1 import install_c09_erasure_barrier_store_v2
+        if bootstrap is not self.__bootstrap or type(control) is not InstalledC09PagedCaptureControlV2:
+            raise AuthorityDenied("actual installed C09 Source resource registration required")
+        control._registered()
+        store=self.__store
+        if not isinstance(store,ProductionGraphStore):
+            raise AuthorityDenied("actual protected Graph store required")
+        namespace=control.maintenance.namespace_id
+        with store._lock:
+            main=next((row[2] for row in store._db.execute("PRAGMA database_list") if row[1]=="main"),None)
+            if main is None or Path(main).resolve(strict=True)!=Path(next(row[2] for row in control.maintenance.graph._db.execute('PRAGMA database_list') if row[1]=='main')).resolve(strict=True):
+                raise AuthorityDenied("C09 resources belong to another physical Graph")
+            metadata,_=self._v2_graph_stamp(namespace)
+            if metadata.requirements.authority_namespace!=control.maintenance.closure.namespace:
+                raise AuthorityDenied("C09 resources belong to another current Core namespace")
+            prior=self.__c09_source_plan_resources_v2
+            if prior is not None and prior is not control:
+                raise AuthorityDenied("C09 installed Source resources already bound")
+            install_c09_source_plan_barrier_schema_v2(store._db)
+            install_c09_erasure_plan_schema_v2(store._db)
+            install_c09_erasure_barrier_store_v2(store._db)
+            self.__c09_source_plan_resources_v2=control
+
+    def issue_current_c09_erasure_plan_v2(self, authority, lease, *, operation_id, source_ref):
+        """One actual Owner-fenced Source capture quantum; repeated calls resume its original."""
+        from uuid import UUID
+        from .runtime.c09_source_plan_barrier_v2 import (
+            begin_c09_source_plan_capture_v2,advance_c09_source_plan_capture_v2,
+            read_c09_source_work_v2,require_c09_source_stamp_v2,seal_c09_source_plan_v2,source_plan_metered_quantum_v2,C09SourcePlanCellReaderV2)
+        from .runtime.c09_erasure_plan_original_v1 import (
+            read_c09_erasure_plan_original_v2,record_c09_erasure_plan_original_v2)
+        store,port,control=self.__store,self.__content_fence_v2,self.__c09_source_plan_resources_v2
+        if (type(authority) is not AuthorityContext or authority.issuer_domain!="d12"
+                or not isinstance(store,ProductionGraphStore) or port is None or control is None):
+            raise UnavailableGuard("installed C09 Owner paged plan unavailable")
+        parsed=UUID(operation_id);key=AtomKey.from_token(source_ref);namespace=authority.namespace
+        if parsed.version!=4 or str(parsed)!=operation_id or key!=source_key(*namespace.as_tuple,key.owner.subject):
+            raise AuthorityDenied("canonical one-Source Owner request required")
+        self._authorize(lease,authority,frozenset(("d06",)),owner_read=True)
+        binding=self.__owner_leases.get(lease);proof=self.__owner_session_proofs.get(lease)
+        if (binding is None or proof is None or "workbench.erase" not in binding.capabilities
+                or binding.actor!=authority.actor or binding.namespace!=namespace
+                or binding.purpose!=authority.purpose or authority.audience!=(binding.audience,)):
+            raise AuthorityDenied("current signed Owner erase binding required")
+        with store._lock:
+            metadata,epoch=self._v2_graph_stamp(namespace)
+            work=read_c09_source_work_v2(store._db,namespace,operation_id)
+            ordinal=0 if work is None else work['quantum_index']
+            prior=read_c09_erasure_plan_original_v2(store._db,namespace,operation_id)
+        target=metadata.requirements
+        if (target.activation_generation!=authority.activation_generation
+                or control.maintenance.namespace_id!=namespace
+                or control.maintenance.closure.namespace!=target.authority_namespace):
+            raise AuthorityDenied("C09 Source resources cross current installation")
+        selection=control.current_source_plan_selection_v2(namespace)
+        selection.require_current()
+        anchor=port.current_anchor(namespace=namespace,authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target,anchor):raise UnavailableGuard("C09 plan current Core anchor differs")
+        if prior is not None:
+            return self.read_current_c09_erasure_plan_v2(authority,lease,operation_id=operation_id)
+        attempt="c09-plan-v2-"+canonical_digest((namespace,operation_id,ordinal))[:48]
+        permit=port.begin_fence(namespace=namespace,authority_namespace=target.authority_namespace,
+            holder=self.__holder,generation=authority.activation_generation,operation="write",operation_id=attempt,expected_anchor=anchor)
+        scope=FenceScope(namespace,target.authority_namespace,authority.activation_generation,"write",attempt,permit,anchor,epoch,metadata.graph_revision)
+        committed=False
+        try:
+            if port.validate_fence(scope)!=permit:raise UnavailableGuard("C09 Owner quantum fence changed")
+            self._owner_binding_in_fence(authority,scope,binding.principal,binding,owner_session_proof=proof)
+            with control.reserve_source_plan_quantum_v2(namespace,operation_id) as budget, source_plan_metered_quantum_v2(budget):
+                with store._lock:
+                    db=store._db;db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if self._v2_graph_stamp(namespace)!=(metadata,epoch):raise StaleRead("C09 Source graph changed before quantum")
+                        owner=db.execute("SELECT revision FROM graph_atoms WHERE token=? AND valid=1",(owner_grant_key(*namespace.as_tuple).token,)).fetchone()
+                        if owner is None:raise UnavailableGuard("current Owner head absent")
+                        state=begin_c09_source_plan_capture_v2(db,namespace=namespace,operation_id=operation_id,source_ref=source_ref,
+                            owner_revision=owner[0],owner_grant_digest=binding.grant_digest,graph_incarnation=target.graph_incarnation,storage_selection=selection,budget=budget)
+                        prior=read_c09_erasure_plan_original_v2(db,namespace,operation_id)
+                        if prior is not None:
+                            require_c09_source_stamp_v2(db,namespace,state);result=prior
+                        else:
+                            if self.__c09_source_plan_cell_reader_v2 is None:
+                                self.__c09_source_plan_cell_reader_v2=C09SourcePlanCellReaderV2(db)
+                            state=advance_c09_source_plan_capture_v2(db,namespace=namespace,operation_id=operation_id,
+                                cell_reader=self.__c09_source_plan_cell_reader_v2,storage_selection=selection,budget=budget)
+                            result=record_c09_erasure_plan_original_v2(db,seal_c09_source_plan_v2(db,namespace,operation_id)) if state['phase']=='plan_complete' else {
+                                'schema':'sylanne3.graph.c09_source_plan_progress.v2','operation_id':operation_id,'phase':state['phase'],
+                                'source_page_count':state['source_page_count'],'source_page_root':state['source_page_root']}
+                        db.execute("COMMIT");committed=True
+                    except BaseException:
+                        if db.in_transaction:db.execute("ROLLBACK")
+                        raise
+        finally:
+            port.finish_fence(scope,request_id=("finish:" if committed else "abort:")+attempt,
+                request_digest="sha256:"+canonical_digest({'action':'c09_source_plan_quantum_v2','committed':committed,'attempt_id':attempt,'permit_token':permit.token}))
+        selection.require_current()
+        return result
+
+    def read_current_c09_erasure_plan_v2(self, authority, lease, *, operation_id):
+        from .runtime.c09_source_plan_barrier_v2 import read_c09_source_work_v2,require_c09_source_stamp_v2,require_c09_source_storage_selection_v2
+        from .runtime.c09_erasure_plan_original_v1 import read_c09_erasure_plan_original_v2
+        self._authorize(lease,authority,frozenset(("d06",)),owner_read=True)
+        binding=self.__owner_leases.get(lease);proof=self.__owner_session_proofs.get(lease)
+        if (type(authority) is not AuthorityContext or authority.issuer_domain!='d12' or binding is None
+                or proof is None or 'workbench.erase' not in binding.capabilities):
+            raise AuthorityDenied('actual current Owner erase reader required')
+        selection=self.__c09_source_plan_resources_v2.current_source_plan_selection_v2(authority.namespace)
+        selection.require_current()
+        def reader():
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                plan=read_c09_erasure_plan_original_v2(db,authority.namespace,operation_id)
+                state=read_c09_source_work_v2(db,authority.namespace,operation_id)
+                if plan is None or plan.owner_grant_digest!=binding.grant_digest:raise UnavailableGuard('complete actual Owner Source plan absent')
+                require_c09_source_stamp_v2(db,authority.namespace,state)
+                require_c09_source_storage_selection_v2(state,selection)
+                db.execute('COMMIT');return plan
+            except BaseException:
+                if db.in_transaction:db.execute('ROLLBACK')
+                raise
+        result=self._read_v2(authority,reader,owner_binding=binding,owner_session_proof=proof)
+        selection.require_current()
+        return result
+
     def issue_current_c09_erasure_plan_v1(
             self, authority: AuthorityContext, lease: object, *,
             operation_id: str, source_ref: str):
@@ -19720,6 +25077,15 @@ class GraphCoordinator:
             authority, reader, owner_binding=binding,
             owner_session_proof=proof)
 
+    def read_current_c09_graph_barrier_versioned_v2(self, bootstrap, *, namespace, deletion_operation_id, permit):
+        from .runtime.c09_erasure_barrier_store_v1 import read_c09_erasure_barrier_v2
+        if bootstrap is not self.__bootstrap:raise AuthorityDenied('actual installed C09 original selector required')
+        with self.__store._lock:
+            original=read_c09_erasure_barrier_v2(self.__store._db,namespace,deletion_operation_id)
+        if original is not None:
+            return self.read_current_c09_graph_barrier_v2(bootstrap,namespace=namespace,deletion_operation_id=deletion_operation_id,permit=permit)
+        return self.read_current_c09_graph_barrier_v1(bootstrap,namespace=namespace,deletion_operation_id=deletion_operation_id,permit=permit)
+
     def read_current_c09_graph_barrier_v1(
             self, bootstrap: object, *, namespace: NamespaceId,
             deletion_operation_id: str, permit: object):
@@ -19787,6 +25153,132 @@ class GraphCoordinator:
         if reader(**args) != pending:
             raise UnavailableGuard("C09 Authority pending changed during graph read")
         return graph
+
+    def commit_current_c09_source_barrier_v2(self, bootstrap, *, namespace, deletion_operation_id, permit):
+        """One actual Core-authorized withdrawal/history quantum, with persistent EOF."""
+        from .authority_service.v2_contract import DeletionMutationReceiptV1,FencePermitV2
+        from .runtime.c09_source_plan_barrier_v2 import (
+            begin_c09_source_barrier_v2,prepare_c09_source_barrier_page_v2,
+            record_c09_source_barrier_page_after_graph_v2,advance_c09_source_barrier_completion_v2,
+            read_c09_source_work_v2,require_c09_source_stamp_v2,bind_c09_barrier_recovery_after_v2,source_plan_metered_quantum_v2,require_c09_source_storage_selection_v2)
+        from .runtime.c09_erasure_plan_original_v1 import read_c09_erasure_plan_original_v2
+        from .runtime.c09_erasure_barrier_store_v1 import read_c09_erasure_barrier_v2,record_c09_erasure_barrier_complete_v2
+        store,port,control=self.__store,self.__content_fence_v2,self.__c09_source_plan_resources_v2
+        if (bootstrap is not self.__bootstrap or not isinstance(store,ProductionGraphStore) or port is None
+                or control is None or type(namespace) is not NamespaceId or type(permit) is not FencePermitV2 or permit.operation!='delete'):
+            raise AuthorityDenied('actual installed C09 Source delete page required')
+        with store._lock:metadata,epoch=self._v2_graph_stamp(namespace)
+        target=metadata.requirements
+        if (control.maintenance.namespace_id!=namespace or control.maintenance.closure.namespace!=target.authority_namespace
+                or permit.namespace!=target.authority_namespace or permit.authority_id!=target.authority_id
+                or permit.generation!=target.activation_generation):
+            raise AuthorityDenied('C09 delete page crosses actual installed Core/Graph identity')
+        selection=control.current_source_plan_selection_v2(namespace)
+        selection.require_current()
+        args=dict(namespace=namespace,authority_namespace=target.authority_namespace,
+            deletion_operation_id=deletion_operation_id,permit=permit)
+        pending=port.get_pending_deletion_for_graph_write(**args)
+        if (type(pending) is not DeletionMutationReceiptV1 or pending.pending.source_phase!='absent'
+                or pending.pending.target_phase!='pending' or pending.pending.deletion_operation_id!=deletion_operation_id
+                or pending.pending.evidence.issuer_id!='authority-owner-graph-plan-v2'
+                or pending.after_anchor!=permit.pinned_anchor or pending.updated_revision!=permit.revision):
+            raise UnavailableGuard('actual C09 pending and exact delete permit changed')
+        if not (self._anchor_matches(target,pending.pending.before_anchor) or self._anchor_matches(target,pending.after_anchor)):
+            raise UnavailableGuard('C09 delete page recovery anchor is unrelated')
+        with control.reserve_source_plan_quantum_v2(namespace,deletion_operation_id) as budget, source_plan_metered_quantum_v2(budget):
+            with store._lock:
+                db=store._db;db.execute('BEGIN IMMEDIATE')
+                try:
+                    if self._v2_graph_stamp(namespace)!=(metadata,epoch):raise StaleRead('C09 Source delete quantum stamp changed')
+                    plan=read_c09_erasure_plan_original_v2(db,namespace,deletion_operation_id)
+                    if plan is None or plan.graph_incarnation!=target.graph_incarnation:raise UnavailableGuard('actual Source capture header absent')
+                    owner=read_graph_head_v3(db, plan.owner_ref)
+                    issue=db.execute('SELECT grant_digest FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?',namespace.as_tuple).fetchone()
+                    if owner is None or owner[0]!=plan.owner_revision or owner[2]!=1 or issue!=(plan.owner_grant_digest,):
+                        raise AuthorityDenied('current actual Owner original changed since plan')
+                    grant=json.loads(owner[1]);validate_owner_grant_v1(grant)
+                    if (grant['state']!='pending_authority' or grant['authority_id']!=target.authority_id
+                            or grant['installation_id']!=port.installation_grant.installation_id
+                            or canonical_json(grant)!=owner[1] or 'sha256:'+canonical_digest(grant)!=plan.owner_grant_digest):
+                        raise AuthorityDenied('current signed Owner differs from actual Core deletion')
+                    state=read_c09_source_work_v2(db,namespace,deletion_operation_id)
+                    require_c09_source_stamp_v2(db,namespace,state)
+                    require_c09_source_storage_selection_v2(state,selection)
+                    prior=read_c09_erasure_barrier_v2(db,namespace,deletion_operation_id)
+                    if prior is not None:
+                        if (prior.pending_receipt_digest!=canonical_digest(pending) or prior.plan_digest!=plan.digest
+                                or not state.get('recovery_closed') or not self._anchor_matches(target,pending.after_anchor)):
+                            raise UnavailableGuard('actual completed Source barrier replay changed')
+                        result=prior
+                    else:
+                        state=begin_c09_source_barrier_v2(db,plan=plan,pending=pending,permit_digest=canonical_digest(permit),budget=budget)
+                        page=None
+                        if state['phase']=='barrier':
+                            prepared=prepare_c09_source_barrier_page_v2(db,namespace=namespace,operation_id=deletion_operation_id,budget=budget)
+                            if prepared is not None:
+                                candidate,members=prepared
+                                graph_receipt=GraphStore._graph_commit_in_transaction(store,candidate,_capability=self.__graph_capability)
+                                page=record_c09_source_barrier_page_after_graph_v2(db,namespace=namespace,operation_id=deletion_operation_id,
+                                    members=members,graph_receipt=graph_receipt,budget=budget)
+                        # A write page consumes its own resource quantum. The independent
+                        # history and page-chain sweep uses later same-operation quanta.
+                        complete=None if page is not None else advance_c09_source_barrier_completion_v2(db,namespace=namespace,
+                            operation_id=deletion_operation_id,plan=plan,budget=budget)
+                        if complete is not None:
+                            after=pending.after_anchor
+                            after_metadata=store.cas_graph_recovery_metadata(metadata,replace(target,
+                                deletion_seq=after.deletion_seq,deletion_digest=after.deletion_digest,revocation_epoch=after.revocation_epoch),
+                                _capability=self.__graph_capability)
+                            bind_c09_barrier_recovery_after_v2(db,namespace=namespace,operation_id=deletion_operation_id,
+                                pending=pending,before_metadata=metadata,after_metadata=after_metadata,budget=budget)
+                            result=record_c09_erasure_barrier_complete_v2(db,complete,plan=plan)
+                        else:
+                            state=read_c09_source_work_v2(db,namespace,deletion_operation_id)
+                            result={'schema':'sylanne3.graph.c09_source_barrier_progress.v2','operation_id':deletion_operation_id,
+                                'phase':state['phase'],'withdrawn_count':state['barrier_count'],
+                                'page_count':state['barrier_pages'],'page_root':state['barrier_page_root']}
+                    db.execute('COMMIT')
+                except BaseException:
+                    if db.in_transaction:db.execute('ROLLBACK')
+                    raise
+        if port.get_pending_deletion_for_graph_write(**args)!=pending:
+            raise UnavailableGuard('C09 partial/complete Source barrier pending changed after actual CAS')
+        selection.require_current()
+        return result
+
+    def read_current_c09_graph_barrier_v2(self, bootstrap, *, namespace, deletion_operation_id, permit):
+        from .authority_service.v2_contract import DeletionMutationReceiptV1,FencePermitV2
+        from .runtime.c09_source_plan_barrier_v2 import read_c09_source_work_v2,require_c09_source_stamp_v2,require_c09_source_storage_selection_v2
+        from .runtime.c09_erasure_barrier_store_v1 import read_c09_erasure_barrier_v2
+        store,port=self.__store,self.__content_fence_v2
+        if bootstrap is not self.__bootstrap or port is None or type(permit) is not FencePermitV2 or permit.operation!='delete':
+            raise AuthorityDenied('actual installed Source barrier reader required')
+        with store._lock:metadata,_=self._v2_graph_stamp(namespace)
+        selection=self.__c09_source_plan_resources_v2.current_source_plan_selection_v2(namespace)
+        selection.require_current()
+        args=dict(namespace=namespace,authority_namespace=metadata.requirements.authority_namespace,
+            deletion_operation_id=deletion_operation_id,permit=permit)
+        pending=port.get_pending_deletion_for_graph_write(**args)
+        if (type(pending) is not DeletionMutationReceiptV1 or pending.after_anchor!=permit.pinned_anchor
+                or pending.updated_revision!=permit.revision or not self._anchor_matches(metadata.requirements,pending.after_anchor)):
+            raise UnavailableGuard('actual Source barrier current pending anchor changed')
+        with store._lock:
+            db=store._db;db.execute('BEGIN')
+            try:
+                state=read_c09_source_work_v2(db,namespace,deletion_operation_id)
+                result=read_c09_erasure_barrier_v2(db,namespace,deletion_operation_id)
+                if (result is None or state is None or not state.get('recovery_closed')
+                        or result.pending_receipt_digest!=canonical_digest(pending)):
+                    raise UnavailableGuard('actual complete Source barrier absent')
+                require_c09_source_stamp_v2(db,namespace,state)
+                require_c09_source_storage_selection_v2(state,selection)
+                db.execute('COMMIT')
+            except BaseException:
+                if db.in_transaction:db.execute('ROLLBACK')
+                raise
+        if port.get_pending_deletion_for_graph_write(**args)!=pending:raise UnavailableGuard('actual Source barrier pending changed during read')
+        selection.require_current()
+        return result
 
     def commit_current_c09_source_barrier_v1(
             self, bootstrap: object, *, namespace: NamespaceId,
@@ -19860,10 +25352,7 @@ class GraphCoordinator:
                 if read_c09_erasure_barrier_v1(
                         db, namespace, deletion_operation_id) is not None:
                     raise StaleRead("C09 barrier appeared before commit")
-                owner = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (owner_grant_key(*namespace.as_tuple).token,),
-                ).fetchone()
+                owner = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
                 issue = db.execute(
                     "SELECT grant_digest FROM graph_owner_issue_operations_v1 "
                     "WHERE bot=? AND persona=?", namespace.as_tuple,
@@ -19941,10 +25430,7 @@ class GraphCoordinator:
                 for token in affected_refs:
                     source = AtomKey.from_token(token)
                     key = access_key(*namespace.as_tuple, source.owner.subject)
-                    row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (key.token,),
-                    ).fetchone()
+                    row = read_graph_head_v3(db, key.token)
                     if row is None or row[2] != 1:
                         raise UnavailableGuard("C09 current source access is absent")
                     value = json.loads(row[1])
@@ -20188,7 +25674,7 @@ class GraphCoordinator:
 
     def with_current_creator_draft_v1(
             self, authority: AuthorityContext, lease: object, *,
-            draft_ref: str, required_capability: str, project):
+            draft_ref: str, required_capability: str, project, allow_missing=False):
         """Project D12's current draft and head under the signed Owner read fence.
 
         The callback receives only graph values read inside this fence.  Its
@@ -20196,10 +25682,8 @@ class GraphCoordinator:
         a browser or the D12 caller.
         """
         from .domains.d12.scheme_command import D12CurrentCreatorDraftV1
-        from .domains.d12.types import (
-            ActiveSchemeHeadV1, CharacterDraft, active_scheme_head_key,
-            character_draft_key,
-        )
+        from .domains.d12.types import active_scheme_head_key, character_draft_key
+        from .runtime.d12_creator_configuration_v1 import decode_current_configuration_draft_v1
 
         if (type(authority) is not AuthorityContext
                 or authority.issuer_domain != "d12"
@@ -20208,7 +25692,7 @@ class GraphCoordinator:
                     "workbench.create", "workbench.compile",
                     "workbench.experiment", "workbench.activate",
                 }
-                or not callable(project)):
+                or not callable(project) or type(allow_missing) is not bool):
             raise AuthorityDenied("current creator draft authority required")
         if (not isinstance(self.__store, ProductionGraphStore)
                 or self.__content_fence_v2 is None):
@@ -20239,26 +25723,9 @@ class GraphCoordinator:
                 store, (draft_key, head_key),
                 _capability=self.__graph_capability)
             draft_atom, head_atom = snapshot.atoms
-            if (draft_atom.revision < 1 or not draft_atom.valid
-                    or head_atom.revision > 0 and not head_atom.valid
-                    or len(snapshot.epochs) != 1):
-                raise UnavailableGuard("current creator draft or head unavailable")
             try:
-                payload = dict(draft_atom.value)
-                if payload.pop("schema") != draft_key.type_name:
-                    raise ValueError("draft schema differs")
-                draft = CharacterDraft(**payload)
-                if (draft.scope != authority.namespace.persona_id
-                        or draft.revision != draft_atom.revision):
-                    raise ValueError("draft revision differs")
-                if head_atom.revision:
-                    head_payload = dict(head_atom.value)
-                    if head_payload.pop("schema") != head_key.type_name:
-                        raise ValueError("active head schema differs")
-                    head = ActiveSchemeHeadV1(**head_payload)
-                    if (head.scope != authority.namespace.persona_id
-                            or head.generation != head_atom.revision):
-                        raise ValueError("active head revision differs")
+                draft = decode_current_configuration_draft_v1(
+                    authority.namespace, snapshot, allow_missing=allow_missing)
             except (TypeError, ValueError, KeyError) as exc:
                 raise UnavailableGuard("current creator draft or head is invalid") from exc
             metadata, graph_epoch = self._v2_graph_stamp(authority.namespace)
@@ -20282,6 +25749,175 @@ class GraphCoordinator:
             authority, read_and_project, owner_binding=binding,
             owner_session_proof=proof,
         )
+
+    def read_current_configuration_draft_v1(self, authority: AuthorityContext, lease: object):
+        """Discover the actual current draft; absence is not an adopted scheme."""
+        from .domains.d12.types import character_draft_key
+        from .runtime.d12_creator_configuration_v1 import supported_configuration_fields_v1
+
+        if type(authority) is not AuthorityContext:
+            raise AuthorityDenied("current creator configuration authority required")
+
+        def project(frame):
+            return {
+                "schema": "d12.creator-configuration.v1",
+                "draft_ref": frame.draft_ref, "exists": frame.draft_revision > 0,
+                "draft_revision": frame.draft_revision,
+                "draft_digest": canonical_digest(frame.draft) if frame.draft_revision else None,
+                "fields": frame.draft.fields, "field_sources": frame.draft.field_sources,
+                "active_head_ref": frame.active_head_ref if frame.active_head_revision else None,
+                "active_head_revision": frame.active_head_revision,
+                "graph_revision": frame.graph_revision, "access_epoch": frame.access_epoch,
+                "delete_epoch": frame.delete_epoch,
+                "access_generation": authority.activation_generation,
+                "supported_fields": supported_configuration_fields_v1(),
+            }
+
+        return self.with_current_creator_draft_v1(
+            authority, lease, draft_ref=character_draft_key(authority.namespace).token,
+            required_capability="workbench.create", project=project, allow_missing=True)
+
+    def save_current_creator_draft_for_operation_v1(
+            self, authority: AuthorityContext, lease: object, *, operation_id: str,
+            draft_ref: str, expected_draft_revision: int, expected_draft_digest: str | None,
+            expected_graph_revision: int, expected_access_epoch: int,
+            expected_delete_epoch: int, fields):
+        """Save typed creator fields through the existing durable Owner write CAS.
+
+        The receipt is a draft save, never a preview, budget authorization or
+        adoption. Unknown commit/finish results retain their original attempt.
+        """
+        from uuid import UUID
+        from .domains.d12.scheme_command import (
+            D12CurrentCreatorDraftV1, D12SchemeHold, plan_creator_draft_update_v1,
+        )
+        from .domains.d12.types import active_scheme_head_key, character_draft_key
+        from .runtime.d12_creator_configuration_v1 import (
+            EDITABLE_FIELDS, decode_current_configuration_draft_v1,
+            edited_configuration_draft_v1,
+        )
+
+        try:
+            parsed = UUID(operation_id)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise D12SchemeHold("canonical draft save operation required") from exc
+        if (parsed.version != 4 or str(parsed) != operation_id
+                or type(authority) is not AuthorityContext
+                or authority.issuer_domain != "d12" or "persona" not in authority.owner_scope
+                or any(type(value) is not int or value < 0 for value in (
+                    expected_draft_revision, expected_graph_revision,
+                    expected_access_epoch, expected_delete_epoch))
+                or (expected_draft_revision == 0 and expected_draft_digest is not None)
+                or (expected_draft_revision > 0 and (
+                    type(expected_draft_digest) is not str or len(expected_draft_digest) != 64
+                    or any(char not in "0123456789abcdef" for char in expected_draft_digest)))
+                or type(fields) is not dict or not set(fields) <= EDITABLE_FIELDS):
+            raise D12SchemeHold("exact editable creator configuration input required",
+                                code="invalid_configuration_fields")
+        # Freeze JSON before any remote observation; callers cannot edit the
+        # proposed value while the Owner write fence is being acquired.
+        fields = json.loads(canonical_json(fields))
+        namespace = authority.namespace
+        draft_key, head_key = character_draft_key(namespace), active_scheme_head_key(namespace)
+        if draft_ref != draft_key.token:
+            raise AuthorityDenied("current creator draft ref differs")
+        self._authorize(lease, authority, frozenset(("d12",)), owner_read=True)
+        owner = self.__owner_leases.get(lease)
+        if (owner is None or self.__owner_session_proofs.get(lease) is None
+                or "workbench.create" not in owner.capabilities
+                or owner.actor != authority.actor or owner.namespace != namespace
+                or owner.purpose != authority.purpose or authority.audience != (owner.audience,)):
+            raise UnavailableGuard("current signed creator write grant is unavailable")
+        request_digest = canonical_digest({
+            "schema": "d12.creator-draft-save-request.v1", "namespace": namespace,
+            "principal": owner.principal, "actor": owner.actor,
+            "activation_generation": authority.activation_generation,
+            "operation_id": operation_id, "draft_ref": draft_ref,
+            "expected_draft_revision": expected_draft_revision,
+            "expected_draft_digest": expected_draft_digest,
+            "expected_graph_revision": expected_graph_revision,
+            "expected_access_epoch": expected_access_epoch,
+            "expected_delete_epoch": expected_delete_epoch, "fields": fields,
+        })
+        store = self.__store
+
+        def commit(db, metadata, epoch, now, current_owner, scope):
+            if current_owner.principal != owner.principal:
+                raise AuthorityDenied("creator principal changed")
+            barriers = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+            if (metadata.graph_revision != expected_graph_revision
+                    or barriers != (expected_access_epoch, expected_delete_epoch)):
+                raise StaleRead("creator configuration graph or authority epochs changed")
+            # _owner_domain_write_v3 owns this transaction. The public snapshot
+            # reader starts its own transaction and must not be nested here.
+            atoms = []
+            for key in (draft_key, head_key):
+                store._assert_c09_key_not_erased(key)
+                row = read_graph_head_v3(db, key.token)
+                atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
+                             if row else GraphAtom(key, 0, {}, False))
+            snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+            try:
+                current = decode_current_configuration_draft_v1(namespace, snapshot, allow_missing=True)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UnavailableGuard("current creator draft or head is invalid") from exc
+            current_digest = canonical_digest(current) if current.revision else None
+            if (current.revision, current_digest) != (expected_draft_revision, expected_draft_digest):
+                raise StaleRead("creator configuration draft revision or digest changed")
+            proposed = edited_configuration_draft_v1(namespace, current, fields)
+            head_revision = snapshot.atoms[1].revision
+            if current.revision:
+                frame = D12CurrentCreatorDraftV1(
+                    namespace, draft_ref, current.revision, current, head_key.token,
+                    head_revision, metadata.graph_revision, *barriers, True)
+                decision = plan_creator_draft_update_v1(
+                    frame, authority, operation_id=operation_id,
+                    base_draft=current, proposed_draft=proposed)
+                if decision.status != "candidate_requires_w01_cas":
+                    raise StaleRead("creator configuration edit requires an explicit merge")
+                changed = list(decision.creator_changed_fields)
+            else:
+                changed = sorted(proposed.fields)
+            event = Event(Scope(*namespace.as_tuple, "d12.creator_draft_save.v1"),
+                          operation_id, now, "creator_draft_saved",
+                          {"draft_digest": canonical_digest(proposed), "request_digest": request_digest})
+            candidate = GraphCandidate(event, snapshot.versions,
+                (GraphWrite(draft_key, {"schema": draft_key.type_name, **asdict(proposed)}),),
+                (epoch,))
+
+            def record(_db, graph_receipt):
+                if (graph_receipt.status != "committed"
+                        or graph_receipt.revisions != (GraphVersion(draft_key, proposed.revision),)):
+                    raise D12SchemeHold("creator draft graph CAS differs")
+                anchor = scope.pinned_anchor
+                replacement = replace(metadata.requirements,
+                    deletion_seq=anchor.deletion_seq, deletion_digest=anchor.deletion_digest,
+                    execution_seq=anchor.execution_seq, execution_digest=anchor.execution_digest,
+                    revocation_epoch=anchor.revocation_epoch)
+                store.cas_graph_recovery_metadata(metadata, replacement,
+                    _capability=self.__graph_capability)
+
+            receipt = GraphStore._graph_commit_in_transaction(
+                store, candidate, _receipt_hook=record, _capability=self.__graph_capability)
+            if receipt.status != "committed":
+                raise D12SchemeHold("creator draft did not commit")
+            return {"schema": "d12.creator-draft-save.v1", "operation_id": operation_id,
+                "draft_ref": draft_ref, "draft_revision": proposed.revision,
+                "draft_digest": canonical_digest(proposed),
+                "graph_revision": metadata.graph_revision + 1,
+                "access_epoch": barriers[0], "delete_epoch": barriers[1],
+                "changed_fields": changed, "status": "draft_saved_not_adopted"}
+
+        result = self._owner_domain_write_v3(authority, lease, operation_id=operation_id,
+            request_digest=request_digest, domains=("d12",), capability="workbench.create", commit=commit,
+            new_work_admission=lambda db: self.__local_module_admission.require_v1(
+                ("d12", "d11"), "save_current_creator_draft_for_operation_v1"))
+        if result.get("schema") != "d12.creator-draft-save.v1":
+            raise D12SchemeHold("original creator draft save was refused",
+                                code="configuration_operation_refused")
+        return result
 
     def initialize_current_d09_scheme_draft_v1(
             self, authority: AuthorityContext, lease: object, *,
@@ -20384,6 +26020,7 @@ class GraphCoordinator:
                     }))
             return GraphVersion(draft_key, 1), GraphVersion(head_key, 1)
 
+        self.__local_module_admission.require_v1(('d09', 'd11', 'd12'), "initialize_current_d09_scheme_draft_v1")
         now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
         permit = port.begin_fence(
             namespace=namespace, authority_namespace=target.authority_namespace,
@@ -20546,6 +26183,7 @@ class GraphCoordinator:
                 if previous is not None and previous != (request_digest, attempt_id):
                     raise D12SchemeHold("compile operation identity changed")
                 if previous is None:
+                    self.__local_module_admission.require_v1(('d12', 'd11'), "compile_current_scheme_for_operation_v1")
                     db.execute(
                         "INSERT INTO graph_d12_compile_attempts_v1 VALUES(?,?,?,?,?)",
                         (*namespace.as_tuple, operation_id, request_digest, attempt_id),
@@ -20567,6 +26205,7 @@ class GraphCoordinator:
                     raise
                 prior_original = None
         if prior_original is None:
+            self.__local_module_admission.require_v1(('d12', 'd11'), "compile_current_scheme_for_operation_v1")
             # The Authority begin is idempotent while active; a lost begin ACK
             # must not make this prepared original permanently unavailable.
             permit = port.begin_fence(
@@ -20629,14 +26268,8 @@ class GraphCoordinator:
                         raise StaleRead("D12 draft graph changed during compilation")
                     draft_key = character_draft_key(namespace)
                     head_key = active_scheme_head_key(namespace)
-                    draft_row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (draft_key.token,),
-                    ).fetchone()
-                    head_row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (head_key.token,),
-                    ).fetchone()
+                    draft_row = read_graph_head_v3(db, draft_key.token)
+                    head_row = read_graph_head_v3(db, head_key.token)
                     if (draft_row is None or draft_row[0] < 1
                             or draft_row[2] != 1
                             or head_row is not None and head_row[2] != 1):
@@ -20916,6 +26549,16 @@ class GraphCoordinator:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 raise
+        with store._lock:
+            install_d12_preview_budget_schema_v1(store._db)
+            store._db.execute("BEGIN")
+            try:
+                original_cost = read_d12_preview_cost_v1(store._db, self.__d11_issuer,
+                    namespace=namespace, operation_id=operation_id)
+            finally:
+                store._db.rollback()
+        if original_cost is None or original_cost.state == "prepared":
+            self.__local_module_admission.require_v1(("d12", "d11"), "preview_current_scheme_for_operation_v1")
         attempt_id = "d12-preview-" + canonical_digest(
             (namespace, operation_id, compiled_digest, budget_ref, attempt))[:48]
         permit = port.begin_fence(
@@ -20977,6 +26620,10 @@ class GraphCoordinator:
 
             def reserve(db):
                 plan = current_plan(db)
+                if original_cost is None or original_cost.state == "prepared":
+                    preview_domain = "d09" if type(plan) is D12CurrentD09PreviewPlanV1 else "d07"
+                    self.__local_module_admission.require_v1((preview_domain, "d11", "d12"),
+                        "d12:preview_first_run")
                 install_d12_preview_budget_schema_v1(db)
                 if type(plan) is D12CurrentD09PreviewPlanV1:
                     install_d09_preview_original_v1(db)
@@ -21214,10 +26861,7 @@ class GraphCoordinator:
                 raise D12SchemeHold("adoption receipt is malformed") from exc
             encoded = json.dumps(asdict(receipt), sort_keys=True,
                                  separators=(",", ":"), ensure_ascii=False)
-            head = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (active_scheme_head_key(namespace).token,),
-            ).fetchone()
+            head = read_graph_head_v3(db, active_scheme_head_key(namespace).token)
             try:
                 head_value = json.loads(head[1]) if head is not None else None
             except (TypeError, ValueError) as exc:
@@ -21279,6 +26923,7 @@ class GraphCoordinator:
                 )
             return committed
 
+        self.__local_module_admission.require_v1(('d09', 'd11', 'd12'), "adopt_current_scheme_for_operation_v1")
         now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
         permit = port.begin_fence(
             namespace=namespace, authority_namespace=target.authority_namespace,
@@ -21815,10 +27460,7 @@ class GraphCoordinator:
                     raise UnavailableGuard("revocation original intent changed; HOLD")
                 atoms = []
                 for key in (source, access):
-                    current = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (key.token,),
-                    ).fetchone()
+                    current = read_graph_head_v3(db, key.token)
                     atoms.append(
                         GraphAtom(key, current[0], json.loads(current[1]),
                                   bool(current[2])) if current else
@@ -21989,6 +27631,14 @@ class GraphCoordinator:
         self._authorize(lease, authority, domains, owner_read=True)
 
         store = self.__store
+        projection_clock = []
+        assembly = self.__d04_installed_joint_assembly
+        def observe_projection_clock(scope):
+            if not projection_clock:
+                reading = self.__content_fence_v2.read_ingress_clock(assembly.admin_bundle.ingress_clock)
+                from .runtime.first_ingress_v2 import trusted_upper
+                projection_clock.append(trusted_upper(reading))
+            return projection_clock[0]
 
         def read_and_project():
             page_after = None
@@ -22035,6 +27685,7 @@ class GraphCoordinator:
                 authority.namespace, expected_epoch, authority.activation_generation,
                 view_type, types, owner_kind, audience, purpose,
                 _seal=_COMPLETE_PROJECTION_SEAL,
+                trusted_now_utc=projection_clock[0] if projection_clock else None,
             )
             projection = view_registry.project_workbench(
                 authority, view_type, tuple(atoms), audience=audience,
@@ -22046,6 +27697,8 @@ class GraphCoordinator:
             authority, read_and_project,
             owner_binding=self.__owner_leases.get(lease),
             owner_session_proof=self.__owner_session_proofs.get(lease),
+            fence_observer=observe_projection_clock if view_type == "relations"
+                and assembly is not None and assembly.admin_bundle is not None else None,
         )
 
     def query(self, authority: AuthorityContext, lease: object, *,
@@ -22217,7 +27870,7 @@ class GraphCoordinator:
         )
 
     def _get_natural_dispatch_candidate_evidence_locked(
-            self, namespace: NamespaceId, operation_id: str
+            self, namespace: NamespaceId, operation_id: str, *, prepared_history=None
     ) -> NaturalDispatchCandidateRecoveryV2 | None:
         """Use the same original-event decoder as the pinned dispatch proof."""
         from .runtime.natural_dispatch_current_read_v2 import (
@@ -22227,7 +27880,7 @@ class GraphCoordinator:
 
         try:
             return recover_natural_dispatch_candidate_in_transaction_v2(
-                self.__store._db, namespace, operation_id)
+                self.__store._db, namespace, operation_id,prepared_history=prepared_history)
         except NaturalDispatchCurrentHold as exc:
             raise UnavailableGuard(str(exc)) from exc
 
@@ -22512,6 +28165,8 @@ class GraphCoordinator:
 
         from .runtime.d04_numeric_adoption_v3 import require_current_numeric_commit_witness_v3
         require_current_numeric_commit_witness_v3(self, db, bundle, numeric_issuance)
+        from .runtime.d06_life_numeric_joint_v1 import _current_life_joint_source_for_commit_v1
+        life_source_bridge = _current_life_joint_source_for_commit_v1(self, db, numeric_issuance)
         evidence = bundle.product_advance
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
@@ -22565,6 +28220,7 @@ class GraphCoordinator:
         current = read_current_joint_replay_input_in_transaction_v2(
             db, namespace=namespace, registry=self.__store._registry,
             authored_topology_verifier=authored_topology_verifier,
+            _life_source_bridge=life_source_bridge,
             scheme=registration[0]._active_scheme,
             root_ref=evidence.members[0].checkpoint_ref,
             role_start=evidence.role_start, role_end=evidence.role_end,
@@ -22617,16 +28273,14 @@ class GraphCoordinator:
             trusted_local_numeric_verifier=lambda current_db, current_evidence, receipt:
             verification_from_installed_joint_replay_v1(
                 current_db, current_evidence, receipt, installed_replay,
-                current_component=current.component),
+                current_component=current.component, _life_source_bridge=life_source_bridge),
         )
         closure_rows = []
         for version in current.component.read_versions:
             ref = version.key.token
             if ref in required:
                 continue  # These predecessors become the issued output writes.
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (ref,),
-            ).fetchone()
+            row = read_graph_head_v3(db, ref)
             if version.revision == 0:
                 if row is not None:
                     raise StaleRead("D04 joint negative read became present")
@@ -22862,7 +28516,7 @@ class GraphCoordinator:
     def _read_current_post_c02_final_route_locked(
             self, namespace: NamespaceId, admission, action, segment,
             snapshot, query,
-            *, now_utc: float):
+            *, now_utc: float, prepared_inventory=None):
         """Rejoin the original private ingress to its current account entity."""
         from .runtime.first_ingress_v2 import scene_ref_for_conversation
         from .runtime.dispatch_source_correction_barrier import (
@@ -22914,13 +28568,20 @@ class GraphCoordinator:
             raise UnavailableGuard("final reply route or account target differs; HOLD")
         try:
             current = read_current_reply_entity_route_binding_v2(
-                db, namespace, route, query, now_utc=now_utc)
+                db, namespace, route, query, now_utc=now_utc, prepared_inventory=prepared_inventory)
         except ReplyEntityRouteHold as exc:
             raise UnavailableGuard("final reply account binding unavailable; HOLD") from exc
         if (current.target_entity_ref != target_entity_ref
                 or current.conversation_ref != destination_ref
                 or current.scene_ref != scene_ref):
             raise UnavailableGuard("final reply current account route changed; HOLD")
+        if prepared_inventory is not None:
+            records=prepared_inventory.source_family(db,(source_ref,),purpose='context',audiences=admission.audience)
+            source_closure=tuple(sorted(records))
+            barrier=read_source_correction_barrier(db,namespace,query,source_closure,
+                dependent_ref=source_ref,prepared_inventory=prepared_inventory)
+            if not barrier.clear:raise UnavailableGuard("final reply source correction changed; HOLD")
+            return current,source_closure
         pending = [AtomKey.from_token(source_ref).owner.subject]
         seen = set()
         while pending:
@@ -22959,6 +28620,14 @@ class GraphCoordinator:
         db = store._db
         if not store._lock._is_owned() or not db.in_transaction:
             raise RuntimeError("final graph snapshot requires held write transaction")
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(db) is not None:
+            from .runtime.current_graph_full_read_v3 import (
+                CURRENT_DISPATCH_FAMILY_V3, require_bound_graph_full_read_v3,
+            )
+            return require_bound_graph_full_read_v3(
+                self, db, namespace,
+                required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3}))
         epoch = GraphStore.graph_epoch(
             store, *namespace.as_tuple, _capability=self.__graph_capability)
         rows = db.execute(
@@ -23127,7 +28796,9 @@ class GraphCoordinator:
             current_effect, effect_snapshot, final, intent, schema,
             route_binding, original_scope_proof, resource_quote, *,
             expected_access_delete_epoch: tuple[int, int],
-            now_utc: float, valid_until_utc: float):
+            now_utc: float, valid_until_utc: float,
+            natural_budget_original_receiver=None,
+            natural_catalogue_original_receiver=None):
         """Issue five current checks before any natural grant or batch exists.
 
         The caller has provisionally staged the four D08 action atoms at E+1.
@@ -23172,7 +28843,8 @@ class GraphCoordinator:
         social = issue_natural_pregrant_social_receipts_v2(
             db, snapshot, query, final, intent, schema, route_binding,
             original_scope_proof, context, scope, now_utc=now_utc,
-            valid_until_utc=valid_until_utc)
+            valid_until_utc=valid_until_utc,
+            natural_catalogue_original_receiver=natural_catalogue_original_receiver)
         metadata = self.__store.graph_recovery_metadata(
             namespace, _capability=self.__graph_capability)
         barrier = db.execute(
@@ -23214,7 +28886,8 @@ class GraphCoordinator:
         budget = inspect_current_d11_dispatch_budget(
             db, intent, d11_issuer=self.__d11_issuer,
             d02_issuer=self.__d02_issuer, now_utc=now_utc,
-            natural_communication=True)
+            natural_communication=True,
+            natural_budget_original_receiver=natural_budget_original_receiver)
         checks = (social.role_receipt, social.boundary_receipt,
                   source, d08.receipt, budget.receipt)
         if (social.status != "checks_candidate"
@@ -23386,11 +29059,28 @@ class GraphCoordinator:
                     budget_versions),
             ))
 
+    def _full_graph_write_capture_locked(self, namespace, scope, candidate, *, phase):
+        from contextlib import nullcontext
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is None:
+            return nullcontext(None)
+        from .runtime.current_graph_full_read_v3 import (
+            CURRENT_DISPATCH_FAMILY_V3,
+            require_bound_graph_full_read_proof_for_db_v3,
+        )
+        from .runtime.current_graph_full_write_v3 import begin_full_read_write_capture_v3
+        proof = require_bound_graph_full_read_proof_for_db_v3(
+            self.__store._db, namespace,
+            required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3}))
+        return begin_full_read_write_capture_v3(
+            proof, graph=self, actual_write_scope=scope,
+            capability=self.__graph_capability, candidate=candidate, phase=phase)
+
     def _stage_natural_final_pregrant_locked(
             self, *, envelope, final, route, original_scope_proof,
             budget_grant, resource_quote, scope, current_effect,
             effect_snapshot, expected_access_delete_epoch: tuple[int, int],
-            now_utc: float):
+            now_utc: float, semantic_segment: bool = False):
         """Stage D08 at E+1 and issue five checks before freezing a grant.
 
         The provisional graph savepoint is rolled back before return. The
@@ -23429,7 +29119,7 @@ class GraphCoordinator:
             current_check_versions=projected,
             route_binding=original_binding, quote=resource_quote,
             grant=budget_grant, anchor=scope.pinned_anchor,
-            now_utc=now_utc)
+            now_utc=now_utc, semantic_segment=semantic_segment)
         if (stage.status != "candidate_hold_w01_current_five_checks"
                 or stage.proposal is None or stage.intent is None
                 or stage.schema is None
@@ -23444,40 +29134,43 @@ class GraphCoordinator:
                                     canonical_digest(stage.intent)}),
             stage.proposal.envelope.version_guard.read_versions,
             stage.proposal.typed_writes, snapshot.epochs)
-        with self.__store._provisional_graph_stage_in_transaction(
-                candidate, _capability=self.__graph_capability):
-            staged_snapshot, staged_query = self._dispatch_full_graph_snapshot_locked(
-                namespace)
-            staged_binding = read_current_reply_entity_route_binding_v2(
-                db, namespace, route, staged_query, now_utc=now_utc)
-            actual = self._read_post_c02_check_versions_locked(
-                namespace, route, staged_binding,
-                final.material.source_ref.ref, final.material.c02_operation_id,
-                budget_grant, resource_quote, scope.pinned_anchor,
-                expected_query=staged_query, now_utc=now_utc,
-                projected=False, action_kind="communication")
-            if (staged_query != next_query or actual != projected
-                    or staged_binding.binding_scan_versions !=
-                       original_binding.binding_scan_versions):
-                raise UnavailableGuard("natural final E+1 scope changed; HOLD")
-            access_delete = db.execute(
-                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
-                "WHERE bot=? AND persona=?", namespace.as_tuple,
-            ).fetchone()
-            if access_delete != expected_access_delete_epoch:
-                raise UnavailableGuard("natural paid access barrier changed; HOLD")
-            checks, social, d08 = self._read_natural_pregrant_checks_locked(
-                namespace, scope, current_effect, effect_snapshot,
-                final, stage.intent, stage.schema, staged_binding,
-                original_scope_proof, resource_quote,
-                expected_access_delete_epoch=expected_access_delete_epoch,
-                now_utc=now_utc,
-                valid_until_utc=envelope.deadline_utc)
+        with self._full_graph_write_capture_locked(
+            namespace, scope, candidate, phase="provisional") as capture:
+            with self.__store._provisional_graph_stage_in_transaction(
+                    candidate, _capability=self.__graph_capability, _full_read_capture=capture):
+                staged_snapshot, staged_query = self._dispatch_full_graph_snapshot_locked(
+                    namespace)
+                staged_binding = read_current_reply_entity_route_binding_v2(
+                    db, namespace, route, staged_query, now_utc=now_utc)
+                actual = self._read_post_c02_check_versions_locked(
+                    namespace, route, staged_binding,
+                    final.material.source_ref.ref, final.material.c02_operation_id,
+                    budget_grant, resource_quote, scope.pinned_anchor,
+                    expected_query=staged_query, now_utc=now_utc,
+                    projected=False, action_kind="communication")
+                if (staged_query != next_query or actual != projected
+                        or staged_binding.binding_scan_versions !=
+                           original_binding.binding_scan_versions):
+                    raise UnavailableGuard("natural final E+1 scope changed; HOLD")
+                access_delete = db.execute(
+                    "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple,
+                ).fetchone()
+                if access_delete != expected_access_delete_epoch:
+                    raise UnavailableGuard("natural paid access barrier changed; HOLD")
+                checks, social, d08 = self._read_natural_pregrant_checks_locked(
+                    namespace, scope, current_effect, effect_snapshot,
+                    final, stage.intent, stage.schema, staged_binding,
+                    original_scope_proof, resource_quote,
+                    expected_access_delete_epoch=expected_access_delete_epoch,
+                    now_utc=now_utc,
+                    valid_until_utc=envelope.deadline_utc)
         return (stage, checks, social, d08, original_binding,
                 staged_binding, projected)
 
     def _freeze_natural_final_grant_locked(
-            self, final, plan, adopted, stage, checks, *, now_utc: float):
+            self, final, plan, adopted, stage, checks, *, now_utc: float,
+            full_final=None, generation_output=None, segment_index=0):
         """Freeze the payload grant from five checks issued in this graph tx.
 
         This only creates D08 graph material. Dispatch still needs the final
@@ -23486,6 +29179,7 @@ class GraphCoordinator:
         from .domains.d08 import RequiredCheckRegistry
         from .domains.d08.natural_final import (
             prepare_natural_final_communication_candidate_v2,
+            prepare_natural_final_communication_candidate_v3,
         )
 
         if (not self.__store._lock._is_owned()
@@ -23510,7 +29204,7 @@ class GraphCoordinator:
             "input_versions": spec.required_input_versions,
         }) for spec in stage.intent.required_checks)
         identity = {
-            "schema": "sylanne.natural-final-communication.v2",
+            "schema": "sylanne.natural-final-communication.v3" if generation_output is not None else "sylanne.natural-final-communication.v2",
             "operation_id": final.material.final_operation_id,
             "effect_id": final.material.final_effect_id,
         }
@@ -23520,8 +29214,13 @@ class GraphCoordinator:
             "payload": final.material.payload_digest,
             "route": final.material.route_binding_digest,
         })
-        candidate = prepare_natural_final_communication_candidate_v2(
-            final, plan=plan, adopted=adopted, intent=stage.intent,
+        mapper = (prepare_natural_final_communication_candidate_v3 if generation_output is not None
+                  else prepare_natural_final_communication_candidate_v2)
+        candidate = mapper(
+            full_final if generation_output is not None else final,
+            **({"generation_output": generation_output, "segment_index": segment_index}
+               if generation_output is not None else {}),
+            plan=plan, adopted=adopted, intent=stage.intent,
             intent_ref=intent_write.key.token, schema=stage.schema,
             contact_id="contact:" + prefix,
             communication_action_id="communication:" + prefix,
@@ -23537,7 +29236,9 @@ class GraphCoordinator:
             self, *, bundle, final, paid, candidate, stage, scope, route,
             original_scope_proof, budget_grant, resource_quote,
             current_effect, effect_snapshot, provisional_checks,
-            projected_check_versions, now_utc: float):
+            projected_check_versions, now_utc: float,
+            natural_budget_original_receiver=None,
+            natural_catalogue_original_receiver=None):
         """Recheck the committed E+1 natural batch before issuing admission.
 
         This runs in the graph receipt hook, before the outer SQLite COMMIT.
@@ -23610,7 +29311,9 @@ class GraphCoordinator:
             final, stage.intent, stage.schema, binding,
             original_scope_proof, resource_quote,
             expected_access_delete_epoch=(paid.access_epoch, paid.delete_epoch),
-            now_utc=now_utc, valid_until_utc=bundle.envelope.deadline_utc)
+            now_utc=now_utc, valid_until_utc=bundle.envelope.deadline_utc,
+            natural_budget_original_receiver=natural_budget_original_receiver,
+            natural_catalogue_original_receiver=natural_catalogue_original_receiver)
         if checks != provisional_checks or social.status != "checks_candidate":
             raise UnavailableGuard("natural final five checks changed; HOLD")
         runtime = inspect_natural_final_d11_v2(
@@ -23618,7 +29321,7 @@ class GraphCoordinator:
             d11_issuer=self.__d11_issuer, now_utc=now_utc)
         projection = read_current_dispatch_projection(
             db, namespace, snapshot, query)
-        return runtime, binding, snapshot, query, projection
+        return runtime, binding, snapshot, query, projection, checks
 
     def _prepare_post_c02_reply_action_stage_locked(
             self, envelope, action_candidate, snapshot: GraphSnapshot,
@@ -23724,47 +29427,49 @@ class GraphCoordinator:
         staged_envelope, action, graph_candidate = (
             self._prepare_post_c02_reply_action_stage_locked(
                 envelope, provisional, snapshot, now_utc=now_utc))
-        with self.__store._provisional_graph_stage_in_transaction(
-                graph_candidate,
-                _capability=self.__graph_capability):
-            staged_snapshot, staged_query = (
-                self._dispatch_full_graph_snapshot_locked(namespace))
-            staged_route_binding = read_current_reply_entity_route_binding_v2(
-                self.__store._db, namespace, route, staged_query,
-                now_utc=now_utc)
-            actual = self._read_post_c02_check_versions_locked(
-                namespace, route, staged_route_binding, source_ref,
-                c02_receipt.operation_id,
-                budget_grant, resource_quote, anchor,
-                expected_query=staged_query, now_utc=now_utc, projected=False)
-            issued = issue_post_c02_reply_action_v2(
-                **common, snapshot=staged_snapshot, query=staged_query,
-                check_inputs=actual)
-            if (issued.status != "candidate"
-                    or issued != replace(provisional, status="candidate")):
-                raise UnavailableGuard(
-                    "actual staged reply action differs from provisional; HOLD")
-            d08, social, source_check, budget_check = (
-                self._read_post_c02_prebatch_checks_locked(
-                    namespace, scope, current_effect, effect_snapshot,
-                    issued.intent, issued.schema, expression, route,
-                    original_route_binding, staged_route_binding,
-                    resource_quote=resource_quote, now_utc=now_utc,
-                    valid_until_utc=envelope.deadline_utc))
-            checks = (social.role_receipt, social.boundary_receipt,
-                      source_check, d08.receipt, budget_check)
-            if (any(item is None or (item.result, item.coverage) !=
-                    ("pass", "full") for item in checks)
-                    or tuple(item.check_kind for item in checks) !=
-                    tuple(spec.check_kind for spec in issued.intent.required_checks)):
-                raise UnavailableGuard(
-                    "actual staged reply checks are incomplete; HOLD")
-            staged_grant = self._freeze_post_c02_reply_route_grant_locked(
-                issued, checks, staged_route_binding, scope,
-                staged_snapshot, now_utc)
-            candidate = self._post_c02_check_candidate_from_reads(
-                envelope, staged_query, anchor, scope, d08, social,
-                staged_route_binding, checks)
+        with self._full_graph_write_capture_locked(
+            namespace, scope, graph_candidate, phase="provisional") as capture:
+            with self.__store._provisional_graph_stage_in_transaction(
+                    graph_candidate,
+                    _capability=self.__graph_capability, _full_read_capture=capture):
+                staged_snapshot, staged_query = (
+                    self._dispatch_full_graph_snapshot_locked(namespace))
+                staged_route_binding = read_current_reply_entity_route_binding_v2(
+                    self.__store._db, namespace, route, staged_query,
+                    now_utc=now_utc)
+                actual = self._read_post_c02_check_versions_locked(
+                    namespace, route, staged_route_binding, source_ref,
+                    c02_receipt.operation_id,
+                    budget_grant, resource_quote, anchor,
+                    expected_query=staged_query, now_utc=now_utc, projected=False)
+                issued = issue_post_c02_reply_action_v2(
+                    **common, snapshot=staged_snapshot, query=staged_query,
+                    check_inputs=actual)
+                if (issued.status != "candidate"
+                        or issued != replace(provisional, status="candidate")):
+                    raise UnavailableGuard(
+                        "actual staged reply action differs from provisional; HOLD")
+                d08, social, source_check, budget_check = (
+                    self._read_post_c02_prebatch_checks_locked(
+                        namespace, scope, current_effect, effect_snapshot,
+                        issued.intent, issued.schema, expression, route,
+                        original_route_binding, staged_route_binding,
+                        resource_quote=resource_quote, now_utc=now_utc,
+                        valid_until_utc=envelope.deadline_utc))
+                checks = (social.role_receipt, social.boundary_receipt,
+                          source_check, d08.receipt, budget_check)
+                if (any(item is None or (item.result, item.coverage) !=
+                        ("pass", "full") for item in checks)
+                        or tuple(item.check_kind for item in checks) !=
+                        tuple(spec.check_kind for spec in issued.intent.required_checks)):
+                    raise UnavailableGuard(
+                        "actual staged reply checks are incomplete; HOLD")
+                staged_grant = self._freeze_post_c02_reply_route_grant_locked(
+                    issued, checks, staged_route_binding, scope,
+                    staged_snapshot, now_utc)
+                candidate = self._post_c02_check_candidate_from_reads(
+                    envelope, staged_query, anchor, scope, d08, social,
+                    staged_route_binding, checks)
         return (staged_envelope, action, issued, social, candidate,
                 original_route_binding, staged_route_binding, staged_grant)
 
@@ -25101,10 +30806,7 @@ class GraphCoordinator:
         if (binding.target_entity_ref != row[14]
                 or route.scene_ref != admission.scene_ref):
             raise UnavailableGuard("reply current account route changed")
-        grant_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*namespace.as_tuple).token,),
-        ).fetchone()
+        grant_row = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
         proof_row = db.execute(
             "SELECT operation_id,request_digest,grant_id,grant_digest,"
             "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -25325,7 +31027,7 @@ class GraphCoordinator:
     def assemble_post_c02_reply_v2(
             self, authority: AuthorityContext, lease: object, progress,
             installed_bundle, *, handler_invocation_id: str,
-            handler_deadline_utc: float) -> CommitReceipt:
+            handler_deadline_utc: float, _prepared_full_read=None) -> CommitReceipt:
         """Atomically seal one paid private reply, ending at host takeover HOLD.
 
         The original ingress handler supplies a deadline, bounded by the
@@ -25378,6 +31080,15 @@ class GraphCoordinator:
             installed_bundle.installation_policy.root_grant.valid_until_utc)
         if not now < deadline:
             raise UnavailableGuard("reply dispatch policy window elapsed; HOLD")
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is not None and _prepared_full_read is None:
+            from .runtime.current_graph_full_read_v3 import PRIVATE_REPLY_ROUTE_FULL_READ_V3
+            return self._prepare_full_read_then_call_v3(
+                authority, lease, PRIVATE_REPLY_ROUTE_FULL_READ_V3,
+                lambda proof: self.assemble_post_c02_reply_v2(authority, lease, progress, installed_bundle, handler_invocation_id=handler_invocation_id, handler_deadline_utc=handler_deadline_utc, _prepared_full_read=proof),
+                deadline_utc=handler_deadline_utc,
+                c02_operation_id=progress.run.preparation.c02_receipt.operation_id,
+                source_ref=progress.run.preparation.source.source_ref)
         namespace = authority.namespace
         with store._lock:
             metadata, epoch = self._v2_graph_stamp(namespace)
@@ -25520,7 +31231,8 @@ class GraphCoordinator:
                     current_effect=current_effect,
                     effect_snapshot=effect_snapshot, now_utc=now,
                     prepared=prepared, finish_id=finish_id,
-                    finish_digest=finish_digest)
+                    finish_digest=finish_digest,
+                    prepared_full_read=_prepared_full_read)
                 self._mark_post_c02_reply_dispatch_committed_locked(
                     namespace=namespace, operation_id=operation_id,
                     handler_invocation_id=handler_invocation_id,
@@ -26000,7 +31712,8 @@ class GraphCoordinator:
     def _seal_post_c02_reply_dispatch_locked(
             self, *, lease, scope: FenceScope, metadata, clock_reading,
             owner_guard, current_effect, effect_snapshot, now_utc: float,
-            prepared, finish_id: str, finish_digest: str) -> CommitReceipt:
+            prepared, finish_id: str, finish_digest: str,
+            prepared_full_read=None) -> CommitReceipt:
         """Seal only a locally assembled reply under the caller's write tx.
 
         The provisional check tuple is never an admission.  The normal graph
@@ -26072,7 +31785,9 @@ class GraphCoordinator:
             dispatch_admission_current_effect=current_effect,
             dispatch_admission_effect_snapshot=effect_snapshot,
             provisional_check_candidate=candidate,
-            installed_final_check_reissuer=reissue)
+            installed_final_check_reissuer=reissue,
+            _prepared_full_read=prepared_full_read,
+            _full_read_write_scope=scope)
 
     def _verify_dispatch_owner_graph_locked(
             self, namespace, witness, admission, graph_epoch,
@@ -26084,10 +31799,7 @@ class GraphCoordinator:
 
         db = self.__store._db
         metadata, epoch = self._v2_graph_stamp(namespace)
-        grant_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*namespace.as_tuple).token,),
-        ).fetchone()
+        grant_row = read_graph_head_v3(db, owner_grant_key(*namespace.as_tuple).token)
         proof_row = db.execute(
             "SELECT operation_id,request_digest,grant_id,grant_digest,"
             "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -26148,7 +31860,7 @@ class GraphCoordinator:
         return epochs
 
     def _commit_dispatch_claim_atom_in_transaction(
-            self, namespace: NamespaceId, value, claimed_receipt):
+            self, namespace: NamespaceId, value, claimed_receipt, *, contact_p2_proof=None, _inventory_delta_capture=None):
         """Persist an already verified final claim and recovery stamp atomically.
 
         This is a private transaction primitive, not the handoff authorizer.
@@ -26171,6 +31883,28 @@ class GraphCoordinator:
                 or type(claimed_receipt) is not MutationReceiptV2
                 or namespace.as_tuple != (value.bot_id, value.persona_id)):
             raise UnavailableGuard("dispatch claim typed identity differs")
+        contact_write = None
+        if contact_p2_proof is not None:
+            from .runtime.contact_p2_qualification_v1 import (
+                ContactP2GraphProofV1, contact_p2_graph_proof_write_v1,
+            )
+            if (type(contact_p2_proof) is not ContactP2GraphProofV1
+                    or (contact_p2_proof.namespace, contact_p2_proof.operation_id,
+                        contact_p2_proof.effect_id, contact_p2_proof.activity_id,
+                        contact_p2_proof.admission_ref, contact_p2_proof.context_digest,
+                        contact_p2_proof.graph_incarnation, 'sha256:' + contact_p2_proof.digest) != (
+                        namespace, value.operation_id, value.effect_id, value.activity_id,
+                        value.admission_ref, value.context_digest,
+                        value.graph_incarnation, value.current_evidence_digest)
+                    or claimed_receipt.pending.binding.origin.proactive_contact is not True
+                    or (contact_p2_proof.policy_capsule.binding_digest,
+                        contact_p2_proof.policy_capsule.claimed_receipt_digest,
+                        contact_p2_proof.policy_capsule.owner_witness_digest) != (
+                        value.binding_digest, value.claimed_receipt_digest, value.owner_witness_digest)
+                    or self.__d04_installed_joint_assembly is None
+                    or contact_p2_proof.installation_id != self.__d04_installed_joint_assembly.installation_policy.installation_id):
+                raise UnavailableGuard("Contact P2 claim companion differs from actual claim")
+            contact_write = contact_p2_graph_proof_write_v1(contact_p2_proof)
         pending = claimed_receipt.pending
         anchor = claimed_receipt.after_anchor
         if (claimed_receipt.durable_state != "committed"
@@ -26200,10 +31934,7 @@ class GraphCoordinator:
             raise StaleRead("dispatch claim recovery watermark differs from P2")
         write = dispatch_claim_graph_write(value)
         event_id = "dispatch-claim:" + value.effect_id
-        existing = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (write.key.token,),
-        ).fetchone()
+        existing = read_graph_head_v3(db, write.key.token)
         if existing is not None:
             if (requirements.deletion_seq != anchor.deletion_seq
                     or requirements.deletion_digest != anchor.deletion_digest
@@ -26221,7 +31952,19 @@ class GraphCoordinator:
             ).fetchone()
             if event_row is None or event_row[0] > epoch.revision:
                 raise UnavailableGuard("dispatch claim event is unavailable")
+            if contact_write is not None:
+                proof_head = read_graph_head_v3(db, contact_write.key.token)
+                proof_birth = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1",
+                    (contact_write.key.token,)).fetchone()
+                if (proof_head != (1, canonical_serialize(contact_write.value), 1)
+                        or proof_birth != (event_id, canonical_serialize(contact_write.value), 1)
+                        or event_row[0] != contact_p2_proof.qualification.graph_epoch + 1):
+                    raise EventConflict("Contact P2 replay lacks its exact atomic qualification companion")
             return GraphVersion(write.key, 1), event_row[0], False
+        if contact_write is not None and (
+                contact_p2_proof.qualification.graph_epoch != epoch.revision
+                or contact_p2_proof.qualification.check_versions.graph_epoch != epoch.revision):
+            raise StaleRead("Contact P2 qualification differs from the actual first claim Graph epoch")
         event = Event(
             Scope(*namespace.as_tuple, value.activity_id), event_id, time.time(),
             "dispatch_graph_claim_v1", {"claim_digest": canonical_digest(write.value)},
@@ -26229,8 +31972,14 @@ class GraphCoordinator:
         from .runtime.d13_outbound_observation_v1 import reserve_natural_outbound_slot_at_claim_v1
         turn_writes, turn_reads = reserve_natural_outbound_slot_at_claim_v1(
             db, namespace, pending.binding.origin.operation_id)
+        if contact_write is not None and turn_writes:
+            raise UnavailableGuard("Contact P2 cannot borrow a natural outbound reservation")
+        contact_reads = (() if contact_write is None else (
+            GraphVersion(contact_write.key, 0), *contact_p2_proof.qualification.positive_reads))
+        contact_writes = () if contact_write is None else (contact_write,)
         candidate = GraphCandidate(
-            event, (GraphVersion(write.key, 0), *turn_reads), (write, *turn_writes), (epoch,))
+            event, (GraphVersion(write.key, 0), *turn_reads, *contact_reads),
+            (write, *turn_writes, *contact_writes), (epoch,))
         replacement = replace(
             requirements,
             deletion_seq=anchor.deletion_seq,
@@ -26251,6 +32000,11 @@ class GraphCoordinator:
         receipt = GraphStore._graph_commit_in_transaction(
             store, candidate, _receipt_hook=stamp_claim,
             _capability=self.__graph_capability)
+        if _inventory_delta_capture is not None:
+            from .runtime.dispatch_current_inventory_v3 import _DispatchCommittedDeltaCaptureV3
+            if type(_inventory_delta_capture) is not _DispatchCommittedDeltaCaptureV3 or contact_p2_proof is None:
+                raise UnavailableGuard("actual Contact committed delta capture required")
+            _inventory_delta_capture.capture(self,db,candidate,receipt,(metadata,epoch),self._v2_graph_stamp(namespace))
         return GraphVersion(write.key, 1), receipt.epoch.revision, True
 
     def register_dispatch_final_claim_writer_v1(
@@ -26298,7 +32052,7 @@ class GraphCoordinator:
     def _commit_natural_dispatch_final_claim_v2(
             self, context, binding, claimed, witness, authority_snapshot,
             route_port=None, issuer_id=None, *, frozen_clock=None,
-            frozen_installation_id=None):
+            frozen_installation_id=None, prepared_inventory=None):
         """Recheck one V2 paid batch and current private route at the P2 fence."""
         from .authority_service.reverse_handoff import (
             require_exact_authority_snapshot,
@@ -26362,19 +32116,25 @@ class GraphCoordinator:
             db = store._db
             db.execute("BEGIN")
             try:
+                if runtime_storage_v3(db) is not None:
+                    from .runtime.dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
+                    if type(prepared_inventory) is not PreparedCurrentDispatchInventoryV3:
+                        raise UnavailableGuard("actual pre-P1 natural dispatch inventory required; HOLD")
+                    prepared_inventory.require_for(context,binding,claimed,db,authority_snapshot=authority_snapshot)
                 admission_receipt = load_admission(
                     db, namespace, binding.origin.admission_ref)
                 issued = (load_request(
                     db, namespace, binding.origin.admission_ref)
                           if admission_receipt is not None else None)
                 recovered = self._get_natural_dispatch_candidate_evidence_locked(
-                    namespace, binding.operation_id)
+                    namespace, binding.operation_id,
+                    prepared_history=None if prepared_inventory is None else prepared_inventory.natural_history)
                 if (issued is None or recovered is None
                         or issued[0] != admission_receipt):
                     raise UnavailableGuard("natural original admission absent; HOLD")
                 request = issued[1]
                 segment = self._get_natural_dispatch_text_segment_locked(
-                    namespace, request, now_utc=now_utc)
+                    namespace, request, now_utc=now_utc,prepared_inventory=prepared_inventory)
                 if segment is None or segment[1] != recovered.evidence:
                     raise UnavailableGuard("natural original segment absent; HOLD")
                 selectors = (
@@ -26389,6 +32149,21 @@ class GraphCoordinator:
             except BaseException:
                 db.execute("ROLLBACK")
                 raise
+        from .runtime.natural_same_batch_history_v3 import read_natural_roster_head_v1
+        with store._lock:
+            db.execute("BEGIN")
+            try:
+                parents = db.execute("SELECT parent_original_id FROM graph_natural_generation_preparations_v2 "
+                    "WHERE bot=? AND persona=? AND original_operation_id=?",
+                    namespace.as_tuple + (recovered.evidence.generation_original_operation_id,)).fetchall()
+                if len(parents) != 1:
+                    raise UnavailableGuard("natural P2 actual parent original is unavailable; HOLD")
+                roster = read_natural_roster_head_v1(db, namespace, parents[0][0])
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        self._confirm_natural_roster_head_v1(namespace, roster, permit.namespace)
         live_route = route_port.read_live_host_scene_only(
             namespace=namespace, account_ref=selectors[0],
             destination_ref=selectors[1], scene_ref=selectors[2],
@@ -26402,6 +32177,8 @@ class GraphCoordinator:
             db.execute("BEGIN IMMEDIATE")
             try:
                 metadata, epoch = self._v2_graph_stamp(namespace)
+                if read_natural_roster_head_v1(db, namespace, roster[2].parent_original_id) != roster:
+                    raise UnavailableGuard("natural P2 adopted roster changed after Core proof; HOLD")
                 anchor = authority_snapshot.anchor
                 if (metadata.requirements.graph_incarnation
                     != binding.graph_incarnation
@@ -26416,7 +32193,8 @@ class GraphCoordinator:
                     db, namespace, binding.origin.admission_ref)
                           if admission_receipt is not None else None)
                 recovered = self._get_natural_dispatch_candidate_evidence_locked(
-                    namespace, binding.operation_id)
+                    namespace, binding.operation_id,
+                    prepared_history=None if prepared_inventory is None else prepared_inventory.natural_history)
                 if issued is None or recovered is None:
                     raise UnavailableGuard("natural P2 original absent; HOLD")
                 request = issued[1]
@@ -26426,7 +32204,7 @@ class GraphCoordinator:
                         admission_receipt.admission.scene_ref) != selectors:
                     raise UnavailableGuard("natural P2 route changed; HOLD")
                 segment = self._get_natural_dispatch_text_segment_locked(
-                    namespace, request, now_utc=now_utc)
+                    namespace, request, now_utc=now_utc,prepared_inventory=prepared_inventory)
                 if segment is None or segment[1] != recovered.evidence:
                     raise UnavailableGuard("natural P2 segment changed; HOLD")
                 if (live_route.current_scene.scene_ref != selectors[2]
@@ -26436,16 +32214,20 @@ class GraphCoordinator:
                     namespace, request.operation_id)
                 if operation is None:
                     raise UnavailableGuard("natural P2 operation absent; HOLD")
-                batch_row = db.execute(
-                    "SELECT value,valid FROM graph_history WHERE token=? "
-                    "AND event_bot=? AND event_persona=? "
-                    "AND event_session=? AND event_id=?",
-                    (recovered.evidence.batch_ref,) + namespace.as_tuple + (
-                        request.activity_id, request.operation_id),
-                ).fetchone()
+                if prepared_inventory is None:
+                    batch_row = db.execute(
+                        "SELECT value,valid FROM graph_history WHERE token=? "
+                        "AND event_bot=? AND event_persona=? "
+                        "AND event_session=? AND event_id=?",
+                        (recovered.evidence.batch_ref,) + namespace.as_tuple + (
+                            request.activity_id, request.operation_id),
+                    ).fetchone()
+                else:
+                    batch_ref,batch_revision=recovered.write_versions[3]
+                    batch_row=prepared_inventory.natural_history.read_history_json_v3(db,namespace,batch_ref,batch_revision,request.activity_id,request.operation_id)
                 if batch_row is None or batch_row[1] != 1:
                     raise UnavailableGuard("natural P2 batch history absent; HOLD")
-                batch = json.loads(batch_row[0])
+                batch = json.loads(batch_row[0]) if prepared_inventory is None else batch_row[0]
                 parent_row = db.execute(
                     "SELECT parent_original_id FROM "
                     "graph_natural_generation_preparations_v2 WHERE bot=? "
@@ -26456,17 +32238,24 @@ class GraphCoordinator:
                 if parent_row is None:
                     raise UnavailableGuard("natural P2 generation original absent; HOLD")
                 generation = read_original_preparation(
-                    db, namespace, parent_row[0], "generation")
+                    db, namespace, parent_row[0], "generation",
+                    prepared_originals=None if prepared_inventory is None else prepared_inventory.natural_originals)
                 if generation is None:
                     raise UnavailableGuard("natural P2 generation seal absent; HOLD")
                 scoped = read_original_scoped_query_proof_v2(db, generation)
                 _inputs, route = self._current_post_c02_reply_route_locked(
                     namespace, generation.seal.c02_operation_id,
-                    generation.seal.source_ref, now_utc, epoch)
-                _snapshot, query = self._dispatch_full_graph_snapshot_locked(
-                    namespace)
+                    generation.seal.source_ref, now_utc, epoch,prepared_inventory=prepared_inventory)
+                if runtime_storage_v3(db) is None:
+                    _snapshot,query = self._dispatch_full_graph_snapshot_locked(namespace)
+                else:
+                    from .runtime.dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
+                    if type(prepared_inventory) is not PreparedCurrentDispatchInventoryV3:
+                        raise UnavailableGuard("actual pre-P1 natural dispatch inventory is absent; HOLD")
+                    prepared_inventory.require_for(context,binding,claimed,db,authority_snapshot=authority_snapshot)
+                    query = prepared_inventory.query
                 binding_route = read_current_reply_entity_route_binding_v2(
-                    db, namespace, route, query, now_utc=now_utc)
+                    db, namespace, route, query, now_utc=now_utc, prepared_inventory=prepared_inventory)
                 if evaluate_dispatch_budget_authority_snapshot(
                         context, witness, authority_snapshot,
                         namespace=namespace,
@@ -26504,7 +32293,7 @@ class GraphCoordinator:
     def _commit_dispatch_final_claim_v1(
             self, context, binding, claimed, witness, authority_snapshot,
             route_port=None, issuer_id=None, *, frozen_clock=None,
-            frozen_installation_id=None):
+            frozen_installation_id=None, prepared_inventory=None):
         """Recheck the exact P2 and current graph in one write transaction.
 
         All Authority reads precede the GraphStore lock. Incomplete domain
@@ -26611,260 +32400,275 @@ class GraphCoordinator:
         store = self.__store
         if type(route_port) is not InstalledDispatchRoutePort:
             raise UnavailableGuard("installed final dispatch route reader unavailable; HOLD")
-        with store._lock:
-            db = store._db
-            db.execute("BEGIN")
-            try:
-                from .runtime.dispatch_admission import load_admission
-                receipt = load_admission(db, namespace, binding.origin.admission_ref)
-                if receipt is None:
-                    raise UnavailableGuard("final dispatch admission is absent; HOLD")
-                frozen = receipt.admission
-                from .runtime.dispatch_current_segment import read_current_dispatch_segment
-                pre_route = read_current_dispatch_segment(
-                    db, namespace, frozen.admission_ref, now_utc=now_utc)
-                selectors = (frozen.account_ref, frozen.destination_ref,
-                             frozen.scene_ref, pre_route.route_digest)
-            finally:
-                db.execute("ROLLBACK")
-        live_route = route_port.read_live_host_scene_only(
-            namespace=namespace, account_ref=selectors[0],
-            destination_ref=selectors[1], scene_ref=selectors[2],
-            route_digest=selectors[3])
-        if (type(live_route) is not InstalledDispatchRouteReadV1
-                or live_route.status != "verified_route"
-                or live_route.route_digest != selectors[3]
-                or live_route.graph_epoch is not None
-                or live_route.current_scene is None):
-            raise UnavailableGuard("current installed AstrBot route unavailable; HOLD")
+        with runtime_storage_operation_v3(store._db,
+                operation_id=permit.operation_id, deadline_utc=None):
+            with store._lock, runtime_storage_quantum_v3(store._db):
+                db = store._db
+                db.execute("BEGIN")
+                try:
+                    from .runtime.dispatch_admission import load_admission
+                    receipt = load_admission(db, namespace, binding.origin.admission_ref)
+                    if receipt is None:
+                        raise UnavailableGuard("final dispatch admission is absent; HOLD")
+                    frozen = receipt.admission
+                    from .runtime.dispatch_current_segment import read_current_dispatch_segment
+                    pre_route = read_current_dispatch_segment(
+                        db, namespace, frozen.admission_ref, now_utc=now_utc)
+                    selectors = (frozen.account_ref, frozen.destination_ref,
+                                 frozen.scene_ref, pre_route.route_digest)
+                finally:
+                    db.execute("ROLLBACK")
+            live_route = route_port.read_live_host_scene_only(
+                namespace=namespace, account_ref=selectors[0],
+                destination_ref=selectors[1], scene_ref=selectors[2],
+                route_digest=selectors[3])
+            if (type(live_route) is not InstalledDispatchRouteReadV1
+                    or live_route.status != "verified_route"
+                    or live_route.route_digest != selectors[3]
+                    or live_route.graph_epoch is not None
+                    or live_route.current_scene is None):
+                raise UnavailableGuard("current installed AstrBot route unavailable; HOLD")
 
-        with store._lock:
-            db = store._db
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                metadata, _ = self._v2_graph_stamp(namespace)
-                requirements = metadata.requirements
-                if (requirements.namespace != namespace
-                        or requirements.graph_incarnation != binding.graph_incarnation
-                        or requirements.authority_namespace != permit.namespace
-                        or requirements.deletion_seq != anchor.deletion_seq
-                        or requirements.revocation_epoch != anchor.revocation_epoch
-                        or not self._accounting_anchor_covers(requirements, anchor)):
-                    raise UnavailableGuard("final dispatch graph/Authority stamp differs; HOLD")
-                provision_row = self._provision_row(db, namespace)
-                if (provision_row is None or
-                        self._decode_provision_receipt(provision_row).installation_id
-                        != witness.guard.installation_id):
-                    raise UnavailableGuard("final dispatch Owner installation differs; HOLD")
-                prerequisite = self._read_dispatch_final_claim_prerequisite_locked(
-                    namespace, binding, claimed, context.handoff_id,
-                    now_utc=now_utc)
-                from .runtime.dispatch_admission import load_admission
-                admission_receipt = load_admission(
-                    db, namespace, prerequisite.admission_ref)
-                if (admission_receipt is None
-                        or admission_receipt.admission.clock_policy_ref
-                        != self.__dispatch_clock_policy.source_id
-                        or admission_receipt.admission.clock_policy_digest
-                        != canonical_digest(asdict(self.__dispatch_clock_policy))):
-                    raise UnavailableGuard("final dispatch installed clock differs; HOLD")
-                graph, query = self._dispatch_full_graph_snapshot_locked(namespace)
-                segment = read_current_dispatch_segment(
-                    db, namespace, prerequisite.admission_ref, now_utc=now_utc)
-                if ((admission_receipt.admission.account_ref,
-                     admission_receipt.admission.destination_ref,
-                     admission_receipt.admission.scene_ref,
-                     segment.route_digest) != selectors):
-                    raise UnavailableGuard("final dispatch route changed during host read; HOLD")
-                projection = read_current_dispatch_projection(
-                    db, namespace, graph, query)
-                blockers = evaluate_dispatch_budget_authority_snapshot(
-                    context, witness, authority_snapshot, namespace=namespace,
-                    proposed_footprint=binding.origin.footprint)
-                if blockers:
-                    raise UnavailableGuard(
-                        "final dispatch Authority budget conflicts: "
-                        + ",".join(blockers) + "; HOLD")
-                facts = read_current_d08_conflict_facts(
-                    db, namespace, graph, query)
-                actions = tuple(item for item in facts.action_intents
-                                if item.identity.operation_id == binding.operation_id
-                                and item.identity.effect_id == binding.origin.effect_id)
-                if len(actions) != 1:
-                    raise UnavailableGuard("current D08 action is absent or ambiguous; HOLD")
-                current_reply_route = None
-                if binding.operation_id.startswith("post-c02-reply:"):
-                    current_reply_route = self._read_current_post_c02_final_route_locked(
-                        namespace, admission_receipt.admission, actions[0],
-                        segment, graph, query, now_utc=now_utc)
-                action = read_current_d08_action_conflict_evidence(
-                    db, namespace, graph, query, actions[0].action_id,
-                    permit, effect)
-                if (action.effect_state != "unresolved"
-                        or action.action_cancellation_state != "clear"
-                        or action.job_cancellation_state != "clear"
-                        or projection.coverage != "full"
-                        or projection.missing_sources):
-                    raise UnavailableGuard("current D08/graph checks incomplete; HOLD")
-                candidate = self._get_dispatch_candidate_evidence_locked(
-                    namespace, binding.operation_id)
-                if candidate is None:
-                    raise UnavailableGuard("current D08 schema candidate absent; HOLD")
-                schema_ref, schema_revision = candidate.write_versions[1]
-                schema_atom = graph.get(AtomKey.from_token(schema_ref))
-                if (schema_atom is None or not schema_atom.valid
-                        or schema_atom.revision != schema_revision):
-                    raise UnavailableGuard("current D08 action schema differs; HOLD")
-                schema = next(spec for spec in GoalExecutionProvider().register_types()
-                              if spec.name == "d08.action_schema.v1").validator(
-                                  schema_atom.value)
-                commitment = read_current_commitment_criteria_v1(
-                    db, namespace, graph, query, actions[0], schema,
-                    claimed, context, witness, authority_snapshot, effect,
-                    now_utc=now_utc)
-                d03 = self.__providers.get("d03")
-                d05 = self.__providers.get("d05")
-                if (d03 is None or d05 is None
-                        or type(d03[0]) is not ContextProvider
-                        or type(d05[0]) is not RelationshipProvider
-                        or len(admission_receipt.admission.audience) != 1):
-                    raise UnavailableGuard("current D03/D05 provider or scope absent; HOLD")
+            with store._lock, runtime_storage_quantum_v3(store._db):
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
                 try:
-                    catalogue_current = all(
-                        store._registry.spec(spec.name) == spec
-                        for provider in (d03[0], d05[0])
-                        for spec in provider.type_specs())
-                except (AttributeError, KeyError, TypeError, ValueError):
-                    catalogue_current = False
-                receipts = {
-                    item.check_kind: item
-                    for item in admission_receipt.admission.check_receipts}
-                if set(receipts) != {item.check_kind for item in schema.required_checks}:
-                    raise UnavailableGuard("current RequiredCheck set is incomplete; HOLD")
-                role = receipts.get("role_binding")
-                boundary = receipts.get("boundary")
-                if role is None or boundary is None:
-                    raise UnavailableGuard("current D03/D05 receipts absent; HOLD")
-                social = verify_current_social_checks(
-                    db, graph, projection, actions[0], schema, role, boundary,
-                    context=d03[0], scene_ref=admission_receipt.admission.scene_ref,
-                    audience_scope=admission_receipt.admission.audience[0],
-                    now_utc=now_utc,
-                    current_catalogue_confirmed=catalogue_current)
-                if social.status != "verified" or social.verified is not True:
-                    raise UnavailableGuard(
-                        "current D03/D05 check incomplete: " + social.reason + "; HOLD")
-                from .domains.d08.execution import BASE_REQUIRED_PROVIDERS
-                if (schema.proactive or binding.origin.proactive_contact
-                        or schema.action_kind != "message"
-                        or {(item.check_kind, item.provider_id)
-                            for item in schema.required_checks}
-                        != set(BASE_REQUIRED_PROVIDERS)
-                        or len(schema.required_checks) != len(BASE_REQUIRED_PROVIDERS)
-                        or schema.required_checks != actions[0].required_checks):
-                    raise UnavailableGuard(
-                        "final dispatch action needs an unavailable current check; HOLD")
-                if current_reply_route is not None:
-                    source_receipt = receipts.get("source_grant")
-                    budget_receipt = receipts.get("dispatch_budget")
-                    source_coverage = (
-                        query.scope_ref == "all"
-                        and graph.epochs == (NamespaceEpoch(
-                            *namespace.as_tuple, query.revision),)
-                        and len(graph.atoms) == db.execute(
-                            "SELECT COUNT(*) FROM graph_atoms WHERE bot=? AND persona=?",
-                            namespace.as_tuple).fetchone()[0]
-                    )
-                    source_barrier = (
-                        source_coverage
-                        and anchor == context.permit.pinned_anchor
-                        and metadata.requirements.deletion_seq == anchor.deletion_seq
-                        and metadata.requirements.revocation_epoch == anchor.revocation_epoch
-                        and db.execute(
-                            "SELECT access_epoch,delete_epoch "
-                            "FROM graph_authority_epochs WHERE bot=? AND persona=?",
-                            namespace.as_tuple).fetchone() == (
-                            admission_receipt.admission.access_epoch,
-                            admission_receipt.admission.delete_epoch)
-                        and set(actions[0].source_refs).issubset(
-                            current_reply_route[1])
-                    )
-                    if source_receipt is None or budget_receipt is None:
-                        raise UnavailableGuard("final reply D06/D11 check is absent; HOLD")
-                    current_source_check = provide_source_grant_check(
-                        actions[0], SourceGrantRead(
-                            graph, admission_receipt.admission.audience,
-                            "expression", source_coverage, source_barrier),
-                        valid_until=source_receipt.valid_until)
-                    current_budget_check = inspect_current_d11_dispatch_budget(
-                        db, actions[0], d11_issuer=self.__d11_issuer,
-                        d02_issuer=self.__d02_issuer, now_utc=now_utc)
-                    if (current_source_check != source_receipt
-                            or current_source_check.result != "pass"
-                            or current_source_check.coverage != "full"
-                            or current_budget_check.status != "check_pass"
-                            or current_budget_check.receipt != budget_receipt):
+                    metadata, _ = self._v2_graph_stamp(namespace)
+                    requirements = metadata.requirements
+                    if (requirements.namespace != namespace
+                            or requirements.graph_incarnation != binding.graph_incarnation
+                            or requirements.authority_namespace != permit.namespace
+                            or requirements.deletion_seq != anchor.deletion_seq
+                            or requirements.revocation_epoch != anchor.revocation_epoch
+                            or not self._accounting_anchor_covers(requirements, anchor)):
+                        raise UnavailableGuard("final dispatch graph/Authority stamp differs; HOLD")
+                    provision_row = self._provision_row(db, namespace)
+                    if (provision_row is None or
+                            self._decode_provision_receipt(provision_row).installation_id
+                            != witness.guard.installation_id):
+                        raise UnavailableGuard("final dispatch Owner installation differs; HOLD")
+                    prerequisite = self._read_dispatch_final_claim_prerequisite_locked(
+                        namespace, binding, claimed, context.handoff_id,
+                        now_utc=now_utc)
+                    from .runtime.dispatch_admission import load_admission
+                    admission_receipt = load_admission(
+                        db, namespace, prerequisite.admission_ref)
+                    if (admission_receipt is None
+                            or admission_receipt.admission.clock_policy_ref
+                            != self.__dispatch_clock_policy.source_id
+                            or admission_receipt.admission.clock_policy_digest
+                            != canonical_digest(asdict(self.__dispatch_clock_policy))):
+                        raise UnavailableGuard("final dispatch installed clock differs; HOLD")
+                    if runtime_storage_v3(db) is None:
+                        graph,query = self._dispatch_full_graph_snapshot_locked(namespace)
+                    else:
+                        from .runtime.dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
+                        if type(prepared_inventory) is not PreparedCurrentDispatchInventoryV3:
+                            raise UnavailableGuard("actual pre-P1 full dispatch inventory is absent; HOLD")
+                        graph = prepared_inventory.require_for(context,binding,claimed,db,authority_snapshot=authority_snapshot)
+                        query = prepared_inventory.query
+                    segment = read_current_dispatch_segment(
+                        db, namespace, prerequisite.admission_ref, now_utc=now_utc)
+                    if ((admission_receipt.admission.account_ref,
+                         admission_receipt.admission.destination_ref,
+                         admission_receipt.admission.scene_ref,
+                         segment.route_digest) != selectors):
+                        raise UnavailableGuard("final dispatch route changed during host read; HOLD")
+                    projection = read_current_dispatch_projection(
+                        db, namespace, graph, query, prepared_inventory=prepared_inventory)
+                    blockers = evaluate_dispatch_budget_authority_snapshot(
+                        context, witness, authority_snapshot, namespace=namespace,
+                        proposed_footprint=binding.origin.footprint)
+                    if blockers:
                         raise UnavailableGuard(
-                            "final reply current D06/D11 checks differ; HOLD")
-                try:
-                    check_receipts_against_specs(
-                        admission_receipt.admission, schema.required_checks,
-                        now_utc)
-                except ValueError as exc:
-                    raise UnavailableGuard(
-                        "final dispatch frozen RequiredCheck differs; HOLD") from exc
-                owner_epochs = self._verify_dispatch_owner_graph_locked(
-                    namespace, witness, admission_receipt.admission,
-                    query.revision, frozen_installation_id)
-                if (live_route.route_digest != segment.route_digest
-                        or live_route.current_scene.scene_ref
-                        != admission_receipt.admission.scene_ref
-                        or live_route.current_scene.namespace != namespace):
-                    raise UnavailableGuard("final dispatch live scene differs; HOLD")
-                evidence_digest = "sha256:" + canonical_digest({
-                    "prerequisite": prerequisite,
-                    "graph_epoch": query.revision,
-                    "segment": segment,
-                    "reply_account_route": current_reply_route,
-                    "route": live_route,
-                    "projection": projection.digest,
-                    "social": social,
-                    "commitment": commitment,
-                    "current_source_check": (
-                        current_source_check if current_reply_route is not None else None),
-                    "current_budget_check": (
-                        current_budget_check if current_reply_route is not None else None),
-                    "action": action,
-                    "owner_witness": witness,
-                    "owner_epochs": owner_epochs,
-                    "authority_snapshot": authority_snapshot,
-                })
-                value = DispatchGraphClaimValueV1(
-                    namespace.bot_id, namespace.persona_id,
-                    binding.graph_incarnation, binding.origin.activity_id,
-                    binding.origin.effect_id, binding.operation_id,
-                    context.handoff_id, prerequisite.admission_ref,
-                    permit.namespace, authority_digest(context.permit),
-                    permit.fence_epoch, claimed.updated_revision,
-                    anchor.execution_seq, anchor.execution_digest,
-                    authority_digest(context), authority_digest(witness),
-                    authority_digest(binding), authority_digest(claimed),
-                    evidence_digest,
-                )
-                version, graph_epoch, _ = self._commit_dispatch_claim_atom_in_transaction(
-                    namespace, value, claimed)
-                claim_receipt = DispatchGraphClaimReceiptV1(
-                    authority_digest(context), binding.graph_namespace,
-                    binding.graph_incarnation, f"graph:{version.revision}",
-                    graph_epoch, owner_epochs[0], owner_epochs[1],
-                    "dispatch-claim:" + binding.origin.effect_id,
-                    "sha256:" + canonical_digest(asdict(value)), issuer_id,
-                )
-                db.execute("COMMIT")
-                return claim_receipt
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
+                            "final dispatch Authority budget conflicts: "
+                            + ",".join(blockers) + "; HOLD")
+                    facts = read_current_d08_conflict_facts(
+                        db, namespace, graph, query, prepared_inventory=prepared_inventory)
+                    actions = tuple(item for item in facts.action_intents
+                                    if item.identity.operation_id == binding.operation_id
+                                    and item.identity.effect_id == binding.origin.effect_id)
+                    if len(actions) != 1:
+                        raise UnavailableGuard("current D08 action is absent or ambiguous; HOLD")
+                    current_reply_route = None
+                    if binding.operation_id.startswith("post-c02-reply:"):
+                        current_reply_route = self._read_current_post_c02_final_route_locked(
+                            namespace, admission_receipt.admission, actions[0],
+                            segment, graph, query, now_utc=now_utc, prepared_inventory=prepared_inventory)
+                    action = read_current_d08_action_conflict_evidence(
+                        db, namespace, graph, query, actions[0].action_id,
+                        permit, effect, prepared_inventory=prepared_inventory)
+                    if (action.effect_state != "unresolved"
+                            or action.action_cancellation_state != "clear"
+                            or action.job_cancellation_state != "clear"
+                            or projection.coverage != "full"
+                            or projection.missing_sources):
+                        raise UnavailableGuard("current D08/graph checks incomplete; HOLD")
+                    candidate = self._get_dispatch_candidate_evidence_locked(
+                        namespace, binding.operation_id)
+                    if candidate is None:
+                        raise UnavailableGuard("current D08 schema candidate absent; HOLD")
+                    schema_ref, schema_revision = candidate.write_versions[1]
+                    schema_atom = graph.get(AtomKey.from_token(schema_ref))
+                    if (schema_atom is None or not schema_atom.valid
+                            or schema_atom.revision != schema_revision):
+                        raise UnavailableGuard("current D08 action schema differs; HOLD")
+                    schema = next(spec for spec in GoalExecutionProvider().register_types()
+                                  if spec.name == "d08.action_schema.v1").validator(
+                                      schema_atom.value)
+                    commitment = read_current_commitment_criteria_v1(
+                        db, namespace, graph, query, actions[0], schema,
+                        claimed, context, witness, authority_snapshot, effect,
+                        now_utc=now_utc, prepared_inventory=prepared_inventory)
+                    d03 = self.__providers.get("d03")
+                    d05 = self.__providers.get("d05")
+                    if (d03 is None or d05 is None
+                            or type(d03[0]) is not ContextProvider
+                            or type(d05[0]) is not RelationshipProvider
+                            or len(admission_receipt.admission.audience) != 1):
+                        raise UnavailableGuard("current D03/D05 provider or scope absent; HOLD")
+                    try:
+                        catalogue_current = all(
+                            store._registry.spec(spec.name) == spec
+                            for provider in (d03[0], d05[0])
+                            for spec in provider.type_specs())
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        catalogue_current = False
+                    receipts = {
+                        item.check_kind: item
+                        for item in admission_receipt.admission.check_receipts}
+                    if set(receipts) != {item.check_kind for item in schema.required_checks}:
+                        raise UnavailableGuard("current RequiredCheck set is incomplete; HOLD")
+                    role = receipts.get("role_binding")
+                    boundary = receipts.get("boundary")
+                    if role is None or boundary is None:
+                        raise UnavailableGuard("current D03/D05 receipts absent; HOLD")
+                    social = verify_current_social_checks(
+                        db, graph, projection, actions[0], schema, role, boundary,
+                        context=d03[0], scene_ref=admission_receipt.admission.scene_ref,
+                        audience_scope=admission_receipt.admission.audience[0],
+                        now_utc=now_utc,
+                        current_catalogue_confirmed=catalogue_current, prepared_inventory=prepared_inventory)
+                    if social.status != "verified" or social.verified is not True:
+                        raise UnavailableGuard(
+                            "current D03/D05 check incomplete: " + social.reason + "; HOLD")
+                    from .domains.d08.execution import BASE_REQUIRED_PROVIDERS
+                    if (schema.proactive or binding.origin.proactive_contact
+                            or schema.action_kind != "message"
+                            or {(item.check_kind, item.provider_id)
+                                for item in schema.required_checks}
+                            != set(BASE_REQUIRED_PROVIDERS)
+                            or len(schema.required_checks) != len(BASE_REQUIRED_PROVIDERS)
+                            or schema.required_checks != actions[0].required_checks):
+                        raise UnavailableGuard(
+                            "final dispatch action needs an unavailable current check; HOLD")
+                    if current_reply_route is not None:
+                        source_receipt = receipts.get("source_grant")
+                        budget_receipt = receipts.get("dispatch_budget")
+                        source_coverage = (
+                            query.scope_ref == "all"
+                            and graph.epochs == (NamespaceEpoch(
+                                *namespace.as_tuple, query.revision),)
+                            and (prepared_inventory.full_eof if prepared_inventory is not None else
+                                len(graph.atoms)==db.execute("SELECT COUNT(*) FROM graph_atoms WHERE bot=? AND persona=?",
+                                    namespace.as_tuple).fetchone()[0])
+                        )
+                        source_barrier = (
+                            source_coverage
+                            and anchor == context.permit.pinned_anchor
+                            and metadata.requirements.deletion_seq == anchor.deletion_seq
+                            and metadata.requirements.revocation_epoch == anchor.revocation_epoch
+                            and db.execute(
+                                "SELECT access_epoch,delete_epoch "
+                                "FROM graph_authority_epochs WHERE bot=? AND persona=?",
+                                namespace.as_tuple).fetchone() == (
+                                admission_receipt.admission.access_epoch,
+                                admission_receipt.admission.delete_epoch)
+                            and set(actions[0].source_refs).issubset(
+                                current_reply_route[1])
+                        )
+                        if source_receipt is None or budget_receipt is None:
+                            raise UnavailableGuard("final reply D06/D11 check is absent; HOLD")
+                        if prepared_inventory is None:
+                            current_source_check = provide_source_grant_check(
+                                actions[0],SourceGrantRead(graph,admission_receipt.admission.audience,
+                                    "expression",source_coverage,source_barrier),valid_until=source_receipt.valid_until)
+                        else:
+                            if not source_coverage or not source_barrier:
+                                raise UnavailableGuard("current Source barrier is incomplete; HOLD")
+                            from .domains.d06.source_grant import provide_prepared_source_grant_check_v3
+                            current_source_check = provide_prepared_source_grant_check_v3(actions[0],
+                                prepared_inventory=prepared_inventory,db=db,audience=admission_receipt.admission.audience,
+                                purpose="expression",valid_until=source_receipt.valid_until)
+                        current_budget_check = inspect_current_d11_dispatch_budget(
+                            db, actions[0], d11_issuer=self.__d11_issuer,
+                            d02_issuer=self.__d02_issuer, now_utc=now_utc)
+                        if (current_source_check != source_receipt
+                                or current_source_check.result != "pass"
+                                or current_source_check.coverage != "full"
+                                or current_budget_check.status != "check_pass"
+                                or current_budget_check.receipt != budget_receipt):
+                            raise UnavailableGuard(
+                                "final reply current D06/D11 checks differ; HOLD")
+                    try:
+                        check_receipts_against_specs(
+                            admission_receipt.admission, schema.required_checks,
+                            now_utc)
+                    except ValueError as exc:
+                        raise UnavailableGuard(
+                            "final dispatch frozen RequiredCheck differs; HOLD") from exc
+                    owner_epochs = self._verify_dispatch_owner_graph_locked(
+                        namespace, witness, admission_receipt.admission,
+                        query.revision, frozen_installation_id)
+                    if (live_route.route_digest != segment.route_digest
+                            or live_route.current_scene.scene_ref
+                            != admission_receipt.admission.scene_ref
+                            or live_route.current_scene.namespace != namespace):
+                        raise UnavailableGuard("final dispatch live scene differs; HOLD")
+                    evidence_digest = "sha256:" + canonical_digest({
+                        "prerequisite": prerequisite,
+                        "graph_epoch": query.revision,
+                        "segment": segment,
+                        "reply_account_route": current_reply_route,
+                        "route": live_route,
+                        "projection": projection.digest,
+                        "social": social,
+                        "commitment": commitment,
+                        "current_source_check": (
+                            current_source_check if current_reply_route is not None else None),
+                        "current_budget_check": (
+                            current_budget_check if current_reply_route is not None else None),
+                        "action": action,
+                        "owner_witness": witness,
+                        "owner_epochs": owner_epochs,
+                        "authority_snapshot": authority_snapshot,
+                    })
+                    value = DispatchGraphClaimValueV1(
+                        namespace.bot_id, namespace.persona_id,
+                        binding.graph_incarnation, binding.origin.activity_id,
+                        binding.origin.effect_id, binding.operation_id,
+                        context.handoff_id, prerequisite.admission_ref,
+                        permit.namespace, authority_digest(context.permit),
+                        permit.fence_epoch, claimed.updated_revision,
+                        anchor.execution_seq, anchor.execution_digest,
+                        authority_digest(context), authority_digest(witness),
+                        authority_digest(binding), authority_digest(claimed),
+                        evidence_digest,
+                    )
+                    version, graph_epoch, _ = self._commit_dispatch_claim_atom_in_transaction(
+                        namespace, value, claimed)
+                    claim_receipt = DispatchGraphClaimReceiptV1(
+                        authority_digest(context), binding.graph_namespace,
+                        binding.graph_incarnation, f"graph:{version.revision}",
+                        graph_epoch, owner_epochs[0], owner_epochs[1],
+                        "dispatch-claim:" + binding.origin.effect_id,
+                        "sha256:" + canonical_digest(asdict(value)), issuer_id,
+                    )
+                    db.execute("COMMIT")
+                    return claim_receipt
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
 
     def get_dispatch_text_segment(self, authority: AuthorityContext,
                                   lease: object, request):
@@ -27065,16 +32869,31 @@ class GraphCoordinator:
         return self._read_v2(authority, reader)
 
     def _get_natural_dispatch_text_segment_locked(
-            self, namespace, request, *, now_utc: float):
+            self, namespace, request, *, now_utc: float, prepared_inventory=None):
         """Use the shared current proof before exposing the committed body."""
         from .runtime.natural_dispatch_current_read_v2 import (
             NaturalDispatchCurrentHold,
             read_current_natural_dispatch_segment_in_transaction_v2,
         )
+        from .runtime.natural_reply_job_v2 import read_original_preparation
+
+        recovered = self._get_natural_dispatch_candidate_evidence_locked(namespace, request.operation_id,
+            prepared_history=None if prepared_inventory is None else prepared_inventory.natural_history)
+        if recovered is not None:
+            parents = self.__store._db.execute(
+                "SELECT parent_original_id FROM graph_natural_generation_preparations_v2 "
+                "WHERE bot=? AND persona=? AND original_operation_id=?",
+                (*namespace.as_tuple, recovered.evidence.generation_original_operation_id)).fetchall()
+            if len(parents) != 1:
+                raise UnavailableGuard("natural parent original is ambiguous; HOLD")
+            generation = read_original_preparation(self.__store._db, namespace, parents[0][0], "generation",
+                prepared_originals=None if prepared_inventory is None else prepared_inventory.natural_originals)
+            if generation is None or self._natural_parent_stop_original_locked(namespace, generation) is not None:
+                raise UnavailableGuard("natural parent reply was stopped or its original is unavailable; HOLD")
 
         try:
             return read_current_natural_dispatch_segment_in_transaction_v2(
-                self.__store._db, namespace, request, now_utc=now_utc)
+                self.__store._db, namespace, request, now_utc=now_utc,prepared_inventory=prepared_inventory)
         except NaturalDispatchCurrentHold as exc:
             raise UnavailableGuard(str(exc)) from exc
 
@@ -27703,14 +33522,8 @@ class GraphCoordinator:
             identity = json.loads(receipt.identity_json)
             source_atom_key = source_key(*namespace.as_tuple, source_ref)
             access_atom_key = access_key(*namespace.as_tuple, source_ref)
-            source_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (source_atom_key.token,),
-            ).fetchone()
-            access_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (access_atom_key.token,),
-            ).fetchone()
+            source_row = read_graph_head_v3(db, source_atom_key.token)
+            access_row = read_graph_head_v3(db, access_atom_key.token)
             if (source_row is None or access_row is None
                     or not source_row[2] or not access_row[2]):
                 raise UnavailableGuard("D03 arrival current source or access is unavailable")
@@ -27739,14 +33552,8 @@ class GraphCoordinator:
                 source_version=GraphVersion(source_atom_key, source_row[0]),
                 access_version=GraphVersion(access_atom_key, access_row[0]),
             )
-            sender_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (candidate.sender_key.token,),
-            ).fetchone()
-            binding_row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (candidate.account_binding_key.token,),
-            ).fetchone()
+            sender_row = read_graph_head_v3(db, candidate.sender_key.token)
+            binding_row = read_graph_head_v3(db, candidate.account_binding_key.token)
             event_row = db.execute(
                 "SELECT 1 FROM graph_atoms WHERE token=?",
                 (candidate.event_key.token,),
@@ -27775,10 +33582,7 @@ class GraphCoordinator:
                             prior_binding_event_key.owner.persona) != namespace.as_tuple):
                     raise UnavailableGuard(
                         "D03 existing account binding event crosses scope; HOLD")
-                prior_event_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (prior_binding_event_key.token,),
-                ).fetchone()
+                prior_event_row = read_graph_head_v3(db, prior_binding_event_key.token)
                 if (prior_event_row is None or not prior_event_row[2]
                         or prior_event_row[0] < 1):
                     raise UnavailableGuard(
@@ -28316,10 +34120,7 @@ class GraphCoordinator:
                                        event_row[1], json.loads(event_row[2]),
                                        bool(event_row[3]))
                 mapping_key = self_mapping_key(namespace)
-                mapping_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (mapping_key.token,),
-                ).fetchone()
+                mapping_row = read_graph_head_v3(db, mapping_key.token)
                 mapping_atom = (GraphAtom(mapping_key, mapping_row[0],
                                           json.loads(mapping_row[1]), bool(mapping_row[2]))
                                 if mapping_row else GraphAtom(mapping_key, 0, {}, False))
@@ -28711,6 +34512,7 @@ class GraphCoordinator:
         The installed semantic/time and numerical resource issuers must bind
         this preparation before the public adoption port may commit it.
         """
+        self.__local_module_admission.require_v1(('d04', 'd11'), "prepare_current_d04_joint_product_v3")
         from .domains.d04.affect import AffectProvider, AffectScheme
         from .domains.d04.joint_state_output_v1 import (
             JointStateFrozenPredecessorsV1, JointStatePredecessorV1)
@@ -28752,8 +34554,7 @@ class GraphCoordinator:
                     audience=authority.audience, purpose=authority.purpose)
                 atoms = []
                 for version in current.component.read_versions:
-                    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                                     (version.key.token,)).fetchone()
+                    row = read_graph_head_v3(db, version.key.token)
                     if (row[0] if row else 0) != version.revision:
                         raise StaleRead("D04 frozen component changed")
                     atoms.append(GraphAtom(version.key, row[0], json.loads(row[1]), bool(row[2]))
@@ -28930,10 +34731,7 @@ class GraphCoordinator:
                                          member.predecessor_state_ref))
                 atoms = []
                 for key in keys:
-                    row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (key.token,),
-                    ).fetchone()
+                    row = read_graph_head_v3(db, key.token)
                     atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
                                  if row else GraphAtom(key, 0, {}, False))
                 snapshot = GraphSnapshot(
@@ -29090,10 +34888,7 @@ class GraphCoordinator:
             for token, revision, encoded in perspectives:
                 value = SelfPerspective(**json.loads(encoded))
                 event_key = AtomKey.from_token(value.arrival_event_ref)
-                event_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (event_key.token,),
-                ).fetchone()
+                event_row = read_graph_head_v3(db, event_key.token)
                 if (event_row is not None and event_row[2] == 1
                         and json.loads(event_row[1]).get("source_refs")
                         == [inputs.source_ref]):
@@ -29124,10 +34919,7 @@ class GraphCoordinator:
                     event_key, perspective_key, mapping_key)
             atoms = []
             for key in keys:
-                row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (key.token,),
-                ).fetchone()
+                row = read_graph_head_v3(db, key.token)
                 if row is None:
                     raise UnavailableGuard("D04 baseline prerequisite graph atom absent")
                 atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])))
@@ -29995,6 +35787,10 @@ class GraphCoordinator:
             "model_request_digest", "authority_operation_id", "binding_digest",
             "terminal_read_attempt_id",
         }
+        if type(evidence) is dict and "c1_task_result_v1" in evidence:
+            from .runtime.c1_artifact_task_intent_v1 import validate_c1_task_result_evidence_v1
+            validate_c1_task_result_evidence_v1(evidence)
+            evidence_keys.add("c1_task_result_v1")
         if (type(evidence) is not dict or set(evidence) != evidence_keys
                 or canonical_json(evidence) != candidate[4]
                 or canonical_serialize(asdict(seal)) != candidate[6]
@@ -30489,7 +36285,8 @@ class GraphCoordinator:
             receipt = self._commit_domain_bundle_v2(
                 bundle, lease, c02_adoption=(
                     original_intent, read, binding, held, installation_policy,
-                    admin_policy, now), c02_first_seal_v2=_first_seal_v2)
+                    admin_policy, now), c02_first_seal_v2=_first_seal_v2,
+                c02_foreground_clock_reading=reading)
             verified = self._first_ingress_c02_duplicate_v1(
                 namespace, operation_id, original_intent, read)
             if verified is None:
@@ -30816,9 +36613,7 @@ class GraphCoordinator:
                 or context.operation_id != operation_id):
             raise UnavailableGuard("current Owner-fenced D04 V3 root read unavailable")
         for ref, revision, value, valid in context.read_rows:
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (ref,)
-            ).fetchone()
+            row = read_graph_head_v3(db, ref)
             current = (0, "{}", 0) if row is None else row
             if current != (revision, value, valid):
                 raise StaleRead("D04 root V3 graph input changed before D11 freeze")
@@ -30877,10 +36672,7 @@ class GraphCoordinator:
         initial_keys = (activation_key, draft_key, head_key)
         read_rows = []
         for key in initial_keys:
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (key.token,),
-            ).fetchone()
+            row = read_graph_head_v3(db, key.token)
             if row is None or row[0] < 1 or row[2] != 1:
                 raise UnavailableGuard("D01 activation or current D12 draft/head absent")
             if canonical_json(json.loads(row[1])) != row[1]:
@@ -30954,10 +36746,7 @@ class GraphCoordinator:
             candidate, initial_box, readout, output_policy, operation_id)
         rows = authored_root_write_rows_v3(output.members)
         for ref, _, _ in rows:
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (ref,),
-            ).fetchone()
+            row = read_graph_head_v3(db, ref)
             if row is not None:
                 raise UnavailableGuard("D04 V3 root already has a graph state")
             read_rows.append((ref, 0, "{}", 0))
@@ -31162,7 +36951,7 @@ class GraphCoordinator:
             assembly.package_root, policy.manifest_digest,
             available_cpu_features=assembly.available_cpu_features,
         )
-        if (not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance"}
+        if (not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}
                 or package.manifest_digest != policy.manifest_digest):
             raise UnavailableGuard("formal D04 installed package unavailable; HOLD")
         selected_output_policy = load_installed_d04_output_policy_v1(
@@ -31657,14 +37446,8 @@ class GraphCoordinator:
                     now_utc=now_utc)
                 if authority.audience != (binding.conversation_ref,):
                     raise AuthorityDenied("D13 ingress audience differs from original route")
-                source_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (binding.source_version.key.token,),
-                ).fetchone()
-                access_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (binding.access_version.key.token,),
-                ).fetchone()
+                source_row = read_graph_head_v3(db, binding.source_version.key.token)
+                access_row = read_graph_head_v3(db, binding.access_version.key.token)
                 if (source_row is None or access_row is None
                         or (source_row[0], source_row[2])
                            != (binding.source_version.revision, 1)
@@ -31755,10 +37538,7 @@ class GraphCoordinator:
             now_utc=now_utc)
 
         def atom(version):
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (version.key.token,),
-            ).fetchone()
+            row = read_graph_head_v3(db, version.key.token)
             if row is None or (row[0], row[2]) != (version.revision, 1):
                 raise UnavailableGuard("D13 inbound source or arrival changed; HOLD")
             return GraphAtom(version.key, row[0], json.loads(row[1]), True)
@@ -31873,6 +37653,8 @@ class GraphCoordinator:
                 raise EventConflict("original D13 ingress operation differs")
             if RestoreAnchor(**json.loads(row[2])) != anchor:
                 raise UnavailableGuard("original D13 turn anchor changed; HOLD")
+        if row is None or row[8] is None:
+            self.__local_module_admission.require_v1(('d13', 'd11'), "commit_confirmed_d13_inbound_turn_v1")
         self._read_v2(authority, preflight)
         if row is None:
             with store._lock:
@@ -32040,10 +37822,7 @@ class GraphCoordinator:
                     raise StaleRead("D13 turn scene order query changed")
                 scene, conversation = binding.scene_ref, binding.conversation_ref
                 order_key = turn_order_key(namespace, scene, conversation)
-                order_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (order_key.token,),
-                ).fetchone()
+                order_row = read_graph_head_v3(db, order_key.token)
                 if order_row is not None and order_row[2] != 1:
                     raise UnavailableGuard("D13 scene order is invalid; HOLD")
                 order = (None if order_row is None else GraphAtom(
@@ -32085,9 +37864,7 @@ class GraphCoordinator:
                 order_write, slot_write = reservation.writes
                 slot = GraphAtom(slot_write.key, 1, slot_write.value, True)
                 evidence_version = binding.binding_evidence_event_version
-                evidence_row = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (evidence_version.key.token,)).fetchone()
+                evidence_row = read_graph_head_v3(db, evidence_version.key.token)
                 if (evidence_version.revision < 1 or evidence_row is None
                         or evidence_row[0] != evidence_version.revision or evidence_row[2] != 1):
                     raise StaleRead("D09 original account-binding evidence changed")
@@ -32980,6 +38757,21 @@ class GraphCoordinator:
     def schedule_d13_paid_precompression_v1(self, authority, lease, *, scene_ref):
         """Schedule or recover one installed independent paid D13 original."""
         from .runtime.d13_paid_product_v1 import schedule_d13_paid_precompression_graph_v1
+        from .runtime.d13_standby_read_v3 import prepare_d13_standby_read_v3, bind_prepared_d13_standby_v3
+        from .runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(self.__store._db) is not None:
+            work = prepare_d13_standby_read_v3(self, authority, lease, scene_ref=scene_ref)
+            def completed(proof):
+                try:
+                    from .runtime_storage_v3 import bind_runtime_storage_operation_v3
+                    with bind_runtime_storage_operation_v3(work.operation, self.__store._db), bind_prepared_d13_standby_v3(proof):
+                        return schedule_d13_paid_precompression_graph_v1(
+                            self, authority, lease, scene_ref=scene_ref)
+                finally:
+                    proof.release_payload_v3()
+            def failed(error):
+                raise error
+            return work.map_terminal_v3("issuer", completed, failed)
         return schedule_d13_paid_precompression_graph_v1(
             self, authority, lease, scene_ref=scene_ref)
 
@@ -33005,8 +38797,31 @@ class GraphCoordinator:
     def complete_d13_paid_precompression_v1(self, authority, lease, *, job_id, selected_main):
         """Recheck current source/model and atomically complete job plus standby."""
         from .runtime.d13_paid_product_v1 import complete_d13_paid_graph_v1
-        return complete_d13_paid_graph_v1(
-            self, authority, lease, job_id=job_id, selected_main=selected_main)
+        from .runtime.d13_derived_product_v6 import complete_d13_paid_derived_graph_v6
+        from .host.model_workflows_v6 import AdminModelWorkflowsV6
+        from .model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE
+        assembly = self.__d04_installed_joint_assembly
+        bundle = None if assembly is None else assembly.admin_bundle
+        actual_v6 = (bundle is not None and type(bundle.model_workflows) is AdminModelWorkflowsV6
+            and bundle.model_workflows.natural_generation is not None
+            and bundle.model_workflows.natural_generation.template_version == V6_TEMPLATE)
+        from .host.model_workflows_v7 import AdminModelWorkflowsV7
+        from .model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
+        actual_v7=(bundle is not None and type(bundle.model_workflows) is AdminModelWorkflowsV7
+            and bundle.model_workflows.natural_generation is not None
+            and bundle.model_workflows.natural_generation.template_version==V7_TEMPLATE)
+        # The persisted derived metadata/payload product has the same V1 contract.
+        producer = complete_d13_paid_derived_graph_v6 if actual_v6 or actual_v7 else complete_d13_paid_graph_v1
+        return producer(self, authority, lease, job_id=job_id, selected_main=selected_main)
+
+    def discover_due_d13_derived_cache_v6(self, authority, lease):
+        from .runtime.d13_derived_product_v6 import discover_due_d13_derived_graph_v6
+        return discover_due_d13_derived_graph_v6(self, authority, lease)
+
+    def retire_due_d13_derived_cache_v6(self, authority, lease, *, block_ref, expected_revision):
+        from .runtime.d13_derived_product_v6 import retire_due_d13_derived_graph_v6
+        return retire_due_d13_derived_graph_v6(self, authority, lease,
+            block_ref=block_ref, expected_revision=expected_revision)
 
     def recover_d13_paid_precompression_v1(self, authority, lease, *, job_id):
         """Return only durable original recovery actions; never replace a call."""
@@ -33075,6 +38890,7 @@ class GraphCoordinator:
                 authority, lease,
                 original_operation_id=matching[0].original_operation_id)
 
+        self.__local_module_admission.require_v1(('d13', 'd11'), "schedule_d13_deterministic_precompression_v2")
         window = self.read_current_d13_conversation_window_v1(
             authority, lease, scene_ref=scene_ref, max_slots=policy.max_slots)
         # A bounded page with any known gap cannot establish the oldest
@@ -33456,11 +39272,18 @@ class GraphCoordinator:
         return scope
 
     def _d13_worker_write_v2(self, authority, operation_id, request_digest,
-                             commit):
+                             commit, *, paid_owner_phase=None):
         """Retain the original V2 write before one atomic business transaction."""
         store = self.__store
         port = self.__content_fence_v2
         namespace = authority.namespace
+        if paid_owner_phase not in {None,'schedule','acquire'}:
+            raise ValueError('exact named paid Owner original phase required')
+        if paid_owner_phase is not None:
+            from .authority_service.v3_owner_paid_guard_observation import require_committed_paid_owner_guard_link_v3
+            with store._lock:
+                require_committed_paid_owner_guard_link_v3(store._db,namespace=namespace,
+                    business_operation_id=operation_id,request_digest=request_digest,phase=paid_owner_phase)
         prior = self._d13_worker_replay_v2(authority, operation_id, request_digest)
         if prior is not None:
             return prior
@@ -33514,6 +39337,7 @@ class GraphCoordinator:
         if scope is None or scope.operation_id != attempt_id:
             raise UnavailableGuard("D13 original worker scope unavailable; HOLD")
         permit = scope.permit
+        owner_observation=None
         finish_id = "finish:" + attempt_id
         finish_digest = "sha256:" + canonical_digest({
             "action": "finish_d13_worker", "operation_id": operation_id,
@@ -33521,6 +39345,12 @@ class GraphCoordinator:
         })
         from .runtime.first_ingress_v2 import trusted_upper
         try:
+            if paid_owner_phase is not None:
+                owner_observation,current_permit=port.observe_paid_owner_guard_for_fence_v3(
+                    namespace=namespace,authority_namespace=scope.authority_namespace,permit=permit,
+                    business_operation_id=operation_id,request_digest=request_digest,phase=paid_owner_phase)
+                if current_permit!=permit or owner_observation.permit!=permit:
+                    raise UnavailableGuard('paid Owner original observation crossed its active write Scope; HOLD')
             clock = port.read_ingress_clock(self.__scene_clock_policy)
             trusted_upper(clock)
         except Exception:
@@ -33531,7 +39361,7 @@ class GraphCoordinator:
                     "operation_id": operation_id,
                     "permit_token": permit.token,
                 }))
-            raise UnavailableGuard("D13 worker trusted clock unavailable; HOLD")
+            raise UnavailableGuard("D13 worker Owner original or trusted clock unavailable; HOLD")
         with store._lock:
             db = store._db
             db.execute("BEGIN IMMEDIATE")
@@ -33547,6 +39377,11 @@ class GraphCoordinator:
                     (canonical_json(result), *namespace.as_tuple, operation_id))
                 if db.execute("SELECT changes()").fetchone() != (1,):
                     raise EventConflict("D13 worker receipt was already sealed")
+                if owner_observation is not None:
+                    from .authority_service.v3_owner_paid_guard_observation import record_paid_owner_guard_link_v3
+                    record_paid_owner_guard_link_v3(db,namespace=namespace,business_operation_id=operation_id,
+                        request_digest=request_digest,phase=paid_owner_phase,permit=permit,
+                        observation=owner_observation,receipt_json=canonical_json(result))
                 commit_started = True
                 db.execute("COMMIT")
             except BaseException as exc:
@@ -33634,6 +39469,7 @@ class GraphCoordinator:
             if current != saved:
                 raise UnavailableGuard("D13 acquired job changed after receipt; HOLD")
             return saved
+        self.__local_module_admission.require_v1(('d13', 'd11'), "acquire_d13_deterministic_precompression_job_v2")
         if original.phase != "queued" or original.cancel_epoch:
             raise UnavailableGuard("D13 original job is not queued; HOLD")
         pending_scope = self._d13_worker_pending_scope_v2(
@@ -33734,15 +39570,13 @@ class GraphCoordinator:
             job = PersistentJob(**prior["job"])
             with store._lock:
                 current = get_job(store._db, job_id)
-                row = store._db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (AtomKey(Owner("persona", *authority.namespace.as_tuple),
-                             "d13.compressed_turn_block.v2", receipt.block_ref).token,
-                     )).fetchone()
+                row = read_graph_head_v3(store._db, AtomKey(Owner("persona", *authority.namespace.as_tuple),
+                             "d13.compressed_turn_block.v2", receipt.block_ref).token)
             if (current != job or row is None or row[0] != receipt.cache_revision
                     or row[2] != 1):
                 raise UnavailableGuard("D13 completion replay state differs; HOLD")
             return receipt, budget, job
+        self.__local_module_admission.require_v1(('d13', 'd11'), "complete_d13_deterministic_precompression_job_v2")
         with store._lock:
             original = get_job(store._db, job_id)
         plan = plan_from_precompression_job_v1(original)
@@ -33970,10 +39804,7 @@ class GraphCoordinator:
             raise RuntimeError("D13 current read needs the held graph transaction")
         key = AtomKey(Owner("persona", *namespace.as_tuple),
                       "d13.compressed_turn_block.v2", block_ref)
-        row = store._db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (key.token,),
-        ).fetchone()
+        row = read_graph_head_v3(store._db, key.token)
         retired = store._db.execute(
             "SELECT 1 FROM graph_d13_retirements_v1 WHERE bot=? AND persona=? "
             "AND block_token=?", namespace.as_tuple + (key.token,),
@@ -34018,10 +39849,7 @@ class GraphCoordinator:
                     "d13.compressed_turn_block.v2", intent.block.block_ref).token):
                 raise EventConflict("D13 retirement operation was reused")
             receipt = D13CacheCommitReceiptV1(**json.loads(prior[2]))
-            row = db.execute(
-                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (prior[1],),
-            ).fetchone()
+            row = read_graph_head_v3(db, prior[1])
             if (row is None or row[0] != receipt.cache_revision or row[2] != 1
                     or _block_from_graph_value(json.loads(row[1])) != intent.block):
                 raise UnavailableGuard("D13 retired graph block differs; HOLD")
@@ -34037,10 +39865,7 @@ class GraphCoordinator:
             raise StaleRead("D13 retirement graph head changed")
         key = AtomKey(Owner("persona", *namespace.as_tuple),
                       "d13.compressed_turn_block.v2", intent.block.block_ref)
-        row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (key.token,),
-        ).fetchone()
+        row = read_graph_head_v3(db, key.token)
         if row is None or row[2] != 1 or row[0] != intent.expected_cache_revision:
             raise StaleRead("D13 cache CAS revision changed")
         old = _block_from_graph_value(json.loads(row[1]))
@@ -34127,7 +39952,7 @@ class GraphCoordinator:
                                  baseline_issuance=None,
                                  self_identity_issuance=None,
                                  correction_issuance=None,
-                                  c02_adoption=None,
+                                  c02_adoption=None, c02_foreground_clock_reading=None,
                                   c02_recovery: _C02PendingRecovery | None = None,
                                   c02_terminal_recovery: _C02TerminalRecovery | None = None,
                                   c02_first_seal_v2: bool = False,
@@ -34220,6 +40045,19 @@ class GraphCoordinator:
                 "authority_operation_id": held.authority_operation_id,
                 "binding_digest": binding.binding_digest,
             }
+            from .model_broker.first_ingress_encoding import (
+                FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION, FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION,
+                FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION)
+            if binding.request["prompt_template_version"] in {
+                    FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION, FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION,
+                    FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION}:
+                if not c02_first_seal_v2:
+                    raise ValueError("typed task intent requires the actual version-2 C02 seal")
+                evidence["c1_task_result_v1"]={"schema":"d11.c1-task-result-evidence.v1",
+                    "template_version":binding.request["prompt_template_version"],
+                    "worker_read":worker_read_to_wire(read)}
+                from .runtime.c1_artifact_task_intent_v1 import validate_c1_task_result_evidence_v1
+                validate_c1_task_result_evidence_v1(evidence)
             if c02_first_seal_v2:
                 request = read.request
                 c02_first_seal_key = OriginalC02ResultKeyV1(
@@ -34276,6 +40114,16 @@ class GraphCoordinator:
         anchor_json = canonical_json(asdict(anchor))
         if c02_terminal_recovery is not None and intent is None:
             raise UnavailableGuard("terminal C02 durable first-seal intent is absent; HOLD")
+        if prior is None:
+            new_work = (
+                ("d03", "d11") if arrival_issuance is not None else
+                ("d07", "d11") if attention_issuance is not None else
+                ("d04", "d06", "d07", "d11") if c04_association_issuance is not None else
+                ("d04", "d11") if baseline_issuance is not None else
+                ("d03", "d11") if self_identity_issuance is not None else
+                ("d06", "d11") if c02_adoption is not None or c02_first_seal_v2 else
+                ("d04", "d11") if d04_joint_replay is not None else ())
+            self.__local_module_admission.require_v1(new_work, "installed_domain_bundle")
         if intent is None and prior is None:
             with store._lock:
                 db = store._db
@@ -34708,10 +40556,7 @@ class GraphCoordinator:
                     activation_key = AtomKey(
                         Owner("persona", *namespace.as_tuple),
                         "d01.persona_activation.v1", "current")
-                    row = store._db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (activation_key.token,),
-                    ).fetchone()
+                    row = read_graph_head_v3(store._db, activation_key.token)
                     if row is None:
                         raise UnavailableGuard("current D01 activation unavailable; HOLD")
                     activation_atom = GraphAtom(
@@ -34783,6 +40628,7 @@ class GraphCoordinator:
                  c02_adoption=(c02_witness, c02_fact, permit)
                  if c02_witness is not None else None,
                  c02_first_seal_quote=c02_v2_quote,
+                 c02_foreground_clock_reading=c02_foreground_clock_reading,
                  c02_terminal_recovery=c02_terminal_recovery)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
@@ -34933,9 +40779,11 @@ class GraphCoordinator:
     def _commit_domain_bundle_fenced(self, bundle: DomainBundle,
                                      lease: object, *, v2_read: bool = False,
                                      v2_write=None, v2_transaction_state=None,
+                                     _prepared_full_read=None, _full_read_write_scope=None,
                                       in_transaction: bool = False,
                                       now_utc: float | None = None,
                                       dispatch_clock_reading=None,
+                                       dispatch_clock_original=None,
                                       dispatch_clock_frozen_now_utc=None,
                                       dispatch_admission_scope=None,
                                       dispatch_admission_owner_guard=None,
@@ -34959,7 +40807,7 @@ class GraphCoordinator:
                                       self_identity_issuance=None,
                                       correction_issuance=None,
                                        qualified_self=None,
-                                       c02_adoption=None,
+                                       c02_adoption=None, c02_foreground_clock_reading=None,
                                        c02_first_seal_quote=None,
                                        c02_terminal_recovery: _C02TerminalRecovery | None = None
                                        ) -> CommitReceipt:
@@ -34979,1675 +40827,1788 @@ class GraphCoordinator:
             raise ValueError("domain bundle requires proposals")
         self._authorize(lease, envelope.authority, domains)
         store = self.__store
-        writes = tuple(write for proposal in bundle.proposals for write in proposal.typed_writes)
-        if c04_runtime_writes_v3:
-            if (c04_adoption_issuance_v3 is None or not in_transaction
-                    or type(c04_runtime_writes_v3) is not tuple
-                    or len(c04_runtime_writes_v3) != 2
-                    or {w.key.type_name for w in c04_runtime_writes_v3} != {"runtime.job", "runtime.outbox"}):
-                raise AuthorityDenied("C04 runtime staging requires installed five-write adoption")
-            self._authorize(lease, envelope.authority, frozenset({"d11"}))
-            from .runtime.d11_types import validate_d11_writes
-            if not validate_d11_writes(c04_runtime_writes_v3, namespace,
-                    operation_id=envelope.identity.operation_id, activity_id=envelope.identity.activity_id,
-                    effect_id=envelope.identity.effect_id):
-                raise AuthorityDenied("C04 original job/outbox staging differs")
-            for runtime_write in c04_runtime_writes_v3:
-                reconcile_runtime_write(store._db, runtime_write)
-            writes += c04_runtime_writes_v3
-        from .domains.d09.contact_batch_v1 import CONTACT_BATCH_SCHEMA_V1
-        from .runtime.contact_dispatch_candidate_v1 import (
-            ContactDispatchCandidateEvidenceV1, validate_contact_dispatch_candidate_writes_v1)
-        from .runtime.contact_final_stage_v1 import _ContactFinalCommitWitnessV1
-        from .domains.d09.contact_batch_v2 import KINDS as contact_v2_kinds
-        from .runtime.contact_dispatch_candidate_v2 import ContactDispatchCandidateEvidenceV2, validate_contact_dispatch_candidate_writes_v2
-        from .runtime.contact_final_stage_v2 import _ContactFinalCommitWitnessV2
-        from .domains.d09.contact_batch_v3 import KINDS as contact_v3_kinds
-        from .runtime.contact_dispatch_candidate_v3 import ContactDispatchCandidateEvidenceV3, validate_contact_dispatch_candidate_writes_v3
-        from .runtime.contact_final_stage_v3 import _ContactFinalCommitWitnessV3
-        has_contact_v3 = any(w.key.type_name in contact_v3_kinds for w in writes)
-        has_contact_v2 = any(w.key.type_name in contact_v2_kinds for w in writes)
-        has_contact_batch = any(w.key.type_name == CONTACT_BATCH_SCHEMA_V1 for w in writes)
-        if has_contact_v3:
-            if (has_contact_v2 or has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
-                    or natural_final_admission is not None or v2_write is None):
-                raise UnavailableGuard("Contact3 requires its exact installed final GCP witness; HOLD")
-            dispatch_candidate = validate_contact_dispatch_candidate_writes_v3(
-                tuple((p.domain,w) for p in bundle.proposals for w in p.typed_writes),
-                namespace=namespace, identity=envelope.identity, read_versions=envelope.version_guard.read_versions,
-                source_refs=envelope.source_qualification.source_refs, access_epoch=envelope.version_guard.access_epoch,
-                delete_epoch=envelope.version_guard.delete_epoch,
-                query_epoch=envelope.version_guard.query_epochs[0].revision if len(envelope.version_guard.query_epochs)==1 else -1)
-        elif has_contact_v2:
-            if (has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV2
-                    or natural_final_admission is not None or v2_write is None):
-                raise UnavailableGuard("Contact v2 requires its exact installed final GCP witness; HOLD")
-            dispatch_candidate = validate_contact_dispatch_candidate_writes_v2(
-                tuple((p.domain,w) for p in bundle.proposals for w in p.typed_writes),
-                namespace=namespace, identity=envelope.identity, read_versions=envelope.version_guard.read_versions,
-                source_refs=envelope.source_qualification.source_refs, access_epoch=envelope.version_guard.access_epoch,
-                delete_epoch=envelope.version_guard.delete_epoch,
-                query_epoch=envelope.version_guard.query_epochs[0].revision if len(envelope.version_guard.query_epochs)==1 else -1)
-        elif has_contact_batch:
-            if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV1
-                    or natural_final_admission is not None or v2_write is None):
-                raise UnavailableGuard("Contact batch requires its installed current final GCP witness; HOLD")
-            dispatch_candidate = validate_contact_dispatch_candidate_writes_v1(
-                tuple((p.domain, w) for p in bundle.proposals for w in p.typed_writes),
-                namespace=namespace, identity=envelope.identity,
-                read_versions=envelope.version_guard.read_versions,
-                source_refs=envelope.source_qualification.source_refs,
-                access_epoch=envelope.version_guard.access_epoch,
-                delete_epoch=envelope.version_guard.delete_epoch,
-                query_epoch=envelope.version_guard.query_epochs[0].revision
-                if len(envelope.version_guard.query_epochs) == 1 else -1)
-        else:
-            dispatch_candidate = validate_dispatch_candidate_writes(
-                tuple((proposal.domain, write) for proposal in bundle.proposals
-                      for write in proposal.typed_writes),
-                namespace=namespace, identity=envelope.identity,
-                read_versions=envelope.version_guard.read_versions,
-                source_refs=envelope.source_qualification.source_refs,
-                access_epoch=envelope.version_guard.access_epoch,
-                delete_epoch=envelope.version_guard.delete_epoch,
-                query_epoch=envelope.version_guard.query_epochs[0].revision
-                if len(envelope.version_guard.query_epochs) == 1 else -1,
-            )
-        if (type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2
-                and natural_final_admission is None):
-            raise UnavailableGuard(
-                "natural final dispatch admission is not installed; HOLD")
-        if (natural_final_admission is not None
-                and type(dispatch_candidate) is not NaturalDispatchCandidateEvidenceV2):
-            raise AuthorityDenied("natural final admission needs a V2 batch")
-        if (type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2
-                and not callable(natural_final_admission)):
-            raise UnavailableGuard("natural final issuer is unavailable; HOLD")
-        if len({write.key for write in writes}) != len(writes):
-            raise ValueError("duplicate writes across proposals")
-        read_map = {item.key: item.revision for item in envelope.version_guard.read_versions}
-        if not set(write.key for write in writes).issubset(read_map):
-            raise ValueError("all writes require read versions, including absent keys")
-        for proposal in bundle.proposals:
-            registration = self.__providers.get(proposal.domain)
-            if registration is None:
-                raise AuthorityDenied("unregistered proposal domain")
-            _, schema, schema_hash = registration
-            if any(write.key.type_name == 'memory.subjective_trace.v3' for write in proposal.typed_writes):
-                raise UnavailableGuard('installed Life C02 trace-v3 issuer is unavailable; HOLD')
-            from .runtime.d06_internal_life_episode_v2 import KINDS as internal_life_kinds, PROPOSAL_SCHEMA as internal_life_schema, PROPOSAL_HASH as internal_life_hash, require_exact_internal_life_issuance_v2
-            internal_life = any(write.key.type_name in internal_life_kinds for write in proposal.typed_writes)
-            from .domains.d08.contact_plan_v2 import KINDS as contact_plan_v2_kinds,PROPOSAL_SCHEMA as contact_plan_v2_schema,PROPOSAL_HASH as contact_plan_v2_hash
-            is_contact_plan_v2=any(write.key.type_name in contact_plan_v2_kinds for write in proposal.typed_writes)
-            if proposal.envelope.identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
-                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_task_issuance_v1
-                actual = require_exact_life_numeric_task_issuance_v1(domain_production_issuance_v1, self, bundle)
-                if proposal not in actual.bundle.proposals:
-                    raise AuthorityDenied('numeric Life proposal differs from the actual private task')
-                if proposal.envelope.identity.phase == 'acquire_internal_life_numeric':
-                    from .runtime.d06_life_numeric_worker_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
-                    expected = (ns, nh) if proposal.domain == 'd11' else None
-                else:
-                    from .runtime.d06_life_numeric_task_v1 import APPRAISAL_SCHEMA, APPRAISAL_HASH, JOB_SCHEMA, JOB_HASH
-                    expected = (APPRAISAL_SCHEMA, APPRAISAL_HASH) if proposal.domain == 'd04' else (JOB_SCHEMA, JOB_HASH) if proposal.domain == 'd11' else None
-                if expected is None or (proposal.proposal_schema, proposal.proposal_schema_hash) != expected:
-                    raise AuthorityDenied('numeric Life task independent schema differs')
-            elif proposal.envelope.identity.phase in {'prepare_internal_life_numeric_drive', 'adopt_internal_life_numeric_trace'}:
-                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_math_issuance_v1
-                require_exact_life_numeric_math_issuance_v1(domain_production_issuance_v1, self, bundle)
-                if proposal.envelope.identity.phase == 'prepare_internal_life_numeric_drive':
-                    from .runtime.d06_life_numeric_drive_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
-                else:
-                    from .runtime.d06_life_numeric_trace_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
-                if (proposal.proposal_schema, proposal.proposal_schema_hash) != (ns, nh):
-                    raise AuthorityDenied('numeric Life mathematical proposal schema differs')
-            elif proposal.envelope.identity.phase == 'prepare_internal_life_numeric_context':
-                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
-                from .runtime.d06_life_numeric_context_v1 import D03_SCHEMA, D07_SCHEMA, PROPOSAL_HASHES
-                require_exact_life_numeric_context_issuance_v1(domain_production_issuance_v1, self, bundle)
-                expected = D03_SCHEMA if proposal.domain == 'd03' else D07_SCHEMA if proposal.domain == 'd07' else None
-                if expected is None or (proposal.proposal_schema, proposal.proposal_schema_hash) != (expected, PROPOSAL_HASHES[expected]):
-                    raise AuthorityDenied('numeric Life context requires its independent installed schema')
-            elif proposal.envelope.identity.phase == 'adopt_internal_life_content_v1':
-                from .runtime.internal_life_content_adoption_v1 import (require_exact_content_issuance_v1,
-                    PROPOSAL_SCHEMA as cs,PROPOSAL_HASH as ch,JOB_SCHEMA as js,JOB_HASH as jh)
-                require_exact_content_issuance_v1(domain_production_issuance_v1,self,bundle)
-                expected=(cs,ch) if proposal.domain=='d06' else (js,jh)
-                if (proposal.proposal_schema,proposal.proposal_schema_hash)!=expected:
-                    raise AuthorityDenied('Life content completion requires its independent installed schema')
-            elif proposal.envelope.identity.phase == "acquire_internal_life_content_v2":
-                from .runtime.internal_life_content_worker_v2 import (
-                    PROPOSAL_SCHEMA as worker_schema,PROPOSAL_HASH as worker_hash,
-                    require_exact_internal_life_acquisition_issuance_v2)
-                require_exact_internal_life_acquisition_issuance_v2(domain_production_issuance_v1,self,bundle)
-                if (proposal.proposal_schema,proposal.proposal_schema_hash)!=(worker_schema,worker_hash):
-                    raise AuthorityDenied('Life worker requires its independent dual-role installed schema')
-            elif proposal.envelope.identity.phase == "acquire_internal_life_content":
-                from .runtime.internal_life_content_worker_v1 import (
-                    PROPOSAL_SCHEMA as life_acquire_schema, PROPOSAL_HASH as life_acquire_hash,
-                    require_exact_internal_life_acquisition_issuance_v1)
-                require_exact_internal_life_acquisition_issuance_v1(domain_production_issuance_v1,self,bundle)
-                if (proposal.proposal_schema,proposal.proposal_schema_hash) != (life_acquire_schema,life_acquire_hash):
-                    raise AuthorityDenied('Life acquisition requires its independent exact installed schema')
-            elif internal_life:
-                require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
-                if (proposal.proposal_schema, proposal.proposal_schema_hash) != (internal_life_schema, internal_life_hash):
-                    raise AuthorityDenied('internal Life proposal requires its explicit installed v2 schema')
-            elif is_contact_plan_v2:
-                from .runtime.contact_plan_adoption_v2 import require_exact_contact_plan_issuance_v2
-                require_exact_contact_plan_issuance_v2(domain_production_issuance_v1,self,bundle)
-                if (proposal.proposal_schema,proposal.proposal_schema_hash)!=(contact_plan_v2_schema,contact_plan_v2_hash):
-                    raise AuthorityDenied('Contact Plan v2 requires its independent exact installed schema/witness')
-            elif any(write.key.type_name in contact_v3_kinds for write in proposal.typed_writes):
-                from .domains.d09.contact_batch_v3 import PROPOSAL_SCHEMA as contact_v3_schema, PROPOSAL_HASH as contact_v3_hash
-                if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
-                        or domain_production_issuance_v1.stage.bundle is not bundle
-                        or (proposal.proposal_schema,proposal.proposal_schema_hash) != (contact_v3_schema,contact_v3_hash)):
-                    raise AuthorityDenied("Contact3 proposal has no exact private installed schema/witness")
-            elif any(write.key.type_name in contact_v2_kinds for write in proposal.typed_writes):
-                from .domains.d09.contact_batch_v2 import PROPOSAL_SCHEMA as contact_v2_schema, PROPOSAL_HASH as contact_v2_hash
-                if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV2
-                        or domain_production_issuance_v1.stage.bundle is not bundle
-                        or (proposal.proposal_schema,proposal.proposal_schema_hash) != (contact_v2_schema,contact_v2_hash)):
-                    raise AuthorityDenied('Contact v2 proposal has no exact private installed schema/witness')
-            elif (proposal.proposal_schema, proposal.proposal_schema_hash) != (schema, schema_hash):
-                raise AuthorityDenied("proposal schema differs from registered provider")
-            for write in proposal.typed_writes:
-                spec = store._registry.spec(write.key.type_name)
-                if (spec.writer_domain != proposal.domain or spec.schema_hash is None
-                        or write.key.owner.kind not in envelope.authority.owner_scope):
-                    raise AuthorityDenied("writer lacks registered type or owner capability")
-                if not set(write.dependencies).issubset(read_map):
-                    raise ValueError("dependency is outside complete read set")
-            for ref in (proposal.dependencies.current_invalidation
-                        + proposal.dependencies.historical_provenance
-                        + proposal.dependencies.associations
-                        + proposal.dependencies.numeric_coupling):
-                if read_map.get(ref.key) != ref.revision:
-                    raise StaleRead("dependency reference is not guarded")
-            current = {ref.key for ref in proposal.dependencies.current_invalidation}
-            actual_current = set()
-            for write in proposal.typed_writes:
-                actual_current.update(write.dependencies)
-                if not set(write.dependencies).issubset(current):
-                    raise ValueError("graph invalidation edges must match classified dependencies")
-            if actual_current != current:
-                raise ValueError("classified current dependencies are not materialized")
-        write_tokens = {write.key.token for write in writes}
-        for write in writes:
-            if (write.key.type_name == "runtime.job"
-                    and write.key.token not in bundle.persistent_job_refs
-                    and not (c02_adoption is not None
-                             and write == bundle.proposals[1].typed_writes[0])):
-                raise ValueError("runtime.job write must be a bound persistent job ref")
-            if (write.key.type_name == "runtime.outbox"
-                    and write.key.token not in bundle.outbox_refs):
-                raise ValueError("runtime.outbox write must be a bound outbox ref")
-            if write.key.type_name == "runtime.outbox":
-                if write.value.get("dispatch_generation") != envelope.authority.activation_generation:
-                    raise StaleRead("outbox dispatch generation differs from active holder")
-                if write.value.get("idempotency_key") not in bundle.idempotency_keys:
-                    raise AuthorityDenied("outbox idempotency key is not in the bundle ledger")
-        part_refs = (
-            ("experience", bundle.experience_refs), ("choice", bundle.choice_refs),
-            ("d02_settlement", bundle.d02_settlement_refs),
-            ("cost_settlement", bundle.d11_cost_settlement_refs),
-            ("idempotency", bundle.idempotency_keys),
-            ("persistent_job", bundle.persistent_job_refs),
-            ("outbox", bundle.outbox_refs),
-        )
-        for kind, refs in part_refs:
-            for ref in refs:
-                if kind in {"idempotency"}:
-                    continue
-                if (c04_adoption_issuance_v3 is not None
-                        and kind in {"d02_settlement", "cost_settlement"}):
-                    # V3 refers to already paid immutable originals. The final
-                    # plan below verifies their exact refs and proof linkage.
-                    continue
-                key = self._parse_ref(ref, namespace)
-                if key.token not in write_tokens:
-                    raise ValueError(f"{kind} reference must be written in the same bundle")
-                required_type = {
-                    "cost_settlement": "runtime.cost_settlement",
-                    "persistent_job": "runtime.job",
-                    "outbox": "runtime.outbox",
-                }.get(kind)
-                if required_type is not None and key.type_name != required_type:
-                    raise AuthorityDenied(f"{kind} requires {required_type}")
-                required_writer = {
-                    "d02_settlement": "d02", "cost_settlement": "d11",
-                    "persistent_job": "d11", "outbox": "d11",
-                }.get(kind)
-                if required_writer is not None and (
-                        store._registry.spec(key.type_name).writer_domain != required_writer):
-                    raise AuthorityDenied(f"{kind} requires the {required_writer} graph writer")
-        new_sources = []
-        for source in envelope.source_qualification.source_refs:
-            key = self._parse_ref(source, namespace)
-            if key not in read_map:
-                raise StaleRead("source outside complete read set")
-            if key != source_key(*namespace.as_tuple, key.owner.subject or ""):
-                raise AuthorityDenied("source reference is not a canonical D06 source")
-            access = access_key(*namespace.as_tuple, key.owner.subject or "")
-            access_revision = read_map.get(access)
-            if access_revision is None:
-                raise StaleRead("source access record is outside complete read set")
-            if read_map[key] == 0:
-                if access_revision != 0:
-                    raise StaleRead("new source cannot reuse an existing access record")
-                source_writes = tuple((proposal.domain, write) for proposal in bundle.proposals
-                                      for write in proposal.typed_writes if write.key == key)
-                access_writes = tuple((proposal.domain, write) for proposal in bundle.proposals
-                                      for write in proposal.typed_writes if write.key == access)
-                if (len(source_writes) != 1 or len(access_writes) != 1
-                        or source_writes[0][0] != "d06" or access_writes[0][0] != "d06"):
-                    raise AuthorityDenied("new source requires D06 source and access writes")
-                record = access_writes[0][1].value
-                if (record.get("source_id") != key.owner.subject
-                        or record.get("status") != "active"
-                        or not set(envelope.authority.audience).issubset(record.get("audiences", ()))
-                        or envelope.authority.purpose not in record.get("purposes", ())
-                        or key not in access_writes[0][1].dependencies):
-                    raise AuthorityDenied("new source access does not cover this use")
-                if not (bundle.persistent_job_refs and bundle.outbox_refs
-                        and bundle.idempotency_keys):
-                    raise ValueError("new source requires encoding job, outbox and idempotency")
-                new_sources.append(key)
-            elif access_revision == 0:
-                raise StaleRead("existing source has no access record")
-        digest = bundle.digest
-        identity = envelope.identity
-        event = Event(Scope(*namespace.as_tuple, identity.activity_id),
-                      identity.operation_id, envelope.source_qualification.learned_at,
-                      "domain_bundle", {"bundle_digest": digest})
-        result: list[CommitReceipt] = []
-        runtime_admissions: list[RuntimeAdmission] = []
-        product_advances: list[dict] = []
-        joint_product_advances: list[tuple] = []
-        c04_adoption_plans_v3 = []
-        qualified_dispatch_candidates = []
-        guard_snapshots: list[GraphSnapshot] = []
-        dispatch_projections = []
-
-        def dispatch_now() -> float | None:
-            if dispatch_clock_reading is None:
-                if dispatch_clock_frozen_now_utc is not None:
-                    raise UnavailableGuard("frozen dispatch time lacks paired clock; HOLD")
-                return now_utc
-            fresh = self._dispatch_clock_upper(dispatch_clock_reading)
-            if dispatch_clock_frozen_now_utc is None:
-                return fresh
-            frozen = dispatch_clock_frozen_now_utc
-            if (type(frozen) not in (int, float) or not math.isfinite(frozen)
-                    or fresh < frozen or fresh >= envelope.deadline_utc
-                    or (provisional_check_candidate is not None
-                        and any(fresh >= item.valid_until
-                                for item in provisional_check_candidate.checks))):
-                raise UnavailableGuard("final dispatch clock or check expired; HOLD")
-            return float(frozen)
-
-        def guard(db):
-            if v2_write is not None:
-                expected, expected_epoch = v2_write[:2]
-                if self._v2_graph_stamp(namespace) != (expected, expected_epoch):
-                    raise StaleRead("v2 graph recovery stamp changed")
-                if db.execute(
-                        "SELECT 1 FROM graph_bundle_rejections_v2 WHERE bot=? "
-                        "AND persona=? AND operation_id=?",
-                        namespace.as_tuple + (identity.operation_id,),
-                ).fetchone() is not None:
-                    raise UnavailableGuard("v2 bundle is terminal rejected_no_commit")
-                if self_identity_issuance is not None or baseline_issuance is not None:
-                    stage_table = ("graph_d03_self_projection_intents_v1"
-                                   if self_identity_issuance is not None else
-                                   "graph_d04_baseline_intents_v1")
-                    stage_source = (self_identity_issuance[4]
-                                    if self_identity_issuance is not None else
-                                    baseline_issuance[3])
-                    original_op = (self_identity_issuance[7]
-                                   if self_identity_issuance is not None else
-                                   baseline_issuance[7])
-                    if db.execute(
-                            f"SELECT operation_id,bundle_digest FROM {stage_table} "
-                            "WHERE bot=? AND persona=? AND source_ref=? "
-                            "AND original_operation_id=?",
-                            namespace.as_tuple + (stage_source, original_op),
-                    ).fetchone() != (identity.operation_id, digest):
-                        raise EventConflict("stage current attempt changed")
-            elif not v2_read:
-                self._admit_content(
-                    namespace, envelope.authority.activation_generation, "write",
-                    tuple(item.key.token for item in envelope.version_guard.read_versions)
-                    + tuple(write.key.token for write in writes),
-                )
-            prior = db.execute(
-                "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
-                "AND operation_id=?", namespace.as_tuple + (identity.operation_id,),
-            ).fetchone()
-            if prior is not None:
-                if prior[0] != digest:
-                    raise EventConflict("operation ID reused with different bundle")
-                return
-            if domain_production_issuance_v1 is not None:
-                if d04_numeric_issuance_v3 is not None:
-                    raise AuthorityDenied("one bundle cannot carry two journal-advancing issuers")
-                from .runtime.domain_production_commit_v1 import require_current_production_commit_v1
-                require_current_production_commit_v1(domain_production_issuance_v1, self, db, bundle, v2_write)
-            elif identity.phase in {"prepare_internal_life_numeric_drive", "prepare_internal_life_interval_baseline", "adopt_internal_life_numeric_trace", "prepare_internal_life_numeric", "acquire_internal_life_numeric", "adopt_internal_life_numeric", "prepare_internal_life_numeric_context", "acquire_internal_life_content_v2", "acquire_internal_life_content", "prepare_internal_life_content", "encode_internal_life", "encode_structured_experience", "form_association", "record_host_lifecycle", "d11.offline_tick.prepare.v1", "adopt_offline_tick", "d11.life.prepare.v1", "prepare_life", "adopt_life", "prepare_source_note_action", "prepare_source_note_body", "prepare_life_project_context", "focus_life_project", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
-                raise AuthorityDenied("installed internal experience requires its exact composite issuer")
-            if c02_terminal_recovery is not None:
-                row = db.execute(
-                    "SELECT schema,bundle_digest,fence_attempt_id,bundle_json,"
-                    "evidence_json,quote_json,seal_json FROM "
-                    "graph_first_ingress_c02_candidates_v2 WHERE bot=? "
-                    "AND persona=? AND operation_id=?",
-                    namespace.as_tuple + (identity.operation_id,),
-                ).fetchone()
-                witness = c02_terminal_recovery
-                if (row is None or row[:5] != witness.sealed_candidate
-                        or row[3] != witness.bundle_json
-                        or row[5] != witness.quote_json
-                        or row[6] != canonical_serialize(asdict(witness.seal))
-                        or time.monotonic() >= witness.local_monotonic_deadline):
-                    raise UnavailableGuard("terminal C02 first seal changed; HOLD")
-            elif c02_adoption is not None:
-                self._validate_first_ingress_c02_adoption_locked(
-                    db, bundle, c02_adoption, v2_write)
-            if attention_issuance is not None:
-                from .domains.d07 import (
-                    AttentionTicket, FocusState,
-                )
-                from .domains.d07.post_c02_competition import (
-                    choose_post_c02_attention_v2,
-                )
-                from .runtime.d12_current_d07_policy_v1 import (
-                    read_current_d07_attention_policy_v1,
-                )
-                from .runtime.d07_current_competitor_v2 import (
-                    read_current_primary_competitor_in_transaction,
-                )
-                from .runtime.reply_model_job import (
-                    d07_attention_quote_id_v1,
-                    read_settled_c02_reply_source_v1,
-                    source_key_from_ref,
-                )
-                from .runtime.issuers import ResourceQuote
-                from .runtime_contracts import VersionedRef
-
-                installed, attention_now = attention_issuance
-                admin = installed.d07_attention
-                policy = installed.installation_policy
-                source_ref = envelope.source_qualification.source_refs[0]
-                source_id = source_key_from_ref(source_ref, namespace)
-                c02_operation_id = envelope.causation[0]
-                source_atom_key = source_key(*namespace.as_tuple, source_id)
-                access_atom_key = access_key(*namespace.as_tuple, source_id)
-                source_atoms = []
-                for key in (source_atom_key, access_atom_key):
-                    row = db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                        (key.token,),
-                    ).fetchone()
-                    if row is None:
-                        raise UnavailableGuard("D07 attention source is absent; HOLD")
-                    source_atoms.append(GraphAtom(
-                        key, row[0], json.loads(row[1]), bool(row[2])))
-                c02_row = db.execute(
-                    "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
-                    "FROM graph_bundle_operations WHERE bot=? AND persona=? "
-                    "AND operation_id=?",
-                    namespace.as_tuple + (c02_operation_id,),
-                ).fetchone()
-                if c02_row is None:
-                    raise UnavailableGuard("D07 attention original C02 absent; HOLD")
-                c02_event = db.execute(
-                    "SELECT reads,revisions,epoch_revision FROM graph_events "
-                    "WHERE bot=? AND persona=? AND session=? AND event_id=?",
-                    namespace.as_tuple + (c02_row[1], c02_operation_id),
-                ).fetchone()
-                if c02_event is None:
-                    raise UnavailableGuard("D07 attention C02 event absent; HOLD")
-                c02_detail = json.loads(c02_row[4])
-                c02_receipt = CommitReceipt(
-                    "committed", c02_operation_id, c02_row[0], c02_row[1],
-                    c02_row[2], c02_row[3],
-                    GraphStore._version_rows(c02_event[0]),
-                    GraphStore._version_rows(c02_event[1]),
-                    (NamespaceEpoch(*namespace.as_tuple, c02_event[2]),),
-                    tuple(c02_detail["ledger_refs"]),
-                    tuple(c02_detail["outbox_refs"]))
-                current = read_settled_c02_reply_source_v1(
-                    db, self.__d02_issuer, namespace, c02_receipt, source_ref,
-                    GraphSnapshot(tuple(source_atoms), (v2_write[1],)))
-                ticket_write = next(
-                    (write for write in writes if
-                     write.key.type_name == "d07.attention_ticket.v1"), None)
-                focus_write = next(
-                    (write for write in writes if
-                     write.key.type_name == "d07.focus.v1"), None)
-                if ticket_write is None or focus_write is None:
-                    raise AuthorityDenied("D07 attention writes are missing")
-                quote_id = d07_attention_quote_id_v1(
-                    namespace, identity.operation_id)
-                active_policy = read_current_d07_attention_policy_v1(
-                    db, namespace)
-                guarded_versions = {
-                    item.key: item for item in envelope.version_guard.read_versions}
-                if guarded_versions.get(active_policy.active_head_ref.key) != (
-                        active_policy.active_head_ref):
-                    raise AuthorityDenied("D07 active policy head is not guarded")
-                focus_key = AtomKey(
-                    Owner("persona", *namespace.as_tuple),
-                    "d07.focus.v1", namespace.persona_id)
-                prior_focus = db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (focus_key.token,),
-                ).fetchone()
-                if prior_focus is None:
-                    current_focus = FocusState(
-                        namespace.persona_id, 0, None, (), "no_eligible_ticket")
-                else:
-                    if prior_focus[2] != 1:
-                        raise AuthorityDenied("D07 current focus is invalid")
-                    prior_value = json.loads(prior_focus[1])
-                    prior_value.pop("schema", None)
-                    current_focus = FocusState(
-                        prior_value["persona_id"], prior_value["focus_epoch"],
-                        prior_value["primary_ticket_ref"],
-                        tuple(prior_value["auxiliary_ticket_refs"]),
-                        prior_value["switch_reason"],
-                    )
-                competitor = read_current_primary_competitor_in_transaction(
-                    db, namespace, current_focus.primary_ticket_ref,
-                    now_utc=attention_now)
-                for atom in competitor.atoms if competitor is not None else ():
-                    if guarded_versions.get(atom.key) != GraphVersion(
-                            atom.key, atom.revision):
-                        raise AuthorityDenied("D07 competitor closure is not guarded")
-                try:
-                    ticket_value = dict(ticket_write.value)
-                    ticket_value.pop("schema", None)
-                    ticket_value["cancel_refs"] = tuple(ticket_value["cancel_refs"])
-                    ticket_value["source_refs"] = tuple(ticket_value["source_refs"])
-                    selected_ticket = AttentionTicket(**ticket_value)
-                    choice = choose_post_c02_attention_v2(
-                        current_focus, selected_ticket,
-                        competitor.ticket if competitor is not None else None,
-                        active_policy.policy, now=attention_now)
-                    expected_focus = choice.focus
-                    expected_focus = replace(
-                        expected_focus,
-                        primary_ticket_ref=(
-                            ticket_write.key.token
-                            if choice.selected_ticket_id == selected_ticket.ticket_id
-                            else competitor.ticket_version.key.token),
-                        auxiliary_ticket_refs=tuple(
-                            ticket_write.key.token if ticket_id == selected_ticket.ticket_id
-                            else competitor.ticket_version.key.token
-                            for ticket_id in expected_focus.auxiliary_ticket_refs),
-                    )
-                except (TypeError, ValueError, KeyError) as exc:
-                    raise AuthorityDenied("D07 policy selection is unavailable") from exc
-                if focus_write.value != {
-                        "schema": "d07.focus.v1", **asdict(expected_focus),
-                        "auxiliary_ticket_refs": list(
-                            expected_focus.auxiliary_ticket_refs)}:
-                    raise AuthorityDenied("D07 focus differs from adopted policy")
-                grant = self.__d11_issuer.current_budget_grant(
-                    db, policy.root_lease.lease_id)
-                budget = get_budget_lease(db, grant.lease_id)
-                provision_row = self._provision_row(db, namespace)
-                provision = (self._decode_provision_receipt(provision_row)
-                             if provision_row is not None else None)
-                if (v2_write is None or grant != policy.root_grant
-                        or provision is None
-                        or provision.installation_id != policy.installation_id
-                        or provision.root_grant_id != grant.grant_id
-                        or provision.root_lease_id != grant.lease_id
-                        or budget.state != "active"
-                        or "d07.attention" not in grant.allowed_work_kinds
-                        or identity.phase != "post_c02_attention"
-                        or identity.activity_id != c02_receipt.activity_id
-                        or current.source_qualification !=
-                           envelope.source_qualification
-                        or current.conversation_ref !=
-                           envelope.authority.audience[0]
-                        or envelope.parent_budget_lease_ref != grant.lease_id
-                        or ticket_write is None or focus_write is None
-                        or len(writes) != 2
-                        or ticket_write.value.get("causal_root") != source_ref
-                        or ticket_write.value.get("source_refs") != [source_ref]
-                        or ticket_write.value.get("category") != "interaction"
-                        or ticket_write.value.get("valid_until") !=
-                           envelope.deadline_utc
-                        or focus_write.value.get("primary_ticket_ref") !=
-                           expected_focus.primary_ticket_ref
-                        or not attention_now < envelope.deadline_utc
-                        or envelope.deadline_utc >
-                           attention_now + admin.deadline_after_seconds
-                        or envelope.version_guard.resource_lease_versions !=
-                           (VersionedRef(quote_id, 1),)
-                        or any(amount > grant.max_ceiling.get(name, 0)
-                               or amount > budget.available(name)
-                               for name, amount in admin.quote_ceiling.items())):
-                    raise AuthorityDenied("D07 attention signed issuance differs")
-                quote = ResourceQuote(
-                    quote_id, 1, *namespace.as_tuple, identity.activity_id,
-                    identity.operation_id, None, grant.lease_id,
-                    "d07.attention", admin.snapshot_ref,
-                    envelope.deadline_utc, admin.resource_ref, None,
-                    (), (), dict(admin.quote_ceiling), None,
-                    envelope.deadline_utc)
-                self.__d02_issuer.issue_quote(db, quote)
-                db.execute(
-                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                    "VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + ("resource_lease", quote_id, "1"),
-                )
-                db.execute("""CREATE TABLE IF NOT EXISTS graph_d07_attention_issuance_v1(
-                    bot TEXT NOT NULL, persona TEXT NOT NULL,
-                    operation_id TEXT NOT NULL, c02_operation_id TEXT NOT NULL,
-                    source_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
-                    policy_digest TEXT NOT NULL, bundle_digest TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,operation_id))""")
-                db.execute(
-                    "INSERT INTO graph_d07_attention_issuance_v1"
-                    "(bot,persona,operation_id,c02_operation_id,source_ref,"
-                    "quote_id,policy_digest,bundle_digest) VALUES(?,?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (identity.operation_id,
-                    c02_operation_id, source_ref, quote_id,
-                    canonical_digest({
-                        "deadline_after_seconds": admin.deadline_after_seconds,
-                        "quote_ceiling": dict(admin.quote_ceiling),
-                        "snapshot_ref": admin.snapshot_ref,
-                        "resource_ref": admin.resource_ref,
-                    }), digest),
-                )
-                db.execute("""CREATE TABLE IF NOT EXISTS graph_d07_attention_decisions_v2(
-                    bot TEXT NOT NULL, persona TEXT NOT NULL,
-                    c02_operation_id TEXT NOT NULL, attention_operation_id TEXT NOT NULL,
-                    inbound_ticket_ref TEXT NOT NULL, selected_ticket_ref TEXT NOT NULL,
-                    inbound_deferred INTEGER NOT NULL CHECK(inbound_deferred IN (0,1)),
-                    wake_at REAL, bundle_digest TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,c02_operation_id),
-                    UNIQUE(bot,persona,attention_operation_id))""")
-                db.execute("""CREATE TRIGGER IF NOT EXISTS graph_d07_attention_decisions_no_update_v2
-                    BEFORE UPDATE ON graph_d07_attention_decisions_v2
-                    BEGIN SELECT RAISE(ABORT, 'D07 decision is immutable'); END""")
-                db.execute("""CREATE TRIGGER IF NOT EXISTS graph_d07_attention_decisions_no_delete_v2
-                    BEFORE DELETE ON graph_d07_attention_decisions_v2
-                    BEGIN SELECT RAISE(ABORT, 'D07 decision is immutable'); END""")
-                db.execute(
-                    "INSERT INTO graph_d07_attention_decisions_v2 VALUES(?,?,?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (
-                        c02_operation_id, identity.operation_id,
-                        ticket_write.key.token, expected_focus.primary_ticket_ref,
-                        int(choice.inbound_deferred), choice.wake_at, digest),
-                )
-            if arrival_issuance is not None:
-                admin_policy, installation_id, arrival_now, source_ref, policy_digest = (
-                    arrival_issuance)
-                if (v2_write is None or len(bundle.proposals) != 1
-                        or bundle.proposals[0].domain != "d03"
-                        or bundle.persistent_job_refs or bundle.outbox_refs
-                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
-                        or envelope.source_qualification.source_refs
-                        != (source_key(*namespace.as_tuple, source_ref).token,)
-                        or policy_digest != canonical_digest(
-                            admin_policy.digest_payload())):
-                    raise AuthorityDenied("D03 arrival issuance identity differs")
-                pre_quote = replace(envelope, version_guard=replace(
-                    envelope.version_guard, resource_lease_versions=()))
-                quote = self.__d11_issuer.issue_d03_arrival_quote(
-                    db, pre_quote, admin_policy,
-                    installation_id=installation_id, now_utc=arrival_now)
-                refs = envelope.version_guard.resource_lease_versions
-                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
-                        quote.quote_id, quote.version):
-                    raise AuthorityDenied("D03 arrival quote guard differs")
-                db.execute(
-                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                    "VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + ("resource_lease", quote.quote_id,
-                                          str(quote.version)),
-                )
-                db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_arrival_issuance_v2(
-                    bot TEXT NOT NULL, persona TEXT NOT NULL,
-                    operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
-                    quote_id TEXT NOT NULL, policy_digest TEXT NOT NULL,
-                    bundle_digest TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,operation_id))""")
-                db.execute(
-                    "INSERT INTO graph_d03_arrival_issuance_v2"
-                    "(bot,persona,operation_id,source_ref,quote_id,policy_digest,bundle_digest) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (identity.operation_id, source_ref,
-                                          quote.quote_id, policy_digest, digest),
-                )
-            if correction_issuance is not None:
-                admin_policy, installation_id, correction_now, request, pre_quote, planned = (
-                    correction_issuance[:6])
-                if (v2_write is None or identity.phase != "source-correction"
-                        or tuple(item.domain for item in bundle.proposals)
-                        not in {("d06", "d07", "d11"), ("d06", "d11")}
-                        or bundle.persistent_job_refs != (planned.graph_job_ref,)
-                        or bundle.outbox_refs != planned.outbox_refs
-                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
-                    raise AuthorityDenied("source correction bundle identity differs")
-                quote = self.__d11_issuer.issue_d06_source_correction_quote(
-                    db, pre_quote, admin_policy, request,
-                    installation_id=installation_id, now_utc=correction_now,
-                    planned_quote=planned)
-                refs = envelope.version_guard.resource_lease_versions
-                if (quote != planned or len(refs) != 1
-                        or (refs[0].ref, refs[0].version)
-                        != (quote.quote_id, quote.version)):
-                    raise AuthorityDenied("source correction quote plan changed")
-                db.execute(
-                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                    "VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + ("resource_lease", quote.quote_id,
-                                          str(quote.version)),
-                )
-            if baseline_issuance is not None:
-                (admin_policy, installation_id, baseline_now, source_ref,
-                 event_ref, job_id, installation_policy,
-                 original_operation_id, _retry) = baseline_issuance
-                if (v2_write is None or len(bundle.proposals) != 1
-                        or bundle.proposals[0].domain != "d04"
-                        or envelope.input_refs != (source_ref, event_ref)
-                        or bundle.persistent_job_refs or bundle.outbox_refs
-                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
-                        or qualified_self is None
-                        or installation_policy.installation_id != installation_id):
-                    raise AuthorityDenied("D04 baseline stage identity differs")
-                baseline_write = bundle.proposals[0].typed_writes[0]
-                perspective_key = AtomKey.from_token(
-                    baseline_write.value["perspective_ref"])
-                perspective_row = db.execute(
-                    "SELECT value,valid FROM graph_atoms WHERE token=?",
-                    (perspective_key.token,),
-                ).fetchone()
-                if (perspective_key.type_name != "d03.self_perspective.v1"
-                        or perspective_row is None or perspective_row[1] != 1):
-                    raise UnavailableGuard("D04 baseline lacks current self perspective; HOLD")
-                mapping_key = AtomKey.from_token(
-                    json.loads(perspective_row[0])["identity_mapping_ref"])
-                mapping_row = db.execute(
-                    "SELECT value,valid FROM graph_atoms WHERE token=?",
-                    (mapping_key.token,),
-                ).fetchone()
-                if (mapping_row is None or mapping_row[1] != 1
-                        or json.loads(mapping_row[0]) != asdict(qualified_self[1])):
-                    raise UnavailableGuard("D04 baseline current Authority self differs; HOLD")
-                job, _, _, outbox, _, _, source_version, access_version = (
-                    self._first_ingress_encoding_job_locked(namespace, job_id))
-                if (job.operation_id != original_operation_id
-                        or job.phase != "queued" or job.cancel_epoch != 0
-                        or job.fence != 0 or job.lease_holder is not None
-                        or source_version.key.token != source_ref
-                        or outbox.payload_ref != source_version.key.owner.subject
-                        or source_version not in envelope.version_guard.read_versions
-                        or access_version not in envelope.version_guard.read_versions):
-                    raise UnavailableGuard("D04 baseline job/source changed; HOLD")
-                pre_quote = replace(envelope, version_guard=replace(
-                    envelope.version_guard, resource_lease_versions=()))
-                quote = self.__d11_issuer.issue_d04_baseline_quote(
-                    db, pre_quote, admin_policy,
-                    installation_id=installation_id, now_utc=baseline_now)
-                refs = envelope.version_guard.resource_lease_versions
-                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
-                        quote.quote_id, quote.version):
-                    raise AuthorityDenied("D04 baseline quote guard differs")
-                db.execute(
-                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                    "VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + ("resource_lease", quote.quote_id,
-                                          str(quote.version)),
-                )
-                db.execute("""CREATE TABLE IF NOT EXISTS graph_d04_baseline_issuance_v1(
-                    bot TEXT NOT NULL, persona TEXT NOT NULL,
-                    operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
-                    event_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
-                    bundle_digest TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,operation_id))""")
-                db.execute(
-                    "INSERT INTO graph_d04_baseline_issuance_v1"
-                    "(bot,persona,operation_id,source_ref,event_ref,quote_id,bundle_digest) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (identity.operation_id, source_ref,
-                                          event_ref, quote.quote_id, digest),
-                )
-            if self_identity_issuance is not None:
-                (installation_policy, admin_policy, installation_id, stage_now,
-                 source_ref, candidate, job_id, original_operation_id, _retry) = (
-                    self_identity_issuance)
-                if (v2_write is None or qualified_self is None
-                        or len(bundle.proposals) != 1
-                        or bundle.proposals[0].domain != "d03"
-                        or envelope.identity.phase != "d03.self_identity_projection"
-                        or envelope.input_refs != (source_ref,)
-                        or bundle.persistent_job_refs or bundle.outbox_refs
-                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
-                    raise AuthorityDenied("D03 self projection issuance identity differs")
-                role, qualified_mapping, current_self = qualified_self
-                expected_metadata, expected_epoch = v2_write[:2]
-                if (qualified_mapping != candidate
-                        or current_self.graph_revision != expected_metadata.graph_revision
-                        or current_self.graph_epoch != expected_epoch.revision
-                        or installation_policy.installation_id != installation_id):
-                    raise UnavailableGuard("D03 current self proof changed; HOLD")
-                job, _, _, _, _, _, source_version, access_version = (
-                    self._first_ingress_encoding_job_locked(namespace, job_id))
-                if (job.operation_id != original_operation_id or job.phase != "queued"
-                        or job.cancel_epoch != 0 or job.fence != 0
-                        or job.lease_holder is not None
-                        or source_version.key.token != source_ref
-                        or source_version not in envelope.version_guard.read_versions
-                        or access_version not in envelope.version_guard.read_versions):
-                    raise UnavailableGuard("D03 self projection job/source changed; HOLD")
-                pre_quote = replace(envelope, version_guard=replace(
-                    envelope.version_guard, resource_lease_versions=()))
-                quote = self.__d11_issuer.issue_d03_self_identity_projection_quote(
-                    db, pre_quote, admin_policy, installation_id=installation_id,
-                    qualified_mapping=qualified_mapping, now_utc=stage_now)
-                refs = envelope.version_guard.resource_lease_versions
-                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
-                        quote.quote_id, quote.version):
-                    raise AuthorityDenied("D03 self projection quote guard differs")
-                db.execute(
-                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                    "VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + ("resource_lease", quote.quote_id,
-                                          str(quote.version)),
-                )
-                db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_self_projection_issuance_v1(
-                    bot TEXT NOT NULL, persona TEXT NOT NULL,
-                    operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
-                    certification_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
-                    bundle_digest TEXT NOT NULL,
-                    PRIMARY KEY(bot,persona,operation_id))""")
-                db.execute(
-                    "INSERT INTO graph_d03_self_projection_issuance_v1"
-                    "(bot,persona,operation_id,source_ref,certification_ref,quote_id,bundle_digest) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (identity.operation_id, source_ref,
-                                          qualified_mapping.certification_ref,
-                                          quote.quote_id, digest),
-                )
-            if c02_adoption is not None:
-                witness = c02_adoption[0]
-                if isinstance(witness, _C02TerminalRecovery):
-                    request = witness.seal.original_key
-                    installation = admin = None
-                    stage_now = witness.now
-                elif isinstance(witness, _C02PendingRecovery):
-                    from .runtime.first_ingress_v2 import trusted_upper
-
-                    request = witness.request
-                    installation, admin, stage_now = (
-                        witness.installation, witness.admin,
-                        trusted_upper(witness.clock_reading))
-                else:
-                    _, read, _, _, installation, admin, stage_now = witness
-                    request = read.request
-                if c02_first_seal_quote is None:
-                    if c02_terminal_recovery is not None:
-                        raise UnavailableGuard("terminal C02 original signed quote absent; HOLD")
-                    pre_quote = replace(envelope, version_guard=replace(
-                        envelope.version_guard, resource_lease_versions=()))
-                    quote = self.__d11_issuer.issue_d06_first_ingress_c02_quote(
-                        db, pre_quote, admin,
-                        installation_id=installation.installation_id,
-                        job_id=request.job_id, now_utc=stage_now)
-                else:
-                    quote = c02_first_seal_quote
-                refs = envelope.version_guard.resource_lease_versions
-                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
-                        quote.quote_id, quote.version):
-                    raise AuthorityDenied("C02 signed quote guard differs")
-                db.execute(
-                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                    "VALUES(?,?,?,?,?)",
-                    namespace.as_tuple + ("resource_lease", quote.quote_id,
-                                          str(quote.version)),
-                )
-            snapshot = self._check_guard(
-                db, bundle, ingress_deadline_check=ingress_deadline_check,
-                scene_owner_guard=scene_owner_guard)
-            if c04_adoption_issuance_v3 is not None:
-                from .runtime.c04_adoption_plan_v3 import build_c04_adoption_plan_v3
-                terminal_proof, terminal_verified = c04_adoption_issuance_v3
-                plan = build_c04_adoption_plan_v3(
-                    db, namespace=namespace, operation_id=identity.operation_id,
-                    proof=terminal_proof, verified=terminal_verified, bundle=bundle,
-                    installation_id=self.__d04_installed_joint_assembly.installation_policy.installation_id,
-                    manifest_digest=self.__d04_installed_joint_assembly.installation_policy.manifest_digest)
-                if (self.__c04_algorithm_build_digest is None
-                        or plan.algorithm_build_digest != "sha256:" + self.__c04_algorithm_build_digest):
-                    raise UnavailableGuard("C04 V3 installed algorithm changed; HOLD")
-                c04_adoption_plans_v3.append(plan)
-            if c04_association_issuance is not None:
-                from .domains.d06.current_c04_association_preflight import (
-                    preflight_current_c04_association_v1,
-                )
-                from .runtime.d06_atomic_association_v2 import (
-                    read_atomic_association_v2,
-                )
-
-                (c04_candidate, ticket, candidates, focus_snapshot,
-                 originals, budget, context_tags, c04_now) = c04_association_issuance
-                atomic = read_atomic_association_v2(
-                    db, c04_candidate, ticket=ticket,
-                    focus_snapshot=focus_snapshot, namespace=namespace,
-                    now=c04_now, audience=envelope.authority.audience[0],
-                    purpose=envelope.authority.purpose, budget=budget,
-                    context_tags=context_tags)
-                for atom in atomic.current_snapshot.atoms:
-                    if snapshot.get(atom.key) != atom:
-                        raise StaleRead("C04 association is outside the guarded snapshot")
-                checked = preflight_current_c04_association_v1(
-                    c04_candidate, ticket=ticket, candidates=candidates,
-                    associations=atomic.associations,
-                    current_snapshot=snapshot, namespace=namespace,
-                    envelope=envelope, originals=originals,
-                    now=c04_now, audience=envelope.authority.audience[0],
-                    purpose=envelope.authority.purpose)
-                if (checked.bundle_candidate != bundle
-                        or not set(checked.read_versions).issubset(
-                            snapshot.versions)):
-                    raise StaleRead("C04 atomic bundle or association reads differ")
-            if dispatch_candidate is not None and self.__dispatch_admission_issuer is not None:
-                from .runtime.dispatch_current_projection import (
-                    read_current_dispatch_projection,
-                )
-
-                if len(envelope.version_guard.query_epochs) != 1:
-                    raise UnavailableGuard("dispatch admission needs one full graph query")
-                try:
-                    dispatch_projections.append(read_current_dispatch_projection(
-                        db, namespace, snapshot, envelope.version_guard.query_epochs[0],
-                    ))
-                except ValueError as exc:
-                    raise UnavailableGuard(
-                        "dispatch D03/D05 graph projection is incomplete") from exc
-            guard_snapshots.append(snapshot)
-            if type(bundle.product_advance) is ProductAdvanceEvidenceV2:
-                joint_product_advances.append(self._check_joint_product_advance_v2(
-                    db, bundle, snapshot, writes, d04_joint_replay,
-                    d04_joint_output, v2_write, authored_topology_verifier=d04_topology_verifier,
-                    numeric_issuance=d04_numeric_issuance_v3))
+        with runtime_storage_operation_v3(store._db,
+                operation_id=envelope.identity.operation_id, deadline_utc=envelope.deadline_utc):
+            writes = tuple(write for proposal in bundle.proposals for write in proposal.typed_writes)
+            if c04_runtime_writes_v3:
+                if (c04_adoption_issuance_v3 is None or not in_transaction
+                        or type(c04_runtime_writes_v3) is not tuple
+                        or len(c04_runtime_writes_v3) != 2
+                        or {w.key.type_name for w in c04_runtime_writes_v3} != {"runtime.job", "runtime.outbox"}):
+                    raise AuthorityDenied("C04 runtime staging requires installed five-write adoption")
+                self._authorize(lease, envelope.authority, frozenset({"d11"}))
+                from .runtime.d11_types import validate_d11_writes
+                if not validate_d11_writes(c04_runtime_writes_v3, namespace,
+                        operation_id=envelope.identity.operation_id, activity_id=envelope.identity.activity_id,
+                        effect_id=envelope.identity.effect_id):
+                    raise AuthorityDenied("C04 original job/outbox staging differs")
+                for runtime_write in c04_runtime_writes_v3:
+                    reconcile_runtime_write(store._db, runtime_write)
+                writes += c04_runtime_writes_v3
+            from .domains.d09.contact_batch_v1 import CONTACT_BATCH_SCHEMA_V1
+            from .runtime.contact_dispatch_candidate_v1 import (
+                ContactDispatchCandidateEvidenceV1, validate_contact_dispatch_candidate_writes_v1)
+            from .runtime.contact_final_stage_v1 import _ContactFinalCommitWitnessV1
+            from .domains.d09.contact_batch_v2 import KINDS as contact_v2_kinds
+            from .runtime.contact_dispatch_candidate_v2 import ContactDispatchCandidateEvidenceV2, validate_contact_dispatch_candidate_writes_v2
+            from .runtime.contact_final_stage_v2 import _ContactFinalCommitWitnessV2
+            from .domains.d09.contact_batch_v3 import KINDS as contact_v3_kinds
+            from .runtime.contact_dispatch_candidate_v3 import ContactDispatchCandidateEvidenceV3, validate_contact_dispatch_candidate_writes_v3
+            from .runtime.contact_final_stage_v3 import _ContactFinalCommitWitnessV3
+            has_contact_v3 = any(w.key.type_name in contact_v3_kinds for w in writes)
+            has_contact_v2 = any(w.key.type_name in contact_v2_kinds for w in writes)
+            has_contact_batch = any(w.key.type_name == CONTACT_BATCH_SCHEMA_V1 for w in writes)
+            if has_contact_v3:
+                if (has_contact_v2 or has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
+                        or natural_final_admission is not None or v2_write is None):
+                    raise UnavailableGuard("Contact3 requires its exact installed final GCP witness; HOLD")
+                dispatch_candidate = validate_contact_dispatch_candidate_writes_v3(
+                    tuple((p.domain,w) for p in bundle.proposals for w in p.typed_writes),
+                    namespace=namespace, identity=envelope.identity, read_versions=envelope.version_guard.read_versions,
+                    source_refs=envelope.source_qualification.source_refs, access_epoch=envelope.version_guard.access_epoch,
+                    delete_epoch=envelope.version_guard.delete_epoch,
+                    query_epoch=envelope.version_guard.query_epochs[0].revision if len(envelope.version_guard.query_epochs)==1 else -1)
+            elif has_contact_v2:
+                if (has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV2
+                        or natural_final_admission is not None or v2_write is None):
+                    raise UnavailableGuard("Contact v2 requires its exact installed final GCP witness; HOLD")
+                dispatch_candidate = validate_contact_dispatch_candidate_writes_v2(
+                    tuple((p.domain,w) for p in bundle.proposals for w in p.typed_writes),
+                    namespace=namespace, identity=envelope.identity, read_versions=envelope.version_guard.read_versions,
+                    source_refs=envelope.source_qualification.source_refs, access_epoch=envelope.version_guard.access_epoch,
+                    delete_epoch=envelope.version_guard.delete_epoch,
+                    query_epoch=envelope.version_guard.query_epochs[0].revision if len(envelope.version_guard.query_epochs)==1 else -1)
+            elif has_contact_batch:
+                if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV1
+                        or natural_final_admission is not None or v2_write is None):
+                    raise UnavailableGuard("Contact batch requires its installed current final GCP witness; HOLD")
+                dispatch_candidate = validate_contact_dispatch_candidate_writes_v1(
+                    tuple((p.domain, w) for p in bundle.proposals for w in p.typed_writes),
+                    namespace=namespace, identity=envelope.identity,
+                    read_versions=envelope.version_guard.read_versions,
+                    source_refs=envelope.source_qualification.source_refs,
+                    access_epoch=envelope.version_guard.access_epoch,
+                    delete_epoch=envelope.version_guard.delete_epoch,
+                    query_epoch=envelope.version_guard.query_epochs[0].revision
+                    if len(envelope.version_guard.query_epochs) == 1 else -1)
             else:
-                product_advance = self._check_product_advance(db, bundle, snapshot, writes)
-                if product_advance is not None:
-                    product_advances.append(product_advance)
+                dispatch_candidate = validate_dispatch_candidate_writes(
+                    tuple((proposal.domain, write) for proposal in bundle.proposals
+                          for write in proposal.typed_writes),
+                    namespace=namespace, identity=envelope.identity,
+                    read_versions=envelope.version_guard.read_versions,
+                    source_refs=envelope.source_qualification.source_refs,
+                    access_epoch=envelope.version_guard.access_epoch,
+                    delete_epoch=envelope.version_guard.delete_epoch,
+                    query_epoch=envelope.version_guard.query_epochs[0].revision
+                    if len(envelope.version_guard.query_epochs) == 1 else -1,
+                )
+            if (type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2
+                    and natural_final_admission is None):
+                raise UnavailableGuard(
+                    "natural final dispatch admission is not installed; HOLD")
+            if (natural_final_admission is not None
+                    and type(dispatch_candidate) is not NaturalDispatchCandidateEvidenceV2):
+                raise AuthorityDenied("natural final admission needs a V2 batch")
+            if (type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2
+                    and not callable(natural_final_admission)):
+                raise UnavailableGuard("natural final issuer is unavailable; HOLD")
+            if len({write.key for write in writes}) != len(writes):
+                raise ValueError("duplicate writes across proposals")
+            read_map = {item.key: item.revision for item in envelope.version_guard.read_versions}
+            if not set(write.key for write in writes).issubset(read_map):
+                raise ValueError("all writes require read versions, including absent keys")
+            for proposal in bundle.proposals:
+                registration = self.__providers.get(proposal.domain)
+                if registration is None:
+                    raise AuthorityDenied("unregistered proposal domain")
+                _, schema, schema_hash = registration
+                if any(write.key.type_name == 'memory.subjective_trace.v3' for write in proposal.typed_writes):
+                    raise UnavailableGuard('installed Life C02 trace-v3 issuer is unavailable; HOLD')
+                from .runtime.d06_internal_life_episode_v2 import KINDS as internal_life_kinds, PROPOSAL_SCHEMA as internal_life_schema, PROPOSAL_HASH as internal_life_hash, require_exact_internal_life_issuance_v2
+                internal_life = any(write.key.type_name in internal_life_kinds for write in proposal.typed_writes)
+                from .domains.d08.contact_plan_v2 import KINDS as contact_plan_v2_kinds,PROPOSAL_SCHEMA as contact_plan_v2_schema,PROPOSAL_HASH as contact_plan_v2_hash
+                is_contact_plan_v2=any(write.key.type_name in contact_plan_v2_kinds for write in proposal.typed_writes)
+                if proposal.envelope.identity.phase in {"prepare_artifact_draft_model", "acquire_artifact_draft_model"}:
+                    from .runtime.d11_artifact_draft_model_v1 import (require_artifact_draft_model_commit_v1,
+                        C4_MODEL_PROPOSAL_SCHEMA, C4_MODEL_PROPOSAL_HASH)
+                    actual = require_artifact_draft_model_commit_v1(domain_production_issuance_v1, self, self.__store._db, bundle)
+                    if (proposal not in actual.stage.stage.proposals or
+                            (proposal.domain, proposal.proposal_schema, proposal.proposal_schema_hash) !=
+                            ("d11", C4_MODEL_PROPOSAL_SCHEMA, C4_MODEL_PROPOSAL_HASH)):
+                        raise AuthorityDenied("C4 model proposal lacks its exact private installed schema")
+                elif proposal.envelope.identity.phase in {"adopt_artifact_draft_content", "adopt_artifact_draft_content_v2"}:
+                    from .runtime.d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2
+                    from .runtime.d11_artifact_draft_model_v1 import C4_MODEL_PROPOSAL_SCHEMA, C4_MODEL_PROPOSAL_HASH
+                    from .runtime.domain_production_commit_v1 import _ProductionCommitWitnessV1, _ACTIVE, _require_foreground_witness_v1
+                    if (type(domain_production_issuance_v1) is not _ProductionCommitWitnessV1
+                            or _ACTIVE.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                            or type(domain_production_issuance_v1.stage) not in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}
+                            or domain_production_issuance_v1.bundle is not bundle):
+                        raise AuthorityDenied("C4 source/job proposal lacks its actual private foreground witness")
+                    _require_foreground_witness_v1(domain_production_issuance_v1, self, self.__store._db, bundle)
+                    from .runtime.d11_artifact_draft_model_v1 import C4_PHASE_MODEL_PROPOSAL_SCHEMA_V2, C4_PHASE_MODEL_PROPOSAL_HASH_V2
+                    model_schema = (C4_PHASE_MODEL_PROPOSAL_SCHEMA_V2, C4_PHASE_MODEL_PROPOSAL_HASH_V2) if type(domain_production_issuance_v1.stage) is ArtifactDraftContentStageV2 else (C4_MODEL_PROPOSAL_SCHEMA, C4_MODEL_PROPOSAL_HASH)
+                    expected = model_schema if proposal.domain == "d11" else (schema, schema_hash)
+                    if proposal not in domain_production_issuance_v1.stage.stage.proposals or (proposal.proposal_schema, proposal.proposal_schema_hash) != expected:
+                        raise AuthorityDenied("C4 content proposal differs from its exact registered dual-job stage")
+                elif proposal.envelope.identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+                    from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_task_issuance_v1
+                    actual = require_exact_life_numeric_task_issuance_v1(domain_production_issuance_v1, self, bundle)
+                    if proposal not in actual.bundle.proposals:
+                        raise AuthorityDenied('numeric Life proposal differs from the actual private task')
+                    if proposal.envelope.identity.phase == 'acquire_internal_life_numeric':
+                        from .runtime.d06_life_numeric_worker_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
+                        expected = (ns, nh) if proposal.domain == 'd11' else None
+                    else:
+                        from .runtime.d06_life_numeric_task_v1 import APPRAISAL_SCHEMA, APPRAISAL_HASH, JOB_SCHEMA, JOB_HASH
+                        expected = (APPRAISAL_SCHEMA, APPRAISAL_HASH) if proposal.domain == 'd04' else (JOB_SCHEMA, JOB_HASH) if proposal.domain == 'd11' else None
+                    if expected is None or (proposal.proposal_schema, proposal.proposal_schema_hash) != expected:
+                        raise AuthorityDenied('numeric Life task independent schema differs')
+                elif proposal.envelope.identity.phase in {'prepare_internal_life_numeric_drive', 'adopt_internal_life_numeric_trace'}:
+                    from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_math_issuance_v1
+                    require_exact_life_numeric_math_issuance_v1(domain_production_issuance_v1, self, bundle)
+                    if proposal.envelope.identity.phase == 'prepare_internal_life_numeric_drive':
+                        from .runtime.d06_life_numeric_drive_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
+                    else:
+                        from .runtime.d06_life_numeric_trace_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
+                    if (proposal.proposal_schema, proposal.proposal_schema_hash) != (ns, nh):
+                        raise AuthorityDenied('numeric Life mathematical proposal schema differs')
+                elif proposal.envelope.identity.phase == 'prepare_internal_life_numeric_context':
+                    from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
+                    from .runtime.d06_life_numeric_context_v1 import D03_SCHEMA, D07_SCHEMA, PROPOSAL_HASHES
+                    require_exact_life_numeric_context_issuance_v1(domain_production_issuance_v1, self, bundle)
+                    expected = D03_SCHEMA if proposal.domain == 'd03' else D07_SCHEMA if proposal.domain == 'd07' else None
+                    if expected is None or (proposal.proposal_schema, proposal.proposal_schema_hash) != (expected, PROPOSAL_HASHES[expected]):
+                        raise AuthorityDenied('numeric Life context requires its independent installed schema')
+                elif proposal.envelope.identity.phase == 'adopt_internal_life_content_v1':
+                    from .runtime.internal_life_content_adoption_v1 import (require_exact_content_issuance_v1,
+                        PROPOSAL_SCHEMA as cs,PROPOSAL_HASH as ch,JOB_SCHEMA as js,JOB_HASH as jh)
+                    require_exact_content_issuance_v1(domain_production_issuance_v1,self,bundle)
+                    expected=(cs,ch) if proposal.domain=='d06' else (js,jh)
+                    if (proposal.proposal_schema,proposal.proposal_schema_hash)!=expected:
+                        raise AuthorityDenied('Life content completion requires its independent installed schema')
+                elif proposal.envelope.identity.phase == "acquire_internal_life_content_v2":
+                    from .runtime.internal_life_content_worker_v2 import (
+                        PROPOSAL_SCHEMA as worker_schema,PROPOSAL_HASH as worker_hash,
+                        require_exact_internal_life_acquisition_issuance_v2)
+                    require_exact_internal_life_acquisition_issuance_v2(domain_production_issuance_v1,self,bundle)
+                    if (proposal.proposal_schema,proposal.proposal_schema_hash)!=(worker_schema,worker_hash):
+                        raise AuthorityDenied('Life worker requires its independent dual-role installed schema')
+                elif proposal.envelope.identity.phase == "acquire_internal_life_content":
+                    from .runtime.internal_life_content_worker_v1 import (
+                        PROPOSAL_SCHEMA as life_acquire_schema, PROPOSAL_HASH as life_acquire_hash,
+                        require_exact_internal_life_acquisition_issuance_v1)
+                    require_exact_internal_life_acquisition_issuance_v1(domain_production_issuance_v1,self,bundle)
+                    if (proposal.proposal_schema,proposal.proposal_schema_hash) != (life_acquire_schema,life_acquire_hash):
+                        raise AuthorityDenied('Life acquisition requires its independent exact installed schema')
+                elif internal_life:
+                    require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
+                    if (proposal.proposal_schema, proposal.proposal_schema_hash) != (internal_life_schema, internal_life_hash):
+                        raise AuthorityDenied('internal Life proposal requires its explicit installed v2 schema')
+                elif is_contact_plan_v2:
+                    from .runtime.contact_plan_adoption_v2 import require_exact_contact_plan_issuance_v2
+                    require_exact_contact_plan_issuance_v2(domain_production_issuance_v1,self,bundle)
+                    if (proposal.proposal_schema,proposal.proposal_schema_hash)!=(contact_plan_v2_schema,contact_plan_v2_hash):
+                        raise AuthorityDenied('Contact Plan v2 requires its independent exact installed schema/witness')
+                elif any(write.key.type_name in contact_v3_kinds for write in proposal.typed_writes):
+                    from .domains.d09.contact_batch_v3 import PROPOSAL_SCHEMA as contact_v3_schema, PROPOSAL_HASH as contact_v3_hash
+                    if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
+                            or domain_production_issuance_v1.stage.bundle is not bundle
+                            or (proposal.proposal_schema,proposal.proposal_schema_hash) != (contact_v3_schema,contact_v3_hash)):
+                        raise AuthorityDenied("Contact3 proposal has no exact private installed schema/witness")
+                elif any(write.key.type_name in contact_v2_kinds for write in proposal.typed_writes):
+                    from .domains.d09.contact_batch_v2 import PROPOSAL_SCHEMA as contact_v2_schema, PROPOSAL_HASH as contact_v2_hash
+                    if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV2
+                            or domain_production_issuance_v1.stage.bundle is not bundle
+                            or (proposal.proposal_schema,proposal.proposal_schema_hash) != (contact_v2_schema,contact_v2_hash)):
+                        raise AuthorityDenied('Contact v2 proposal has no exact private installed schema/witness')
+                elif (proposal.proposal_schema, proposal.proposal_schema_hash) != (schema, schema_hash):
+                    raise AuthorityDenied("proposal schema differs from registered provider")
+                for write in proposal.typed_writes:
+                    spec = store._registry.spec(write.key.type_name)
+                    if (spec.writer_domain != proposal.domain or spec.schema_hash is None
+                            or write.key.owner.kind not in envelope.authority.owner_scope):
+                        raise AuthorityDenied("writer lacks registered type or owner capability")
+                    if not set(write.dependencies).issubset(read_map):
+                        raise ValueError("dependency is outside complete read set")
+                for ref in (proposal.dependencies.current_invalidation
+                            + proposal.dependencies.historical_provenance
+                            + proposal.dependencies.associations
+                            + proposal.dependencies.numeric_coupling):
+                    if read_map.get(ref.key) != ref.revision:
+                        raise StaleRead("dependency reference is not guarded")
+                current = {ref.key for ref in proposal.dependencies.current_invalidation}
+                actual_current = set()
+                for write in proposal.typed_writes:
+                    actual_current.update(write.dependencies)
+                    if not set(write.dependencies).issubset(current):
+                        raise ValueError("graph invalidation edges must match classified dependencies")
+                if actual_current != current:
+                    raise ValueError("classified current dependencies are not materialized")
+            write_tokens = {write.key.token for write in writes}
+            for write in writes:
+                if (write.key.type_name == "runtime.job"
+                        and write.key.token not in bundle.persistent_job_refs
+                        and not (c02_adoption is not None
+                                 and write == bundle.proposals[1].typed_writes[0])):
+                    raise ValueError("runtime.job write must be a bound persistent job ref")
+                if (write.key.type_name == "runtime.outbox"
+                        and write.key.token not in bundle.outbox_refs):
+                    raise ValueError("runtime.outbox write must be a bound outbox ref")
+                if write.key.type_name == "runtime.outbox":
+                    if write.value.get("dispatch_generation") != envelope.authority.activation_generation:
+                        raise StaleRead("outbox dispatch generation differs from active holder")
+                    if write.value.get("idempotency_key") not in bundle.idempotency_keys:
+                        raise AuthorityDenied("outbox idempotency key is not in the bundle ledger")
+            part_refs = (
+                ("experience", bundle.experience_refs), ("choice", bundle.choice_refs),
+                ("d02_settlement", bundle.d02_settlement_refs),
+                ("cost_settlement", bundle.d11_cost_settlement_refs),
+                ("idempotency", bundle.idempotency_keys),
+                (PERSISTENT_JOB_REF_KIND, bundle.persistent_job_refs),
+                ("outbox", bundle.outbox_refs),
+            )
+            for kind, refs in part_refs:
+                for ref in refs:
+                    if kind in {"idempotency"}:
+                        continue
+                    if (c04_adoption_issuance_v3 is not None
+                            and kind in {"d02_settlement", "cost_settlement"}):
+                        # V3 refers to already paid immutable originals. The final
+                        # plan below verifies their exact refs and proof linkage.
+                        continue
+                    key = self._parse_ref(ref, namespace)
+                    if key.token not in write_tokens:
+                        raise ValueError(f"{kind} reference must be written in the same bundle")
+                    required_type = {
+                        "cost_settlement": "runtime.cost_settlement",
+                        "persistent_job": "runtime.job",
+                        "outbox": "runtime.outbox",
+                    }.get(kind)
+                    if required_type is not None and key.type_name != required_type:
+                        raise AuthorityDenied(f"{kind} requires {required_type}")
+                    required_writer = {
+                        "d02_settlement": "d02", "cost_settlement": "d11",
+                        "persistent_job": "d11", "outbox": "d11",
+                    }.get(kind)
+                    if required_writer is not None and (
+                            store._registry.spec(key.type_name).writer_domain != required_writer):
+                        raise AuthorityDenied(f"{kind} requires the {required_writer} graph writer")
+            new_sources = []
             for source in envelope.source_qualification.source_refs:
                 key = self._parse_ref(source, namespace)
-                if key in new_sources:
-                    continue
-                atom = snapshot.get(key)
-                access = snapshot.get(access_key(*namespace.as_tuple,
-                                                 key.owner.subject or ""))
-                if atom is None or not atom.valid or access is None or not access.valid:
-                    raise StaleRead("source or access is absent or invalid")
-                if (access.value.get("status") != "active"
-                        or access.value.get("source_id") != key.owner.subject
-                        or not set(envelope.authority.audience).issubset(
-                            access.value.get("audiences", ()))
-                        or envelope.authority.purpose not in access.value.get("purposes", ())):
-                    raise AuthorityDenied("source access no longer covers this use")
-            if (type(dispatch_candidate) is DispatchCandidateEvidenceV1
-                    and len(envelope.version_guard.query_epochs) == 1
-                    and envelope.version_guard.query_epochs[0].scope_ref == "all"):
-                from .domains.d08 import GoalExecutionProvider
+                if key not in read_map:
+                    raise StaleRead("source outside complete read set")
+                if key != source_key(*namespace.as_tuple, key.owner.subject or ""):
+                    raise AuthorityDenied("source reference is not a canonical D06 source")
+                access = access_key(*namespace.as_tuple, key.owner.subject or "")
+                access_revision = read_map.get(access)
+                if access_revision is None:
+                    raise StaleRead("source access record is outside complete read set")
+                if read_map[key] == 0:
+                    if access_revision != 0:
+                        raise StaleRead("new source cannot reuse an existing access record")
+                    source_writes = tuple((proposal.domain, write) for proposal in bundle.proposals
+                                          for write in proposal.typed_writes if write.key == key)
+                    access_writes = tuple((proposal.domain, write) for proposal in bundle.proposals
+                                          for write in proposal.typed_writes if write.key == access)
+                    if (len(source_writes) != 1 or len(access_writes) != 1
+                            or source_writes[0][0] != "d06" or access_writes[0][0] != "d06"):
+                        raise AuthorityDenied("new source requires D06 source and access writes")
+                    record = access_writes[0][1].value
+                    if (record.get("source_id") != key.owner.subject
+                            or record.get("status") != "active"
+                            or not set(envelope.authority.audience).issubset(record.get("audiences", ()))
+                            or envelope.authority.purpose not in record.get("purposes", ())
+                            or key not in access_writes[0][1].dependencies):
+                        raise AuthorityDenied("new source access does not cover this use")
+                    if not (bundle.persistent_job_refs and bundle.outbox_refs
+                            and bundle.idempotency_keys):
+                        raise ValueError("new source requires encoding job, outbox and idempotency")
+                    new_sources.append(key)
+                elif access_revision == 0:
+                    raise StaleRead("existing source has no access record")
+            digest = bundle.digest
+            identity = envelope.identity
+            event = Event(Scope(*namespace.as_tuple, identity.activity_id),
+                          identity.operation_id, envelope.source_qualification.learned_at,
+                          "domain_bundle", {"bundle_digest": digest})
+            result: list[CommitReceipt] = []
+            runtime_admissions: list[RuntimeAdmission] = []
+            product_advances: list[dict] = []
+            joint_product_advances: list[tuple] = []
+            c04_adoption_plans_v3 = []
+            qualified_dispatch_candidates = []
+            guard_snapshots: list[GraphSnapshot] = []
+            dispatch_projections = []
 
-                action_write = next(write for write in writes
-                                    if write.key.type_name == "d08.action_intent.v1")
-                action = next(spec for spec in GoalExecutionProvider().register_types()
-                              if spec.name == "d08.action_intent.v1").validator(
-                                  action_write.value)
-                qualified_dispatch_candidates.append(qualify_dispatch_candidate_sources(
-                    dispatch_candidate, action, snapshot,
-                    audience=envelope.authority.audience,
-                    batch_audiences=tuple(next(write.value["audiences"] for write in writes
-                                               if write.key.type_name ==
-                                               "d09.verified_segment_batch.v1")),
-                    current_barrier_confirmed=True,
-                    valid_until=next(write.value["valid_until"] for write in writes
-                                     if write.key.type_name == "d09.verified_segment_batch.v1"),
-                ))
-            for proposal in bundle.proposals:
-                if domain_production_issuance_v1 is not None:
-                    # Exact installed operation was independently rebuilt and
-                    # bound to this Graph, permit, policies and complete bundle.
-                    continue
-                if (d04_numeric_issuance_v3 is not None and proposal.domain == "d04"
-                        and type(bundle.product_advance) is ProductAdvanceEvidenceV2):
-                    # The installed output issuer + complete current joint
-                    # preflight above is the dedicated D11 adoption route.
-                    # The generic D04 proposal validator intentionally rejects
-                    # committed numeric states from ordinary callers.
-                    continue
-                if self_identity_issuance is not None:
-                    from .domains.d03.self_perspective import (
-                        validate_self_identity_projection_snapshot,
-                    )
-
-                    validate_self_identity_projection_snapshot(
-                        proposal, snapshot, qualified_self[0], qualified_self[1])
+            def dispatch_now() -> float | None:
+                if dispatch_clock_reading is None:
+                    if dispatch_clock_frozen_now_utc is not None:
+                        raise UnavailableGuard("frozen dispatch time lacks paired clock; HOLD")
+                    return now_utc
+                if dispatch_clock_original is None:
+                    fresh = self._dispatch_clock_upper(dispatch_clock_reading)
                 else:
-                    if c02_adoption is not None and proposal.domain == "d11":
-                        from .runtime.d11_types import validate_d11_writes
+                    if dispatch_clock_original.reading is not dispatch_clock_reading:
+                        raise UnavailableGuard("natural dispatch clock original crossed actual reading")
+                    fresh = dispatch_clock_original.upper_for('natural_dispatch')
+                if dispatch_clock_frozen_now_utc is None:
+                    return fresh
+                frozen = dispatch_clock_frozen_now_utc
+                if (type(frozen) not in (int, float) or not math.isfinite(frozen)
+                        or fresh < frozen or fresh >= envelope.deadline_utc
+                        or (provisional_check_candidate is not None
+                            and any(fresh >= item.valid_until
+                                    for item in provisional_check_candidate.checks))):
+                    raise UnavailableGuard("final dispatch clock or check expired; HOLD")
+                return float(frozen)
 
-                        validate_d11_writes(
-                            proposal.typed_writes, namespace,
-                            operation_id=(c02_terminal_recovery.seal.original_key.original_operation_id
-                                          if c02_terminal_recovery is not None else
-                                          c02_adoption[0].request.original_operation_id
-                                          if isinstance(c02_adoption[0], _C02PendingRecovery)
-                                          else c02_adoption[0][2].budget_reservation_operation_id),
-                            activity_id=identity.activity_id,
-                            effect_id=identity.effect_id)
-                        continue
-                    provider = self.__providers[proposal.domain][0]
-                    # Providers may return approval or the exact unchanged proposal.
-                    # A transformed candidate would need its own validation pass.
-                    from .runtime.d06_internal_life_episode_v2 import KINDS as internal_life_kinds, require_exact_internal_life_issuance_v2, validate_internal_life_proposal_v2
-                    if proposal.envelope.identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
-                        from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_task_issuance_v1
-                        actual = require_exact_life_numeric_task_issuance_v1(domain_production_issuance_v1, self, bundle)
-                        if proposal.envelope.identity.phase == 'acquire_internal_life_numeric':
-                            from .runtime.d06_life_numeric_worker_v1 import validate_life_numeric_acquisition_proposal_v1
-                            validated = validate_life_numeric_acquisition_proposal_v1(proposal, snapshot, actual.stage.binding)
-                        else:
-                            # Same-transaction issuer rederived the actual paid Appraisal and completed job.
-                            if proposal not in (*actual.stage.stage.proposals, actual.stage.job_proposal):
-                                raise AuthorityDenied('numeric appraisal proposal differs from actual reissued members')
-                            validated = proposal
-                    elif proposal.envelope.identity.phase in {'prepare_internal_life_numeric_drive', 'adopt_internal_life_numeric_trace'}:
-                        from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_math_issuance_v1
-                        require_exact_life_numeric_math_issuance_v1(domain_production_issuance_v1, self, bundle)
-                        if proposal.envelope.identity.phase == 'prepare_internal_life_numeric_drive':
-                            from .runtime.d06_life_numeric_drive_v1 import validate_life_numeric_drive_proposal_v1 as numeric_validate
-                        else:
-                            from .runtime.d06_life_numeric_trace_v1 import validate_life_numeric_trace_proposal_v1 as numeric_validate
-                        validated = numeric_validate(proposal, snapshot)
-                    elif proposal.envelope.identity.phase == 'prepare_internal_life_numeric_context':
-                        from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
-                        from .runtime.d06_life_numeric_context_v1 import validate_life_numeric_context_proposal_v1
-                        require_exact_life_numeric_context_issuance_v1(domain_production_issuance_v1, self, bundle)
-                        validated = validate_life_numeric_context_proposal_v1(proposal, snapshot)
-                    elif proposal.envelope.identity.phase == 'adopt_internal_life_content_v1':
-                        from .runtime.internal_life_content_adoption_v1 import require_exact_content_issuance_v1,validate_content_proposal_v1
-                        require_exact_content_issuance_v1(domain_production_issuance_v1,self,bundle)
-                        validated=validate_content_proposal_v1(proposal,snapshot)
-                    elif proposal.envelope.identity.phase == "acquire_internal_life_content_v2":
-                        from .runtime.internal_life_content_worker_v2 import require_exact_internal_life_acquisition_issuance_v2,validate_internal_life_acquisition_proposal_v2
-                        actual_worker=require_exact_internal_life_acquisition_issuance_v2(domain_production_issuance_v1,self,bundle)
-                        validated=validate_internal_life_acquisition_proposal_v2(proposal,snapshot,actual_worker.stage.frame.binding)
-                    elif proposal.envelope.identity.phase == "acquire_internal_life_content":
-                        from .runtime.internal_life_content_worker_v1 import require_exact_internal_life_acquisition_issuance_v1,validate_internal_life_acquisition_proposal_v1
-                        require_exact_internal_life_acquisition_issuance_v1(domain_production_issuance_v1,self,bundle)
-                        validated = validate_internal_life_acquisition_proposal_v1(proposal,snapshot)
-                    elif any(write.key.type_name in internal_life_kinds for write in proposal.typed_writes):
-                        require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
-                        validated = validate_internal_life_proposal_v2(proposal, snapshot)
-                    else:
-                        validated = provider.validate(proposal, snapshot)
-                    if validated is not True and validated != proposal:
-                        raise AuthorityDenied("domain validation did not approve proposal")
-            if (c04_adoption_issuance_v3 is None and d04_numeric_issuance_v3 is None
-                    and domain_production_issuance_v1 is None):
-                runtime_admissions.append(self._admit_runtime_bundle(
-                db, bundle, now_utc=dispatch_now(),
-                require_arrival_quote=arrival_issuance is not None,
-                c02_terminal_recovery=c02_terminal_recovery,
-                c02_terminal_bundle_json=(c02_terminal_recovery.bundle_json
-                                          if c02_terminal_recovery is not None else None),
-                c02_terminal_quote_json=(c02_terminal_recovery.quote_json
-                                         if c02_terminal_recovery is not None else None)))
-            if c02_adoption is not None:
-                from .runtime.d11_types import job_graph_write
-
-                result_ref = bundle.proposals[1].typed_writes[0].value["result_ref"]
-                if c02_terminal_recovery is None:
-                    from .runtime.jobs import transition_job
-
-                    completed = transition_job(
-                        db, (c02_adoption[0].request.job_id
-                             if isinstance(c02_adoption[0], _C02PendingRecovery)
-                             else c02_adoption[0][1].request.job_id),
-                        envelope.authority.actor, envelope.authority.worker_fence,
-                        target_phase="completed", result_ref=result_ref)
-                else:
-                    from .runtime.c02_terminal_job import (
-                        complete_original_c02_job_in_transaction,
-                    )
-
-                    witness = c02_terminal_recovery
-                    completed = complete_original_c02_job_in_transaction(
-                        db, original=witness.original, seal=witness.seal,
-                        pinned_read=witness.pinned_read,
-                        consumer_operation_id=identity.operation_id,
-                        result_ref=result_ref, now_utc=now_utc,
-                        current_gate=lambda conn, job, seal, fact:
-                            self._validate_first_ingress_c02_terminal_locked(
-                                conn, bundle, witness, job, seal, fact, v2_write))
-                if job_graph_write(completed) != bundle.proposals[1].typed_writes[0]:
-                    raise UnavailableGuard("C02 job transition differs from graph write")
-            for proposal in bundle.proposals:
-                for write in proposal.typed_writes:
-                    if write.key.type_name.startswith("runtime."):
-                        if proposal.domain != "d11":
-                            raise AuthorityDenied("runtime graph write requires D11")
-                        reconcile_runtime_write(db, write)
-
-        def receipt_hook(db, graph_receipt):
-            if c02_adoption is not None and isinstance(
-                    c02_adoption[0], (_C02PendingRecovery, _C02TerminalRecovery)):
-                from .runtime.first_ingress_v2 import trusted_upper
-
-                if (trusted_upper(c02_adoption[0].clock_reading)
-                        >= envelope.deadline_utc
-                        or time.monotonic()
-                        >= c02_adoption[0].local_monotonic_deadline):
-                    raise UnavailableGuard("pending C02 deadline expired before commit")
-            prior = db.execute(
-                "SELECT digest,receipt_json FROM graph_bundle_operations WHERE bot=? "
-                "AND persona=? AND operation_id=?",
-                namespace.as_tuple + (identity.operation_id,),
-            ).fetchone()
-            if prior:
-                if prior[0] != digest:
-                    raise EventConflict("operation ID reused with different bundle")
-                if graph_receipt.status != "duplicate":
-                    raise EventConflict("operation ledger and graph event disagree")
-                data = json.loads(prior[1])
-                # Stored receipt is reconstructed from current canonical graph
-                # event data; no caller-supplied status can mark a duplicate.
-                result.append(CommitReceipt(
-                    "duplicate", identity.operation_id, digest,
-                    identity.activity_id, identity.effect_id, data["commit_seq"],
-                    envelope.version_guard.read_versions,
-                    graph_receipt.revisions, (graph_receipt.epoch,),
-                    tuple(data["ledger_refs"]), tuple(data["outbox_refs"]),
-                ))
-                return
-            if graph_receipt.status != "committed":
-                raise EventConflict("graph event exists without bundle operation ledger")
-            if identity.phase == "ingress" and not envelope.version_guard.query_epochs:
-                # This runs after graph writes but before SQLite COMMIT.  The
-                # sealed four-key exception must still hold, and the current
-                # process clock may have advanced during provider validation.
+            def guard(db):
                 if v2_write is not None:
                     expected, expected_epoch = v2_write[:2]
-                    current_metadata, current_epoch = self._v2_graph_stamp(namespace)
-                    if (current_metadata != expected
-                            or current_epoch != graph_receipt.epoch
-                            or current_epoch.revision != expected_epoch.revision + 1):
+                    if self._v2_graph_stamp(namespace) != (expected, expected_epoch):
                         raise StaleRead("v2 graph recovery stamp changed")
+                    if db.execute(
+                            "SELECT 1 FROM graph_bundle_rejections_v2 WHERE bot=? "
+                            "AND persona=? AND operation_id=?",
+                            namespace.as_tuple + (identity.operation_id,),
+                    ).fetchone() is not None:
+                        raise UnavailableGuard("v2 bundle is terminal rejected_no_commit")
+                    if self_identity_issuance is not None or baseline_issuance is not None:
+                        stage_table = ("graph_d03_self_projection_intents_v1"
+                                       if self_identity_issuance is not None else
+                                       "graph_d04_baseline_intents_v1")
+                        stage_source = (self_identity_issuance[4]
+                                        if self_identity_issuance is not None else
+                                        baseline_issuance[3])
+                        original_op = (self_identity_issuance[7]
+                                       if self_identity_issuance is not None else
+                                       baseline_issuance[7])
+                        if db.execute(
+                                f"SELECT operation_id,bundle_digest FROM {stage_table} "
+                                "WHERE bot=? AND persona=? AND source_ref=? "
+                                "AND original_operation_id=?",
+                                namespace.as_tuple + (stage_source, original_op),
+                        ).fetchone() != (identity.operation_id, digest):
+                            raise EventConflict("stage current attempt changed")
                 elif not v2_read:
                     self._admit_content(
                         namespace, envelope.authority.activation_generation, "write",
                         tuple(item.key.token for item in envelope.version_guard.read_versions)
                         + tuple(write.key.token for write in writes),
                     )
-                if self._version(db, namespace, "activation", "current") != str(
-                        envelope.authority.activation_generation):
-                    raise StaleRead("ingress activation generation changed before commit")
-                epoch_row = db.execute(
-                    "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
-                    "WHERE bot=? AND persona=?", namespace.as_tuple,
-                ).fetchone() or (0, 0)
-                if tuple(epoch_row) != (
-                        envelope.version_guard.access_epoch,
-                        envelope.version_guard.delete_epoch):
-                    raise StaleRead("ingress access or deletion epoch changed before commit")
-                if not self._exact_ingress_without_query(
-                        db, bundle, deadline_check=ingress_deadline_check):
-                    raise UnavailableGuard("sealed ingress authority changed before commit")
-            seq_row = db.execute(
-                "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?",
-                namespace.as_tuple,
-            ).fetchone()
-            seq = (seq_row[0] if seq_row else 0) + 1
-            db.execute(
-                "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) VALUES(?,?,?) "
-                "ON CONFLICT(bot,persona) DO UPDATE SET last_seq=excluded.last_seq",
-                namespace.as_tuple + (seq,),
-            )
-            ledger_refs = tuple(ref for kind, refs in part_refs if kind not in {"outbox"}
-                                for ref in refs)
-            data = {"commit_seq": seq, "ledger_refs": list(ledger_refs),
-                    "outbox_refs": list(bundle.outbox_refs)}
-            if c02_adoption is not None:
-                witness = c02_adoption[0]
-                observation_digest = (witness.evidence["observation_digest"]
-                                      if isinstance(witness, (_C02PendingRecovery,
-                                                              _C02TerminalRecovery))
-                                      else witness[3].observation_digest)
-                result_digest = (witness.evidence["result_payload_digest"]
-                                 if isinstance(witness, (_C02PendingRecovery,
-                                                         _C02TerminalRecovery))
-                                 else witness[3].result_digest)
-                if c02_terminal_recovery is None:
-                    fact = c02_adoption[1]
-                    data["first_ingress_c02"] = {
-                        "read_request_digest": fact.read_request_digest,
-                        "read_result_digest": fact.result_digest,
-                        "original_intent_digest": fact.original_intent_digest,
-                        "terminal_receipt_digest": canonical_digest(
-                            asdict(fact.terminal_receipt)),
-                        "observation_digest": observation_digest,
-                        "result_digest": result_digest,
-                    }
-                    if c02_first_seal_quote is not None:
-                        # The signed presealed quote selects the v2 candidate
-                        # table, whose exact schema is checked before adoption.
-                        data["first_ingress_c02"]["seal_schema"] = (
-                            "sylanne.first-ingress-c02-candidate.v2")
-                else:
-                    fact = c02_terminal_recovery.pinned_read.fact
-                    data["first_ingress_c02"] = {
-                        "seal_schema": c02_terminal_recovery.seal.schema,
-                        "read_request_digest": canonical_digest(
-                            c02_terminal_recovery.evidence["read_request"]),
-                        "read_result_digest": c02_terminal_recovery.evidence["read_result_digest"],
-                        "terminal_read_request_digest": fact.request.digest,
-                        "terminal_read_fact_digest": fact.digest,
-                        "original_key_digest": c02_terminal_recovery.seal.original_key.digest,
-                        "signed_quote_digest": c02_terminal_recovery.seal.quote_digest,
-                        "terminal_read_attempt_id": fact.request.read_attempt_id,
-                        "original_intent_digest": c02_terminal_recovery.seal.original_key.original_intent_digest,
-                        "terminal_receipt_digest": c02_terminal_recovery.seal.original_key.terminal_receipt_digest,
-                        "observation_digest": observation_digest,
-                        "result_digest": result_digest,
-                    }
-            if type(dispatch_candidate) in (ContactDispatchCandidateEvidenceV1,ContactDispatchCandidateEvidenceV2,ContactDispatchCandidateEvidenceV3):
-                from .runtime.contact_final_stage_v1 import seal_contact_final_admission_v1
-                from .runtime.contact_final_stage_v2 import seal_contact_final_admission_v2
-                from .runtime.contact_final_stage_v3 import seal_contact_final_admission_v3
-                seal_contact = seal_contact_final_admission_v3 if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV3 else seal_contact_final_admission_v2 if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV2 else seal_contact_final_admission_v1
-                admission_receipt, request, runtime_admission, binding = seal_contact(
-                    domain_production_issuance_v1, self, db, graph_receipt, dispatch_candidate)
-                if (load_request(db, namespace, admission_receipt.admission.admission_ref)
-                        != (admission_receipt, request)
-                        or request.proactive_contact is not True or request.segment_index != 0
-                        or (request.operation_id, request.effect_id, request.payload_digest) != (
-                            identity.operation_id, identity.effect_id, dispatch_candidate.payload_digest)):
-                    raise UnavailableGuard("Contact final actual admission/request differs")
-                runtime_admissions.append(runtime_admission)
-                versions = {v.key.token:v.revision for v in graph_receipt.revisions}
-                refs = (dispatch_candidate.action_ref, dispatch_candidate.schema_ref,
-                        dispatch_candidate.grant_ref, dispatch_candidate.batch_ref)
-                if any(versions.get(ref) != 1 for ref in refs):
-                    raise UnavailableGuard("Contact final four-join actual receipt differs")
-                data["contact_dispatch_candidate"] = {
-                    "schema":"sylanne.d11.contact_dispatch_candidate.v3" if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV3 else "sylanne.d11.contact_dispatch_candidate.v2" if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV2 else "sylanne.d11.contact_dispatch_candidate.v1",
-                    "digest":dispatch_candidate.digest, "refs":[[ref,versions[ref]] for ref in refs],
-                    "graph_epoch":graph_receipt.epoch.revision,
-                    "reviewed_content_digest":dispatch_candidate.reviewed_content_digest,
-                    "segment_index":0, "query_epoch":dispatch_candidate.query_epoch}
-                data["dispatch_admission"] = {"schema":admission_receipt.admission.schema,
-                    "ref":admission_receipt.admission.admission_ref, "digest":admission_receipt.receipt_digest}
-                data["dispatch_action_job_binding"] = {"schema":binding.schema, "digest":binding.digest,
-                    "admission_ref":binding.admission_ref, "job_id":binding.job_id}
-            elif type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2:
-                versions = {item.key.token: item.revision
-                            for item in graph_receipt.revisions}
-                refs = (dispatch_candidate.action_ref,
-                        dispatch_candidate.schema_ref,
-                        dispatch_candidate.grant_ref,
-                        dispatch_candidate.batch_ref)
-                if any(versions.get(ref) != 1 for ref in refs):
-                    raise UnavailableGuard("natural final graph writes differ")
-                data["natural_dispatch_candidate"] = {
-                    "schema": "sylanne.d11.natural_dispatch_candidate.v2",
-                    "status": dispatch_candidate.status,
-                    "digest": dispatch_candidate.digest,
-                    "refs": [[ref, versions[ref]] for ref in refs],
-                    "graph_epoch": graph_receipt.epoch.revision,
-                    "source_refs": list(envelope.source_qualification.source_refs),
-                    "access_epoch": dispatch_candidate.access_epoch,
-                    "delete_epoch": dispatch_candidate.delete_epoch,
-                    "query_epoch": dispatch_candidate.query_epoch,
-                    "graph_incarnation": (v2_write[0].requirements.graph_incarnation
-                                          if v2_write is not None else None),
-                    "graph_revision": (v2_write[0].graph_revision + 1
-                                       if v2_write is not None else None),
-                }
-                admission_receipt, request = natural_final_admission(
-                    db, graph_receipt, dispatch_candidate,
-                    tuple(runtime_admissions))
-                issued = load_request(db, namespace,
-                                      admission_receipt.admission.admission_ref)
-                if (issued != (admission_receipt, request)
-                        or (request.operation_id, request.effect_id,
-                            request.payload_digest) != (
-                                identity.operation_id, identity.effect_id,
-                                dispatch_candidate.payload_digest)):
-                    raise UnavailableGuard("natural final admission differs")
-                data["dispatch_admission"] = {
-                    "schema": admission_receipt.admission.schema,
-                    "ref": admission_receipt.admission.admission_ref,
-                    "digest": admission_receipt.receipt_digest,
-                }
-            elif dispatch_candidate is not None:
-                candidate_evidence = (qualified_dispatch_candidates[0]
-                                      if qualified_dispatch_candidates else dispatch_candidate)
-                versions = {item.key.token: item.revision
-                            for item in graph_receipt.revisions}
-                refs = (dispatch_candidate.action_ref,
-                        dispatch_candidate.schema_ref,
-                        dispatch_candidate.grant_ref,
-                        dispatch_candidate.batch_ref)
-                if any(versions.get(ref, 0) < 1 for ref in refs):
-                    raise UnavailableGuard("dispatch candidate lacks same-commit graph versions")
-                data["dispatch_candidate"] = {
-                    "schema": "sylanne.d11.dispatch_candidate.v1",
-                    "status": candidate_evidence.status,
-                    "digest": candidate_evidence.digest,
-                    "refs": [[ref, versions[ref]] for ref in refs],
-                    "graph_epoch": graph_receipt.epoch.revision,
-                    "source_refs": list(dispatch_candidate.source_refs),
-                    "access_epoch": dispatch_candidate.access_epoch,
-                    "delete_epoch": dispatch_candidate.delete_epoch,
-                    "query_epoch": dispatch_candidate.query_epoch,
-                    "source_audience": list(candidate_evidence.source_audience),
-                    "source_proof_versions": [list(item) for item in
-                                              candidate_evidence.source_proof_versions],
-                    "source_proof_digest": candidate_evidence.source_proof_digest,
-                    "graph_incarnation": (
-                        v2_write[0].requirements.graph_incarnation
-                        if v2_write is not None else None),
-                    "graph_revision": (
-                        v2_write[0].graph_revision + 1
-                        if v2_write is not None else None),
-                }
-                if self.__dispatch_admission_issuer is not None:
-                    from .domains.d08 import ActionCancellationState, GoalExecutionProvider
-                    from .runtime.dispatch_action_job_binding import bind_action_job
-
-                    admission_jobs = runtime_admissions[0].jobs
-                    if (len(admission_jobs) != 1
-                            or len(bundle.persistent_job_refs) != 1
-                            or len(bundle.outbox_refs) != 1
-                            or admission_jobs[0].graph_job_ref
-                            != bundle.persistent_job_refs[0]
-                            or set(admission_jobs[0].outbox_refs)
-                            != set(bundle.outbox_refs)):
-                        raise UnavailableGuard(
-                            "dispatch admission requires one D11 job and its outbox")
-
-                    d08_types = {spec.name: spec for spec in
-                                 GoalExecutionProvider().register_types()}
-                    linked = {write.key.type_name: write.value for write in writes
-                              if write.key.type_name in {
-                                  "d08.action_intent.v1", "d08.action_schema.v1",
-                                  "d08.communication_intent_grant.v1",
-                                  "d09.verified_segment_batch.v1",
-                              }}
-                    action = d08_types["d08.action_intent.v1"].validator(
-                        linked["d08.action_intent.v1"])
-                    admission_receipt = self._issue_dispatch_admission(
-                        db, bundle, guard_snapshots[0], candidate_evidence,
-                        action,
-                        d08_types["d08.action_schema.v1"].validator(
-                            linked["d08.action_schema.v1"]),
-                        d08_types["d08.communication_intent_grant.v1"].validator(
-                            linked["d08.communication_intent_grant.v1"]),
-                        linked["d09.verified_segment_batch.v1"],
-                        graph_receipt=graph_receipt, v2_write=v2_write,
-                        projection=dispatch_projections[0] if dispatch_projections else None,
-                        now_utc=dispatch_now(),
-                        clock_reading=dispatch_clock_reading,
-                        dispatch_scope=dispatch_admission_scope,
-                        dispatch_owner_guard=dispatch_admission_owner_guard,
-                        dispatch_current_effect=dispatch_admission_current_effect,
-                        dispatch_effect_snapshot=dispatch_admission_effect_snapshot,
-                        provisional_check_candidate=provisional_check_candidate,
-                        installed_final_check_reissuer=installed_final_check_reissuer,
+                prior = db.execute(
+                    "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                    "AND operation_id=?", namespace.as_tuple + (identity.operation_id,),
+                ).fetchone()
+                if prior is not None:
+                    if prior[0] != digest:
+                        raise EventConflict("operation ID reused with different bundle")
+                    return
+                if domain_production_issuance_v1 is not None:
+                    if d04_numeric_issuance_v3 is not None:
+                        raise AuthorityDenied("one bundle cannot carry two journal-advancing issuers")
+                    from .runtime.domain_production_commit_v1 import require_current_production_commit_v1
+                    require_current_production_commit_v1(domain_production_issuance_v1, self, db, bundle, v2_write)
+                elif identity.phase in {"prepare_internal_life_numeric_drive", "prepare_internal_life_interval_baseline", "adopt_internal_life_numeric_trace", "prepare_internal_life_numeric", "acquire_internal_life_numeric", "adopt_internal_life_numeric", "prepare_internal_life_numeric_context", "acquire_internal_life_content_v2", "acquire_internal_life_content", "prepare_internal_life_content", "encode_internal_life", "encode_structured_experience", "form_association", "record_host_lifecycle", "d11.offline_tick.prepare.v1", "adopt_offline_tick", "d11.life.prepare.v1", "prepare_life", "adopt_life", "prepare_source_note_action", "prepare_source_note_body", "prepare_life_project_context", "focus_life_project", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
+                    raise AuthorityDenied("installed internal experience requires its exact composite issuer")
+                if c02_terminal_recovery is not None:
+                    row = db.execute(
+                        "SELECT schema,bundle_digest,fence_attempt_id,bundle_json,"
+                        "evidence_json,quote_json,seal_json FROM "
+                        "graph_first_ingress_c02_candidates_v2 WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (identity.operation_id,),
+                    ).fetchone()
+                    witness = c02_terminal_recovery
+                    if (row is None or row[:5] != witness.sealed_candidate
+                            or row[3] != witness.bundle_json
+                            or row[5] != witness.quote_json
+                            or row[6] != canonical_serialize(asdict(witness.seal))
+                            or time.monotonic() >= witness.local_monotonic_deadline):
+                        raise UnavailableGuard("terminal C02 first seal changed; HOLD")
+                elif c02_adoption is not None:
+                    self._validate_first_ingress_c02_adoption_locked(
+                        db, bundle, c02_adoption, v2_write)
+                if attention_issuance is not None:
+                    from .domains.d07 import (
+                        AttentionTicket, FocusState,
                     )
-                    issued = load_request(
-                        db, namespace, admission_receipt.admission.admission_ref)
-                    outbox_writes = tuple(
-                        write for write in writes
-                        if write.key.type_name == "runtime.outbox")
-                    if (issued is None or issued[0] != admission_receipt
-                            or len(outbox_writes) != 1
-                            or outbox_writes[0].key.token != bundle.outbox_refs[0]):
-                        raise UnavailableGuard("dispatch outbox payload is unbound")
-                    request = issued[1]
-                    outbox = outbox_writes[0].value
-                    job = admission_jobs[0].job
-                    if (outbox.get("job_id") != job.job_id
-                            or outbox.get("job_ref")
-                            != admission_jobs[0].graph_job_ref
-                            or outbox.get("operation_id") != request.operation_id
-                            or outbox.get("effect_id") != request.effect_id
-                            or outbox.get("activity_id") != request.activity_id
-                            or (outbox.get("bot_id"), outbox.get("persona_id"))
-                            != namespace.as_tuple
-                            or outbox.get("payload_ref") != request.payload_ref
-                            or outbox.get("dispatch_generation")
-                            != request.dispatch_generation
-                            or outbox.get("phase") != "pending"):
-                        raise UnavailableGuard("dispatch outbox payload differs from request")
+                    from .domains.d07.post_c02_competition import (
+                        choose_post_c02_attention_v2,
+                    )
+                    from .runtime.d12_current_d07_policy_v1 import (
+                        read_current_d07_attention_policy_v1,
+                    )
+                    from .runtime.d07_current_competitor_v2 import (
+                        read_current_primary_competitor_in_transaction,
+                    )
+                    from .runtime.reply_model_job import (
+                        d07_attention_quote_id_v1,
+                        read_settled_c02_reply_source_v1,
+                        source_key_from_ref,
+                    )
+                    from .runtime.issuers import ResourceQuote
+                    from .runtime_contracts import VersionedRef
+
+                    installed, attention_now = attention_issuance
+                    admin = installed.d07_attention
+                    policy = installed.installation_policy
+                    source_ref = envelope.source_qualification.source_refs[0]
+                    source_id = source_key_from_ref(source_ref, namespace)
+                    c02_operation_id = envelope.causation[0]
+                    source_atom_key = source_key(*namespace.as_tuple, source_id)
+                    access_atom_key = access_key(*namespace.as_tuple, source_id)
+                    source_atoms = []
+                    for key in (source_atom_key, access_atom_key):
+                        row = read_graph_head_v3(db, key.token)
+                        if row is None:
+                            raise UnavailableGuard("D07 attention source is absent; HOLD")
+                        source_atoms.append(GraphAtom(
+                            key, row[0], json.loads(row[1]), bool(row[2])))
+                    c02_row = db.execute(
+                        "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                        "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                        "AND operation_id=?",
+                        namespace.as_tuple + (c02_operation_id,),
+                    ).fetchone()
+                    if c02_row is None:
+                        raise UnavailableGuard("D07 attention original C02 absent; HOLD")
+                    c02_event = db.execute(
+                        "SELECT reads,revisions,epoch_revision FROM graph_events "
+                        "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                        namespace.as_tuple + (c02_row[1], c02_operation_id),
+                    ).fetchone()
+                    if c02_event is None:
+                        raise UnavailableGuard("D07 attention C02 event absent; HOLD")
+                    c02_detail = json.loads(c02_row[4])
+                    c02_receipt = CommitReceipt(
+                        "committed", c02_operation_id, c02_row[0], c02_row[1],
+                        c02_row[2], c02_row[3],
+                        GraphStore._version_rows(c02_event[0]),
+                        GraphStore._version_rows(c02_event[1]),
+                        (NamespaceEpoch(*namespace.as_tuple, c02_event[2]),),
+                        tuple(c02_detail["ledger_refs"]),
+                        tuple(c02_detail["outbox_refs"]))
+                    current = read_settled_c02_reply_source_v1(
+                        db, self.__d02_issuer, namespace, c02_receipt, source_ref,
+                        GraphSnapshot(tuple(source_atoms), (v2_write[1],)))
+                    ticket_write = next(
+                        (write for write in writes if
+                         write.key.type_name == "d07.attention_ticket.v1"), None)
+                    focus_write = next(
+                        (write for write in writes if
+                         write.key.type_name == "d07.focus.v1"), None)
+                    if ticket_write is None or focus_write is None:
+                        raise AuthorityDenied("D07 attention writes are missing")
+                    quote_id = d07_attention_quote_id_v1(
+                        namespace, identity.operation_id)
+                    active_policy = read_current_d07_attention_policy_v1(
+                        db, namespace)
+                    guarded_versions = {
+                        item.key: item for item in envelope.version_guard.read_versions}
+                    if guarded_versions.get(active_policy.active_head_ref.key) != (
+                            active_policy.active_head_ref):
+                        raise AuthorityDenied("D07 active policy head is not guarded")
+                    focus_key = AtomKey(
+                        Owner("persona", *namespace.as_tuple),
+                        "d07.focus.v1", namespace.persona_id)
+                    prior_focus = read_graph_head_v3(db, focus_key.token)
+                    if prior_focus is None:
+                        current_focus = FocusState(
+                            namespace.persona_id, 0, None, (), "no_eligible_ticket")
+                    else:
+                        if prior_focus[2] != 1:
+                            raise AuthorityDenied("D07 current focus is invalid")
+                        prior_value = json.loads(prior_focus[1])
+                        prior_value.pop("schema", None)
+                        current_focus = FocusState(
+                            prior_value["persona_id"], prior_value["focus_epoch"],
+                            prior_value["primary_ticket_ref"],
+                            tuple(prior_value["auxiliary_ticket_refs"]),
+                            prior_value["switch_reason"],
+                        )
+                    competitor = read_current_primary_competitor_in_transaction(
+                        db, namespace, current_focus.primary_ticket_ref,
+                        now_utc=attention_now)
+                    for atom in competitor.atoms if competitor is not None else ():
+                        if guarded_versions.get(atom.key) != GraphVersion(
+                                atom.key, atom.revision):
+                            raise AuthorityDenied("D07 competitor closure is not guarded")
                     try:
-                        action_job_binding = bind_action_job(
-                            db, action, admission_receipt)
+                        ticket_value = dict(ticket_write.value)
+                        ticket_value.pop("schema", None)
+                        ticket_value["cancel_refs"] = tuple(ticket_value["cancel_refs"])
+                        ticket_value["source_refs"] = tuple(ticket_value["source_refs"])
+                        selected_ticket = AttentionTicket(**ticket_value)
+                        choice = choose_post_c02_attention_v2(
+                            current_focus, selected_ticket,
+                            competitor.ticket if competitor is not None else None,
+                            active_policy.policy, now=attention_now)
+                        expected_focus = choice.focus
+                        expected_focus = replace(
+                            expected_focus,
+                            primary_ticket_ref=(
+                                ticket_write.key.token
+                                if choice.selected_ticket_id == selected_ticket.ticket_id
+                                else competitor.ticket_version.key.token),
+                            auxiliary_ticket_refs=tuple(
+                                ticket_write.key.token if ticket_id == selected_ticket.ticket_id
+                                else competitor.ticket_version.key.token
+                                for ticket_id in expected_focus.auxiliary_ticket_refs),
+                        )
+                    except (TypeError, ValueError, KeyError) as exc:
+                        raise AuthorityDenied("D07 policy selection is unavailable") from exc
+                    if focus_write.value != {
+                            "schema": "d07.focus.v1", **asdict(expected_focus),
+                            "auxiliary_ticket_refs": list(
+                                expected_focus.auxiliary_ticket_refs)}:
+                        raise AuthorityDenied("D07 focus differs from adopted policy")
+                    grant = self.__d11_issuer.current_budget_grant(
+                        db, policy.root_lease.lease_id)
+                    budget = get_budget_lease(db, grant.lease_id)
+                    provision_row = self._provision_row(db, namespace)
+                    provision = (self._decode_provision_receipt(provision_row)
+                                 if provision_row is not None else None)
+                    if (v2_write is None or grant != policy.root_grant
+                            or provision is None
+                            or provision.installation_id != policy.installation_id
+                            or provision.root_grant_id != grant.grant_id
+                            or provision.root_lease_id != grant.lease_id
+                            or budget.state != "active"
+                            or "d07.attention" not in grant.allowed_work_kinds
+                            or identity.phase != "post_c02_attention"
+                            or identity.activity_id != c02_receipt.activity_id
+                            or current.source_qualification !=
+                               envelope.source_qualification
+                            or current.conversation_ref !=
+                               envelope.authority.audience[0]
+                            or envelope.parent_budget_lease_ref != grant.lease_id
+                            or ticket_write is None or focus_write is None
+                            or len(writes) != 2
+                            or ticket_write.value.get("causal_root") != source_ref
+                            or ticket_write.value.get("source_refs") != [source_ref]
+                            or ticket_write.value.get("category") != "interaction"
+                            or ticket_write.value.get("valid_until") !=
+                               envelope.deadline_utc
+                            or focus_write.value.get("primary_ticket_ref") !=
+                               expected_focus.primary_ticket_ref
+                            or not attention_now < envelope.deadline_utc
+                            or envelope.deadline_utc >
+                               attention_now + admin.deadline_after_seconds
+                            or envelope.version_guard.resource_lease_versions !=
+                               (VersionedRef(quote_id, 1),)
+                            or any(amount > grant.max_ceiling.get(name, 0)
+                                   or amount > budget.available(name)
+                                   for name, amount in admin.quote_ceiling.items())):
+                        raise AuthorityDenied("D07 attention signed issuance differs")
+                    quote = ResourceQuote(
+                        quote_id, 1, *namespace.as_tuple, identity.activity_id,
+                        identity.operation_id, None, grant.lease_id,
+                        "d07.attention", admin.snapshot_ref,
+                        envelope.deadline_utc, admin.resource_ref, None,
+                        (), (), dict(admin.quote_ceiling), None,
+                        envelope.deadline_utc)
+                    self.__d02_issuer.issue_quote(db, quote)
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote_id, "1"),
+                    )
+                    db.execute("""CREATE TABLE IF NOT EXISTS graph_d07_attention_issuance_v1(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL, c02_operation_id TEXT NOT NULL,
+                        source_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
+                        policy_digest TEXT NOT NULL, bundle_digest TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute(
+                        "INSERT INTO graph_d07_attention_issuance_v1"
+                        "(bot,persona,operation_id,c02_operation_id,source_ref,"
+                        "quote_id,policy_digest,bundle_digest) VALUES(?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (identity.operation_id,
+                        c02_operation_id, source_ref, quote_id,
+                        canonical_digest({
+                            "deadline_after_seconds": admin.deadline_after_seconds,
+                            "quote_ceiling": dict(admin.quote_ceiling),
+                            "snapshot_ref": admin.snapshot_ref,
+                            "resource_ref": admin.resource_ref,
+                        }), digest),
+                    )
+                    db.execute("""CREATE TABLE IF NOT EXISTS graph_d07_attention_decisions_v2(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        c02_operation_id TEXT NOT NULL, attention_operation_id TEXT NOT NULL,
+                        inbound_ticket_ref TEXT NOT NULL, selected_ticket_ref TEXT NOT NULL,
+                        inbound_deferred INTEGER NOT NULL CHECK(inbound_deferred IN (0,1)),
+                        wake_at REAL, bundle_digest TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,c02_operation_id),
+                        UNIQUE(bot,persona,attention_operation_id))""")
+                    db.execute("""CREATE TRIGGER IF NOT EXISTS graph_d07_attention_decisions_no_update_v2
+                        BEFORE UPDATE ON graph_d07_attention_decisions_v2
+                        BEGIN SELECT RAISE(ABORT, 'D07 decision is immutable'); END""")
+                    db.execute("""CREATE TRIGGER IF NOT EXISTS graph_d07_attention_decisions_no_delete_v2
+                        BEFORE DELETE ON graph_d07_attention_decisions_v2
+                        BEGIN SELECT RAISE(ABORT, 'D07 decision is immutable'); END""")
+                    db.execute(
+                        "INSERT INTO graph_d07_attention_decisions_v2 VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            c02_operation_id, identity.operation_id,
+                            ticket_write.key.token, expected_focus.primary_ticket_ref,
+                            int(choice.inbound_deferred), choice.wake_at, digest),
+                    )
+                if arrival_issuance is not None:
+                    admin_policy, installation_id, arrival_now, source_ref, policy_digest = (
+                        arrival_issuance)
+                    if (v2_write is None or len(bundle.proposals) != 1
+                            or bundle.proposals[0].domain != "d03"
+                            or bundle.persistent_job_refs or bundle.outbox_refs
+                            or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
+                            or envelope.source_qualification.source_refs
+                            != (source_key(*namespace.as_tuple, source_ref).token,)
+                            or policy_digest != canonical_digest(
+                                admin_policy.digest_payload())):
+                        raise AuthorityDenied("D03 arrival issuance identity differs")
+                    pre_quote = replace(envelope, version_guard=replace(
+                        envelope.version_guard, resource_lease_versions=()))
+                    quote = self.__d11_issuer.issue_d03_arrival_quote(
+                        db, pre_quote, admin_policy,
+                        installation_id=installation_id, now_utc=arrival_now)
+                    refs = envelope.version_guard.resource_lease_versions
+                    if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                            quote.quote_id, quote.version):
+                        raise AuthorityDenied("D03 arrival quote guard differs")
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                              str(quote.version)),
+                    )
+                    db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_arrival_issuance_v2(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+                        quote_id TEXT NOT NULL, policy_digest TEXT NOT NULL,
+                        bundle_digest TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute(
+                        "INSERT INTO graph_d03_arrival_issuance_v2"
+                        "(bot,persona,operation_id,source_ref,quote_id,policy_digest,bundle_digest) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (identity.operation_id, source_ref,
+                                              quote.quote_id, policy_digest, digest),
+                    )
+                if correction_issuance is not None:
+                    admin_policy, installation_id, correction_now, request, pre_quote, planned = (
+                        correction_issuance[:6])
+                    if (v2_write is None or identity.phase != "source-correction"
+                            or tuple(item.domain for item in bundle.proposals)
+                            not in {("d06", "d07", "d11"), ("d06", "d11")}
+                            or bundle.persistent_job_refs != (planned.graph_job_ref,)
+                            or bundle.outbox_refs != planned.outbox_refs
+                            or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                        raise AuthorityDenied("source correction bundle identity differs")
+                    quote = self.__d11_issuer.issue_d06_source_correction_quote(
+                        db, pre_quote, admin_policy, request,
+                        installation_id=installation_id, now_utc=correction_now,
+                        planned_quote=planned)
+                    refs = envelope.version_guard.resource_lease_versions
+                    if (quote != planned or len(refs) != 1
+                            or (refs[0].ref, refs[0].version)
+                            != (quote.quote_id, quote.version)):
+                        raise AuthorityDenied("source correction quote plan changed")
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                              str(quote.version)),
+                    )
+                if baseline_issuance is not None:
+                    (admin_policy, installation_id, baseline_now, source_ref,
+                     event_ref, job_id, installation_policy,
+                     original_operation_id, _retry) = baseline_issuance
+                    if (v2_write is None or len(bundle.proposals) != 1
+                            or bundle.proposals[0].domain != "d04"
+                            or envelope.input_refs != (source_ref, event_ref)
+                            or bundle.persistent_job_refs or bundle.outbox_refs
+                            or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
+                            or qualified_self is None
+                            or installation_policy.installation_id != installation_id):
+                        raise AuthorityDenied("D04 baseline stage identity differs")
+                    baseline_write = bundle.proposals[0].typed_writes[0]
+                    perspective_key = AtomKey.from_token(
+                        baseline_write.value["perspective_ref"])
+                    perspective_row = db.execute(
+                        "SELECT value,valid FROM graph_atoms WHERE token=?",
+                        (perspective_key.token,),
+                    ).fetchone()
+                    if (perspective_key.type_name != "d03.self_perspective.v1"
+                            or perspective_row is None or perspective_row[1] != 1):
+                        raise UnavailableGuard("D04 baseline lacks current self perspective; HOLD")
+                    mapping_key = AtomKey.from_token(
+                        json.loads(perspective_row[0])["identity_mapping_ref"])
+                    mapping_row = db.execute(
+                        "SELECT value,valid FROM graph_atoms WHERE token=?",
+                        (mapping_key.token,),
+                    ).fetchone()
+                    if (mapping_row is None or mapping_row[1] != 1
+                            or json.loads(mapping_row[0]) != asdict(qualified_self[1])):
+                        raise UnavailableGuard("D04 baseline current Authority self differs; HOLD")
+                    job, _, _, outbox, _, _, source_version, access_version = (
+                        self._first_ingress_encoding_job_locked(namespace, job_id))
+                    if (job.operation_id != original_operation_id
+                            or job.phase != "queued" or job.cancel_epoch != 0
+                            or job.fence != 0 or job.lease_holder is not None
+                            or source_version.key.token != source_ref
+                            or outbox.payload_ref != source_version.key.owner.subject
+                            or source_version not in envelope.version_guard.read_versions
+                            or access_version not in envelope.version_guard.read_versions):
+                        raise UnavailableGuard("D04 baseline job/source changed; HOLD")
+                    pre_quote = replace(envelope, version_guard=replace(
+                        envelope.version_guard, resource_lease_versions=()))
+                    quote = self.__d11_issuer.issue_d04_baseline_quote(
+                        db, pre_quote, admin_policy,
+                        installation_id=installation_id, now_utc=baseline_now)
+                    refs = envelope.version_guard.resource_lease_versions
+                    if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                            quote.quote_id, quote.version):
+                        raise AuthorityDenied("D04 baseline quote guard differs")
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                              str(quote.version)),
+                    )
+                    db.execute("""CREATE TABLE IF NOT EXISTS graph_d04_baseline_issuance_v1(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+                        event_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
+                        bundle_digest TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute(
+                        "INSERT INTO graph_d04_baseline_issuance_v1"
+                        "(bot,persona,operation_id,source_ref,event_ref,quote_id,bundle_digest) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (identity.operation_id, source_ref,
+                                              event_ref, quote.quote_id, digest),
+                    )
+                if self_identity_issuance is not None:
+                    (installation_policy, admin_policy, installation_id, stage_now,
+                     source_ref, candidate, job_id, original_operation_id, _retry) = (
+                        self_identity_issuance)
+                    if (v2_write is None or qualified_self is None
+                            or len(bundle.proposals) != 1
+                            or bundle.proposals[0].domain != "d03"
+                            or envelope.identity.phase != "d03.self_identity_projection"
+                            or envelope.input_refs != (source_ref,)
+                            or bundle.persistent_job_refs or bundle.outbox_refs
+                            or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                        raise AuthorityDenied("D03 self projection issuance identity differs")
+                    role, qualified_mapping, current_self = qualified_self
+                    expected_metadata, expected_epoch = v2_write[:2]
+                    if (qualified_mapping != candidate
+                            or current_self.graph_revision != expected_metadata.graph_revision
+                            or current_self.graph_epoch != expected_epoch.revision
+                            or installation_policy.installation_id != installation_id):
+                        raise UnavailableGuard("D03 current self proof changed; HOLD")
+                    job, _, _, _, _, _, source_version, access_version = (
+                        self._first_ingress_encoding_job_locked(namespace, job_id))
+                    if (job.operation_id != original_operation_id or job.phase != "queued"
+                            or job.cancel_epoch != 0 or job.fence != 0
+                            or job.lease_holder is not None
+                            or source_version.key.token != source_ref
+                            or source_version not in envelope.version_guard.read_versions
+                            or access_version not in envelope.version_guard.read_versions):
+                        raise UnavailableGuard("D03 self projection job/source changed; HOLD")
+                    pre_quote = replace(envelope, version_guard=replace(
+                        envelope.version_guard, resource_lease_versions=()))
+                    quote = self.__d11_issuer.issue_d03_self_identity_projection_quote(
+                        db, pre_quote, admin_policy, installation_id=installation_id,
+                        qualified_mapping=qualified_mapping, now_utc=stage_now)
+                    refs = envelope.version_guard.resource_lease_versions
+                    if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                            quote.quote_id, quote.version):
+                        raise AuthorityDenied("D03 self projection quote guard differs")
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                              str(quote.version)),
+                    )
+                    db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_self_projection_issuance_v1(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+                        certification_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
+                        bundle_digest TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute(
+                        "INSERT INTO graph_d03_self_projection_issuance_v1"
+                        "(bot,persona,operation_id,source_ref,certification_ref,quote_id,bundle_digest) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (identity.operation_id, source_ref,
+                                              qualified_mapping.certification_ref,
+                                              quote.quote_id, digest),
+                    )
+                if c02_adoption is not None:
+                    witness = c02_adoption[0]
+                    if isinstance(witness, _C02TerminalRecovery):
+                        request = witness.seal.original_key
+                        installation = admin = None
+                        stage_now = witness.now
+                    elif isinstance(witness, _C02PendingRecovery):
+                        from .runtime.first_ingress_v2 import trusted_upper
+
+                        request = witness.request
+                        installation, admin, stage_now = (
+                            witness.installation, witness.admin,
+                            trusted_upper(witness.clock_reading))
+                    else:
+                        _, read, _, _, installation, admin, stage_now = witness
+                        request = read.request
+                    if c02_first_seal_quote is None:
+                        if c02_terminal_recovery is not None:
+                            raise UnavailableGuard("terminal C02 original signed quote absent; HOLD")
+                        pre_quote = replace(envelope, version_guard=replace(
+                            envelope.version_guard, resource_lease_versions=()))
+                        quote = self.__d11_issuer.issue_d06_first_ingress_c02_quote(
+                            db, pre_quote, admin,
+                            installation_id=installation.installation_id,
+                            job_id=request.job_id, now_utc=stage_now)
+                    else:
+                        quote = c02_first_seal_quote
+                    refs = envelope.version_guard.resource_lease_versions
+                    if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                            quote.quote_id, quote.version):
+                        raise AuthorityDenied("C02 signed quote guard differs")
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                              str(quote.version)),
+                    )
+                snapshot = self._check_guard(
+                    db, bundle, ingress_deadline_check=ingress_deadline_check,
+                    scene_owner_guard=scene_owner_guard,
+                    domain_production_issuance_v1=domain_production_issuance_v1)
+                if c04_adoption_issuance_v3 is not None:
+                    from .runtime.c04_adoption_plan_v3 import build_c04_adoption_plan_v3
+                    terminal_proof, terminal_verified = c04_adoption_issuance_v3
+                    plan = build_c04_adoption_plan_v3(
+                        db, namespace=namespace, operation_id=identity.operation_id,
+                        proof=terminal_proof, verified=terminal_verified, bundle=bundle,
+                        installation_id=self.__d04_installed_joint_assembly.installation_policy.installation_id,
+                        manifest_digest=self.__d04_installed_joint_assembly.installation_policy.manifest_digest)
+                    if (self.__c04_algorithm_build_digest is None
+                            or plan.algorithm_build_digest != "sha256:" + self.__c04_algorithm_build_digest):
+                        raise UnavailableGuard("C04 V3 installed algorithm changed; HOLD")
+                    c04_adoption_plans_v3.append(plan)
+                if c04_association_issuance is not None:
+                    from .domains.d06.current_c04_association_preflight import (
+                        preflight_current_c04_association_v1,
+                    )
+                    from .runtime.d06_atomic_association_v2 import (
+                        read_atomic_association_v2,
+                    )
+
+                    (c04_candidate, ticket, candidates, focus_snapshot,
+                     originals, budget, context_tags, c04_now) = c04_association_issuance
+                    atomic = read_atomic_association_v2(
+                        db, c04_candidate, ticket=ticket,
+                        focus_snapshot=focus_snapshot, namespace=namespace,
+                        now=c04_now, audience=envelope.authority.audience[0],
+                        purpose=envelope.authority.purpose, budget=budget,
+                        context_tags=context_tags)
+                    for atom in atomic.current_snapshot.atoms:
+                        if snapshot.get(atom.key) != atom:
+                            raise StaleRead("C04 association is outside the guarded snapshot")
+                    checked = preflight_current_c04_association_v1(
+                        c04_candidate, ticket=ticket, candidates=candidates,
+                        associations=atomic.associations,
+                        current_snapshot=snapshot, namespace=namespace,
+                        envelope=envelope, originals=originals,
+                        now=c04_now, audience=envelope.authority.audience[0],
+                        purpose=envelope.authority.purpose)
+                    if (checked.bundle_candidate != bundle
+                            or not set(checked.read_versions).issubset(
+                                snapshot.versions)):
+                        raise StaleRead("C04 atomic bundle or association reads differ")
+                if dispatch_candidate is not None and self.__dispatch_admission_issuer is not None:
+                    from .runtime.dispatch_current_projection import (
+                        read_current_dispatch_projection,
+                    )
+
+                    if len(envelope.version_guard.query_epochs) != 1:
+                        raise UnavailableGuard("dispatch admission needs one full graph query")
+                    try:
+                        dispatch_projections.append(read_current_dispatch_projection(
+                            db, namespace, snapshot, envelope.version_guard.query_epochs[0],
+                        ))
                     except ValueError as exc:
                         raise UnavailableGuard(
-                            "dispatch action/attempt lacks an exact D11 job binding") from exc
-                    cancel_writes = tuple(
-                        (proposal.domain, write)
-                        for proposal in bundle.proposals
-                        for write in proposal.typed_writes
-                        if write.key.type_name == "d08.action_cancellation.v1"
-                    )
-                    expected_cancel = ActionCancellationState.for_action(
-                        action, state="active", actor=envelope.authority.actor,
-                        source_refs=envelope.source_qualification.source_refs,
-                        operation_id=identity.operation_id,
-                    )
-                    cancel_key = AtomKey(
-                        Owner("activity", *namespace.as_tuple, identity.activity_id),
-                        "d08.action_cancellation.v1", action.action_id,
-                    )
-                    if (len(cancel_writes) != 1
-                            or cancel_writes[0][0] != "d08"
-                            or cancel_writes[0][1].key != cancel_key
-                            or cancel_writes[0][1].value != json.loads(
-                                canonical_serialize(asdict(expected_cancel)))
-                            or tuple(ref.revision for ref in
-                                     envelope.version_guard.read_versions
-                                     if ref.key == cancel_key) != (0,)
-                            or tuple(ref.revision for ref in graph_receipt.revisions
-                                     if ref.key == cancel_key) != (1,)
-                            or (admission_receipt.admission.action_ref,
-                                admission_receipt.admission.attempt_id,
-                                admission_receipt.admission.operation_id) != (
-                                    action.action_id, identity.attempt_id,
-                                    identity.operation_id)
-                            or (action_job_binding.action_id,
-                                action_job_binding.attempt_id,
-                                action_job_binding.operation_id) != (
-                                    action.action_id, identity.attempt_id,
-                                    identity.operation_id)):
-                        raise UnavailableGuard(
-                            "dispatch admission lacks same-commit D08 active cancellation head")
+                            "dispatch D03/D05 graph projection is incomplete") from exc
+                guard_snapshots.append(snapshot)
+                if type(bundle.product_advance) is ProductAdvanceEvidenceV2:
+                    joint_product_advances.append(self._check_joint_product_advance_v2(
+                        db, bundle, snapshot, writes, d04_joint_replay,
+                        d04_joint_output, v2_write, authored_topology_verifier=d04_topology_verifier,
+                        numeric_issuance=d04_numeric_issuance_v3))
+                else:
+                    product_advance = self._check_product_advance(db, bundle, snapshot, writes)
+                    if product_advance is not None:
+                        product_advances.append(product_advance)
+                for source in envelope.source_qualification.source_refs:
+                    key = self._parse_ref(source, namespace)
+                    if key in new_sources:
+                        continue
+                    atom = snapshot.get(key)
+                    access = snapshot.get(access_key(*namespace.as_tuple,
+                                                     key.owner.subject or ""))
+                    if atom is None or not atom.valid or access is None or not access.valid:
+                        raise StaleRead("source or access is absent or invalid")
+                    if (access.value.get("status") != "active"
+                            or access.value.get("source_id") != key.owner.subject
+                            or not set(envelope.authority.audience).issubset(
+                                access.value.get("audiences", ()))
+                            or envelope.authority.purpose not in access.value.get("purposes", ())):
+                        raise AuthorityDenied("source access no longer covers this use")
+                if (type(dispatch_candidate) is DispatchCandidateEvidenceV1
+                        and len(envelope.version_guard.query_epochs) == 1
+                        and envelope.version_guard.query_epochs[0].scope_ref == "all"):
+                    from .domains.d08 import GoalExecutionProvider
+
+                    action_write = next(write for write in writes
+                                        if write.key.type_name == "d08.action_intent.v1")
+                    action = next(spec for spec in GoalExecutionProvider().register_types()
+                                  if spec.name == "d08.action_intent.v1").validator(
+                                      action_write.value)
+                    qualified_dispatch_candidates.append(qualify_dispatch_candidate_sources(
+                        dispatch_candidate, action, snapshot,
+                        audience=envelope.authority.audience,
+                        batch_audiences=tuple(next(write.value["audiences"] for write in writes
+                                                   if write.key.type_name ==
+                                                   "d09.verified_segment_batch.v1")),
+                        current_barrier_confirmed=True,
+                        valid_until=next(write.value["valid_until"] for write in writes
+                                         if write.key.type_name == "d09.verified_segment_batch.v1"),
+                    ))
+                for proposal in bundle.proposals:
+                    if domain_production_issuance_v1 is not None:
+                        from .runtime.d11_artifact_draft_model_v1 import ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, validate_artifact_draft_model_proposal_v1
+                        from .runtime.d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, validate_artifact_draft_content_job_proposal_v1
+                        from .runtime.domain_production_commit_v1 import _ProductionCommitWitnessV1
+                        concrete = (domain_production_issuance_v1.stage
+                            if type(domain_production_issuance_v1) is _ProductionCommitWitnessV1 else None)
+                        if type(concrete) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2}:
+                            validate_artifact_draft_model_proposal_v1(proposal, snapshot, concrete)
+                        elif type(concrete) in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2} and proposal.domain == "d11":
+                            validate_artifact_draft_content_job_proposal_v1(proposal, snapshot, concrete)
+                        # Exact installed operation was independently rebuilt and
+                        # bound to this Graph, permit, policies and complete bundle.
+                        continue
+                    if (d04_numeric_issuance_v3 is not None and proposal.domain == "d04"
+                            and type(bundle.product_advance) is ProductAdvanceEvidenceV2):
+                        # The installed output issuer + complete current joint
+                        # preflight above is the dedicated D11 adoption route.
+                        # The generic D04 proposal validator intentionally rejects
+                        # committed numeric states from ordinary callers.
+                        continue
+                    if self_identity_issuance is not None:
+                        from .domains.d03.self_perspective import (
+                            validate_self_identity_projection_snapshot,
+                        )
+
+                        validate_self_identity_projection_snapshot(
+                            proposal, snapshot, qualified_self[0], qualified_self[1])
+                    else:
+                        if c02_adoption is not None and proposal.domain == "d11":
+                            from .runtime.d11_types import validate_d11_writes
+
+                            validate_d11_writes(
+                                proposal.typed_writes, namespace,
+                                operation_id=(c02_terminal_recovery.seal.original_key.original_operation_id
+                                              if c02_terminal_recovery is not None else
+                                              c02_adoption[0].request.original_operation_id
+                                              if isinstance(c02_adoption[0], _C02PendingRecovery)
+                                              else c02_adoption[0][2].budget_reservation_operation_id),
+                                activity_id=identity.activity_id,
+                                effect_id=identity.effect_id)
+                            continue
+                        provider = self.__providers[proposal.domain][0]
+                        # Providers may return approval or the exact unchanged proposal.
+                        # A transformed candidate would need its own validation pass.
+                        from .runtime.d06_internal_life_episode_v2 import KINDS as internal_life_kinds, require_exact_internal_life_issuance_v2, validate_internal_life_proposal_v2
+                        if proposal.envelope.identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+                            from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_task_issuance_v1
+                            actual = require_exact_life_numeric_task_issuance_v1(domain_production_issuance_v1, self, bundle)
+                            if proposal.envelope.identity.phase == 'acquire_internal_life_numeric':
+                                from .runtime.d06_life_numeric_worker_v1 import validate_life_numeric_acquisition_proposal_v1
+                                validated = validate_life_numeric_acquisition_proposal_v1(proposal, snapshot, actual.stage.binding)
+                            else:
+                                # Same-transaction issuer rederived the actual paid Appraisal and completed job.
+                                if proposal not in (*actual.stage.stage.proposals, actual.stage.job_proposal):
+                                    raise AuthorityDenied('numeric appraisal proposal differs from actual reissued members')
+                                validated = proposal
+                        elif proposal.envelope.identity.phase in {'prepare_internal_life_numeric_drive', 'adopt_internal_life_numeric_trace'}:
+                            from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_math_issuance_v1
+                            require_exact_life_numeric_math_issuance_v1(domain_production_issuance_v1, self, bundle)
+                            if proposal.envelope.identity.phase == 'prepare_internal_life_numeric_drive':
+                                from .runtime.d06_life_numeric_drive_v1 import validate_life_numeric_drive_proposal_v1 as numeric_validate
+                            else:
+                                from .runtime.d06_life_numeric_trace_v1 import validate_life_numeric_trace_proposal_v1 as numeric_validate
+                            validated = numeric_validate(proposal, snapshot)
+                        elif proposal.envelope.identity.phase == 'prepare_internal_life_numeric_context':
+                            from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
+                            from .runtime.d06_life_numeric_context_v1 import validate_life_numeric_context_proposal_v1
+                            require_exact_life_numeric_context_issuance_v1(domain_production_issuance_v1, self, bundle)
+                            validated = validate_life_numeric_context_proposal_v1(proposal, snapshot)
+                        elif proposal.envelope.identity.phase == 'adopt_internal_life_content_v1':
+                            from .runtime.internal_life_content_adoption_v1 import require_exact_content_issuance_v1,validate_content_proposal_v1
+                            require_exact_content_issuance_v1(domain_production_issuance_v1,self,bundle)
+                            validated=validate_content_proposal_v1(proposal,snapshot)
+                        elif proposal.envelope.identity.phase == "acquire_internal_life_content_v2":
+                            from .runtime.internal_life_content_worker_v2 import require_exact_internal_life_acquisition_issuance_v2,validate_internal_life_acquisition_proposal_v2
+                            actual_worker=require_exact_internal_life_acquisition_issuance_v2(domain_production_issuance_v1,self,bundle)
+                            validated=validate_internal_life_acquisition_proposal_v2(proposal,snapshot,actual_worker.stage.frame.binding)
+                        elif proposal.envelope.identity.phase == "acquire_internal_life_content":
+                            from .runtime.internal_life_content_worker_v1 import require_exact_internal_life_acquisition_issuance_v1,validate_internal_life_acquisition_proposal_v1
+                            require_exact_internal_life_acquisition_issuance_v1(domain_production_issuance_v1,self,bundle)
+                            validated = validate_internal_life_acquisition_proposal_v1(proposal,snapshot)
+                        elif any(write.key.type_name in internal_life_kinds for write in proposal.typed_writes):
+                            require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
+                            validated = validate_internal_life_proposal_v2(proposal, snapshot)
+                        else:
+                            validated = provider.validate(proposal, snapshot)
+                        if validated is not True and validated != proposal:
+                            raise AuthorityDenied("domain validation did not approve proposal")
+                if (c04_adoption_issuance_v3 is None and d04_numeric_issuance_v3 is None
+                        and domain_production_issuance_v1 is None):
+                    runtime_admissions.append(self._admit_runtime_bundle(
+                    db, bundle, now_utc=dispatch_now(),
+                    require_arrival_quote=arrival_issuance is not None,
+                    c02_terminal_recovery=c02_terminal_recovery,
+                    c02_terminal_bundle_json=(c02_terminal_recovery.bundle_json
+                                              if c02_terminal_recovery is not None else None),
+                    c02_terminal_quote_json=(c02_terminal_recovery.quote_json
+                                             if c02_terminal_recovery is not None else None)))
+                if c02_adoption is not None:
+                    from .runtime.d11_types import job_graph_write
+
+                    result_ref = bundle.proposals[1].typed_writes[0].value["result_ref"]
+                    if c02_terminal_recovery is None:
+                        from .runtime.jobs import transition_job
+
+                        completed = transition_job(
+                            db, (c02_adoption[0].request.job_id
+                                 if isinstance(c02_adoption[0], _C02PendingRecovery)
+                                 else c02_adoption[0][1].request.job_id),
+                            envelope.authority.actor, envelope.authority.worker_fence,
+                            target_phase="completed", result_ref=result_ref)
+                    else:
+                        from .runtime.c02_terminal_job import (
+                            complete_original_c02_job_in_transaction,
+                        )
+
+                        witness = c02_terminal_recovery
+                        completed = complete_original_c02_job_in_transaction(
+                            db, original=witness.original, seal=witness.seal,
+                            pinned_read=witness.pinned_read,
+                            consumer_operation_id=identity.operation_id,
+                            result_ref=result_ref, now_utc=now_utc,
+                            current_gate=lambda conn, job, seal, fact:
+                                self._validate_first_ingress_c02_terminal_locked(
+                                    conn, bundle, witness, job, seal, fact, v2_write))
+                    if job_graph_write(completed) != bundle.proposals[1].typed_writes[0]:
+                        raise UnavailableGuard("C02 job transition differs from graph write")
+                if domain_production_issuance_v1 is not None:
+                    from .runtime.domain_production_commit_v1 import apply_foreground_cycle_before_graph_write_v1
+                    apply_foreground_cycle_before_graph_write_v1(domain_production_issuance_v1, self, db)
+                for proposal in bundle.proposals:
+                    for write in proposal.typed_writes:
+                        if write.key.type_name.startswith("runtime."):
+                            if proposal.domain != "d11":
+                                raise AuthorityDenied("runtime graph write requires D11")
+                            reconcile_runtime_write(db, write)
+
+            def receipt_hook(db, graph_receipt):
+                from .runtime.first_ingress_v2 import trusted_upper
+
+                if c02_adoption is not None and isinstance(
+                        c02_adoption[0], (_C02PendingRecovery, _C02TerminalRecovery)):
+                    if (trusted_upper(c02_adoption[0].clock_reading)
+                            >= envelope.deadline_utc
+                            or time.monotonic()
+                            >= c02_adoption[0].local_monotonic_deadline):
+                        raise UnavailableGuard("pending C02 deadline expired before commit")
+                prior = db.execute(
+                    "SELECT digest,receipt_json FROM graph_bundle_operations WHERE bot=? "
+                    "AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (identity.operation_id,),
+                ).fetchone()
+                if prior:
+                    if prior[0] != digest:
+                        raise EventConflict("operation ID reused with different bundle")
+                    if graph_receipt.status != "duplicate":
+                        raise EventConflict("operation ledger and graph event disagree")
+                    data = json.loads(prior[1])
+                    # Stored receipt is reconstructed from current canonical graph
+                    # event data; no caller-supplied status can mark a duplicate.
+                    result.append(CommitReceipt(
+                        "duplicate", identity.operation_id, digest,
+                        identity.activity_id, identity.effect_id, data["commit_seq"],
+                        envelope.version_guard.read_versions,
+                        graph_receipt.revisions, (graph_receipt.epoch,),
+                        tuple(data["ledger_refs"]), tuple(data["outbox_refs"]),
+                    ))
+                    return
+                if graph_receipt.status != "committed":
+                    raise EventConflict("graph event exists without bundle operation ledger")
+                if identity.phase == "ingress" and not envelope.version_guard.query_epochs:
+                    # This runs after graph writes but before SQLite COMMIT.  The
+                    # sealed four-key exception must still hold, and the current
+                    # process clock may have advanced during provider validation.
+                    if v2_write is not None:
+                        expected, expected_epoch = v2_write[:2]
+                        current_metadata, current_epoch = self._v2_graph_stamp(namespace)
+                        if (current_metadata != expected
+                                or current_epoch != graph_receipt.epoch
+                                or current_epoch.revision != expected_epoch.revision + 1):
+                            raise StaleRead("v2 graph recovery stamp changed")
+                    elif not v2_read:
+                        self._admit_content(
+                            namespace, envelope.authority.activation_generation, "write",
+                            tuple(item.key.token for item in envelope.version_guard.read_versions)
+                            + tuple(write.key.token for write in writes),
+                        )
+                    if self._version(db, namespace, "activation", "current") != str(
+                            envelope.authority.activation_generation):
+                        raise StaleRead("ingress activation generation changed before commit")
+                    epoch_row = db.execute(
+                        "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone() or (0, 0)
+                    if tuple(epoch_row) != (
+                            envelope.version_guard.access_epoch,
+                            envelope.version_guard.delete_epoch):
+                        raise StaleRead("ingress access or deletion epoch changed before commit")
+                    if not self._exact_ingress_without_query(
+                            db, bundle, deadline_check=ingress_deadline_check):
+                        raise UnavailableGuard("sealed ingress authority changed before commit")
+                seq_row = db.execute(
+                    "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?",
+                    namespace.as_tuple,
+                ).fetchone()
+                seq = (seq_row[0] if seq_row else 0) + 1
+                db.execute(
+                    "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) VALUES(?,?,?) "
+                    "ON CONFLICT(bot,persona) DO UPDATE SET last_seq=excluded.last_seq",
+                    namespace.as_tuple + (seq,),
+                )
+                ledger_refs = tuple(ref for kind, refs in part_refs if kind not in {"outbox"}
+                                    for ref in refs)
+                data = {"commit_seq": seq, "ledger_refs": list(ledger_refs),
+                        "outbox_refs": list(bundle.outbox_refs)}
+                if c02_adoption is not None:
+                    witness = c02_adoption[0]
+                    observation_digest = (witness.evidence["observation_digest"]
+                                          if isinstance(witness, (_C02PendingRecovery,
+                                                                  _C02TerminalRecovery))
+                                          else witness[3].observation_digest)
+                    result_digest = (witness.evidence["result_payload_digest"]
+                                     if isinstance(witness, (_C02PendingRecovery,
+                                                             _C02TerminalRecovery))
+                                     else witness[3].result_digest)
+                    if c02_terminal_recovery is None:
+                        fact = c02_adoption[1]
+                        data["first_ingress_c02"] = {
+                            "read_request_digest": fact.read_request_digest,
+                            "read_result_digest": fact.result_digest,
+                            "original_intent_digest": fact.original_intent_digest,
+                            "terminal_receipt_digest": canonical_digest(
+                                asdict(fact.terminal_receipt)),
+                            "observation_digest": observation_digest,
+                            "result_digest": result_digest,
+                        }
+                        if c02_first_seal_quote is not None:
+                            # The signed presealed quote selects the v2 candidate
+                            # table, whose exact schema is checked before adoption.
+                            data["first_ingress_c02"]["seal_schema"] = (
+                                "sylanne.first-ingress-c02-candidate.v2")
+                    else:
+                        fact = c02_terminal_recovery.pinned_read.fact
+                        data["first_ingress_c02"] = {
+                            "seal_schema": c02_terminal_recovery.seal.schema,
+                            "read_request_digest": canonical_digest(
+                                c02_terminal_recovery.evidence["read_request"]),
+                            "read_result_digest": c02_terminal_recovery.evidence["read_result_digest"],
+                            "terminal_read_request_digest": fact.request.digest,
+                            "terminal_read_fact_digest": fact.digest,
+                            "original_key_digest": c02_terminal_recovery.seal.original_key.digest,
+                            "signed_quote_digest": c02_terminal_recovery.seal.quote_digest,
+                            "terminal_read_attempt_id": fact.request.read_attempt_id,
+                            "original_intent_digest": c02_terminal_recovery.seal.original_key.original_intent_digest,
+                            "terminal_receipt_digest": c02_terminal_recovery.seal.original_key.terminal_receipt_digest,
+                            "observation_digest": observation_digest,
+                            "result_digest": result_digest,
+                        }
+                if type(dispatch_candidate) in (ContactDispatchCandidateEvidenceV1,ContactDispatchCandidateEvidenceV2,ContactDispatchCandidateEvidenceV3):
+                    from .runtime.contact_final_stage_v1 import seal_contact_final_admission_v1
+                    from .runtime.contact_final_stage_v2 import seal_contact_final_admission_v2
+                    from .runtime.contact_final_stage_v3 import seal_contact_final_admission_v3
+                    seal_contact = seal_contact_final_admission_v3 if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV3 else seal_contact_final_admission_v2 if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV2 else seal_contact_final_admission_v1
+                    admission_receipt, request, runtime_admission, binding = seal_contact(
+                        domain_production_issuance_v1, self, db, graph_receipt, dispatch_candidate)
+                    if (load_request(db, namespace, admission_receipt.admission.admission_ref)
+                            != (admission_receipt, request)
+                            or request.proactive_contact is not True or request.segment_index != 0
+                            or (request.operation_id, request.effect_id, request.payload_digest) != (
+                                identity.operation_id, identity.effect_id, dispatch_candidate.payload_digest)):
+                        raise UnavailableGuard("Contact final actual admission/request differs")
+                    runtime_admissions.append(runtime_admission)
+                    versions = {v.key.token:v.revision for v in graph_receipt.revisions}
+                    refs = (dispatch_candidate.action_ref, dispatch_candidate.schema_ref,
+                            dispatch_candidate.grant_ref, dispatch_candidate.batch_ref)
+                    if any(versions.get(ref) != 1 for ref in refs):
+                        raise UnavailableGuard("Contact final four-join actual receipt differs")
+                    data["contact_dispatch_candidate"] = {
+                        "schema":"sylanne.d11.contact_dispatch_candidate.v3" if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV3 else "sylanne.d11.contact_dispatch_candidate.v2" if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV2 else "sylanne.d11.contact_dispatch_candidate.v1",
+                        "digest":dispatch_candidate.digest, "refs":[[ref,versions[ref]] for ref in refs],
+                        "graph_epoch":graph_receipt.epoch.revision,
+                        "reviewed_content_digest":dispatch_candidate.reviewed_content_digest,
+                        "segment_index":0, "query_epoch":dispatch_candidate.query_epoch}
+                    data["dispatch_admission"] = {"schema":admission_receipt.admission.schema,
+                        "ref":admission_receipt.admission.admission_ref, "digest":admission_receipt.receipt_digest}
+                    data["dispatch_action_job_binding"] = {"schema":binding.schema, "digest":binding.digest,
+                        "admission_ref":binding.admission_ref, "job_id":binding.job_id}
+                elif type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2:
+                    versions = {item.key.token: item.revision
+                                for item in graph_receipt.revisions}
+                    refs = (dispatch_candidate.action_ref,
+                            dispatch_candidate.schema_ref,
+                            dispatch_candidate.grant_ref,
+                            dispatch_candidate.batch_ref)
+                    if any(versions.get(ref) != 1 for ref in refs):
+                        raise UnavailableGuard("natural final graph writes differ")
+                    data["natural_dispatch_candidate"] = {
+                        "schema": "sylanne.d11.natural_dispatch_candidate.v2",
+                        "status": dispatch_candidate.status,
+                        "digest": dispatch_candidate.digest,
+                        "refs": [[ref, versions[ref]] for ref in refs],
+                        "graph_epoch": graph_receipt.epoch.revision,
+                        "source_refs": list(envelope.source_qualification.source_refs),
+                        "access_epoch": dispatch_candidate.access_epoch,
+                        "delete_epoch": dispatch_candidate.delete_epoch,
+                        "query_epoch": dispatch_candidate.query_epoch,
+                        "graph_incarnation": (v2_write[0].requirements.graph_incarnation
+                                              if v2_write is not None else None),
+                        "graph_revision": (v2_write[0].graph_revision + 1
+                                           if v2_write is not None else None),
+                    }
+                    admission_receipt, request, natural_authorization_original = natural_final_admission(
+                        db, graph_receipt, dispatch_candidate,
+                        tuple(runtime_admissions))
+                    issued = load_request(db, namespace,
+                                          admission_receipt.admission.admission_ref)
+                    if (issued != (admission_receipt, request)
+                            or (request.operation_id, request.effect_id,
+                                request.payload_digest) != (
+                                    identity.operation_id, identity.effect_id,
+                                    dispatch_candidate.payload_digest)):
+                        raise UnavailableGuard("natural final admission differs")
                     data["dispatch_admission"] = {
                         "schema": admission_receipt.admission.schema,
                         "ref": admission_receipt.admission.admission_ref,
                         "digest": admission_receipt.receipt_digest,
                     }
-                    data["dispatch_action_job_binding"] = {
-                        "schema": action_job_binding.schema,
-                        "ref": action_job_binding.admission_ref,
-                        "digest": action_job_binding.digest,
-                        "job_id": action_job_binding.job_id,
+                    from .runtime.natural_final_authorization_original_v3 import _NaturalFinalAuthorizationWitnessV3
+                    if type(natural_authorization_original) is not _NaturalFinalAuthorizationWitnessV3:
+                        raise UnavailableGuard("natural final actual authorization original is absent")
+                    data["natural_final_authorization_original"] = natural_authorization_original.consume_for(
+                        self,db,bundle,dispatch_candidate,graph_receipt,v2_write,admission_receipt,request)
+                elif dispatch_candidate is not None:
+                    candidate_evidence = (qualified_dispatch_candidates[0]
+                                          if qualified_dispatch_candidates else dispatch_candidate)
+                    versions = {item.key.token: item.revision
+                                for item in graph_receipt.revisions}
+                    refs = (dispatch_candidate.action_ref,
+                            dispatch_candidate.schema_ref,
+                            dispatch_candidate.grant_ref,
+                            dispatch_candidate.batch_ref)
+                    if any(versions.get(ref, 0) < 1 for ref in refs):
+                        raise UnavailableGuard("dispatch candidate lacks same-commit graph versions")
+                    data["dispatch_candidate"] = {
+                        "schema": "sylanne.d11.dispatch_candidate.v1",
+                        "status": candidate_evidence.status,
+                        "digest": candidate_evidence.digest,
+                        "refs": [[ref, versions[ref]] for ref in refs],
+                        "graph_epoch": graph_receipt.epoch.revision,
+                        "source_refs": list(dispatch_candidate.source_refs),
+                        "access_epoch": dispatch_candidate.access_epoch,
+                        "delete_epoch": dispatch_candidate.delete_epoch,
+                        "query_epoch": dispatch_candidate.query_epoch,
+                        "source_audience": list(candidate_evidence.source_audience),
+                        "source_proof_versions": [list(item) for item in
+                                                  candidate_evidence.source_proof_versions],
+                        "source_proof_digest": candidate_evidence.source_proof_digest,
+                        "graph_incarnation": (
+                            v2_write[0].requirements.graph_incarnation
+                            if v2_write is not None else None),
+                        "graph_revision": (
+                            v2_write[0].graph_revision + 1
+                            if v2_write is not None else None),
                     }
-            if product_advances:
-                data["product_advance_candidate"] = product_advances[0]
-            if joint_product_advances:
-                joint_evidence, numeric_receipt, output_original, *_ = (
-                    joint_product_advances[0])
-                data["joint_product_advance_v2"] = {
-                    "evidence_digest": joint_evidence.digest,
-                    "numeric_receipt_digest": numeric_receipt.receipt_digest,
-                    "output_original_digest": output_original.original_digest,
-                }
-            if correction_issuance is not None:
-                request = correction_issuance[3]
-                correction_ref = bundle.proposals[0].typed_writes[0].key.token
-                from .domains.d06 import source_correction_head_key
-                head_refs = tuple(source_correction_head_key(
-                    namespace, AtomKey.from_token(ref).owner.subject).token
-                    for ref in request.source_refs)
-                expected_writes = {
-                    correction_ref, *request.target_refs,
-                    *head_refs, bundle.persistent_job_refs[0], bundle.outbox_refs[0],
-                }
-                written = {item.key.token for item in graph_receipt.revisions}
-                if (not expected_writes.issubset(written)
-                        or v2_write is None or len(bundle.outbox_refs) != 1):
-                    raise UnavailableGuard("source correction graph writes differ")
-                data["source_correction"] = {
-                    "request_digest": request.request_digest,
-                    "correction_source_ref": correction_ref,
-                    "source_refs": list(request.source_refs),
-                    "correction_head_refs": list(head_refs),
-                    "invalidated_target_refs": list(request.target_refs),
-                    "reevaluation_outbox_ref": bundle.outbox_refs[0],
-                    "audit_event_ref": identity.operation_id,
-                    "graph_revision": v2_write[0].graph_revision + 1,
-                    "access_epoch": request.access_epoch,
-                    "deletion_epoch": request.deletion_epoch,
-                    "reevaluation_status": "pending",
-                }
-            db.execute(
-                "INSERT INTO graph_bundle_operations(bot,persona,operation_id,digest,"
-                "activity_id,effect_id,commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
-                namespace.as_tuple + (identity.operation_id, digest, identity.activity_id,
-                                      identity.effect_id, seq, canonical_json(data)),
-            )
-            if c04_adoption_plans_v3:
-                from .runtime.c04_v3_contracts import C04AdoptionReceiptV3
-                if len(c04_adoption_plans_v3) != 1:
-                    raise UnavailableGuard("C04 V3 plan was not uniquely issued")
-                plan = c04_adoption_plans_v3[0]
-                receipt = C04AdoptionReceiptV3(
-                    namespace, identity.operation_id, plan.plan_digest,
-                    plan.input_digest, plan.result_digest, plan.write_set_digest,
-                    graph_receipt.epoch.revision)
-                receipt.validate_plan(plan)
-                db.execute("INSERT INTO graph_c04_adoptions_v3 VALUES(?,?,?,?,?,?)",
-                           (*namespace.as_tuple, identity.operation_id, digest,
-                            plan.to_json(), receipt.to_json()))
-            if joint_product_advances:
-                from .runtime.d04_joint_advance_v2 import (
-                    record_joint_advance_v2, record_joint_numeric_original_v1,
-                )
+                    if self.__dispatch_admission_issuer is not None:
+                        from .domains.d08 import ActionCancellationState, GoalExecutionProvider
+                        from .runtime.dispatch_action_job_binding import bind_action_job
 
-                (joint_evidence, numeric_receipt, output_original,
-                 joint_preflight, numeric_preflight, closure_rows,
-                 closure_audience, closure_purpose) = joint_product_advances[0]
-                if (record_joint_advance_v2(
-                        db, joint_evidence, preflight=joint_preflight)
-                        != "recorded_pending_transaction_commit"
-                        or record_joint_numeric_original_v1(
-                            db, joint_evidence, numeric_receipt,
-                            preflight=numeric_preflight)
-                        != "recorded_pending_transaction_commit"):
-                    raise UnavailableGuard("D04 joint original was not recorded")
-                from .runtime.d04_joint_output_original_store_v1 import (
-                    record_d04_joint_output_original_v1,
-                    record_d04_joint_output_closure_v1,
+                        admission_jobs = runtime_admissions[0].jobs
+                        if (len(admission_jobs) != 1
+                                or len(bundle.persistent_job_refs) != 1
+                                or len(bundle.outbox_refs) != 1
+                                or admission_jobs[0].graph_job_ref
+                                != bundle.persistent_job_refs[0]
+                                or set(admission_jobs[0].outbox_refs)
+                                != set(bundle.outbox_refs)):
+                            raise UnavailableGuard(
+                                "dispatch admission requires one D11 job and its outbox")
+
+                        d08_types = {spec.name: spec for spec in
+                                     GoalExecutionProvider().register_types()}
+                        linked = {write.key.type_name: write.value for write in writes
+                                  if write.key.type_name in {
+                                      "d08.action_intent.v1", "d08.action_schema.v1",
+                                      "d08.communication_intent_grant.v1",
+                                      "d09.verified_segment_batch.v1",
+                                  }}
+                        action = d08_types["d08.action_intent.v1"].validator(
+                            linked["d08.action_intent.v1"])
+                        admission_receipt = self._issue_dispatch_admission(
+                            db, bundle, guard_snapshots[0], candidate_evidence,
+                            action,
+                            d08_types["d08.action_schema.v1"].validator(
+                                linked["d08.action_schema.v1"]),
+                            d08_types["d08.communication_intent_grant.v1"].validator(
+                                linked["d08.communication_intent_grant.v1"]),
+                            linked["d09.verified_segment_batch.v1"],
+                            graph_receipt=graph_receipt, v2_write=v2_write,
+                            projection=dispatch_projections[0] if dispatch_projections else None,
+                            now_utc=dispatch_now(),
+                            clock_reading=dispatch_clock_reading,
+                            dispatch_scope=dispatch_admission_scope,
+                            dispatch_owner_guard=dispatch_admission_owner_guard,
+                            dispatch_current_effect=dispatch_admission_current_effect,
+                            dispatch_effect_snapshot=dispatch_admission_effect_snapshot,
+                            provisional_check_candidate=provisional_check_candidate,
+                            installed_final_check_reissuer=installed_final_check_reissuer,
+                        )
+                        issued = load_request(
+                            db, namespace, admission_receipt.admission.admission_ref)
+                        outbox_writes = tuple(
+                            write for write in writes
+                            if write.key.type_name == "runtime.outbox")
+                        if (issued is None or issued[0] != admission_receipt
+                                or len(outbox_writes) != 1
+                                or outbox_writes[0].key.token != bundle.outbox_refs[0]):
+                            raise UnavailableGuard("dispatch outbox payload is unbound")
+                        request = issued[1]
+                        outbox = outbox_writes[0].value
+                        job = admission_jobs[0].job
+                        if (outbox.get("job_id") != job.job_id
+                                or outbox.get("job_ref")
+                                != admission_jobs[0].graph_job_ref
+                                or outbox.get("operation_id") != request.operation_id
+                                or outbox.get("effect_id") != request.effect_id
+                                or outbox.get("activity_id") != request.activity_id
+                                or (outbox.get("bot_id"), outbox.get("persona_id"))
+                                != namespace.as_tuple
+                                or outbox.get("payload_ref") != request.payload_ref
+                                or outbox.get("dispatch_generation")
+                                != request.dispatch_generation
+                                or outbox.get("phase") != "pending"):
+                            raise UnavailableGuard("dispatch outbox payload differs from request")
+                        try:
+                            action_job_binding = bind_action_job(
+                                db, action, admission_receipt)
+                        except ValueError as exc:
+                            raise UnavailableGuard(
+                                "dispatch action/attempt lacks an exact D11 job binding") from exc
+                        cancel_writes = tuple(
+                            (proposal.domain, write)
+                            for proposal in bundle.proposals
+                            for write in proposal.typed_writes
+                            if write.key.type_name == "d08.action_cancellation.v1"
+                        )
+                        expected_cancel = ActionCancellationState.for_action(
+                            action, state="active", actor=envelope.authority.actor,
+                            source_refs=envelope.source_qualification.source_refs,
+                            operation_id=identity.operation_id,
+                        )
+                        cancel_key = AtomKey(
+                            Owner("activity", *namespace.as_tuple, identity.activity_id),
+                            "d08.action_cancellation.v1", action.action_id,
+                        )
+                        if (len(cancel_writes) != 1
+                                or cancel_writes[0][0] != "d08"
+                                or cancel_writes[0][1].key != cancel_key
+                                or cancel_writes[0][1].value != json.loads(
+                                    canonical_serialize(asdict(expected_cancel)))
+                                or tuple(ref.revision for ref in
+                                         envelope.version_guard.read_versions
+                                         if ref.key == cancel_key) != (0,)
+                                or tuple(ref.revision for ref in graph_receipt.revisions
+                                         if ref.key == cancel_key) != (1,)
+                                or (admission_receipt.admission.action_ref,
+                                    admission_receipt.admission.attempt_id,
+                                    admission_receipt.admission.operation_id) != (
+                                        action.action_id, identity.attempt_id,
+                                        identity.operation_id)
+                                or (action_job_binding.action_id,
+                                    action_job_binding.attempt_id,
+                                    action_job_binding.operation_id) != (
+                                        action.action_id, identity.attempt_id,
+                                        identity.operation_id)):
+                            raise UnavailableGuard(
+                                "dispatch admission lacks same-commit D08 active cancellation head")
+                        data["dispatch_admission"] = {
+                            "schema": admission_receipt.admission.schema,
+                            "ref": admission_receipt.admission.admission_ref,
+                            "digest": admission_receipt.receipt_digest,
+                        }
+                        data["dispatch_action_job_binding"] = {
+                            "schema": action_job_binding.schema,
+                            "ref": action_job_binding.admission_ref,
+                            "digest": action_job_binding.digest,
+                            "job_id": action_job_binding.job_id,
+                        }
+                if product_advances:
+                    data["product_advance_candidate"] = product_advances[0]
+                if joint_product_advances:
+                    joint_evidence, numeric_receipt, output_original, *_ = (
+                        joint_product_advances[0])
+                    data["joint_product_advance_v2"] = {
+                        "evidence_digest": joint_evidence.digest,
+                        "numeric_receipt_digest": numeric_receipt.receipt_digest,
+                        "output_original_digest": output_original.original_digest,
+                    }
+                if correction_issuance is not None:
+                    request = correction_issuance[3]
+                    correction_ref = bundle.proposals[0].typed_writes[0].key.token
+                    from .domains.d06 import source_correction_head_key
+                    head_refs = tuple(source_correction_head_key(
+                        namespace, AtomKey.from_token(ref).owner.subject).token
+                        for ref in request.source_refs)
+                    expected_writes = {
+                        correction_ref, *request.target_refs,
+                        *head_refs, bundle.persistent_job_refs[0], bundle.outbox_refs[0],
+                    }
+                    written = {item.key.token for item in graph_receipt.revisions}
+                    if (not expected_writes.issubset(written)
+                            or v2_write is None or len(bundle.outbox_refs) != 1):
+                        raise UnavailableGuard("source correction graph writes differ")
+                    data["source_correction"] = {
+                        "request_digest": request.request_digest,
+                        "correction_source_ref": correction_ref,
+                        "source_refs": list(request.source_refs),
+                        "correction_head_refs": list(head_refs),
+                        "invalidated_target_refs": list(request.target_refs),
+                        "reevaluation_outbox_ref": bundle.outbox_refs[0],
+                        "audit_event_ref": identity.operation_id,
+                        "graph_revision": v2_write[0].graph_revision + 1,
+                        "access_epoch": request.access_epoch,
+                        "deletion_epoch": request.deletion_epoch,
+                        "reevaluation_status": "pending",
+                    }
+                db.execute(
+                    "INSERT INTO graph_bundle_operations(bot,persona,operation_id,digest,"
+                    "activity_id,effect_id,commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (identity.operation_id, digest, identity.activity_id,
+                                          identity.effect_id, seq, canonical_json(data)),
                 )
-                record_d04_joint_output_original_v1(
-                    db, namespace, identity.operation_id,
-                    joint_evidence.digest, output_original)
-                record_d04_joint_output_closure_v1(
-                    db, namespace, identity.operation_id, joint_evidence.digest,
-                    output_original.component_digest, closure_audience,
-                    closure_purpose, closure_rows)
-            if c02_adoption is not None:
-                if c02_first_seal_quote is not None:
-                    db.execute("""CREATE TABLE IF NOT EXISTS
-                        graph_first_ingress_c02_committed_seals_v2 (
-                        bot TEXT NOT NULL, persona TEXT NOT NULL,
-                        operation_id TEXT NOT NULL,
-                        schema TEXT NOT NULL CHECK(schema=
-                            'sylanne.first-ingress-c02-candidate.v2'),
-                        bundle_digest TEXT NOT NULL,
-                        fence_attempt_id TEXT NOT NULL,
-                        bundle_json TEXT NOT NULL,
-                        evidence_json TEXT NOT NULL,
-                        quote_json TEXT NOT NULL,
-                        seal_json TEXT NOT NULL,
-                        PRIMARY KEY(bot,persona,operation_id))""")
-                    copied = db.execute(
-                        "INSERT INTO graph_first_ingress_c02_committed_seals_v2 "
-                        "SELECT * FROM graph_first_ingress_c02_candidates_v2 "
+                if c04_adoption_plans_v3:
+                    from .runtime.c04_v3_contracts import C04AdoptionReceiptV3
+                    if len(c04_adoption_plans_v3) != 1:
+                        raise UnavailableGuard("C04 V3 plan was not uniquely issued")
+                    plan = c04_adoption_plans_v3[0]
+                    receipt = C04AdoptionReceiptV3(
+                        namespace, identity.operation_id, plan.plan_digest,
+                        plan.input_digest, plan.result_digest, plan.write_set_digest,
+                        graph_receipt.epoch.revision)
+                    receipt.validate_plan(plan)
+                    db.execute("INSERT INTO graph_c04_adoptions_v3 VALUES(?,?,?,?,?,?)",
+                               (*namespace.as_tuple, identity.operation_id, digest,
+                                plan.to_json(), receipt.to_json()))
+                if joint_product_advances:
+                    from .runtime.d04_joint_advance_v2 import (
+                        record_joint_advance_v2, record_joint_numeric_original_v1,
+                    )
+
+                    (joint_evidence, numeric_receipt, output_original,
+                     joint_preflight, numeric_preflight, closure_rows,
+                     closure_audience, closure_purpose) = joint_product_advances[0]
+                    if (record_joint_advance_v2(
+                            db, joint_evidence, preflight=joint_preflight)
+                            != "recorded_pending_transaction_commit"
+                            or record_joint_numeric_original_v1(
+                                db, joint_evidence, numeric_receipt,
+                                preflight=numeric_preflight)
+                            != "recorded_pending_transaction_commit"):
+                        raise UnavailableGuard("D04 joint original was not recorded")
+                    from .runtime.d04_joint_output_original_store_v1 import (
+                        record_d04_joint_output_original_v1,
+                        record_d04_joint_output_closure_v1,
+                    )
+                    record_d04_joint_output_original_v1(
+                        db, namespace, identity.operation_id,
+                        joint_evidence.digest, output_original)
+                    record_d04_joint_output_closure_v1(
+                        db, namespace, identity.operation_id, joint_evidence.digest,
+                        output_original.component_digest, closure_audience,
+                        closure_purpose, closure_rows)
+                if c02_adoption is not None:
+                    if c02_first_seal_quote is not None:
+                        db.execute("""CREATE TABLE IF NOT EXISTS
+                            graph_first_ingress_c02_committed_seals_v2 (
+                            bot TEXT NOT NULL, persona TEXT NOT NULL,
+                            operation_id TEXT NOT NULL,
+                            schema TEXT NOT NULL CHECK(schema=
+                                'sylanne.first-ingress-c02-candidate.v2'),
+                            bundle_digest TEXT NOT NULL,
+                            fence_attempt_id TEXT NOT NULL,
+                            bundle_json TEXT NOT NULL,
+                            evidence_json TEXT NOT NULL,
+                            quote_json TEXT NOT NULL,
+                            seal_json TEXT NOT NULL,
+                            PRIMARY KEY(bot,persona,operation_id))""")
+                        copied = db.execute(
+                            "INSERT INTO graph_first_ingress_c02_committed_seals_v2 "
+                            "SELECT * FROM graph_first_ingress_c02_candidates_v2 "
+                            "WHERE bot=? AND persona=? AND operation_id=? "
+                            "AND bundle_digest=?",
+                            namespace.as_tuple + (identity.operation_id, digest),
+                        )
+                        if copied.rowcount != 1:
+                            raise UnavailableGuard("C02 v2 committed seal was lost")
+                        from .runtime.c1_artifact_task_intent_v1 import record_c1_task_intent_after_c02_commit_v1
+                        record_c1_task_intent_after_c02_commit_v1(db,namespace=namespace,
+                            c02_operation_id=identity.operation_id,issuer=self.__d11_issuer)
+                    deleted = db.execute(
+                        "DELETE FROM " + (
+                            "graph_first_ingress_c02_candidates_v2 "
+                            if c02_first_seal_quote is not None else
+                            "graph_first_ingress_c02_candidates_v1 ") +
                         "WHERE bot=? AND persona=? AND operation_id=? "
                         "AND bundle_digest=?",
                         namespace.as_tuple + (identity.operation_id, digest),
                     )
-                    if copied.rowcount != 1:
-                        raise UnavailableGuard("C02 v2 committed seal was lost")
-                deleted = db.execute(
-                    "DELETE FROM " + (
-                        "graph_first_ingress_c02_candidates_v2 "
-                        if c02_first_seal_quote is not None else
-                        "graph_first_ingress_c02_candidates_v1 ") +
-                    "WHERE bot=? AND persona=? AND operation_id=? "
-                    "AND bundle_digest=?",
-                    namespace.as_tuple + (identity.operation_id, digest),
-                )
-                if deleted.rowcount != 1:
-                    raise UnavailableGuard("C02 pending candidate was lost before commit")
-            if product_advances:
-                advance = product_advances[0]
-                db.execute(
-                    "INSERT INTO graph_product_advances"
-                    "(bot,persona,operation_id,process_id,feeling_ref,mood_ref,"
-                    "parent_operation_id,replay_key,from_cursor,to_cursor,candidate_digest,"
-                    "numeric_input_digest,numeric_output_digest,native_manifest_sha256,"
-                    "native_sha256,previous_error_bound,next_error_bound) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (
-                        identity.operation_id, advance["process_id"], advance["feeling_ref"],
-                        advance["mood_ref"], advance["parent_operation_id"], advance["replay_key"],
-                        advance["from_cursor"], advance["to_cursor"], advance["candidate_digest"],
-                        advance["numeric_input_digest"], advance["numeric_output_digest"],
-                        advance["native_manifest_sha256"], advance["native_sha256"],
-                        advance["previous_error_bound"], advance["next_error_bound"]),
-                )
-            for kind, refs in part_refs:
-                for ref in refs:
-                    if kind == "persistent_job" and domain_production_issuance_v1 is not None:
-                        if identity.phase=='adopt_internal_life_content_v1':
-                            from .runtime.internal_life_content_adoption_v1 import require_content_job_registration_v1
-                            if ref not in require_content_job_registration_v1(domain_production_issuance_v1,db):
-                                raise ValueError('Life content completion contains another persistent job')
-                            continue
-                        if identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
-                            from .runtime.d06_life_numeric_commit_v1 import require_life_numeric_job_registration_v1
-                            if ref not in require_life_numeric_job_registration_v1(domain_production_issuance_v1, db):
-                                raise ValueError('numeric Life task contains another persistent job')
-                            continue
-                        if identity.phase == 'acquire_internal_life_content_v2':
-                            from .runtime.internal_life_content_worker_v2 import require_internal_life_acquisition_job_registration_v2
-                            if ref not in require_internal_life_acquisition_job_registration_v2(domain_production_issuance_v1,db):
-                                raise ValueError('Life worker acquisition contains another persistent job')
-                            continue
-                        if identity.phase == 'acquire_internal_life_content':
-                            from .runtime.internal_life_content_worker_v1 import require_internal_life_acquisition_job_registration_v1
-                            if ref not in require_internal_life_acquisition_job_registration_v1(domain_production_issuance_v1,db):
-                                raise ValueError('Life acquisition contains another persistent job')
-                            continue
-                        from .runtime.d11_offline_adoption_v1 import (
-                            _OfflineCommitWitnessV1, require_offline_job_registration_v1,
-                        )
-                        if type(domain_production_issuance_v1) is _OfflineCommitWitnessV1:
-                            if ref not in require_offline_job_registration_v1(domain_production_issuance_v1, db):
-                                raise ValueError("offline terminal contains another persistent job")
-                            continue
-                        from .runtime.d11_life_adoption_v1 import _LifeCommitWitnessV1, require_life_job_registration_v1
-                        if type(domain_production_issuance_v1) is _LifeCommitWitnessV1:
-                            if ref not in require_life_job_registration_v1(domain_production_issuance_v1, db):
-                                raise ValueError("Life terminal contains another persistent job")
-                            continue
+                    if deleted.rowcount != 1:
+                        raise UnavailableGuard("C02 pending candidate was lost before commit")
+                if product_advances:
+                    advance = product_advances[0]
                     db.execute(
-                        "INSERT INTO graph_bundle_refs(bot,persona,operation_id,ref_kind,ref) "
-                        "VALUES(?,?,?,?,?)",
-                        namespace.as_tuple + (identity.operation_id, kind, ref),
+                        "INSERT INTO graph_product_advances"
+                        "(bot,persona,operation_id,process_id,feeling_ref,mood_ref,"
+                        "parent_operation_id,replay_key,from_cursor,to_cursor,candidate_digest,"
+                        "numeric_input_digest,numeric_output_digest,native_manifest_sha256,"
+                        "native_sha256,previous_error_bound,next_error_bound) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            identity.operation_id, advance["process_id"], advance["feeling_ref"],
+                            advance["mood_ref"], advance["parent_operation_id"], advance["replay_key"],
+                            advance["from_cursor"], advance["to_cursor"], advance["candidate_digest"],
+                            advance["numeric_input_digest"], advance["numeric_output_digest"],
+                            advance["native_manifest_sha256"], advance["native_sha256"],
+                            advance["previous_error_bound"], advance["next_error_bound"]),
                     )
-            for ref in bundle.outbox_refs:
-                db.execute(
-                    "INSERT INTO graph_bundle_outbox(bot,persona,outbox_ref,operation_id,phase) "
-                    "VALUES(?,?,?,?, 'pending')",
-                    namespace.as_tuple + (ref, identity.operation_id),
-                )
-            if (c04_adoption_issuance_v3 is None and d04_numeric_issuance_v3 is None
-                    and domain_production_issuance_v1 is None
-                    and len(runtime_admissions) != 1):
-                raise UnavailableGuard("D11 runtime admission was not recorded")
-            for binding in (runtime_admissions[0].jobs if runtime_admissions else ()):
-                for outbox_ref in binding.outbox_refs:
-                    db.execute(
-                        "INSERT INTO graph_outbox_jobs(bot,persona,outbox_ref,job_id,operation_id) "
-                        "VALUES(?,?,?,?,?)",
-                        namespace.as_tuple + (outbox_ref, binding.job.job_id,
-                                              identity.operation_id),
-                    )
-            if c04_runtime_writes_v3:
-                outbox = next(w for w in c04_runtime_writes_v3 if w.key.type_name == "runtime.outbox")
-                db.execute("INSERT INTO graph_outbox_jobs(bot,persona,outbox_ref,job_id,operation_id) VALUES(?,?,?,?,?)",
-                    (*namespace.as_tuple, outbox.key.token, outbox.value["job_id"], identity.operation_id))
-            for proposal in bundle.proposals:
-                for kind, edges in (("historical_provenance", proposal.dependencies.historical_provenance),
-                                    ("association", proposal.dependencies.associations),
-                                    ("numeric_coupling", proposal.dependencies.numeric_coupling)):
-                    for write in proposal.typed_writes:
-                        for ref in edges:
-                            db.execute(
-                                "INSERT INTO graph_dependency_edges(dependent_token,dependency_token,"
-                                "dependency_revision,edge_kind,operation_id) VALUES(?,?,?,?,?)",
-                                (write.key.token, ref.key.token, ref.revision, kind,
-                                 identity.operation_id),
+                for kind, refs in part_refs:
+                    for ref in refs:
+                        if kind == "persistent_job" and domain_production_issuance_v1 is not None:
+                            from .runtime.d11_artifact_draft_model_v1 import ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, require_artifact_draft_model_commit_v1
+                            from .runtime.d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2
+                            from .runtime.domain_production_commit_v1 import _ProductionCommitWitnessV1
+                            concrete = (domain_production_issuance_v1.stage
+                                if type(domain_production_issuance_v1) is _ProductionCommitWitnessV1 else None)
+                            from .runtime.c04_ingress_preparation_v4 import _SelfC04CommitV4, require_self_c04_persistent_member_v4
+                            from .runtime.c04_ingress_adoption_v4 import SelfC04AdoptionStageV4, require_self_c04_adoption_member_v4
+                            if type(domain_production_issuance_v1) is _SelfC04CommitV4:
+                                require_self_c04_persistent_member_v4(domain_production_issuance_v1, ref)
+                                continue
+                            if type(concrete) is SelfC04AdoptionStageV4:
+                                require_self_c04_adoption_member_v4(domain_production_issuance_v1, ref)
+                                continue
+                            from .runtime.d07_ingress_recall_acquisition_v1 import D07IngressRecallAcquisitionStageV1
+                            from .runtime.d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1
+                            if type(concrete) in {D07IngressRecallAcquisitionStageV1, D07IngressRecallResultStageV1}:
+                                from .runtime.domain_production_commit_v1 import _ACTIVE, _FOREGROUND_APPLIED
+                                if (_ACTIVE.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or _FOREGROUND_APPLIED.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or ref != job_graph_write(concrete.after_job).key.token):
+                                    raise ValueError("Self C3 acquired job differs from its privately verified once CAS")
+                                continue
+                            from .runtime.d07_ingress_recall_preparation_v1 import D07IngressRecallMaterializedStageV1
+                            if type(concrete) is D07IngressRecallMaterializedStageV1:
+                                from .runtime.domain_production_commit_v1 import _ACTIVE, _FOREGROUND_APPLIED
+                                if (_ACTIVE.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or _FOREGROUND_APPLIED.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or ref not in {job_graph_write(job).key.token
+                                            for job in (concrete.resources.job, concrete.after_cycle)}):
+                                    raise ValueError("Self C3 persistent job differs from its privately verified once CAS")
+                                continue
+                            from .runtime.owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
+                            if type(concrete) is OwnerStopReplyProjectionStageV1:
+                                from .runtime.domain_production_commit_v1 import _ACTIVE, _FOREGROUND_APPLIED
+                                if (_ACTIVE.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or _FOREGROUND_APPLIED.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or ref not in {job_graph_write(job).key.token for job in concrete.after_jobs}):
+                                    raise ValueError("Stop projection persistent job differs from its actual once-apply")
+                                continue
+                            if type(concrete) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}:
+                                from .runtime.domain_production_commit_v1 import _ACTIVE, _FOREGROUND_APPLIED
+                                if (_ACTIVE.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1
+                                        or _FOREGROUND_APPLIED.get(id(domain_production_issuance_v1)) is not domain_production_issuance_v1):
+                                    raise ValueError("C4 persistent job lacks actual private once-apply")
+                                jobs = ((concrete.job,) if concrete.after_cycle is None else (concrete.job, concrete.after_cycle)) if type(concrete) in {ArtifactDraftModelStageV1, ArtifactDraftModelStageV2} else (concrete.after_job,)
+                                if ref not in {job_graph_write(job).key.token for job in jobs}:
+                                    raise ValueError("C4 persistent job differs from its exact adopted stage")
+                                continue
+                            if identity.phase=='adopt_internal_life_content_v1':
+                                from .runtime.internal_life_content_adoption_v1 import require_content_job_registration_v1
+                                if ref not in require_content_job_registration_v1(domain_production_issuance_v1,db):
+                                    raise ValueError('Life content completion contains another persistent job')
+                                continue
+                            if identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+                                from .runtime.d06_life_numeric_commit_v1 import require_life_numeric_job_registration_v1
+                                if ref not in require_life_numeric_job_registration_v1(domain_production_issuance_v1, db):
+                                    raise ValueError('numeric Life task contains another persistent job')
+                                continue
+                            if identity.phase == 'acquire_internal_life_content_v2':
+                                from .runtime.internal_life_content_worker_v2 import require_internal_life_acquisition_job_registration_v2
+                                if ref not in require_internal_life_acquisition_job_registration_v2(domain_production_issuance_v1,db):
+                                    raise ValueError('Life worker acquisition contains another persistent job')
+                                continue
+                            if identity.phase == 'acquire_internal_life_content':
+                                from .runtime.internal_life_content_worker_v1 import require_internal_life_acquisition_job_registration_v1
+                                if ref not in require_internal_life_acquisition_job_registration_v1(domain_production_issuance_v1,db):
+                                    raise ValueError('Life acquisition contains another persistent job')
+                                continue
+                            from .runtime.d11_offline_adoption_v1 import (
+                                _OfflineCommitWitnessV1, require_offline_job_registration_v1,
                             )
-            if v2_write is not None:
-                expected, expected_epoch, finish_id, finish_digest, permit_json = v2_write
-                replacement = expected.requirements
-                if d04_numeric_issuance_v3 is not None:
-                    replacement = d04_numeric_issuance_v3.target_requirements
-                    # The witness was independently gated and checked before
-                    # Graph mutation. No ordinary bundle may advance journals.
-                elif domain_production_issuance_v1 is not None:
-                    from .runtime.d11_offline_adoption_v1 import _OfflineCommitWitnessV1, offline_target_requirements_v1
-                    if type(domain_production_issuance_v1) is _OfflineCommitWitnessV1:
-                        replacement = offline_target_requirements_v1(domain_production_issuance_v1)
-                    else:
-                        from .runtime.d11_life_adoption_v1 import _LifeCommitWitnessV1, life_target_requirements_v1
-                        if type(domain_production_issuance_v1) is _LifeCommitWitnessV1:
-                            replacement = life_target_requirements_v1(domain_production_issuance_v1)
-                store.cas_graph_recovery_metadata(
-                    expected, replacement,
-                    _capability=self.__graph_capability)
-                db.execute(
-                    "INSERT INTO graph_bundle_fences_v2"
-                    "(bot,persona,operation_id,digest,permit_json,pre_graph_revision,"
-                    "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
-                    "finish_request_id,finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    namespace.as_tuple + (
-                        identity.operation_id, digest, permit_json,
-                        expected.graph_revision, expected_epoch.revision,
-                        expected.graph_revision + 1, graph_receipt.epoch.revision,
-                        finish_id, finish_digest),
-                )
-            result.append(CommitReceipt(
-                "committed", identity.operation_id, digest, identity.activity_id,
-                identity.effect_id, seq, envelope.version_guard.read_versions,
-                graph_receipt.revisions, (graph_receipt.epoch,), ledger_refs,
-                bundle.outbox_refs,
-            ))
+                            if type(domain_production_issuance_v1) is _OfflineCommitWitnessV1:
+                                if ref not in require_offline_job_registration_v1(domain_production_issuance_v1, db):
+                                    raise ValueError("offline terminal contains another persistent job")
+                                continue
+                            from .runtime.d11_life_adoption_v1 import _LifeCommitWitnessV1, require_life_job_registration_v1
+                            if type(domain_production_issuance_v1) is _LifeCommitWitnessV1:
+                                if ref not in require_life_job_registration_v1(domain_production_issuance_v1, db):
+                                    raise ValueError("Life terminal contains another persistent job")
+                                continue
+                        db.execute(
+                            "INSERT INTO graph_bundle_refs(bot,persona,operation_id,ref_kind,ref) "
+                            "VALUES(?,?,?,?,?)",
+                            namespace.as_tuple + (identity.operation_id, kind, ref),
+                        )
+                for ref in bundle.outbox_refs:
+                    db.execute(
+                        "INSERT INTO graph_bundle_outbox(bot,persona,outbox_ref,operation_id,phase) "
+                        "VALUES(?,?,?,?, 'pending')",
+                        namespace.as_tuple + (ref, identity.operation_id),
+                    )
+                if (c04_adoption_issuance_v3 is None and d04_numeric_issuance_v3 is None
+                        and domain_production_issuance_v1 is None
+                        and len(runtime_admissions) != 1):
+                    raise UnavailableGuard("D11 runtime admission was not recorded")
+                for binding in (runtime_admissions[0].jobs if runtime_admissions else ()):
+                    for outbox_ref in binding.outbox_refs:
+                        db.execute(
+                            "INSERT INTO graph_outbox_jobs(bot,persona,outbox_ref,job_id,operation_id) "
+                            "VALUES(?,?,?,?,?)",
+                            namespace.as_tuple + (outbox_ref, binding.job.job_id,
+                                                  identity.operation_id),
+                        )
+                if c04_runtime_writes_v3:
+                    outbox = next(w for w in c04_runtime_writes_v3 if w.key.type_name == "runtime.outbox")
+                    db.execute("INSERT INTO graph_outbox_jobs(bot,persona,outbox_ref,job_id,operation_id) VALUES(?,?,?,?,?)",
+                        (*namespace.as_tuple, outbox.key.token, outbox.value["job_id"], identity.operation_id))
+                for proposal in bundle.proposals:
+                    for kind, edges in (("historical_provenance", proposal.dependencies.historical_provenance),
+                                        ("association", proposal.dependencies.associations),
+                                        ("numeric_coupling", proposal.dependencies.numeric_coupling)):
+                        for write in proposal.typed_writes:
+                            for ref in edges:
+                                db.execute(
+                                    "INSERT INTO graph_dependency_edges(dependent_token,dependency_token,"
+                                    "dependency_revision,edge_kind,operation_id) VALUES(?,?,?,?,?)",
+                                    (write.key.token, ref.key.token, ref.revision, kind,
+                                     identity.operation_id),
+                                )
+                if v2_write is not None:
+                    expected, expected_epoch, finish_id, finish_digest, permit_json = v2_write
+                    replacement = expected.requirements
+                    if d04_numeric_issuance_v3 is not None:
+                        replacement = d04_numeric_issuance_v3.target_requirements
+                        # The witness was independently gated and checked before
+                        # Graph mutation. No ordinary bundle may advance journals.
+                    elif domain_production_issuance_v1 is not None:
+                        from .runtime.d11_offline_adoption_v1 import _OfflineCommitWitnessV1, offline_target_requirements_v1
+                        if type(domain_production_issuance_v1) is _OfflineCommitWitnessV1:
+                            replacement = offline_target_requirements_v1(domain_production_issuance_v1)
+                        else:
+                            from .runtime.d11_life_adoption_v1 import _LifeCommitWitnessV1, life_target_requirements_v1
+                            if type(domain_production_issuance_v1) is _LifeCommitWitnessV1:
+                                replacement = life_target_requirements_v1(domain_production_issuance_v1)
+                    store.cas_graph_recovery_metadata(
+                        expected, replacement,
+                        _capability=self.__graph_capability)
+                    db.execute(
+                        "INSERT INTO graph_bundle_fences_v2"
+                        "(bot,persona,operation_id,digest,permit_json,pre_graph_revision,"
+                        "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                        "finish_request_id,finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            identity.operation_id, digest, permit_json,
+                            expected.graph_revision, expected_epoch.revision,
+                            expected.graph_revision + 1, graph_receipt.epoch.revision,
+                            finish_id, finish_digest),
+                    )
+                result.append(CommitReceipt(
+                    "committed", identity.operation_id, digest, identity.activity_id,
+                    identity.effect_id, seq, envelope.version_guard.read_versions,
+                    graph_receipt.revisions, (graph_receipt.epoch,), ledger_refs,
+                    bundle.outbox_refs,
+                ))
+                if c02_foreground_clock_reading is not None:
+                    live_now = trusted_upper(c02_foreground_clock_reading)
+                    if (c02_adoption is None or isinstance(c02_adoption[0], (_C02PendingRecovery, _C02TerminalRecovery))
+                            or not now_utc <= live_now < envelope.deadline_utc
+                            or time.monotonic() >= envelope.monotonic_deadline):
+                        raise ValueError("foreground cause clock is not the actual live C02 adopting transition")
+                    from .runtime.foreground_activity_issuance_v1 import record_live_post_c02_foreground_cause_after_cas_v1
+                    record_live_post_c02_foreground_cause_after_cas_v1(db, graph=self, bundle=bundle,
+                        receipt=result[-1], clock_reading=c02_foreground_clock_reading, live_now=live_now)
 
-        candidate = GraphCandidate(event, envelope.version_guard.read_versions,
-                                   writes, ())
-        if in_transaction:
-            GraphStore._graph_commit_in_transaction(
-                store, candidate, _guard=guard, _receipt_hook=receipt_hook,
-                _capability=self.__graph_capability,
-            )
-        else:
-            GraphStore.graph_commit(
-                store, candidate, _guard=guard, _receipt_hook=receipt_hook,
-                _capability=self.__graph_capability,
-                _transaction_state=v2_transaction_state,
-            )
-        return result[0]
+            candidate = GraphCandidate(event, envelope.version_guard.read_versions,
+                                       writes, ())
+            if in_transaction:
+                if _prepared_full_read is None:
+                    GraphStore._graph_commit_in_transaction(
+                        store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                        _capability=self.__graph_capability,
+                    )
+                else:
+                    with self._full_graph_write_capture_locked(
+                            namespace, _full_read_write_scope, candidate,
+                            phase="applied_transaction") as capture:
+                        if capture.base is not _prepared_full_read:
+                            raise UnavailableGuard("formal writer must use its actual FULL entry proof")
+                        GraphStore._graph_commit_in_transaction(
+                            store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                            _capability=self.__graph_capability, _full_read_capture=capture,
+                        )
+            else:
+                GraphStore.graph_commit(
+                    store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                    _capability=self.__graph_capability,
+                    _transaction_state=v2_transaction_state,
+                )
+            return result[0]
 
 
 __all__ = [

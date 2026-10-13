@@ -17,6 +17,7 @@ from typing import Iterator, Protocol
 from ..contracts import StaleRead
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_coordinator import GraphCoordinator, UnavailableGuard
+from ..graph_types import owner_grant_key
 from ..runtime_contracts import NamespaceId
 from .issuer import CoordinatorGrant
 from .service import AuthenticatedSession
@@ -229,7 +230,8 @@ class DurableOwnerGrantResolver:
             return None
         return CoordinatorGrant(
             grant.scope, grant.authority, grant.lease, current.capabilities,
-            current.grant_id, current.grant_revision, current.grant_digest)
+            owner_grant_key(*current.namespace.as_tuple).token,
+            current.grant_revision, current.grant_digest)
 
 
 __all__ = ("CurrentOwnerGrant", "CurrentOwnerGrantPort",

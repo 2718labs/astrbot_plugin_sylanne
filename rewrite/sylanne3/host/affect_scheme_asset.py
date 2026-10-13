@@ -111,7 +111,7 @@ def load_verified_affect_scheme(
         catalogue.get("activation_status") == "runtime_verified"
         and catalogue.get("release_eligibility") == "READY"
     ) if verification.build_mode == "formal-alpha1" else (
-        verification.runtime_scope == "backend-production-acceptance"
+        verification.runtime_scope in {"backend-production-acceptance", "backend-local-alpha2-acceptance"}
         and catalogue.get("activation_status") == "candidate_only"
         and str(catalogue.get("release_eligibility", "")).startswith("HOLD:")
     )

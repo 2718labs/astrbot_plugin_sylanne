@@ -57,3 +57,57 @@ async def test_unknown_file_holds_before_deleting_known_export(tmp_path):
             runtime, NamespaceId("bot", "persona"),
             deletion_operation_id="delete-original")
     assert target.is_file()
+
+
+@pytest.mark.asyncio
+async def test_legal_filename_does_not_authorize_deletion_of_changed_export(tmp_path):
+    root = tmp_path / "support_exports"
+    root.mkdir()
+    target = _export(root, "bot/persona")
+    target.write_bytes(target.read_bytes().replace(b'"view_status"', b'"unsafe_data"'))
+    before = target.read_bytes()
+    runtime = RuntimeContext(tmp_path, dependencies=None)
+    with pytest.raises(LocalCleanupHold, match="original differs"):
+        await purge_stopped_support_exports_v1(
+            runtime, NamespaceId("bot", "persona"), deletion_operation_id="delete-original")
+    assert target.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_exporter_and_cleanup_reject_new_unmanaged_directory(tmp_path):
+    root = tmp_path / "support_exports"
+    root.mkdir()
+    target = _export(root, "bot/persona")
+    before = target.read_bytes()
+    (root / "nested").mkdir()
+    with pytest.raises(ValueError):
+        _export(root, "bot/persona")
+    runtime = RuntimeContext(tmp_path, dependencies=None)
+    with pytest.raises(LocalCleanupHold, match="unmanaged"):
+        await purge_stopped_support_exports_v1(
+            runtime, NamespaceId("bot", "persona"), deletion_operation_id="delete-original")
+    assert target.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_exporter_and_cleanup_reject_replaced_export_root(tmp_path):
+    root = tmp_path / "support_exports"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = _export(root, "bot/persona")
+    before = target.read_bytes()
+    moved = outside / target.name
+    target.rename(moved)
+    root.rmdir()
+    try:
+        root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    with pytest.raises(ValueError):
+        _export(root, "bot/persona")
+    runtime = RuntimeContext(tmp_path, dependencies=None)
+    with pytest.raises(LocalCleanupHold, match="unsafe"):
+        await purge_stopped_support_exports_v1(
+            runtime, NamespaceId("bot", "persona"), deletion_operation_id="delete-original")
+    assert moved.read_bytes() == before

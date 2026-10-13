@@ -20,6 +20,10 @@ from ..authority_service.v2_model_egress_wire import from_wire as model_unwire
 from ..domains.d01.production_operations_v1 import plain_v1
 from ..host.authority_profile import AdminInstallationBundle
 from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from .contact_paid_original_v2 import record_contact_original_v2, require_contact_original_v2, read_contact_original_v2
 from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2, require_contact_inventory_current_v2
 from .contact_model_job_v2 import contact_model_ids_v2, read_contact_prepared_v2
@@ -54,7 +58,8 @@ class InstalledContactModelGraphRuntimeV2:
         port = graph._GraphCoordinator__content_fence_v2
         assembly = graph._GraphCoordinator__d04_installed_joint_assembly
         if (not isinstance(store, ProductionGraphStore) or type(bundle) is not AdminInstallationBundle
-                or type(bundle.model_workflows) is not AdminModelWorkflowsV3
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
+                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or port is None or assembly is None or assembly.admin_bundle is not bundle
                 or graph._GraphCoordinator__model_terminal_cost_port is None):
             raise ValueError("contact stages require actual installed W01/Authority/model accounting")

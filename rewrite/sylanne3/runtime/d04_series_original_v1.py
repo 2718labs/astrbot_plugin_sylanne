@@ -1,4 +1,5 @@
 """Explicit series original dispatch for subsequent advances and D06 consumers."""
+
 from dataclasses import asdict
 import json
 from types import SimpleNamespace
@@ -59,11 +60,20 @@ def _require_series_adopted_original_in_transaction_v1(db, namespace, operation_
     nor substitutes an old v3 numeric artifact for a series native original.
     Current content/Owner qualifications remain the caller's fenced duty.
     """
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     prefix = read_d04_original_v3(db, namespace, "series_final_native_prefix", operation_id)
-    retained = db.execute("SELECT original_ref FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind='series_adoption' "
-        "AND json_extract(payload_json,'$.operation_id')=?", (*namespace.as_tuple, operation_id)).fetchall()
-    roots = db.execute("SELECT original_ref FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind='series_root'",
-        namespace.as_tuple).fetchall()
+    from .natural_producer_qualification_v1 import (_host_producer_attachment_owner_v3,_series_adoption_refs_v3,_producer_original_many_v3)
+    from .domain_background_read_v3 import _active_v3
+    if _host_producer_attachment_owner_v3(db)is not None or _active_v3(db)is not None:
+        retained=_series_adoption_refs_v3(db,namespace,operation_id)
+        roots=_producer_original_many_v3(db,table='graph_d04_originals_v3',columns=('original_ref',),
+            key_columns=('bot','persona','kind'),key=(*namespace.as_tuple,'series_root'),order_column='original_ref',legacy_reader=None)
+    else:
+        retained = db.execute("SELECT original_ref FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind='series_adoption' "
+            "AND json_extract(payload_json,'$.operation_id')=?", (*namespace.as_tuple, operation_id)).fetchall()
+        roots = db.execute("SELECT original_ref FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind='series_root'",
+            namespace.as_tuple).fetchall()
     selected = []
     for (ref,) in roots:
         candidate = read_d04_original_v3(db, namespace, "series_root", ref)
@@ -128,32 +138,32 @@ def _require_series_adopted_original_in_transaction_v1(db, namespace, operation_
     from .d04_joint_output_original_store_v1 import read_d04_joint_output_original_v1
     from .d04_joint_advance_v2 import read_joint_advance_v2, _decode_numeric_candidate
     persisted_output = read_d04_joint_output_original_v1(db, namespace, operation_id)
-    numeric_row = db.execute("SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,verification_digest,evidence_digest FROM graph_d04_joint_numeric_originals_v1 WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, operation_id)).fetchone()
+    numeric_row = _producer_original_point_v3(db, table='graph_d04_joint_numeric_originals_v1', columns=('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest', 'evidence_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, operation_id)), legacy_reader=lambda: db.execute("SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,verification_digest,evidence_digest FROM graph_d04_joint_numeric_originals_v1 WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, operation_id)).fetchone())
     evidence = read_joint_advance_v2(db, namespace, operation_id)
     verification = derive_d04_series_numeric_verification_v1(numeric, summary,
         package_root=Path(__file__).resolve().parents[3])
     from ..graph_store import GraphStore
     from ..graph_types import GraphReceipt, NamespaceEpoch, GraphWrite, AtomKey
-    event = db.execute("SELECT revisions,invalidated,epoch_revision FROM graph_events "
+    event = _producer_original_point_v3(db, table='graph_events', columns=('revisions', 'invalidated', 'epoch_revision'), key_columns=('bot', 'persona', 'session', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))((*namespace.as_tuple, receipt.activity_id, operation_id)), legacy_reader=lambda: db.execute("SELECT revisions,invalidated,epoch_revision FROM graph_events "
         "WHERE bot=? AND persona=? AND session=? AND event_id=?",
-        (*namespace.as_tuple, receipt.activity_id, operation_id)).fetchone()
+        (*namespace.as_tuple, receipt.activity_id, operation_id)).fetchone())
     actual_receipt = None if event is None else GraphReceipt("committed", GraphStore._version_rows(event[0]),
         GraphStore._version_rows(event[1]), NamespaceEpoch(*namespace.as_tuple, event[2]))
     contributions = []
     for ref in receipt.ledger_refs:
         revision = next((value.revision for value in receipt.write_versions if value.key.token == ref), None)
-        row = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
+        row = _producer_original_point_v3(db, table='graph_history', columns=('value', 'valid'), key_columns=('token', 'revision', 'event_bot', 'event_persona', 'event_session', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3],_producer_params_v3[4],_producer_params_v3[5]))((ref, revision, *namespace.as_tuple, receipt.activity_id, operation_id)), legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
             "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-            (ref, revision, *namespace.as_tuple, receipt.activity_id, operation_id)).fetchone()
+            (ref, revision, *namespace.as_tuple, receipt.activity_id, operation_id)).fetchone())
         if row is None or row[1] != 1:
             raise ValueError("series final contribution is not in its actual atomic event")
-        contributions.append(GraphWrite(AtomKey.from_token(ref), json.loads(row[0])))
+        contributions.append(GraphWrite(AtomKey.from_token(ref), background_json_loads_v3(row[0])))
     from .d04_series_adoption_v1 import _evidence
     expected_evidence = _evidence(root, decoded, numeric, output, summary, tuple(chunks), tuple(contributions))
     if (persisted_output != output or numeric_row is None or _decode_numeric_candidate(numeric_row[0]) != numeric
             or numeric_row[1] != numeric.receipt_digest
-            or numeric_row[2] != canonical_serialize(asdict(verification))
+            or not background_json_matches_v3(numeric_row[2],asdict(verification))
             or numeric_row[3] != canonical_digest(asdict(verification))
             or numeric_row[4] != expected_evidence.digest
             or evidence != expected_evidence or evidence.full_transcript_digest != numeric.full_transcript_sha256
@@ -181,11 +191,11 @@ def _require_series_adopted_original_in_transaction_v1(db, namespace, operation_
         raise ValueError("series final atomic event has an unrelated or missing write")
     job_ref = series_own_job_ref_v1(root)
     job_revision = next(version.revision for version in receipt.write_versions if version.key.token == job_ref)
-    job = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=? AND event_bot=? "
+    job = _producer_original_point_v3(db, table='graph_history', columns=('value', 'valid'), key_columns=('token', 'revision', 'event_bot', 'event_persona', 'event_session', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3],_producer_params_v3[4],_producer_params_v3[5]))((job_ref, job_revision, *namespace.as_tuple, receipt.activity_id, operation_id)), legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=? AND event_bot=? "
         "AND event_persona=? AND event_session=? AND event_id=?",
-        (job_ref, job_revision, *namespace.as_tuple, receipt.activity_id, operation_id)).fetchone()
-    if (job is None or job[1] != 1 or json.loads(job[0])["phase"] != "completed"
-            or json.loads(job[0])["usage_digest"] != canonical_digest({"cpu_ms": adopted[0]["actual_cpu_ms"]})
-            or json.loads(job[0])["result_ref"] != root.root_ref):
+        (job_ref, job_revision, *namespace.as_tuple, receipt.activity_id, operation_id)).fetchone())
+    if (job is None or job[1] != 1 or background_json_loads_v3(job[0])["phase"] != "completed"
+            or background_json_loads_v3(job[0])["usage_digest"] != canonical_digest({"cpu_ms": adopted[0]["actual_cpu_ms"]})
+            or background_json_loads_v3(job[0])["result_ref"] != root.root_ref):
         raise ValueError("series final actual worker was not atomically completed with all CPU")
     return root, tuple(chunks), numeric, output, summary

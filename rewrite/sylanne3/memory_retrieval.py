@@ -253,7 +253,7 @@ class MemoryRetriever:
         def inspect(key: AtomKey, raw_record) -> bool:
             """Return False only when the node budget stopped this candidate."""
             nonlocal node_count
-            if raw_record is None or not self._predicate(raw_record, query, folded_terms):
+            if raw_record is None:
                 return True
             remaining = max_nodes - node_count
             if remaining < 1:
@@ -270,7 +270,7 @@ class MemoryRetriever:
                     )
                     self._check_snapshot_epoch(proof, epoch)
                     node_count += len(proof.atoms)
-                    if record is not None:
+                    if record is not None and self._predicate(record, query, folded_terms):
                         sources = (record,)
                         hits.append(MemoryHit(
                             key, record, proof.versions, _unique_roots(sources), sources
@@ -287,7 +287,7 @@ class MemoryRetriever:
                 )
                 self._check_snapshot_epoch(interpretation_proof, epoch)
                 node_count += len(interpretation_proof.atoms)
-                if record is None:
+                if record is None or not self._predicate(record, query, folded_terms):
                     return True
                 sources: list[SourceRecord] = []
                 proofs = [interpretation_proof]

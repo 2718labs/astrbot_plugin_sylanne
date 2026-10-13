@@ -98,7 +98,7 @@ class _Graph:
         raise AssertionError("P2 began without an installed natural final claim")
 
 
-async def _run(graph, continuation=None):
+async def _run(graph, continuation=None, *, fresh_dispatch=False):
     worker = await GraphWorker.start(
         lambda: SimpleNamespace(close=lambda: None), lambda _store: graph)
     try:
@@ -110,7 +110,7 @@ async def _run(graph, continuation=None):
             continuation._lease = lease
         return await NaturalReplyDispatchDriverV2(
             worker, authority, lease, continuation).run_once(
-                operation_id="natural-op")
+                operation_id="natural-op", fresh_dispatch=fresh_dispatch)
     finally:
         await worker.close()
 
@@ -145,7 +145,7 @@ def test_lost_natural_handoff_ack_is_unknown_without_second_send():
         return CurrentEffectReadV2(
             "authority", "ns-a", original.effect_id, 1, "absent", 0, "head")
     continuation.read_recovery_state = absent
-    result = asyncio.run(_run(graph, continuation))
+    result = asyncio.run(_run(graph, continuation, fresh_dispatch=True))
     assert result.status == "unknown" and calls == ["natural-op"]
     assert graph.calls == ["original", "text"]
 
@@ -185,12 +185,33 @@ def test_verified_owner_barrier_holds_but_ambiguous_handoff_stays_unknown():
         raise V2OwnerAuthorizationBarrier("current Owner authorization bars handoff")
 
     continuation.dispatch = owner_barrier
-    denied = asyncio.run(_run(graph, continuation))
+    denied = asyncio.run(_run(graph, continuation, fresh_dispatch=True))
     assert denied.status == "hold"
 
     async def socket_unknown(_original):
         raise V2FenceOutcomeUnknown("handoff response lost")
 
     continuation.dispatch = socket_unknown
-    unknown = asyncio.run(_run(graph, continuation))
+    unknown = asyncio.run(_run(graph, continuation, fresh_dispatch=True))
     assert unknown.status == "unknown"
+
+
+def test_absent_effect_recovery_is_read_only_and_does_not_create_a_fresh_send():
+    graph = _Graph()
+    continuation = object.__new__(InstalledNaturalReplyContinuationV2)
+    calls = []
+
+    async def absent(original):
+        return CurrentEffectReadV2("authority", "ns-a", original.effect_id, 1,
+                                   "absent", 0, "head")
+
+    async def dispatch(original):
+        calls.append(original.operation_id)
+        raise AssertionError("recovery must not automatically send an absent effect")
+
+    continuation.read_recovery_state = absent
+    continuation.dispatch = dispatch
+    result = asyncio.run(_run(graph, continuation))
+    assert result.status == "hold" and "recovery read only" in result.reason
+    assert result.original is not None
+    assert not calls

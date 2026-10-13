@@ -161,11 +161,18 @@ class ReverseGraphClaimClient:
             ssl.PEM_cert_to_DER_cert(
                 profile.client_certificate.read_text(encoding="ascii"))).hexdigest()
 
-    def claim(self, context: DispatchHandoffContextV1,
+    def claim(self, context, binding, claimed, witness, snapshot):
+        return self._claim_current_channel_v1(context,binding,claimed,witness,snapshot)
+
+    def claim_contact_v1(self, context, binding, claimed, witness, snapshot, contact_policy_capsule):
+        return self._claim_current_channel_v1(context,binding,claimed,witness,snapshot,
+            contact_policy_capsule=contact_policy_capsule)
+
+    def _claim_current_channel_v1(self, context: DispatchHandoffContextV1,
               binding: ExecutionBindingV2,
               claimed: MutationReceiptV2,
               witness: OwnerDispatchWitnessV1,
-              snapshot: AuthorityDispatchSnapshotV1) -> DispatchGraphClaimReceiptV1:
+              snapshot: AuthorityDispatchSnapshotV1, *, contact_policy_capsule=None) -> DispatchGraphClaimReceiptV1:
         profile = self.profile
         require_exact_reverse_handoff_identity(
             profile.namespace, context, binding, claimed,
@@ -181,6 +188,14 @@ class ReverseGraphClaimClient:
             "owner_witness": to_wire(witness),
             "authority_snapshot": to_wire(snapshot),
         }
+        if contact_policy_capsule is not None:
+            from .contact_p2_contract_v1 import (
+                require_exact_contact_p2_policy_capsule_v1, contact_p2_policy_capsule_to_wire_v1,
+            )
+            require_exact_contact_p2_policy_capsule_v1(context,binding,claimed,witness,snapshot,contact_policy_capsule)
+            message["contact_policy_capsule"] = contact_p2_policy_capsule_to_wire_v1(contact_policy_capsule)
+        elif binding.origin.proactive_contact is True:
+            raise AuthorityUnavailable("Contact reverse requires its actual current policy capsule")
         response = self._exchange(message)
         try:
             value = json.loads(response)

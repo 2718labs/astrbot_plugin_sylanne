@@ -143,3 +143,32 @@ def test_original_compression_cannot_fall_back_after_port_disappears(monkeypatch
     db.execute("UPDATE graph_atoms SET revision=2,value=?", (json.dumps(decision.activation_write.value),))
     with pytest.raises(ValueError):
         frame.freeze_current_natural_frame_v4(db, **args, original=result)
+
+
+def test_semantic_history_v5_replays_exact_wire_and_rejects_template_change(monkeypatch):
+    from sylanne3.model_broker.natural_reply_history_v4 import (
+        INPUT_SCHEMA_V5, FROZEN_SCHEMA_V5, TEMPLATE_DIGEST_V5)
+    from sylanne3.runtime.natural_original_v3 import natural_generation_template_digest
+    db, args, _, _ = case(monkeypatch)
+    result, _, decision = frame.freeze_current_natural_frame_v4(
+        db, **args, input_schema=INPUT_SCHEMA_V5)
+    assert result.schema == FROZEN_SCHEMA_V5
+    assert natural_generation_template_digest(result) == TEMPLATE_DIGEST_V5
+    assert decision.activation_write is None
+    recovered, _, _ = frame.freeze_current_natural_frame_v4(
+        db, **dict(args, now_utc=101.0), original=result,
+        input_schema=INPUT_SCHEMA_V5)
+    assert recovered == result
+    with pytest.raises(ValueError, match="original input schema"):
+        frame.freeze_current_natural_frame_v4(
+            db, **dict(args, now_utc=101.0), original=result)
+
+
+def test_old_history_original_cannot_be_reinterpreted_as_semantic_v5(monkeypatch):
+    from sylanne3.model_broker.natural_reply_history_v4 import INPUT_SCHEMA_V5
+    db, args, _, _ = case(monkeypatch)
+    original, _, _ = frame.freeze_current_natural_frame_v4(db, **args)
+    with pytest.raises(ValueError, match="original input schema"):
+        frame.freeze_current_natural_frame_v4(
+            db, **dict(args, now_utc=101.0), original=original,
+            input_schema=INPUT_SCHEMA_V5)

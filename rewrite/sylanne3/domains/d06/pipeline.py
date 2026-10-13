@@ -156,7 +156,7 @@ def validate_first_encoding_authority_result(
     if (type(source_revision) is not int or source_revision < 1
             or type(access_revision) is not int or access_revision < 1):
         raise ValueError("committed source and access revisions are required")
-    payload, template_digest = build_first_ingress_encoding_payload(original_source)
+    payload, template_digest = build_first_ingress_encoding_payload(original_source,template_version=frozen_request["prompt_template_version"])
     if (frozen_request.get("source_id") != original_source.source_id
             or frozen_request.get("payload") != payload
             or frozen_request.get("prompt_template_digest") != template_digest):
@@ -245,7 +245,7 @@ def validate_first_encoding_authority_result(
     result = observation.result
     if type(result) is not dict:
         raise ValueError("completed original result is unavailable")
-    parse_first_ingress_encoding_result(result, original_source)
+    parse_first_ingress_encoding_result(result, original_source,template_version=frozen_request["prompt_template_version"])
     return result
 
 
@@ -1066,6 +1066,8 @@ class D06MemoryPipeline:
         vector_model_id: str | None = None,
         vector_preprocessing_id: str | None = None,
         vector_enabled: bool = True,
+        max_candidates_per_channel: int = 32,
+        max_nodes_per_channel: int = 128,
     ) -> RetrievalOutcome:
         """Run only qualified bounded searches and return authorization-bound candidates."""
 
@@ -1075,6 +1077,9 @@ class D06MemoryPipeline:
             raise TypeError("plans must be a tuple of SearchPlan")
         if len(plans) > 5:
             raise ValueError("at most five structural search plans are allowed")
+        for value, maximum in ((max_candidates_per_channel, 32), (max_nodes_per_channel, 128)):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError("structural channel budget exceeds its existing hard ceiling")
         _epoch(access_epoch, "access_epoch")
         _epoch(delete_epoch, "delete_epoch")
         if qualification.mode in {"no_history_search", "working_set_only"}:
@@ -1093,9 +1098,9 @@ class D06MemoryPipeline:
                 purpose=purpose,
                 as_known_at=as_known_at,
                 valid_at=valid_at,
-                max_candidates=32,
-                max_nodes=128,
-                page_size=32,
+                max_candidates=max_candidates_per_channel,
+                max_nodes=max_nodes_per_channel,
+                page_size=max_candidates_per_channel,
                 max_pages=1,
                 expected_epoch=expected_epoch,
             )

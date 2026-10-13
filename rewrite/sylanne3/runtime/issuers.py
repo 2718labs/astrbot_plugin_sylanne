@@ -17,12 +17,13 @@ import math
 import re
 import sqlite3
 import time
-from typing import Mapping
+from typing import Mapping, TYPE_CHECKING
 
-from ..graph_coordinator import (
-    BudgetAdmission, JobBinding, RuntimeAdmission, ScheduleAdmission,
-    budget_operation_digest,
-)
+if TYPE_CHECKING:
+    from ..graph_coordinator import (
+        BudgetAdmission, JobBinding, RuntimeAdmission, ScheduleAdmission,
+        budget_operation_digest,
+    )
 from ..graph_types import AtomKey
 from ..runtime_contracts import (
     CommandEnvelope, DomainBundle, FenceScope, NamespaceId, OperationIdentity,
@@ -1109,14 +1110,16 @@ def _payload(value: object) -> dict[str, object]:
 
 
 def _decode_quote(payload: str) -> ResourceQuote:
-    value = json.loads(payload)
+    from .domain_background_read_v3 import background_json_loads_v3
+    value = background_json_loads_v3(payload)
     value["outbox_refs"] = tuple(value["outbox_refs"])
     value["d02_settlement_refs"] = tuple(value["d02_settlement_refs"])
     return ResourceQuote(**value)
 
 
 def _decode_grant(payload: str) -> BudgetLeaseGrant:
-    value = json.loads(payload)
+    from .domain_background_read_v3 import background_json_loads_v3
+    value = background_json_loads_v3(payload)
     value["allowed_work_kinds"] = tuple(value["allowed_work_kinds"])
     return BudgetLeaseGrant(**value)
 
@@ -1160,6 +1163,36 @@ class _Signer:
 
     def verify(self, kind: str, payload: str, signature: str) -> None:
         if not hmac.compare_digest(self.sign(kind, payload), signature):
+            raise IssuerAuthorityDenied(f"{kind} signature is invalid")
+
+    def begin_original_stream_verification_v3(self, kind: str, original):
+        """Use the unchanged kind prefix for a private actual-column read."""
+        from .domain_background_read_v3 import BackgroundJSONColumnV3, require_background_signature_column_v3
+        from .current_method_learning_read_v3 import MethodJSONColumnV3, require_method_signature_column_v3
+        from ..authority_service.current_authority_graph_read_v3 import AuthoritySignedJSONColumnV3, require_authority_signature_column_v3
+        if type(original) is BackgroundJSONColumnV3:
+            require_background_signature_column_v3(original, signer=self, kind=kind)
+        elif type(original) is MethodJSONColumnV3:
+            require_method_signature_column_v3(original, signer=self, kind=kind)
+        elif type(original) is AuthoritySignedJSONColumnV3:
+            require_authority_signature_column_v3(original,signer=self,kind=kind)
+        else:
+            raise IssuerAuthorityDenied("actual fixed original signature column required")
+        return hmac.new(self.__key, (kind + "\n").encode("utf-8"), hashlib.sha256)
+
+    def finish_original_stream_verification_v3(self, kind: str, signature: str, original, verifier) -> None:
+        from .domain_background_read_v3 import BackgroundJSONColumnV3, require_background_signature_column_v3
+        from .current_method_learning_read_v3 import MethodJSONColumnV3, require_method_signature_column_v3
+        from ..authority_service.current_authority_graph_read_v3 import AuthoritySignedJSONColumnV3, require_authority_signature_column_v3
+        if type(original) is BackgroundJSONColumnV3:
+            require_background_signature_column_v3(original, signer=self, kind=kind, signature=signature, verifier=verifier, complete=True)
+        elif type(original) is MethodJSONColumnV3:
+            require_method_signature_column_v3(original, signer=self, kind=kind, signature=signature, verifier=verifier, complete=True)
+        elif type(original) is AuthoritySignedJSONColumnV3:
+            require_authority_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
+        else:
+            raise IssuerAuthorityDenied("actual fixed original signature column required")
+        if not hmac.compare_digest(verifier.hexdigest(), signature):
             raise IssuerAuthorityDenied(f"{kind} signature is invalid")
 
 
@@ -1762,20 +1795,52 @@ class D02ResourceIssuer:
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise IssuerAuthorityDenied("resource quote payload is invalid") from exc
 
-    def original_signed_quote(self, db, quote_id: str, version: int) -> ResourceQuote:
+    def original_signed_quote(self, db, quote_id: str, version: int, *, meter=None, prepared_originals=None) -> ResourceQuote:
         """Read original signed accounting bounds after expiry or revocation.
 
         This historical read authorizes no new work or budget reservation.
         The caller must independently join the original job, Authority call,
         and durable budget reservation before recording a cost.
         """
-        row = db.execute(
-            "SELECT quote_json,signature FROM runtime_resource_quotes "
-            "WHERE quote_id=? AND version=?", (quote_id, version),
-        ).fetchone()
+        if prepared_originals is not None:
+            from .current_graph_source_material_v3 import PreparedCurrentC02OriginalsV3
+            from .c09_paged_sql_v2 import require_c09_reserved_meter_v3
+            if(type(prepared_originals)is not PreparedCurrentC02OriginalsV3 or meter is None
+                    or meter is not require_c09_reserved_meter_v3(meter.budget)):
+                raise IssuerAuthorityDenied('actual completed caller C02 original streams required')
+            return prepared_originals.require_quote_for_v3(self,db,quote_id,version)
+        from ..authority_service.current_authority_graph_read_v3 import (
+            read_bound_authority_graph_attachment_v3,authority_verify_signature_v3)
+        authority,row=read_bound_authority_graph_attachment_v3(db,table='runtime_resource_quotes',
+            columns=('quote_json','signature'),key_columns=('quote_id','version'),key=(quote_id,version))
+        if authority:
+            if row is None:raise IssuerAuthorityDenied('original signed D02 quote is absent')
+            authority_verify_signature_v3(self._signer,'resource-quote.v1',row[0],row[1])
+            raw=row[0].json_v3()
+            if not row[0].matches_v3(raw):raise IssuerAuthorityDenied('Authority quote exact raw EOF changed')
+            raw['outbox_refs']=tuple(raw['outbox_refs']);raw['d02_settlement_refs']=tuple(raw['d02_settlement_refs'])
+            quote=ResourceQuote(**raw)
+            if(quote.quote_id,quote.version)!=(quote_id,version):
+                raise IssuerAuthorityDenied('original signed D02 quote identity differs')
+            return quote
+        from .domain_background_read_v3 import read_bound_background_graph_attachment_v3, background_verify_signature_v3
+        background,row=read_bound_background_graph_attachment_v3(db,table='runtime_resource_quotes',
+            columns=('quote_json','signature'),key_columns=('quote_id','version'),key=(quote_id,version))
+        if background:pass
+        elif meter is None:
+            row = db.execute(
+                "SELECT quote_json,signature FROM runtime_resource_quotes "
+                "WHERE quote_id=? AND version=?", (quote_id, version),
+            ).fetchone()
+        else:
+            from .c09_paged_sql_v2 import require_c09_reserved_meter_v3
+            if meter is not require_c09_reserved_meter_v3(meter.budget):
+                raise IssuerAuthorityDenied('original quote requires the actual caller quantum')
+            row=meter.read_fixed_row(db,'runtime_resource_quotes',('quote_json','signature'),
+                'quote_id=? AND version=?',(quote_id,version))
         if row is None:
             raise IssuerAuthorityDenied("original signed D02 quote is absent")
-        self._signer.verify("resource-quote.v1", row[0], row[1])
+        background_verify_signature_v3(self._signer,"resource-quote.v1",row[0],row[1])
         try:
             quote = _decode_quote(row[0])
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -1875,6 +1940,20 @@ class D11BudgetGrantIssuer:
         return signature
 
     def _load_grant(self, db, lease_id: str) -> BudgetLeaseGrant:
+        from .current_method_learning_read_v3 import read_bound_method_budget_grant_v3
+        handled, prepared = read_bound_method_budget_grant_v3(db, lease_id)
+        if handled:
+            if type(prepared) is not BudgetLeaseGrant:
+                raise IssuerAuthorityDenied("actual verified typed Method budget grant required")
+            return prepared
+        from .domain_background_read_v3 import _active_v3
+        from ..authority_service.model_reply_scope_observation_v3 import read_model_reply_latest_budget_grant_metadata_v3
+        observed,actual=read_model_reply_latest_budget_grant_metadata_v3(db,lease_id)
+        if observed or _active_v3(db)is not None:
+            if not observed:
+                actual=db.execute("SELECT version,status FROM runtime_budget_grants WHERE lease_id=? ORDER BY version DESC LIMIT 1",(lease_id,)).fetchone()
+            if actual is None or actual[1]!='active':raise IssuerAuthorityDenied('signed D11 budget lease grant is absent')
+            return self.signed_budget_grant_at_version(db,lease_id,actual[0])[0]
         row = db.execute(
             "SELECT grant_json,signature,status FROM runtime_budget_grants "
             "WHERE lease_id=? ORDER BY version DESC LIMIT 1", (lease_id,),
@@ -1894,13 +1973,15 @@ class D11BudgetGrantIssuer:
     def signed_budget_grant_at_version(self, db, lease_id: str,
                                        version: int) -> tuple[BudgetLeaseGrant, str]:
         """Verify an original signed grant for receipt replay, regardless of current status."""
-        row = db.execute(
+        from .domain_background_read_v3 import background_point_v3, background_verify_signature_v3
+        row=background_point_v3(db,table='runtime_budget_grants',columns=('grant_json','signature'),
+            key_columns=('lease_id','version'),key=(lease_id,version),legacy_reader=lambda:db.execute(
             "SELECT grant_json,signature FROM runtime_budget_grants "
             "WHERE lease_id=? AND version=?", (lease_id, version),
-        ).fetchone()
+        ).fetchone())
         if row is None:
             raise IssuerAuthorityDenied("historical D11 budget lease grant is absent")
-        self._signer.verify("budget-grant.v1", row[0], row[1])
+        background_verify_signature_v3(self._signer,"budget-grant.v1",row[0],row[1])
         try:
             grant = _decode_grant(row[0])
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -2718,6 +2799,7 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         source/access graph, original model cost and fenced job transition.
         This method never signs a new quote or changes a reservation.
         """
+        from ..graph_coordinator import BudgetAdmission, RuntimeAdmission, budget_operation_digest
         from .c02_bundle_codec import c02_bundle_to_wire
 
         now = _now_utc(now_utc)
@@ -3071,6 +3153,7 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
 
     def admit_schedule(self, envelope: CommandEnvelope, db, *,
                        now_utc: float | None = None) -> ScheduleAdmission:
+        from ..graph_coordinator import BudgetAdmission, ScheduleAdmission
         now_utc = _now_utc(now_utc)
         quote, _, lease = self._admission_state(envelope, db, now_utc=now_utc)
         if quote.required_worker_fence is not None:
@@ -3082,6 +3165,7 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
 
     def admit_runtime(self, bundle: DomainBundle, db, *,
                       now_utc: float | None = None) -> RuntimeAdmission:
+        from ..graph_coordinator import BudgetAdmission, JobBinding, RuntimeAdmission, budget_operation_digest
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
         envelope = bundle.envelope

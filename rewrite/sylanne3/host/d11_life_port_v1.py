@@ -1,4 +1,5 @@
 """Life operations on the actual paired mTLS fence port; no caller result channel."""
+from ..runtime.d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from .v2_fence_port import V2FencePort, V2FenceOutcomeUnknown
@@ -13,6 +14,36 @@ class InstalledD11LifePortV1:
         if type(port) is not V2FencePort or type(port._transport) is not MtlsAuthorityTransport:
             raise TypeError("Life needs the actual installed paired mTLS fence port")
         self.port = port
+
+    async def _draft_observation_call_v1(self, binding, request, method, outcome=None):
+        from ..runtime.d11_artifact_draft_contract_v1 import (DraftFileObservationRequestV1,
+            DraftObservationOutcomeV1, draft_to_wire_v1, draft_from_wire_v1)
+        if type(binding) not in LIFE_BINDING_TYPES or type(request) is not DraftFileObservationRequestV1:
+            raise TypeError("closed installed draft observation selectors required")
+        handshake, grant = self.port._identity()
+        if (binding.authority_id, binding.installation_id) != (grant.authority_id, grant.installation_id):
+            raise RuntimeError("draft observation paired installation differs")
+        command = {"namespace": binding.authority_namespace, "binding": life_to_wire_v1(binding), "request": draft_to_wire_v1(request)}
+        if method == "d11_draft_observation_original_v1":
+            command["outcome"] = None if outcome is None else draft_to_wire_v1(outcome)
+        response = await self.port._transport._content_rpc(self.port._request, handshake, method, command, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"} or response["channel_binding_sha256"] != handshake.channel_binding_sha256:
+            raise RuntimeError("draft observation authenticated response differs")
+        result = None if response["result"] is None else draft_from_wire_v1(response["result"], DraftObservationOutcomeV1)
+        if result is not None and (result.call_id != request.call_id or result.original_effect_id != binding.effect_id
+                or result.original_binding_digest != binding.digest):
+            raise RuntimeError("draft observation response belongs to another original call/effect")
+        return result
+
+    def observe_artifact_draft_v1(self, *, binding, request):
+        try:
+            return self.port._submit(self._draft_observation_call_v1(binding, request, "d11_draft_observe_v1"))
+        except (RuntimeError, FutureTimeout) as exc:
+            raise V2FenceOutcomeUnknown("observation ACK lost; inspect the original read call, never reread its file automatically") from exc
+
+    def read_draft_observation_original_v1(self, *, binding, request, outcome=None):
+        return self.port._submit(self.port._with_session_repair(
+            lambda: self._draft_observation_call_v1(binding, request, "d11_draft_observation_original_v1", outcome)))
 
     def read_d11_life_execution_inventory_v1(self, *, namespace, permit):
         from ..authority_service.v2_contract import to_wire
@@ -32,7 +63,7 @@ class InstalledD11LifePortV1:
         return self.port._submit(self.port._with_session_repair(read))
 
     async def _call(self, binding, method, *, action=None, gate=None, outcome=None):
-        if type(binding) is not D11LifeExecutionBindingV1:
+        if type(binding) not in LIFE_BINDING_TYPES:
             raise TypeError("Life accepts its fixed actual prepared execution selector only")
         port = self.port
         handshake, grant = port._identity()

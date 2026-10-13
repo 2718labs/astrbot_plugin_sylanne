@@ -298,3 +298,48 @@ __all__ = [
     "read_c09_erasure_barrier_v1", "record_c09_erasure_barrier_after_graph_v1",
     "verify_c09_graph_barrier_v1",
 ]
+
+
+
+SOURCE_BARRIER_ORIGINAL_DDL_V2 = 'CREATE TABLE graph_c09_erasure_barriers_v2 (bot TEXT NOT NULL,persona TEXT NOT NULL,operation_id TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(bot,persona,operation_id))'
+
+
+def install_c09_erasure_barrier_store_v2(db):
+    db.execute(SOURCE_BARRIER_ORIGINAL_DDL_V2.replace("CREATE TABLE ","CREATE TABLE IF NOT EXISTS ",1))
+    for action in ("UPDATE","DELETE"):
+        db.execute("CREATE TRIGGER IF NOT EXISTS graph_c09_erasure_barriers_v2_"+action.lower()+"_immutable BEFORE "+action+" ON graph_c09_erasure_barriers_v2 BEGIN SELECT RAISE(ABORT,'C09 V2 Source barrier immutable'); END")
+
+
+def read_c09_erasure_barrier_v2(db,namespace,operation_id):
+    from .c09_source_plan_barrier_v2 import C09GraphBarrierReceiptV2
+    row=db.execute('SELECT receipt_json FROM graph_c09_erasure_barriers_v2 WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation_id)).fetchone()
+    if row is None:return None
+    original=C09GraphBarrierReceiptV2.from_wire(json.loads(row[0]))
+    if original.namespace!=namespace or original.operation_id!=operation_id or canonical_serialize(asdict(original))!=row[0]:
+        raise ValueError('C09 V2 barrier original canonical identity differs')
+    return original
+
+
+def record_c09_erasure_barrier_complete_v2(db,receipt,*,plan):
+    from .c09_source_plan_barrier_v2 import C09GraphBarrierReceiptV2,read_c09_source_work_v2,require_c09_source_stamp_v2
+    if not db.in_transaction or type(receipt) is not C09GraphBarrierReceiptV2 or receipt.plan_digest!=plan.digest:
+        raise ValueError('C09 V2 completed Source barrier requires actual transaction and plan')
+    state=read_c09_source_work_v2(db,receipt.namespace,receipt.operation_id)
+    require_c09_source_stamp_v2(db,receipt.namespace,state)
+    if (state['phase']!='barrier_complete' or not state.get('recovery_closed') or state['barrier_count']!=receipt.affected_count
+            or state['verify_count']!=receipt.withdrawn_count or state['verify_root']!=receipt.withdrawn_root
+            or state['barrier_pages']!=receipt.page_count or state['barrier_page_root']!=receipt.page_root):
+        raise ValueError('C09 V2 barrier has no completed actual EOF/page/history sweep')
+    prior=read_c09_erasure_barrier_v2(db,receipt.namespace,receipt.operation_id)
+    if prior is not None:
+        if prior!=receipt:raise ValueError('C09 V2 Source barrier replay differs')
+        return prior
+    db.execute('INSERT INTO graph_c09_erasure_barriers_v2 VALUES(?,?,?,?)',(*receipt.namespace.as_tuple,receipt.operation_id,canonical_serialize(asdict(receipt))))
+    return receipt
+
+
+def read_c09_erasure_barrier_versioned_v2(db,namespace,operation_id):
+    new=read_c09_erasure_barrier_v2(db,namespace,operation_id)
+    old=read_c09_erasure_barrier_v1(db,namespace,operation_id)
+    if new is not None and old is not None:raise ValueError('C09 operation has two barrier versions')
+    return new if new is not None else old

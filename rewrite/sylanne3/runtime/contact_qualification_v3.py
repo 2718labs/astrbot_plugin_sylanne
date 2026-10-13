@@ -43,11 +43,11 @@ class CurrentContactQualificationV3:
         return canonical_digest(self)
 
 
-def _social_reads(db, snapshot, query, content, route, context, now):
-    projection = read_current_dispatch_projection(db, content.namespace, snapshot, query)
+def _social_reads(db, snapshot, query, content, route, context, now, *, prepared_inventory=None):
+    projection = read_current_dispatch_projection(db, content.namespace, snapshot, query, prepared_inventory=prepared_inventory)
     request = RoleBindingRequest('persona:' + content.namespace.persona_id,
         route.target_entity_ref, None, content.scene_id, 'message', 'expression', now, True)
-    role, boundary = derive_current_domain_reads(db, projection, request, context)
+    role, boundary = derive_current_domain_reads(db, projection, request, context, prepared_inventory=prepared_inventory)
     if projection.coverage != 'full' or role.status != 'complete' or boundary.coverage != 'full':
         raise ValueError('contact social inventory is incomplete')
     return projection, role, boundary

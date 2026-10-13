@@ -312,6 +312,66 @@ class AuthorityV2SelfIdentityService:
                 or request.manifest_digest != self._manifest_digest
                 or subject != self._read_subject):
             raise AuthorityUnavailable("self identity reader installation differs")
+        return self._current_for_installed_permit(
+            credential=credential, subject=subject, request=request)
+
+    def current_for_c04_v4(self, *, credential, reader, binding, permit):
+        """Closed Authority-internal read for the installed C04 exclusive claim."""
+        from .c04_current_execution_v3 import InstalledC04CurrentReaderV3
+        from .internal_work_contract import InternalWorkBindingV1
+        from .c04_exclusive_execution_v3 import _operation
+        from ..host.installed_d06_build import ALGORITHM_ID_V4
+        if (type(reader) is not InstalledC04CurrentReaderV3
+                or reader.foreground_observer is None
+                or reader.foreground_observer.self_identity is not self
+                or reader.namespace != self._namespace_id
+                or reader.graph_path != self._graph._path
+                or type(binding) is not InternalWorkBindingV1
+                or binding.algorithm_ref != ALGORITHM_ID_V4
+                or binding.namespace != self._fences.namespace
+                or type(permit) is not FencePermitV2
+                or permit.subject != "c04-exclusive:" + binding.binding_digest
+                or permit.operation != "write"
+                or permit.operation_id != _operation(binding, "claim")
+                or permit.generation != binding.activation_generation):
+            raise AuthorityUnavailable("Self C04 identity read crossed its installed exclusive claim")
+        request = SelfIdentityCurrentRequestV1(
+            permit.authority_id, self._fences.namespace, self._namespace_id,
+            self._installation_id, self._manifest_digest, binding.operation_id, permit)
+        self._core._require(credential, "self_identity_read",
+                            request.authority_namespace, self._holder)
+        location_reader, owner_reader = self._source_location, self._owner_storage
+        if location_reader is None or owner_reader is None:
+            raise AuthorityUnavailable("Self C04 lacks its actual installed current storage readers")
+        # Read-only internal observation. The caller cannot open/finish a fence,
+        # mutate an Owner grant, or borrow the public Host read subject.
+        location = location_reader._observe(purpose="business", credential=credential,
+            subject=permit.subject, permit=permit)
+        with self._fences._frozen() as (db, deletion, execution, history):
+            before = self._read_locked(db, deletion, execution, history,
+                credential, permit.subject, request, location)
+            owner_head = owner_reader._head_in_tx(db)
+            owner_reader._background_identity_in_tx(db, owner_head)
+        if before is None:
+            return None
+        head, guard, anchor, epoch = before
+        if owner_head.guard != guard:
+            raise AuthorityUnavailable("Self C04 storage Owner head differs")
+        _, _, admission = owner_reader._read_graph(owner_head=owner_head, anchor=anchor)
+        current_graph = self._graph.current(request.namespace, anchor, request.installation_id, guard,
+            source_location=location_reader, location_observation=location,
+            storage_admission=admission, holder=self._holder)
+        if current_graph is None:
+            raise AuthorityUnavailable("Self C04 current D01 role/storage identity is unavailable")
+        with self._fences._frozen() as (db, deletion, execution, history):
+            after = self._read_locked(db, deletion, execution, history,
+                credential, permit.subject, request, location)
+            if after != before or owner_reader._head_in_tx(db) != owner_head:
+                raise AuthorityUnavailable("Self C04 mapping or Owner changed during actual graph read")
+            owner_reader._background_identity_in_tx(db, owner_head)
+        return self._current_value(request, head, guard, anchor, current_graph, admission)
+
+    def _current_for_installed_permit(self, *, credential, subject, request):
         self._core._require(credential, "self_identity_read",
                             request.authority_namespace, self._holder)
         location = current_owner = None
@@ -344,8 +404,12 @@ class AuthorityV2SelfIdentityService:
                                       history, credential, subject, request, location)
             if after != before:
                 raise AuthorityUnavailable("self identity changed during graph read")
-        graph_incarnation, role_head_id, graph_revision, graph_epoch = current_graph
         admission = None if current_owner is None else current_owner.storage_admission
+        return self._current_value(request, head, guard, anchor, current_graph, admission)
+
+    @staticmethod
+    def _current_value(request, head, guard, anchor, current_graph, admission):
+        graph_incarnation, role_head_id, graph_revision, graph_epoch = current_graph
         return AuthorityCurrentSelfIdentityV1(
             namespace=request.namespace,
             authority_namespace=request.authority_namespace,

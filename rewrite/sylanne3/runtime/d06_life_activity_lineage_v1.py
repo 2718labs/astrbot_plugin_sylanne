@@ -15,7 +15,7 @@ from ..domains.d08.execution import _decode
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1, raw_head_value_v1
 from .d11_life_contract_v1 import D11LifeTerminalV1, life_from_wire_v1, life_to_wire_v1
 from .d11_life_preparation_v1 import _read, read_prepared_life_v1
-from .d11_life_adoption_v1 import _read_signed, verify_life_adoption_commit_v1
+from .d11_life_adoption_v1 import _read_signed, _verify_life_adoption_commit_and_original_v1
 from .d11_life_source_note_v1 import verify_durable_life_artifact_v1
 from .d10_life_outcome_v2 import life_experience_source_id_v1, life_experience_provenance_ref_v1
 from .d02_life_effect_v1 import require_life_body_quote_v1
@@ -114,11 +114,10 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
     gate = life_bridge_from_wire_v1(bridge[1])
     if gate.binding != b or gate.terminal != terminal:
         raise ValueError("Life experience differs from its signed execution bridge")
-    receipt = verify_life_adoption_commit_v1(db, gate=gate, issuer=issuer,
-        resource_issuer=installed_readers.resource_issuer, require_current_metadata=False)
-    from .d11_life_terminal_v1 import read_adopted_life_original_v1
+    receipt, fact_original = _verify_life_adoption_commit_and_original_v1(db,
+        gate=gate, issuer=issuer, resource_issuer=installed_readers.resource_issuer,
+        require_current_metadata=False)
     from .d11_life_fact_provenance_v1 import require_current_life_fact_eligibility_v1
-    fact_original=read_adopted_life_original_v1(db,namespace=ns,result_ref=b.artifact_ref,issuer=issuer)
     require_current_life_fact_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=fact_original)
     from .d10_life_progress_provenance_v1 import require_current_life_progress_v1,require_life_experience_access_edges_v1
     require_current_life_progress_v1(db,namespace=ns,progress=progress,issuer=issuer,read=read)
@@ -171,11 +170,8 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
     if len(payload["cost_refs"]) != 1:
         raise ValueError("Life activity requires its one genuine CPU settlement")
     from .d11_types import job_graph_write
-    from .d11_life_terminal_v1 import read_adopted_life_original_v1, read_current_life_job_result_v1
-    completed_original = read_adopted_life_original_v1(db, namespace=ns, result_ref=b.artifact_ref, issuer=issuer)
-    if completed_original is None:
-        raise MissingProductionOriginalV1("signed_actual_life_job_result_mapping")
-    job, expected_result_ref = read_current_life_job_result_v1(db, job_id=b.job_id, adopted=completed_original)
+    from .d11_life_terminal_v1 import read_current_life_job_result_v1
+    job, expected_result_ref = read_current_life_job_result_v1(db, job_id=b.job_id, adopted=fact_original)
     if (job.phase != "completed" or job.result_ref != expected_result_ref
             or job.operation_id != b.operation_id or job.usage != {"thread_cpu_ms": terminal.actual_cpu_ms}):
         raise ValueError("Life activity job does not preserve its actual terminal usage")

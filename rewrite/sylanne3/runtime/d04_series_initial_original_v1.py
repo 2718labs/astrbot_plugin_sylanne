@@ -1,4 +1,5 @@
 """Read the actual historical initial set behind a frozen joint series."""
+
 from contextvars import ContextVar
 from contextlib import contextmanager
 import json
@@ -66,6 +67,8 @@ def require_d04_series_initial_binding_v1(root):
 
 
 def require_d04_series_initial_original_v1(db, root):
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     if not db.in_transaction:
         raise ValueError("series initial history requires the caller's actual read transaction")
     decoded = require_d04_series_initial_binding_v1(root)
@@ -94,10 +97,10 @@ def require_d04_series_initial_original_v1(db, root):
             for ref, revision, value in ((member.checkpoint_ref, member.checkpoint_revision,
                     joint_checkpoint_payload_v1(checkpoint)),
                     (member.state_ref, member.state_revision, joint_state_payload_v1(state))):
-                row = db.execute("SELECT value,valid,event_bot,event_persona,event_id FROM graph_history "
-                    "WHERE token=? AND revision=?", (ref, revision)).fetchone()
+                row = _producer_original_point_v3(db, table='graph_history', columns=('value', 'valid', 'event_bot', 'event_persona', 'event_id'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((ref, revision)), legacy_reader=lambda: db.execute("SELECT value,valid,event_bot,event_persona,event_id FROM graph_history "
+                    "WHERE token=? AND revision=?", (ref, revision)).fetchone())
                 if (row is None or row[1:] != (1, *namespace.as_tuple, checkpoint.commit_operation_id)
-                        or json.loads(row[0]) != value):
+                        or background_json_loads_v3(row[0]) != value):
                     raise ValueError("series initial set lacks its exact actual historical producing event")
             root_digest, receipt_digest = _authored_predecessor_original(db, namespace,
                 member.checkpoint_ref, member.checkpoint_revision, checkpoint, state)

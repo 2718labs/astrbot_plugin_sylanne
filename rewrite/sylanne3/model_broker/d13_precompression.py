@@ -161,7 +161,7 @@ class D13PrecompressionCallGateV1:
             raise ValueError("D13 gate status and token evidence differ")
 
 
-def _planned_turns(
+def _planned_turns_shape_v1(
     window: ConversationWindowProjectionV1, plan: PrecompressionPlan,
 ) -> tuple:
     if (type(window) is not ConversationWindowProjectionV1
@@ -178,7 +178,6 @@ def _planned_turns(
             or turns[-1].sequence != plan.last_sequence
             or any(right.sequence != left.sequence + 1
                    for left, right in zip(turns, turns[1:]))
-            or _fingerprint(window, turns) != plan.input_digest
             or window.scene_ref != plan.scene_ref
             or window.audience_ref != plan.audience_ref
             or (window.access_epoch, window.delete_epoch, window.activation_epoch)
@@ -203,27 +202,25 @@ def _planned_turns(
     return turns
 
 
-def freeze_d13_precompression_request_v1(
-    window: ConversationWindowProjectionV1,
-    plan: PrecompressionPlan,
-    installation: D13PrecompressionInstallationV1,
-) -> FrozenD13PrecompressionRequestV1:
-    """Freeze exact turns using a host-selected conversation model identity.
 
-    W09 must construct this from the actual conversation main workflow. D13
-    does not infer main-model identity from optional natural workflows.
-    """
-    if type(installation) is not D13PrecompressionInstallationV1:
-        raise TypeError("installed main-conversation model workflow is required")
-    turns = _planned_turns(window, plan)
-    read_closure_digest = canonical_digest({
+def _planned_turns(window,plan):
+    turns=_planned_turns_shape_v1(window,plan)
+    if _fingerprint(window,turns)!=plan.input_digest:
+        raise ValueError("stale, incomplete, or out-of-lifetime source window")
+    return turns
+
+def _d13_read_closure_value_v1(window):
+    return {
         "read_set": window.read_set,
         "source_dependencies": window.source_dependencies,
         "access_epoch": window.access_epoch,
         "delete_epoch": window.delete_epoch,
         "activation_epoch": window.activation_epoch,
-    })
-    payload = {
+    }
+
+
+def _d13_frozen_payload_value_v1(window,plan,turns,read_closure_digest):
+    return {
         "schema": INPUT_SCHEMA,
         "template_version": TEMPLATE_VERSION,
         "output_schema": EXTRACTIVE_OUTPUT_SCHEMA,
@@ -261,20 +258,41 @@ def freeze_d13_precompression_request_v1(
             "tool_state": turn.tool_state,
         } for turn in turns],
     }
-    canonical_input = canonical_serialize(payload)
-    messages = (
-        D13ModelMessageV1("system", SYSTEM_MESSAGE),
-        D13ModelMessageV1("user", canonical_input),
-    )
-    messages_wire = canonical_serialize([asdict(message) for message in messages])
-    wire = canonical_serialize({
+
+
+def _d13_frozen_wire_value_v1(installation,messages):
+    return {
         "installation_id": installation.installation_id,
         "provider_id": installation.provider_id,
         "model_id": installation.model_id,
         "provider_config_digest": installation.provider_config_digest,
         "messages": [asdict(message) for message in messages],
         "max_output_tokens": installation.max_output_tokens,
-    })
+    }
+
+
+def freeze_d13_precompression_request_v1(
+    window: ConversationWindowProjectionV1,
+    plan: PrecompressionPlan,
+    installation: D13PrecompressionInstallationV1,
+) -> FrozenD13PrecompressionRequestV1:
+    """Freeze exact turns using a host-selected conversation model identity.
+
+    W09 must construct this from the actual conversation main workflow. D13
+    does not infer main-model identity from optional natural workflows.
+    """
+    if type(installation) is not D13PrecompressionInstallationV1:
+        raise TypeError("installed main-conversation model workflow is required")
+    turns = _planned_turns(window, plan)
+    read_closure_digest=canonical_digest(_d13_read_closure_value_v1(window))
+    payload=_d13_frozen_payload_value_v1(window,plan,turns,read_closure_digest)
+    canonical_input = canonical_serialize(payload)
+    messages = (
+        D13ModelMessageV1("system", SYSTEM_MESSAGE),
+        D13ModelMessageV1("user", canonical_input),
+    )
+    messages_wire = canonical_serialize([asdict(message) for message in messages])
+    wire=canonical_serialize(_d13_frozen_wire_value_v1(installation,messages))
     return FrozenD13PrecompressionRequestV1(
         window, plan, turns, installation, canonical_input, messages,
         messages_wire, wire, canonical_digest(payload),
@@ -282,11 +300,8 @@ def freeze_d13_precompression_request_v1(
     )
 
 
-def thaw_d13_precompression_request_v1(raw: str) -> FrozenD13PrecompressionRequestV1:
-    """Restore the saved frozen wire and reject every noncanonical variation."""
-    from ..runtime_contracts import CompletedTurnV1, NamespaceId, VersionedRef
-
-    data = json.loads(raw)
+def _d13_typed_window_plan_v1(data):
+    from ..runtime_contracts import CompletedTurnV1,NamespaceId,VersionedRef
     window_data = data["window"]
     window = ConversationWindowProjectionV1(**{
         **window_data, "namespace": NamespaceId(**window_data["namespace"]),
@@ -308,6 +323,15 @@ def thaw_d13_precompression_request_v1(raw: str) -> FrozenD13PrecompressionReque
         "source_dependencies": tuple(VersionedRef(**ref)
                                      for ref in plan_data["source_dependencies"]),
     })
+    return window,plan
+
+
+def thaw_d13_precompression_request_v1(raw: str) -> FrozenD13PrecompressionRequestV1:
+    """Restore the saved frozen wire and reject every noncanonical variation."""
+    from ..runtime_contracts import CompletedTurnV1, NamespaceId, VersionedRef
+
+    data = json.loads(raw)
+    window,plan=_d13_typed_window_plan_v1(data)
     frozen = freeze_d13_precompression_request_v1(
         window, plan, D13PrecompressionInstallationV1(**data["installation"]))
     if canonical_serialize(asdict(frozen)) != raw:
@@ -318,6 +342,7 @@ def thaw_d13_precompression_request_v1(raw: str) -> FrozenD13PrecompressionReque
 def gate_d13_exact_token_count_v1(
     frozen: FrozenD13PrecompressionRequestV1,
     count: D13ExactTokenCountV1 | None,
+    *,_prepared_paid_eof_v3=None,
 ) -> D13PrecompressionCallGateV1:
     """Check optional exact evidence for a frozen wire.
 
@@ -328,6 +353,12 @@ def gate_d13_exact_token_count_v1(
     """
     if type(frozen) is not FrozenD13PrecompressionRequestV1:
         raise TypeError("frozen D13 request required")
+    messages_digest=None
+    if _prepared_paid_eof_v3 is not None:
+        from ..authority_service.d13_paid_block_verifier_v1 import PreparedD13PaidRequestEOFV3
+        if type(_prepared_paid_eof_v3)is not PreparedD13PaidRequestEOFV3:
+            raise ValueError('actual D13 Paid frozen EOF required')
+        messages_digest=_prepared_paid_eof_v3.require_frozen_v3(frozen)['messages_wire']
     reason = None
     if count is not None and type(count) is not D13ExactTokenCountV1:
         reason = "token evidence has an unsupported type"
@@ -335,7 +366,7 @@ def gate_d13_exact_token_count_v1(
           or count.provider_id != frozen.installation.provider_id
           or count.model_id != frozen.installation.model_id
           or count.provider_config_digest != frozen.installation.provider_config_digest
-          or count.messages_digest != sha256(frozen.messages_wire.encode("utf-8")).hexdigest()
+          or count.messages_digest != (sha256(frozen.messages_wire.encode('utf-8')).hexdigest() if _prepared_paid_eof_v3 is None else messages_digest)
           or count.wire_digest != frozen.wire_digest):
         reason = "token count is estimated or bound to another provider/model/config/wire"
     return D13PrecompressionCallGateV1(
@@ -343,6 +374,20 @@ def gate_d13_exact_token_count_v1(
         count.input_tokens if reason is None and count is not None else None,
         reason,
     )
+
+
+def _d13_model_request_fields_v1(envelope,frozen,*,call_id,timeout_seconds,privacy_tier):
+    if type(envelope)is not CommandEnvelope or type(frozen)is not FrozenD13PrecompressionRequestV1:
+        raise TypeError('typed D13 envelope and frozen request required')
+    if (envelope.identity.phase!='d13.precompress' or envelope.authority.issuer_domain!='d13'
+            or envelope.authority.namespace!=frozen.window.namespace
+            or envelope.identity.operation_id!=frozen.plan.job_ref
+            or type(envelope.authority.worker_fence)is not int or envelope.authority.worker_fence<1):
+        raise ValueError('D13 model request differs from original job scope')
+    return dict(envelope=envelope,call_id=call_id,provider_id=frozen.installation.provider_id,
+        model_id=frozen.installation.model_id,required_capabilities=frozenset({'text'}),privacy_tier=privacy_tier,
+        prompt_template_digest=TEMPLATE_DIGEST,payload={'system_prompt':SYSTEM_MESSAGE,'prompt':frozen.canonical_input},
+        timeout_seconds=timeout_seconds,max_output_tokens=frozen.installation.max_output_tokens)
 
 
 def issue_unadmitted_d13_model_request_v1(
@@ -359,22 +404,8 @@ def issue_unadmitted_d13_model_request_v1(
     W09 must recheck the selected main workflow before dispatch. An exact
     pre-call count is optional; W01 must reserve the signed upper bound.
     """
-    if type(envelope) is not CommandEnvelope or type(frozen) is not FrozenD13PrecompressionRequestV1:
-        raise TypeError("typed D13 envelope and frozen request required")
-    if (envelope.identity.phase != "d13.precompress"
-            or envelope.authority.issuer_domain != "d13"
-            or envelope.authority.namespace != frozen.window.namespace
-            or envelope.identity.operation_id != frozen.plan.job_ref
-            or type(envelope.authority.worker_fence) is not int
-            or envelope.authority.worker_fence < 1):
-        raise ValueError("D13 model request differs from original job scope")
-    request = ModelCallRequest(
-        envelope, call_id, frozen.installation.provider_id,
-        frozen.installation.model_id, frozenset({"text"}), privacy_tier,
-        TEMPLATE_DIGEST,
-        {"system_prompt": SYSTEM_MESSAGE, "prompt": frozen.canonical_input},
-        timeout_seconds, frozen.installation.max_output_tokens,
-    )
+    request=ModelCallRequest(**_d13_model_request_fields_v1(envelope,frozen,call_id=call_id,
+        timeout_seconds=timeout_seconds,privacy_tier=privacy_tier))
     if not d13_model_request_shape_valid_v1(request, frozen):
         raise ValueError("D13 model request differs from frozen wire")
     return request

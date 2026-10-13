@@ -1,15 +1,18 @@
 name: astrbot_plugin_sylanne
-display_name: Sylanne Embodiment 3.0.0-alpha1
-desc: "Sylanne Embodiment 3.0.0-alpha1 测试快照。启用前需完成管理员 Authority、Owner 和模型预算配置；每项执行仍需当前权限。"
-short_desc: "需管理员 Authority 入驻；完整运行时就绪前保持阻塞。"
-version: "3.0.0-alpha1"
+display_name: Sylanne 3.0.0-alpha2 candidate
+desc: "Sylanne 3.0.0-alpha2 Linux x86_64/glibc 本地候选快照，含 2718lab 0.25.0 工作台。完整启动需匹配的 Authority/Host 安装身份与 Owner 授权；每项执行仍需当前权限。"
+short_desc: "Linux 测试快照；需正式安装身份和 Owner 授权。"
+version: "3.0.0-alpha2"
 author: 2718-labs
 license: AGPL-3.0-or-later
 repo: "https://github.com/2718labs/astrbot_plugin_sylanne"
+pages:
+  - name: workbench
+    title: Sylanne WebUI / 模块状态
 support_platforms: []
 astrbot_version: ">=4.28.1,<5.0.0"
-tested_astrbot_version: "4.28.1"
+tested_astrbot_version: "4.28.2"
 compatibility_matrix:
-  min_python: "3.11"
-  tested_python: ["3.13"]
-  tested_platforms: ["windows"]
+  min_python: "3.12"
+  tested_python: ["3.12.3"]
+  tested_platforms: ["linux"]

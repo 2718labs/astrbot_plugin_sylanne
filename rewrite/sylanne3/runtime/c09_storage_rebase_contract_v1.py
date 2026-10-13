@@ -78,6 +78,30 @@ class GraphRowDispositionV1:
 
 
 @dataclass(frozen=True, slots=True)
+class GraphRowDispositionV3:
+    """Explicit logical preservation; locators require original-store verification."""
+    row_key_digest: str
+    old_commitment: str
+    disposition: str
+    new_commitment: str
+    source_logical_row_descriptor_digest: str
+    target_cell_seal_digest: str
+    logical_equivalence_original_digest: str
+    schema: str = "sylanne3.graph.c09-row-disposition.v3"
+
+    def __post_init__(self) -> None:
+        if (self.schema != "sylanne3.graph.c09-row-disposition.v3"
+                or self.disposition != "logical_preserved_v3"):
+            raise ValueError("unknown V3 logical row disposition")
+        for name in ("row_key_digest", "old_commitment", "new_commitment",
+                     "source_logical_row_descriptor_digest", "target_cell_seal_digest",
+                     "logical_equivalence_original_digest"):
+            _digest(getattr(self, name), name)
+        if self.old_commitment != self.source_logical_row_descriptor_digest:
+            raise ValueError("Source stream must commit its complete logical descriptor")
+
+
+@dataclass(frozen=True, slots=True)
 class GraphTableDispositionManifestV1:
     table_name: str
     rows: tuple[GraphRowDispositionV1, ...]
@@ -375,7 +399,7 @@ def require_same_operation_replay_v1(prior, candidate) -> None:
 
 
 __all__ = [
-    "GraphRowDispositionV1", "GraphTableDispositionManifestV1",
+    "GraphRowDispositionV1", "GraphRowDispositionV3", "GraphTableDispositionManifestV1",
     "GraphErasureRebaseCertificateV1", "SanitizedExecutionFactV4",
     "SanitizedD02FactV4", "SanitizedD11FactV4", "SanitizedUnknownFactV4",
     "SanitizedGraphFactV4", "SanitizedRecoveryFactsV4", "SanitizedGraphReadV1",

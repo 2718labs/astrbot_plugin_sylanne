@@ -1,4 +1,5 @@
 # Build artifacts
+node_modules/
 output/
 dist/
 .playwright-cli/
@@ -98,3 +99,7 @@ docs/humanlike_agent_literature_kb.md
 # (by any shared() call, e.g. tests/test_body_port_v2.py) — machine-specific UUID, never commit.
 sylanne_alpha/_engine/sylanne_core/_identity.json
 sylanne_alpha/_engine/sylanne_core/_identity.json.tmp
+
+# Local continuation journals and duplicate frontend build output
+/docs/plans/complete-agent-20261006/
+/workbench-src/prototype-v6/singlefile/

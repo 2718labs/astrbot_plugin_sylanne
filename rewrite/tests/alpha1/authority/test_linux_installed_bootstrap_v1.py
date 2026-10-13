@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import ssl
+import sqlite3
 import subprocess
 import sys
 import zipfile
@@ -72,7 +73,8 @@ def fixture(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fresh_current_schemas_reopen_and_refuse_reinitialize(tmp_path):
-    config, registry, namespace, _peer, _paths, _state = fixture(tmp_path)
+    config, registry, namespace, peer, paths, _state = fixture(tmp_path)
+    config = replace(config, self_identity_readers_v2={namespace: peer})
     # Initializer is synchronous and starts no listener/model/tool subprocess.
     import asyncio
     original = await asyncio.to_thread(initialize_fresh_authority_v1, config, registry)
@@ -83,11 +85,21 @@ async def test_fresh_current_schemas_reopen_and_refuse_reinitialize(tmp_path):
         with daemon.deletion.freeze_writes():
             assert daemon.deletion.schema_version() == 2
         assert namespace in daemon.server._v2_fences
+        assert namespace in daemon.server._v2_self_identity
         assert (namespace, "installation") in daemon.server._current_erasure_prepares
     finally:
         await daemon.aclose()
     with pytest.raises(AuthorityUnavailable, match="existing or partial"):
         initialize_fresh_authority_v1(config, registry)
+    # Deliberate corruption of this newly generated unit-test Core. Normal
+    # composition must reject a partial schema rather than create its table.
+    with sqlite3.connect(paths["core"]) as db:
+        db.execute("DROP TABLE authority_self_identity_heads_v1")
+    with pytest.raises(AuthorityUnavailable, match="self identity schema is absent or partial"):
+        open_authority_daemon(config)
+    with sqlite3.connect(paths["core"]) as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                          "name='authority_self_identity_heads_v1'").fetchone() is None
 
 
 def test_signed_current_storage_real_peer_crash_restart_and_live_peer_denial(tmp_path):
@@ -138,3 +150,36 @@ def test_signed_current_storage_real_peer_crash_restart_and_live_peer_denial(tmp
                 if process.poll() is None:
                     process.terminate()
                 process.wait(timeout=5)
+
+
+def test_installed_life_execution_and_self_read_credentials_remain_separate(tmp_path):
+    """Real package policy caps; no credential forgery or permissive authorizer."""
+    config, _registry, namespace, _peer, _paths, _state = fixture(tmp_path)
+    execution = config.local_administrator_credential("c04_execute", namespace)
+    self_read = config.local_administrator_credential("c04_self_identity_read", namespace)
+    authorize = config.core_authorizer
+    for action in ("execution", "current"):
+        assert authorize(execution, action, namespace, "host") is True
+        assert authorize(self_read, action, namespace, "host") is False
+    assert authorize(self_read, "self_identity_read", namespace, "host") is True
+    assert authorize(execution, "self_identity_read", namespace, "host") is False
+    for action in ("read", "write", "delete", "owner_identity_pair", "self_identity_mutate"):
+        assert authorize(execution, action, namespace, "host") is False
+        assert authorize(self_read, action, namespace, "host") is False
+    for credential in (execution, self_read):
+        assert authorize(credential, "execution", "bot:another-installed-namespace", "host") is False
+        assert authorize(credential, "self_identity_read", "bot:another-installed-namespace", "host") is False
+    with pytest.raises(AuthorityUnavailable, match="local service credential unavailable"):
+        config.local_administrator_credential("execution", namespace)
+    with pytest.raises(AuthorityUnavailable, match="local service credential unavailable"):
+        config.local_administrator_credential("c04_self_identity_read", "bot:another-installed-namespace")
+    # A second real policy verifies the same installed package but owns another
+    # opaque credential issuer. Namespace and action equality cannot borrow it.
+    selected = authorize.__self__
+    foreign = InstalledAuthorityPolicyV2(peer_scopes=selected._scopes,
+        profile_peers=selected._profiles, package_root=selected._package_root,
+        trusted_manifest_sha256=selected._manifest_pin, authority_uid=selected._authority_uid)
+    for action in ("c04_execute", "c04_self_identity_read"):
+        other = foreign.local_administrator_credential(action, namespace)
+        assert authorize(other, "execution", namespace, "host") is False
+        assert authorize(other, "self_identity_read", namespace, "host") is False

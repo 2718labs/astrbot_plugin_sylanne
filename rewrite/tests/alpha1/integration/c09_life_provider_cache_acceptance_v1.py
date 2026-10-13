@@ -65,13 +65,28 @@ def _read(root, name):
         os.close(fd)
 
 
+def _checked_provider_configuration_v3(provider_config,phase_config):
+    if phase_config is None:
+        if provider_config!={'id':'provider-1','type':'openai_chat_completion','model':'model-1'}:
+            raise ValueError('mock provider installed configuration differs')
+        return False
+    from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
+    from sylanne3.runtime_contracts import canonical_digest
+    if type(phase_config) is not M1PhaseFixtureInstallationV2 or provider_config!=phase_config.provider_configuration:
+        raise ValueError('actual typed protected phase provider configuration required')
+    policy=phase_config.counter_policy
+    if (policy.source_scope!='LOCAL_FIXTURE' or policy.provider_id!=provider_config['id']
+            or policy.model_id!=provider_config['model'] or policy.provider_config_digest!=canonical_digest(provider_config)):
+        raise ValueError('actual finite phase provider/model/config pin differs')
+    return True
+
+
 class ControlledLifeProviderCacheV1:
-    def __init__(self, root, provider_config):
+    def __init__(self, root, provider_config, *, phase_config=None):
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
-        if (type(provider_config) is not dict or set(provider_config) != {'id', 'type', 'model'}
-                or provider_config != {'id': 'provider-1', 'type': 'openai_chat_completion', 'model': 'model-1'}):
-            raise ValueError('mock provider installed configuration differs')
+        self.current_phase=_checked_provider_configuration_v3(provider_config,phase_config)
+        self.model_id=provider_config['model']
         self.root = Path(root).absolute()
         self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
         (self.root / 'cache').mkdir(mode=0o700)
@@ -91,20 +106,21 @@ class ControlledLifeProviderCacheV1:
 
     @classmethod
     def attach_installed(cls, root, provider_config, *, authority_id, installation_id,
-                         namespace, executable_sha256, public_key_sha256):
+                         namespace, executable_sha256, public_key_sha256,phase_config=None):
         """Child attaches to the original fixture provider, never installs anew."""
         path = Path(root).absolute()
         if path.is_symlink() or not path.is_dir():
             raise ValueError('installed mock cache directory differs')
-        if provider_config != {'id': 'provider-1', 'type': 'openai_chat_completion', 'model': 'model-1'}:
-            raise ValueError('installed mock provider configuration differs')
+        current=_checked_provider_configuration_v3(provider_config,phase_config)
         instance = object.__new__(cls)
+        instance.current_phase=current;instance.model_id=provider_config['model']
         instance.root = path
         instance.provider_id = provider_config['id']
         instance.config_digest = hashlib.sha256(_canonical(provider_config).encode()).hexdigest()
         instance.recorded_requests = 0
         binding = dict(authority_id=authority_id, installation_id=installation_id,
             namespace=namespace, provider_id=instance.provider_id, config_digest=instance.config_digest)
+        if current:binding['model_id']=instance.model_id
         if json.loads(_read(path, 'binding.json')) != binding:
             raise ValueError('installed mock cache binding differs')
         if (hashlib.sha256(_read(path, 'adapter')).hexdigest() != executable_sha256
@@ -130,7 +146,7 @@ class ControlledLifeProviderCacheV1:
             if request.url.host != 'mock.invalid' or request.method != 'POST':
                 raise ValueError('non-mock provider request refused')
             body = request.content
-            if len(body) > 8 * 1024 * 1024 or json.loads(body).get('model') != 'model-1':
+            if len(body) > 8 * 1024 * 1024 or json.loads(body).get('model') != self.model_id:
                 raise ValueError('mock provider body differs')
             with _locked(self.root):
                 if not (self.root / 'binding.json').is_file():
@@ -148,6 +164,7 @@ class ControlledLifeProviderCacheV1:
     def bind(self, *, authority_id, installation_id, namespace):
         document = dict(authority_id=authority_id, installation_id=installation_id,
             namespace=namespace, provider_id=self.provider_id, config_digest=self.config_digest)
+        if self.current_phase:document['model_id']=self.model_id
         if any(type(value) is not str or not value for value in document.values()):
             raise ValueError('actual installation binding required')
         with _locked(self.root):

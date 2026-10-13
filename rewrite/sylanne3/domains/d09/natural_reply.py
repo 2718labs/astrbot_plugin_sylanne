@@ -7,7 +7,7 @@ the coordinator before any candidate may be adopted or sent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Protocol
 
@@ -24,6 +24,98 @@ from .expression_policy import (
 
 
 NATURAL_REPLY_OUTPUT_SCHEMA_V2 = "sylanne.d09.context_reply_output.v2"
+NATURAL_REPLY_OUTPUT_SCHEMA_V3 = "sylanne.d09.context_reply_output.v3"
+MAX_SEMANTIC_SEGMENTS_V3 = 4
+_MARKDOWN_LIST_ITEM_V3 = re.compile(r"^( {0,3})(?:[-+*]|[0-9]{1,9}[.)])[ \t]+")
+_MARKDOWN_BLOCK_START_V3 = re.compile(
+    r"^ {0,3}(?:#{1,6}(?:[ \t]|$)|>|`{3,}|~{3,}|(?:[-*_][ \t]*){3,}$)"
+)
+
+
+def _markdown_list_spans_v3(body: str) -> tuple[tuple[int, int], ...]:
+    """Keep list items, nested/indented content and lazy continuations together."""
+    spans = []
+    start = None
+    end = offset = indent = 0
+    after_blank = False
+    for line in body.splitlines(keepends=True):
+        text = line.rstrip("\r\n")
+        item = _MARKDOWN_LIST_ITEM_V3.match(text)
+        continuation = (text.startswith("\t")
+                        or len(text) - len(text.lstrip(" ")) >= indent + 2)
+        if item is not None:
+            if start is None:
+                start, indent = offset, len(item[1])
+            end, after_blank = offset + len(text), False
+        elif start is not None and not text.strip():
+            after_blank = True
+        elif start is not None and (
+                continuation or not after_blank and not _MARKDOWN_BLOCK_START_V3.match(text)):
+            end, after_blank = offset + len(text), False
+        elif start is not None:
+            spans.append((start, end))
+            start, after_blank = None, False
+        offset += len(line)
+    if start is not None:
+        spans.append((start, end))
+    return tuple(spans)
+
+
+def natural_semantic_ranges_v3(output: dict) -> tuple[tuple[int, int], ...]:
+    """Read the model's whole-meaning manifest; never split by punctuation.
+
+    Whole claim units, Markdown lists and fenced code remain in one bubble. Independent
+    review separately checks meaning and every visible prefix, including any
+    attribution, uncertainty or restriction needed by an earlier assertion.
+    """
+    if output.get("schema") == NATURAL_REPLY_OUTPUT_SCHEMA_V2:
+        if set(output) != {"schema", "body", "units"}:
+            raise ValueError("legacy natural output fields differ")
+        return ((0, len(output["body"])),)
+    if (output.get("schema") != NATURAL_REPLY_OUTPUT_SCHEMA_V3
+            or set(output) != {"schema", "body", "units", "semantic_segments"}
+            or type(output["body"]) is not str
+            or type(output["units"]) is not list
+            or type(output["semantic_segments"]) is not list
+            or not 1 <= len(output["semantic_segments"]) <= MAX_SEMANTIC_SEGMENTS_V3):
+        raise ValueError("finite natural semantic manifest required")
+    body, cursor, ranges = output["body"], 0, []
+    list_spans = _markdown_list_spans_v3(body)
+    for item in output["semantic_segments"]:
+        if type(item) is not dict or set(item) != {"start", "end"}:
+            raise ValueError("semantic segment fields differ")
+        start, end = item["start"], item["end"]
+        if (type(start) is not int or type(end) is not int
+                or start != cursor or not start < end <= len(body)
+                or not body[start:end].strip()):
+            raise ValueError("semantic segments must exactly partition the body")
+        for unit in output["units"]:
+            if (type(unit) is not dict or type(unit.get("start")) is not int
+                    or type(unit.get("end")) is not int):
+                raise ValueError("semantic claim span required")
+            if unit["start"] < end < unit["end"]:
+                raise ValueError("semantic boundary splits a qualified claim")
+        if body[:end].count("```") % 2 or body[:end].count("~~~") % 2:
+            raise ValueError("semantic boundary splits a fenced code block")
+        if any(list_start < end < list_end for list_start, list_end in list_spans):
+            raise ValueError("semantic boundary splits a Markdown list block")
+        ranges.append((start, end))
+        cursor = end
+    if cursor != len(body):
+        raise ValueError("semantic manifest leaves body text uncovered")
+    return tuple(ranges)
+
+
+def natural_segment_identity_v3(plan: NaturalExpressionPlanV2, output: dict,
+                                index: int) -> tuple[str, str, str]:
+    ranges = natural_semantic_ranges_v3(output)
+    if type(index) is not int or not 0 <= index < len(ranges):
+        raise ValueError("semantic segment index differs")
+    digest = canonical_digest({"plan": plan.plan_ref,
+                               "output": canonical_digest(output), "index": index})
+    return (plan.final_operation_id if index == 0 else "operation:natural-segment:" + digest,
+            plan.final_effect_id if index == 0 else "effect:natural-segment:" + digest,
+            "segment:natural:" + digest)
 _UNSCOPED_COMMITMENT_CUE = re.compile(
     r"(?:\bI\s+(?:will|promise\s+to|guarantee\b)|\bI'll\b|"
     r"(?:我|我们)(?:会|将|一定|保证))", re.IGNORECASE,
@@ -111,10 +203,14 @@ def mechanically_verify_natural_reply_v2(
         raise TypeError("typed natural plan and read set required")
     if expression_policy is not None and type(expression_policy) is not D09ExpressionPolicyV1:
         raise TypeError("typed D09 expression policy required")
-    if type(output) is not dict or set(output) != {"schema", "body", "units"}:
+    if type(output) is not dict:
         return hold("output_schema")
+    try:
+        natural_semantic_ranges_v3(output)
+    except (TypeError, ValueError, KeyError):
+        return hold("output_semantic_manifest")
     body, units = output.get("body"), output.get("units")
-    if (output["schema"] != NATURAL_REPLY_OUTPUT_SCHEMA_V2
+    if (output["schema"] not in {NATURAL_REPLY_OUTPUT_SCHEMA_V2, NATURAL_REPLY_OUTPUT_SCHEMA_V3}
             or type(body) is not str or not 0 < len(body) <= DEFAULT_MAX_VISIBLE_CHARS_V1
             or type(units) is not list or not 0 < len(units) <= 16
             or any(ord(char) < 32 and char not in "\n\t" for char in body)):
@@ -304,11 +400,15 @@ def verify_current_qualified_natural_reply_v2(
     def hold(reason: str) -> NaturalMechanicalCandidateV2:
         return NaturalMechanicalCandidateV2("hold", (), None, None, None, (), (reason,))
 
+    from ...runtime.natural_producer_qualification_v1 import (
+        CANDIDATE_TYPES, C04_KIND, DRAFT_KIND, verify_live_producer_candidate_v1)
     if (type(current_snapshot) is not GraphSnapshot
             or type(d06_candidates) is not tuple
-            or any(type(item) is not QualifiedExpressionUnitCandidate
-                   for item in d06_candidates)):
-        return hold("typed_current_d06_read_required")
+            or any(type(item) not in (QualifiedExpressionUnitCandidate, *CANDIDATE_TYPES)
+                   for item in d06_candidates)
+            or any(unit.d06_claim_kind not in {
+                "attributed_report", "confirmed_external_fact", C04_KIND, DRAFT_KIND} for unit in plan.units)):
+        return hold("typed_current_natural_basis_required")
     current = mechanically_verify_natural_reply_v2(
         output, plan=plan, current_reads=current_reads, now_utc=now_utc,
         expression_policy=expression_policy,
@@ -330,9 +430,19 @@ def verify_current_qualified_natural_reply_v2(
                    for key, revision in read_map.items())):
         return hold("current_snapshot_read_set_changed")
     for unit in plan.units:
-        if unit.d06_claim_kind is None:
-            continue
         candidate = candidates[unit.qualification_digest]
+        if unit.d06_claim_kind in {C04_KIND, DRAFT_KIND}:
+            if type(candidate) not in CANDIDATE_TYPES:
+                return hold("typed_current_producer_required")
+            try:
+                verify_live_producer_candidate_v1(candidate, unit, snapshot=current_snapshot,
+                    current_reads=current_reads, access_epoch=access_epoch,
+                    deletion_epoch=deletion_epoch, now_utc=now_utc)
+            except (ValueError, TypeError, PermissionError):
+                return hold("actual_current_producer_qualification_failed")
+            continue
+        if type(candidate) is not QualifiedExpressionUnitCandidate:
+            return hold("typed_current_source_candidate_required")
         try:
             rebuilt = recompute_qualified_expression_unit(
                 current_snapshot, namespace=plan.namespace,
@@ -584,3 +694,42 @@ __all__ = [
     "NaturalPaidReviewVerifierV2", "NaturalFinalActionMaterialV2",
     "NaturalFinalActionCandidateV2", "prepare_natural_final_action_candidate_v2",
 ]
+
+
+def select_natural_final_segment_v3(
+    final: NaturalFinalActionCandidateV2, *, plan: NaturalExpressionPlanV2,
+    generation_output: dict, segment_index: int,
+) -> NaturalFinalActionCandidateV2:
+    """Select one reviewed bubble for its own current D08/D11 admission.
+
+    The paid receipt continues to bind the complete generated batch. No new
+    model call, review, experience, grant or send permission is created here.
+    """
+    if (type(final) is not NaturalFinalActionCandidateV2 or final.material is None
+            or generation_output.get("schema") != NATURAL_REPLY_OUTPUT_SCHEMA_V3
+            or final.material.paid_receipt.generation_output_digest
+               != canonical_digest(generation_output)
+            or final.material.segment.body != generation_output["body"]):
+        raise ValueError("original complete reviewed natural material required")
+    ranges = natural_semantic_ranges_v3(generation_output)
+    operation_id, effect_id, segment_id = natural_segment_identity_v3(
+        plan, generation_output, segment_index)
+    start, end = ranges[segment_index]
+    material = final.material
+    uses = tuple(replace(use, start=use.start - start, end=use.end - start)
+                 for use in material.segment.claim_uses
+                 if start <= use.start and use.end <= end)
+    slots = tuple(sorted({slot for unit in generation_output["units"]
+                          if start <= unit["start"] and unit["end"] <= end
+                          for slot in unit["slot_ids"]}))
+    body = generation_output["body"][start:end]
+    segment = SegmentCandidate(segment_id, effect_id, body, uses, slots, (), 0.0)
+    return replace(final, material=replace(
+        material, final_operation_id=operation_id, final_effect_id=effect_id,
+        segment=segment, payload_digest=segment_payload_digest(body, (), uses),
+        required_slots=slots))
+
+
+__all__ += ["NATURAL_REPLY_OUTPUT_SCHEMA_V3", "MAX_SEMANTIC_SEGMENTS_V3",
+            "natural_semantic_ranges_v3", "natural_segment_identity_v3",
+            "select_natural_final_segment_v3"]

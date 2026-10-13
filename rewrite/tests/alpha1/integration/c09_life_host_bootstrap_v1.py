@@ -20,7 +20,7 @@ _CACHE_FIELDS = {'root', 'authority_id', 'installation_id', 'namespace', 'provid
 
 
 @asynccontextmanager
-async def open_life_host_bootstrap_v1(material):
+async def open_life_host_bootstrap_v1(material, *, l02_initial_issuers_v1=False):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from sylanne3.graph_store import ProductionGraphStore
     from sylanne3.graph_coordinator import GraphCoordinator
@@ -95,7 +95,12 @@ async def open_life_host_bootstrap_v1(material):
             material.grant.authority_id, material.grant.installation_id, material.grant.manifest_digest, material.grant.subject)
         # These are the Host side of the original fixture key configuration.
         # Parent Authority retains its original issuer instances throughout.
-        d02, d11 = build_runtime_issuers(config['runtime_issuer_signing_key'])
+        if l02_initial_issuers_v1:
+            from sylanne3.runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+            d02 = D02ResourceIssuer(bundle.d02_signing_key)
+            d11 = D11BudgetJobIssuer(d02, bundle.d11_signing_key)
+        else:
+            d02, d11 = build_runtime_issuers(config['runtime_issuer_signing_key'])
         assert d11.resource_issuer is d02
         body = cpu = None
         if config['enable_c04_body_work']:

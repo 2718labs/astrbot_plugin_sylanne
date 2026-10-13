@@ -27,7 +27,7 @@ from ..authority_service.v2_owner_proof import (
     to_wire as proof_to_wire,
 )
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from .owner_deployment import (
     CurrentCreationPairing, CurrentDashboardLogin, CurrentOwnerPairing,
 )

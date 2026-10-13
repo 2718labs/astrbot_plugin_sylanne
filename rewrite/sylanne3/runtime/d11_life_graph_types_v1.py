@@ -4,13 +4,40 @@ from ..graph_types import AtomKey, Owner, TypeSpec, GraphWrite
 from ..runtime_contracts import canonical_digest, canonical_serialize, schema_hash
 from .d11_life_contract_v1 import (RoleSegmentStartV1, LifeTerminalPayloadV1, D11LifeExecutionBindingV1,
     life_from_wire_v1, life_to_wire_v1, ARTIFACT_SCHEMA, RECIPE_ID, life_artifact_ref_v1)
+from .d11_life_contract_v1 import D11DraftExecutionBindingV1
+from .d11_artifact_draft_contract_v1 import DraftFileReadbackV1, draft_from_wire_v1, draft_to_wire_v1
 
 TYPES = ("d11.life_artifact.v1", "d11.role_segment_start.v1", "d11.role_segment_end.v1")
+DRAFT_TYPES = ("d11.draft_artifact.v1", "d11.draft_segment_start.v1", "d11.draft_segment_end.v1")
 
 
 def validate_life_graph_value_v1(type_name, value):
     if type(value) is not dict:
         raise ValueError("Life graph fact requires a closed JSON object")
+    if type_name in DRAFT_TYPES:
+        binding = life_from_wire_v1(value.get("binding"), D11LifeExecutionBindingV1)
+        if type(binding) is not D11DraftExecutionBindingV1:
+            raise ValueError("draft fact requires its exact draft execution binding")
+        if type_name == DRAFT_TYPES[0]:
+            if set(value) != {"schema", "binding", "readback", "artifact_digest", "artifact_length", "source_refs", "audiences", "purposes"}:
+                raise ValueError("draft artifact has another closed witness shape")
+            witness = draft_from_wire_v1(value["readback"], DraftFileReadbackV1)
+            if (value["schema"] != "d11.adopted-draft-artifact.v1" or not value["source_refs"]
+                    or not value["audiences"] or value["purposes"] != ["context", "consolidation"]
+                    or (witness.effect_id, witness.execution_call_id, witness.plan_digest,
+                        witness.target_scope_digest, witness.root_registration_digest) !=
+                       (binding.effect_id, binding.execution_call_id, binding.plan_digest,
+                        binding.target_scope_digest, binding.root_registration_digest)
+                    or (value["artifact_digest"], value["artifact_length"]) !=
+                       (witness.content_digest, witness.content_length)):
+                raise ValueError("draft adopted artifact crossed its original effect/target/readback")
+        else:
+            if set(value) != {"schema", "binding", "payload", "journal_ref", "journal_digest"} or value["schema"] != type_name:
+                raise ValueError("draft segment fact closed shape differs")
+            payload = life_from_wire_v1(value["payload"], RoleSegmentStartV1 if type_name == DRAFT_TYPES[1] else LifeTerminalPayloadV1)
+            if payload.binding_digest != binding.digest:
+                raise ValueError("draft segment fact crossed original binding")
+        return binding
     if type_name == TYPES[0]:
         if set(value) != {"schema", "binding", "artifact", "artifact_digest", "artifact_length", "source_refs", "audiences", "purposes"}:
             raise ValueError("Life adopted artifact fields differ")
@@ -50,13 +77,14 @@ def life_graph_type_specs_v1():
     from .d11_life_fact_provenance_v1 import life_fact_auxiliary_type_specs_v1
     from .d11_life_outcome_provenance_v1 import life_outcome_type_specs_v1
     return (tuple(TypeSpec(name, ("activity",), "state", lambda value, name=name: validate_life_graph_value_v1(name, value),
-        immutable=True, schema_version=1, writer_domain="d11", schema_hash=schema_hash({"type": name, "version": 1})) for name in TYPES)
+        immutable=True, schema_version=1, writer_domain="d11", schema_hash=schema_hash({"type": name, "version": 1})) for name in (*TYPES, *DRAFT_TYPES))
         + life_fact_auxiliary_type_specs_v1() + life_outcome_type_specs_v1())
 
 
 def life_role_segment_key_v1(binding, phase):
+    types = DRAFT_TYPES if type(binding) is D11DraftExecutionBindingV1 else TYPES
     return AtomKey(Owner("activity", *binding.namespace.as_tuple, binding.activity_id),
-        TYPES[1] if phase == "start" else TYPES[2], binding.execution_id)
+        types[1] if phase == "start" else types[2], binding.execution_id)
 
 
 def life_fact_writes_v1(prepared, claim, terminal, artifact):
@@ -68,12 +96,20 @@ def life_fact_writes_v1(prepared, claim, terminal, artifact):
             "payload": life_to_wire_v1(original.payload), "journal_ref": original.original_ref,
             "journal_digest": original.claim_digest if phase == "start" else original.terminal_digest}))
     if terminal.status == "completed":
-        data, digest, length = artifact
-        import json
         source_refs = tuple(row.ref for row in prepared.read_rows if AtomKey.from_token(row.ref).type_name == "memory.source")
-        result.append(GraphWrite(AtomKey.from_token(b.artifact_ref), {"schema": "d11.adopted-life-artifact.v1",
-            "binding": life_to_wire_v1(b), "artifact": json.loads(data), "artifact_digest": digest, "artifact_length": length,
-            "source_refs": list(source_refs), "audiences": list(prepared.plan.audiences), "purposes": ["context", "consolidation"]}))
+        if type(b) is D11DraftExecutionBindingV1:
+            if type(artifact) is not DraftFileReadbackV1 or artifact != terminal.payload.readback:
+                raise ValueError("draft Graph adoption requires the actual signed terminal file witness")
+            result.append(GraphWrite(AtomKey.from_token(b.artifact_ref), {"schema": "d11.adopted-draft-artifact.v1",
+                "binding": life_to_wire_v1(b), "readback": draft_to_wire_v1(artifact),
+                "artifact_digest": artifact.content_digest, "artifact_length": artifact.content_length,
+                "source_refs": list(source_refs), "audiences": list(prepared.plan.audiences), "purposes": ["context", "consolidation"]}))
+        else:
+            data, digest, length = artifact
+            import json
+            result.append(GraphWrite(AtomKey.from_token(b.artifact_ref), {"schema": "d11.adopted-life-artifact.v1",
+                "binding": life_to_wire_v1(b), "artifact": json.loads(data), "artifact_digest": digest, "artifact_length": length,
+                "source_refs": list(source_refs), "audiences": list(prepared.plan.audiences), "purposes": ["context", "consolidation"]}))
     from .d11_life_fact_provenance_v1 import life_fact_qualified_writes_v1
     qualified=life_fact_qualified_writes_v1(prepared,claim,terminal,tuple(result))
     from .d11_life_outcome_provenance_v1 import life_outcome_qualified_writes_v1

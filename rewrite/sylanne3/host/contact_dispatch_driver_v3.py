@@ -119,7 +119,11 @@ class InstalledContactContinuationV3:
     """Use the registered private Contact P2 writer, never caller evidence."""
     def __init__(self, *, worker, authority, lease, fence_port, policy, grant,
                  server, claim_writer, context, candidates, clock_policy,
-                 adapter_ref="astrbot:onebot:call_action", send_timeout_seconds=30.0):
+                 adapter_ref="astrbot:onebot:call_action", send_timeout_seconds=30.0, local_module_admission=None):
+        from ..runtime.local_module_admission_v1 import LocalModuleAdmissionV1
+        if local_module_admission is not None and type(local_module_admission) is not LocalModuleAdmissionV1:
+            raise TypeError("dispatch requires the frozen native module admission")
+        self._local_module_admission = local_module_admission or LocalModuleAdmissionV1()
         from ..runtime.contact_dispatch_host_v3 import InstalledContactFinalClaimWriterV3
         if (type(worker) is not GraphWorker or type(fence_port) is not V2FencePort
                 or type(policy) is not AdminInstallationPolicy
@@ -154,6 +158,7 @@ class InstalledContactContinuationV3:
         return reading
 
     async def dispatch(self, original):
+        self._local_module_admission.require_v1(('d08', 'd09', 'd10', 'd11'), "dispatch:InstalledContactContinuationV3")
         request, namespace = original.request, original.namespace
         if await asyncio.to_thread(lambda: self._port.installation_grant) != self._grant:
             raise ContactDispatchHold("current Contact installation grant differs")
@@ -183,36 +188,41 @@ class InstalledContactContinuationV3:
             admission_receipt=original.admission, recovered_request=request,
             original_dispatch_permit=permit, adapter_ref=self._adapter_ref, now_utc=now)
         identity = hashlib.sha256((original.operation_id + "\0" + request.effect_id).encode()).hexdigest()
-        prepared, _ = await _settled_thread(self._port.execution_prepare,
-            namespace=namespace, authority_namespace=authority_namespace,
-            permit=permit, mutation_id="dispatch:" + identity, footprint=footprint)
-        claimed, _ = await _settled_thread(self._port.execution_claim_v2,
-            namespace=namespace, authority_namespace=authority_namespace,
-            prepared_receipt=prepared, binding=binding)
-        handoff_id = "handoff:" + identity
-        writer = await self._worker.call(lambda graph:
-            self._claim_writer.prepare_contact_for_handoff(graph, claimed, handoff_id, original))
-        if not callable(writer):
-            raise ContactDispatchHold("current Contact P2 qualification unavailable")
-        handoff = await asyncio.to_thread(InstalledCurrentDispatchHandoffPort,
-            fence_port=self._port, policy=self._policy, grant=self._grant, claimed_receipt=claimed)
-        sender = AstrBotV2TextSender(context=self._context, candidates=self._candidates,
-            resolver=_FrozenContactTextResolver(request, payload), authority=handoff,
-            clock_policy=self._clock_policy, record_observation=handoff.record_observation,
-            send_timeout_seconds=self._timeout)
-
-        async def begin(receipt, handoff_id):
-            return await _settled_thread(self._port.execution_begin_handoff_v2,
+        from ..runtime.dispatch_current_inventory_v3 import prepare_dispatch_inventory_on_worker_v3
+        async with prepare_dispatch_inventory_on_worker_v3(self._worker,self._authority,self._lease,
+                binding=binding,admission=original.admission,request=request,permit=permit,
+                now_utc=now,dispatch_family="contact") as prepared_inventory:
+            prepared, _ = await _settled_thread(self._port.execution_prepare,
                 namespace=namespace, authority_namespace=authority_namespace,
-                claimed_receipt=receipt, handoff_id=handoff_id)
+                permit=permit, mutation_id="dispatch:" + identity, footprint=footprint)
+            claimed, _ = await _settled_thread(self._port.execution_claim_v2,
+                namespace=namespace, authority_namespace=authority_namespace,
+                prepared_receipt=prepared, binding=binding)
+            handoff_id = "handoff:" + identity
+            writer = await self._worker.call(lambda graph:
+                self._claim_writer.prepare_contact_for_handoff(graph, claimed, handoff_id, original, prepared_inventory=prepared_inventory))
+            if not callable(writer):
+                raise ContactDispatchHold("current Contact P2 qualification unavailable")
+            handoff = await asyncio.to_thread(InstalledCurrentDispatchHandoffPort,
+                fence_port=self._port, policy=self._policy, grant=self._grant, claimed_receipt=claimed)
+            sender = AstrBotV2TextSender(context=self._context, candidates=self._candidates,
+                resolver=_FrozenContactTextResolver(request, payload), authority=handoff,
+                clock_policy=self._clock_policy, record_observation=handoff.record_observation,
+                send_timeout_seconds=self._timeout, local_module_admission=self._local_module_admission)
 
-        async with begin_handoff_with_reverse_claim(worker=self._worker, server=self._server,
-                claimed=claimed, handoff_id=handoff_id, claim_writer=writer, begin=begin) as decision:
-            if decision.replay:
-                return "replay"
-            observation = await sender.send(decision=decision, binding=binding,
-                claimed_receipt=claimed, request=request)
-        return observation.outcome
+            async def begin(receipt, handoff_id):
+                return await _settled_thread(self._port.execution_begin_handoff_v2,
+                    namespace=namespace, authority_namespace=authority_namespace,
+                    claimed_receipt=receipt, handoff_id=handoff_id)
+
+            async with begin_handoff_with_reverse_claim(worker=self._worker, server=self._server,
+                    claimed=claimed, handoff_id=handoff_id, claim_writer=writer, begin=begin) as decision:
+                if decision.replay:
+                    return "replay"
+                observation = await sender.send(decision=decision, binding=binding,
+                    claimed_receipt=claimed, request=request)
+            await self._worker.call(lambda graph:self._claim_writer.consume_observation(graph,original))
+            return observation.outcome
 
 
 class ContactDispatchDriverV3:
@@ -242,6 +252,9 @@ class ContactDispatchDriverV3:
         if type(operation_id) is not str or not operation_id:
             return ContactDispatchResultV3("hold", "original Contact operation required")
         try:
+            if self._continuation is not None:
+                await self._worker.call(lambda graph:self._continuation._claim_writer.recover_observation_metadata(
+                    graph,operation_id))
             original = await self._worker.call(_read_original, self._authority, self._lease, operation_id)
         except asyncio.CancelledError:
             return ContactDispatchResultV3("cancelled", "cancelled before any Contact P2 attempt")

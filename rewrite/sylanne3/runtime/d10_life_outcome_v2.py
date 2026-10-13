@@ -14,6 +14,8 @@ from ..domains.d06 import D06DomainProvider
 from ..domains.d08.execution import _decode, _decode_intent
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1, waiting_stage_v1
 from .d11_life_contract_v1 import (RegisteredLifeOutcomeV2, D11LifeTerminalV1, life_from_wire_v1, life_to_wire_v1)
+from .d11_life_contract_v1 import D11DraftTerminalV1
+from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
 from .d11_life_preparation_v1 import _read, _record, read_registered_life_plan_v2, read_prepared_life_v1
 from .d11_life_terminal_v1 import read_adopted_life_original_v1
 from .d11_life_source_note_v1 import verify_durable_life_artifact_v1
@@ -59,7 +61,11 @@ def _actual_outcome(db, read, issuer, outcome):
         raise MissingProductionOriginalV1("actual_life_frozen_source_and_body_preparation")
     from .d11_life_fact_provenance_v1 import require_current_life_fact_eligibility_v1
     require_current_life_fact_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=adopted)
-    verify_durable_life_artifact_v1(db, prepared, digest=outcome.artifact_digest, length=terminal.payload.artifact_length)
+    if type(terminal) is D11DraftTerminalV1:
+        from .d11_life_adoption_v1 import require_draft_terminal_readback_v1
+        require_draft_terminal_readback_v1(prepared=prepared, terminal=terminal)
+    else:
+        verify_durable_life_artifact_v1(db, prepared, digest=outcome.artifact_digest, length=terminal.payload.artifact_length)
     action = _decode_intent(read.head(db, plan.action_intent.ref, required=True).value)
     actual = _decode("d08.action_outcome.v1", read.head(db, outcome.action_outcome_ref, required=True).value)
     if (actual.action_id != action.action_id or actual.effect_id != b.effect_id or actual.attempt_id != b.attempt_id
@@ -76,9 +82,10 @@ def _actual_outcome(db, read, issuer, outcome):
         operation_id=b.reservation_operation_id) for ref in outcome.paid_cost_refs)
     if len(costs) != 1:
         raise ValueError("Life outcome must consume the one actual thread CPU settlement")
+    roots = tuple(dict.fromkeys((plan.input_source.ref, *plan.content.source_refs))) if type(plan) is RegisteredDraftFilePlanV3 else (plan.input_source.ref,)
     for purpose in ("context", "consolidation"):
         for audience in plan.audiences:
-            read.source_family(db, (plan.input_source.ref,), purpose=purpose, audience=audience)
+            read.source_family(db, roots, purpose=purpose, audience=audience)
     return plan, prepared, terminal, terminal_original, costs
 
 
@@ -126,9 +133,10 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
             raise MissingProductionOriginalV1(*(body.missing_inputs or ("actual_life_body_component_settlement",)))
         activity = ActivityOutcome(b.activity_id, b.effect_id, "completed", b.artifact_ref,
             (terminal.claim.original_ref, terminal.original_ref, outcome.action_outcome_ref))
-        progress = LifeProgressHeadV1(plan.project.ref, plan.recipe.ref, b.activity_id, b.effect_id, "real_execution", "source_note",
+        roots = tuple(dict.fromkeys((plan.input_source.ref, *plan.content.source_refs))) if type(plan) is RegisteredDraftFilePlanV3 else (plan.input_source.ref,)
+        progress = LifeProgressHeadV1(plan.project.ref, plan.recipe.ref, b.activity_id, b.effect_id, "real_execution", plan.step,
             float(terminal.claim.payload.character_at), float(terminal.payload.character_at), b.artifact_ref, terminal.original_ref,
-            activity.receipt_refs, (plan.input_source.ref,))
+            activity.receipt_refs, roots)
         progress_key = AtomKey(Owner("activity", *b.namespace.as_tuple, b.activity_id), "d10.life_progress.v1", b.effect_id)
         prior = read.head(db, progress_key)
         if prior.revision and (not prior.valid or prior.value != plain_v1(progress)):
@@ -164,7 +172,7 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
             "start_original_ref": terminal.claim.original_ref, "terminal_original_ref": terminal.original_ref,
             "action_outcome_ref": outcome.action_outcome_ref, "cost_refs": list(outcome.paid_cost_refs),
             "actual_cpu_ms": terminal.actual_cpu_ms, "started_at_utc": terminal.claim.payload.claimed_at_utc,
-            "completed_at_utc": terminal.payload.completed_at_utc, "reality": "real_execution", "step": "source_note"}
+            "completed_at_utc": terminal.payload.completed_at_utc, "reality": "real_execution", "step": plan.step}
         record = SourceRecord(source_id, canonical_serialize(payload), "persona:" + b.namespace.persona_id, "internal", "confirmed",
             _utc(terminal.payload.completed_at_utc).timestamp(), frame.now_utc, "life-terminal:" + terminal.terminal_digest,
             plan.audiences, ("context", "consolidation"), (AtomKey.from_token(plan.input_source.ref).owner.subject,), "same_root")

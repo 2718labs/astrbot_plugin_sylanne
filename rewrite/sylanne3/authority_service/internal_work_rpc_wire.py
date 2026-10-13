@@ -10,7 +10,7 @@ from .internal_work_contract import (
     InternalWorkBindingV1, InternalWorkClaimV1, InternalWorkTerminalProofV1,
     InternalWorkTerminalV1, InternalWorkTerminalV2,
 )
-from .internal_work_service import (
+from .internal_work_contract import (
     AuthorityInternalWorkVerifiedReceiptV1, InternalWorkJournalAppendV1,
     InternalWorkJournalInspectionV1,
 )

@@ -124,9 +124,9 @@ async def run_installed_post_c02_context_reply_model_v2(
                 trusted_umo=trusted_umo, descriptor=descriptor,
                 admin_model=workflow, installation_bundle=bundle)
             executor = HostModelEgressExecutor(
-                authority=client, bundle=bundle, grant=client_grant, adapter=adapter)
-            recovery, permit = await client.model_prepare_fenced_v1(
-                bundle, client_grant, draft=draft, expected_anchor=anchor)
+                authority=client, bundle=bundle, grant=client_grant, adapter=adapter, local_module_admission=runtime.local_module_admission)
+            recovery, permit = await executor.prepare_once(
+                draft=draft, expected_anchor=anchor, request=call)
             if (type(recovery) is not ModelEgressRecoveryV1
                     or ModelEgressDraftV1.from_intent(recovery.intent) != draft
                     or type(permit) is not FencePermitV2

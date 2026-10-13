@@ -53,7 +53,7 @@ def natural_final_action_parameters_digest_v2(
     })
 
 
-def prepare_natural_final_communication_candidate_v2(
+def _prepare_natural_final_communication_candidate(
     final: NaturalFinalActionCandidateV2, *,
     plan: NaturalExpressionPlanV2, adopted: AdoptedNaturalPlanV2,
     intent: ActionIntent, intent_ref: str, schema: ActionSchema,
@@ -61,6 +61,7 @@ def prepare_natural_final_communication_candidate_v2(
     batch_revision: int, cancellation_epoch: int,
     required_check_refs: tuple[str, ...],
     qualification_receipt_digest: str, valid_until: float,
+    segment_scope: tuple[str, str, tuple[str, ...]] | None = None,
 ) -> NaturalFinalCommunicationCandidateV2:
     """Map reviewed final material to one payload-bound D08 candidate.
 
@@ -81,12 +82,15 @@ def prepare_natural_final_communication_candidate_v2(
             or type(schema) is not ActionSchema):
         return hold("current_paid_final_material_required")
     material = final.material
+    operation_id, effect_id, required_slots = (
+        (plan.final_operation_id, plan.final_effect_id, plan.required_slots)
+        if segment_scope is None else segment_scope)
     if (material.final_activity_id != plan.final_activity_id
-            or material.final_operation_id != plan.final_operation_id
-            or material.final_effect_id != plan.final_effect_id
+            or material.final_operation_id != operation_id
+            or material.final_effect_id != effect_id
             or material.final_activity_id != adopted.final_activity_id
-            or material.final_operation_id != adopted.final_operation_id
-            or material.final_effect_id != adopted.final_effect_id
+            or plan.final_operation_id != adopted.final_operation_id
+            or plan.final_effect_id != adopted.final_effect_id
             or material.c02_operation_id != adopted.c02_operation_id
             or material.source_ref != adopted.source_ref
             or material.scene_id != plan.scene_id
@@ -94,9 +98,9 @@ def prepare_natural_final_communication_candidate_v2(
             or material.scene_ref != plan.scene_ref
             or material.audience_ref != plan.audience_ref
             or material.route_binding_digest != adopted.route_binding_digest
-            or material.required_slots != plan.required_slots
+            or material.required_slots != required_slots
             or material.qualified_units_digest != adopted.qualified_units_digest
-            or material.segment.effect_id != plan.final_effect_id
+            or material.segment.effect_id != effect_id
             or material.payload_digest != segment_payload_digest(
                 material.segment.body, material.segment.media_refs,
                 material.segment.claim_uses)):
@@ -182,8 +186,68 @@ def prepare_natural_final_communication_candidate_v2(
          "d11_final_admission"))
 
 
+def prepare_natural_final_communication_candidate_v2(
+    final: NaturalFinalActionCandidateV2, *,
+    plan: NaturalExpressionPlanV2, adopted: AdoptedNaturalPlanV2,
+    intent: ActionIntent, intent_ref: str, schema: ActionSchema,
+    contact_id: str, communication_action_id: str, grant_id: str,
+    batch_revision: int, cancellation_epoch: int,
+    required_check_refs: tuple[str, ...],
+    qualification_receipt_digest: str, valid_until: float,
+) -> NaturalFinalCommunicationCandidateV2:
+    return _prepare_natural_final_communication_candidate(
+        final, plan=plan, adopted=adopted, intent=intent, intent_ref=intent_ref,
+        schema=schema, contact_id=contact_id,
+        communication_action_id=communication_action_id, grant_id=grant_id,
+        batch_revision=batch_revision, cancellation_epoch=cancellation_epoch,
+        required_check_refs=required_check_refs,
+        qualification_receipt_digest=qualification_receipt_digest,
+        valid_until=valid_until)
+
+
+def prepare_natural_final_communication_candidate_v3(
+    full_final: NaturalFinalActionCandidateV2, *,
+    generation_output: dict, segment_index: int,
+    plan: NaturalExpressionPlanV2, adopted: AdoptedNaturalPlanV2,
+    intent: ActionIntent, intent_ref: str, schema: ActionSchema,
+    contact_id: str, communication_action_id: str, grant_id: str,
+    batch_revision: int, cancellation_epoch: int,
+    required_check_refs: tuple[str, ...],
+    qualification_receipt_digest: str, valid_until: float,
+) -> NaturalFinalCommunicationCandidateV2:
+    """Map one bubble from the current reviewed original to its own grant.
+
+    The adopted parent plan and paid receipt stay intact. A single child grant
+    uses local position zero; the immutable D09 manifest carries its ordinal.
+    """
+    from ..d09.natural_reply import select_natural_final_segment_v3
+    if (type(full_final) is not NaturalFinalActionCandidateV2
+            or full_final.material is None
+            or type(plan) is not NaturalExpressionPlanV2
+            or full_final.material.final_operation_id != plan.final_operation_id
+            or full_final.material.final_effect_id != plan.final_effect_id
+            or full_final.material.required_slots != plan.required_slots):
+        return NaturalFinalCommunicationCandidateV2(
+            "hold", None, None, None, ("complete_parent_final_material_required",))
+    selected = select_natural_final_segment_v3(
+        full_final, plan=plan, generation_output=generation_output,
+        segment_index=segment_index)
+    material = selected.material
+    return _prepare_natural_final_communication_candidate(
+        selected, plan=plan, adopted=adopted, intent=intent,
+        intent_ref=intent_ref, schema=schema, contact_id=contact_id,
+        communication_action_id=communication_action_id, grant_id=grant_id,
+        batch_revision=batch_revision, cancellation_epoch=cancellation_epoch,
+        required_check_refs=required_check_refs,
+        qualification_receipt_digest=qualification_receipt_digest,
+        valid_until=valid_until, segment_scope=(
+            material.final_operation_id, material.final_effect_id,
+            material.required_slots))
+
+
 __all__ = [
     "NaturalFinalCommunicationCandidateV2",
     "natural_final_action_parameters_digest_v2",
     "prepare_natural_final_communication_candidate_v2",
+    "prepare_natural_final_communication_candidate_v3",
 ]

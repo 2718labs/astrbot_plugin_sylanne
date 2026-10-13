@@ -12,7 +12,7 @@ import json
 from ..authority_service.v2_contract import MutationReceiptV2, PlatformObservationV2, to_wire, from_wire
 from ..contracts import Event, Scope
 from ..domains.d06 import D06DomainAdapter, SourceAdmission
-from ..domains.d09.natural_batch import validate_natural_verified_batch_value_v2
+from ..domains.d09.natural_batch import validate_natural_verified_batch_value
 from ..domains.d09.turn_order import (
     reserve_turn_slot_v1, turn_order_key, observe_outbound_turn_v1,
     complete_outbound_turn_v1, validate_turn_completion_v1, turn_outbound_observation_key,
@@ -42,6 +42,19 @@ def install_d13_outbound_schema_v1(db):
 
 
 def _atom(db, namespace, key):
+    from ..authority_service.current_authority_graph_read_v3 import (
+        _authority_attachment_owner_v3,authority_collection_source_atom_v6)
+    work=_authority_attachment_owner_v3(db)
+    if work is not None:
+        if work.namespace!=namespace:raise ValueError('Authority outbound atom crossed namespace')
+        if key.type_name=='memory.source':
+            root=work.collection_record.get('source_ref')if work.collection_record is not None else None
+            material=work.collection_source_materials.get(root)
+            if material is None:raise ValueError('Authority outbound Source lacks its current record body EOF')
+            return authority_collection_source_atom_v6(work,material,key.token)
+        atom=work.projection.get(key)
+        if not atom.valid:raise ValueError('current Authority outbound dependency unavailable')
+        return atom
     row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
                      (key.token, *namespace.as_tuple)).fetchone()
     if row is None or row[2] != 1:
@@ -87,7 +100,7 @@ def _stage(db, namespace, final_operation_id, observed, now):
             or observation.outcome not in {"accepted", "unknown", "delivered"}):
         raise ValueError("outbound observation and original final differ")
     batch = _atom(db, namespace, AtomKey.from_token(recovered.evidence.batch_ref))
-    validate_natural_verified_batch_value_v2(batch.value)
+    validate_natural_verified_batch_value(batch.value)
     # The actual observation permits recording an event that happened, but it
     # does not permit substituting a newer authored batch or route original.
     for token, revision in recovered.write_versions:
@@ -330,19 +343,40 @@ def commit_natural_outbound_observation_v1(graph, bootstrap, namespace, final_op
 def read_current_outbound_turn_v1(db, namespace, slot, completion, *, now_utc):
     """Reconstruct a confirmed delivered turn from its adopted W01 original."""
     validate_turn_completion_v1(completion.value)
-    row = db.execute(f"SELECT source_ref,batch_ref,observation_json,original_json,original_digest "
-        f"FROM {TABLE} WHERE bot=? AND persona=? AND slot_ref=? AND observation_digest=?",
-        (*namespace.as_tuple, slot.key.token, completion.value["evidence_ref"])).fetchone()
+    from ..authority_service.current_authority_graph_read_v3 import (
+        _authority_attachment_owner_v3,read_bound_authority_graph_attachment_rows_v3,
+        read_authority_current_point_v3,authority_current_json_v3,require_authority_outbound_collection_source_v6,
+        authority_collection_source_atom_v6)
+    work=_authority_attachment_owner_v3(db)
+    if work is None:
+        row = db.execute(f"SELECT source_ref,batch_ref,observation_json,original_json,original_digest "
+            f"FROM {TABLE} WHERE bot=? AND persona=? AND slot_ref=? AND observation_digest=?",
+            (*namespace.as_tuple, slot.key.token, completion.value["evidence_ref"])).fetchone()
+    else:
+        handled,refs=read_bound_authority_graph_attachment_rows_v3(db,table=TABLE,columns=('final_operation_id',),
+            key_columns=('bot','persona','slot_ref','observation_digest'),
+            key=(*namespace.as_tuple,slot.key.token,completion.value['evidence_ref']),order_column='final_operation_id')
+        if not handled or len(refs)!=1:raise ValueError('Authority outbound completion has no unique adopted original')
+        row=read_authority_current_point_v3(db,table=TABLE,
+            columns=('source_ref','batch_ref','observation_json','original_json','original_digest'),
+            key_columns=('bot','persona','final_operation_id','observation_digest'),
+            key=(*namespace.as_tuple,refs[0][0],completion.value['evidence_ref']),legacy_reader=lambda:None)
     if row is None:
         raise ValueError("outbound completion lacks its actual adopted observation")
-    original, receipt = json.loads(row[3]), from_wire(json.loads(row[2]))
-    if canonical_digest(original) != row[4] or canonical_digest(receipt) != original["observation_digest"]:
+    original, receipt = authority_current_json_v3(row[3]), from_wire(authority_current_json_v3(row[2]))
+    if (canonical_digest(original)if work is None else row[3].sha256) != row[4] or canonical_digest(receipt) != original["observation_digest"]:
         raise ValueError("outbound original commitment differs")
-    source = _atom(db, namespace, AtomKey.from_token(row[0]))
+    batch = _atom(db, namespace, AtomKey.from_token(row[1]))
+    outbox = _atom(db, namespace, AtomKey.from_token(slot.value['origin_ref']))
+    material=None
+    if work is None:source=_atom(db,namespace,AtomKey.from_token(row[0]))
+    else:
+        material=require_authority_outbound_collection_source_v6(work,slot=slot,completion=completion,
+            batch=batch,outbox=outbox,source_ref=row[0],original=row[3],receipt=receipt)
+        work.collection_record['source_ref']=row[0]
+        source=authority_collection_source_atom_v6(work,material,row[0])
     record = SourceRecord.from_dict(source.value)
     access = _atom(db, namespace, access_key(*namespace.as_tuple, record.source_id))
-    batch = _atom(db, namespace, AtomKey.from_token(row[1]))
-    outbox = _atom(db, namespace, AtomKey.from_token(slot.value["origin_ref"]))
     expected = complete_outbound_turn_v1(namespace, slot, outbox, batch, source, access, receipt)
     if expected.write.value != completion.value or expected.write.key != completion.key:
         raise ValueError("outbound completion is not the original delivered turn")
@@ -370,14 +404,23 @@ def read_current_outbound_turn_v1(db, namespace, slot, completion, *, now_utc):
         active.add(sid)
         if len(seen) + len(active) > 128:
             raise ValueError("outbound context ancestry exceeds bounded coverage")
-        parent = _atom(db, namespace, source_key(*namespace.as_tuple, sid))
-        access_parent = _atom(db, namespace, access_key(*namespace.as_tuple, sid))
-        parent_record = _source_guard(namespace, slot.value["conversation_ref"], parent, access_parent)
-        correction = source_correction_head_key(namespace, sid)
-        if db.execute("SELECT 1 FROM graph_atoms WHERE token=?", (correction.token,)).fetchone():
-            raise ValueError("outbound source or ancestor was corrected")
-        reads.extend((VersionedRef(parent.key.token, parent.revision),
-                      VersionedRef(access_parent.key.token, access_parent.revision), VersionedRef(correction.token, 0)))
+        if work is None:
+            parent = _atom(db, namespace, source_key(*namespace.as_tuple, sid))
+            access_parent = _atom(db, namespace, access_key(*namespace.as_tuple, sid))
+            parent_record = _source_guard(namespace, slot.value["conversation_ref"], parent, access_parent)
+            correction = source_correction_head_key(namespace, sid)
+            if db.execute("SELECT 1 FROM graph_atoms WHERE token=?", (correction.token,)).fetchone():
+                raise ValueError("outbound source or ancestor was corrected")
+            reads.extend((VersionedRef(parent.key.token, parent.revision),
+                          VersionedRef(access_parent.key.token, access_parent.revision), VersionedRef(correction.token, 0)))
+        else:
+            ref=source_key(*namespace.as_tuple,sid).token
+            witness=material.witnesses[ref].require_current_v3()
+            parent_record=material.metadata_records[ref]
+            access_parent=work.projection.get(access_key(*namespace.as_tuple,sid))
+            correction=source_correction_head_key(namespace,sid);head=work.projection.get(correction)
+            if head.valid or head.revision!=0:raise ValueError('Authority outbound Source ancestor was corrected')
+            reads.extend((VersionedRef(ref,witness.revision),VersionedRef(access_parent.key.token,access_parent.revision),VersionedRef(correction.token,0)))
         pending.append((sid, True))
         pending.extend((parent_id, False) for parent_id in reversed(parent_record.parent_source_ids))
     turn = CompletedTurnV1(slot.value["conversation_ref"], audience, slot.value["sequence"],

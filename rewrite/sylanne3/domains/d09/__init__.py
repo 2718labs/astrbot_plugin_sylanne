@@ -570,6 +570,7 @@ class D09ExpressionProvider:
         )
         from .contact_batch_v2 import contact_batch_type_specs_v2
         from .contact_batch_v3 import contact_batch_type_specs_v3
+        from .natural_disposition_v1 import natural_disposition_type_spec_v1
         return tuple(TypeSpec(
             name=name,
             owner_kinds=owners,
@@ -590,7 +591,16 @@ class D09ExpressionProvider:
                 "immutable": immutable, "fields": fields,
                 "version": 2 if name in {PAID_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V2} else 1,
             }),
-        ) for name, owners, role, immutable, fields in definitions) + turn_order_type_specs_v1() + contact_batch_type_specs_v2() + contact_batch_type_specs_v3()
+        ) for name, owners, role, immutable, fields in definitions) + turn_order_type_specs_v1() + contact_batch_type_specs_v2() + contact_batch_type_specs_v3() + (natural_disposition_type_spec_v1(),) + (
+            TypeSpec(name=NATURAL_BATCH_SCHEMA_V3, owner_kinds=("activity",),
+                     storage_role="state", validator=validate_natural_verified_batch_value_v3,
+                     immutable=True, schema_version=3, writer_domain="d09",
+                     schema_hash=schema_hash({
+                         "domain": "d09", "type": NATURAL_BATCH_SCHEMA_V3,
+                         "owners": ("activity",), "role": "state", "immutable": True,
+                         "version": 3, "fields": "v2 plus whole reviewed semantic_manifest and selected_index 0..3; child position 0",
+                     })),
+        )
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
@@ -1099,6 +1109,8 @@ from .natural_batch import (
     NATURAL_BATCH_SCHEMA_V2, NaturalVerifiedBatchProposalV2,
     prepare_natural_verified_batch_proposal_v2,
     validate_natural_verified_batch_value_v2,
+    NATURAL_BATCH_SCHEMA_V3, prepare_natural_verified_batch_proposal_v3,
+    validate_natural_verified_batch_value_v3,
 )
 from .contact_batch_v1 import CONTACT_BATCH_SCHEMA_V1, validate_contact_verified_batch_v1
 from .interruption import (

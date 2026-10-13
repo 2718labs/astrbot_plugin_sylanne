@@ -186,6 +186,7 @@ class ModelEgressObservationV1:
     usage: tuple[tuple[str, int], ...]
     cost: tuple[tuple[str, int], ...]
     provider_call_ref: str | None
+    billing_receipt_json: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("authority_id", "namespace", "subject", "operation_id", "call_id"):
@@ -218,6 +219,10 @@ class ModelEgressObservationV1:
             if (type(self.provider_call_ref) is not str or not self.provider_call_ref
                     or len(self.provider_call_ref) > 256):
                 raise ValueError("invalid provider_call_ref")
+        if self.billing_receipt_json is not None:
+            if self.status != "completed":
+                raise ValueError("billing receipt requires the original completed observation")
+            _billing_observation_receipt_v1(self)
 
     @classmethod
     def from_response(cls, intent: ModelEgressIntentV1, response) -> ModelEgressObservationV1:
@@ -227,16 +232,18 @@ class ModelEgressObservationV1:
             raise ValueError("typed intent and parsed provider response required")
         if response.status == "not_dispatched":
             raise ValueError("dispatch_started cannot be reclassified as unsent")
-        return cls(intent.authority_id, intent.namespace, intent.subject,
+        observation = cls(intent.authority_id, intent.namespace, intent.subject,
                    intent.operation_id, intent.call_id, intent.request_digest,
                    response.status,
                    canonical_serialize(dict(response.result)) if response.result is not None else None,
                    tuple(sorted(response.usage.items())), tuple(sorted(response.cost.items())),
-                   response.provider_call_ref)
+                   response.provider_call_ref, response.billing_receipt_json)
+        require_model_observation_billing_intent_v1(observation, intent)
+        return observation
 
     @property
     def digest(self) -> str:
-        return canonical_digest(asdict(self))
+        return canonical_digest(model_observation_to_wire_v1(self))
 
     @property
     def result(self) -> dict | None:
@@ -323,6 +330,7 @@ class HostObservedModelCompletionV2:
     usage: tuple[tuple[str, int], ...]
     cost: tuple[tuple[str, int], ...]
     provider_call_ref: str | None
+    billing_receipt_json: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("admission_id", "host_incarnation", "request_digest",
@@ -345,10 +353,15 @@ class HostObservedModelCompletionV2:
             for key, amount in amounts:
                 identifier(key, name)
                 _integer(amount, f"{name} amount")
+        if self.billing_receipt_json is not None:
+            receipt = _billing_observation_receipt_v1(self)
+            if (receipt.provider_id, receipt.model_id, receipt.provider_config_digest) != (
+                    self.provider_id, self.model_id, self.provider_config_digest):
+                raise ValueError("billing receipt differs from the actual provider/model/configuration")
 
     @property
     def digest(self) -> str:
-        return canonical_digest(asdict(self))
+        return canonical_digest(host_model_completion_to_wire_v2(self))
 
     def observation_for(self, intent: ModelEgressIntentV1) -> ModelEgressObservationV1:
         if (type(intent) is not ModelEgressIntentV1
@@ -361,7 +374,72 @@ class HostObservedModelCompletionV2:
             intent.authority_id, intent.namespace, intent.subject,
             intent.operation_id, intent.call_id, intent.request_digest,
             "completed", self.result_json, self.usage, self.cost,
-            self.provider_call_ref)
+            self.provider_call_ref, self.billing_receipt_json)
+
+
+def _billing_observation_receipt_v1(value):
+    from ..model_broker.provider_billing_receipt_v1 import provider_billing_receipt_from_json_v1
+    receipt = provider_billing_receipt_from_json_v1(value.billing_receipt_json)
+    if ((receipt.call_id, receipt.request_digest, receipt.provider_call_ref) != (
+            value.call_id, value.request_digest, value.provider_call_ref)
+            or receipt.usage != dict(value.usage)
+            or dict(value.cost).get("model_microusd") != receipt.final_charged_amount):
+        raise ValueError("billing receipt differs from original call/response/usage/final charge")
+    return receipt
+
+
+def require_model_observation_billing_intent_v1(observation, intent):
+    if observation.billing_receipt_json is not None:
+        receipt = _billing_observation_receipt_v1(observation)
+        if (receipt.provider_id, receipt.model_id, receipt.provider_config_digest) != (
+                intent.provider_id, intent.model_id, intent.provider_config_digest):
+            raise ValueError("billing receipt differs from original model intent configuration")
+
+
+def _model_observation_wire_v1(value, kind):
+    if type(value) is not kind:
+        raise TypeError("exact model observation/report required")
+    data = asdict(value)
+    if data["billing_receipt_json"] is None:
+        del data["billing_receipt_json"]
+    for name in ("usage", "cost"):
+        data[name] = [list(pair) for pair in data[name]]
+    return data
+
+
+def _model_observation_unwire_v1(raw, kind):
+    expected = set(kind.__dataclass_fields__)
+    legacy = expected - {"billing_receipt_json"}
+    if (type(raw) is not dict or set(raw) not in (legacy, expected)
+            or "billing_receipt_json" in raw and type(raw["billing_receipt_json"]) is not str):
+        raise ValueError("model observation/report exact legacy or billing fields required")
+    data = dict(raw)
+    for name in ("usage", "cost"):
+        pairs = data[name]
+        if (type(pairs) is not list or any(type(pair) is not list or len(pair) != 2
+                or type(pair[0]) is not str or type(pair[1]) is not int for pair in pairs)):
+            raise ValueError("model observation/report amount pairs differ")
+        data[name] = tuple(tuple(pair) for pair in pairs)
+    result = kind(**data)
+    if _model_observation_wire_v1(result, kind) != raw:
+        raise ValueError("noncanonical model observation/report wire")
+    return result
+
+
+def model_observation_to_wire_v1(value):
+    return _model_observation_wire_v1(value, ModelEgressObservationV1)
+
+
+def model_observation_from_wire_v1(raw):
+    return _model_observation_unwire_v1(raw, ModelEgressObservationV1)
+
+
+def host_model_completion_to_wire_v2(value):
+    return _model_observation_wire_v1(value, HostObservedModelCompletionV2)
+
+
+def host_model_completion_from_wire_v2(raw):
+    return _model_observation_unwire_v1(raw, HostObservedModelCompletionV2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,4 +470,7 @@ __all__ = [
     "ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressObservationV1",
     "ModelEgressRecoveryV1", "ModelAdmissionV2", "HostObservedModelCompletionV2",
     "ModelTerminalReceiptV2",
+    "model_observation_to_wire_v1", "model_observation_from_wire_v1",
+    "host_model_completion_to_wire_v2", "host_model_completion_from_wire_v2",
+    "require_model_observation_billing_intent_v1",
 ]

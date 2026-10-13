@@ -47,15 +47,13 @@ def life_numeric_model_draft_v1(db, *, namespace, issuer, job_id, metadata, epoc
 
 
 def seal_life_numeric_call_v1(db, *, namespace, issuer, intent, permit, metadata, epoch):
-    from .d06_life_numeric_worker_v1 import read_committed_life_numeric_request_v1
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1, ModelEgressDraftV1
     from ..authority_service.v2_model_egress_wire import to_wire
     from ..authority_service.v2_contract import FencePermitV2, to_wire as permit_wire
     from .jobs import get_job
     if not db.in_transaction or type(intent) is not ModelEgressIntentV1 or type(permit) is not FencePermitV2:
         raise TypeError('Life numeric call requires its actual acquired intent and egress permit')
-    p, b, model = read_committed_life_numeric_request_v1(db, namespace=namespace, issuer=issuer, job_id=intent.job_id)
-    _, _, _, draft = life_numeric_model_draft_v1(db, namespace=namespace, issuer=issuer,
+    p, b, model, draft = life_numeric_model_draft_v1(db, namespace=namespace, issuer=issuer,
         job_id=intent.job_id, metadata=metadata, epoch=epoch)
     if ModelEgressDraftV1.from_intent(intent) != draft:
         raise ValueError('Life numeric Core intent differs from its exact actual acquired draft')
@@ -164,13 +162,13 @@ def record_life_numeric_paid_result_v1(db, *, namespace, issuer, job_id, result_
         operation_id=cost.operation_id, value=raw)
 
 
-def read_life_numeric_paid_result_v1(db, *, namespace, issuer, job_id):
+def _verify_life_numeric_paid_original_v1(db, *, namespace, issuer, job_id, signed_original):
     from ..authority_service.current_life_numeric_v1 import LifeNumericModelResultReadV1, life_numeric_result_from_wire_v1
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
     from ..authority_service.v2_model_egress_wire import from_wire
     from .d06_life_numeric_worker_v1 import read_committed_life_numeric_request_v1
     p, b, model = read_committed_life_numeric_request_v1(db, namespace=namespace, issuer=issuer, job_id=job_id)
-    saved = _read(db, issuer=issuer, namespace=namespace, kind='numeric_paid_v1', ref=job_id)
+    saved = signed_original
     call = _read(db, issuer=issuer, namespace=namespace, kind='numeric_call_v1', ref=job_id)
     if saved is None or call is None: raise ValueError('Life numeric actual paid/call originals absent')
     raw = saved[0]
@@ -187,6 +185,15 @@ def read_life_numeric_paid_result_v1(db, *, namespace, issuer, job_id):
             or result.request.model_request_digest != model.digest):
         raise ValueError('Life numeric paid original lost exact cost/worker membership')
     return p, b, result, cost, canonical_digest(raw)
+
+
+def read_life_numeric_paid_result_v1(db, *, namespace, issuer, job_id):
+    """Signed paid result joins the exact model-cost ABI, not a Domain receipt."""
+    from .d11_life_preparation_v1 import _read_signed_life_payload_v1
+    saved = _read_signed_life_payload_v1(db, issuer=issuer, namespace=namespace,
+        kind="numeric_paid_v1", ref=job_id)
+    return _verify_life_numeric_paid_original_v1(db, namespace=namespace, issuer=issuer,
+        job_id=job_id, signed_original=saved)
 
 
 def prepare_life_numeric_result_selector_v1(db, *, namespace, issuer, job_id,

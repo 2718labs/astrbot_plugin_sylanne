@@ -5,16 +5,19 @@ to eligibility. Provenance is a typed deletion/verification commitment, not a
 permission source; installed consumers must authenticate the signed prepared
 and adopted originals and independently recheck current Source/Owner rights.
 """
+
+from .d11_life_contract_v1 import LIFE_BINDING_TYPES, LIFE_CLAIM_TYPES, LIFE_TERMINAL_TYPES
 from dataclasses import dataclass
 import json
 
 from ..graph_types import AtomKey, GraphWrite, TypeSpec
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize, schema_hash
 from .d11_life_contract_v1 import D11LifeExecutionBindingV1, life_adoption_operation_id_v1
+from .d11_life_preparation_v1 import life_read_digest_v1
 
 PROVENANCE_TYPE='d11.life_fact_provenance.v1'
 ELIGIBILITY_TYPE='d11.life_fact_eligibility.v1'
-FACT_TYPES=frozenset({'d11.life_artifact.v1','d11.role_segment_start.v1','d11.role_segment_end.v1'})
+FACT_TYPES=frozenset({'d11.life_artifact.v1','d11.role_segment_start.v1','d11.role_segment_end.v1','d11.draft_artifact.v1','d11.draft_segment_start.v1','d11.draft_segment_end.v1'})
 
 
 def _digest(value):
@@ -54,7 +57,7 @@ class LifeFactProvenanceV1:
 
     def __post_init__(self):
         b=self.binding;key=AtomKey.from_token(self.fact_ref)
-        if (type(b) is not D11LifeExecutionBindingV1 or self.schema!=PROVENANCE_TYPE
+        if (type(b) not in LIFE_BINDING_TYPES or self.schema!=PROVENANCE_TYPE
                 or key.type_name not in FACT_TYPES or NamespaceId.from_key(key)!=b.namespace
                 or type(self.fact_revision) is not int or self.fact_revision!=1
                 or self.producing_operation_id!=life_adoption_operation_id_v1(b)
@@ -66,8 +69,8 @@ class LifeFactProvenanceV1:
             raise ValueError('Life provenance closed fact/read scope differs')
         for value in (self.fact_digest,self.prepared_digest):_digest(value)
         from .d11_life_graph_types_v1 import life_role_segment_key_v1
-        exact=(AtomKey.from_token(b.artifact_ref) if key.type_name=='d11.life_artifact.v1'
-            else life_role_segment_key_v1(b,'start' if key.type_name=='d11.role_segment_start.v1' else 'end'))
+        exact=(AtomKey.from_token(b.artifact_ref) if key.type_name in {'d11.life_artifact.v1','d11.draft_artifact.v1'}
+            else life_role_segment_key_v1(b,'start' if key.type_name in {'d11.role_segment_start.v1','d11.draft_segment_start.v1'} else 'end'))
         if key!=exact:raise ValueError('Life provenance fact key is not its actual bound original')
         for value in (self.claim_digest,self.terminal_digest):
             if type(value) is not str or not value.startswith('sha256:'):raise ValueError('Life provenance journal digest differs')
@@ -125,8 +128,9 @@ def life_fact_auxiliary_type_specs_v1():
 
 
 def life_fact_provenance_v1(prepared,claim,terminal,fact):
+    from .d11_life_preparation_v1 import life_read_digest_v1
     rows=tuple(sorted((LifeFactReadCommitmentV1(row.ref,row.revision,
-        canonical_digest(json.loads(row.value_json)),row.valid) for row in prepared.read_rows),key=lambda row:row.ref))
+        life_read_digest_v1(row),row.valid) for row in prepared.read_rows),key=lambda row:row.ref))
     return LifeFactProvenanceV1(prepared.binding,fact.key.token,1,canonical_digest(fact.value),
         life_adoption_operation_id_v1(prepared.binding),prepared.digest,claim.original_ref,claim.claim_digest,
         terminal.original_ref,terminal.terminal_digest,rows,
@@ -142,6 +146,15 @@ SOURCE_FAMILY_TYPES=frozenset({'memory.source','memory.access','d06.source_corre
 
 
 def life_current_fact_reads_v1(prepared):
+    from .d11_life_preparation_v1 import D11DraftPreparedV1
+    if type(prepared) is D11DraftPreparedV1:
+        from ..graph_types import owner_grant_key
+        owner = owner_grant_key(*prepared.binding.namespace.as_tuple).token
+        selected = tuple(row for row in prepared.read_rows if row.ref == owner or
+            AtomKey.from_token(row.ref).type_name in SOURCE_FAMILY_TYPES | CURRENT_PERMISSION_TYPES)
+        if owner not in {row.ref for row in selected}:
+            raise ValueError("draft current eligibility lost its actual upstream Owner read")
+        return selected
     from ..graph_types import owner_grant_key
     from ..memory_types import SourceRecord, source_key, access_key
     from ..domains.d06 import source_correction_head_key
@@ -183,6 +196,8 @@ def life_fact_qualified_writes_v1(prepared,claim,terminal,facts):
 
 def require_current_life_fact_eligibility_v1(db,*,prepared,terminal,adopted):
     """Signed-original callers join every fact, proof and current projection."""
+    from .natural_producer_qualification_v1 import _producer_original_many_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     from .d11_life_graph_types_v1 import validate_life_graph_value_v1, life_role_segment_key_v1
     from ..domains.d01.production_operations_v1 import plain_v1
     b=prepared.binding
@@ -191,8 +206,9 @@ def require_current_life_fact_eligibility_v1(db,*,prepared,terminal,adopted):
     facts=[life_role_segment_key_v1(b,'start'),life_role_segment_key_v1(b,'end')]
     if terminal.status=='completed':facts.append(AtomKey.from_token(b.artifact_ref))
     commitments={row['ref']:row for row in adopted['write_commitments']}
+    current_reads=life_current_fact_reads_v1(prepared)
     for key in facts:
-        row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
+        row=_producer_original_point_v3(db, table='graph_atoms', columns=('revision', 'value', 'valid'), key_columns=('token',), key=(lambda _producer_params_v3: (_producer_params_v3[0],))((key.token,)), legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone())
         if row is None or row[0]!=1 or row[2]!=1 or validate_life_graph_value_v1(key.type_name,json.loads(row[1]))!=b:
             raise ValueError('Life current immutable fact is missing or differs')
         fact=GraphWrite(key,json.loads(row[1]))
@@ -203,37 +219,38 @@ def require_current_life_fact_eligibility_v1(db,*,prepared,terminal,adopted):
             canonical_digest(plain_v1(proof)),proof.producing_operation_id)
         for member,value in ((key,fact.value),(proof_key,plain_v1(proof)),(eligibility_key,plain_v1(eligibility))):
             expected=(1,canonical_serialize(value),1)
-            if db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(member.token,)).fetchone()!=expected:
+            if _producer_original_point_v3(db, table='graph_atoms', columns=('revision', 'value', 'valid'), key_columns=('token',), key=(lambda _producer_params_v3: (_producer_params_v3[0],))((member.token,)), legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(member.token,)).fetchone())!=expected:
                 raise ValueError('Life current fact/provenance/eligibility is missing, changed or invalidated')
             if commitments.get(member.token)!={'ref':member.token,'revision':1,'digest':canonical_digest(value)}:
                 raise ValueError('Life eligibility lacks its exact signed adoption membership')
         expected_dependencies=tuple(sorted({(key.token,1),(proof_key.token,1),
-            *((row.ref,row.revision) for row in life_current_fact_reads_v1(prepared))}))
-        dependencies=tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
-            'WHERE dependent_token=? ORDER BY dependency_token',(eligibility_key.token,)))
+            *((row.ref,row.revision) for row in current_reads)}))
+        dependencies=_producer_original_many_v3(db,table='graph_dependencies',columns=('dependency_token', 'dependency_revision'),key_columns=('dependent_token',),key=(eligibility_key.token,),order_column='dependency_token',legacy_reader=lambda: tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
+            'WHERE dependent_token=? ORDER BY dependency_token',(eligibility_key.token,))))
         if dependencies!=expected_dependencies:
             raise ValueError('Life current eligibility invalidation edges differ or are absent')
-        for frozen in life_current_fact_reads_v1(prepared):
-            actual=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(frozen.ref,)).fetchone()
+        for frozen in current_reads:
+            actual=_producer_original_point_v3(db, table='graph_atoms', columns=('revision', 'value', 'valid'), key_columns=('token',), key=(lambda _producer_params_v3: (_producer_params_v3[0],))((frozen.ref,)), legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(frozen.ref,)).fetchone())
             if frozen.revision==0 and actual is None:continue
             if (actual is None or actual[0]!=frozen.revision or bool(actual[2])!=frozen.valid
-                    or canonical_digest(json.loads(actual[1]))!=canonical_digest(json.loads(frozen.value_json))):
+                    or canonical_digest(json.loads(actual[1]))!=life_read_digest_v1(frozen)):
                 raise ValueError('Life current Source/Access/Correction/plan ancestor changed or deleted')
     from .d11_life_outcome_provenance_v1 import require_current_life_outcome_eligibility_v1
-    life_writes=tuple(GraphWrite(key,json.loads(db.execute('SELECT value FROM graph_atoms WHERE token=?',(key.token,)).fetchone()[0])) for key in facts)
+    life_writes=tuple(GraphWrite(key,json.loads(_producer_original_point_v3(db, table='graph_atoms', columns=('value',), key_columns=('token',), key=(lambda _producer_params_v3: (_producer_params_v3[0],))((key.token,)), legacy_reader=lambda: db.execute('SELECT value FROM graph_atoms WHERE token=?',(key.token,)).fetchone())[0])) for key in facts)
     outcome=require_current_life_outcome_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=adopted,life_writes=life_writes)
     return (*facts,outcome)
 
 
 def validate_life_fact_provenance_history_v1(db,*,terminal,adopted,receipt,members):
     """Authenticate the closed immutable history join, without current rights."""
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     from .d11_life_graph_types_v1 import life_role_segment_key_v1
     from .d11_life_contract_v1 import life_to_wire_v1
     b=terminal.binding
     from .d11_life_preparation_v1 import TABLE, life_prepared_from_wire_v1
-    row=db.execute('SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
+    row=_producer_original_point_v3(db, table='graph_d11_life_originals_v1', columns=('payload_json', 'payload_digest', 'producing_operation_id'), key_columns=('bot', 'persona', 'kind', 'original_ref'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],'prepared',_producer_params_v3[2]))((*b.namespace.as_tuple, b.prepared_original_ref)), legacy_reader=lambda: db.execute('SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
         " WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
-        (*b.namespace.as_tuple,b.prepared_original_ref)).fetchone()
+        (*b.namespace.as_tuple,b.prepared_original_ref)).fetchone())
     if row is None:raise ValueError('Life historical provenance lacks its actual prepared original')
     raw=json.loads(row[0]);prepared=life_prepared_from_wire_v1(raw)
     if (canonical_serialize(raw)!=row[0] or prepared.digest!=row[1] or row[1]!=adopted['prepared_digest']
@@ -264,13 +281,14 @@ def validate_life_fact_provenance_history_v1(db,*,terminal,adopted,receipt,membe
         if canonical_serialize(members[proof_key.token])!=canonical_serialize(plain_v1(expected_proof)):
             raise ValueError('Life historical provenance complete prepared read-set differs')
         for frozen in prepared.read_rows:
-            original=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
-                (frozen.ref,frozen.revision)).fetchone()
+            original=_producer_original_point_v3(db, table='graph_history', columns=('value', 'valid'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((frozen.ref, frozen.revision)), legacy_reader=lambda: db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
+                (frozen.ref,frozen.revision)).fetchone())
             if frozen.revision==0 and original is None:continue
-            if original!=(frozen.value_json,int(frozen.valid)):
+            if (original is None or original[1] != int(frozen.valid)
+                    or canonical_digest(json.loads(original[0])) != life_read_digest_v1(frozen)):
                 raise ValueError('Life historical Source/Access/Correction/plan revision bytes differ')
-        if fact_key.type_name!='d11.life_artifact.v1':
-            original=terminal.claim if fact_key.type_name=='d11.role_segment_start.v1' else terminal
+        if fact_key.type_name not in {'d11.life_artifact.v1','d11.draft_artifact.v1'}:
+            original=terminal.claim if fact_key.type_name in {'d11.role_segment_start.v1','d11.draft_segment_start.v1'} else terminal
             expected={'schema':fact_key.type_name,'binding':life_to_wire_v1(b),'payload':life_to_wire_v1(original.payload),
                 'journal_ref':original.original_ref,'journal_digest':original.claim_digest if original is terminal.claim else original.terminal_digest}
             if canonical_serialize(fact)!=canonical_serialize(expected):
@@ -278,8 +296,8 @@ def validate_life_fact_provenance_history_v1(db,*,terminal,adopted,receipt,membe
         expected_dependencies=tuple(sorted({(fact_key.token,1),(proof_key.token,1),
             *((row.ref,row.revision) for row in life_current_fact_reads_v1(prepared))}))
         for key,expected in ((fact_key,()),(proof_key,()),(eligibility_key,expected_dependencies)):
-            row=db.execute('SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?',
-                (key.token,receipt.operation_id)).fetchone()
+            row=_producer_original_point_v3(db, table='graph_history', columns=('dependencies',), key_columns=('token', 'revision', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],1,_producer_params_v3[1]))((key.token, receipt.operation_id)), legacy_reader=lambda: db.execute('SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?',
+                (key.token,receipt.operation_id)).fetchone())
             dependencies=None if row is None else json.loads(row[0])
             if (type(dependencies) is not list or len(dependencies)!=len(expected)
                     or tuple(sorted(tuple(item) for item in dependencies))!=expected):

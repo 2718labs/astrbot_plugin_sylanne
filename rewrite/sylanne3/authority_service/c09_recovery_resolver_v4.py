@@ -1,6 +1,10 @@
 """Read authenticated typed recovery facts without recreating execution bodies."""
 from __future__ import annotations
 
+from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3
+
+from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+
 from contextlib import closing
 from dataclasses import asdict
 import json
@@ -64,7 +68,7 @@ class InstalledSanitizedRecoveryResolverV4:
                 if bindings.prior_transition_digest_or_none != prior_root:
                     raise AuthorityUnavailable("C09 recovery transition lineage differs")
                 from .c09_model_budget_original_v1 import read_model_budget_originals_v1, model_unit_fact_v4
-                models = read_model_budget_originals_v1(db, namespace=namespace, operation_id=operation)
+                models = read_model_budget_originals_v1(db, namespace=namespace, operation_id=operation, meter=current_c09_sql_meter_v2())
                 model_bindings = {item.execution_id: item for item in bindings.execution_bindings if item.execution_kind == "model"}
                 if set(model_bindings) != {item.call_id for item in models}:
                     raise AuthorityUnavailable("C09 model obligation inventory differs from authenticated bindings")
@@ -132,22 +136,44 @@ class InstalledSanitizedRecoveryResolverV4:
         context.require_current("maintenance")
         return context,tuple(frames)
 
+    def _read_selected_point_v3(self, method, **arguments):
+        from .c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+        from ..runtime.c09_paged_sql_v2 import C09SqlByteMeterV2, c09_sql_meter_quantum_v2, C09PagedCaptureHold
+        view = getattr(self.reader, '_selected_history_read_v3', None)
+        if type(view) is not VerifiedSelectedHistoryReadV3:
+            return False, None
+        try:
+            meter = current_c09_sql_meter_v2()
+        except C09PagedCaptureHold:
+            with self.reader.reserve_control_read_v3() as budget:
+                meter = require_c09_reserved_meter_v3(budget)
+                with c09_sql_meter_quantum_v2(meter):
+                    return True, getattr(view, method)(meter=meter, **arguments)
+        return True, getattr(view, method)(meter=meter, **arguments)
+
     def read_sanitized_model_budget_v1(self, *, namespace, call_id):
+        selected, value = self._read_selected_point_v3('read_sanitized_model_budget_v3', namespace=namespace, call_id=call_id)
+        if selected:
+            return value
         context, frames = self.read_verified_frames_v4()
-        from .c09_model_budget_original_v1 import read_model_budget_originals_v1
+        from .c09_model_budget_original_v1 import read_model_budget_original_v1
         member = next(item for item in context.manifest["members"] if item["role"] == "core")
         found = None
         with closing(sqlite3.connect(Path(member["resolved_path"]).as_uri() + "?mode=ro", uri=True)) as db:
             for original, _facts, _bindings in frames:
-                for model in read_model_budget_originals_v1(db, namespace=namespace, operation_id=original["operation_id"]):
-                    if model.call_id == call_id:
-                        if found is not None and found != model:
-                            raise AuthorityUnavailable("C09 model obligation repeated-frame conflict")
-                        found = model
+                model = read_model_budget_original_v1(db, namespace=namespace,
+                    operation_id=original["operation_id"], call_id=call_id, meter=current_c09_sql_meter_v2())
+                if model is not None:
+                    if found is not None and found != model:
+                        raise AuthorityUnavailable("C09 model obligation repeated-frame conflict")
+                    found = model
         context.require_current("accounting")
         return found
 
     def read_sanitized_execution_v4(self, *, namespace, execution_id):
+        selected, value = self._read_selected_point_v3('read_sanitized_execution_v3', namespace=namespace, execution_id=execution_id)
+        if selected:
+            return value
         context,frames = self.read_verified_frames_v4()
         found, binding, unknown = None,None,None
         d02,d11,chain = {},{},[]

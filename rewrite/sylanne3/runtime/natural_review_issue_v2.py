@@ -9,19 +9,23 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
+import json
 
 from ..graph_types import GraphVersion
 from ..domains.d08.natural_plan import AdoptedNaturalPlanV2
 from ..model_broker.natural_review import (
-    FrozenNaturalReplyReviewV1, REVIEW_TEMPLATE_VERSION,
+    FrozenNaturalReplyReviewV1, REVIEW_TEMPLATE_VERSION, REVIEW_TEMPLATE_VERSION_V2,
+    INPUT_SCHEMA_V2,
 )
 from ..runtime_contracts import (
-    NaturalReplyReviewOriginalSealV2, NamespaceId, QueryEpoch,
+    NaturalReplyGenerationOriginalSealV2, NaturalReplyReviewOriginalSealV2, NamespaceId, QueryEpoch,
     canonical_digest,
 )
 from .natural_original_v3 import NaturalReplyGenerationOriginalSealV3, NaturalReplyReviewOriginalSealV3
 from .natural_original_v4 import NaturalReplyGenerationOriginalSealV4, NaturalReplyReviewOriginalSealV4
-from .budget import get_budget_lease, reserve_budget
+from .natural_original_v6 import NaturalReplyGenerationOriginalSealV6,NaturalReplyReviewOriginalSealV6
+from .natural_original_v7 import NaturalReplyGenerationOriginalSealV7, NaturalReplyReviewOriginalSealV7
+from .budget import reserve_budget
 from .d11_types import runtime_job_key
 from .issuers import D02ResourceIssuer, D11BudgetJobIssuer, ResourceQuote
 from .jobs import PersistentJob, create_job
@@ -179,15 +183,25 @@ def issue_original_natural_review_in_transaction_v2(
 ) -> tuple[PersistentJob, ResourceQuote, str, NaturalReplyReviewOriginalSealV2]:
     if not db.in_transaction:
         raise NaturalReviewIssueHold("natural review requires graph write tx")
+    seal_class = {
+        NaturalReplyGenerationOriginalSealV2: NaturalReplyReviewOriginalSealV2,
+        NaturalReplyGenerationOriginalSealV3: NaturalReplyReviewOriginalSealV3,
+        NaturalReplyGenerationOriginalSealV4: NaturalReplyReviewOriginalSealV4,
+        NaturalReplyGenerationOriginalSealV6: NaturalReplyReviewOriginalSealV6,
+        NaturalReplyGenerationOriginalSealV7: NaturalReplyReviewOriginalSealV7,
+    }.get(type(generation.seal))
+    if seal_class is None:
+        raise NaturalReviewIssueHold("unknown natural generation original version")
     namespace: NamespaceId = generation.seal.namespace
     parent = generation.parent_original_id
     policy = installed_bundle.installation_policy
     workflow = installed_bundle.model_workflows.natural_review
     if workflow is None or generation.stage != "generation":
         raise NaturalReviewIssueHold("installed independent review is absent")
-    grant = d11_issuer.current_budget_grant(
-        db, policy.root_lease.lease_id)
-    lease = get_budget_lease(db, grant.lease_id)
+    from .natural_reply_budget_v3 import resolve_natural_reply_budget_for_original_admission_v3
+    lease, grant = resolve_natural_reply_budget_for_original_admission_v3(db, namespace=namespace,
+        c02_operation_id=parent, source_ref=generation.seal.source_ref, issuer=d11_issuer,
+        installed_bundle=installed_bundle, now_utc=now_utc, original_preparation=generation)
     ceiling = dict(workflow.quote_ceiling)
     plan = generation.frozen.input.plan
     if (generation.state != "terminal"
@@ -196,12 +210,14 @@ def issue_original_natural_review_in_transaction_v2(
                != frozen.generation_frozen_input_digest
             or generation.seal.qualified_units_digest
                != frozen.qualified_units_digest
-            or policy.namespace != namespace or grant != policy.root_grant
+            or policy.namespace != namespace
             or grant.lease_id != generation.seal.parent_budget_lease_id
             or tuple(sorted(ceiling.items())) != adopted_plan.review_ceiling
             or workflow.work_kind != "natural_review"
             or workflow.purpose != "proposal"
-            or workflow.template_version != REVIEW_TEMPLATE_VERSION
+            or workflow.template_version != (
+                REVIEW_TEMPLATE_VERSION_V2 if json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2
+                else REVIEW_TEMPLATE_VERSION)
             or plan.audience_id not in workflow.audiences
             or frozen.installation.installation_id != policy.installation_id
             or frozen.installation.provider_id != workflow.provider_id
@@ -262,7 +278,9 @@ def issue_original_natural_review_in_transaction_v2(
         namespace, read_versions, query_epochs, graph_epoch=graph_epoch,
         access_epoch=access_epoch, deletion_epoch=deletion_epoch,
     )
-    seal_class = (NaturalReplyReviewOriginalSealV4 if type(generation.seal) is NaturalReplyGenerationOriginalSealV4 else NaturalReplyReviewOriginalSealV3 if type(generation.seal) is NaturalReplyGenerationOriginalSealV3 else NaturalReplyReviewOriginalSealV2)
+    semantic_batch = generation.seal.schema in {"sylanne.d09.natural_generation_seal.v5", "sylanne.d09.natural_generation_seal.v6", "sylanne.d09.natural_generation_seal.v7"}
+    if semantic_batch != (json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2):
+        raise NaturalReviewIssueHold("generation and review semantic versions differ")
     seal = seal_class(
         namespace=namespace, installation_id=policy.installation_id,
         provider_config_digest=workflow.provider_config_digest,
@@ -280,6 +298,8 @@ def issue_original_natural_review_in_transaction_v2(
         parent_budget_lease_id=grant.lease_id,
         reservation_operation_id=reservation_id,
         review_policy_version=frozen.review_policy_version,
+        **({"schema": generation.seal.schema.replace("natural_generation_seal", "natural_review_seal"),
+            "template_version": REVIEW_TEMPLATE_VERSION_V2} if semantic_batch else {}),
     )
     d02_issuer.issue_quote(db, quote)
     reserve_budget(db, grant.lease_id, reservation_id,

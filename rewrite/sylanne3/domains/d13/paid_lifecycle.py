@@ -42,6 +42,20 @@ class D13PaidOriginalBindingV1:
     binding_digest: str
 
 
+def _paid_original_binding_value_v1(frozen,*,original_operation_id,call_id):
+    return dict(
+        job_ref=frozen.plan.job_ref, original_operation_id=original_operation_id,
+        call_id=call_id, frozen_input_digest=frozen.digest,
+        wire_digest=frozen.wire_digest,
+        read_closure_digest=frozen.read_closure_digest,
+        installation_id=frozen.installation.installation_id,
+        provider_id=frozen.installation.provider_id,
+        model_id=frozen.installation.model_id,
+        provider_config_digest=frozen.installation.provider_config_digest,
+        expires_at_utc=frozen.plan.expires_at_utc,
+    )
+
+
 def bind_paid_original_v1(
     frozen: FrozenD13PrecompressionRequestV1, *,
     original_operation_id: str, call_id: str,
@@ -54,17 +68,7 @@ def bind_paid_original_v1(
     if frozen != freeze_d13_precompression_request_v1(
             frozen.window, frozen.plan, frozen.installation):
         raise ValueError("D13 frozen request was modified")
-    fields = dict(
-        job_ref=frozen.plan.job_ref, original_operation_id=original_operation_id,
-        call_id=call_id, frozen_input_digest=frozen.digest,
-        wire_digest=frozen.wire_digest,
-        read_closure_digest=frozen.read_closure_digest,
-        installation_id=frozen.installation.installation_id,
-        provider_id=frozen.installation.provider_id,
-        model_id=frozen.installation.model_id,
-        provider_config_digest=frozen.installation.provider_config_digest,
-        expires_at_utc=frozen.plan.expires_at_utc,
-    )
+    fields=_paid_original_binding_value_v1(frozen,original_operation_id=original_operation_id,call_id=call_id)
     return D13PaidOriginalBindingV1(
         **fields, binding_digest=canonical_digest({
             "schema": "d13.paid_original_binding.v1", **fields,

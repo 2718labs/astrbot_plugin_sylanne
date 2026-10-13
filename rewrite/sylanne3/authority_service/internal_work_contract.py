@@ -11,10 +11,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import re
-from typing import TYPE_CHECKING, Protocol
-
-if TYPE_CHECKING:
-    from .internal_work_service import AuthorityInternalWorkVerifiedReceiptV1
+from typing import Protocol
 
 from ..runtime_contracts import canonical_digest
 from ..contracts import canonical_json
@@ -317,6 +314,54 @@ class InternalWorkOriginalTerminalVerifierV1(Protocol):
     ) -> AuthorityInternalWorkVerifiedReceiptV1: ...
 
 
+@dataclass(frozen=True, slots=True)
+class InternalWorkJournalAppendV1:
+    """One verified append identity returned by the installed journal only."""
+
+    namespace: str
+    journal_id: str
+    sequence: int
+    mutation_id: str
+    binding_digest: str
+    content_digest: str
+    chain_digest: str
+    receipt_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class InternalWorkJournalInspectionV1:
+    """Full-chain reread result; None terminal after claim means unknown."""
+
+    binding: InternalWorkBindingV1
+    claim: InternalWorkClaimV1 | None
+    terminal: InternalWorkTerminalV1 | InternalWorkTerminalV2 | None
+    claim_append: InternalWorkJournalAppendV1 | None
+    terminal_append: InternalWorkJournalAppendV1 | None
+    verified_head: JournalHead
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityInternalWorkVerifiedReceiptV1:
+    """Authority-origin reread result for D02, never a caller-created permit."""
+
+    proof_digest: str
+    namespace: str
+    activity_id: str
+    operation_id: str
+    execution_id: str
+    input_digest: str
+    resource_quote_ref: str
+    resource_quote_version: int
+    resource_quote_digest: str
+    terminal_receipt_ref: str
+    terminal_receipt_digest: str
+    terminal_sequence: int
+    journal_head: JournalHead
+    status: str
+    actual_cpu_ms: int | None
+    component_completed: bool
+
+
 __all__ = [
     "InternalWorkBindingV1", "InternalWorkClaimV1",
     "InternalWorkTerminalV1", "InternalWorkTerminalV2",
@@ -324,4 +369,7 @@ __all__ = [
     "InternalWorkOriginalTerminalVerifierV1",
     "claim_internal_work_v1", "terminal_internal_work_v1",
     "validate_internal_work_terminal_proof_v1",
+    'InternalWorkJournalAppendV1',
+    'InternalWorkJournalInspectionV1',
+    'AuthorityInternalWorkVerifiedReceiptV1',
 ]

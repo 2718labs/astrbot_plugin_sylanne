@@ -7,6 +7,7 @@ remain with the shared runtime coordinator.
 
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Mapping
+import json
 
 from ...graph_types import (
     AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner,
@@ -23,8 +24,51 @@ from ...runtime_contracts import (
     NamespaceId,
     ProviderDescriptor,
     RUNTIME_SCHEMA,
-    schema_hash,
+    schema_hash, canonical_digest,
 )
+
+
+METHOD_POLICY_SCHEMA_V1 = "d01.method-policy.v1"
+METHOD_POLICY_ID_V1 = "CP-tone-order"
+FULL_DRAFT_METHOD_V1 = "CP-tone-order:full-draft-then-check"
+TONE_SAMPLE_METHOD_V1 = "CP-tone-order:tone-sample-then-full-draft"
+
+
+def method_policy_state_v1(claim):
+    """Only the registered structured claim is executable strategy."""
+    try:
+        value = json.loads(claim)
+    except (TypeError, ValueError):
+        return None
+    if (type(value) is not dict or set(value) != {"schema", "policy_id", "strategy_state"}
+            or value["schema"] != METHOD_POLICY_SCHEMA_V1
+            or value["policy_id"] != METHOD_POLICY_ID_V1
+            or type(value["strategy_state"]) is not str
+            or value["strategy_state"] not in {"ST0", "ST2"}):
+        return None
+    return value["strategy_state"]
+
+
+def method_preference_edges_v1(strategy_state, method_candidates, condition_values, *, complete):
+    """A finite soft order; evidence matching and hard eligibility stay external."""
+    from ..d07 import METHOD_CONDITION_IDS_V1
+    if strategy_state not in {"ST0", "ST2"}:
+        return "unregistered_policy", ()
+    values = dict(condition_values)
+    if (not complete or set(values) != set(METHOD_CONDITION_IDS_V1)
+            or any(type(value) is not bool for value in values.values()) or values["fact_permission_gap"]):
+        return "unknown", ()
+    if values["short_draft"] or values["immediate_full_draft"]:
+        applicability, preferred = "excluded", FULL_DRAFT_METHOD_V1
+    elif all(values[condition] for condition in METHOD_CONDITION_IDS_V1[:6]):
+        applicability = "applicable"
+        preferred = TONE_SAMPLE_METHOD_V1 if strategy_state == "ST2" else FULL_DRAFT_METHOD_V1
+    else:
+        return "unknown", ()
+    a = tuple(ref for ref, method in method_candidates if method == FULL_DRAFT_METHOD_V1)
+    b = tuple(ref for ref, method in method_candidates if method == TONE_SAMPLE_METHOD_V1)
+    better, worse = (a, b) if preferred == FULL_DRAFT_METHOD_V1 else (b, a)
+    return applicability, tuple(sorted((left, right) for left in better for right in worse))
 
 
 _BLOCK_KINDS = frozenset({"semantic_identity", "value", "trait", "preference", "strategy", "self_knowledge"})
@@ -100,8 +144,14 @@ class PersonaBlock:
             raise ValueError("unknown persona block kind")
         if self.plasticity not in _PLASTICITY:
             raise ValueError("unknown plasticity")
-        if self.kind == "semantic_identity" and self.plasticity != "read_only":
-            raise ValueError("semantic identity is a lifecycle identity and must be read_only")
+        if self.kind == "semantic_identity":
+            from .identity_v3 import decode_semantic_identity_v3
+            semantic = decode_semantic_identity_v3(self.claim)
+            if semantic is None and self.plasticity != "read_only":
+                raise ValueError("legacy semantic identity remains read_only")
+            if semantic is not None and (semantic.block_id != self.block_id
+                    or self.plasticity == "growth" and semantic.plasticity_policy_ref is None):
+                raise ValueError("semantic V3 block/policy binding differs")
 
 
 @dataclass(frozen=True)
@@ -146,6 +196,12 @@ class PersonaPlan:
             raise ValueError("blocks must contain PersonaBlock values")
         if any(not isinstance(item, ValueRule) for item in values):
             raise TypeError("values must contain ValueRule values")
+        from .identity_v3 import decode_semantic_identity_v3
+        for block in blocks:
+            if block.kind=="semantic_identity":
+                semantic=decode_semantic_identity_v3(block.claim)
+                if semantic is not None and (self.version==1 or semantic.runtime_identity.namespace!=self.namespace):
+                    raise ValueError("versioned semantic identity requires an actual existing persona migration, never fabricated initial history")
         if len({item.block_id for item in blocks}) != len(blocks):
             raise ValueError("persona block IDs must be unique")
         if len({item.rule_id for item in values}) != len(values):
@@ -268,7 +324,7 @@ class ContinuityRecord:
         )
         object.__setattr__(
             self, "source_families",
-            _unique_strings(self.source_families, "source_families", minimum=1),
+            _unique_strings(self.source_families, "source_families"),
         )
 
 
@@ -368,6 +424,7 @@ class PersonaDomain:
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
+        from .method_learning_v1 import method_learning_type_specs_v1
         layouts = (
             ("d01.persona_plan.v1", _validate_persona_plan, PersonaPlan),
             ("d01.persona_activation.v1", _validate_persona_activation, PersonaActivation),
@@ -387,7 +444,7 @@ class PersonaDomain:
                 "storage_role": "state",
                 "fields": [field.name for field in fields(value_type)],
             }),
-        ) for name, validator, value_type in layouts)
+        ) for name, validator, value_type in layouts) + method_learning_type_specs_v1()
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
@@ -598,14 +655,33 @@ class PersonaDomain:
 
     def project(
         self, plan: PersonaPlan, snapshot: object = None, *, context_tags: tuple[str, ...] = (),
-        role_binding_complete: bool = False,
+        role_binding_complete: bool = False, semantic_projection=None,
     ) -> PersonaView:
         if not isinstance(plan, PersonaPlan):
             raise TypeError("plan must be PersonaPlan")
         tags = _unique_strings(context_tags, "context_tags")
         # D03 remains the only social-role authority.  A missing resolution only
         # means social strategy is unknown; no permissive default is invented.
-        return PersonaView(plan.head_id, plan.namespace, plan.blocks, plan.values, tags, role_binding_complete)
+        from .identity_v3 import decode_semantic_identity_v3, SelfModelProjectionV3, SemanticIdentityRevisionRefV3
+        if semantic_projection is not None and (type(semantic_projection) is not SelfModelProjectionV3
+                or semantic_projection.runtime_identity.namespace!=plan.namespace or semantic_projection.persona_head!=plan.head_id):
+            raise ValueError("persona readout requires the exact current qualified self model")
+        blocks=[]
+        for block in plan.blocks:
+            if block.kind!="semantic_identity":blocks.append(block);continue
+            semantic=decode_semantic_identity_v3(block.claim)
+            if semantic is None:blocks.append(block);continue
+            if semantic.runtime_identity.namespace!=plan.namespace:raise ValueError("semantic projection crossed namespace")
+            if semantic_projection is None:continue
+            rows=tuple(row for row in semantic_projection.semantic_identities if row.block_id==block.block_id)
+            if len(rows)!=1 or rows[0].availability!="qualified" or rows[0].claim is None:continue
+            expected_ref=SemanticIdentityRevisionRefV3(plan.head_id,block.block_id,semantic.revision,canonical_digest(block.claim))
+            if (rows[0].semantic_revision!=expected_ref or rows[0].runtime_identity!=semantic.runtime_identity
+                    or rows[0].runtime_identity!=semantic_projection.runtime_identity or rows[0].claim!=semantic.claim
+                    or rows[0].plasticity_policy_ref!=semantic.plasticity_policy_ref or rows[0].scope_refs!=semantic.scope_refs):
+                raise ValueError("persona readout semantic payload/ref/runtime/claim/policy/scope differs from qualified source")
+            blocks.append(replace(block,claim=rows[0].claim,plasticity="read_only"))
+        return PersonaView(plan.head_id, plan.namespace, tuple(blocks), plan.values, tags, role_binding_complete)
 
     def evaluate_values(self, view: PersonaView, candidates: Mapping[str, tuple[str, ...]]) -> ValueEvaluation:
         if not isinstance(view, PersonaView):
@@ -629,7 +705,7 @@ class PersonaDomain:
                 unresolved.append(candidate_id)
         return ValueEvaluation(tuple(preferred), tuple(rejected), tuple(unresolved), reasons)
 
-    def validate_growth(self, plan: PersonaPlan, proposal: GrowthProposal) -> None:
+    def validate_growth(self, plan: PersonaPlan, proposal: GrowthProposal, *, semantic_qualification=None) -> None:
         if not isinstance(plan, PersonaPlan) or not isinstance(proposal, GrowthProposal):
             raise TypeError("plan and proposal must be D01 values")
         if proposal.base_head != plan.head_id:
@@ -637,6 +713,15 @@ class PersonaDomain:
         target = next((block for block in plan.blocks if block.block_id == proposal.target_block), None)
         if target is None:
             raise ValueError("growth target block is missing")
+        if target.kind == "semantic_identity":
+            from .identity_v3 import decode_semantic_identity_v3
+            base = decode_semantic_identity_v3(target.claim)
+            from .production_operations_v1 import SemanticGrowthQualificationV3
+            if (proposal.change_kind != "core" or base is None or type(semantic_qualification) is not SemanticGrowthQualificationV3
+                    or semantic_qualification.base_head != plan.head_id
+                    or semantic_qualification.target_block != target.block_id
+                    or semantic_qualification.replacement_claim != proposal.replacement_claim):
+                raise ValueError("semantic growth requires installed V2 intent, deep policy, current trial and continuity qualification")
         if target.plasticity != "growth":
             raise ValueError("target block cannot be changed by natural growth")
         if proposal.evidence_reality != "external":
@@ -646,8 +731,8 @@ class PersonaDomain:
         if not proposal.counterevidence_checked:
             raise ValueError("growth needs a completed counterevidence check")
 
-    def activate_revision(self, plan: PersonaPlan, proposal: GrowthProposal) -> PersonaRevision:
-        self.validate_growth(plan, proposal)
+    def activate_revision(self, plan: PersonaPlan, proposal: GrowthProposal, *, semantic_qualification=None) -> PersonaRevision:
+        self.validate_growth(plan, proposal, semantic_qualification=semantic_qualification)
         blocks = tuple(
             PersonaBlock(block.block_id, block.kind, proposal.replacement_claim, block.plasticity)
             if block.block_id == proposal.target_block else block
@@ -664,7 +749,7 @@ class PersonaDomain:
     def issue_growth_candidate(
         self, snapshot: GraphSnapshot, *, namespace: NamespaceId,
         current_guard: OwnerAuthorizationGuardV1, proposal: GrowthProposal,
-        source_ids: tuple[str, ...],
+        source_ids: tuple[str, ...], semantic_qualification=None,
     ) -> GrowthAdoptionCandidate:
         """Prepare a natural-growth write set from one current shared-graph read.
 
@@ -672,7 +757,7 @@ class PersonaDomain:
         deletion authority at commit. This method grants no write authority.
         """
         active = self.resolve_active_role(snapshot, namespace=namespace, current_guard=current_guard)
-        self.validate_growth(active.plan, proposal)
+        self.validate_growth(active.plan, proposal, semantic_qualification=semantic_qualification)
         source_ids = _unique_strings(source_ids, "source_ids", minimum=1)
         if len(source_ids) != len(proposal.source_families):
             raise ValueError("each evidence family needs one independent source")
@@ -703,7 +788,7 @@ class PersonaDomain:
                          GraphVersion(head_key, 0)))
         if set(roots) != set(proposal.source_families) or len(set(roots)) != len(roots):
             raise ValueError("evidence provenance differs from independent families")
-        revision = self.activate_revision(active.plan, proposal)
+        revision = self.activate_revision(active.plan, proposal, semantic_qualification=semantic_qualification)
         next_plan = replace(active.plan, version=active.plan.version + 1,
                             blocks=revision.blocks, authored=False)
         grant_atom = snapshot.get(owner_grant_key(*namespace.as_tuple))
@@ -727,14 +812,14 @@ class PersonaDomain:
     def validate_growth_candidate(
         self, candidate: GrowthAdoptionCandidate, snapshot: GraphSnapshot, *,
         namespace: NamespaceId, current_guard: OwnerAuthorizationGuardV1,
-        proposal: GrowthProposal, source_ids: tuple[str, ...],
+        proposal: GrowthProposal, source_ids: tuple[str, ...], semantic_qualification=None,
     ) -> GrowthAdoptionCandidate:
         """Reject modified or stale D01 write sets before D11's atomic commit."""
         if not isinstance(candidate, GrowthAdoptionCandidate):
             raise TypeError("candidate must be GrowthAdoptionCandidate")
         expected = self.issue_growth_candidate(
             snapshot, namespace=namespace, current_guard=current_guard,
-            proposal=proposal, source_ids=source_ids,
+            proposal=proposal, source_ids=source_ids, semantic_qualification=semantic_qualification,
         )
         if candidate != expected:
             raise ValueError("growth candidate differs from current evidence and head")

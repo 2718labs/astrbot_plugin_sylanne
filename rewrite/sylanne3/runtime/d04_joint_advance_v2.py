@@ -8,6 +8,7 @@ transaction. Neither function commits, invokes FFI, or owns graph state.
 
 from __future__ import annotations
 
+
 from dataclasses import asdict, dataclass, fields
 import json
 import math
@@ -545,35 +546,38 @@ def record_joint_advance_v2(
 def read_joint_advance_v2(db: sqlite3.Connection, namespace: NamespaceId,
                           operation_id: str) -> ProductAdvanceEvidenceV2 | None:
     """Reconstruct and check a committed receipt using any SQLite connection."""
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_many_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     _schema(db)
-    row = db.execute(
+    row = _producer_original_point_v3(db, table='graph_d04_joint_advances_v2', columns=('evidence_json', 'evidence_digest', 'bundle_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT evidence_json,evidence_digest,bundle_digest FROM graph_d04_joint_advances_v2 "
         "WHERE bot=? AND persona=? AND operation_id=?",
         namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         return None
     try:
-        raw = json.loads(row[0])
-        if canonical_serialize(raw) != row[0]:
+        raw = background_json_loads_v3(row[0])
+        if not background_json_matches_v3(row[0],raw):
             raise ValueError("noncanonical")
         raw["namespace"] = NamespaceId(**raw["namespace"])
         raw["members"] = tuple(ProductAdvanceMemberV2(**item) for item in raw["members"])
         raw["family_loo_transcripts"] = tuple(tuple(item) for item in raw["family_loo_transcripts"])
         evidence = ProductAdvanceEvidenceV2(**raw)
         _event_root_schema(db, evidence)
-        indexed = db.execute(
+        indexed = _producer_original_many_v3(db,table='graph_d04_joint_advance_members_v2',columns=('checkpoint_ref','process_id','role_start','role_end'),key_columns=('bot','persona','operation_id'),key=namespace.as_tuple + (operation_id,),order_column='checkpoint_ref',legacy_reader=lambda: db.execute(
             "SELECT checkpoint_ref,process_id,role_start,role_end "
             "FROM graph_d04_joint_advance_members_v2 WHERE bot=? AND persona=? "
             "AND operation_id=? ORDER BY checkpoint_ref",
             namespace.as_tuple + (operation_id,),
-        ).fetchall()
+        ).fetchall())
         expected = [(m.checkpoint_ref, evidence.process_id, evidence.role_start,
                      evidence.role_end) for m in evidence.members]
-        operation = db.execute(
+        operation = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest',), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
             "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
             "AND operation_id=?", namespace.as_tuple + (operation_id,),
-        ).fetchone()
+        ).fetchone())
         if (evidence.namespace != namespace or evidence.operation_id != operation_id
                 or evidence.digest != row[1] or evidence.bundle_digest != row[2]
                 or indexed != expected or operation != (evidence.bundle_digest,)):
@@ -666,13 +670,14 @@ def _numeric_candidate(evidence: ProductAdvanceEvidenceV2,
 
 
 def _decode_numeric_candidate(encoded: str) -> D04JointNumericReceiptCandidateV1:
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
     def exact(cls: type, raw: object):
         if type(raw) is not dict or set(raw) != set(cls.__dataclass_fields__):
             raise ValueError("numeric original fields differ")
         return cls(**raw)
 
-    raw = json.loads(encoded)
-    if type(raw) is not dict or canonical_serialize(raw) != encoded:
+    raw = background_json_loads_v3(encoded)
+    if type(raw) is not dict or not background_json_matches_v3(encoded,raw):
         raise ValueError("numeric original JSON is noncanonical")
     if set(raw) != set(D04JointNumericReceiptCandidateV1.__dataclass_fields__):
         raise ValueError("numeric original candidate fields differ")
@@ -703,6 +708,7 @@ def _current_numeric_sources(
     db: sqlite3.Connection, evidence: ProductAdvanceEvidenceV2,
     receipt: D04JointNumericReceiptCandidateV1,
     expected_drives: tuple[SourcedNumericDrive, ...],
+    *, _life_source_bridge=None,
 ) -> None:
     """Bind each family to the current D06 provenance root and exact graph rows."""
     _transaction(db)
@@ -710,6 +716,20 @@ def _current_numeric_sources(
                 for drive in expected_drives}
     if len(expected) != len(expected_drives):
         raise JointAdvanceHold("replay drive identities are ambiguous")
+    life_current = None
+    life_selected = set()
+    if _life_source_bridge is not None:
+        from .d06_life_numeric_joint_v1 import _require_life_joint_source_bridge_v1
+        life_current, life_frame = _require_life_joint_source_bridge_v1(db, _life_source_bridge)
+        witness = _life_source_bridge.numeric_witness
+        original = life_current.original
+        if (_life_source_bridge.stage is not None or witness is None
+                or witness.candidate.bundle.product_advance != evidence
+                or original.namespace != evidence.namespace
+                or original.root_ref not in {member.checkpoint_ref for member in evidence.members}
+                or (original.clock.role_start, original.clock.role_end) != (evidence.role_start, evidence.role_end)
+                or life_frame.snapshot.epochs[0].revision != evidence.graph_epoch):
+            raise JointAdvanceHold("Life source family lacks this exact final numeric witness")
     for drive_ref, drive_revision, source_ref, source_revision, access_ref, access_revision, family in (
             receipt.source_versions):
         try:
@@ -735,12 +755,19 @@ def _current_numeric_sources(
             drive = decode_sourced_numeric_drive(values[0])
             source = SourceRecord.from_dict(values[1])
             validate_access(values[2])
+            life_source = (life_current is not None
+                and (drive_ref, drive_revision) in life_current.original.drive_versions)
+            if life_source:
+                if (source_ref != life_current.original.source_ref
+                        or source_revision != life_current.context.original.source_revision):
+                    raise ValueError("Life final drive crossed its exact current qualified Source")
+                life_selected.add((drive_ref, drive_revision))
             if (expected.get(drive_ref) != drive
                     or drive.source_ref != source_ref or drive.access_ref != access_ref
                     or drive.source_revision != source_revision
                     or drive.access_revision != access_revision
                     or source.source_id != source_id
-                    or source.parent_source_ids
+                    or source.parent_source_ids and not life_source
                     or source.provenance_root != family
                     or values[2]["source_id"] != source_id
                     or values[2]["status"] != "active"):
@@ -753,6 +780,8 @@ def _current_numeric_sources(
                 raise ValueError("source correction head is present")
         except (TypeError, ValueError, KeyError, IndexError) as exc:
             raise JointAdvanceHold("numeric source family proof differs") from exc
+    if life_current is not None and life_selected != set(life_current.original.drive_versions):
+        raise JointAdvanceHold("Life final source family omits an actual mapped drive")
 
 
 def verification_from_installed_joint_replay_v1(
@@ -760,7 +789,7 @@ def verification_from_installed_joint_replay_v1(
     evidence: ProductAdvanceEvidenceV2,
     receipt: D04JointNumericReceiptCandidateV1,
     replay: object,
-    *, current_component: object,
+    *, current_component: object, _life_source_bridge=None,
 ) -> JointNumericOriginalVerificationV1:
     """Compare W01's lock-free installed ABI2 replay to the final joint premise.
 
@@ -786,7 +815,7 @@ def verification_from_installed_joint_replay_v1(
             or {(item.source_ref, item.family_id) for item in replay.families}
                != {(row[2], row[6]) for row in receipt.source_versions}):
         raise JointAdvanceHold("current complete component differs from installed replay")
-    _current_numeric_sources(db, evidence, receipt, replay.drives)
+    _current_numeric_sources(db, evidence, receipt, replay.drives, _life_source_bridge=_life_source_bridge)
     math_result = replay.math_result
     policy = replay.policy
     readout = replay.readout
@@ -849,10 +878,13 @@ def preflight_joint_numeric_original_v1(
 
 def _numeric_history(db: sqlite3.Connection,
                      evidence: ProductAdvanceEvidenceV2) -> None:
-    operation = db.execute(
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .domain_background_read_v3 import background_typed_original_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    operation = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('activity_id',), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(evidence.namespace.as_tuple + (evidence.operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT activity_id FROM graph_bundle_operations WHERE bot=? AND persona=? "
         "AND operation_id=?", evidence.namespace.as_tuple + (evidence.operation_id,),
-    ).fetchone()
+    ).fetchone())
     if operation is None:
         raise JointAdvanceHold("numeric original has no graph operation")
     for member in evidence.members:
@@ -861,15 +893,15 @@ def _numeric_history(db: sqlite3.Connection,
             (member.output_state_ref, member.output_state_revision,
              member.output_state_digest),
         ):
-            row = db.execute(
+            row = _producer_original_point_v3(db, table='graph_history', columns=('value', 'valid'), key_columns=('token', 'revision', 'event_bot', 'event_persona', 'event_session', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3],_producer_params_v3[4],_producer_params_v3[5]))((ref, revision, *evidence.namespace.as_tuple, operation[0], evidence.operation_id)), legacy_reader=lambda: db.execute(
                 "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
                 "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
                 (ref, revision, *evidence.namespace.as_tuple, operation[0],
                  evidence.operation_id),
-            ).fetchone()
+            ).fetchone())
             try:
                 valid = row is not None and row[1] == 1
-                matches = valid and canonical_digest(json.loads(row[0])) == digest
+                matches = valid and background_typed_original_digest_v3(db,row[0],background_json_loads_v3(row[0])) == digest
             except (TypeError, ValueError):
                 matches = False
             if not matches:

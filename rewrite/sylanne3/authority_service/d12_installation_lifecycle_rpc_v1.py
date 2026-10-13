@@ -43,12 +43,20 @@ def dispatch_d12_installation_lifecycle_v1(server,method,credential,profile_id,m
         return service.read_current_host_bootstrap_progress_v1(ref)
     common={"namespace","action","owner_actor_id","owner_session_token","owner_session_request"}
     extra={"inspect":set(),"submit":{"original_ref"},"status":{"operation_id"},"continue":{"operation_id"},
-           "resume":{"pause_operation_id","operation_id","expected_lifecycle_epoch"}}
+           "resume":{"pause_operation_id","operation_id","expected_lifecycle_epoch"},
+           "upgrade_catalogue":{"operation_id","pause_operation_id","target_cohort_ref","source_catalogue_hash"}}
     action=command.get("action")
     if action not in extra or set(command)!=common|extra[action]:
         raise AuthorityUnavailable("whole-Host lifecycle action fields differ")
     kwargs=server._owner_session_kwargs(command,namespace,installed.installation_id)
     kwargs.update(credential=credential,actor=identifier(command["owner_actor_id"],"owner_actor_id"))
+    if action=="upgrade_catalogue":
+        from .graph_catalogue_upgrade_v1 import InstalledGraphCatalogueUpgradeV1
+        catalogue=getattr(server,"_d12_graph_catalogue_upgrade_services_v1",{}).get((namespace,installed.installation_id))
+        if type(catalogue) is not InstalledGraphCatalogueUpgradeV1 or catalogue.lifecycle is not service:
+            raise AuthorityUnavailable("registered catalogue maintenance service unavailable")
+        return {"catalogue_upgrade":catalogue.advance_current_upgrade_v1(
+            **{key:command[key] for key in extra[action]},**kwargs)}
     if action=="inspect":
         return {"lifecycle_head":asdict(service.inspect_current_lifecycle_v1(**kwargs))}
     if action=="submit":

@@ -53,16 +53,31 @@ class AuthorityV2DeletionPendingRecovery:
             if scoped_present != (scoped_store is not None):
                 raise AuthorityUnavailable("scoped deletion recovery mode differs")
             if scoped_store is not None:
-                scoped_store.state_locked(db, allow_reserved=True)
+                from ..runtime_storage_v3 import PhysicalRuntimeHandleV3, runtime_storage_v3
+                if type(runtime_storage_v3(db)) is not PhysicalRuntimeHandleV3:
+                    scoped_store.state_locked(db, allow_reserved=True)
+
+    def initialize_current_selected_state_v3(self):
+        """Run the original state check only inside the actual actor's bound lease."""
+        from ..runtime_storage_v3 import PhysicalRuntimeHandleV3, runtime_storage_v3
+        handle=runtime_storage_v3(self.core._db)
+        if type(handle) is not PhysicalRuntimeHandleV3:
+            raise AuthorityUnavailable("actual selected maintenance physical state required")
+        with handle.quantum(),self.core._tx() as db:
+            from ..runtime_storage_v3 import require_maintenance_runtime_operation_v3
+            require_maintenance_runtime_operation_v3(db)
+            self._require_mode(db)
+            self.scoped_store.state_locked(db,allow_reserved=True)
 
     @staticmethod
     def _require_mode(db):
-        if db.execute("SELECT value FROM authority_meta WHERE key='service_mode'").fetchone() != ("v2-only",):
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        if c09_actual_root_read_v3(db).execute("SELECT value FROM authority_meta WHERE key='service_mode'").fetchone() != ("v2-only",):
             raise AuthorityUnavailable("deletion recovery requires persistent v2-only mode")
-        AuthorityServiceCore._require_no_deletion_migration(db)
+        AuthorityServiceCore._require_no_deletion_migration(c09_actual_root_read_v3(db))
 
     def recover(self, *, credential, subject: str,
-                mutation_id: str) -> DeletionMutationReceiptV1 | None:
+                mutation_id: str, selected_proof=None) -> DeletionMutationReceiptV1 | None:
         """Return None while unappended; otherwise commit or read the one receipt.
 
         The subject and credential come from the trusted local caller. No RPC
@@ -92,9 +107,19 @@ class AuthorityV2DeletionPendingRecovery:
         # is invoked while any journal guard or Authority transaction is held.
         with self.deletion.freeze_writes():
             with self.execution.freeze_writes():
-                deletion_head = self.deletion.verified_head()
-                execution_head = self.execution.verified_head()
-                observed = self.deletion._inspect_pending_locked(pending)
+                if selected_proof is None:
+                    deletion_head = self.deletion.verified_head()
+                    execution_head = self.execution.verified_head()
+                else:
+                    from .c09_graph_application_v1 import SelectedC09JournalProofV3
+                    from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+                    if type(selected_proof) is not SelectedC09JournalProofV3:
+                        raise AuthorityUnavailable('actual private selected recovery journal proof required')
+                    selected_proof.require_identity(deletion=self.deletion,execution=self.execution,core=self.core)
+                    meter = current_c09_sql_meter_v2()
+                    deletion_head = selected_proof.deletion_head_locked(self.deletion,meter=meter)
+                    execution_head = selected_proof.execution_head_locked(self.execution,meter=meter)
+                observed = self.deletion._inspect_pending_locked(pending,selected_proof=selected_proof)
                 with self.core._tx() as db:
                     self._require_mode(db)
                     self.fences._check_schema(db)
@@ -110,7 +135,7 @@ class AuthorityV2DeletionPendingRecovery:
                         self.fences._decode_mutation_row(mutation))
                     if live_kind != "deletion" or live_pending != pending:
                         raise AuthorityUnavailable("deletion mutation changed during recovery")
-                    self.fences.require_prior_deletion_transition_locked(db, pending, core=self.core)
+                    self.fences.require_prior_deletion_transition_locked(db, pending, core=self.core,selected_proof=selected_proof)
                     row = self.core._row(db, self.namespace)
                     fence = self.fences._row(db, permit.operation_id)
                     if (fence is None or fence[6] != "active"
@@ -154,7 +179,8 @@ class AuthorityV2DeletionPendingRecovery:
                     target_phase = (
                         self.scoped_store.transition_locked(db, pending)
                         if self.scoped_store is not None else pending.target_phase)
-                    changed = db.execute(
+                    from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+                    changed = _capture_write_v2(db,
                         "UPDATE authority_namespaces SET deletion_seq=?,deletion_digest=?,"
                         "deletion_phase=?,revocation_epoch=?,anchor_nonce=? "
                         "WHERE namespace=? AND holder=? AND generation=? AND phase='active' "

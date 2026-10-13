@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, replace
 import json
+import math
 import time
 from types import SimpleNamespace
 
@@ -267,6 +268,52 @@ def test_v2_binding_requires_current_epoch_and_exact_acquire(token_ingress_syste
     assert not verifier.complete_graph_current(intent)
     verifier._paired_clock = None
     assert not verifier.complete_graph_current(intent)
+
+
+@pytest.mark.parametrize("include_binding, fresh_now, fresh_epoch, expected", [
+    (True, math.nextafter(110.0, -math.inf), "clock-a", True),
+    (True, 110.0, "clock-a", False),
+    (True, 111.0, "clock-a", False),
+    (True, 109.0, "clock-b", False),
+    (True, 99.0, "clock-a", False),
+    (True, math.nan, "clock-a", False),
+    (False, math.nextafter(110.0, -math.inf), "clock-a", True),
+    (False, 110.0, "clock-a", False),
+])
+def test_numeric_current_read_must_finish_before_its_original_deadline(
+    token_ingress_system, monkeypatch, include_binding, fresh_now,
+    fresh_epoch, expected,
+):
+    # Isolate elapsed time after a qualified reader returns. Real installation,
+    # Source/Owner and ledger refusal cases belong to the installed fixture.
+    from sylanne3.authority_service import current_model_egress_graph_verifier as module
+    from sylanne3.authority_service.v2_model_egress_wire import to_wire
+    from sylanne3.runtime import d11_life_preparation_v1
+
+    db, verifier, intent = _case(token_ingress_system)
+    job = replace(get_job(db, intent.job_id), work_kind="d06.encode_internal_life_numeric")
+    monkeypatch.setattr(module, "get_job", lambda connection, job_id: job)
+    namespace = NamespaceId(job.bot_id, job.persona_id)
+    reads = []
+
+    def read_current(connection, candidate, now):
+        reads.append((connection.in_transaction, candidate, now))
+        return SimpleNamespace(prepared=SimpleNamespace(namespace=namespace),
+                               valid_until_utc=110.0)
+
+    verifier._life_numeric_reader_v1 = SimpleNamespace(read=read_current)
+    monkeypatch.setattr(d11_life_preparation_v1, "_read",
+                        lambda *args, **kwargs: ({"intent": to_wire(intent)},))
+    samples = iter(((100.0, "clock-a"), (fresh_now, fresh_epoch)))
+    verifier._paired_clock = lambda: next(samples)
+    unpaired_samples = iter((100.0, fresh_now))
+    verifier._clock = lambda: next(unpaired_samples)
+    changes = db.total_changes
+    check = verifier.complete_graph_current if include_binding else verifier.graph_facts_current
+    assert check(intent) is expected
+    assert reads == [(True, intent, 100.0)]
+    assert db.total_changes == changes
+    assert verifier(intent) is False  # Graph qualification alone cannot admit a call.
 
 
 def test_cpu_budget_cannot_be_treated_as_output_tokens(ingress_system):

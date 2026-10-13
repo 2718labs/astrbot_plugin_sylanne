@@ -48,13 +48,23 @@ class InstalledC04AuthorityPortV3:
             future.cancel()
             raise RuntimeError("original C04 Authority operation unresolved; inspect only") from exc
 
+    def _binding_methods(self, binding):
+        from ..authority_service.internal_work_contract import InternalWorkBindingV1
+        if type(binding) is not InternalWorkBindingV1:
+            raise TypeError("actual C04 installed binding required")
+        if binding.algorithm_ref == "d06.association_activation.v3":
+            return self._client.c04_execute_v3, self._client.c04_inspect_v3
+        if binding.algorithm_ref == "d06.association_activation.direct_seed.v4":
+            return self._client.c04_execute_v4, self._client.c04_inspect_v4
+        raise ValueError("C04 binding has no installed execution route")
+
     def execute(self, binding):
-        return self._run(self._client.c04_execute_v3(
-            self._bundle, self._grant, binding=binding))
+        execute, _ = self._binding_methods(binding)
+        return self._run(execute(self._bundle, self._grant, binding=binding))
 
     def inspect(self, binding):
-        return self._run(self._client.c04_inspect_v3(
-            self._bundle, self._grant, binding=binding))
+        _, inspect = self._binding_methods(binding)
+        return self._run(inspect(self._bundle, self._grant, binding=binding))
 
     def verify_terminal(self, proof):
         return self._run(self._client.c04_terminal_verify_v1(

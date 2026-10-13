@@ -198,7 +198,7 @@ def prepare_binding(
     from ..memory_types import SourceRecord, access_key, source_key
     from ..model_broker.broker import ModelCallRequest
     from ..model_broker.first_ingress_encoding import (
-        FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+        FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, ENCODING_TEMPLATE_VERSIONS,
         build_first_ingress_encoding_payload,
     )
     from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize
@@ -244,10 +244,10 @@ def prepare_binding(
             or request.envelope.authority.purpose not in source.purposes
             or not set(request.envelope.authority.audience).issubset(source.audiences)):
         raise ValueError("model request lost source version or access scope")
-    expected_payload, expected_template_digest = build_first_ingress_encoding_payload(source)
+    expected_payload, expected_template_digest = build_first_ingress_encoding_payload(source,template_version=prompt_template_version)
     if (dict(request.payload) != expected_payload
             or request.prompt_template_digest != expected_template_digest
-            or prompt_template_version != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION):
+            or prompt_template_version not in ENCODING_TEMPLATE_VERSIONS):
         raise ValueError("model request differs from fixed first-ingress template")
     frozen = {
         "schema": ("sylanne.first-ingress-encoding-call.v3"

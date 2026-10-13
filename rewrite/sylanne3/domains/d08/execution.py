@@ -1340,6 +1340,9 @@ def _decode_communication_grant(payload: dict) -> CommunicationIntentGrant:
 
 
 def _decode(type_name: str, payload: dict) -> object:
+    if type_name in {"d08.personal_plan.v1", "d08.decision_record.v2"}:
+        from .personal_plan_v1 import decode_personal_plan_type_v1
+        return decode_personal_plan_type_v1(type_name, payload)
     if type_name == "d08.aspiration.v1":
         return Aspiration(**_tuple_fields(payload, "consideration_conditions", "source_refs"))
     if type_name == "d08.goal.v1":
@@ -1433,7 +1436,8 @@ class GoalExecutionProvider:
                 }),
             ))
         from .contact_plan_v2 import contact_plan_type_specs_v2
-        return (*specs,*contact_plan_type_specs_v2())
+        from .personal_plan_v1 import personal_plan_type_specs_v1
+        return (*specs, *contact_plan_type_specs_v2(), *personal_plan_type_specs_v1())
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):

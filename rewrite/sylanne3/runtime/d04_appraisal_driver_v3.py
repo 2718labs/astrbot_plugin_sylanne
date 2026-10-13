@@ -6,6 +6,7 @@ an accounting or appraisal original. Network calls run outside SQL locks.
 """
 from __future__ import annotations
 
+
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -129,13 +130,15 @@ def record_d04_original_in_transaction_v3(db, namespace, kind, original_ref, pay
 
 
 def read_d04_original_v3(db, namespace, kind, original_ref):
-    row = db.execute("SELECT payload_json,payload_digest FROM graph_d04_originals_v3 "
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table='graph_d04_originals_v3', columns=('payload_json', 'payload_digest'), key_columns=('bot', 'persona', 'kind', 'original_ref'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))((*namespace.as_tuple, kind, original_ref)), legacy_reader=lambda: db.execute("SELECT payload_json,payload_digest FROM graph_d04_originals_v3 "
                      "WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
-                     (*namespace.as_tuple, kind, original_ref)).fetchone()
+                     (*namespace.as_tuple, kind, original_ref)).fetchone())
     if row is None:
         return None
-    raw = json.loads(row[0])
-    if canonical_serialize(raw) != row[0] or sha256(row[0].encode("utf-8")).hexdigest() != row[1]:
+    raw = background_json_loads_v3(row[0])
+    if not background_json_matches_v3(row[0],raw) or background_json_digest_v3(row[0],raw) != row[1]:
         raise ValueError("D04 immutable original payload changed")
     return raw, row[1]
 

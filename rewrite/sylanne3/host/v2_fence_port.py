@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from .model_workflows_v3 import AdminModelWorkflowsV3
+from .model_workflows_v4 import AdminModelWorkflowsV4
+from .model_workflows_v5 import AdminModelWorkflowsV5
+from .model_workflows_v6 import AdminModelWorkflowsV6
+from .model_workflows_v7 import AdminModelWorkflowsV7
 from concurrent.futures import TimeoutError as FutureTimeout
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from weakref import WeakSet
 import hashlib
 import math
 from threading import Event, RLock, Thread
@@ -36,7 +41,7 @@ from ..authority_service.v2_owner_session import (
     OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1,
 )
 from ..authority_service.v2_execution_bridge import CurrentEffectReadV2, HandoffStartV2
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
     FenceScope, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
@@ -69,6 +74,57 @@ class VerifiedIngressClockV2:
     monotonic_before_seconds: float
     monotonic_after_seconds: float
     utc_upper_bound_seconds: float
+
+
+_CLOCK_ORIGINAL_ISSUER_V4 = object()
+_CLOCK_ORIGINALS_V4 = WeakSet()
+
+
+class _VerifiedIngressClockOriginalV4:
+    """Only the successful paired port check can issue this transient original."""
+    def __init__(self, issuer, *, port, reading, policy, prior, next_watermark):
+        if issuer is not _CLOCK_ORIGINAL_ISSUER_V4:
+            raise TypeError("actual paired clock verification required")
+        self.port, self.reading, self.policy = port, reading, policy
+        self.prior, self.next_watermark = prior, next_watermark
+        self.uses = []
+        self.used = False
+        _CLOCK_ORIGINALS_V4.add(self)
+
+    def upper_for(self, purpose):
+        from ..runtime.first_ingress_v2 import trusted_upper_at_v4
+        if (self not in _CLOCK_ORIGINALS_V4 or self.used
+                or purpose not in {"natural_basis", "natural_dispatch"}):
+            raise RuntimeError("actual natural clock consumer required")
+        monotonic_now = time.monotonic()
+        upper = trusted_upper_at_v4(self.reading, monotonic_now)
+        self.uses.append({"purpose": purpose, "monotonic_now": monotonic_now,
+                          "utc_upper": upper})
+        return upper
+
+    def consume_for(self, *, port, reading, policy, basis_now):
+        if (self not in _CLOCK_ORIGINALS_V4 or self.used or self.port is not port
+                or self.reading is not reading or self.policy != policy
+                or not self.uses or self.uses[0]["purpose"] != "natural_basis"
+                or self.uses[0]["utc_upper"] != basis_now
+                or any(use["purpose"] != "natural_dispatch" for use in self.uses[1:])):
+            raise RuntimeError("natural clock original crossed its actual port/reading/consumer")
+        names = ("source_id", "epoch", "source_monotonic", "local_after", "lower")
+        value = {
+            "schema": "sylanne.natural-clock-validation.v4",
+            "authority_id": reading.sample.authority_id,
+            "installation_id": reading.sample.installation_id,
+            "sample": asdict(reading.sample), "policy": asdict(policy),
+            "monotonic_before": reading.monotonic_before_seconds,
+            "monotonic_after": reading.monotonic_after_seconds,
+            "prior_watermark": None if self.prior is None else dict(zip(names, self.prior, strict=True)),
+            "next_watermark": dict(zip(names, self.next_watermark, strict=True)),
+            "utc_upper": reading.utc_upper_bound_seconds,
+        }
+        uses = tuple(dict(use) for use in self.uses)
+        self.used = True
+        _CLOCK_ORIGINALS_V4.discard(self)
+        return value, uses
 
 
 @dataclass
@@ -277,7 +333,8 @@ class V2FencePort:
             AdminModelWorkflowsV2, NATURAL_GENERATION_TEMPLATE_VERSION,
             NATURAL_GENERATION_TEMPLATE_VERSION_V3,
             NATURAL_GENERATION_TEMPLATE_VERSION_V4,
-            REVIEW_TEMPLATE_VERSION,
+            NATURAL_GENERATION_TEMPLATE_VERSION_V5,
+            REVIEW_TEMPLATE_VERSION, REVIEW_TEMPLATE_VERSION_V2,
         )
         from .model_egress_executor import HostModelEgressExecutor
 
@@ -301,7 +358,7 @@ class V2FencePort:
                    != grant.installation_id
                 or bundle.installation_policy.manifest_digest
                    != grant.manifest_digest
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -314,10 +371,14 @@ class V2FencePort:
                     binding.generation.template_version) not in (
                     ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION),
                     ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V3),
-                    ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V4))
+                    ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V4),
+                    ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V5))
                 or (binding.review.work_kind, binding.review.purpose,
-                    binding.review.template_version) != (
-                    "natural_review", "proposal", REVIEW_TEMPLATE_VERSION)
+                    binding.review.template_version) not in (
+                    ("natural_review", "proposal", REVIEW_TEMPLATE_VERSION),
+                    ("natural_review", "proposal", REVIEW_TEMPLATE_VERSION_V2))
+                or ((binding.generation.template_version == NATURAL_GENERATION_TEMPLATE_VERSION_V5)
+                    != (binding.review.template_version == REVIEW_TEMPLATE_VERSION_V2))
                 or HostModelEgressExecutor.execute_frozen_natural_once
                    is not binding.executor_method
                 or AstrBotModelProvider._request_allowed
@@ -459,7 +520,14 @@ class V2FencePort:
             raise RuntimeError("v2 ingress clock policy is unavailable")
         return self._submit(self._with_session_repair(lambda: self._read_ingress_clock(policy)))
 
-    async def _read_ingress_clock(self, policy: AdminIngressClockPolicy) -> VerifiedIngressClockV2:
+    def read_ingress_clock_with_original_v4(self, policy: AdminIngressClockPolicy):
+        """Use the same paired validation and preserve its actual prior watermark."""
+        if type(policy) is not AdminIngressClockPolicy:
+            raise RuntimeError("v2 ingress clock policy is unavailable")
+        return self._submit(self._with_session_repair(
+            lambda: self._read_ingress_clock(policy, with_original=True)))
+
+    async def _read_ingress_clock(self, policy: AdminIngressClockPolicy, *, with_original=False):
         handshake, grant = self._identity()
         before = time.monotonic()
         sample = await self._transport.ingress_clock_sample_v2(
@@ -496,10 +564,16 @@ class V2FencePort:
                     or math.nextafter(sample_upper, math.inf) < projected_lower):
                 raise RuntimeError("v2 ingress clock response is unqualified")
             lower = max(lower, projected_lower)
-        self._clock_watermark = (
+        next_watermark = (
             sample.source_id, sample.epoch, sample.monotonic_seconds, after, lower,
         )
-        return VerifiedIngressClockV2(sample, before, after, upper)
+        self._clock_watermark = next_watermark
+        reading = VerifiedIngressClockV2(sample, before, after, upper)
+        if with_original:
+            return reading, _VerifiedIngressClockOriginalV4(
+                _CLOCK_ORIGINAL_ISSUER_V4, port=self, reading=reading,
+                policy=policy, prior=prior, next_watermark=next_watermark)
+        return reading
 
     def provision_namespace(self, *, namespace: NamespaceId,
                             request_id: str) -> NamespaceBootstrapV2:
@@ -569,6 +643,25 @@ class V2FencePort:
         if anchor.authority_id != grant.authority_id or anchor.namespace != authority_namespace:
             raise RuntimeError("v2 anchor identity mismatch")
         return anchor
+
+    def observe_content_write_attempt_v1(self, *, namespace, authority_namespace, operation_id, expected_anchor):
+        """Paired negative or existing attempt facts; absence grants no write permission."""
+        return self._submit(self._with_session_repair(lambda: self._observe_content_write_attempt_v1(
+            namespace, authority_namespace, operation_id, expected_anchor)))
+
+    async def _observe_content_write_attempt_v1(self, namespace, authority_namespace, operation_id, expected_anchor):
+        from ..authority_service.v2_contract import ContentWriteAttemptObservationV1
+        identifier(operation_id, "operation_id")
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        observed = await self._transport.v2_observe_content_write_attempt_v1(self._request, handshake,
+            namespace=authority_namespace, holder=grant.administrator_holder,
+            operation_id=operation_id, expected_anchor=expected_anchor)
+        if (type(observed) is not ContentWriteAttemptObservationV1 or observed.current_anchor != expected_anchor
+                or (observed.authority_id, observed.namespace, observed.subject, observed.holder, observed.operation_id) != (
+                    grant.authority_id, authority_namespace, grant.subject, grant.administrator_holder, operation_id)):
+            raise RuntimeError("paired write attempt observation identity differs")
+        return observed
 
     def get_fence_operation(self, *, namespace: NamespaceId,
                             authority_namespace: str,
@@ -789,6 +882,28 @@ class V2FencePort:
             self._request, handshake, namespace=authority_namespace, token=token)
         self._owner_session_identity(namespace, authority_namespace, described)
         return described
+
+    def installation_management_v1(self, *, namespace, authority_namespace,
+                                    operation, owner_token, payload):
+        # A lost write response is unknown: do not replay it through repair.
+        return self._submit(self._installation_management_v1(namespace, authority_namespace,
+            operation, owner_token, payload))
+
+    async def _installation_management_v1(self, namespace, authority_namespace,
+                                          operation, owner_token, payload):
+        await self._mapped(namespace, authority_namespace)
+        handshake, _ = self._identity()
+        return await self._transport.v2_installation_management(self._request, handshake,
+            namespace=authority_namespace, operation=operation, owner_token=owner_token, payload=payload)
+
+    def installation_management_startup_v1(self, *, namespace, authority_namespace):
+        return self._submit(self._installation_management_startup_v1(namespace, authority_namespace))
+
+    async def _installation_management_startup_v1(self, namespace, authority_namespace):
+        await self._mapped(namespace, authority_namespace)
+        handshake, _ = self._identity()
+        return await self._transport.v2_installation_management_startup(self._request, handshake,
+            namespace=authority_namespace)
 
     def logout_owner_session(self, *, namespace: NamespaceId,
                              authority_namespace: str,
@@ -1170,6 +1285,296 @@ class V2FencePort:
         from .d12_target_owner_port_v1 import get_current_background_owner_authority_for_fence_v1
         return get_current_background_owner_authority_for_fence_v1(self, **request)
 
+    def admit_owner_source_note_task_for_fence_v1(self, *, scope, request):
+        return self._submit(self._with_session_repair(lambda: self._owner_source_note_task_v1(
+            'owner_source_note_task_admit_v1', scope=scope, request=request)))
+
+    def read_current_owner_source_note_task_for_fence_v1(self, *, scope, original_request):
+        return self._submit(self._with_session_repair(lambda: self._owner_source_note_task_v1(
+            'owner_source_note_task_current_v1', scope=scope, request=original_request)))
+
+    async def _owner_source_note_task_v1(self, method, *, scope, request):
+        from ..authority_service.current_owner_source_note_task_v1 import (OwnerTaskActivityRequestV1, OwnerTaskActivityValuesChildRequestV1,
+            OwnerTaskActivityEvidenceV1, owner_task_fence_operation_id_v1,
+            owner_task_activity_to_wire_v1, owner_task_activity_from_wire_v1)
+        from ..authority_service.v2_contract import from_wire, to_wire
+        if (type(scope) is not FenceScope or type(request) not in {OwnerTaskActivityRequestV1,OwnerTaskActivityValuesChildRequestV1}
+                or scope.namespace != request.namespace):
+            raise RuntimeError('Owner task request/fence namespace differs')
+        await self._mapped(scope.namespace, scope.authority_namespace)
+        handshake, grant = self._identity()
+        permit = scope.permit
+        if (permit.operation != 'write' or (permit.authority_id, permit.namespace, permit.subject, permit.holder) !=
+                (grant.authority_id, scope.authority_namespace, grant.subject, grant.administrator_holder)
+                or request.installation_id != grant.installation_id
+                or permit.operation_id != owner_task_fence_operation_id_v1(request)):
+            raise RuntimeError('Owner task actual paired installation/Host/write permit differs')
+        response = await self._transport._content_rpc(self._request, handshake, method,
+            {'namespace': scope.authority_namespace, 'permit': to_wire(permit),
+                'request': owner_task_activity_to_wire_v1(request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {'evidence', 'permit', 'channel_binding_sha256'}:
+            raise RuntimeError('Owner task paired response fields differ')
+        evidence = owner_task_activity_from_wire_v1(response['evidence'], OwnerTaskActivityEvidenceV1)
+        observed = from_wire(response['permit'])
+        if observed != permit or evidence.request != request or evidence.current_self.permit != permit:
+            raise RuntimeError('Owner task response changed its actual request/permit/Self')
+        return evidence, observed
+
+    def admit_foreground_activity_for_fence_v1(self, *, scope, request):
+        return self._submit(self._with_session_repair(lambda: self._foreground_activity_v1(
+            "foreground_activity_admit_v1", scope=scope, request=request)))
+
+    def read_current_foreground_activity_for_fence_v1(self, *, scope, original_request):
+        return self._submit(self._with_session_repair(lambda: self._foreground_activity_v1(
+            "foreground_activity_current_v1", scope=scope, request=original_request)))
+
+    def admit_draft_root_registration_for_fence_v1(self, *, scope, request,
+            owner_actor_ref, owner_session_token, owner_session_request):
+        return self._submit(self._with_session_repair(lambda: self._foreground_activity_v1(
+            "draft_root_registration_admit_v1", scope=scope, request=request,
+            owner_actor_ref=owner_actor_ref, owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)))
+
+    async def _foreground_activity_v1(self, method, *, scope, request,
+            owner_actor_ref=None, owner_session_token=None, owner_session_request=None):
+        from ..authority_service.current_foreground_activity_v1 import (ForegroundActivityRequestV1,
+            ForegroundActivityEvidenceV1, DraftRootRegistrationRequestV1, DraftRootRegistrationEvidenceV1,
+            foreground_from_wire_v1, foreground_to_wire_v1, foreground_fence_operation_id_v1,
+            ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2, ForegroundActivityEvidenceV2,
+            foreground_from_wire_v2, foreground_to_wire_v2, foreground_fence_operation_id_v2)
+        from ..authority_service.v2_contract import from_wire, to_wire
+        from ..authority_service.v2_owner_session import to_wire as session_to_wire
+        root_setup = method == "draft_root_registration_admit_v1"
+        internal_v2 = not root_setup and type(request) in {ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2}
+        expected_request = DraftRootRegistrationRequestV1 if root_setup else type(request) if internal_v2 else ForegroundActivityRequestV1
+        expected_result = DraftRootRegistrationEvidenceV1 if root_setup else ForegroundActivityEvidenceV2 if internal_v2 else ForegroundActivityEvidenceV1
+        encode = foreground_to_wire_v2 if internal_v2 else foreground_to_wire_v1
+        decode = foreground_from_wire_v2 if internal_v2 else foreground_from_wire_v1
+        fence_id = foreground_fence_operation_id_v2 if internal_v2 else foreground_fence_operation_id_v1
+        if type(scope) is not FenceScope or type(request) is not expected_request or scope.namespace != request.namespace:
+            raise RuntimeError("foreground exact request/fence namespace differs")
+        await self._mapped(scope.namespace, scope.authority_namespace)
+        handshake, grant = self._identity()
+        permit = scope.permit
+        if (permit.operation != "write" or (permit.authority_id, permit.namespace, permit.subject, permit.holder) !=
+                (grant.authority_id, scope.authority_namespace, grant.subject, grant.administrator_holder)
+                or not root_setup and (request.installation_id != grant.installation_id
+                    or permit.operation_id != fence_id(request))):
+            raise RuntimeError("foreground actual paired installation/Host/write permit differs")
+        command = {"namespace": scope.authority_namespace, "permit": to_wire(permit), "request": encode(request)}
+        if root_setup:
+            if type(owner_session_request) is not OwnerSessionLoginRequestV1 or not owner_actor_ref or not owner_session_token:
+                raise RuntimeError("explicit root setup needs the actual Owner session")
+            self._owner_session_identity(scope.namespace, scope.authority_namespace, owner_session_request)
+            command.update(owner_actor_ref=owner_actor_ref, owner_session_token=owner_session_token,
+                owner_session_request=session_to_wire(owner_session_request))
+        response = await self._transport._content_rpc(self._request, handshake, method, command, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"evidence", "permit", "channel_binding_sha256"}:
+            raise RuntimeError("foreground exact paired response fields differ")
+        evidence = decode(response["evidence"], expected_result)
+        observed = from_wire(response["permit"])
+        if type(observed) is not FencePermitV2 or observed != permit or evidence.request != request:
+            raise RuntimeError("foreground paired response changed its original request/permit")
+        actual_permit = evidence.permit if root_setup else evidence.current_self.permit
+        if actual_permit != permit:
+            raise RuntimeError("foreground independent self/root proof uses another permit")
+        return evidence, observed
+
+    def read_natural_current_graph_identity_v1(self, *, namespace, authority_namespace):
+        return self._submit(self._with_session_repair(lambda:self._natural_current_graph_metadata_v1(
+            namespace=namespace,authority_namespace=authority_namespace)))
+
+    def read_natural_roster_prepared_for_parent_v1(self, *, namespace, authority_namespace, parent_original_id):
+        return self._submit(self._with_session_repair(lambda:self._natural_current_graph_metadata_v1(
+            namespace=namespace,authority_namespace=authority_namespace,parent_original_id=parent_original_id)))
+
+    async def _natural_current_graph_metadata_v1(self, *, namespace, authority_namespace, parent_original_id=None):
+        from ..authority_service.natural_disposition_maintenance_v1 import core_original_from_wire_v1,natural_graph_identity_from_wire_v1
+        await self._mapped(namespace,authority_namespace)
+        handshake,grant=self._identity()
+        command={"namespace":authority_namespace,"holder":grant.administrator_holder}
+        if parent_original_id is None:
+            method="natural_current_graph_identity_v1";key="identity"
+        else:
+            method="natural_roster_prepared_for_parent_v1";key="original";command["parent_original_id"]=parent_original_id
+        response=await self._transport._content_rpc(self._request,handshake,method,command,protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response)!={key,"channel_binding_sha256"}
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("natural current metadata crossed its exact authenticated channel")
+        if parent_original_id is None:
+            value=natural_graph_identity_from_wire_v1(response[key])
+            if (value.namespace,value.installation_id)!=(namespace,grant.installation_id):
+                raise RuntimeError("natural current C09 identity crossed its actual installed namespace")
+        else:
+            if response[key] is None:return None
+            value=core_original_from_wire_v1(response[key])
+            if ((value.authority_namespace,value.installation_id,value.parent_original_id)!=(authority_namespace,grant.installation_id,parent_original_id)
+                    or value.kind!="roster_prepared"):
+                raise RuntimeError("natural Core preparation lookup crossed its actual parent/installation")
+        return value
+
+    def reject_natural_unprepared_write_v1(self, *, scope, request):
+        return self._submit(self._with_session_repair(lambda:self._natural_unprepared_write_closure_v1(scope=scope,request=request)))
+
+    async def _natural_unprepared_write_closure_v1(self, *, scope, request):
+        from ..authority_service.natural_disposition_maintenance_v1 import core_original_from_wire_v1,require_unprepared_family_permit_v1
+        from ..authority_service.v2_contract import from_wire,to_wire
+        if type(scope) is not FenceScope or scope.operation!="write" or request.namespace!=scope.namespace:
+            raise TypeError("natural unprepared closure requires its exact actual write scope")
+        require_unprepared_family_permit_v1(request,scope.permit)
+        await self._mapped(scope.namespace,scope.authority_namespace)
+        handshake,grant=self._identity()
+        if (request.installation_id!=grant.installation_id or (scope.permit.authority_id,scope.permit.namespace,scope.permit.subject,scope.permit.holder)
+                !=(grant.authority_id,scope.authority_namespace,grant.subject,grant.administrator_holder)):
+            raise RuntimeError("natural unprepared closure crossed its actual installed write identity")
+        response=await self._transport._content_rpc(self._request,handshake,"natural_disposition_reject_unprepared_write_v1",
+            {"namespace":scope.authority_namespace,"holder":grant.administrator_holder,"request":request.to_wire(),"permit":to_wire(scope.permit)},protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response)!={"original","channel_binding_sha256"}
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("natural unprepared closure crossed its authenticated channel")
+        value=core_original_from_wire_v1(response["original"])
+        if ((value.authority_namespace,value.installation_id)!=(scope.authority_namespace,grant.installation_id)
+                or from_wire(value.payload["permit"])!=scope.permit
+                or value.kind not in {"rejected_no_commit","roster_committed","maintenance_committed"}):
+            raise RuntimeError("natural unprepared closure returned another original actual permit")
+        return value
+
+    def prepare_natural_roster_original_v1(self, *, scope, paid_request):
+        return self._submit(self._with_session_repair(lambda:self._natural_disposition_original_v1(scope=scope,paid_request=paid_request)))
+
+    def confirm_natural_disposition_original_v1(self, *, scope, original_ref):
+        return self._submit(self._with_session_repair(lambda:self._natural_disposition_original_v1(scope=scope,original_ref=original_ref,confirm=True)))
+
+    def reject_natural_disposition_no_commit_v1(self, *, scope, original_ref):
+        return self._submit(self._with_session_repair(lambda:self._natural_disposition_original_v1(
+            scope=scope,original_ref=original_ref,reject=True)))
+
+    def read_natural_disposition_original_v1(self, *, namespace, authority_namespace, original_ref):
+        return self._submit(self._with_session_repair(lambda:self._natural_disposition_original_v1(namespace=namespace,
+            authority_namespace=authority_namespace,original_ref=original_ref)))
+
+    async def _natural_disposition_original_v1(self, *, namespace=None, authority_namespace=None,scope=None,paid_request=None,original_ref=None,confirm=False,reject=False):
+        from ..authority_service.natural_disposition_maintenance_v1 import core_original_from_wire_v1
+        from ..authority_service.v2_contract import from_wire, to_wire
+        from ..authority_service.v2_natural_paid_review_contract import to_wire as paid_to_wire
+        if scope is not None:
+            if type(scope) is not FenceScope or scope.operation!="write":
+                raise TypeError("natural Core original requires its actual first/maintenance write scope")
+            namespace,authority_namespace=scope.namespace,scope.authority_namespace
+        await self._mapped(namespace,authority_namespace)
+        handshake,grant=self._identity()
+        command={"namespace":authority_namespace,"holder":grant.administrator_holder}
+        if scope is not None:
+            if (scope.permit.authority_id,scope.permit.namespace,scope.permit.subject,scope.permit.holder)!=(grant.authority_id,authority_namespace,grant.subject,grant.administrator_holder):
+                raise RuntimeError("natural original crossed its actual installed write identity")
+            command["permit"]=to_wire(scope.permit)
+        if paid_request is not None:
+            method="natural_roster_prepare_for_final_v1";command["request"]=paid_to_wire(paid_request)
+        else:
+            method=("natural_disposition_reject_no_commit_v1" if reject else "natural_disposition_confirm_original_v1" if confirm else "natural_disposition_read_original_v1")
+            command["original_ref"]=original_ref
+        response=await self._transport._content_rpc(self._request,handshake,method,command,protocol=AUTHORITY_V2_PROTOCOL)
+        if type(response) is not dict or set(response)!={"original","channel_binding_sha256"}:
+            raise RuntimeError("natural signed original exact response differs")
+        if response["channel_binding_sha256"] != handshake.channel_binding_sha256:
+            raise RuntimeError("natural signed original crossed its authenticated channel")
+        value=core_original_from_wire_v1(response["original"])
+        if (paid_request is not None and value.kind != "roster_prepared"
+                or confirm and value.kind not in {"roster_committed", "maintenance_committed"}
+                or reject and value.kind != "rejected_no_commit"):
+            raise RuntimeError("natural original response changed its named operation kind")
+        if (value.authority_namespace,value.installation_id)!=(authority_namespace,grant.installation_id):
+            raise RuntimeError("natural signed original crossed its current paired installation")
+        if scope is not None and from_wire(value.payload["permit"])!=scope.permit:
+            raise RuntimeError("natural signed original uses another actual write permit")
+        if original_ref is not None and not (confirm or reject) and value.original_ref!=original_ref:
+            raise RuntimeError("natural original lookup changed its exact identity")
+        if (confirm or reject) and value.payload["prepared_original_ref"]!=original_ref:
+            raise RuntimeError("natural confirmed original changed its exact prepared lineage")
+        return value
+
+    def plan_natural_disposition_maintenance_v1(self, *, namespace, authority_namespace, parent_original_id):
+        return self._submit(self._with_session_repair(lambda:
+            self._natural_disposition_metadata_v1(namespace=namespace, authority_namespace=authority_namespace,
+                parent_original_id=parent_original_id)))
+
+    def observe_natural_disposition_maintenance_v1(self, *, scope, request):
+        return self._submit(self._with_session_repair(lambda:
+            self._natural_disposition_metadata_v1(namespace=scope.namespace, authority_namespace=scope.authority_namespace,
+                request=request, scope=scope)))
+
+    async def _natural_disposition_metadata_v1(self, *, namespace, authority_namespace,
+            parent_original_id=None, request=None, scope=None):
+        from ..authority_service.natural_disposition_maintenance_v1 import (
+            plan_from_wire_v1, observed_from_wire_v1, NaturalDispositionMaintenanceRequestV1,
+        )
+        from ..authority_service.v2_contract import to_wire
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        command = {"namespace":authority_namespace,"holder":grant.administrator_holder}
+        if scope is None:
+            command["parent_original_id"] = parent_original_id
+            method = "natural_disposition_plan_v1"
+        else:
+            if (type(scope) is not FenceScope or scope.operation != "write"
+                    or type(request) is not NaturalDispositionMaintenanceRequestV1
+                    or (scope.permit.authority_id,scope.permit.namespace,scope.permit.subject,scope.permit.holder)
+                        != (grant.authority_id,authority_namespace,grant.subject,grant.administrator_holder)
+                    or (request.namespace,request.installation_id,request.operation_id)
+                        != (namespace,grant.installation_id,scope.operation_id)):
+                raise RuntimeError("natural disposition private observation crossed its installed write identity")
+            command.update(request=request.to_wire(),permit=to_wire(scope.permit))
+            method = "natural_disposition_observe_v1"
+        response = await self._transport._content_rpc(self._request,handshake,method,command,protocol=AUTHORITY_V2_PROTOCOL)
+        field = "plan" if scope is None else "observation"
+        if type(response) is not dict or set(response) != {field,"channel_binding_sha256"}:
+            raise RuntimeError("natural disposition private response exact fields differ")
+        if response[field] is None and scope is None:
+            return None
+        value = plan_from_wire_v1(response[field]) if scope is None else observed_from_wire_v1(response[field])
+        plan = value if scope is None else value.plan
+        if (plan.request.namespace,plan.request.installation_id,plan.requirements.authority_namespace) != (namespace,grant.installation_id,authority_namespace):
+            raise RuntimeError("natural disposition private plan crossed its installed namespace")
+        if scope is not None and (value.permit!=scope.permit or plan.request!=request
+                or plan.graph_revision!=scope.graph_revision or plan.graph_epoch!=scope.graph_epoch.revision):
+            raise RuntimeError("natural disposition private witness differs from its fixed Graph read/write stamp")
+        return value
+
+    def observe_owner_stop_reply_projection_for_fence_v1(self, *, scope, original_ref):
+        return self._submit(self._with_session_repair(lambda:
+            self._observe_owner_stop_reply_projection_v1(scope=scope, original_ref=original_ref)))
+
+    async def _observe_owner_stop_reply_projection_v1(self, *, scope, original_ref):
+        from ..authority_service.owner_stop_reply_v1 import owner_stop_reply_projection_observed_from_wire_v1
+        from ..authority_service.v2_contract import to_wire
+        if type(scope) is not FenceScope or scope.operation != "write":
+            raise TypeError("StopReply projection needs its actual installed write scope")
+        await self._mapped(scope.namespace, scope.authority_namespace)
+        handshake, grant = self._identity()
+        permit = scope.permit
+        if (permit.authority_id, permit.namespace, permit.subject, permit.holder) != (
+                grant.authority_id, scope.authority_namespace, grant.subject, grant.administrator_holder):
+            raise RuntimeError("StopReply projection crossed its actual paired installation/subject")
+        response = await self._transport._content_rpc(self._request, handshake,
+            "owner_stop_reply_projection_observe_v1", {"namespace": scope.authority_namespace,
+                "holder": grant.administrator_holder, "original_ref": original_ref, "permit": to_wire(permit)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if type(response) is not dict or set(response) != {"observation", "channel_binding_sha256"}:
+            raise RuntimeError("StopReply permit-bound observation exact response differs")
+        value = owner_stop_reply_projection_observed_from_wire_v1(response["observation"])
+        if (value.permit != permit or value.request.namespace != scope.namespace
+                or value.request.installation_id != grant.installation_id
+                or scope.operation_id != "owner-stop-projection:" + value.initial_original.operation_id
+                or value.requirements.authority_id != grant.authority_id
+                or value.requirements.authority_namespace != scope.authority_namespace
+                or value.requirements.activation_generation != scope.generation):
+            raise RuntimeError("StopReply observed original/permit/installation/stamp binding differs")
+        return value
+
+    def observe_owner_artifact_for_fence_v1(self, **request):
+        from .d12_owner_artifact_read_port_v1 import observe_owner_artifact_for_fence_v1
+        return observe_owner_artifact_for_fence_v1(self, **request)
+
     def get_current_owner_authority_for_fence_v1(self, **request):
         from .d12_target_owner_port_v1 import get_current_owner_authority_for_fence_v1
         return get_current_owner_authority_for_fence_v1(self, **request)
@@ -1248,6 +1653,29 @@ class V2FencePort:
                     raise PermissionError('Contact associated session identity differs')
             return {'observation': observed, 'authority': authority}
         return self._submit(self._with_session_repair(read))
+
+    def observe_paid_owner_guard_for_fence_v3(self, *, namespace: NamespaceId,
+            authority_namespace: str, permit: FencePermitV2, business_operation_id: str,
+            request_digest: str, phase: str):
+        return self._submit(self._with_session_repair(lambda: self._observe_paid_owner_guard_for_fence_v3(
+            namespace,authority_namespace,permit,business_operation_id,request_digest,phase)))
+
+    async def _observe_paid_owner_guard_for_fence_v3(self,namespace,authority_namespace,permit,
+            business_operation_id,request_digest,phase):
+        await self._mapped(namespace,authority_namespace)
+        handshake,grant=self._identity()
+        if (type(permit) is not FencePermitV2 or permit.operation!="write"
+                or permit.namespace!=authority_namespace or permit.authority_id!=grant.authority_id
+                or permit.subject!=grant.subject):
+            raise RuntimeError("paid Owner observation permit installation identity differs")
+        original,current=await self._transport.v3_observe_paid_owner_guard_for_fence(
+            self._request,handshake,namespace=authority_namespace,permit=permit,
+            business_operation_id=business_operation_id,request_digest=request_digest,phase=phase)
+        if (current!=permit or original.guard.namespace!=namespace
+                or original.guard.authority_id!=grant.authority_id
+                or original.guard.installation_id!=grant.installation_id):
+            raise RuntimeError("paid Owner observation namespace or original write differs")
+        return original,current
 
     def get_current_owner_guard_for_fence(
         self, *, namespace: NamespaceId, authority_namespace: str,
@@ -1513,6 +1941,30 @@ class V2FencePort:
             raise RuntimeError("v2 dispatch permit installation or generation mismatch")
         return permit
 
+    def read_natural_final_effect_observation_v4(self, *, namespace: NamespaceId, authority_namespace: str,
+            permit: FencePermitV2, effect_id: str):
+        """Read the Core's immutable target/negative-inventory original under the current write fence."""
+        return self._submit(self._with_session_repair(lambda: self._read_natural_final_effect_observation_v4(
+            namespace, authority_namespace, permit, effect_id)))
+
+    async def _read_natural_final_effect_observation_v4(self, namespace, authority_namespace, permit, effect_id):
+        from ..authority_service.v2_contract import NaturalFinalEffectObservationReadV4
+        identifier(effect_id, "effect_id")
+        if type(permit) is not FencePermitV2 or permit.operation != "write" or permit.namespace != authority_namespace:
+            raise ValueError("natural final observation requires actual ordinary write fence")
+        current = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if (permit.authority_id != grant.authority_id or permit.subject != grant.subject
+                or permit.holder != current.holder or permit.generation != current.generation or permit.pinned_anchor != current.anchor):
+            raise RuntimeError("natural final observation permit is stale or unpaired")
+        observed = await self._transport.v2_execution_read_natural_final_effect_observation_v4(
+            self._request, handshake, permit=permit, effect_id=effect_id)
+        if (type(observed) is not NaturalFinalEffectObservationReadV4 or observed.observation.permit != permit
+                or observed.observation.installation_id != grant.installation_id
+                or observed.observation.target_effect_id != effect_id):
+            raise RuntimeError("natural final observation differs from actual paired installation/permit/target")
+        return observed
+
     def read_current_effect_snapshot_for_write_fence(
         self, *, namespace: NamespaceId, authority_namespace: str,
         permit: FencePermitV2,
@@ -1553,6 +2005,88 @@ class V2FencePort:
                 or snapshot.coverage != "complete"):
             raise RuntimeError("current effect snapshot is stale or incomplete")
         return snapshot
+
+    def prepare_current_d13_frame_v7(self,selector):
+        return self._submit(self._with_session_repair(lambda:self._d13_core_counter_rpc_v1('prepare_current_d13_frame_v7',selector)))
+
+    def count_current_d13_wire_v1(self,selector,*,frame):
+        return self._submit(self._with_session_repair(lambda:self._d13_core_counter_rpc_v1('count_current_d13_wire_v1',selector,frame=frame)))
+
+    async def _d13_core_counter_rpc_v1(self,method,selector,*,frame=None):
+        from dataclasses import asdict
+        from ..authority_service.d13_core_counter_contract_v1 import (D13CurrentFramePrepareSelectorV7,
+            D13CurrentWireCountSelectorV1,D13CoreFrameIntentHeaderV7,D13CoreFullWireEnvelopeV1,D13CounterCPUPrepareInstructionV1,
+            D13CounterAwaitingAccountingV1,d13_core_counter_from_wire_v1)
+        if method=='prepare_current_d13_frame_v7':
+            if type(selector) is not D13CurrentFramePrepareSelectorV7:raise TypeError('actual V7 frame selector required')
+            namespace=selector.namespace;authority_namespace=selector.authority_namespace
+        else:
+            if type(selector) is not D13CurrentWireCountSelectorV1 or type(frame) is not D13CoreFrameIntentHeaderV7:
+                raise TypeError('exact count selector and original frame required')
+            namespace=frame.namespace;authority_namespace=frame.authority_namespace
+        observed=await self._mapped(namespace,authority_namespace)
+        handshake,grant=self._identity()
+        if (selector.install_id,authority_namespace)!=(grant.installation_id,namespace_ref(namespace)):
+            raise RuntimeError('Core counter selector crossed actual paired installation/namespace')
+        response=await self._transport._content_rpc(self._request,handshake,method,
+            {'namespace':authority_namespace,'selector':asdict(selector)},protocol=AUTHORITY_V2_PROTOCOL)
+        terminal_key='frame' if method=='prepare_current_d13_frame_v7' else 'evidence'
+        if (type(response) is not dict or set(response) not in (
+                {terminal_key,'channel_binding_sha256'},{'progress','channel_binding_sha256'})
+                or response['channel_binding_sha256']!=handshake.channel_binding_sha256):
+            raise RuntimeError('Core counter response crossed exact authenticated channel')
+        if 'progress' in response:
+            cls=D13CounterCPUPrepareInstructionV1 if method=='prepare_current_d13_frame_v7' else D13CounterAwaitingAccountingV1
+            progress=d13_core_counter_from_wire_v1(response['progress'],cls)
+            if type(progress) is D13CounterCPUPrepareInstructionV1:
+                if ((progress.namespace,progress.install_id,progress.authority_namespace,progress.activation_generation,
+                        progress.c02_operation_id,progress.plan_ref,progress.counter_operation_id)!=(namespace,
+                        grant.installation_id,authority_namespace,observed.generation,selector.c02_operation_id,
+                        selector.plan_ref,selector.counter_operation_id)):
+                    raise RuntimeError('Core CPU instruction crossed current actual channel/parent/prospective scope')
+            elif ((progress.namespace,progress.frame_intent_id,progress.frame_intent_digest,progress.counter_operation_id)
+                    !=(frame.namespace,frame.frame_intent_id,frame.frame_intent_digest,frame.counter_operation_id)):
+                raise RuntimeError('Core CPU accounting locator replaced immutable original operation')
+            return progress
+        cls=D13CoreFrameIntentHeaderV7 if terminal_key=='frame' else D13CoreFullWireEnvelopeV1
+        result=d13_core_counter_from_wire_v1(response[terminal_key],cls)
+        header=result if terminal_key=='frame' else result.payload.frame
+        if (header.namespace,header.authority_namespace,header.install_id,header.authority_id,header.activation_generation)!= (
+                namespace,authority_namespace,grant.installation_id,grant.authority_id,observed.generation):
+            raise RuntimeError('Core counter original crossed current actual channel/scope')
+        if terminal_key=='frame':
+            if (header.c02_operation_id,header.plan_ref,header.counter_operation_id)!=(
+                    selector.c02_operation_id,selector.plan_ref,selector.counter_operation_id):
+                raise RuntimeError('Core frame changed original cause/prospective plan/count operation')
+        elif header!=frame:raise RuntimeError('Core counter replaced immutable original frame')
+        return result
+
+    def read_current_contact_observation_for_projection_v1(self, *, namespace, authority_namespace,
+            installation_id, holder, effect_id):
+        return self._submit(self._with_session_repair(lambda:self._contact_observation_projection_v1(
+            namespace=namespace,authority_namespace=authority_namespace,installation_id=installation_id,
+            holder=holder,effect_id=effect_id)))
+
+    async def _contact_observation_projection_v1(self, *, namespace, authority_namespace,
+            installation_id, holder, effect_id):
+        from ..authority_service.contact_p2_contract_v1 import contact_observation_projection_from_wire_v1
+        observed=await self._mapped(namespace,authority_namespace)
+        handshake,grant=self._identity()
+        if (installation_id,holder)!=(grant.installation_id,grant.administrator_holder):
+            raise RuntimeError("Contact observation private installation selector differs")
+        response=await self._transport._content_rpc(self._request,handshake,
+            "contact_current_observation_projection_v1",{"namespace":authority_namespace,
+                "installation_id":installation_id,"holder":holder,"effect_id":effect_id},protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response)!={"read","channel_binding_sha256"}
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("Contact observation crossed its exact authenticated channel")
+        result=contact_observation_projection_from_wire_v1(response["read"])
+        permit=result.observed_permit
+        if ((result.namespace,result.installation_id,permit.authority_id,permit.subject,permit.holder,
+                permit.namespace,permit.effect_id,permit.generation)!=(namespace,installation_id,
+                grant.authority_id,grant.subject,holder,authority_namespace,effect_id,observed.generation)):
+            raise RuntimeError("Contact observation actual original crossed its paired namespace/effect")
+        return result
 
     def read_current_observation_receipt_v1(self, *, namespace, authority_namespace, effect_id):
         return self._submit(self._with_session_repair(lambda:

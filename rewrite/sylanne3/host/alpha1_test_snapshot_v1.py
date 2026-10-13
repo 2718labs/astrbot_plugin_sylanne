@@ -7,6 +7,23 @@ MODE = 'snapshot-alpha1-test'
 VERSION = '3.0.0-alpha1'
 SCHEMA = 'sylanne.alpha1-test-snapshot.v1'
 QUALIFICATION_SCHEMA = 'sylanne.alpha1-test-snapshot-qualification.v1'
+ALPHA2_MODE = 'alpha2-candidate'
+ALPHA2_VERSION = '3.0.0-alpha2'
+ALPHA2_SCHEMA = 'sylanne.alpha2-local-candidate.v1'
+ALPHA2_QUALIFICATION_SCHEMA = 'sylanne.alpha2-local-qualification.v1'
+ALPHA2_RUNTIME_SCOPE = 'backend-local-alpha2-acceptance'
+ALPHA2_UNMET_GATES = ['catalogue_runtime_verified', 'migration_validated',
+    'alpha2_source_freeze', 'full_v3_39_local_acceptance']
+ALPHA2_SPECIFICATION = {
+    'schema': 'sylanne.alpha2-v3-specification.v1', 'spec_version': 3, 'task_count': 39,
+    'input_sha256': {
+        'prompt': '0fd7d7415e40182303e85970c921dbb67a812ef54d6ecd2f4cbb059e78849acf',
+        'json': 'a4d715d8a155fecd54eaff80b471a27196ebeffa7fd287cac4600f17e727f884',
+        'csv': '43ed34bc5ee8def6dc7d93ad46be47ebed6f0a2943be039033c8e9c894561222',
+        'html': '3abf41bafa414679bd774d52186428b2acd60612eb7aa871b78d0bfc2a3bf218'},
+    'resource_contract': {'cpu_count': 2, 'process_group_memory_max_bytes': 2000000000,
+        'app_memory_max_bytes': 1342177280, 'app_memory_high_bytes': 1073741824},
+}
 
 
 def _sha(value):
@@ -19,14 +36,39 @@ def qualify_test_snapshot_v1(candidate):
     return value
 
 
+def qualify_alpha2_candidate_v1(candidate):
+    value = dict(candidate)
+    value.update(schema=ALPHA2_QUALIFICATION_SCHEMA, status='alpha2_candidate',
+        product_status='candidate_only', runtime_scope=ALPHA2_RUNTIME_SCOPE,
+        unmet_product_gates=list(ALPHA2_UNMET_GATES))
+    return value
+
+
 def validate_test_snapshot_manifest_v1(manifest):
+    return _validate_candidate_manifest_v1(manifest, MODE)
+
+
+def validate_alpha2_candidate_manifest_v1(manifest):
+    return _validate_candidate_manifest_v1(manifest, ALPHA2_MODE)
+
+
+def _validate_candidate_manifest_v1(manifest, expected_mode):
+    contracts = {
+        MODE: (VERSION, SCHEMA, 'alpha1-test', 'Embodiment-3.0.0-alpha1 test snapshot',
+            'sylanne.alpha1-test-evidence.v1'),
+        ALPHA2_MODE: (ALPHA2_VERSION, ALPHA2_SCHEMA, 'alpha2-local', 'Sylanne 3.0.0-alpha2 local candidate',
+            'sylanne.alpha2-local-evidence.v1'),
+    }
+    version, schema, scope, label, evidence_schema = contracts[expected_mode]
     value=manifest.get('test_snapshot')
     fields={'schema','label','handoff_archive_sha256','handoff_manifest_sha256','source_inventory_sha256',
         'native_sha256','source_delta','engineering_source_inventory','engineering_source_delta',
         'verification_evidence','verification_evidence_digest','public_release'}
-    if (manifest.get('build_mode')!=MODE or manifest.get('package_version')!=VERSION
-            or manifest.get('candidate_scope')!='alpha1-test' or type(value) is not dict or set(value)!=fields
-            or value['schema']!=SCHEMA or value['label']!='Embodiment-3.0.0-alpha1 test snapshot'
+    if expected_mode == ALPHA2_MODE:
+        fields.add('specification')
+    if (manifest.get('build_mode')!=expected_mode or manifest.get('package_version')!=version
+            or manifest.get('candidate_scope')!=scope or type(value) is not dict or set(value)!=fields
+            or value['schema']!=schema or value['label']!=label
             or value['public_release'] is not False or not _sha(value['handoff_archive_sha256'])
             or not _sha(value['handoff_manifest_sha256'])
             or value['source_inventory_sha256']!=manifest.get('source_inventory',{}).get('sha256')
@@ -35,6 +77,8 @@ def validate_test_snapshot_manifest_v1(manifest):
             or manifest.get('source',{}).get('handoff_snapshot',{}).get('origin_head_is_baseline_only') is not True
             or manifest.get('source',{}).get('dirty') is not True):
         raise ValueError('alpha1 test snapshot provenance differs')
+    if expected_mode == ALPHA2_MODE and value['specification'] != ALPHA2_SPECIFICATION:
+        raise ValueError('alpha2 candidate does not bind the exact v3 design/resource contract')
     delta=value['source_delta']
     if type(delta) is not dict or set(delta)!={'added','changed','removed'}:
         raise ValueError('test snapshot source delta schema differs')
@@ -88,7 +132,7 @@ def validate_test_snapshot_manifest_v1(manifest):
             or any(path in actual for path in engineering['removed'])):
         raise ValueError('test snapshot removed engineering source differs')
     evidence=value['verification_evidence']
-    if (type(evidence) is not dict or evidence.get('schema')!='sylanne.alpha1-test-evidence.v1'
+    if (type(evidence) is not dict or evidence.get('schema')!=evidence_schema
             or type(evidence.get('checks')) is not list or not evidence['checks']
             or len(evidence['checks'])>256 or canonical_digest(evidence)!=value['verification_evidence_digest']):
         raise ValueError('test snapshot actual evidence inventory differs')

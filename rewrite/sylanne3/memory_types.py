@@ -152,6 +152,22 @@ def _tuple_from_json(value: object, label: str) -> tuple:
     return tuple(value)
 
 
+def validate_source_metadata_v1(*, source_id, speaker_id, source_kind, assertion_status,
+        occurred_at, recorded_at, provenance_root, audiences, purposes, parent_source_ids, independence):
+    """Original SourceRecord rules for metadata, shared with its streaming codec."""
+    _text(source_id, "source_id")
+    _text(speaker_id, "speaker_id")
+    _enum(source_kind, _SOURCE_KINDS, "source_kind")
+    _enum(assertion_status, _ASSERTION_STATUSES, "assertion_status")
+    _time(occurred_at, "occurred_at", optional=True)
+    _time(recorded_at, "recorded_at")
+    _text(provenance_root, "provenance_root")
+    _string_tuple(audiences, "audiences", reject_wildcard=True)
+    _string_tuple(purposes, "purposes", allowed=_PURPOSES)
+    _string_tuple(parent_source_ids, "parent_source_ids")
+    _enum(independence, _INDEPENDENCE_VALUES, "independence")
+
+
 @dataclass(frozen=True)
 class SourceRecord:
     source_id: str
@@ -168,18 +184,13 @@ class SourceRecord:
     independence: str = "unknown"
 
     def __post_init__(self) -> None:
-        _text(self.source_id, "source_id")
+        validate_source_metadata_v1(source_id=self.source_id, speaker_id=self.speaker_id,
+            source_kind=self.source_kind, assertion_status=self.assertion_status,
+            occurred_at=self.occurred_at, recorded_at=self.recorded_at,
+            provenance_root=self.provenance_root, audiences=self.audiences,
+            purposes=self.purposes, parent_source_ids=self.parent_source_ids,
+            independence=self.independence)
         _text(self.text, "text", bounded=True)
-        _text(self.speaker_id, "speaker_id")
-        _enum(self.source_kind, _SOURCE_KINDS, "source_kind")
-        _enum(self.assertion_status, _ASSERTION_STATUSES, "assertion_status")
-        _time(self.occurred_at, "occurred_at", optional=True)
-        _time(self.recorded_at, "recorded_at")
-        _text(self.provenance_root, "provenance_root")
-        _string_tuple(self.audiences, "audiences", reject_wildcard=True)
-        _string_tuple(self.purposes, "purposes", allowed=_PURPOSES)
-        _string_tuple(self.parent_source_ids, "parent_source_ids")
-        _enum(self.independence, _INDEPENDENCE_VALUES, "independence")
 
     def to_dict(self) -> dict:
         return {
@@ -364,15 +375,20 @@ def validate_association(value: object) -> None:
         raise ValueError("association context_tags may contain at most 8 values")
 
 
-def validate_access(value: object) -> None:
-    data = _exact_object(value, _ACCESS_FIELDS, "memory access")
-    _text(data["source_id"], "source_id")
-    audiences = _tuple_from_json(data["audiences"], "audiences")
-    purposes = _tuple_from_json(data["purposes"], "purposes")
+def validate_access_metadata_v1(*, source_id, audiences, purposes, status, recorded_at) -> None:
+    """The original Access predicates also serve actual streaming JSON metadata."""
+    _text(source_id, "source_id")
+    audiences = _tuple_from_json(audiences, "audiences")
+    purposes = _tuple_from_json(purposes, "purposes")
     _string_tuple(audiences, "audiences", reject_wildcard=True)
     _string_tuple(purposes, "purposes", allowed=_PURPOSES)
-    _enum(data["status"], _ACCESS_STATUSES, "access status")
-    _time(data["recorded_at"], "recorded_at")
+    _enum(status, _ACCESS_STATUSES, "access status")
+    _time(recorded_at, "recorded_at")
+
+
+def validate_access(value: object) -> None:
+    data = _exact_object(value, _ACCESS_FIELDS, "memory access")
+    validate_access_metadata_v1(**data)
 
 
 def _validate_source(value: object) -> None:

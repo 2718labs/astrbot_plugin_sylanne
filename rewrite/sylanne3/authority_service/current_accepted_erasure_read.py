@@ -172,7 +172,7 @@ def read_current_accepted_erasure_in_tx_v1(
             or accepted.source_phase != "pending"
             or accepted.target_phase != "accepted"
             or pending.evidence.issuer_id != "authority-owner-graph-plan-v2"
-            or accepted.evidence.issuer_id != "authority-pinned-graph-barrier-v1"
+            or accepted.evidence.issuer_id not in {"authority-pinned-graph-barrier-v1","authority-pinned-graph-barrier-v2"}
             or pending.deletion_operation_id != deletion_operation_id
             or accepted.deletion_operation_id != deletion_operation_id
             or pending.request_digest != accepted.request_digest
@@ -199,6 +199,9 @@ def read_current_accepted_erasure_in_tx_v1(
                 pending.expected_append_digest)
             or deletion._inspect_pending_locked(accepted) is None):
         raise AuthorityUnavailable("current accepted original differs")
+    # Both issuers are the Core's closed typed barrier consumers. This reader
+    # verifies actual signed accepted journal/fence originals; Graph V2 members
+    # still require the independent complete Source-barrier view.
     return CurrentAcceptedErasureV1(
         namespace, deletion_operation_id, pending_receipt,
         accepted_receipt, permit, pending.closure_roots,

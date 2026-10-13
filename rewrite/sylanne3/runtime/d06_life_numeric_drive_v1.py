@@ -290,9 +290,24 @@ def record_life_numeric_drive_after_cas_v1(db, *, stage, issuer, receipt):
         operation_id=original.operation_id, value=original)
 
 
+def _require_life_numeric_drive_producer_membership_v1(db, original):
+    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+    mapping = read_d04_mapping_acceptance_v3(db, original.namespace, original.mapping_ref)
+    adopted = read_adopted_domain_operation_v1(db, original.namespace, original.operation_id)
+    mapping_writes = None if mapping is None else [
+        {'key': AtomKey(Owner(**w['key']['owner']), w['key']['type_name'], w['key']['name']).token,
+         'value': w['value'], 'dependencies': [AtomKey(Owner(**k['owner']), k['type_name'], k['name']).token for k in w['dependencies']]}
+        for w in mapping[0]['output_writes']]
+    if (mapping is None or mapping[1] != original.mapping_digest or adopted is None or adopted['domain'] != 'd04'
+            or adopted['operation_kind'] != OPERATION
+            or adopted['payload']['provenance'].get('life_numeric_drive_original') != plain_v1(original)
+            or canonical_serialize(adopted['payload']['writes']) != canonical_serialize(mapping_writes)):
+        raise ValueError('Life drive lacks its exact complete shared mapping producer')
+    return adopted
+
+
 def read_current_life_numeric_drive_v1(db, *, frame, request, installed_readers):
     from .d11_life_preparation_v1 import _read
-    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .d06_life_numeric_task_v1 import require_current_life_numeric_appraisal_acceptance_v1
     from .d04_semantic_mapping_v3 import require_current_d04_role_clock_v3
     context = read_current_life_numeric_context_v1(db, frame=frame,
@@ -307,17 +322,7 @@ def read_current_life_numeric_drive_v1(db, *, frame, request, installed_readers)
             or original.appraisal_acceptance_digest != accepted.digest or original.appraisal_adoption_operation_id != accepted.operation_id
             or saved[1] != original.operation_id or original.operation_id != ids['operation']):
         raise ValueError('Life drive current context/appraisal original differs')
-    mapping = read_d04_mapping_acceptance_v3(db, original.namespace, original.mapping_ref)
-    adopted = read_adopted_domain_operation_v1(db, original.namespace, original.operation_id)
-    mapping_writes = None if mapping is None else [
-        {'key': AtomKey(Owner(**w['key']['owner']), w['key']['type_name'], w['key']['name']).token,
-         'value': w['value'], 'dependencies': [AtomKey(Owner(**k['owner']), k['type_name'], k['name']).token for k in w['dependencies']]}
-        for w in mapping[0]['output_writes']]
-    if (mapping is None or mapping[1] != original.mapping_digest or adopted is None or adopted['domain'] != 'd04'
-            or adopted['operation_kind'] != OPERATION
-            or adopted['payload']['provenance'].get('life_numeric_drive_original') != plain_v1(original)
-            or canonical_serialize(adopted['payload']['writes']) != canonical_serialize(mapping_writes)):
-        raise ValueError('Life drive lacks its exact complete shared mapping producer')
+    adopted = _require_life_numeric_drive_producer_membership_v1(db, original)
     read = CurrentDomainReadV1(frame); read.check(db)
     require_current_d04_role_clock_v3(db, original.clock)
     for ref, revision in original.drive_versions:

@@ -7,6 +7,8 @@ into solver inputs or issue an ABI2/product certificate.
 
 from __future__ import annotations
 
+from ..runtime_storage_v3 import read_graph_row_v3, read_graph_rows_v3
+
 from dataclasses import asdict, dataclass
 import json
 import math
@@ -79,7 +81,21 @@ def _authored_predecessor_original(
     db: sqlite3.Connection, namespace: NamespaceId, checkpoint_ref: str,
     checkpoint_revision: int, checkpoint, state,
 ) -> tuple[str, str]:
+    from .domain_background_read_v3 import read_bound_background_authored_predecessor_v3
+    handled,result=read_bound_background_authored_predecessor_v3(db,namespace,checkpoint_ref,checkpoint_revision,checkpoint,state)
+    if handled:return result
+    steps=_authored_predecessor_steps_v3(db,namespace,checkpoint_ref,checkpoint_revision,checkpoint,state)
+    while True:
+        try:next(steps)
+        except StopIteration as completed:return completed.value
+
+
+def _authored_predecessor_steps_v3(
+    db: sqlite3.Connection, namespace: NamespaceId, checkpoint_ref: str,
+    checkpoint_revision: int, checkpoint, state,
+) -> tuple[str, str]:
     """Replay committed root/advance/output history down to the authored root."""
+    from .domain_background_read_v3 import background_role_clock_call_v3,background_history_v3,background_json_loads_v3,background_json_matches_v3
     from ..domains.d04.authored_lineage_v3 import (
         decode_authored_numeric_checkpoint_v2, decode_authored_feeling_state_v1,
         decode_authored_mood_state_v1, decode_authored_root_candidate_v3,
@@ -96,20 +112,15 @@ def _authored_predecessor_original(
     def history(ref: str, revision: int, operation_id: str) -> dict:
         activity_id = ("d04.authored_root.v3" if operation_id == root.operation_id
                        else _receipt(db, namespace, operation_id).activity_id)
-        rows = db.execute(
-            "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
-            "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-            (ref, revision, *namespace.as_tuple, activity_id, operation_id),
-        ).fetchall()
-        if len(rows) != 1 or rows[0][1] != 1:
+        row=background_history_v3(db,ref,revision,columns=('value','valid','event_bot','event_persona','event_session','event_id'))
+        if row is None or row[1:]!=(1,*namespace.as_tuple,activity_id,operation_id):
             raise ValueError("authored predecessor history is absent or ambiguous")
-        value = json.loads(rows[0][0])
-        if canonical_json(value) != rows[0][0]:
+        value=background_json_loads_v3(row[0])
+        if not background_json_matches_v3(row[0],value):
             raise ValueError("authored predecessor history is noncanonical")
         return value
 
-    root = read_d04_root_original_v3(
-        db, namespace=namespace, operation_id=state.root_operation_id)
+    root=yield from background_role_clock_call_v3(lambda:read_d04_root_original_v3(db,namespace=namespace,operation_id=state.root_operation_id))
     root_candidate = decode_authored_root_candidate_v3(json.loads(root.candidate_json))
     root_rows = {ref: (revision, value) for ref, revision, value in
                  json.loads(root.output_json)["rows"]}
@@ -118,23 +129,23 @@ def _authored_predecessor_original(
         return (root.graph_receipt_digest if operation_id == root.operation_id
                 else canonical_digest(asdict(_receipt(db, namespace, operation_id))))
 
-    current_receipt_digest = receipt_digest(checkpoint.commit_operation_id)
+    current_receipt_digest=yield from background_role_clock_call_v3(lambda:receipt_digest(checkpoint.commit_operation_id))
     while checkpoint_revision > 1:
         validate_authored_joint_predecessor_v3(checkpoint, state, checkpoint_revision)
         operation_id = checkpoint.commit_operation_id
         from .d04_series_original_v1 import require_series_adopted_original_v1
-        require_series_adopted_original_v1(db, namespace, operation_id)
-        evidence = read_joint_advance_v2(db, namespace, operation_id)
-        output = read_d04_joint_output_original_v1(db, namespace, operation_id)
+        yield from background_role_clock_call_v3(lambda:require_series_adopted_original_v1(db,namespace,operation_id))
+        evidence=yield from background_role_clock_call_v3(lambda:read_joint_advance_v2(db,namespace,operation_id))
+        output=yield from background_role_clock_call_v3(lambda:read_d04_joint_output_original_v1(db,namespace,operation_id))
         if evidence is None or output is None:
             raise ValueError("authored continuation originals are absent")
-        _numeric_history(db, evidence)
+        yield from background_role_clock_call_v3(lambda:_numeric_history(db,evidence))
         members = [item for item in evidence.members if item.checkpoint_ref == checkpoint_ref]
         outputs = [item for item in output.members if item.checkpoint_ref == checkpoint_ref]
         if len(members) != 1 or len(outputs) != 1:
             raise ValueError("authored continuation member original is incomplete")
         member, emitted = members[0], outputs[0]
-        receipt = _receipt(db, namespace, operation_id)
+        receipt=yield from background_role_clock_call_v3(lambda:_receipt(db,namespace,operation_id))
         if (evidence.schema != "d11.product_advance_evidence.v3"
                 or output.schema != AUTHORED_SCHEMA
                 or receipt.operation_digest != evidence.bundle_digest
@@ -158,16 +169,13 @@ def _authored_predecessor_original(
                 or canonical_digest(emitted.axes) != checkpoint.readout_proof_digest
                 or tuple((axis.axis_id, axis.representative) for axis in emitted.axes) != state.coordinates):
             raise ValueError("authored continuation values or output proof differ")
-        prior_value = history(checkpoint_ref, member.predecessor_revision,
-                              member.predecessor_operation_id)
+        prior_value=yield from background_role_clock_call_v3(lambda:history(checkpoint_ref,member.predecessor_revision,member.predecessor_operation_id))
         prior = decode_authored_numeric_checkpoint_v2(prior_value)
-        prior_state_value = history(member.predecessor_state_ref,
-                                    member.predecessor_state_revision,
-                                    member.predecessor_operation_id)
+        prior_state_value=yield from background_role_clock_call_v3(lambda:history(member.predecessor_state_ref,member.predecessor_state_revision,member.predecessor_operation_id))
         prior_state = (decode_authored_feeling_state_v1(prior_state_value)
                        if prior.block.kind == "feeling"
                        else decode_authored_mood_state_v1(prior_state_value))
-        prior_receipt_digest = receipt_digest(member.predecessor_operation_id)
+        prior_receipt_digest=yield from background_role_clock_call_v3(lambda:receipt_digest(member.predecessor_operation_id))
         reads, writes = set(receipt.read_versions), set(receipt.write_versions)
         prior_versions = (
             GraphVersion(AtomKey.from_token(checkpoint_ref), member.predecessor_revision),
@@ -201,7 +209,8 @@ def _authored_predecessor_original(
         sources = state.historical_source_refs if prior.block.kind == "feeling" else state.source_refs
         if not set(old_sources) <= set(sources):
             raise ValueError("authored continuation drops inherited source provenance")
-        checkpoint_revision, checkpoint, state = member.predecessor_revision, prior, prior_state
+        checkpoint_revision,checkpoint,state=member.predecessor_revision,prior,prior_state
+        yield None
     validate_authored_joint_predecessor_v3(checkpoint, state, checkpoint_revision)
     if (checkpoint.commit_operation_id != root.operation_id
             or checkpoint.root_candidate_digest != root_candidate.digest
@@ -219,7 +228,7 @@ def read_joint_numeric_component(
     expected_query_epoch: QueryEpoch, expected_graph_incarnation: str,
     expected_graph_revision: int, expected_access_epoch: int,
     expected_delete_epoch: int, audience: tuple[str, ...], purpose: str,
-    max_rows: int = MAX_ROWS, authored_topology_verifier=None,
+    max_rows: int = MAX_ROWS, authored_topology_verifier=None, _life_source_bridge=None,
 ) -> JointNumericComponentCandidate:
     """Read all numeric rows and the root's entire active connected component."""
     from ..domains.d04.authored_lineage_v3 import (
@@ -276,11 +285,7 @@ def read_joint_numeric_component(
                 or recovery is None or recovery[1] != expected_graph_revision
                 or incarnation != expected_graph_incarnation):
             raise JointNumericHold("joint graph or authority epoch changed")
-        rows = db.execute(
-            "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
-            "AND type_name IN (?,?,?) ORDER BY token LIMIT ?",
-            namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1),
-        ).fetchall()
+        rows = read_graph_rows_v3(db, ('token', 'revision', 'value', 'valid'), where='bot=? AND persona=? AND type_name IN (?,?,?)', parameters=(namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1))[:-1], history=False, order_by=('token',), limit=(namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1))[-1])
         if len(rows) > max_rows:
             raise JointNumericHold("joint numeric enumeration exceeds complete page")
         numeric: dict[AtomKey, GraphAtom] = {}
@@ -356,8 +361,7 @@ def read_joint_numeric_component(
             except (TypeError, ValueError) as exc:
                 raise JointNumericHold("joint dependency ref is invalid") from exc
             if key not in atoms:
-                row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                                 (ref,)).fetchone()
+                row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(ref,), history=False)
                 if row is None:
                     atoms[key] = GraphAtom(key, 0, {}, False)
                 else:
@@ -369,6 +373,22 @@ def read_joint_numeric_component(
                         raise JointNumericHold("joint dependency value is invalid") from exc
                     atoms[key] = GraphAtom(key, row[0], value, bool(row[2]))
             return atoms[key]
+
+        life_original = None
+        life_selected = set()
+        if _life_source_bridge is not None:
+            from .d06_life_numeric_joint_v1 import _require_life_joint_source_bridge_v1
+            life_current, life_frame = _require_life_joint_source_bridge_v1(db, _life_source_bridge)
+            life_original = life_current.original
+            if (life_original.namespace != namespace or life_original.root_ref != root_ref
+                    or (life_original.clock.role_start, life_original.clock.role_end) != (role_start, role_end)
+                    or life_frame.envelope.authority.audience != audience or purpose != 'consolidation'
+                    or life_frame.envelope.authority.purpose != purpose
+                    or life_frame.snapshot.epochs[0].revision != expected_query_epoch.revision):
+                raise JointNumericHold('Life joint private current scope differs')
+            for atom in life_frame.snapshot.atoms:
+                if load(atom.key.token) != atom:
+                    raise JointNumericHold('Life joint complete current qualification changed')
 
         def qualify_source(ref: str) -> None:
             try:
@@ -541,7 +561,14 @@ def read_joint_numeric_component(
                 if (not source_atom.valid or source_atom.revision != drive.source_revision
                         or not access_atom.valid or access_atom.revision != drive.access_revision):
                     raise JointNumericHold("joint drive source or access is stale")
-                qualify_source(drive.source_ref)
+                if (life_original is not None
+                        and (drive_atom.key.token, drive_atom.revision) in life_original.drive_versions):
+                    if (drive.source_ref != life_original.source_ref
+                            or source_atom.revision != life_current.context.original.source_revision):
+                        raise JointNumericHold('Life joint selected drive is outside its exact qualified Source')
+                    life_selected.add((drive_atom.key.token, drive_atom.revision))
+                else:
+                    qualify_source(drive.source_ref)
                 source = SourceRecord.from_dict(source_atom.value)
                 if source.provenance_root in roots:
                     raise JointNumericHold("joint drive contribution key repeats")
@@ -557,6 +584,8 @@ def read_joint_numeric_component(
                 tuple(drive.drive for _, drive in selected),
                 predecessor_receipt_digest,
             ))
+        if life_original is not None and life_selected != set(life_original.drive_versions):
+            raise JointNumericHold('Life joint did not consume its complete actual mapped member set')
         versions = tuple(sorted((GraphVersion(atom.key, atom.revision)
                                  for atom in atoms.values()), key=lambda item: item.key.token))
         values_digest = canonical_digest(tuple(sorted(

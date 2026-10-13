@@ -52,7 +52,10 @@ class ContactQualificationEvidenceV3:
     effect_snapshot: AuthorityCurrentEffectSnapshotV2
     schema: str = 'd08.contact-final-qualification-evidence.v3'
 
-    def __post_init__(self):
+    def __post_init__(self, *, prepared_sources=None):
+        if prepared_sources is not None:
+            from .dispatch_initial_source_read_v3 import require_prepared_contact_sources_v3, PreparedContactSourceMemberV3
+            require_prepared_contact_sources_v3(prepared_sources)
         if (self.schema != 'd08.contact-final-qualification-evidence.v3'
                 or type(self.namespace) is not NamespaceId or type(self.operation_id) is not str or not self.operation_id
                 or any(type(getattr(self, field)) is not int or getattr(self, field) < 0 for field in
@@ -65,14 +68,17 @@ class ContactQualificationEvidenceV3:
                 or type(self.current_effect) is not CurrentEffectReadV2
                 or type(self.effect_snapshot) is not AuthorityCurrentEffectSnapshotV2
                 or type(self.members) is not tuple or not 1 <= len(self.members) <= 1024
-                or any(type(row) is not OfflineTickGraphReadV1 for row in self.members)
+                or any(type(row) is not OfflineTickGraphReadV1 and (prepared_sources is None or type(row) is not PreparedContactSourceMemberV3) for row in self.members)
                 or len({row.ref for row in self.members}) != len(self.members)
                 or type(self.query_coverage) is not tuple
                 or any(type(page) is not ProductionQueryCoverageV1 for page in self.query_coverage)):
             raise ValueError('Contact qualification evidence is not the closed installed type')
-        self.validate_structure()
+        ContactQualificationEvidenceV3.validate_structure(self,prepared_sources=prepared_sources)
 
-    def validate_structure(self):
+    def validate_structure(self, *, prepared_sources=None):
+        if prepared_sources is not None:
+            from .dispatch_initial_source_read_v3 import require_prepared_contact_sources_v3
+            require_prepared_contact_sources_v3(prepared_sources)
         q, ns = self.qualification, self.namespace
         versions = q.check_versions
         if (versions.namespace != ns or versions.graph_epoch != self.graph_epoch
@@ -197,7 +203,8 @@ class ContactQualificationEvidenceV3:
                 correction = rows.get(source_correction_head_key(ns,key.owner.subject).token)
                 if source is None or access is None or not source.valid or not access.valid or correction is None:
                     raise ValueError('Contact qualification Source/access/correction inventory is incomplete')
-                record = SourceRecord.from_dict(json.loads(source.value_json)); rights=json.loads(access.value_json)
+                record = (SourceRecord.from_dict(json.loads(source.value_json))if prepared_sources is None else
+                    prepared_sources.require_member_v3(source)); rights=json.loads(access.value_json)
                 validate_access(rights)
                 audience = 'owner' if purpose == 'structural' else self.audience
                 allowed = (set(record.purposes) & set(rights['purposes']) & {'context','audit'}

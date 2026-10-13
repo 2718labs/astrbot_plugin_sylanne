@@ -8,12 +8,14 @@ identity, publisher, and journal verification adapters before calling open.
 from __future__ import annotations
 
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import threading
+from queue import Queue
+from concurrent.futures import Future
 from types import MappingProxyType
 
 from .contract import AuthorityUnavailable
@@ -79,7 +81,7 @@ def _installed_file(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
-def _preflight(config: AuthorityDeploymentConfig) -> dict[str, Path]:
+def _preflight(config: AuthorityDeploymentConfig, *, composition=None) -> dict[str, Path]:
     paths = {
         "authority": _installed_file(config.authority_db, "Authority DB"),
         "deletion": _installed_file(config.deletion_db, "deletion journal"),
@@ -119,10 +121,11 @@ def _preflight(config: AuthorityDeploymentConfig) -> dict[str, Path]:
     for profile in config.reverse_handoff_profiles.values():
         for name in ("trust_root", "client_certificate", "client_private_key"):
             _installed_file(Path(getattr(profile, name)), "reverse TLS " + name)
+    if composition is not None and composition.selected is not None:
+        composition.require_current()
+        return paths
     with closing(sqlite3.connect(paths["authority"].as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("PRAGMA query_only=ON")
-        if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
-            raise AuthorityUnavailable("installed Authority DB integrity differs")
         rows = db.execute("SELECT type,name FROM sqlite_master").fetchall()
         tables = {name for kind, name in rows if kind == "table"}
         triggers = {name for kind, name in rows if kind == "trigger"}
@@ -138,6 +141,12 @@ def _preflight(config: AuthorityDeploymentConfig) -> dict[str, Path]:
         if contact_table in tables:
             from .c09_contact_policy_rows_v1 import require_contact_policy_schema_v1
             require_contact_policy_schema_v1(db)
+        from .installation_management_v1 import TABLES as management_tables, TRIGGERS as management_triggers
+        management_schema = {**management_tables, **management_triggers}
+        if set(management_tables) & tables:
+            for name, ddl in management_schema.items():
+                if db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone() != (ddl,):
+                    raise AuthorityUnavailable("installed management schema differs")
         meta = dict(db.execute("SELECT key,value FROM authority_meta"))
         if (not meta.get("authority_id") or meta.get("service_mode") != "v2-only"):
             raise AuthorityUnavailable("installed Authority is not sealed v2-only")
@@ -180,6 +189,7 @@ def _resolve_current_c09_config(config, lease):
             key_path=installed.key_path, installation_id=installed.installation_id,
             authority_id=installed.authority_id, control_store_id=installed.control_store_id,
             key_id=installed.key_id, lease=lease, resource_roots=installed.resource_roots)
+        control.install_selected_producer_config_v3(config)
         selector = InstalledC09ControlSelectorV2(control,
             installed.selector_path, installed.selector_journal_path)
         reader = InstalledC09StorageReaderV2(control=control, selector=selector)
@@ -210,37 +220,8 @@ def _resolve_current_c09_config(config, lease):
         key_path=installed.key_path, installation_id=installed.installation_id,
         authority_id=installed.authority_id, control_store_id=installed.control_store_id,
         key_id=installed.key_id, lease=lease, resource_roots=installed.resource_roots)
-    from .c09_preopen_switch_v1 import switch_cold_prepared_storage_before_open_v1
-    before_stage = control.read_verified_current_storage_v1().stage
-    if before_stage == "INTENT":
-        with control._db() as db:
-            operation = control._current(db)["active_operation_id"]
-        complete = all(control.read_build_original_v1(operation_id=operation, kind=kind) is not None
-            for kind in ("graph_candidate", "storage_candidate", "prepared_checkpoint_inputs_v1", "current_inventory_scan_v3"))
-        if complete:
-            from .c09_retired_final_scan_v1 import resume_retired_final_scan_before_open_v1
-            resume_retired_final_scan_before_open_v1(control=control,
-                registry=None if config.c09_maintenance_factory is None else config.c09_maintenance_factory.registry)
-        else:
-            from .c09_cold_intent_v1 import resume_early_intent_before_open_v1
-            resume_early_intent_before_open_v1(config=config, control=control)
-    switch_cold_prepared_storage_before_open_v1(control=control,
-        registry=None if config.c09_maintenance_factory is None else config.c09_maintenance_factory.registry)
-    current = control.read_verified_current_storage_v1()
-    if before_stage in {"INTENT", "PREPARED"} and current.stage == "SWITCHED":
-        from .contract import AuthorityColdRestartRequired
-        raise AuthorityColdRestartRequired("C09 preopen switched; restart in a new OS process before cleanup")
-    members = {member["role"]: member for member in current.manifest["members"]}
-    namespaces = set(config.execution_journals)
-    if current.manifest["cohort_namespaces"] != sorted(namespaces):
-        raise AuthorityUnavailable("C09 current manifest namespace coverage differs")
-    namespace = next(iter(namespaces))
-    return replace(config, authority_db=Path(members["core"]["resolved_path"]),
-        deletion_db=Path(members["deletion"]["resolved_path"]),
-        graph_db=Path(members["graph"]["resolved_path"]),
-        execution_journals={namespace: ExecutionJournalInstallation(
-            Path(members["execution"]["resolved_path"]),
-            members["execution"]["incarnation_or_journal_id"])}), control
+    control.install_selected_producer_config_v3(config)
+    return config, control
 
 
 class AuthorityFactualDaemonV2:
@@ -316,18 +297,9 @@ class AuthorityDaemon:
         await self.aclose()
 
     async def resume_cold_maintenance_v1(self) -> bool:
-        """Resume the exact durable operation before opening ordinary RPCs."""
-        if self.c09_control is None:
-            return False
-        context = self.c09_control.read_verified_current_storage_v1()
-        if context.stage in {"READY", "RELEASED"}:
-            context.require_current("business")
-            return False
-        with self.c09_control._db() as db:
-            operation_id = self.c09_control._current(db)["active_operation_id"]
-        await asyncio.to_thread(self.c09_maintenance.resume_storage_maintenance_v1,
-                                operation_id=operation_id)
-        return self.c09_maintenance.restart_required
+        """A composed business daemon already passed the private bootstrap qualification."""
+        self._resolved_storage_composition_v3.require_current()
+        return False
 
     async def wait_until_stopped_v1(self, stop) -> bool:
         """A service wrapper exits on true so its OS supervisor can restart it."""
@@ -412,6 +384,9 @@ class AuthorityDaemon:
                 raise AuthorityUnavailable("Authority daemon is not stopped")
             self._starting = True
         try:
+            if await self.resume_cold_maintenance_v1():
+                from .contract import AuthorityColdRestartRequired
+                raise AuthorityColdRestartRequired("C09 switched actual storage; restart before opening business RPCs")
             listener = await self.server.start(
                 self.config.bind_host, self.config.bind_port, self.config.tls)
             with self._maintenance_lock:
@@ -459,7 +434,7 @@ class AuthorityDaemon:
                     self._lock_handle = None
 
 
-def _compose_installed_authority_server_v1(config, paths, core, deletion, execution, reverse):
+def _compose_installed_fence_components_v3(config, paths, core, deletion, execution):
     fences = AuthorityV2FenceStore(core._db, create=False, lock=core._lock)
     natural = config.natural_model_authorities_v2 or {}
     installed_clock_limits = {}
@@ -518,6 +493,12 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
             v2_dispatch_verifier=dispatch_verifiers.get(namespace))
         for namespace, journal in execution.items()
     }
+    return fences, services, natural, installed_clock_reading, installed_utc_clock, dispatch_verifiers, namespace_map
+
+
+def _compose_installed_authority_server_v1(config, paths, core, deletion, execution, reverse):
+    fences, services, natural, installed_clock_reading, installed_utc_clock, dispatch_verifiers, namespace_map = (
+        _compose_installed_fence_components_v3(config, paths, core, deletion, execution))
     if config.c09_maintenance_factory is not None:
         from .c09_installed_factory_v1 import InstalledC09MaintenanceFactoryV1
         from .installer_genesis_v1 import install_first_graph_provision_composition_v1
@@ -541,12 +522,25 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
             history_verifier = None
             if item.installation_bundle is not None:
                 from .d13_natural_frame_verifier_v1 import build_authority_d13_natural_frame_verifier_v1
-                history_verifier = build_authority_d13_natural_frame_verifier_v1(
-                    bundle=item.installation_bundle, d11_issuer=item.d11_issuer, authority_store=model_store)
+                from .d13_natural_frame_verifier_v6 import build_authority_d13_natural_frame_verifier_v6
+                from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+                from ..model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE
+                workflows=item.installation_bundle.model_workflows
+                actual_v6=(type(workflows) is AdminModelWorkflowsV6 and workflows.natural_generation is not None
+                    and workflows.natural_generation.template_version==V6_TEMPLATE)
+                from .d13_natural_frame_verifier_v7 import build_authority_d13_natural_frame_verifier_v7
+                from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+                from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
+                actual_v7=(type(workflows) is AdminModelWorkflowsV7 and workflows.natural_generation is not None
+                    and workflows.natural_generation.template_version==V7_TEMPLATE)
+                history_factory=(build_authority_d13_natural_frame_verifier_v7 if actual_v7 else
+                    build_authority_d13_natural_frame_verifier_v6 if actual_v6 else build_authority_d13_natural_frame_verifier_v1)
+                history_verifier=history_factory(bundle=item.installation_bundle,d11_issuer=item.d11_issuer,authority_store=model_store)
             verifier = PinnedCurrentModelEgressGraphVerifier(
                 paths["graph"], d11_issuer=item.d11_issuer,
                 trusted_now_utc=lambda: installed_clock_reading().utc_seconds,
-                trusted_paired_clock=paired_clock, natural_history_verifier=history_verifier)
+                trusted_paired_clock=paired_clock, natural_history_verifier=history_verifier,
+                artifact_draft_bundle=item.installation_bundle)
             models[namespace] = AuthorityV2ModelEgressService(
                 model_store, services[namespace], graph_verifier=verifier,
                 admin_model_policy=item.workflows)
@@ -579,6 +573,26 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
                                       for namespace in natural},
         clock_provider=installed_clock_reading if natural else None,
         owner_sessions=sessions, create_owner_schema=False)
+    for namespace, model_service in models.items():
+        history = model_service._graph_verifier._natural_history
+        if history is not None:
+            history.install_actual_execution_bridge_v3(server._v2_execution[namespace])
+    from .installation_management_v1 import InstallationManagementServiceV1
+    from .installation_management_rpc_v1 import install_installation_management_v1
+    with core._tx() as db:
+        installed_management = (db.execute("SELECT installation_id,namespace,authority_profile FROM "
+            "authority_installation_management_v1").fetchall()
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                "name='authority_installation_management_v1'").fetchone() else [])
+    for installation_id, namespace, profile in installed_management:
+        if (namespace not in services or not any(
+                peer_profile == profile and item.installation_id == installation_id
+                for (_, peer_profile), item in config.installations_v2.items())):
+            raise AuthorityUnavailable("management metadata differs from installed peer")
+        install_installation_management_v1(server, InstallationManagementServiceV1(
+            core, sessions, namespace=namespace, installation_id=installation_id,
+            authority_profile=profile, utc_clock=installed_utc_clock,
+            administrator_authorizer=config.administrator_authorizer))
     with core._tx() as db:
         scoped_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -637,7 +651,7 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
             store=models[namespace]._store, fences=services[namespace], graph_db_path=paths["graph"],
             d11_issuer=model_installation.d11_issuer, installation_id=installed.installation_id,
             read_subject="mtls:sha256:" + peer[0], holder=installed.administrator_holder,
-            trusted_now_utc=appraisal_trusted_now))
+            trusted_now_utc=appraisal_trusted_now, installed_bundle=model_installation.installation_bundle))
     c04_v2 = config.c04_installations_v2 or {}
     c04_v3 = getattr(config, "c04_installations_v3", None) or {}
     for namespace in sorted(set(c04_v2) | set(c04_v3)):
@@ -684,7 +698,12 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
                     credential=credential,
                     resource_issuer=c04_model_installation.d11_issuer.resource_issuer,
                     budget_issuer=c04_model_installation.d11_issuer,
+                    self_identity_read_credential=config.local_administrator_credential(
+                        "c04_self_identity_read", namespace),
                     install_bridge_verifier=False))
+
+        if "d06.association_activation.v3" in installed:
+            installed["d06.association_activation.direct_seed.v4"] = installed["d06.association_activation.v3"]
 
         core.install_execution_redaction_c04_services(
             namespace, {algorithm: pair[0]
@@ -693,7 +712,7 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
         def verify_c04_version(binding, claim, terminal, *, versions=installed):
             pair = versions.get(binding.algorithm_ref)
             return (pair is not None and
-                    pair[0].installed_algorithm_id == binding.algorithm_ref and
+                    pair[0].accepts_installed_binding(binding) and
                     pair[0].verify_installed_terminal(
                         binding, claim, terminal) is True)
 
@@ -760,29 +779,26 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
     return pairings, server
 
 
-def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
+def _compose_business_daemon_v3(config, lock_handle, composition):
     """Reopen an installed Authority; never initialize or replace a missing DB."""
-    if type(config) is not AuthorityDeploymentConfig:
-        raise TypeError("installer-owned AuthorityDeploymentConfig is required")
-    lock_handle = _instance_lock(_installed_file(config.instance_lock, "instance lock"))
+    composition.require_current()
     deletion = None
     execution = {}
     core = None
     try:
-        config, control = _resolve_current_c09_config(config, lock_handle)
-        if config.c09_storage_v2 is not None:
-            return AuthorityFactualDaemonV2(config, lock_handle, control)
-        paths = _preflight(config)
+        control=composition.control
+        paths = _preflight(config, composition=composition)
+        store_kwargs=composition.store_kwargs()
         # Fail on unusable TLS material before touching persistent SQLite state.
         config.tls.ssl_context()
         reverse = {namespace: ReverseGraphClaimClient(profile)
                    for namespace, profile in config.reverse_handoff_profiles.items()}
-        deletion = AuthorityV2DeletionGuard(paths["deletion"])
+        deletion = AuthorityV2DeletionGuard(paths["deletion"], **store_kwargs)
         for namespace, installation in config.execution_journals.items():
             execution[namespace] = AuthorityV2ExecutionJournal(
                 paths["execution:" + namespace], namespace=namespace,
                 journal_id=installation.journal_id, create=False,
-                installed_storage_reader=control)
+                installed_storage_reader=control, **store_kwargs)
         verifiers = config.core_verifier_factory(
             deletion, MappingProxyType(dict(execution)))
         if type(verifiers) is not AuthorityCoreVerifiers:
@@ -792,7 +808,7 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
             deletion_verifier=verifiers.deletion,
             execution_verifier=verifiers.execution,
             effect_verifier=verifiers.effect,
-            dispatch_verifier=verifiers.dispatch, create=False)
+            dispatch_verifier=verifiers.dispatch, create=False, **store_kwargs)
         if control is not None:
             with core._lock:
                 if core._id(core._db) != control.authority_id:
@@ -802,9 +818,12 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
             config, paths, core, deletion, execution, reverse)
         daemon = AuthorityDaemon(config, lock_handle, core, deletion, execution,
                                  pairings, server)
+        daemon._resolved_storage_composition_v3=composition
         if control is not None:
             from .c09_storage_maintenance_v1 import InstalledC09WriterGateV1, InstalledC09MaintenanceV1
-            gate = InstalledC09WriterGateV1(control=control)
+            gate = composition.peer_gate
+            if type(gate) is not InstalledC09WriterGateV1 or gate._installed_config_v3 is not config:
+                raise AuthorityUnavailable("actual qualified selected peer registry Gate required before business composition")
             maintenance = config.c09_maintenance_factory(daemon=daemon, control=control, gate=gate)
             if (type(maintenance) is not InstalledC09MaintenanceV1
                     or maintenance.control is not control or maintenance.gate is not gate
@@ -835,12 +854,69 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
             self_identity = server._v2_self_identity.get(namespace)
             if self_identity is not None:
                 self_identity.install_current_source_location_v1(location, storage_owner)
+            from .current_authority_graph_read_v3 import install_authority_graph_read_service_registry_v3
+            install_authority_graph_read_service_registry_v3(server,namespace=namespace,source_location=location)
             for registry in (server._d04_numeric_services_v3, getattr(server, "_d04_root_services_v3", {})):
                 numeric = registry.get(namespace)
                 if numeric is not None:
                     numeric.install_storage_owner_service_v1(storage_owner)
             offline_installation = (config.natural_model_authorities_v2 or {}).get(namespace)
             offline_bundle = None if offline_installation is None else offline_installation.installation_bundle
+            if (offline_bundle is not None and "d11.foreground_cycle.v1" in
+                    offline_bundle.installation_policy.root_grant.allowed_work_kinds):
+                from .current_foreground_activity_v1 import InstalledCurrentForegroundActivityV1
+                if self_identity is None:
+                    raise AuthorityUnavailable("foreground activity requires its actual current self service")
+                foreground = InstalledCurrentForegroundActivityV1(
+                    self_identity_service=self_identity,
+                    budget_issuer=offline_installation.d11_issuer,
+                    clock_provider=config.clock_provider,
+                    installed_bundle=offline_bundle,
+                    filesystem_manifest=(config.c09_maintenance_factory.inventory
+                        if "d10.life.artifact_draft.v1" in offline_bundle.installation_policy.root_grant.allowed_work_kinds
+                        else None))
+                server.install_current_foreground_activity_v1(namespace, foreground)
+                from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+                if type(offline_bundle.model_workflows) is AdminModelWorkflowsV7:
+                    from .d13_installed_counter_factory_v1 import install_d13_core_counter_v1
+                    from ..runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
+                    from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
+                    import hmac
+                    assets=(config.d13_counter_assets_v1 or {}).get(namespace)
+                    if assets is None or model is None:
+                        raise AuthorityUnavailable("V7 requires its actual protected counter assets and model store")
+                    counter_cpu=D13CounterCpuQuotePolicyAuthorityV1(hmac.digest(offline_bundle.d11_signing_key,
+                        b"sylanne3.d13.counter.cpu_quote_policy.v1\0"+control.installation_id.encode(),"sha256"))
+                    counter_body=D02BodyQuoteAuthority(hmac.digest(offline_bundle.d02_signing_key,
+                        b"sylanne3.d02.body_quote_original.v1\0"+control.installation_id.encode(),"sha256"))
+                    counter=install_d13_core_counter_v1(foreground_observer=foreground,
+                        bridge=server._v2_execution[namespace],
+                        execute_credential=config.local_administrator_credential("c04_execute",namespace),
+                        assets=assets,cpu_quote_authority=counter_cpu,body_quote_authority=counter_body,
+                        authority_store=model._store,create=False)
+                    server.install_d13_core_counter_v1(namespace,counter)
+                    maintenance._d13_core_counter_v1=counter
+                if 'd10.life.source_note.v1' in offline_bundle.installation_policy.root_grant.allowed_work_kinds:
+                    from .current_owner_source_note_task_v1 import InstalledCurrentOwnerSourceNoteTaskV1
+                    server.install_current_owner_source_note_task_v1(namespace,
+                        InstalledCurrentOwnerSourceNoteTaskV1(self_identity_service=self_identity,
+                            budget_issuer=offline_installation.d11_issuer,
+                            clock_provider=config.clock_provider, installed_bundle=offline_bundle))
+            if (offline_bundle is not None and "artifact_draft_v1" in
+                    offline_bundle.installation_policy.root_grant.allowed_work_kinds):
+                from ..runtime.d11_artifact_draft_model_v1 import installed_artifact_draft_workflow_v1
+                from .d11_artifact_draft_model_v1 import AuthorityArtifactDraftModelResultServiceV1
+                installed_artifact_draft_workflow_v1(offline_bundle)
+                if model is None or self_identity is None or server._clock_provider is None:
+                    raise AuthorityUnavailable("artifact draft requires actual model/self/current clock composition")
+                worker = server._v2_worker_model_result_reads[namespace]
+                server.install_artifact_draft_model_result_reader_v1(namespace,
+                    AuthorityArtifactDraftModelResultServiceV1(store=model._store, fences=server._v2_fences[namespace],
+                        graph_db_path=location._graph_db_path, d11_issuer=offline_installation.d11_issuer,
+                        installed_bundle=offline_bundle, installation_id=control.installation_id,
+                        read_subject=worker._read_subject, holder=next(iter(holders)),
+                        trusted_now_utc=lambda: server._clock_provider().utc_seconds,
+                        read_attempts=worker._attempts))
             if offline_bundle is not None and server._clock_provider is not None:
                 import hashlib
                 import hmac
@@ -854,21 +930,29 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
                         b"sylanne.authority.d10-contact-policy-signing.v1", hashlib.sha256).digest(),
                     trusted_now_utc=lambda: server._clock_provider().utc_seconds, create=True)
                 server._d10_contact_policy_services_v1[(namespace, control.installation_id)] = contact_service
+                server.install_contact_p2_service_v1(contact_service, location)
                 if offline_bundle.model_workflows.contact_generation is not None:
                     from .contact_model_result_service_v1 import InstalledContactModelResultServiceV1
                     model._graph_verifier.install_contact_policy_service_v1(contact_service)
                     from ..host.model_workflows_v3 import AdminModelWorkflowsV3
-                    if type(offline_bundle.model_workflows) is AdminModelWorkflowsV3:
+                    from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+                    from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+                    from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+                    from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
                         from .contact_model_result_service_v2 import InstalledContactModelResultServiceV2 as InstalledContactModelResultServiceV1
                         install_contact_reader = server.install_contact_model_result_reader_v2
                     else:
                         install_contact_reader = server.install_contact_model_result_reader_v1
+                    def contact_trusted_now():
+                        sample = server._clock_provider()
+                        return sample.utc_seconds + sample.utc_error_seconds
                     install_contact_reader(namespace, InstalledContactModelResultServiceV1(
                         store=model._store, fences=server._v2_fences[namespace],
                         graph_db_path=location._graph_db_path, d11_issuer=offline_installation.d11_issuer,
                         installation_id=control.installation_id,
                         read_subject="mtls:sha256:" + offline_installation.observer_peer[0],
-                        holder=next(iter(holders)), trusted_now_utc=appraisal_trusted_now,
+                        holder=next(iter(holders)), trusted_now_utc=contact_trusted_now,
                         source_location=location, contact_policy_service=contact_service))
             if (offline_bundle is not None and "d10.offline_observed_tick.v1" in
                     offline_bundle.installation_policy.root_grant.allowed_work_kinds):
@@ -883,7 +967,7 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
                     manifest_digest=offline_bundle.installation_policy.manifest_digest,
                     graph_db_path=location._graph_db_path, issuer=offline_installation.d11_issuer,
                     resource_issuer=offline_installation.d11_issuer.resource_issuer,
-                    credential=config.local_administrator_credential("execution", namespace),
+                    credential=config.local_administrator_credential("c04_execute", namespace),
                     signing_key=hmac.new(offline_bundle.d11_signing_key,
                         b"sylanne.authority.d11-offline-signing.v1", hashlib.sha256).digest(),
                     trusted_now_utc=lambda: server._clock_provider().utc_seconds,
@@ -895,8 +979,8 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
                     raise AuthorityUnavailable("offline tick service already installed")
                 server._d11_offline_tick_services_v1[namespace] = offline_service
                 core.install_execution_redaction_d11_offline_service_v1(namespace, offline_service)
-            if (offline_bundle is not None and "d10.life.source_note.v1" in
-                    offline_bundle.installation_policy.root_grant.allowed_work_kinds):
+            if (offline_bundle is not None and {"d10.life.source_note.v1", "d10.life.artifact_draft.v1"}.intersection(
+                    offline_bundle.installation_policy.root_grant.allowed_work_kinds)):
                 from .d11_life_service_v1 import AuthorityD11LifeServiceV1
                 import hashlib
                 import hmac
@@ -909,17 +993,25 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
                     manifest_digest=life_installation.formal_manifest_sha256,
                     graph_db_path=location._graph_db_path, issuer=offline_installation.d11_issuer,
                     resource_issuer=offline_installation.d11_issuer.resource_issuer,
-                    credential=config.local_administrator_credential("execution", namespace),
+                    credential=config.local_administrator_credential("c04_execute", namespace),
                     signing_key=hmac.new(offline_bundle.d11_signing_key,
                         b"sylanne.authority.d11-life-signing.v1", hashlib.sha256).digest(),
                     trusted_now_utc=lambda: server._clock_provider().utc_seconds,
                     owner_service=getattr(server, "_d12_target_owner_services_v1", {}).get(
-                        (namespace, control.installation_id), storage_owner), package_root=life_installation.package_root, body_quote_authority=config.c09_maintenance_factory.body_authority)
+                        (namespace, control.installation_id), storage_owner),
+                    package_root=life_installation.package_root,
+                    body_quote_authority=config.c09_maintenance_factory.body_authority,
+                    current_source_location=location, installed_bundle=offline_bundle,
+                    draft_inventory_manifest=(config.c09_maintenance_factory.inventory
+                        if "d10.life.artifact_draft.v1" in offline_bundle.installation_policy.root_grant.allowed_work_kinds
+                        else None),
+                    draft_self_identity=(self_identity
+                        if "d10.life.artifact_draft.v1" in offline_bundle.installation_policy.root_grant.allowed_work_kinds else None),
+                    draft_self_read_credential=(config.local_administrator_credential("c04_self_identity_read", namespace)
+                        if "d10.life.artifact_draft.v1" in offline_bundle.installation_policy.root_grant.allowed_work_kinds else None))
                 server._d11_life_services_v1[namespace] = life
                 core.install_execution_redaction_d11_life_service_v1(namespace, life)
-            current = control.read_verified_current_storage_v1()
-            if current.stage in {"READY", "RELEASED"}:
-                current.require_current("business")
+            composition.require_current()
         return daemon
     except BaseException:
         if core is not None:
@@ -928,8 +1020,482 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
             journal.close()
         if deletion is not None:
             deletion.close()
-        _release_instance_lock(lock_handle)
         raise
 
 
-__all__ = ("AuthorityDaemon", "open_authority_daemon")
+_COMPOSITION_V3 = object()
+
+
+@contextmanager
+def _bootstrap_control_quantum_v3(control):
+    from ..runtime.c09_paged_sql_v2 import (current_c09_sql_meter_v2,
+        require_c09_reserved_meter_v3,C09PagedCaptureHold)
+    try:
+        meter=current_c09_sql_meter_v2()
+    except C09PagedCaptureHold:
+        with control.reserve_control_read_v3() as budget:
+            yield require_c09_reserved_meter_v3(budget)
+    else:
+        yield meter
+
+
+class _ResolvedStorageCompositionV3:
+    """Private completed physical selection; executable permissions stay in Core."""
+    def __init__(self, issuer, config, control, context, selected, maintenance_basis):
+        if issuer is not _COMPOSITION_V3:
+            raise AuthorityUnavailable("actual bootstrap storage composition required")
+        self.config,self.control,self.context=config,control,context
+        self.selected,self.maintenance_basis=selected,maintenance_basis
+        self.peer_gate=None
+
+    def require_current(self):
+        if self.control is None:
+            return
+        with _bootstrap_control_quantum_v3(self.control) as meter:
+            if self.maintenance_basis is not None:
+                self.maintenance_basis.require_current(meter=meter)
+            else:
+                self.context.require_current("business" if self.context.stage in {"READY","RELEASED"} else "maintenance")
+
+    def store_kwargs(self):
+        if self.maintenance_basis is not None:
+            return dict(maintenance_basis=self.maintenance_basis,storage_context=self.context)
+        if self.selected is not None:
+            return dict(selected_storage=self.selected,storage_context=self.context)
+        return {}
+
+    def open_graph(self, registry):
+        from ..graph_store import ProductionGraphStore
+        self.require_current()
+        from ..runtime_storage_v3 import install_runtime_storage_schema_v3
+        if self.maintenance_basis is not None:
+            with _bootstrap_control_quantum_v3(self.control):
+                graph=ProductionGraphStore(self.config.graph_db,registry,**self.store_kwargs())
+                try:install_runtime_storage_schema_v3(graph._db,handle=graph._runtime_storage_v3)
+                except BaseException:
+                    graph.close()
+                    raise
+        else:
+            graph=ProductionGraphStore(self.config.graph_db,registry,**self.store_kwargs())
+            if self.selected is not None:
+                try:install_runtime_storage_schema_v3(graph._db,handle=graph._runtime_storage_v3)
+                except BaseException:
+                    graph.close()
+                    raise
+        return graph
+
+
+def _selected_config_v3(config, context):
+    members={member["role"]:member for member in context.manifest["members"]}
+    namespaces=sorted(config.execution_journals)
+    installed=config.c09_storage_v1
+    if (context.manifest["cohort_namespaces"]!=namespaces
+            or context.manifest["installation_id"]!=installed.installation_id
+            or context.manifest["authority_id"]!=installed.authority_id
+            or any(item.installation_id!=installed.installation_id for item in config.installations_v2.values())):
+        raise AuthorityUnavailable("selected composition differs from actual installed cohort")
+    namespace=namespaces[0]
+    return replace(config,authority_db=Path(members["core"]["resolved_path"]),
+        deletion_db=Path(members["deletion"]["resolved_path"]),graph_db=Path(members["graph"]["resolved_path"]),
+        execution_journals={namespace:ExecutionJournalInstallation(Path(members["execution"]["resolved_path"]),
+            members["execution"]["incarnation_or_journal_id"])})
+
+
+def _compose_cold_maintenance_services_v3(composition):
+    from .c09_installed_factory_v1 import InstalledAuthorityMaintenanceServicesV3
+    from .local_composition import compose_installed_owner_ticket_store_v3
+    from ..host.owner_deployment import OwnerDeploymentVerifier
+    from .v2_owner_proof import AuthorityV2OwnerProofStore
+    from .v2_execution_bridge import AuthorityV2ExecutionBridge
+    config=composition.config
+    paths=_preflight(config,composition=composition)
+    kwargs=composition.store_kwargs()
+    deletion=None
+    execution={}
+    core=None
+    try:
+        deletion=AuthorityV2DeletionGuard(paths["deletion"],**kwargs)
+        for namespace,installation in config.execution_journals.items():
+            execution[namespace]=AuthorityV2ExecutionJournal(paths["execution:"+namespace],namespace=namespace,
+                journal_id=installation.journal_id,create=False,installed_storage_reader=composition.control,**kwargs)
+        verifiers=config.core_verifier_factory(deletion,MappingProxyType(dict(execution)))
+        if type(verifiers) is not AuthorityCoreVerifiers:
+            raise AuthorityUnavailable("actual installed maintenance Core verifiers required")
+        core=AuthorityServiceCore(paths["authority"],authorizer=config.core_authorizer,
+            deletion_verifier=verifiers.deletion,execution_verifier=verifiers.execution,
+            effect_verifier=verifiers.effect,dispatch_verifier=verifiers.dispatch,create=False,**kwargs)
+        core.install_current_c09_storage_reader_v1(reader=composition.control)
+        fences,services,natural,clock,utc_clock,dispatch,namespace_map=(
+            _compose_installed_fence_components_v3(config,paths,core,deletion,execution))
+        factory=config.c09_maintenance_factory
+        namespace=next(iter(execution))
+        installed=config.installations_v2[factory.peer]
+        credential=config.local_administrator_credential("c09_maintenance",namespace)
+        core._require(credential,"execution_redaction_install",namespace)
+        pairings=AuthorityOwnerPairingSource(core,utc_clock=utc_clock,create=False)
+        sessions=AuthorityV2OwnerSessionStore(core,utc_clock=utc_clock,current_pairing_source=pairings,create=False)
+        identity=OwnerDeploymentVerifier(pairings,utc_clock)
+        # The same genuine proof-store constructor and verifiers are used by ordinary composition.
+        AuthorityV2OwnerProofStore(core,utc_clock=utc_clock,pairing_verifier=identity.pair_credential,
+            session_verifier=None,current_pairing_source=pairings,create=False)
+        owner_tickets=compose_installed_owner_ticket_store_v3(core=core,services=services,
+            graph_db_path=paths["graph"],utc_clock=utc_clock,first_claim_verifier=identity.first_claim,
+            verified_claimant=None,owner_sessions=sessions,creation_pairing_source=pairings)
+        scoped=AuthorityV2ScopedErasureStore(core=core,fences=fences,deletion=deletion,
+            execution=execution[namespace],namespace=namespace)
+        recovery=AuthorityV2DeletionPendingRecovery(core=core,fences=fences,deletion=deletion,
+            execution=execution[namespace],namespace=namespace,scoped_store=scoped)
+        erasure=CurrentErasureAuthority(recovery,fence_service=services[namespace],owner_sessions=sessions,
+            owner_tickets=owner_tickets,installation_id=installed.installation_id,scoped_store=scoped,
+            graph_db_path=paths["graph"])
+        accepted=CurrentAcceptedErasureReadService(fence_service=services[namespace],
+            owner_tickets=owner_tickets,scoped_store=scoped)
+        bridge=AuthorityV2ExecutionBridge(core=core,fences=fences,journal=execution[namespace],namespace=namespace,
+            deletion=deletion,owner_tickets=owner_tickets,owner_installation_id=installed.installation_id,
+            v2_dispatch_verifier=dispatch.get(namespace))
+        historical={}
+        for version,installations in ((2,config.c04_installations_v2 or {}),(3,config.c04_installations_v3 or {})):
+            item=installations.get(namespace)
+            if item is None:
+                continue
+            if version==2:
+                from .installed_c04_executor_v2 import compose_installed_c04_service_v2
+                historical["d06.association_activation.v2"]=compose_installed_c04_service_v2(bridge=bridge,
+                    namespace=namespace_map[namespace],graph_db_path=paths["graph"],package_root=item.package_root,
+                    trusted_manifest_sha256=item.formal_manifest_sha256,
+                    component_signing_key=paths["c04_key:"+namespace].read_bytes(),credential=credential,
+                    install_bridge_verifier=False)
+            else:
+                from .installed_c04_executor_v3 import compose_installed_c04_service_v3
+                policy=natural[namespace]
+                service=compose_installed_c04_service_v3(bridge=bridge,namespace=namespace_map[namespace],
+                    graph_db_path=paths["graph"],package_root=item.package_root,
+                    trusted_manifest_sha256=item.formal_manifest_sha256,
+                    component_signing_key=paths["c04_v3_key:"+namespace].read_bytes(),credential=credential,
+                    resource_issuer=policy.d11_issuer.resource_issuer,budget_issuer=policy.d11_issuer,
+                    self_identity_read_credential=config.local_administrator_credential("c04_self_identity_read",namespace),
+                    install_bridge_verifier=False)
+                historical["d06.association_activation.v3"]=service
+                historical["d06.association_activation.direct_seed.v4"]=service
+        core.install_execution_redaction_c04_services(namespace,historical)
+        return InstalledAuthorityMaintenanceServicesV3(config,core,deletion,MappingProxyType(execution),
+            services[namespace],pairings,sessions,owner_tickets,scoped,recovery,erasure,accepted)
+    except BaseException:
+        if core is not None:core.close()
+        for journal in execution.values():journal.close()
+        if deletion is not None:deletion.close()
+        raise
+
+
+class _AuthorityBootstrapPlanV3:
+    def __init__(self,config,lease):
+        self.config,self.lease=config,lease
+        self.control=None
+        self.phase="identity"
+        self.metadata=self.selected=self.context=self.composition=None
+        self.legacy_reader=None
+        self.maintenance=self.services=self.actor=self.operation=None
+        self.business=None
+        self.factual=None
+        self.counter_builders=[]
+        self.counter_index=0
+        self.failure=None
+
+    def _progress(self):
+        return dict(status="progress",phase=self.phase)
+
+    def advance(self):
+        if self.failure is not None:
+            raise self.failure
+        if self.phase=="identity":
+            if self.config.c09_storage_v2 is not None:
+                config,reader=_resolve_current_c09_config(self.config,self.lease)
+                self.factual=AuthorityFactualDaemonV2(config,self.lease,reader)
+                self.phase="factual_ready"
+                return self.factual
+            _,self.control=_resolve_current_c09_config(self.config,self.lease)
+            self.phase="control" if self.control is not None else "business_compose"
+            if self.control is None:
+                self.composition=_ResolvedStorageCompositionV3(_COMPOSITION_V3,self.config,None,None,None,None)
+            return self._progress()
+        if self.phase=="control":
+            self.metadata=self.control.read_verified_control_status_v3()
+            if self.metadata["status"]=="complete":self.phase="selected"
+            return self._progress()
+        if self.phase=="selected":
+            if self.metadata["manifest_schema"]=="sylanne3.c09.storage_manifest.v3":
+                from .c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+                selected=self.control.advance_selected_history_read_v3()
+                if type(selected) is not VerifiedSelectedHistoryReadV3:return selected
+                self.selected=selected
+                self.phase="physical_composition"
+            else:
+                from .c09_paged_recovery_facts_v2 import begin_selected_legacy_prepared_reader_v2
+                with _bootstrap_control_quantum_v3(self.control) as meter:
+                    self.legacy_reader=begin_selected_legacy_prepared_reader_v2(self.control,meter=meter)
+                self.phase="legacy_selected" if self.legacy_reader is not None else "physical_composition"
+            return self._progress()
+        if self.phase=="legacy_selected":
+            with _bootstrap_control_quantum_v3(self.control) as meter:
+                summary=self.legacy_reader.advance(meter=meter)
+                if summary is not None:
+                    summary.require_current(meter=meter)
+                    self.control._c09_selected_legacy_prepared_v2=summary
+                    self.phase="physical_composition"
+            return self._progress()
+        if self.phase=="physical_composition":
+            maintenance_basis=None
+            with _bootstrap_control_quantum_v3(self.control) as meter:
+                if self.selected is not None:
+                    from .c09_selected_history_v3 import begin_selected_physical_composition_v3
+                    physical=begin_selected_physical_composition_v3(self.control,view=self.selected,meter=meter)
+                    self.context=physical.context
+                    if self.context.stage in {"INTENT","PREPARED","SWITCHED","CLEANED"}:
+                        maintenance_basis=physical.require_current_for_maintenance_v3(meter=meter,
+                            context=self.context,operation_id=self.metadata["active_operation_id"])
+                else:
+                    self.context=self.control.read_verified_current_storage_v2(meter=meter)
+                self.context.require_current("maintenance")
+            config=_selected_config_v3(self.config,self.context)
+            self.composition=_ResolvedStorageCompositionV3(_COMPOSITION_V3,config,self.control,self.context,
+                self.selected,maintenance_basis)
+            self.phase="peer_registry"
+            return self._progress()
+        if self.phase=="peer_registry":
+            from .c09_storage_maintenance_v1 import InstalledC09WriterGateV1
+            factory=self.composition.config.c09_maintenance_factory
+            result=factory.advance_peer_registry_preparation_v3(control=self.control,
+                config=self.composition.config,context=self.context)
+            if type(result) is not InstalledC09WriterGateV1:return result
+            self.composition.peer_gate=factory.take_prepared_peer_registry_gate_v3(
+                control=self.control,config=self.composition.config)
+            self.phase="business_qualification" if self.context.stage in {"READY","RELEASED"} else "maintenance_compose"
+            return self._progress()
+        if self.phase=="business_qualification":
+            if self.selected is None and (self.context.stage!="READY" or self.context.storage_generation!=0):
+                raise AuthorityUnavailable("ordinary bootstrap requires real initial READY or completed RELEASED V3")
+            if self.selected is not None:
+                from .c09_close_apply_v1 import SelectedAppliedReadV3
+                proof=self.control.advance_selected_storage_applied_read_v3()
+                if type(proof) is not SelectedAppliedReadV3:return proof
+            with _bootstrap_control_quantum_v3(self.control):self.context.require_current("business")
+            self.phase="business_compose"
+            return self._progress()
+        if self.phase=="maintenance_compose":
+            self.services=_compose_cold_maintenance_services_v3(self.composition)
+            self.maintenance=self.config.c09_maintenance_factory.compose_for_cold_maintenance_v3(
+                self.services,self.composition)
+            self.actor=self.maintenance.bind_current_thread_actor_v3(operation_id=self.metadata["active_operation_id"])
+            if self.selected is not None:
+                from ..runtime_storage_v3 import begin_maintenance_runtime_operation_v3
+                self.operation=begin_maintenance_runtime_operation_v3(self.services.core._runtime_storage_v3,
+                    actor=self.actor,core=self.services.core,credential=self.maintenance.credential)
+                self.phase="maintenance_selected_state"
+            else:
+                self.phase="maintenance_advance"
+            return self._progress()
+        if self.phase=="maintenance_selected_state":
+            from ..runtime_storage_v3 import bind_maintenance_runtime_operation_v3
+            with _bootstrap_control_quantum_v3(self.control):
+                with bind_maintenance_runtime_operation_v3(self.operation,self.services.core._db):
+                    self.services.recovery.initialize_current_selected_state_v3()
+            self.phase="maintenance_advance"
+            return self._progress()
+        if self.phase=="maintenance_advance":
+            from ..runtime_storage_v3 import bind_maintenance_runtime_operation_v3
+            if self.operation is None:
+                result=self.maintenance.advance_storage_maintenance_current_thread_v3(operation_id=self.actor.operation_id)
+            else:
+                with bind_maintenance_runtime_operation_v3(self.operation,self.services.core._db):
+                    result=self.maintenance.advance_storage_maintenance_current_thread_v3(operation_id=self.actor.operation_id)
+            if result["status"]=="failed":
+                raise AuthorityUnavailable("C09 maintenance first failure: "+result["reason"])
+            if self.maintenance.restart_required:
+                self._close_maintenance()
+                from .contract import AuthorityColdRestartRequired
+                raise AuthorityColdRestartRequired("C09 actual SWITCHED requires a new OS process")
+            if result["status"]=="complete" and result["phase"]=="PREPARED":
+                return dict(result,status="progress")
+            if result["status"]=="complete" and result["phase"]=="RELEASED":
+                self.phase="maintenance_release_check"
+            return result
+        if self.phase=="maintenance_release_check":
+            status=self.control.read_verified_control_status_v3()
+            if status["status"]!="complete":return status
+            if status["stage"]!="RELEASED" or status["active_operation_id"]!=self.actor.operation_id:
+                raise AuthorityUnavailable("actual signed maintenance RELEASED operation differs")
+            self._close_maintenance()
+            # Reconstruct protected identity after closing the actual old composition.
+            # Its one-use gate/applied-reader and selected caches must never be reused.
+            self.control=self.metadata=self.selected=self.context=self.composition=None
+            self.legacy_reader=None
+            self.phase="identity"
+            return self._progress()
+        if self.phase=="business_compose":
+            self.business=_compose_business_daemon_v3(self.composition.config,self.lease,self.composition)
+            if self.selected is not None:
+                from .d13_provider_http_admission_v1 import RuntimeCounterCallIndexBuilderV3
+                self.counter_builders=[RuntimeCounterCallIndexBuilderV3(counter)
+                    for counter in self.business.server._d13_core_counters_v1.values()]
+            self.phase="counter_bootstrap"
+            return self._progress()
+        if self.phase=="counter_bootstrap":
+            if self.counter_index<len(self.counter_builders):
+                result=self.counter_builders[self.counter_index].advance()
+                if result["status"]=="complete":self.counter_index+=1
+                return self._progress()
+            self.composition.require_current()
+            self.phase="ready"
+            return self.business
+        raise AuthorityUnavailable("actual bootstrap phase differs")
+
+    def _close_maintenance(self):
+        from ..runtime_storage_v3 import finish_runtime_storage_operation_v3
+        if self.actor is not None:self.actor.close_current_thread_v3()
+        finish_runtime_storage_operation_v3(self.operation)
+        self.operation=None
+        if self.maintenance is not None:self.maintenance.graph.close()
+        if self.services is not None:
+            self.services.core.close()
+            for journal in self.services.execution.values():journal.close()
+            self.services.deletion.close()
+        self.actor=self.maintenance=self.services=None
+
+    def close(self):
+        if self.control is not None and self.config.c09_maintenance_factory is not None:
+            self.config.c09_maintenance_factory.close_peer_registry_preparation_v3(self.control)
+        self._close_maintenance()
+        if self.business is not None and self.phase!="ready":
+            asyncio.run(self.business.aclose())
+            self.business=None
+            self.lease=None
+        if self.business is None and self.lease is not None:
+            _release_instance_lock(self.lease)
+            self.lease=None
+
+
+class AuthorityBootstrapDaemonV3:
+    """Installer-owned lifecycle; one bounded queue and one actual bootstrap thread."""
+    def __init__(self,config,lease):
+        self.config=config
+        self._plan=_AuthorityBootstrapPlanV3(config,lease)
+        self._queue=Queue(maxsize=1)
+        self._thread=None
+        self._ready_lock=asyncio.Lock()
+        self._daemon=None
+        self._factual=None
+        self._failure=None
+        self._pending=None
+        self._pending_command=None
+        self._closed=False
+
+    @property
+    def is_listening(self):
+        return self._daemon is not None and self._daemon.is_listening
+
+    def _run(self):
+        while True:
+            command,future=self._queue.get()
+            try:
+                if command=="close":
+                    self._plan.close()
+                    future.set_result(None)
+                    return
+                result=self._plan.advance()
+                if type(result) is AuthorityDaemon:
+                    self._daemon=result
+                elif type(result) is AuthorityFactualDaemonV2:
+                    self._factual=result
+                future.set_result(result)
+                if self._daemon is not None or self._factual is not None:return
+            except BaseException as exc:
+                self._failure=exc
+                self._plan.failure=exc
+                try:self._plan.close()
+                finally:future.set_exception(exc)
+                return
+
+    async def _harvest_pending(self):
+        future=self._pending
+        if future is None:return None
+        result=await asyncio.shield(asyncio.wrap_future(future))
+        if self._pending is future:
+            self._pending=None
+            self._pending_command=None
+        return result
+
+    async def _request(self,command):
+        if self._pending is not None:
+            pending_command=self._pending_command
+            result=await self._harvest_pending()
+            if pending_command==command:return result
+            if self._daemon is not None or self._factual is not None:return None
+        if self._failure is not None:raise self._failure
+        if self._thread is None:
+            self._thread=threading.Thread(target=self._run,
+                name="authority-bootstrap-"+str(self.config.instance_lock),daemon=True)
+            self._thread.start()
+        future=Future()
+        self._pending=future
+        self._pending_command=command
+        self._queue.put_nowait((command,future))
+        return await self._harvest_pending()
+
+    async def await_business_ready_v3(self):
+        if self.config.c09_storage_v2 is not None:
+            raise AuthorityUnavailable("C09 V2 remains factual-only; ordinary business admission HOLD")
+        async with self._ready_lock:
+            if self._closed:raise AuthorityUnavailable("actual Authority bootstrap is closed")
+            while self._daemon is None:
+                result=await self._request("advance")
+                if type(result) is AuthorityDaemon:return result
+                await asyncio.sleep(0.025)
+            return self._daemon
+
+    async def await_factual_ready_v2(self):
+        if self.config.c09_storage_v2 is None:
+            raise AuthorityUnavailable("the installed factual-only V2 reader is absent")
+        async with self._ready_lock:
+            if self._closed:raise AuthorityUnavailable("actual Authority bootstrap is closed")
+            if self._factual is None:
+                result=await self._request("advance")
+                if type(result) is not AuthorityFactualDaemonV2:
+                    raise AuthorityUnavailable("actual installed factual V2 composition differs")
+            return self._factual
+
+    async def await_offline_ready_v3(self):
+        return await self.await_business_ready_v3()
+
+    async def resume_cold_maintenance_v1(self):
+        await self.await_business_ready_v3()
+        return False
+
+    async def start(self):
+        daemon=await self.await_business_ready_v3()
+        return await daemon.start()
+
+    async def aclose(self):
+        async with self._ready_lock:
+            if self._closed:return
+            self._closed=True
+            if self._pending is not None and self._failure is None:
+                await self._harvest_pending()
+            if self._daemon is not None:
+                await self._daemon.aclose()
+            elif self._factual is not None:
+                await self._factual.aclose()
+            elif self._thread is None:
+                self._plan.close()
+            elif self._failure is None:
+                await self._request("close")
+
+
+def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityBootstrapDaemonV3:
+    """Acquire only installed identity and the live OS lease; no SQL or listener."""
+    if type(config) is not AuthorityDeploymentConfig:
+        raise TypeError("installer-owned AuthorityDeploymentConfig is required")
+    lease=_instance_lock(_installed_file(config.instance_lock,"instance lock"))
+    return AuthorityBootstrapDaemonV3(config,lease)
+
+
+__all__=("AuthorityDaemon","AuthorityBootstrapDaemonV3","open_authority_daemon")

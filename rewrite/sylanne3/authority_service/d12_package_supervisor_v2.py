@@ -13,7 +13,8 @@ from uuid import UUID
 from .contract import AuthorityUnavailable
 from .d12_package_supervisor_writer_v2 import _InstalledPackageSupervisorWriterV2
 from .d12_package_supervisor_client_v2 import InstalledPackageSupervisorAuthorityClientV2
-from .d12_installed_supervisor_v1 import InstalledD12SystemdSupervisorV1
+from .d12_installed_supervisor_v1 import (
+    build_installed_supervisor_v1,process_observation_body_v1,process_observation_state_v1)
 from .c09_process_identity_v1 import read_process_identity_v1,require_process_retired_v1
 from .d12_package_files_v2 import next_package_selection_v2,decode_package_selection_v2
 from ..runtime_contracts import canonical_serialize
@@ -28,8 +29,8 @@ class InstalledD12PackageSupervisorV2:
         self.files,self.journal=self.writer.files,self.writer.reader
         self.policy=self.writer.policy
         self._fresh_start_permissions=set()
-        self.host=InstalledD12SystemdSupervisorV1(config=self.writer.host_config)
-        self.authority=InstalledD12SystemdSupervisorV1(config=self.writer.authority_config)
+        self.host=build_installed_supervisor_v1(self.writer.host_config)
+        self.authority=build_installed_supervisor_v1(self.writer.authority_config)
         self.client=InstalledPackageSupervisorAuthorityClientV2(profile_id=self.policy['profile_id'],
             package_files=self.files,supervisor_policy_digest=self.journal.policy)
 
@@ -42,7 +43,7 @@ class InstalledD12PackageSupervisorV2:
         actual=service.read_current_host_state_v1()
         identity=read_process_identity_v1(actual.main_pid) if actual.main_pid else None
         if actual.main_pid and identity is None:raise AuthorityUnavailable('observed service exited during process read')
-        return self._observe(op,'process',dict(service_role=role,systemd=asdict(actual),process_original=identity))
+        return self._observe(op,'process',process_observation_body_v1(actual,role,identity))
 
     def _stage_observations(self,op,stage):
         rows=[r for r in self.journal.read_verified_receipts_v2(op) if r.stage==stage]
@@ -205,7 +206,7 @@ class InstalledD12PackageSupervisorV2:
             before=self._stage_observations(op,'retire_intent')
             for role,service in (('host',self.host),('authority',self.authority)):
                 original=self._one(before,'process',role)
-                await self._os_call(service.stop_original_host_v1,expected_invocation_id=original.body['systemd']['invocation_id'])
+                await self._os_call(service.stop_original_host_v1,expected_invocation_id=process_observation_state_v1(original.body)['invocation_id'])
                 if original.body['process_original'] is not None:require_process_retired_v1(original.body['process_original'])
             self._finish(op,stage,(self._process(op,'host'),self._process(op,'authority'),self._one(before,'backup_source')));return
         if stage=='backup_ready':
@@ -273,7 +274,7 @@ class InstalledD12PackageSupervisorV2:
             before=self._stage_observations(op,'abort_intent')
             for role,service in (('host',self.host),('authority',self.authority)):
                 original=self._one(before,'process',role)
-                await self._os_call(service.stop_original_host_v1,expected_invocation_id=original.body['systemd']['invocation_id'])
+                await self._os_call(service.stop_original_host_v1,expected_invocation_id=process_observation_state_v1(original.body)['invocation_id'])
                 if original.body['process_original'] is not None:require_process_retired_v1(original.body['process_original'])
             with self._retired_storage() as (control,inventory):
                 body=self._backup_component(control,inventory).read_retired_abort_source_v2(op)
@@ -303,7 +304,7 @@ class InstalledD12PackageSupervisorV2:
             before=self._stage_observations(op,'rollback_retire_intent')
             for role,service in (('host',self.host),('authority',self.authority)):
                 original=self._one(before,'process',role)
-                await self._os_call(service.stop_original_host_v1,expected_invocation_id=original.body['systemd']['invocation_id'])
+                await self._os_call(service.stop_original_host_v1,expected_invocation_id=process_observation_state_v1(original.body)['invocation_id'])
                 if original.body['process_original'] is not None:require_process_retired_v1(original.body['process_original'])
             sources=[o for o in before if o.kind=='backup_source']
             if len(sources)>1:raise AuthorityUnavailable('ambiguous rollback current source')
@@ -366,9 +367,9 @@ class InstalledD12PackageSupervisorV2:
             if (op,stage) not in self._fresh_start_permissions:
                 raise AuthorityUnavailable('original start outcome unknown; stopped state does not permit a second start')
             self._fresh_start_permissions.remove((op,stage))
-            await self._os_call(service.start_stopped_host_v1,expected_prior_invocation_id=prior.body['systemd']['invocation_id'])
+            await self._os_call(service.start_stopped_host_v1,expected_prior_invocation_id=process_observation_state_v1(prior.body)['invocation_id'])
         elif (current.active_state!='active' or current.main_pid<1 or not current.invocation_id
-                or current.invocation_id==prior.body['systemd']['invocation_id']):
+                    or current.invocation_id==process_observation_state_v1(prior.body)['invocation_id']):
             raise AuthorityUnavailable('original start is unresolved; no second process start allowed')
         # An observed new process is not native/data readiness. The following
         # independent bootstrap stage must prove that exact actual incarnation.

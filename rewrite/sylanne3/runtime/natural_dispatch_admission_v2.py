@@ -19,8 +19,8 @@ from ..domains.d08.execution import (
 )
 from ..domains.d08.natural_plan import natural_route_semantic_digest_v2
 from ..domains.d09.natural_batch import (
-    NATURAL_BATCH_SCHEMA_V2, prepare_natural_verified_batch_proposal_v2,
-    validate_natural_verified_batch_value_v2,
+    NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3, rebind_natural_verified_batch_proposal, natural_batch_segment_count,
+    validate_natural_verified_batch_value,
 )
 from ..domains.d09.natural_reply import NaturalFinalActionCandidateV2
 from ..graph_types import AtomKey, GraphReceipt, GraphSnapshot
@@ -187,9 +187,9 @@ def issue_natural_dispatch_admission_v2(
         db, namespace, evidence.schema_ref, "d08.action_schema.v1"))
     grant = types["d08.communication_intent_grant.v1"](_atom(
         db, namespace, evidence.grant_ref, "d08.communication_intent_grant.v1"))
-    batch = _atom(db, namespace, evidence.batch_ref, NATURAL_BATCH_SCHEMA_V2)
-    validate_natural_verified_batch_value_v2(batch)
-    rebuilt = prepare_natural_verified_batch_proposal_v2(final, grant)
+    batch = _atom(db, namespace, evidence.batch_ref, AtomKey.from_token(evidence.batch_ref).type_name)
+    validate_natural_verified_batch_value(batch)
+    rebuilt = rebind_natural_verified_batch_proposal(final, grant, batch)
     _require(type(schema) is ActionSchemaRecord
              and rebuilt.write is not None
              and rebuilt.write.key.token == evidence.batch_ref
@@ -291,7 +291,7 @@ def issue_natural_dispatch_admission_v2(
              }
              and outbox.phase == "pending"
              and outbox.payload_ref == natural_dispatch_segment_payload_ref_v2(
-                 evidence.batch_ref, 0)
+                 evidence.batch_ref, batch["segment"]["position"])
              and outbox.dispatch_generation == scope.generation
              and outbox.idempotency_key == bundle.idempotency_keys[0],
              "natural current D11 command originals changed")
@@ -313,7 +313,7 @@ def issue_natural_dispatch_admission_v2(
         "outbox_ref": runtime.outbox_ref,
         "idempotency_key": outbox.idempotency_key,
         "batch_ref": evidence.batch_ref,
-        "segment_index": 0,
+        "segment_index": batch["segment"]["position"],
         "payload_digest": evidence.payload_digest,
         "fence_token": scope.permit.token,
     })
@@ -325,7 +325,7 @@ def issue_natural_dispatch_admission_v2(
         outbox.dispatch_generation, scope.generation, job.fence,
         scope.permit.token, batch["cancellation_epoch"], footprint,
         False, batch["segment_authorization_ref"],
-        grant.segment_manifest_digest, 0, 1,
+        grant.segment_manifest_digest, batch["segment"]["position"], natural_batch_segment_count(batch),
     )
     deadline = int(min(
         batch["valid_until"],
@@ -351,7 +351,7 @@ def issue_natural_dispatch_admission_v2(
         required_checks_digest=canonical_digest(action.required_checks),
         required_checks_schema_version="d08.required_check_spec.v1",
         grant_digest=evidence.grant_digest, batch_digest=evidence.batch_digest,
-        segment_index=0, payload_digest=evidence.payload_digest,
+        segment_index=batch["segment"]["position"], payload_digest=evidence.payload_digest,
         account_ref=route.platform_ref,
         destination_ref=route.conversation_ref, scene_ref=route.scene_ref,
         owner_head_ref=owner.grant_id, role_ref=role.social_role,

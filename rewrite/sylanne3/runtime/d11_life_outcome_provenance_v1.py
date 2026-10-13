@@ -1,4 +1,5 @@
 """Closed Life-produced D08 outcome companions; no current authority is issued."""
+
 from dataclasses import dataclass
 import json
 
@@ -151,31 +152,35 @@ def life_outcome_qualified_writes_v1(prepared,terminal,life_writes):
 
 
 def require_current_life_outcome_eligibility_v1(db,*,prepared,terminal,adopted,life_writes):
+    from .natural_producer_qualification_v1 import _producer_original_many_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     if adopted['schema']!='d11.adopted-life-original.v4':raise ValueError('legacy Life outcome lacks authenticated current eligibility')
     members={row['ref']:row for row in adopted['write_commitments']}
     writes=life_outcome_qualified_writes_v1(prepared,terminal,life_writes)
     for write in writes:
-        if (db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(write.key.token,)).fetchone()!=
+        if (_producer_original_point_v3(db, table='graph_atoms', columns=('revision', 'value', 'valid'), key_columns=('token',), key=(lambda _producer_params_v3: (_producer_params_v3[0],))((write.key.token,)), legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(write.key.token,)).fetchone())!=
                 (1,canonical_serialize(write.value),1) or members.get(write.key.token)!=
                 {'ref':write.key.token,'revision':1,'digest':canonical_digest(write.value)}):
             raise ValueError('Life current outcome/provenance/eligibility differs from signed actual members')
     end_elig=AtomKey.from_token(writes[2].value['terminal_eligibility_ref'])
-    if db.execute('SELECT revision,valid FROM graph_atoms WHERE token=?',(end_elig.token,)).fetchone()!=(1,1):
+    if _producer_original_point_v3(db, table='graph_atoms', columns=('revision', 'valid'), key_columns=('token',), key=(lambda _producer_params_v3: (_producer_params_v3[0],))((end_elig.token,)), legacy_reader=lambda: db.execute('SELECT revision,valid FROM graph_atoms WHERE token=?',(end_elig.token,)).fetchone())!=(1,1):
         raise ValueError('Life current outcome terminal eligibility is missing or invalidated')
+    current_reads=life_current_fact_reads_v1(prepared)
     expected=tuple(sorted((key.token,1 if key in (writes[0].key,writes[1].key,end_elig) else
-        next(row.revision for row in life_current_fact_reads_v1(prepared) if row.ref==key.token)) for key in writes[2].dependencies))
-    if tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',
-            (writes[2].key.token,)))!=expected:raise ValueError('Life outcome current invalidation edges differ')
+        next(row.revision for row in current_reads if row.ref==key.token)) for key in writes[2].dependencies))
+    if _producer_original_many_v3(db,table='graph_dependencies',columns=('dependency_token', 'dependency_revision'),key_columns=('dependent_token',),key=(writes[2].key.token,),order_column='dependency_token',legacy_reader=lambda: tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',
+            (writes[2].key.token,))))!=expected:raise ValueError('Life outcome current invalidation edges differ')
     return writes[0].key
 
 
 def validate_life_outcome_provenance_history_v1(db,*,prepared,terminal,adopted,receipt,members,life_writes):
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     writes=life_outcome_qualified_writes_v1(prepared,terminal,life_writes)
     for write in writes:
         if canonical_serialize(members.get(write.key.token))!=canonical_serialize(write.value):
             raise ValueError('Life historical outcome differs from actual Action/terminal/provenance originals')
-        row=db.execute('SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?',
-            (write.key.token,receipt.operation_id)).fetchone()
+        row=_producer_original_point_v3(db, table='graph_history', columns=('dependencies',), key_columns=('token', 'revision', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],1,_producer_params_v3[1]))((write.key.token, receipt.operation_id)), legacy_reader=lambda: db.execute('SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?',
+            (write.key.token,receipt.operation_id)).fetchone())
         expected=tuple(sorted((key.token,1 if key in (writes[0].key,writes[1].key,
             AtomKey.from_token(writes[2].value['terminal_eligibility_ref'])) else
             next(row.revision for row in life_current_fact_reads_v1(prepared) if row.ref==key.token)) for key in write.dependencies))

@@ -161,4 +161,63 @@ class InstalledD12SystemdSupervisorV1:
         return after
 
 
-__all__ = ("D12SystemdSupervisorConfigV1", "D12SupervisorObservationV1", "InstalledD12SystemdSupervisorV1")
+def decode_installed_supervisor_config_v1(raw):
+    from .installed_process_supervisor_v1 import KIND, InstalledProcessSupervisorSpecV2
+    if type(raw) is not dict:
+        raise AuthorityUnavailable("closed installed supervisor config required")
+    if raw.get("provider_kind") == KIND:
+        if set(raw) != set(InstalledProcessSupervisorSpecV2.__dataclass_fields__):
+            raise AuthorityUnavailable("closed process supervisor configuration required")
+        return InstalledProcessSupervisorSpecV2(**raw)
+    fields = frozenset(D12SystemdSupervisorConfigV1.__dataclass_fields__)
+    if frozenset(raw) not in {fields, fields - {"timeout_seconds"}}:
+        raise AuthorityUnavailable("closed systemd supervisor configuration required")
+    return D12SystemdSupervisorConfigV1(**raw)
+
+
+def build_installed_supervisor_v1(config):
+    from .installed_process_supervisor_v1 import InstalledProcessSupervisorSpecV2, InstalledRootProcessSupervisorV1
+    if type(config) is D12SystemdSupervisorConfigV1:
+        return InstalledD12SystemdSupervisorV1(config=config)
+    if type(config) is InstalledProcessSupervisorSpecV2:
+        return InstalledRootProcessSupervisorV1(config=config)
+    raise AuthorityUnavailable("one of the two installed concrete supervision providers required")
+
+
+def is_installed_supervisor_v1(value):
+    from .installed_process_supervisor_v1 import InstalledRootProcessSupervisorV1
+    return type(value) in {InstalledD12SystemdSupervisorV1, InstalledRootProcessSupervisorV1}
+
+
+def supervisor_identity_v1(config):
+    from .installed_process_supervisor_v1 import InstalledProcessSupervisorSpecV2
+    if type(config) is D12SystemdSupervisorConfigV1:
+        return ("systemd_v1", config.unit_name)
+    if type(config) is InstalledProcessSupervisorSpecV2:
+        return (config.provider_kind, config.supervisor_id)
+    raise AuthorityUnavailable("closed supervisor identity required")
+
+
+def process_observation_body_v1(observed, role, identity):
+    from dataclasses import asdict
+    from .installed_process_supervisor_v1 import D12SupervisorObservationV2
+    if type(observed) is D12SupervisorObservationV1:
+        return dict(service_role=role, systemd=asdict(observed), process_original=identity)
+    if type(observed) is D12SupervisorObservationV2 and observed.service_role == role:
+        return dict(service_role=role, provider_kind=observed.provider_kind,
+                    supervisor=asdict(observed), process_original=identity)
+    raise AuthorityUnavailable("closed concrete process observation required")
+
+
+def process_observation_state_v1(body):
+    if set(body) == {"service_role", "systemd", "process_original"}:
+        return body["systemd"]
+    from .installed_process_supervisor_v1 import KIND
+    if set(body) == {"service_role", "provider_kind", "supervisor", "process_original"} and body["provider_kind"] == KIND:
+        return body["supervisor"]
+    raise AuthorityUnavailable("closed versioned process observation body required")
+
+
+__all__ = ("D12SystemdSupervisorConfigV1", "D12SupervisorObservationV1", "InstalledD12SystemdSupervisorV1",
+           "decode_installed_supervisor_config_v1", "build_installed_supervisor_v1", "is_installed_supervisor_v1",
+           "supervisor_identity_v1", "process_observation_body_v1", "process_observation_state_v1")

@@ -225,6 +225,61 @@ class C04InternalCpuQuotePolicyAuthorityV1:
             "owner_grant_digest": owner.grant_digest,
             "grant_id": grant.grant_id, "grant_version": grant.version,
         }
+        return self._record_checked_quote_v1(db, namespace=namespace, envelope=envelope,
+            policy=policy, request=request)
+
+    def request_self_quote_v4(self, db, *, scope):
+        """Fixed Self variant; requires the active private W01 scope."""
+        from .c04_self_scope_v4 import require_self_c04_scope_v4, PREPARE_OPERATION
+        from .c04_direct_seed_v4 import ALGORITHM_ID_V4
+        from .budget import require_budget_family_admissible
+        actual = require_self_c04_scope_v4(scope, db)
+        envelope = actual.frame.envelope
+        authority, identity = envelope.authority, envelope.identity
+        namespace = authority.namespace
+        recall = actual.bundle.d06_recall
+        policy_id, policy_version = recall.cpu_policy_id, recall.cpu_policy_version
+        policy = self.read_policy(db, namespace, policy_id, policy_version)
+        if (self is not actual.graph._GraphCoordinator__c04_cpu_quote_authority
+                or policy.installation_id != actual.bundle.installation_policy.installation_id
+                or policy.algorithm_ref != ALGORITHM_ID_V4 or identity.phase != PREPARE_OPERATION
+                or authority.issuer_domain != "d06" or identity.effect_id is None
+                or envelope.version_guard.resource_lease_versions
+                or not actual.frame.now_utc < envelope.deadline_utc <= policy.valid_until_utc):
+            raise IssuerAuthorityDenied("Self C04 fixed installed quote scope differs")
+        issuer = actual.graph._GraphCoordinator__d11_issuer
+        grant = issuer.current_budget_grant(db, envelope.parent_budget_lease_ref)
+        lease = get_budget_lease(db, envelope.parent_budget_lease_ref)
+        require_budget_family_admissible(db, lease.lease_id)
+        cpu = policy.cpu_ms_ceiling
+        if ((grant.bot_id, grant.persona_id) != namespace.as_tuple
+                or C04_INTERNAL_CPU_WORK_KIND not in grant.allowed_work_kinds
+                or grant.valid_until_utc < envelope.deadline_utc or grant.max_ceiling.get("cpu_ms", 0) < cpu
+                or lease.state != "active" or (lease.bot_id, lease.persona_id, lease.currency)
+                    != (grant.bot_id, grant.persona_id, grant.currency)
+                or cpu > lease.available("cpu_ms")):
+            raise IssuerAuthorityDenied("Self C04 original CPU allowance is unavailable")
+        owner = actual.frame.owner_guard
+        from .d01_production_operations_v1 import CurrentDomainReadV1
+        owner_value = CurrentDomainReadV1(actual.frame).head(db, owner.grant_ref, required=True).value
+        request = {"schema": "sylanne3.c04.self_cpu_quote_request.v4", "namespace": namespace.as_tuple,
+            "operation_id": identity.operation_id, "envelope_digest": canonical_digest(envelope),
+            "policy_id": policy.policy_id, "policy_version": policy.version, "policy_digest": canonical_digest(policy),
+            "owner_grant_id": owner_value["grant_id"], "owner_grant_revision": owner.grant_revision,
+            "owner_grant_digest": "sha256:" + owner.grant_digest,
+            "grant_id": grant.grant_id, "grant_version": grant.version,
+            "self_scope_digest": actual.identity_digest, "c03_selection_ref": actual.selection_ref,
+            "c03_selection_original_digest": actual.selection_original_digest}
+        return self._record_checked_quote_v1(db, namespace=namespace, envelope=envelope,
+            policy=policy, request=request)
+
+
+
+    def _record_checked_quote_v1(self, db, *, namespace, envelope, policy, request):
+        """Sign/store only after a fixed Owner/Self wrapper checked actual qualification."""
+        _transaction(db)
+        identity, cpu = envelope.identity, policy.cpu_ms_ceiling
+        policy_id, policy_version = policy.policy_id, policy.version
         request_json = canonical_serialize(request)
         request_digest = canonical_digest(request)
         quote_id = "c04cpu-" + canonical_digest({
@@ -280,7 +335,16 @@ class C04InternalCpuQuotePolicyAuthorityV1:
             quote = ResourceQuote(**raw_quote)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise IssuerAuthorityDenied("C04 original CPU quote request unreadable") from exc
-        if (request.get("schema") != _REQUEST_SCHEMA
+        if request.get("schema") == "sylanne3.c04.self_cpu_quote_request.v4":
+            fields = {"schema", "namespace", "operation_id", "envelope_digest", "policy_id", "policy_version",
+                "policy_digest", "owner_grant_id", "owner_grant_revision", "owner_grant_digest",
+                "grant_id", "grant_version", "self_scope_digest", "c03_selection_ref", "c03_selection_original_digest"}
+            if (set(request) != fields or policy.algorithm_ref != "d06.association_activation.direct_seed.v4"
+                    or any(type(request[name]) is not str or _DIGEST.fullmatch(request[name]) is None
+                        for name in ("self_scope_digest", "c03_selection_original_digest"))
+                    or type(request["c03_selection_ref"]) is not str or not request["c03_selection_ref"]):
+                raise IssuerAuthorityDenied("Self C04 CPU original has another closed schema")
+        if (request.get("schema") not in {_REQUEST_SCHEMA, "sylanne3.c04.self_cpu_quote_request.v4"}
                 or request.get("namespace") != list(namespace.as_tuple)
                 or request.get("operation_id") != operation_id
                 or request.get("policy_id") != policy.policy_id

@@ -37,7 +37,7 @@ def read_current_joint_replay_input_in_transaction_v2(
     expected_query_epoch: QueryEpoch, expected_graph_incarnation: str,
     expected_graph_revision: int, expected_access_epoch: int,
     expected_delete_epoch: int, audience: tuple[str, ...], purpose: str,
-    authored_topology_verifier=None,
+    authored_topology_verifier=None, _life_source_bridge=None,
 ) -> D04CurrentJointReplayInputV2:
     """Read the complete component and its exact typed ABI2 inputs in one tx.
 
@@ -54,6 +54,7 @@ def read_current_joint_replay_input_in_transaction_v2(
         expected_access_epoch=expected_access_epoch,
         expected_delete_epoch=expected_delete_epoch,
         audience=audience, purpose=purpose, authored_topology_verifier=authored_topology_verifier,
+        _life_source_bridge=_life_source_bridge,
     )
     versions = {version.key.token: version.revision for version in component.read_versions}
 

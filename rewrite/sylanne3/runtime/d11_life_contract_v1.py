@@ -257,7 +257,7 @@ class LifeTerminalPayloadV1:
 
 
 def life_mutation_id_v1(binding, phase):
-    if type(binding) is not D11LifeExecutionBindingV1 or phase not in {"claim", "terminal"}:
+    if type(binding) not in LIFE_BINDING_TYPES or phase not in {"claim", "terminal"}:
         raise ValueError("actual life binding and closed phase required")
     return "d11-life:" + phase + ":" + canonical_digest((binding.authority_namespace, binding.installation_id, binding.execution_id))
 
@@ -334,7 +334,7 @@ def life_job_result_binding_v1(terminal, *, artifact_graph_digest, artifact_revi
     This domain-separated ID commits the entire original version and execution
     scope. Its immutable Graph member must be revision one in the actual CAS.
     """
-    if type(terminal) is not D11LifeTerminalV1 or terminal.status != "completed":
+    if type(terminal) not in LIFE_TERMINAL_TYPES or terminal.status != "completed":
         raise ValueError("Life job result requires its actual completed terminal")
     if type(artifact_revision) is not int or artifact_revision != 1:
         raise ValueError("Life job result requires the first immutable artifact version")
@@ -381,21 +381,184 @@ class RegisteredLifeOutcomeV2:
         _digest(self.artifact_digest)
 
 
+@dataclass(frozen=True, slots=True)
+class D11DraftExecutionBindingV1(D11LifeExecutionBindingV1):
+    execution_call_id: str = ""
+    activity_scope_ref: str = ""
+    activity_scope_digest: str = ""
+    target_scope_digest: str = ""
+    root_registration_ref: str = ""
+    root_registration_digest: str = ""
+    algorithm_id: str = "d11.life.artifact_draft.v1"
+    recipe_id: str = "artifact_draft_v1"
+    schema: str = "d11.draft-execution-binding.v1"
+
+    def __post_init__(self):
+        if (self.schema, self.algorithm_id, self.recipe_id) != (
+                "d11.draft-execution-binding.v1", "d11.life.artifact_draft.v1", "artifact_draft_v1"):
+            raise ValueError("exact installed draft binding required")
+        # Reuse the unchanged V1 common constraints, without relabeling any
+        # serialized original or weakening the old source-note constructor.
+        common = {f.name: getattr(self, f.name) for f in fields(D11LifeExecutionBindingV1)}
+        common.update(schema="d11.life-execution-binding.v1", algorithm_id=ALGORITHM_ID,
+            recipe_id=RECIPE_ID, artifact_ref=life_artifact_ref_v1(self.namespace, self.effect_id))
+        D11LifeExecutionBindingV1(**common)
+        for value in (self.execution_call_id, self.activity_scope_ref, self.root_registration_ref):
+            _text(value)
+        for value in (self.activity_scope_digest, self.target_scope_digest, self.root_registration_digest):
+            _digest(value)
+        if self.artifact_ref != draft_artifact_ref_v1(self.namespace, self.effect_id):
+            raise ValueError("draft artifact must bind its original stable effect")
+
+
+def draft_artifact_ref_v1(namespace, effect_id):
+    from ..graph_types import Owner
+    return AtomKey(Owner("activity", *namespace.as_tuple, effect_id), "d11.draft_artifact.v1",
+        "draft:" + canonical_digest((namespace, effect_id))[:48]).token
+
+
+@dataclass(frozen=True, slots=True)
+class DraftRoleSegmentStartV1(RoleSegmentStartV1):
+    source_qualification_digest: str = ""
+    target_scope_digest: str = ""
+    schema: str = "d11.draft-role-segment-start.v1"
+
+    def __post_init__(self):
+        if self.schema != "d11.draft-role-segment-start.v1":
+            raise ValueError("exact draft claim payload required")
+        common = {f.name: getattr(self, f.name) for f in fields(RoleSegmentStartV1)}
+        RoleSegmentStartV1(**{**common, "schema": "d11.life-role-segment-start.v1"})
+        _digest(self.source_qualification_digest)
+        _digest(self.target_scope_digest)
+
+
+@dataclass(frozen=True, slots=True)
+class DraftTerminalPayloadV1(LifeTerminalPayloadV1):
+    handoff_started: bool | None = False
+    readback: object = None
+    schema: str = "d11.draft-terminal-payload.v1"
+
+    def __post_init__(self):
+        from .d11_artifact_draft_contract_v1 import DraftFileReadbackV1
+        if (self.schema != "d11.draft-terminal-payload.v1"
+                or type(self.handoff_started) is not bool and not (self.handoff_started is None and self.status == "unknown")
+                or self.status not in {"completed", "failed", "unknown"}
+                or type(self.claim_sequence) is not int or self.claim_sequence < 1
+                or self.actual_cpu_ms is not None and (type(self.actual_cpu_ms) is not int or self.actual_cpu_ms < 0)):
+            raise ValueError("draft terminal requires independent actual effect and cost facts")
+        for value in (self.binding_digest, self.prepared_digest, self.postcondition_build_digest, self.signature):
+            _digest(value)
+        if not self.claim_digest.startswith("sha256:"):
+            raise ValueError("draft terminal requires its original claim chain")
+        _digest(self.claim_digest[7:]); _utc(self.completed_at_utc)
+        if self.readback is not None and type(self.readback) is not DraftFileReadbackV1:
+            raise ValueError("draft terminal readback is not its closed actual file witness")
+        if self.status == "completed":
+            if (not self.handoff_started or self.readback is None or self.reason_code is not None
+                    or self.actual_cpu_ms is None or self.character_at is None
+                    or (self.artifact_digest, self.artifact_length) !=
+                       (self.readback.content_digest, self.readback.content_length)):
+                raise ValueError("draft completion requires actual bound file readback and measured work")
+            _text(self.artifact_ref)
+        elif (self.artifact_ref is not None or self.artifact_digest is not None or self.artifact_length is not None
+                or type(self.reason_code) is not str or not self.reason_code):
+            raise ValueError("incomplete draft preserves facts without a completed artifact grant")
+        if self.status == "failed" and (self.handoff_started or self.readback is not None or self.actual_cpu_ms is None):
+            raise ValueError("possible file handoff cannot be labeled verified pre-handoff failure")
+
+
+@dataclass(frozen=True, slots=True)
+class D11DraftClaimV1(D11LifeClaimV1):
+    def __post_init__(self):
+        b, p = self.binding, self.payload
+        if (type(b) is not D11DraftExecutionBindingV1 or type(p) is not DraftRoleSegmentStartV1
+                or p.binding_digest != b.digest or p.execution_id != b.execution_id
+                or p.claim_id != life_mutation_id_v1(b, "claim") or self.original_ref != p.claim_id
+                or p.executor_installation_id != b.installation_id or p.target_scope_digest != b.target_scope_digest):
+            raise ValueError("draft claim crossed its exact installed binding")
+        if not self.claim_digest.startswith("sha256:"):
+            raise ValueError("draft claim requires actual journal chain")
+        _digest(self.claim_digest[7:])
+
+
+@dataclass(frozen=True, slots=True)
+class D11DraftTerminalV1(D11LifeTerminalV1):
+    def __post_init__(self):
+        b, p = self.binding, self.payload
+        if (type(b) is not D11DraftExecutionBindingV1 or type(self.claim) is not D11DraftClaimV1
+                or type(p) is not DraftTerminalPayloadV1 or self.claim.binding != b
+                or p.binding_digest != b.digest or p.prepared_digest != self.claim.payload.prepared_digest
+                or p.execution_id != b.execution_id or p.claim_sequence != self.claim.claim_sequence
+                or p.claim_digest != self.claim.claim_digest or self.journal_id != self.claim.journal_id
+                or type(self.terminal_sequence) is not int or self.terminal_sequence <= self.claim.claim_sequence
+                or self.original_ref != life_mutation_id_v1(b, "terminal")
+                or p.postcondition_build_digest != b.postcondition_build_digest
+                or _utc(p.completed_at_utc) < _utc(self.claim.payload.claimed_at_utc)):
+            raise ValueError("draft terminal lacks its actual earlier once claim")
+        if not self.terminal_digest.startswith("sha256:"):
+            raise ValueError("draft terminal requires actual journal chain")
+        _digest(self.terminal_digest[7:])
+        if p.readback is not None and (p.readback.effect_id != b.effect_id
+                or p.readback.execution_call_id != b.execution_call_id or p.readback.plan_digest != b.plan_digest
+                or p.readback.target_scope_digest != b.target_scope_digest
+                or p.readback.root_registration_digest != b.root_registration_digest):
+            raise ValueError("draft readback belongs to another target or effect")
+        if p.status == "completed" and (p.artifact_ref != b.artifact_ref or p.actual_cpu_ms > b.cpu_ceiling_ms
+                or _utc(p.completed_at_utc) >= min(_utc(b.deadline_utc), _utc(b.job_lease_expires_utc))):
+            raise ValueError("draft completion exceeds original admitted bounds")
+
+
+LIFE_BINDING_TYPES = frozenset({D11LifeExecutionBindingV1, D11DraftExecutionBindingV1})
+LIFE_CLAIM_TYPES = frozenset({D11LifeClaimV1, D11DraftClaimV1})
+LIFE_TERMINAL_TYPES = frozenset({D11LifeTerminalV1, D11DraftTerminalV1})
+LIFE_START_TYPES = frozenset({RoleSegmentStartV1, DraftRoleSegmentStartV1})
+LIFE_PAYLOAD_TYPES = frozenset({LifeTerminalPayloadV1, DraftTerminalPayloadV1})
+
+
+def life_work_kind_v1(value):
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3, WORK_KIND as DRAFT_WORK
+    if type(value) in {RegisteredDraftFilePlanV3, D11DraftExecutionBindingV1}:
+        return DRAFT_WORK
+    if type(value) in {RegisteredLifePlanV2, D11LifeExecutionBindingV1}:
+        return WORK_KIND
+    raise TypeError("closed registered Life recipe required")
+
+
 _TYPES = {LifeInputRefV1, LifeBodyComponentContractV1, RegisteredLifePlanV2, RegisteredLifeOutcomeV2, D11LifeExecutionBindingV1,
-          RoleSegmentStartV1, LifeTerminalPayloadV1, D11LifeClaimV1, D11LifeTerminalV1}
+          RoleSegmentStartV1, LifeTerminalPayloadV1, D11LifeClaimV1, D11LifeTerminalV1,
+          D11DraftExecutionBindingV1, DraftRoleSegmentStartV1, DraftTerminalPayloadV1, D11DraftClaimV1, D11DraftTerminalV1}
 
 
 def life_to_wire_v1(value):
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3, draft_to_wire_v1
+    if type(value) is RegisteredDraftFilePlanV3:
+        return draft_to_wire_v1(value)
     if type(value) not in _TYPES:
         raise TypeError("exact closed life original required")
     return plain_v1(value)
 
 
 def life_from_wire_v1(raw, kind):
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3, DraftFileReadbackV1, draft_from_wire_v1
+    if kind is RegisteredDraftFilePlanV3:
+        return draft_from_wire_v1(raw, kind)
+    variants = {RegisteredLifePlanV2: RegisteredDraftFilePlanV3, D11LifeExecutionBindingV1: D11DraftExecutionBindingV1,
+        RoleSegmentStartV1: DraftRoleSegmentStartV1, LifeTerminalPayloadV1: DraftTerminalPayloadV1,
+        D11LifeClaimV1: D11DraftClaimV1, D11LifeTerminalV1: D11DraftTerminalV1}
+    if type(raw) is dict and kind in variants:
+        selected = variants[kind]
+        if selected is RegisteredDraftFilePlanV3 and raw.get("schema") == "d10.registered-draft-file-plan.v3":
+            return draft_from_wire_v1(raw, selected)
+        if selected not in {RegisteredDraftFilePlanV3, D11DraftClaimV1, D11DraftTerminalV1}:
+            if raw.get("schema") == selected.__dataclass_fields__["schema"].default:
+                kind = selected
+        elif selected in {D11DraftClaimV1, D11DraftTerminalV1} and type(raw.get("binding")) is dict:
+            if raw["binding"].get("schema") == "d11.draft-execution-binding.v1":
+                kind = selected
     if kind not in _TYPES or type(raw) is not dict or set(raw) != {f.name for f in fields(kind)}:
         raise ValueError("closed life original wire shape differs")
     value = dict(raw)
-    if kind is D11LifeExecutionBindingV1:
+    if kind in LIFE_BINDING_TYPES:
         value["namespace"] = NamespaceId(**value["namespace"])
     if kind is RegisteredLifePlanV2:
         for name in ("project", "recipe", "action_intent", "input_source", "input_access"):
@@ -403,11 +566,13 @@ def life_from_wire_v1(raw, kind):
         value["audiences"] = tuple(value["audiences"])
     if kind is RegisteredLifeOutcomeV2:
         value["paid_cost_refs"] = tuple(value["paid_cost_refs"])
-    if kind in {D11LifeClaimV1, D11LifeTerminalV1}:
+    if kind in LIFE_CLAIM_TYPES | LIFE_TERMINAL_TYPES:
         value["binding"] = life_from_wire_v1(value["binding"], D11LifeExecutionBindingV1)
-        value["payload"] = life_from_wire_v1(value["payload"], RoleSegmentStartV1 if kind is D11LifeClaimV1 else LifeTerminalPayloadV1)
-    if kind is D11LifeTerminalV1:
+        value["payload"] = life_from_wire_v1(value["payload"], RoleSegmentStartV1 if kind in LIFE_CLAIM_TYPES else LifeTerminalPayloadV1)
+    if kind in LIFE_TERMINAL_TYPES:
         value["claim"] = life_from_wire_v1(value["claim"], D11LifeClaimV1)
+    if kind is DraftTerminalPayloadV1 and value["readback"] is not None:
+        value["readback"] = draft_from_wire_v1(value["readback"], DraftFileReadbackV1)
     result = kind(**value)
     if life_to_wire_v1(result) != raw:
         raise ValueError("life original wire is not canonical")

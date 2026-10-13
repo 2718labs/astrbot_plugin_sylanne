@@ -34,6 +34,17 @@ def collect_c04_association_graph_originals_v2(
     focus_ref: str, attention_ticket_ref: str, mood_ref: str,
     budget: CurrentAssociationBudgetV1, context_tags: tuple[str, ...],
 ) -> C04AssociationGraphOriginalsV2:
+    return _collect_c04_association_graph_originals_from_roots_v2(
+        db, namespace, cue_source_ref=cue_source_ref, focus_ref=focus_ref,
+        attention_ticket_ref=attention_ticket_ref, mood_ref=mood_ref, budget=budget,
+        context_tags=context_tags, activation_roots=(cue_source_ref,))
+
+
+def _collect_c04_association_graph_originals_from_roots_v2(
+    db: sqlite3.Connection, namespace: NamespaceId, *, cue_source_ref: str,
+    focus_ref: str, attention_ticket_ref: str, mood_ref: str,
+    budget: CurrentAssociationBudgetV1, context_tags: tuple[str, ...], activation_roots: tuple[str, ...],
+) -> C04AssociationGraphOriginalsV2:
     """Freeze raw graph atoms, negative heads, ancestry and edge query pages."""
     if (type(db) is not sqlite3.Connection or not db.in_transaction
             or type(namespace) is not NamespaceId
@@ -75,12 +86,12 @@ def collect_c04_association_graph_originals_v2(
     ticket_value = observed[ticket].value
     from .c04_d04_state_codec_v3 import decode_c04_mood_v3
     mood_value = decode_c04_mood_v3(mood.token, observed[mood].value)
-    source_refs = set((cue.token, *ticket_value["source_refs"],
+    source_refs = set((*activation_roots, *ticket_value["source_refs"],
                        *mood_value.source_refs))
     if any(type(ref) is not str for ref in source_refs):
         raise ValueError("C04 source ref differs")
     queries: list[AssociationQueryCoverageV2] = []
-    frontier = {cue.token}
+    frontier = set(activation_roots)
     edge_count = 0
     truncated = False
     for hop in range(budget.max_hops):

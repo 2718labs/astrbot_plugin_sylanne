@@ -22,6 +22,28 @@ _PAYLOAD_FIELDS = {'schema','request','namespace','identity','authority','parent
     'policy_refs','read_versions','query_coverage','observed_originals','provenance','writes','coverage',
     'missing_inputs','continuation_ref'}
 _EVENTS = {
+ 'artifact_draft_phase_content_adopted':'d11',
+ 'artifact_draft_phase_model_queued':'d11',
+ 'artifact_phase_action_proposal_available':'d11',
+ 'artifact_draft_phase_structurally_verified':'d11',
+ 'actual_artifact_phase_assessment_available':'d11',
+ 'foreground_cycle_ready':'d11',
+ 'artifact_draft_root_registered':'d11',
+ 'artifact_task_wait_registered':'d11',
+ 'artifact_task_amendment_adopted':'d10',
+ 'foreground_post_c02_cause_available':'d11',
+ 'artifact_draft_model_queued':'d11',
+ 'artifact_draft_content_adopted':'d11',
+ 'artifact_goal_plan_available':'d10',
+ 'artifact_project_definition_available':'d03',
+ 'artifact_project_context_available':'d08',
+ 'artifact_action_proposal_available':'d11',
+ 'personal_plan_revision_available':'d10',
+ 'personal_step_requires_current_final_admission':'d11',
+ 'personal_step_wait_condition_required':'d11',
+ 'project_continuation_updated':'d08',
+ 'actual_project_result_available':'d07',
+ 'project_checkpoint_wait_registered':'d11',
     'action_outcome_observed_requires_current_life_qualification':'d10',
  'values_evaluated':'d08', 'persona_growth_requires_commitment_reevaluation':'d08',
  'persona_growth_requires_life_reevaluation':'d10', 'body_effect_settled':'d10',
@@ -74,8 +96,13 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
             or canonical_serialize(value)!=data['original_payload_json'] or canonical_digest(value)!=data['original_digest']
             or value['schema']!=domain+'.current-'+kind+'.v1' or value['namespace']!={'bot_id':namespace.bot_id,'persona_id':namespace.persona_id}):
         raise ValueError('domain stage original exact bytes/schema differ')
-    from ..workbench_api.domain_operations_v1 import decode_request_v1
-    decode_request_v1(kind,value['request'])
+    from .domain_production_registry_v1 import _FOREGROUND_OPERATIONS, _PERSONAL_OPERATIONS, _ARTIFACT_OPERATIONS, _POSTCONDITION_OPERATIONS
+    if kind in _FOREGROUND_OPERATIONS or kind in _PERSONAL_OPERATIONS or kind in _ARTIFACT_OPERATIONS or kind in _POSTCONDITION_OPERATIONS or kind in {"register_artifact_draft_root", "owner_stop_reply_v1", "adopt_owner_artifact_project_context_v1"}:
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        decode_typed_production_value_v1(value['request'], operation.request_type)
+    else:
+        from ..workbench_api.domain_operations_v1 import decode_request_v1
+        decode_request_v1(kind,value['request'])
     identity=value['identity'];authority=value['authority']
     if (type(identity) is not dict or set(identity)!={f.name for f in fields(OperationIdentity)}
             or identity['operation_id']!=data['operation_id'] or type(authority) is not dict
@@ -118,11 +145,20 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
         key=_key(write['key'],namespace);spec=registry.spec(key.type_name)
         if key not in keys or spec.writer_domain!=domain or key.owner.kind not in spec.owner_kinds:
             raise ValueError('domain output is outside exact writer/read closure')
-        spec.validator(write['value'])
+        if key.type_name == 'd05.contribution':
+            from ..domains.d05.relationship import decode_relationship_contribution_payload_v1
+            decode_relationship_contribution_payload_v1(write['value'])
+        elif key.type_name == 'd05.relationship_projection':
+            from ..domains.d05.relationship import decode_relationship_projection_payload_v1
+            decode_relationship_projection_payload_v1(write['value'])
+        else:
+            spec.validator(write['value'])
         for ref in write['dependencies']:
             if _key(ref,namespace) not in keys:raise ValueError('domain output dependency omitted')
     from .domain_production_erasure_v1 import validate_domain_stage_provenance_v1
-    if kind.startswith('input:'):
+    if kind in _POSTCONDITION_OPERATIONS:
+        extra=validate_domain_stage_provenance_v1(domain,kind,value['provenance'])
+    elif kind.startswith('input:'):
         provenance=value['provenance']
         expected={'producer_kind','input_request_digest'}
         if kind == 'input:set_contact_policy' and 'owner_contact_policy_original' in provenance:
@@ -156,7 +192,7 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
     if (canonical_serialize(receipt_raw)!=data['receipt_json'] or canonical_digest(receipt)!=data['receipt_digest']
             or receipt.operation_id!=data['operation_id'] or receipt.operation_digest!=data['bundle_digest']):
         raise ValueError('domain stage actual receipt commitment differs')
-    return {'content_bearing':True,'graph_refs':tuple(sorted({key.token for key in keys}|set(extra))),
+    return {'content_bearing':kind != 'owner_stop_reply_v1','graph_refs':tuple(sorted({key.token for key in keys}|set(extra))),
         'operation_id':data['operation_id'],'domain':domain,'operation_kind':kind,'original_digest':data['original_digest']}
 
 
@@ -177,6 +213,19 @@ def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
         raise ValueError('unconsumed followup claims a consumer receipt')
     if data['receipt_json'] is not None:
         value=json.loads(data['receipt_json'])
+        if type(value) is dict and value.get('schema') == 'd11.artifact-draft-wake-disposition.v1':
+            if canonical_serialize(value) != data['receipt_json']:
+                raise ValueError('C4 self disposition bytes are noncanonical')
+            from .foreground_cycle_v1 import validate_artifact_draft_wake_disposition_v1
+            validate_artifact_draft_wake_disposition_v1(db, namespace=namespace, row_data=data, value=value)
+            return {'content_bearing': False, 'causal_operation_id': data['causal_operation_id'],
+                'original_ref': data['original_ref'], 'original_digest': data['original_digest']}
+        if type(value) is dict and value.get('schema')=='d11.artifact-task-wait-consumed.v1':
+            if canonical_serialize(value)!=data['receipt_json']:raise ValueError('task wait disposition bytes changed')
+            from .artifact_task_wait_consumer_v1 import validate_task_wait_disposition_v1
+            validate_task_wait_disposition_v1(db,namespace=namespace,row_data=data,value=value)
+            return {'content_bearing':False,'causal_operation_id':data['causal_operation_id'],
+                'original_ref':data['original_ref'],'original_digest':data['original_digest']}
         expected={'schema','resolver_version','dedupe_key','causal_operation_id','causal_original_digest','trigger_original_digest',
             'manifest_digest','state','observed_epoch','completed_commands','missing_originals',
             'continuation_ref','consumer_operation_id'}

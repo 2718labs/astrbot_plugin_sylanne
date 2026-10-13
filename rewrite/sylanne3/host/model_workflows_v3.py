@@ -1,4 +1,4 @@
-"""Explicit installed Contact V2 / Life-content workflow container.
+"""Explicit installed Contact V2 / Life-content / Life-numeric workflow container.
 
 V2 remains a separate wire type. Disabled slots confer no work-kind, model or
 budget permission. Actual execution still requires the installed command,
@@ -62,7 +62,7 @@ def model_workflows_v3_from_payload(raw):
     from .authority_profile import _MODEL_WORKFLOW_FIELDS, _exact_object
     if type(raw) is not dict:
         raise ValueError("version-3 workflows must be a closed object")
-    allowed = {f.name for f in fields(AdminModelWorkflowsV3)} - {"life_numeric"}
+    allowed = {f.name for f in fields(AdminModelWorkflowsV3)}
     if not {"version", "encode", "reply"} <= set(raw) <= allowed:
         raise ValueError("version-3 workflow fields differ")
     workflows = {}

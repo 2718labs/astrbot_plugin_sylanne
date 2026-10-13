@@ -23,7 +23,7 @@ from ..model_broker.natural_reply import (
 )
 from ..model_broker.natural_review import (
     FrozenNaturalReplyReviewV1, NaturalReviewInstallationV1,
-    REVIEW_TEMPLATE_DIGEST,
+    REVIEW_TEMPLATE_DIGEST, REVIEW_TEMPLATE_DIGEST_V2, INPUT_SCHEMA_V2,
     freeze_natural_reply_review_v1,
 )
 from ..runtime_contracts import (
@@ -36,6 +36,10 @@ from ..runtime_contracts import (
 from ..model_broker.natural_reply_history_v3 import FrozenNaturalReplyRequestV3, thaw_natural_reply_request_v3
 from ..model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4, thaw_natural_reply_request_v4
 from .natural_original_v4 import NaturalReplyGenerationOriginalSealV4, NaturalReplyReviewOriginalSealV4
+from .natural_original_v6 import NaturalReplyGenerationOriginalSealV6,NaturalReplyReviewOriginalSealV6
+from ..model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6,thaw_natural_reply_request_v6
+from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,thaw_natural_reply_request_v7
+from .natural_original_v7 import NaturalReplyGenerationOriginalSealV7,NaturalReplyReviewOriginalSealV7
 from .natural_original_v3 import (
     NaturalReplyGenerationOriginalSealV3, NaturalReplyReviewOriginalSealV3,
     natural_generation_template_digest, refreeze_natural_generation,
@@ -148,10 +152,7 @@ class SavedNaturalCallBindingV2:
     worker_fence: int
 
 
-def _request_from_wire(wire: str) -> ModelCallRequest:
-    from .reply_model_job import reply_request_wire_v1
-
-    raw = json.loads(wire)
+def _envelope_from_wire_v3(raw) -> CommandEnvelope:
     envelope_raw = raw["envelope"]
     authority = dict(envelope_raw["authority"])
     authority["namespace"] = NamespaceId(**authority["namespace"])
@@ -180,13 +181,22 @@ def _request_from_wire(wire: str) -> ModelCallRequest:
         envelope_raw["character_interval_ref"],
         tuple(envelope_raw["causation"]),
     )
+    return envelope
+
+
+def _request_from_wire(wire: str, *, prepared_value=None, prepared_originals=None) -> ModelCallRequest:
+    from .reply_model_job import reply_request_wire_v1
+
+    raw = json.loads(wire)if prepared_value is None else prepared_value
+    envelope = _envelope_from_wire_v3(raw)
     request = ModelCallRequest(
         envelope, raw["call_id"], raw["provider_id"], raw["model_id"],
         frozenset(raw["required_capabilities"]), raw["privacy_tier"],
         raw["prompt_template_digest"], raw["payload"],
         raw["timeout_seconds"], raw["max_output_tokens"],
+        _prepared_payload_eof_v3=None if prepared_originals is None else prepared_originals.payload_eof_v3(raw,envelope),
     )
-    if canonical_serialize(reply_request_wire_v1(envelope, request)) != wire:
+    if (canonical_serialize(reply_request_wire_v1(envelope, request)) != wire if prepared_value is None else reply_request_wire_v1(envelope, request) != raw):
         raise ValueError("typed natural call wire differs")
     return request
 
@@ -218,8 +228,19 @@ def _unit(raw: dict) -> QualifiedExpressionUnitV2:
     return QualifiedExpressionUnitV2(**fields)
 
 
-def _generation_frozen(raw: dict) -> FrozenNaturalReplyRequestV2:
-    if raw.get("schema") == "sylanne.d09.frozen_natural_request.v4":
+def _generation_frozen(raw: dict,*,prepared_originals=None) -> FrozenNaturalReplyRequestV2:
+    if prepared_originals is not None:
+        from .dispatch_initial_source_read_v3 import PreparedNaturalOriginalsV3
+        if type(prepared_originals)is not PreparedNaturalOriginalsV3:
+            from .dispatch_initial_source_read_v3 import require_actual_authority_natural_original_v3
+            require_actual_authority_natural_original_v3(prepared_originals)
+        return prepared_originals.frozen_v3(raw)
+    if raw.get("schema") == "sylanne.d09.frozen_natural_request.v7":
+        return thaw_natural_reply_request_v7(raw)
+    if raw.get("schema") == "sylanne.d09.frozen_natural_request.v6":
+        return thaw_natural_reply_request_v6(raw)
+    if raw.get("schema") in {"sylanne.d09.frozen_natural_request.v4",
+                              "sylanne.d09.frozen_natural_request.v5"}:
         return thaw_natural_reply_request_v4(raw)
     if raw.get("schema") == "sylanne.d09.frozen_natural_request.v3":
         return thaw_natural_reply_request_v3(raw)
@@ -253,13 +274,23 @@ def _generation_frozen(raw: dict) -> FrozenNaturalReplyRequestV2:
 
 
 def _review_frozen(
-    raw: dict, generation: NaturalReplyGenerationOriginalSealV2,
+    raw: dict, generation: NaturalReplyGenerationOriginalSealV2, *, prepared_originals=None,
 ) -> FrozenNaturalReplyReviewV1:
+    if prepared_originals is not None:
+        from .dispatch_initial_source_read_v3 import require_actual_authority_natural_original_v3
+        require_actual_authority_natural_original_v3(prepared_originals)
+        frozen=prepared_originals.frozen_v3(raw)
+        if (prepared_originals.stage!='review' or frozen.generation_frozen_input_digest!=generation.frozen_input_digest
+                or frozen.qualified_units_digest!=generation.qualified_units_digest):
+            raise NaturalReplyJobHold('Authority review differs from its actual generation original')
+        return frozen
     payload = json.loads(raw["canonical_input"])
     output = {
-        "schema": "sylanne.d09.context_reply_output.v2",
+        "schema": payload.get("generation_output_schema", "sylanne.d09.context_reply_output.v2"),
         "body": payload["body"], "units": payload["units"],
     }
+    if payload.get("schema") == "sylanne.d09.natural_review_input.v2":
+        output["semantic_segments"] = payload["semantic_segments"]
     basis = tuple(_unit(item["source_unit"])
                   for item in payload["qualified_basis"])
     grants = tuple(payload["qualified_basis"][0]["promise_grant_refs"])
@@ -280,9 +311,15 @@ def _seal(stage: str, raw: dict):
         ("generation", "sylanne.d09.natural_generation_seal.v2"): NaturalReplyGenerationOriginalSealV2,
         ("generation", "sylanne.d09.natural_generation_seal.v3"): NaturalReplyGenerationOriginalSealV3,
         ("generation", "sylanne.d09.natural_generation_seal.v4"): NaturalReplyGenerationOriginalSealV4,
+        ("generation", "sylanne.d09.natural_generation_seal.v5"): NaturalReplyGenerationOriginalSealV4,
+        ("generation", "sylanne.d09.natural_generation_seal.v6"): NaturalReplyGenerationOriginalSealV6,
+        ("generation", "sylanne.d09.natural_generation_seal.v7"): NaturalReplyGenerationOriginalSealV7,
         ("review", "sylanne.d09.natural_review_seal.v2"): NaturalReplyReviewOriginalSealV2,
         ("review", "sylanne.d09.natural_review_seal.v3"): NaturalReplyReviewOriginalSealV3,
         ("review", "sylanne.d09.natural_review_seal.v4"): NaturalReplyReviewOriginalSealV4,
+        ("review", "sylanne.d09.natural_review_seal.v5"): NaturalReplyReviewOriginalSealV4,
+        ("review", "sylanne.d09.natural_review_seal.v6"): NaturalReplyReviewOriginalSealV6,
+        ("review", "sylanne.d09.natural_review_seal.v7"): NaturalReplyReviewOriginalSealV7,
     }
     cls = classes[(stage, data["schema"])]
     return cls(**data)
@@ -321,7 +358,7 @@ def save_original_preparation(
             or seal.original_graph_guard_digest != guard):
         raise NaturalReplyJobHold("natural original job, budget or read guard differs")
     if stage == "generation":
-        if ((type(seal), type(frozen)) not in ((NaturalReplyGenerationOriginalSealV2, FrozenNaturalReplyRequestV2), (NaturalReplyGenerationOriginalSealV3, FrozenNaturalReplyRequestV3), (NaturalReplyGenerationOriginalSealV4, FrozenNaturalReplyRequestV4))
+        if ((type(seal), type(frozen)) not in ((NaturalReplyGenerationOriginalSealV2, FrozenNaturalReplyRequestV2), (NaturalReplyGenerationOriginalSealV3, FrozenNaturalReplyRequestV3), (NaturalReplyGenerationOriginalSealV4, FrozenNaturalReplyRequestV4), (NaturalReplyGenerationOriginalSealV7, FrozenNaturalReplyRequestV7), (NaturalReplyGenerationOriginalSealV6, FrozenNaturalReplyRequestV6))
                 or seal.c02_operation_id != parent_original_id
                 or seal.frozen_input_digest != frozen.frozen_input_digest
                 or seal.qualified_units_digest != frozen.qualified_units_digest
@@ -331,8 +368,12 @@ def save_original_preparation(
                 != frozen.installation.provider_config_digest
                 or refreeze_natural_generation(frozen) != frozen):
             raise NaturalReplyJobHold("natural generation seal differs")
+        if (type(seal) is NaturalReplyGenerationOriginalSealV4
+                and (seal.schema == "sylanne.d09.natural_generation_seal.v5")
+                    != (frozen.schema == "sylanne.d09.frozen_natural_request.v5")):
+            raise NaturalReplyJobHold("generation seal and frozen semantic versions differ")
     else:
-        if (type(seal) not in (NaturalReplyReviewOriginalSealV2, NaturalReplyReviewOriginalSealV3, NaturalReplyReviewOriginalSealV4)
+        if (type(seal) not in (NaturalReplyReviewOriginalSealV2, NaturalReplyReviewOriginalSealV3, NaturalReplyReviewOriginalSealV4, NaturalReplyReviewOriginalSealV6, NaturalReplyReviewOriginalSealV7)
                 or type(frozen) is not FrozenNaturalReplyReviewV1
                 or seal.generation_frozen_input_digest
                 != frozen.generation_frozen_input_digest
@@ -354,7 +395,8 @@ def save_original_preparation(
                 != seal.generation_original_operation_id
                 or (type(original.seal), type(seal)) not in ((NaturalReplyGenerationOriginalSealV2, NaturalReplyReviewOriginalSealV2),
                         (NaturalReplyGenerationOriginalSealV3, NaturalReplyReviewOriginalSealV3),
-                        (NaturalReplyGenerationOriginalSealV4, NaturalReplyReviewOriginalSealV4))
+                        (NaturalReplyGenerationOriginalSealV4, NaturalReplyReviewOriginalSealV4),
+                        (NaturalReplyGenerationOriginalSealV7,NaturalReplyReviewOriginalSealV7), (NaturalReplyGenerationOriginalSealV6,NaturalReplyReviewOriginalSealV6))
                 or original.seal.call_id != seal.generation_call_id
                 or original.seal.frozen_input_digest
                 != seal.generation_frozen_input_digest
@@ -364,6 +406,11 @@ def save_original_preparation(
                 != seal.parent_budget_lease_id
                 or _review_frozen(asdict(frozen), original.seal) != frozen):
             raise NaturalReplyJobHold("review lacks original observed generation result")
+        if ((original.seal.schema in {"sylanne.d09.natural_generation_seal.v5","sylanne.d09.natural_generation_seal.v6","sylanne.d09.natural_generation_seal.v7"})
+                != (seal.schema in {"sylanne.d09.natural_review_seal.v5","sylanne.d09.natural_review_seal.v6","sylanne.d09.natural_review_seal.v7"})
+                or (seal.schema in {"sylanne.d09.natural_review_seal.v5","sylanne.d09.natural_review_seal.v6","sylanne.d09.natural_review_seal.v7"})
+                   != (json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2)):
+            raise NaturalReplyJobHold("generation and review semantic versions differ")
     db.execute(
         f"INSERT INTO {table} (bot,persona,parent_original_id,job_id,"
         "original_operation_id,seal_json,frozen_json,read_versions_json,"
@@ -385,54 +432,77 @@ def save_original_preparation(
 
 
 def read_original_preparation(
-    db, namespace: NamespaceId, parent_original_id: str, stage: str,
+    db, namespace: NamespaceId, parent_original_id: str, stage: str, *, prepared_originals=None,
 ) -> SavedNaturalPreparationV2 | None:
     """Read and fully recompute an original row inside the current graph tx."""
     table = _table(stage)
     if not db.in_transaction:
         raise NaturalReplyJobHold("natural original read requires graph tx")
-    row = db.execute(
-        f"SELECT seal_json,frozen_json,read_versions_json,query_epochs_json,"
-        "graph_epoch,access_epoch,deletion_epoch,state,typed_request_digest,"
-        "worker_fence,typed_request_wire,terminal_receipt_digest,"
-        "terminal_output_digest FROM " + table +
-        " WHERE bot=? AND persona=? AND parent_original_id=?",
-        namespace.as_tuple + (parent_original_id,),
-    ).fetchone()
+    if prepared_originals is None:
+        from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_natural_original_v3
+        handled,original=read_bound_authority_natural_original_v3(db,namespace,parent_original_id,stage)
+        if handled:prepared_originals=original
+    if prepared_originals is None:
+        row = db.execute(
+            f"SELECT seal_json,frozen_json,read_versions_json,query_epochs_json,"
+            "graph_epoch,access_epoch,deletion_epoch,state,typed_request_digest,"
+            "worker_fence,typed_request_wire,terminal_receipt_digest,"
+            "terminal_output_digest FROM " + table +
+            " WHERE bot=? AND persona=? AND parent_original_id=?",
+            namespace.as_tuple + (parent_original_id,),
+        ).fetchone()
+    else:
+        from .dispatch_initial_source_read_v3 import PreparedNaturalOriginalsV3
+        if type(prepared_originals)is not PreparedNaturalOriginalsV3:
+            from .dispatch_initial_source_read_v3 import require_actual_authority_natural_original_v3
+            require_actual_authority_natural_original_v3(prepared_originals)
+        row=prepared_originals.require_for_v3(db,namespace,parent_original_id,stage)
+        saved=prepared_originals.saved_v3(db,namespace,parent_original_id,stage)
+        if saved is not None:return saved
     if row is None:
         return None
     try:
-        if any(canonical_json(json.loads(wire)) != wire for wire in row[:4]):
+        if prepared_originals is None and any(canonical_json(json.loads(wire)) != wire for wire in row[:4]):
             raise ValueError("noncanonical original row")
-        seal = _seal(stage, json.loads(row[0]))
+        seal = _seal(stage, (json.loads(row[0])if prepared_originals is None else prepared_originals.json_v3("seal_json")))
         versions = tuple(GraphVersion(AtomKey.from_token(item["key"]), item["revision"])
-                         for item in json.loads(row[2]))
+                         for item in (json.loads(row[2])if prepared_originals is None else prepared_originals.json_v3("read_versions_json")))
         queries = tuple(QueryEpoch(NamespaceId(**item["namespace"]),
                                    item["scope_ref"], item["revision"])
-                        for item in json.loads(row[3]))
+                        for item in (json.loads(row[3])if prepared_originals is None else prepared_originals.json_v3("query_epochs_json")))
         if stage == "generation":
-            frozen = _generation_frozen(json.loads(row[1]))
+            frozen = _generation_frozen((json.loads(row[1])if prepared_originals is None else prepared_originals.json_v3("frozen_json")),prepared_originals=prepared_originals)
             if (type(seal), type(frozen)) not in (
                     (NaturalReplyGenerationOriginalSealV2, FrozenNaturalReplyRequestV2),
-                    (NaturalReplyGenerationOriginalSealV3, FrozenNaturalReplyRequestV3), (NaturalReplyGenerationOriginalSealV4, FrozenNaturalReplyRequestV4)):
+                    (NaturalReplyGenerationOriginalSealV3, FrozenNaturalReplyRequestV3), (NaturalReplyGenerationOriginalSealV4, FrozenNaturalReplyRequestV4), (NaturalReplyGenerationOriginalSealV7, FrozenNaturalReplyRequestV7), (NaturalReplyGenerationOriginalSealV6, FrozenNaturalReplyRequestV6)):
                 raise ValueError("generation original seal/frozen version differs")
+            if (type(seal) is NaturalReplyGenerationOriginalSealV4
+                    and (seal.schema == "sylanne.d09.natural_generation_seal.v5")
+                        != (frozen.schema == "sylanne.d09.frozen_natural_request.v5")):
+                raise ValueError("generation original semantic version differs")
         else:
             original = read_original_preparation(
                 db, namespace, parent_original_id, "generation",
             )
             if original is None or original.state != "terminal":
                 raise ValueError("generation result missing")
-            frozen = _review_frozen(json.loads(row[1]), original.seal)
+            frozen = _review_frozen((json.loads(row[1])if prepared_originals is None else prepared_originals.json_v3("frozen_json")), original.seal,prepared_originals=prepared_originals)
             if (original.terminal_output_digest != seal.generation_output_digest
                     or original.seal.original_operation_id
                     != seal.generation_original_operation_id
                     or (type(original.seal), type(seal)) not in ((NaturalReplyGenerationOriginalSealV2, NaturalReplyReviewOriginalSealV2),
                         (NaturalReplyGenerationOriginalSealV3, NaturalReplyReviewOriginalSealV3),
-                        (NaturalReplyGenerationOriginalSealV4, NaturalReplyReviewOriginalSealV4))
+                        (NaturalReplyGenerationOriginalSealV4, NaturalReplyReviewOriginalSealV4),
+                        (NaturalReplyGenerationOriginalSealV7,NaturalReplyReviewOriginalSealV7), (NaturalReplyGenerationOriginalSealV6,NaturalReplyReviewOriginalSealV6))
                 or original.seal.call_id != seal.generation_call_id
                     or original.seal.parent_budget_lease_id
                     != seal.parent_budget_lease_id):
                 raise ValueError("review and generation original identity differ")
+            if ((original.seal.schema in {"sylanne.d09.natural_generation_seal.v5","sylanne.d09.natural_generation_seal.v6","sylanne.d09.natural_generation_seal.v7"})
+                    != (seal.schema in {"sylanne.d09.natural_review_seal.v5","sylanne.d09.natural_review_seal.v6","sylanne.d09.natural_review_seal.v7"})
+                    or (seal.schema in {"sylanne.d09.natural_review_seal.v5","sylanne.d09.natural_review_seal.v6","sylanne.d09.natural_review_seal.v7"})
+                       != (json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2)):
+                raise ValueError("review and generation semantic versions differ")
         ids = natural_job_ids_v2(namespace, parent_original_id, stage)
         guard = natural_graph_guard_digest_v2(
             namespace, versions, queries, graph_epoch=row[4],
@@ -440,7 +510,8 @@ def read_original_preparation(
         )
         frozen_wire = (frozen.canonical_wire if stage == "generation"
                        else frozen.canonical_wire)
-        expected_wire_digest = sha256(frozen_wire.encode("utf-8")).hexdigest()
+        expected_wire_digest = (sha256(frozen_wire.encode("utf-8")).hexdigest() if prepared_originals is None else
+                                prepared_originals.digest_v3("frozen_wire"))
         expected_frozen_digest = (frozen.frozen_input_digest if stage == "generation"
                                   else frozen.digest)
         job = get_job(db, seal.job_id)
@@ -466,16 +537,18 @@ def read_original_preparation(
                     or seal.review_policy_version != frozen.review_policy_version))
                 or row[7] not in {"queued", "acquired", "terminal"}
                 or (row[7] == "queued" and any(item is not None for item in row[8:]))
-                or (row[7] != "queued" and any(item is None for item in row[8:11]))
+                or (row[7] != "queued" and (any(item is None for item in row[8:10])
+                    or prepared_originals is None and row[10] is None))
                 or (row[7] == "acquired" and any(item is not None for item in row[11:]))
                 or (row[7] == "terminal" and (row[11] is None or row[12] is None))):
             raise ValueError("natural saved identity differs")
         if row[7] != "queued":
-            request = _request_from_wire(row[10])
+            request = _request_from_wire(row[10],prepared_value=None if prepared_originals is None else prepared_originals.json_v3("typed_request_wire"),prepared_originals=prepared_originals)
             expected_template = (natural_generation_template_digest(frozen) if stage == "generation"
-                                 else REVIEW_TEMPLATE_DIGEST)
+                                 else (REVIEW_TEMPLATE_DIGEST_V2 if json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2
+                                       else REVIEW_TEMPLATE_DIGEST))
             if (type(row[9]) is not int or row[9] < 1
-                    or request.digest != row[8]
+                    or (request.digest if prepared_originals is None else prepared_originals.digest_v3("typed_request")) != row[8]
                     or request.identity.operation_id != seal.acquire_operation_id
                     or request.call_id != seal.call_id
                     or request.provider_id != frozen.installation.provider_id
@@ -483,8 +556,13 @@ def read_original_preparation(
                     or request.max_output_tokens
                     != frozen.installation.max_output_tokens
                     or request.prompt_template_digest != expected_template
-                    or dict(request.payload) != json.loads(frozen.canonical_wire)):
+                    or (dict(request.payload) != json.loads(frozen.canonical_wire) if prepared_originals is None else
+                        not prepared_originals.require_payload_v3(request.payload))):
                 raise ValueError("natural typed paid call binding differs")
+            if prepared_originals is not None:
+                from .dispatch_initial_source_read_v3 import PreparedAuthorityNaturalOriginalsV3
+                if type(prepared_originals)is PreparedAuthorityNaturalOriginalsV3:
+                    prepared_originals.qualify_call_binding_v3(request)
     except (KeyError, TypeError, ValueError, IndexError, JobConflict) as exc:
         raise NaturalReplyJobHold("saved natural preparation is invalid") from exc
     return SavedNaturalPreparationV2(
@@ -522,7 +600,8 @@ def bind_original_call(
             or request.max_output_tokens != frozen.installation.max_output_tokens
             or request.prompt_template_digest != (
                 natural_generation_template_digest(frozen) if saved.stage == "generation"
-                else REVIEW_TEMPLATE_DIGEST)
+                else (REVIEW_TEMPLATE_DIGEST_V2 if json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2
+                                       else REVIEW_TEMPLATE_DIGEST))
             or dict(request.payload) != json.loads(frozen.canonical_wire)):
         raise NaturalReplyJobHold("natural typed paid call differs from frozen wire")
     wire = canonical_serialize(reply_request_wire_v1(request.envelope, request))
@@ -554,6 +633,11 @@ def read_original_call_binding(
     if current.state == "queued":
         return None
     table = _table(saved.stage)
+    from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_natural_original_v3
+    handled,original=read_bound_authority_natural_original_v3(db,saved.seal.namespace,saved.parent_original_id,saved.stage)
+    if handled:
+        request=original.call_binding_v3(db,saved.seal.namespace,saved.parent_original_id,saved.stage)
+        return SavedNaturalCallBindingV2(request,current.typed_request_digest,current.worker_fence)
     row = db.execute(
         f"SELECT typed_request_wire FROM {table} "
         "WHERE bot=? AND persona=? AND parent_original_id=?",

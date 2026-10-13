@@ -98,20 +98,22 @@ def life_progress_type_specs_v1():
 def life_progress_qualified_writes_v1(prepared,terminal,progress,operation_id):
     from .d11_life_outcome_provenance_v1 import life_outcome_key_v1
     b=prepared.binding
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
+    roots = tuple(dict.fromkeys((prepared.plan.input_source.ref, *prepared.plan.content.source_refs))) if type(prepared.plan) is RegisteredDraftFilePlanV3 else (prepared.plan.input_source.ref,)
     if (type(progress) is not LifeProgressHeadV1 or terminal.binding!=b or terminal.payload.prepared_digest!=prepared.digest
             or (progress.project_ref,progress.recipe_ref,progress.activity_id,progress.effect_id,progress.artifact_ref,
                 progress.terminal_ref,progress.source_refs,progress.receipt_refs,progress.reality,progress.step,
                 progress.role_start,progress.role_end)!=
             (prepared.plan.project.ref,prepared.plan.recipe.ref,b.activity_id,b.effect_id,b.artifact_ref,terminal.original_ref,
-                (prepared.plan.input_source.ref,),(terminal.claim.original_ref,terminal.original_ref,
+                roots,(terminal.claim.original_ref,terminal.original_ref,
                     life_outcome_key_v1(b,prepared.plan.action_intent.ref).token),
-                'real_execution','source_note',float(terminal.claim.payload.character_at),float(terminal.payload.character_at))):
+                'real_execution',prepared.plan.step,float(terminal.claim.payload.character_at),float(terminal.payload.character_at))):
         raise ValueError('Life progress differs from actual prepared plan/terminal/outcome')
     # Provenance derives only the existing terminal fact, without producing
     # another execution/result or reading caller-supplied eligibility flags.
     from .d11_life_contract_v1 import life_to_wire_v1
     end=life_role_segment_key_v1(b,'end')
-    end_fact=GraphWrite(end,{'schema':'d11.role_segment_end.v1','binding':life_to_wire_v1(b),
+    end_fact=GraphWrite(end,{'schema':end.type_name,'binding':life_to_wire_v1(b),
         'payload':life_to_wire_v1(terminal.payload),'journal_ref':terminal.original_ref,'journal_digest':terminal.terminal_digest})
     end_proof=life_fact_provenance_v1(prepared,terminal.claim,terminal,end_fact)
     fact=GraphWrite(life_progress_key_v1(b),plain_v1(progress));proof_key=life_progress_auxiliary_key_v1(fact.key,PROVENANCE_TYPE)

@@ -41,6 +41,23 @@ class HostOneBotObservationInstallationV2:
             clock_source_ref=self.clock_source_ref)
 
 
+def parse_installed_onebot_account_v2(account_ref: str) -> tuple[str, str, str]:
+    """Parse the existing exact installed account wire; this is no Host proof."""
+    try:
+        account = json.loads(account_ref)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("installed OneBot account is invalid") from exc
+    if (type(account) is not list or len(account) != 3
+            or any(type(item) is not str or not item for item in account)
+            or account[1] != "aiocqhttp"
+            or not account[2].isascii() or not account[2].isdigit()
+            or account[2].startswith("0")
+            or json.dumps(account, ensure_ascii=True,
+                          separators=(",", ":")) != account_ref):
+        raise ValueError("installed OneBot account is invalid")
+    return tuple(account)
+
+
 class InstalledHostOneBotObservationVerifierV2:
     """Accept only a pinned installation's host-observed ACK or uncertainty.
 
@@ -59,18 +76,7 @@ class InstalledHostOneBotObservationVerifierV2:
                 or type(adapter_ref) is not str or not adapter_ref
                 or type(clock_source_ref) is not str or not clock_source_ref):
             raise ValueError("installed observation identity is invalid")
-        try:
-            account = json.loads(account_ref)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("installed OneBot account is invalid") from exc
-        if (type(account) is not list or len(account) != 3
-                or any(type(item) is not str or not item for item in account)
-                or account[1] != "aiocqhttp"
-                or not account[2].isascii() or not account[2].isdigit()
-                or account[2].startswith("0")
-                or json.dumps(account, ensure_ascii=True,
-                              separators=(",", ":")) != account_ref):
-            raise ValueError("installed OneBot account is invalid")
+        parse_installed_onebot_account_v2(account_ref)
         self.namespace = namespace
         self.subject = "mtls:sha256:" + peer_certificate_sha256
         self.adapter_ref = adapter_ref

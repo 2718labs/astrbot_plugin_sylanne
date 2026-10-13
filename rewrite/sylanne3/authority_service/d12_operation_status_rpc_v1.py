@@ -21,6 +21,7 @@ def install_d12_operation_status_service_v1(server, service):
     if key in services and services[key] is not service:
         raise AuthorityUnavailable("D12 status service already installed")
     services[key] = service
+    server.compose_installed_owner_stop_reply_service_v1(service)
 
 
 def dispatch_d12_operation_status_v1(server, method, credential, profile_id,

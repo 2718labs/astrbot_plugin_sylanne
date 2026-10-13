@@ -64,16 +64,17 @@ def install_d02_c04_body_cost_schema(db: sqlite3.Connection) -> None:
 def read_c04_body_cost_original_v1(
     db: sqlite3.Connection, namespace: NamespaceId, operation_id: str,
 ) -> C04BodyCostOriginalV1 | None:
+    from ...runtime.natural_producer_qualification_v1 import _producer_original_point_v3
     if db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='d02_c04_body_cost_originals_v1'",
     ).fetchone() is None:
         return None
-    row = db.execute(
+    row = _producer_original_point_v3(db,table='d02_c04_body_cost_originals_v1',columns=('original_json', 'original_digest'),key_columns=("bot","persona","operation_id"),key=(*namespace.as_tuple, operation_id),legacy_reader=lambda: db.execute(
         "SELECT original_json,original_digest FROM d02_c04_body_cost_originals_v1 "
         "WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, operation_id),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         return None
     raw = json.loads(row[0])

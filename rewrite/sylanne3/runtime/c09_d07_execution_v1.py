@@ -10,7 +10,7 @@ import math
 from ..graph_types import AtomKey
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize, VersionedRef, AuthorityContext
 from .d07_execution_v1 import (TABLE, SIGN_KIND, KINDS, D07PreparedExecutionV1, D07ExecutionReadV1,
-    D07AccountingPreparedV1, D07SemanticQuestionV1, decode_d07_execution_original_v1)
+    D07AccountingPreparedV1, D07IngressRecallPreparedV1, D07SemanticQuestionV1, decode_d07_execution_original_v1)
 from .d07_graph_stages_v1 import TABLE as STAGE_TABLE
 from .d07_accounting_v1 import TABLE as ACCOUNTING_TABLE
 from .domain_production_erasure_v1 import decode_typed_production_value_v1
@@ -77,8 +77,34 @@ def validate_d07_original_payload_v1(kind, raw):
     from ..model_broker.d07_cognition_v1 import thaw_d07_cognition_request_v1, d07_cognition_messages_v1
     from ..authority_service.d07_current_execution_v1 import D07CognitionResultReadRequestV1, D07CognitionResultReadV1, from_wire
     if kind == "prepared":
-        _fields(raw, (f.name for f in fields(D07PreparedExecutionV1)), "d07.prepared-execution.v1")
-        thaw_d07_cognition_request_v1(_json(raw["frozen_json"]))
+        if raw.get("schema") == "d07.ingress-recall-prepared.v1":
+            from ..model_broker.d07_cognition_v1 import thaw_d07_ingress_recall_request_v1
+            _fields(raw, (f.name for f in fields(D07IngressRecallPreparedV1)), "d07.ingress-recall-prepared.v1")
+            prepared = decode_typed_production_value_v1(raw, D07IngressRecallPreparedV1)
+            frozen = thaw_d07_ingress_recall_request_v1(_json(prepared.frozen_json))
+            if (frozen.input.namespace != prepared.namespace
+                    or frozen.input.c02_operation_id != prepared.c02_operation_id
+                    or frozen.input.cycle_job_ref != prepared.cycle_job_ref
+                    or frozen.input.need_ref != prepared.need_ref
+                    or frozen.input.need_digest != prepared.need_digest):
+                raise ValueError("D07 Self prepared input crosses its exact parent/Need original")
+            authority_field = "self_authority_json"
+        elif raw.get("schema") == "d07.relationship-prepared.v2":
+            from .d07_execution_v1 import D07RelationshipPreparedV2
+            _fields(raw, (f.name for f in fields(D07RelationshipPreparedV2)), "d07.relationship-prepared.v2")
+            prepared = decode_typed_production_value_v1(raw, D07RelationshipPreparedV2)
+            thaw_d07_cognition_request_v1(_json(prepared.frozen_json))
+            authority_field = "owner_authority_json"
+        elif raw.get("schema") == "d07.method-growth-prepared.v2":
+            from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2, method_growth_value_from_wire_v2
+            _fields(raw, (f.name for f in fields(D07MethodGrowthPreparedV2)), "d07.method-growth-prepared.v2")
+            prepared = method_growth_value_from_wire_v2(raw, D07MethodGrowthPreparedV2)
+            thaw_d07_cognition_request_v1(_json(prepared.frozen_json))
+            authority_field = "owner_authority_json"
+        else:
+            _fields(raw, (f.name for f in fields(D07PreparedExecutionV1)), "d07.prepared-execution.v1")
+            thaw_d07_cognition_request_v1(_json(raw["frozen_json"]))
+            authority_field = "owner_authority_json"
         if type(raw["read_rows"]) is not list or len(raw["read_rows"]) > 1024:
             raise ValueError("D07 prepared read closure exceeds installed bounds")
         for row in raw["read_rows"]:
@@ -86,7 +112,7 @@ def validate_d07_original_payload_v1(kind, raw):
             D07ExecutionReadV1(**row)
         from .domain_production_contracts_v1 import ProductionOwnerGuardV1
         decode_typed_production_value_v1(_json(raw["owner_guard_json"]), ProductionOwnerGuardV1)
-        decode_typed_production_value_v1(_json(raw["owner_authority_json"]), AuthorityContext)
+        decode_typed_production_value_v1(_json(raw[authority_field]), AuthorityContext)
         _json(raw["query_inventory_json"])
         external = _json(raw["external_content_originals_json"])
         if type(external) is not list or len(external) > 1:
@@ -141,6 +167,9 @@ def validate_d07_original_payload_v1(kind, raw):
                 raise ValueError("D07 body cost amount differs")
     elif kind == "execution":
         decode_d07_execution_original_v1(raw)
+    elif kind == "adopted" and raw.get("schema") == "d07.ingress-recall-adoption.v1":
+        from .d07_ingress_recall_result_v1 import validate_ingress_recall_adoption_v1
+        validate_ingress_recall_adoption_v1(raw, committed=True)
     elif kind == "adopted":
         _fields(raw, ("schema", "interpretation_ref", "interpretation_revision", "interpretation_value_digest", "adoption_operation_id",
             "graph_receipt_digest", "prepared_digest", "actual_result_digest", "question_scope", "supporting_refs", "meaningful_unknowns"),
@@ -165,7 +194,11 @@ def validate_d07_original_payload_v1(kind, raw):
         if not raw["parent_id"] or grant.lease_id != raw["lease_id"] or canonical_digest(grant) != raw["grant_digest"]:
             raise ValueError("D07 preserved simulation child grant original differs")
     elif kind == "semantic_question":
-        decode_typed_production_value_v1(raw, D07SemanticQuestionV1)
+        from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
+        from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
+        question_type = (D07MethodGrowthSemanticQuestionV2 if raw.get("schema") == "d07.method-growth-semantic-question.v2" else
+            D07RelationshipSemanticQuestionV2 if raw.get("schema") == "d07.relationship-semantic-question.v2" else D07SemanticQuestionV1)
+        decode_typed_production_value_v1(raw, question_type)
     elif kind == "budget_allocation":
         from .issuers import BudgetLeaseGrant
         from .budget import BudgetReceipt

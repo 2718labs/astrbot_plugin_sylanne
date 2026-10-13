@@ -6,7 +6,7 @@ issued by the existing installed math queue after an actual Authority claim.
 No C02 source or message-arrival identity is manufactured. Policies and clocks
 are the unchanged installed originals; incomplete native work remains HOLD.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 import time
@@ -37,6 +37,7 @@ from .d06_life_numeric_drive_v1 import (PrepareLifeNumericDriveRequestV1,
 OPERATION = 'prepare_internal_life_numeric_joint'
 CONTINUATION_SCHEMA = 'd04.internal-life-numeric-continuation.v1'
 _STAGES = {}
+_SOURCE_BRIDGES = weakref.WeakValueDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,8 +113,263 @@ def stage_life_numeric_joint_in_transaction_v1(db, *, frame, request, installed_
     return result
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _LifeJointSourceBridgeV1:
+    current_drive: object
+    frame: object
+    stage: object | None
+    numeric_witness: object | None
+
+
+def _require_life_joint_source_bridge_v1(db, bridge):
+    """Only the actual same-SQL Life stage or final numeric witness can issue."""
+    from .d04_numeric_adoption_v3 import _COMMIT_WITNESSES
+    if (type(bridge) is not _LifeJointSourceBridgeV1
+            or _SOURCE_BRIDGES.get(id(bridge)) is not bridge or not db.in_transaction):
+        raise ValueError('Life joint Source requires its live private issuance')
+    if bridge.stage is not None:
+        issued = _STAGES.get(id(bridge.stage))
+        if (issued is None or issued[0]() is not bridge.stage or issued[1] is not db
+                or bridge.numeric_witness is not None
+                or bridge.current_drive.original != bridge.stage.drive.original):
+            raise ValueError('Life joint Source stage differs from its actual preparation')
+    else:
+        witness = bridge.numeric_witness
+        if witness is None or _COMMIT_WITNESSES.get(id(witness)) is not witness:
+            raise ValueError('Life joint Source final numeric witness is no longer active')
+        graph = witness.graph
+        from .d04_numeric_adoption_v3 import require_current_numeric_commit_witness_v3
+        require_current_numeric_commit_witness_v3(graph, db, witness.candidate.bundle, witness)
+    require_current_life_numeric_drive_v1(bridge.current_drive, db=db, frame=bridge.frame)
+    return bridge.current_drive, bridge.frame
+
+
+def _issue_life_joint_source_bridge_v1(db, current_drive, frame, *, stage=None, numeric_witness=None):
+    bridge = _LifeJointSourceBridgeV1(current_drive, frame, stage, numeric_witness)
+    _SOURCE_BRIDGES[id(bridge)] = bridge
+    _require_life_joint_source_bridge_v1(db, bridge)
+    return bridge
+
+
+def read_life_joint_signed_lineage_v1(db, prepared, *, issuer, resource_issuer, now_utc):
+    """Independent signed-original join; a continuation locator grants nothing.
+
+    The Authority calls this with its own issuers and pinned Graph transaction.
+    Final adoption calls it again before full current-Life requalification.
+    """
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from ..memory_types import SourceRecord
+    from .d11_life_preparation_v1 import _read, read_prepared_life_v1
+    from .d11_life_contract_v1 import D11LifeTerminalV1, life_from_wire_v1
+    from .d06_life_numeric_drive_v1 import (KIND as DRIVE_KIND,
+        decode_life_numeric_drive_original_v1, _require_life_numeric_drive_producer_membership_v1)
+    from .d06_life_numeric_context_v1 import (KIND as CONTEXT_KIND, OPERATION as CONTEXT_OPERATION,
+        decode_life_numeric_context_original_v1, _writes, require_life_numeric_shared_original_v1)
+    from .d06_internal_life_episode_v2 import (PROVENANCE, decode_internal_life_value_v2,
+        validate_internal_life_episode_history_v2, internal_life_writes_from_proof_v2)
+    from .d04_life_before_original_v1 import read_life_d04_before_original_v1
+    from .d06_life_numeric_task_v1 import read_life_numeric_appraisal_acceptance_v1
+    from .d04_installed_numeric_v3 import _ready_from_original_v3
+    from .domain_production_contracts_v1 import CurrentOperationFrameV1, ProductionOwnerGuardV1
+    from .d01_production_operations_v1 import CurrentDomainReadV1
+    from .c04_encoding_baseline_store_v3 import _receipt
+    continuation = json.loads(prepared.job_payload_json)['continuation']
+    if continuation.get('schema') != CONTINUATION_SCHEMA:
+        if prepared.binding.operation_id.startswith('life-joint-'):
+            raise ValueError('Life numerical operation lost its exact continuation schema')
+        return None
+    ns = prepared.binding.namespace
+    request = PrepareLifeNumericJointRequestV1(continuation['episode_ref'],
+        continuation['causal_operation_id'], continuation['appraisal_ref'])
+    if read_life_numeric_joint_prepared_v1(db, namespace=ns, request=request) != prepared:
+        raise ValueError('Life numerical continuation is not its actual immutable preparation')
+    saved_drive = _read(db, issuer=issuer, namespace=ns, kind=DRIVE_KIND, ref=continuation['drive_ref'])
+    saved_context = _read(db, issuer=issuer, namespace=ns, kind=CONTEXT_KIND, ref=continuation['context_ref'])
+    if saved_drive is None or saved_context is None:
+        raise ValueError('Life numerical signed drive/context original is absent')
+    drive = decode_life_numeric_drive_original_v1(saved_drive[0])
+    context = decode_life_numeric_context_original_v1(saved_context[0])
+    if (saved_drive[1] != drive.operation_id or saved_context[1] != context.operation_id
+            or drive.namespace != ns or context.namespace != ns
+            or drive.episode_ref != request.episode_ref or context.episode_ref != request.episode_ref
+            or drive.appraisal_ref != request.appraisal_ref
+            or (drive.context_ref, drive.context_digest, drive.before_digest, drive.source_ref) !=
+                (context.original_ref, context.digest, context.before_digest, context.source_ref)
+            or any(continuation[name] != value for name, value in (
+                ('drive_digest', drive.digest), ('context_digest', context.digest),
+                ('before_digest', context.before_digest), ('source_ref', context.source_ref),
+                ('mapping_ref', drive.mapping_ref), ('mapping_digest', drive.mapping_digest)))):
+        raise ValueError('Life numerical signed occurrence/context/drive/mapping join differs')
+    ready = _ready_from_original_v3(prepared)
+    envelope = ready.preparation.envelope
+    qualification = envelope.source_qualification
+    if (envelope.authority.purpose != 'consolidation'
+            or qualification.source_family != 'derived' or qualification.content_reality != 'inference'
+            or qualification.evidence_eligibility != 'ineligible'
+            or qualification.internal_activity_actuality != 'actual'
+            or context.source_ref not in envelope.input_refs):
+        raise ValueError('Life numerical Source was promoted or removed from its actual inputs')
+    # These rows were frozen by the actual joint reader, never supplied by this
+    # caller. Requiring the whole frame also preserves every ancestor negative.
+    guard = ProductionOwnerGuardV1(prepared.binding.owner_grant_ref,
+        prepared.binding.owner_grant_revision, prepared.binding.owner_grant_digest, context.owner_head_digest)
+    frame = CurrentOperationFrameV1(envelope, ready.preparation.snapshot, now_utc,
+        guard, prepared.binding.activation_generation, (), (), ())
+    read = CurrentDomainReadV1(frame); read.check(db)
+    read.source_family(db, (context.source_ref,), purpose='consolidation')
+    source_atom = read.head(db, context.source_ref, required=True)
+    source = SourceRecord.from_dict(source_atom.value)
+    episode = AtomKey.from_token(request.episode_ref)
+    proof = decode_internal_life_value_v2(PROVENANCE,
+        read.head(db, AtomKey(episode.owner, PROVENANCE, 'record'), required=True).value)
+    validate_internal_life_episode_history_v2(db, proof)
+    if now_utc < max(source.recorded_at, proof.event.activity.completed_at):
+        raise ValueError('Life numerical context precedes its actual occurrence')
+    metadata = json.loads(db.execute('SELECT requirements_json FROM graph_recovery_metadata_v2 '
+        'WHERE bot=? AND persona=?', ns.as_tuple).fetchone()[0])
+    if (proof.episode.episode_ref != request.episode_ref or proof.event.namespace != ns
+            or proof.event.causal_operation_id != request.causal_operation_id
+            or canonical_digest(plain_v1(proof)) != context.occurrence_digest
+            or proof.owner_head_digest != context.owner_head_digest
+            or proof.event.activity.source_ref != context.source_ref
+            or proof.event.activity.execution_id != context.execution_id
+            or proof.event.activity.activity_id != context.interpretation.activity_id
+            or (source_atom.revision, canonical_digest(source_atom.value)) !=
+                (context.source_revision, context.source_digest)
+            or metadata['graph_incarnation'] != context.graph_incarnation
+            or metadata['activation_generation'] != context.activation_generation
+            or context.activation_generation != prepared.binding.activation_generation):
+        raise ValueError('Life numerical actual Episode/current generation/Source differs')
+    for row in proof.current_reads:
+        atom = read.head(db, row.ref)
+        if (atom.revision, canonical_digest(atom.value), atom.valid) != (row.revision, row.digest, row.valid):
+            raise ValueError('Life numerical current occurrence dependency changed')
+    episode_writes = internal_life_writes_from_proof_v2(proof)
+    for write in episode_writes:
+        atom = read.head(db, write.key, required=True)
+        if atom.revision != 1 or atom.value != write.value:
+            raise ValueError('Life numerical Episode projection changed')
+    produced = {write.key for write in episode_writes}
+    expected_edges = tuple(sorted((dep.token, 1 if dep in produced else next(
+        row.revision for row in proof.current_reads if row.ref == dep.token))
+        for dep in episode_writes[-1].dependencies))
+    if tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
+            'WHERE dependent_token=? ORDER BY dependency_token', (episode_writes[-1].key.token,))) != expected_edges:
+        raise ValueError('Life numerical occurrence invalidation edges changed')
+    experience = json.loads(source.text)
+    saved = _read(db, issuer=issuer, namespace=ns, kind='experience', ref=experience['actual_provenance_ref'])
+    if saved is None: raise ValueError('Life numerical signed actual experience is absent')
+    terminal = life_from_wire_v1(saved[0]['terminal'], D11LifeTerminalV1)
+    life_prepared = read_prepared_life_v1(db, binding=terminal.binding, issuer=issuer)
+    if (life_prepared is None or terminal.status != 'completed'
+            or terminal.binding.namespace != ns or terminal.binding.execution_id != context.execution_id
+            or terminal.original_ref != proof.event.activity.terminal_original_ref
+            or saved[1] != request.causal_operation_id
+            or saved[0]['source_ref'] != context.source_ref
+            or saved[0]['source_digest'] != context.source_digest or saved[0]['experience'] != experience):
+        raise ValueError('Life numerical actual experience/preparation/terminal join differs')
+    from .d11_life_adoption_v1 import _read_signed, _verify_life_adoption_commit_and_original_v1
+    from ..authority_service.d11_life_bridge_v1 import life_bridge_from_wire_v1
+    bridge = _read_signed(db, ns, 'adoption_bridge', terminal.binding.execution_id, issuer)
+    if bridge is None: raise ValueError('Life numerical signed execution adoption bridge is absent')
+    gate = life_bridge_from_wire_v1(bridge[1])
+    if gate.binding != terminal.binding or gate.terminal != terminal:
+        raise ValueError('Life numerical actual execution bridge differs')
+    _verify_life_adoption_commit_and_original_v1(db, gate=gate, issuer=issuer,
+        resource_issuer=resource_issuer, require_current_metadata=False)
+    before = read_life_d04_before_original_v1(db, prepared=life_prepared, issuer=issuer)
+    if before.original_ref != context.before_ref or before.digest != context.before_digest:
+        raise ValueError('Life numerical signed before original differs')
+    context_receipt = _receipt(db, ns, context.operation_id)
+    payload = require_life_numeric_shared_original_v1(db, namespace=ns,
+        operation_id=context.operation_id, operation_kind=CONTEXT_OPERATION,
+        receipt=context_receipt, writes=_writes(context))
+    if payload['provenance'].get('context_original') != plain_v1(context):
+        raise ValueError('Life numerical context complete producer differs')
+    for write in _writes(context):
+        atom = read.head(db, write.key, required=True)
+        history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',
+            (write.key.token,)).fetchone()
+        if (atom.revision != 1 or atom.value != write.value
+                or GraphVersion(write.key, 1) not in context_receipt.write_versions
+                or history != (canonical_serialize(write.value), 1, context.operation_id)):
+            raise ValueError('Life numerical context current projection differs')
+    acceptance = read_life_numeric_appraisal_acceptance_v1(db, ns, request.appraisal_ref, issuer)
+    appraisal = read.head(db, request.appraisal_ref, required=True)
+    if (acceptance is None or acceptance.context_digest != context.digest
+            or acceptance.before_digest != before.digest or acceptance.digest != drive.appraisal_acceptance_digest
+            or acceptance.operation_id != drive.appraisal_adoption_operation_id
+            or appraisal.revision != acceptance.appraisal_revision
+            or canonical_serialize(appraisal.value) != acceptance.appraisal_value_json):
+        raise ValueError('Life numerical actual paid appraisal/adoption differs')
+    adopted = _require_life_numeric_drive_producer_membership_v1(db, drive)
+    from .d04_semantic_mapping_v3 import require_current_d04_role_clock_v3
+    from ..domains.d04.numeric_drive import decode_sourced_numeric_drive
+    require_current_d04_role_clock_v3(db, drive.clock)
+    for ref, revision in drive.drive_versions:
+        atom = read.head(db, ref, required=True)
+        item = decode_sourced_numeric_drive(atom.value)
+        history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?',
+            (ref, revision)).fetchone()
+        if (atom.revision != revision or GraphVersion(atom.key, revision) not in adopted['receipt'].write_versions
+                or history != (canonical_serialize(atom.value), 1, drive.operation_id)
+                or item.source_ref != context.source_ref or item.source_revision != context.source_revision
+                or read.head(db, item.checkpoint_ref, required=True).revision != item.checkpoint_revision):
+            raise ValueError('Life numerical actual mapping drive/member changed')
+    selected = {version.key.token: version.revision for block in ready.preparation.current.component.block_drives
+        for version in block.drive_versions}
+    if any(selected.get(ref) != revision for ref, revision in drive.drive_versions):
+        raise ValueError('Life numerical frozen component omitted an actual mapped drive')
+    return request, context, drive
+
+
+def _current_life_joint_source_for_commit_v1(graph, db, witness):
+    """Requalify only from the actual final numerical witness and current SQL."""
+    from .d04_numeric_adoption_v3 import require_current_numeric_commit_witness_v3
+    require_current_numeric_commit_witness_v3(graph, db, witness.candidate.bundle, witness)
+    lineage = read_life_joint_signed_lineage_v1(db, witness.ready.prepared,
+        issuer=graph._GraphCoordinator__d11_issuer, resource_issuer=graph._GraphCoordinator__d02_issuer,
+        now_utc=witness.now_utc)
+    if lineage is None: return None
+    request, context, original = lineage
+    from .domain_production_registry_v1 import installed_operation_v1, installed_readers_for_operation_v1
+    from .domain_production_read_plans_v1 import read_current_domain_original_refs_v1, read_current_domain_policy_refs_v1
+    from .domain_production_frame_v1 import _materialize_current_domain_frame_v1
+    from .domain_production_contracts_v1 import ProductionOwnerGuardV1, ProductionOperationLimitsV1
+    binding, envelope = witness.ready.prepared.binding, witness.ready.preparation.envelope
+    scope, owner = witness.scope, witness.bridge.owner_authority.guard
+    if (db is not graph._GraphCoordinator__store._db or not graph._GraphCoordinator__store._lock._is_owned()
+            or scope.namespace != binding.namespace or scope.graph_epoch != witness.before_epoch
+            or scope.graph_revision != witness.before_metadata.graph_revision
+            or scope.permit != witness.bridge.permit or scope.pinned_anchor != witness.bridge.after_anchor
+            or owner.authorization_head.removeprefix('sha256:') != context.owner_head_digest
+            or owner.pending_revoke_operation_id or witness.now_utc >= envelope.deadline_utc):
+        raise ValueError('Life numerical final actual Owner/fence/deadline differs')
+    readers = installed_readers_for_operation_v1(graph, installed_operation_v1(DRIVE_OPERATION),
+        scope=scope, owner_guard=owner)
+    drive_request = _drive_request(request)
+    plan = read_plan_life_numeric_drive_v1(db, namespace=binding.namespace,
+        activity_id=context.interpretation.activity_id, operation_kind=DRIVE_OPERATION, request=drive_request)
+    originals = read_current_domain_original_refs_v1(db, namespace=binding.namespace, plan=plan, installed_readers=readers)
+    policies = read_current_domain_policy_refs_v1(db, namespace=binding.namespace, plan=plan, installed_readers=readers)
+    # Only the read frame uses the authenticated occurrence activity. The
+    # native execution envelope, grant, reservation and deadline stay intact.
+    read_envelope = replace(envelope, identity=replace(envelope.identity,
+        activity_id=context.interpretation.activity_id))
+    frame = _materialize_current_domain_frame_v1(graph, db, envelope=read_envelope,
+        scope=scope, plan=plan, now_utc=witness.now_utc,
+        expected_owner_guard=ProductionOwnerGuardV1(binding.owner_grant_ref,
+            binding.owner_grant_revision, binding.owner_grant_digest, context.owner_head_digest),
+        expected_rights=(envelope.version_guard.access_epoch, envelope.version_guard.delete_epoch),
+        observed_originals=originals, installed_policy_refs=policies, limits=ProductionOperationLimitsV1())
+    current = read_current_life_numeric_drive_v1(db, frame=frame, request=drive_request, installed_readers=readers)
+    if current.original != original:
+        raise ValueError('Life numerical current qualification differs from its signed continuation')
+    return _issue_life_joint_source_bridge_v1(db, current, frame, numeric_witness=witness)
+
+
 def _freeze_life_product_v1(graph, db, bundle, identity, *, metadata, epoch, clock, root_ref,
-        qualification, audience, deadline, job, topology_verifier):
+        qualification, audience, deadline, job, topology_verifier, life_source_bridge):
     namespace, policy = bundle.installation_policy.namespace, bundle.installation_policy
     store = graph._GraphCoordinator__store
     rights = graph._deletion_epochs_locked(db, namespace)
@@ -127,7 +383,7 @@ def _freeze_life_product_v1(graph, db, bundle, identity, *, metadata, epoch, clo
         expected_graph_incarnation=metadata.requirements.graph_incarnation,
         expected_graph_revision=metadata.graph_revision, expected_access_epoch=rights[0],
         expected_delete_epoch=rights[1], audience=audience, purpose="consolidation",
-        authored_topology_verifier=topology_verifier)
+        authored_topology_verifier=topology_verifier, _life_source_bridge=life_source_bridge)
     keys = {row.key: row.revision for row in current.component.read_versions}
     from .d04_contribution_consumption_v3 import current_contribution_allocations_v3
     for ledger_key, _allocation in current_contribution_allocations_v3(db, namespace, current.drives):
@@ -253,9 +509,15 @@ def prepare_life_numeric_joint_in_transaction_v1(db, *, stage):
     metadata, epoch = graph._v2_graph_stamp(namespace)
     _advance_numeric_job_observation_v3(graph, db, stage.topology, stage.metadata, stage.epoch,
         metadata, epoch, job, receipt, identity)
+    from .domain_production_inputs_v1 import _post_commit_frame
+    post_frame = _post_commit_frame(db, frame, stage.request)
+    post_drive = read_current_life_numeric_drive_v1(db, frame=post_frame,
+        request=_drive_request(stage.request), installed_readers=stage.installed_readers)
+    life_source_bridge = _issue_life_joint_source_bridge_v1(db, post_drive, post_frame, stage=stage)
     preparation = _freeze_life_product_v1(graph, db, bundle, identity, metadata=metadata, epoch=epoch,
         clock=clock, root_ref=drive.root_ref, qualification=context.source_qualification,
-        audience=frame.envelope.authority.audience, deadline=deadline, job=job, topology_verifier=stage.topology)
+        audience=frame.envelope.authority.audience, deadline=deadline, job=job, topology_verifier=stage.topology,
+        life_source_bridge=life_source_bridge)
     evidence = freeze_current_d04_joint_evidence_inputs_v3(db, preparation, clock=clock,
         installed_output_policy=output_policy, installed_mapping_reader=reader)
     if set(preparation.current.component.checkpoint_refs) != {m.checkpoint.ref for m in context.before.members}:

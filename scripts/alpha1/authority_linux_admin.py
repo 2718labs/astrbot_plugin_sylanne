@@ -18,15 +18,14 @@ def main():
     args, rest = parser.parse_known_args()
     from sylanne3.authority_service.linux_deployment_v1 import open_linux_authority_v1
     from sylanne3.authority_service.admin_cli import main as admin
-    daemon, _ = open_linux_authority_v1(args.config)
-    try:
-        from sylanne3.authority_service.daemon import AuthorityFactualDaemonV2
-        from sylanne3.authority_service.contract import AuthorityUnavailable
-        if type(daemon) is AuthorityFactualDaemonV2:
-            raise AuthorityUnavailable('C09 V2 factual-only installation: Owner mutation administration HOLD')
-        return admin(rest, daemon=daemon)
-    finally:
-        asyncio.run(daemon.aclose())
+    bootstrap, _ = open_linux_authority_v1(args.config)
+    async def run_offline():
+        try:
+            daemon=await bootstrap.await_offline_ready_v3()
+            return admin(rest,daemon=daemon)
+        finally:
+            await bootstrap.aclose()
+    return asyncio.run(run_offline())
 
 
 if __name__ == "__main__":

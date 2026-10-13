@@ -27,7 +27,7 @@ from .v2_owner_proof import (
     OwnerCredentialRegistrationV1, from_wire as proof_from_wire,
 )
 from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 
 
 _REVOKE = frozenset({"revoke-creation", "revoke-credential", "revoke-actor"})

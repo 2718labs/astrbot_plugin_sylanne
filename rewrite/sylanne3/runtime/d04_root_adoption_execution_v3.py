@@ -124,6 +124,7 @@ def adopt_executed_root_v3(graph, authority, lease, executed, *, preset):
         parent_budget_lease_ref=binding.parent_budget_lease_ref, preset=preset)
     if duplicate is not None:
         return duplicate
+    graph.local_module_admission.require_v1(("d04", "d11", "d12"), "d04-root:adopt")
     assembly, store = graph._GraphCoordinator__d04_installed_joint_assembly, graph._GraphCoordinator__store
     port = graph._GraphCoordinator__c04_authority_port_v3
     if type(port) is not InstalledC04AuthorityPortV3 or executed.terminal is None:

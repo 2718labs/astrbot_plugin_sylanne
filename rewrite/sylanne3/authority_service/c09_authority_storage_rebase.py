@@ -7,6 +7,8 @@ No source SQLite file is modified and no SQLite backup is used.
 
 from __future__ import annotations
 
+from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+
 from dataclasses import dataclass
 from contextlib import closing
 from hashlib import sha256
@@ -45,9 +47,12 @@ from .c09_life_completed_archive_v1 import (
 
 _KNOWN_CORE_TABLES = frozenset({
     "authority_meta", "authority_namespaces", "authority_transfers",
+    "authority_natural_disposition_originals_v1",
     "authority_permits", "authority_effects", "authority_events",
     "authority_v2_meta", "authority_v2_epochs", "authority_v2_fences",
     "authority_v2_mutations", "authority_v2_never_begun",
+    "authority_installation_management_v1", "authority_installation_management_grants_v1",
+    "authority_installation_management_events_v1", "authority_installation_management_receipts_v1",
     "authority_erasure_surface_registry_v1",
     "authority_erasure_cleanup_runs_v1",
     "authority_erasure_execution_inventory_v1",
@@ -62,9 +67,11 @@ _KNOWN_CORE_TABLES = frozenset({
     "authority_d12_target_owner_admissions_v1",
     "authority_d12_lifecycle_heads_v1", "authority_d12_lifecycle_operations_v1",
     "authority_d12_lifecycle_receipts_v1", "authority_d12_lifecycle_bootstraps_v1",
+    "authority_graph_catalogue_upgrades_v1",
     "authority_dispatch_admission_epoch_v1",
     "authority_execution_handoff_starts_v1",
     "authority_execution_handoff_graph_receipts_v1",
+    "authority_natural_final_observations_v4",
     "authority_migration_v2_meta", "authority_migration_v2_plans",
     "authority_migration_v2_receipts",
     "authority_model_egress_v1", "authority_model_egress_bindings_v1",
@@ -280,6 +287,28 @@ def _build_file(source: sqlite3.Connection, target: Path,
     if observed & set(_PACKAGE_CORE_SCHEMAS):
         from .d12_package_maintenance_authority_v2 import validate_package_authority_schema_v2
         validate_package_authority_schema_v2(source)
+    if "authority_natural_disposition_originals_v1" in observed:
+        _require_natural_disposition_original_inventory_v1(source)
+    if "authority_graph_catalogue_upgrades_v1" in observed:
+        from .graph_catalogue_upgrade_v1 import validate_catalogue_upgrade_core_schema_v1
+        validate_catalogue_upgrade_core_schema_v1(source)
+    if "authority_worker_result_read_attempts_v1" in observed:
+        from .v2_worker_model_result_attempts import (
+            require_worker_result_read_attempt_schema_v1,
+            validate_worker_result_read_attempt_row_v1,
+            require_worker_result_read_attempt_fence_v1)
+        require_worker_result_read_attempt_schema_v1(source)
+        table = "authority_worker_result_read_attempts_v1"
+        for row in _rows(source, table):
+            attempt = validate_worker_result_read_attempt_row_v1(_columns(source, table), row)
+            if attempt.request.authority_namespace == transform.namespace:
+                require_worker_result_read_attempt_fence_v1(
+                    source, attempt=attempt, authority_id=transform.authority_id,
+                    authority_namespace=transform.namespace,
+                    installation_id=transform.installation_id)
+                from .d11_artifact_draft_model_v1 import ArtifactDraftModelResultReadRequestV1
+                if type(attempt.request) is ArtifactDraftModelResultReadRequestV1:
+                    _require_c4_read_attempt_core_original_v1(source,attempt)
     if observed & set(MODEL_TABLES):
         from .v2_model_egress_store import (_DDL, _BINDING_DDL, _OBSERVATION_DDL, _OBSERVATION_STATUS_DDL,
             _ADMISSION_DDL, _ORIGINAL_IDENTITY_DDL, _JOB_INDEX_DDL)
@@ -384,6 +413,59 @@ def _build_file(source: sqlite3.Connection, target: Path,
             tuple(changed))
 
 
+def _require_natural_disposition_original_inventory_v1(source):
+    """The same-Core signed metadata family has explicit retirement, never an exemption."""
+    import hmac
+    from .natural_disposition_maintenance_v1 import (ORIGINAL_TABLE, ORIGINAL_COLUMNS, ORIGINAL_DDL,
+        ORIGINAL_TRIGGER_DDLS, SIGNING_KEY_PREFIX, core_original_from_wire_v1)
+    from ..runtime_contracts import canonical_digest, canonical_serialize
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.execute(ORIGINAL_DDL)
+        for ddl in ORIGINAL_TRIGGER_DDLS:
+            reference.execute(ddl)
+        for db in (source, reference):
+            if _columns(db, ORIGINAL_TABLE) != ORIGINAL_COLUMNS:
+                raise AuthorityUnavailable("C09 natural disposition Core columns differ")
+        actual = tuple(source.execute("SELECT type,name,sql FROM sqlite_master WHERE tbl_name=? ORDER BY type,name", (ORIGINAL_TABLE,)))
+        wanted = tuple(reference.execute("SELECT type,name,sql FROM sqlite_master WHERE tbl_name=? ORDER BY type,name", (ORIGINAL_TABLE,)))
+        if actual != wanted:
+            raise AuthorityUnavailable("C09 natural disposition immutable Core schema differs")
+    finally:
+        reference.close()
+    originals = {}
+    for row in _rows(source, ORIGINAL_TABLE):
+        value = core_original_from_wire_v1(json.loads(row[5]))
+        if (canonical_serialize(value.to_wire()) != row[5]
+                or row[:5] != (value.authority_namespace, value.installation_id, value.kind, value.operation_id, value.original_ref)
+                or row[6:] != (value.payload_digest, value.signature)):
+            raise AuthorityUnavailable("C09 natural disposition original columns/commitment differ")
+        key = source.execute("SELECT value FROM authority_meta WHERE key=?",
+            (SIGNING_KEY_PREFIX + canonical_digest((value.authority_namespace, value.installation_id)),)).fetchone()
+        if key is None or len(key[0]) != 64 or any(c not in "0123456789abcdef" for c in key[0]):
+            raise AuthorityUnavailable("C09 natural disposition actual Core signing material missing")
+        material = {k:v for k,v in value.to_wire().items() if k != "signature"}
+        expected = hmac.new(bytes.fromhex(key[0]), b"sylanne.natural-disposition-original.v1\0" +
+            canonical_serialize(material).encode("utf-8"), sha256).hexdigest()
+        if not hmac.compare_digest(expected, value.signature):
+            raise AuthorityUnavailable("C09 natural disposition original lost its private Core signature")
+        originals[value.original_ref] = value
+    for value in originals.values():
+        if value.kind == "rejected_no_commit":
+            from .natural_disposition_maintenance_v1 import validate_original_terminal_fence_in_tx_v1
+            validate_original_terminal_fence_in_tx_v1(source, value)
+            if value.payload["state"] == "proven_no_preparation_no_graph_commit":
+                continue
+        if value.kind.endswith("_committed") or value.kind == "rejected_no_commit":
+            parent = originals.get(value.payload["prepared_original_ref"])
+            if (parent is None or parent.digest != value.payload["prepared_original_digest"]
+                    or (parent.authority_namespace, parent.installation_id, parent.operation_id, parent.parent_original_id) !=
+                       (value.authority_namespace, value.installation_id, value.operation_id, value.parent_original_id)
+                    or not parent.kind.endswith("_prepared")):
+                raise AuthorityUnavailable("C09 natural disposition confirmation lost its actual prepared original")
+    return True
+
+
 def _change(table: str, columns: tuple[str, ...], old: tuple,
             disposition: str, new: tuple | None = None) -> RowDispositionV1:
     key = _digest((table, tuple(_cell(value) for value in old[:2])))
@@ -397,6 +479,189 @@ def _need_columns(table: str, columns: tuple[str, ...], names: tuple[str, ...]) 
         raise AuthorityUnavailable(
             f"C09 installed {table} missing columns: " +
             ", ".join(name for name in names if name not in columns))
+
+
+def _require_c4_read_attempt_core_original_v1(source,attempt):
+    """Bind the closed fourth variant to its real original model call metadata."""
+    from .v2_model_egress_store import AuthorityV2ModelEgressStore
+    from .d11_artifact_draft_model_v1 import ArtifactDraftModelResultReadRequestV1
+    request=attempt.request
+    if type(request) is not ArtifactDraftModelResultReadRequestV1:
+        raise AuthorityUnavailable("C09 C4 read-attempt classification needs exact request")
+    record=AuthorityV2ModelEgressStore._read(source,request.call_id)
+    if record is None or (record.intent.authority_id,record.intent.namespace,record.intent.job_id,
+            record.intent.acquire_operation_id,record.intent.binding_digest,record.intent.request_digest)!= (
+            request.authority_id,request.authority_namespace,request.job_id,request.acquire_operation_id,
+            request.binding_digest,request.model_request_digest):
+        raise AuthorityUnavailable("C09 C4 read-attempt crossed original model call/acquire/request")
+    identity=source.execute("SELECT installation_id FROM authority_model_original_identity_v2 WHERE call_id=?",
+        (request.call_id,)).fetchone()
+    if identity!=(request.installation_id,):raise AuthorityUnavailable("C09 C4 read-attempt crossed installed model original")
+
+
+
+def _owner_stop_reply_core_dispositions_v1(core_db,*,control,operation_id,issue,mirror):
+    """Join immutable stop groups to the selected Graph and its certified target."""
+    from dataclasses import asdict
+    from ..runtime.c09_foreground_attempt_v1 import _selected_context_v1
+    from ..runtime.c09_graph_rebase_candidate_v1 import graph_source_files_fingerprint_v1,_row_digest
+    from .c09_graph_rebase_issue_v1 import verify_graph_rebase_issue_signature_v1
+    from .owner_stop_reply_v1 import (PLAN_SCHEMA,decode_owner_stop_reply_plan_v1,
+        validate_owner_stop_reply_core_row_v1,owner_reply_cycle_retirement_commitment_v1)
+    from ..runtime.owner_stop_reply_v1 import read_original_owner_reply_cycle_identity_v1
+    from ..runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from ..runtime.jobs import get_job
+    from ..runtime.d11_types import job_graph_write
+    from ..runtime.foreground_cycle_v1 import ForegroundResponsibilityV1
+    from ..runtime.domain_production_original_codec_v1 import decode_typed_production_value_v1
+    from ..runtime_contracts import canonical_digest,canonical_serialize
+    from ..graph_types import AtomKey
+    table="authority_d12_operation_originals_v1"
+    if core_db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone() is None:return {}
+    selected=[]
+    for row in core_db.execute("SELECT * FROM authority_d12_operation_originals_v1 WHERE namespace=?",(issue.namespace,)):
+        plan=json.loads(row[7])
+        if plan.get("schema")==PLAN_SCHEMA:
+            validate_owner_stop_reply_core_row_v1(row);selected.append((tuple(row),plan))
+    if not selected:return {}
+    context,intent,members=_selected_context_v1(control,operation_id)
+    source=Path(members["graph"]["resolved_path"]);target=Path(intent["details"]["targets"]["graph"])
+    verify_graph_rebase_issue_signature_v1(issue,control._key)
+    if (_identity(target)!=mirror.final_file_identity or _file_sha(target)!=mirror.final_file_sha256
+            or Path(core_db.execute("PRAGMA database_list").fetchone()[2]).resolve(strict=True)!=Path(members["core"]["resolved_path"])
+            or issue.source_path!=str(source) or issue.target_path!=str(target)
+            or issue.certificate_digest!=mirror.certificate.certificate_digest or issue.authority_id!=control.authority_id
+            or issue.operation_id!=operation_id or issue.source_files_fingerprint!=graph_source_files_fingerprint_v1(source)):
+        raise AuthorityUnavailable("C09 stop groups are outside the real selected Core/Graph certified source")
+    manifests={m.table_name:{r.row_key_digest:r for r in m.rows} for m in mirror.certificate.table_manifests}
+    groups={}
+    for row,plan in selected:groups.setdefault(row[1],[]).append((row,plan))
+    result={}
+    with closing(sqlite3.connect(source.as_uri()+"?mode=ro",uri=True)) as graph,closing(sqlite3.connect(target.as_uri()+"?mode=ro",uri=True)) as candidate:
+        graph.execute("PRAGMA query_only=ON");graph.execute("BEGIN")
+        candidate.execute("PRAGMA query_only=ON");candidate.execute("BEGIN")
+        def disposition(table,row):
+            info=tuple(graph.execute("PRAGMA table_info("+table+")"));columns=tuple(x[1] for x in info)
+            primary=tuple(x[1] for x in sorted((x for x in info if x[5]),key=lambda x:x[5]))
+            if row is None or not primary:raise AuthorityUnavailable("C09 stop lineage source row absent: "+table)
+            key=tuple(row[columns.index(name)] for name in primary)
+            proof=manifests.get(table,{}).get(canonical_digest((table,key)))
+            if proof is None or proof.old_commitment!=_row_digest(row) or proof.disposition not in {"preserved_exact","derived_removed"}:
+                raise AuthorityUnavailable("C09 stop lineage has no exact certified row disposition: "+table)
+            actual=candidate.execute("SELECT * FROM "+table+" WHERE "+" AND ".join(name+"=?" for name in primary),key).fetchone()
+            if (proof.disposition=="preserved_exact" and (actual!=row or proof.new_commitment!=proof.old_commitment)
+                    or proof.disposition=="derived_removed" and actual is not None):
+                raise AuthorityUnavailable("C09 stop lineage candidate disagrees with its real certified closure")
+            return proof.disposition
+        for stop_operation,group in groups.items():
+            base,plan=group[0];request,_=decode_owner_stop_reply_plan_v1(plan)
+            if request.installation_id!=control.installation_id:
+                raise AuthorityUnavailable("C09 stop original crossed its actual installed cohort")
+            if any(row[4:]!=base[4:] or other!=plan for row,other in group):
+                raise AuthorityUnavailable("C09 initial/derived StopReply group changed its original plan/Owner scope")
+            identity,cycle=read_original_owner_reply_cycle_identity_v1(graph,namespace=request.namespace,request=request)
+            if asdict(identity)!=plan["scope"]:
+                raise AuthorityUnavailable("C09 stop plan has no exact actual historical cycle/create/C02 identity")
+            ns=request.namespace.as_tuple;states=[]
+            states.append(disposition("runtime_jobs",graph.execute("SELECT * FROM runtime_jobs WHERE job_id=?",(cycle.job_id,)).fetchone()))
+            states.append(disposition("graph_atoms",graph.execute("SELECT * FROM graph_atoms WHERE token=?",(request.cycle_job_ref,)).fetchone()))
+            create=read_adopted_domain_operation_v1(graph,request.namespace,cycle.operation_id)
+            states.append(disposition("graph_domain_production_originals_v1",graph.execute("SELECT * FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND operation_id=?",(*ns,cycle.operation_id)).fetchone()))
+            for producer in (cycle.operation_id,request.c02_operation_id):
+                states.append(disposition("graph_bundle_operations",graph.execute("SELECT * FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",(*ns,producer)).fetchone()))
+            if identity.responsibility_ref is not None:
+                responsibility=decode_typed_production_value_v1(create["payload"]["provenance"]["foreground_responsibility"],ForegroundResponsibilityV1)
+                kind="foreground_post_c02_cause" if responsibility.mode=="bounded_causal_window_v1" else "draft_root_capability"
+                states.append(disposition("graph_d11_life_originals_v1",graph.execute("SELECT * FROM graph_d11_life_originals_v1 WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*ns,kind,responsibility.cause_original_ref)).fetchone()))
+            for job_ref,original_ref,original_digest in plan["child_originals"]:
+                child=get_job(graph,AtomKey.from_token(job_ref).name)
+                if job_graph_write(child).key.token!=job_ref or (child.bot_id,child.persona_id)!=ns:
+                    raise AuthorityUnavailable("C09 stop child locator is not its actual same-namespace job")
+                states.append(disposition("runtime_jobs",graph.execute("SELECT * FROM runtime_jobs WHERE job_id=?",(child.job_id,)).fetchone()))
+                states.append(disposition("graph_atoms",graph.execute("SELECT * FROM graph_atoms WHERE token=?",(job_ref,)).fetchone()))
+                carrier=_owner_stop_reply_child_carrier_v1(graph,request.namespace,cycle,child,original_ref,original_digest)
+                for family,row in carrier:states.append(disposition(family,row))
+            for row,_ in group:
+                from ..runtime.lifecycle_operations_v1 import decode_original
+                original=decode_original(json.loads(row[3]))
+                for ref in original.result.domain_receipt_refs:
+                    rows=graph.execute("SELECT * FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND domain='d11' AND substr(original_digest,1,48)=? LIMIT 2",(*ns,ref.removeprefix("d11-current:"))).fetchall()
+                    if len(rows)!=1:raise AuthorityUnavailable("C09 derived stop lost its actual Graph projection original")
+                    projection=read_adopted_domain_operation_v1(graph,request.namespace,rows[0][2])
+                    if projection["operation_kind"]!="owner_stop_reply_v1" or projection["payload"]["provenance"]["cycle_identity"]!=plan["scope"]:
+                        raise AuthorityUnavailable("C09 derived stop projection belongs to another actual control scope")
+                    states.append(disposition("graph_domain_production_originals_v1",rows[0]))
+            state="derived_removed" if "derived_removed" in states else "preserved_exact"
+            commitment=owner_reply_cycle_retirement_commitment_v1(base[0],request.cycle_job_ref,stop_operation)
+            for row,_ in group:result[row[:3]]=(row,state,AtomKey.from_token(request.cycle_job_ref).name,commitment)
+    if _identity(target)!=mirror.final_file_identity or _file_sha(target)!=mirror.final_file_sha256:
+        raise AuthorityUnavailable("C09 stop lineage certified candidate changed during the actual source/target join")
+    control.verify_member_v1(members["graph"],prepared=False);context.require_current("maintenance")
+    return result
+
+
+def _owner_stop_reply_child_carrier_v1(db,namespace,cycle,job,original_ref,original_digest):
+    """Closed immutable metadata carriers; no caller-selected table or codec."""
+    from ..runtime_contracts import canonical_digest
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from ..runtime.d11_types import job_graph_write
+    ns=namespace.as_tuple
+    from ..runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+    continuation=foreground_cycle_from_wire_v1(cycle.continuation)
+    if job.work_kind in {"artifact_draft_v1","d10.life.source_note.v1","d10.life.artifact_draft.v1"}:
+        kind="c4_prepared" if job.work_kind=="artifact_draft_v1" else "prepared"
+        row=db.execute("SELECT * FROM graph_d11_life_originals_v1 WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*ns,kind,original_ref)).fetchone()
+        if row is None or row[6]!=original_digest:raise AuthorityUnavailable("C09 stop child lost its actual Life/C4 signed metadata carrier")
+        if kind=="c4_prepared":
+            from ..runtime.d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1
+            binding=decode_artifact_draft_original_v1(kind,json.loads(row[5]))
+            if binding.selector.cycle_job_ref!=job_graph_write(cycle).key.token or binding.selector.c02_operation_id!=continuation.c02_operation_id:
+                raise AuthorityUnavailable("C09 C4 child belongs to another original reply cycle")
+        else:
+            from ..runtime.d11_life_contract_v1 import D11LifeExecutionBindingV1,life_from_wire_v1
+            encoded=db.execute("SELECT json_extract(payload_json,'$.binding') FROM graph_d11_life_originals_v1 "
+                "WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",(*ns,original_ref)).fetchone()
+            binding=life_from_wire_v1(json.loads(encoded[0]),D11LifeExecutionBindingV1)
+            if binding.activity_id!=cycle.activity_id:raise AuthorityUnavailable("C09 Life child belongs to another original reply activity")
+        if (binding.job_id,binding.operation_id,binding.activity_id)!=(job.job_id,job.operation_id,job.activity_id):
+            raise AuthorityUnavailable("C09 stop Life/C4 child crossed its immutable producer")
+        return (("graph_d11_life_originals_v1",row),)
+    if job.work_kind=="d04.appraisal":
+        from ..runtime.d04_appraisal_driver_v3 import read_current_d04_appraisal_original_v3
+        from ..runtime.d04_product_pipeline_v3 import ids
+        if ids(namespace,continuation.c02_operation_id)["job"]!=job.job_id:
+            raise AuthorityUnavailable("C09 C2 child belongs to another immutable C02")
+        value=read_current_d04_appraisal_original_v3(db,namespace,job.job_id)
+        row=db.execute("SELECT * FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind='appraisal' AND original_ref=?",(*ns,original_ref)).fetchone()
+        if value is None or row is None or value.digest!=original_digest or value.job_id!=job.job_id or value.operation_id!=job.operation_id:
+            raise AuthorityUnavailable("C09 stop C2 child lost actual appraisal metadata")
+        return (("graph_d04_originals_v3",row),)
+    if job.work_kind in {"natural_generation","natural_review"}:
+        from ..runtime.foreground_cycle_v1 import _read_reply_natural_metadata_v1
+        from ..runtime.natural_reply_job_v2 import _table
+        stage=job.work_kind.removeprefix("natural_");table=_table(stage)
+        value=_read_reply_natural_metadata_v1(db,namespace,continuation.c02_operation_id,stage)
+        if value is None:raise AuthorityUnavailable("C09 stop natural child original absent")
+        seal=value[0]
+        if ((seal.original_operation_id,seal.job_id,canonical_digest(plain_v1(seal)))!=(original_ref,job.job_id,original_digest)
+                or job.operation_id!=original_ref or seal.parent_budget_lease_id!=continuation.call_plan.protected_reply_lease_ref):
+            raise AuthorityUnavailable("C09 stop natural child lost immutable sealed identity")
+        row=db.execute("SELECT * FROM "+table+" WHERE bot=? AND persona=? AND job_id=?",(*ns,job.job_id)).fetchone()
+        operation=db.execute("SELECT * FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",(*ns,job.operation_id)).fetchone()
+        return ((table,row),("graph_bundle_operations",operation))
+    if job.work_kind=="message":
+        from ..runtime.foreground_cycle_v1 import _read_reply_natural_metadata_v1,_read_reply_message_metadata_v1
+        generation=_read_reply_natural_metadata_v1(db,namespace,continuation.c02_operation_id,"generation")
+        review=_read_reply_natural_metadata_v1(db,namespace,continuation.c02_operation_id,"review")
+        if generation is None or review is None:raise AuthorityUnavailable("C09 stopped message lacks actual natural parent seals")
+        messages=_read_reply_message_metadata_v1(db,namespace=namespace,generation_seal=generation[0],review_seal=review[0])
+        found=tuple(value for value in messages if value[0].job_id==job.job_id)
+        if len(found)!=1 or (found[0][1],found[0][2])!=(original_ref,original_digest):
+            raise AuthorityUnavailable("C09 stop message child lost its actual immutable batch metadata")
+        row=db.execute("SELECT * FROM graph_atoms WHERE token=?",(original_ref,)).fetchone()
+        operation=db.execute("SELECT * FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",(*ns,job.operation_id)).fetchone()
+        return (("graph_atoms",row),("graph_bundle_operations",operation))
+    raise AuthorityUnavailable("C09 StopReply child metadata family has no registered codec")
 
 
 class _CoreTransform:
@@ -447,6 +712,8 @@ class _CoreTransform:
         self.current_originals = {} if current_originals is None else current_originals
         self.model_originals = self.current_originals.get("model_budget_originals", ())
         self.model_by_call = {original.call_id: original for original in self.model_originals}
+        self.foreground_fences = self.current_originals.get("foreground_fences", {})
+        self.owner_reply_stops = self.current_originals.get("owner_reply_stops", {})
 
     def _consume(self, kind: str, item_id: str, operation_id: str,
                  original_commitment: str) -> None:
@@ -472,6 +739,37 @@ class _CoreTransform:
                  rows: tuple[tuple, ...]) -> tuple[tuple[tuple, ...],
                                                  tuple[RowDispositionV1, ...]]:
         changes: list[RowDispositionV1] = []
+        if table == "authority_natural_disposition_originals_v1":
+            from .natural_disposition_maintenance_v1 import ORIGINAL_COLUMNS, core_original_from_wire_v1
+            if columns != ORIGINAL_COLUMNS:
+                raise AuthorityUnavailable("C09 natural disposition original inventory columns differ")
+            output = []
+            for old in rows:
+                value = core_original_from_wire_v1(json.loads(old[5]))
+                if value.authority_namespace != self.namespace:
+                    output.append(old)
+                    continue
+                # C09 retires this source-dependent roster evidence. Original
+                # admission, UNKNOWN, execution and fee families have their own
+                # existing retained-fact contracts and are never cleared here.
+                self._consume("natural_disposition_original_v1", value.original_ref,
+                    value.operation_id, value.digest)
+                changes.append(_change(table, columns, old, "derived_removed"))
+            return tuple(output), tuple(changes)
+        if table == "authority_worker_result_read_attempts_v1":
+            from .v2_worker_model_result_attempts import (
+                validate_worker_result_read_attempt_row_v1)
+            output = []
+            for old in rows:
+                attempt = validate_worker_result_read_attempt_row_v1(columns, old)
+                request = attempt.request
+                if request.authority_namespace != self.namespace:
+                    output.append(old)
+                    continue
+                self._consume("worker_result_read_attempt", request.read_attempt_id,
+                    request.consumer_operation_id, _row_commitment(table, columns, old))
+                changes.append(_change(table, columns, old, "payload_erased_retained_facts"))
+            return tuple(output), tuple(changes)
         if table == _CONTACT_POLICY_TABLE:
             from .c09_contact_policy_rows_v1 import validate_contact_policy_core_row_v1
             for row in rows:
@@ -554,7 +852,7 @@ class _CoreTransform:
         if table in {"authority_d12_operation_originals_v1", "authority_d12_target_leases_v1",
                      "authority_d12_target_owner_admissions_v1", "authority_d12_lifecycle_heads_v1",
                      "authority_d12_lifecycle_operations_v1", "authority_d12_lifecycle_receipts_v1",
-                     "authority_d12_lifecycle_bootstraps_v1"}:
+                     "authority_d12_lifecycle_bootstraps_v1", "authority_graph_catalogue_upgrades_v1"}:
             from .d12_c09_core_rows_v1 import validate_d12_core_row_v1
             output = []
             for old in rows:
@@ -562,6 +860,15 @@ class _CoreTransform:
                 if namespace != self.namespace:
                     output.append(old)
                     continue
+                if table=="authority_d12_operation_originals_v1":
+                    from .owner_stop_reply_v1 import PLAN_SCHEMA
+                    if json.loads(old[7]).get("schema")==PLAN_SCHEMA:
+                        proof=self.owner_reply_stops.get(old[:3])
+                        if proof is None or proof[0]!=old:raise AuthorityUnavailable("C09 actual StopReply group/closure is unconfirmed")
+                        if proof[1]=="preserved_exact":
+                            output.append(old);continue
+                        if proof[1]!="derived_removed":raise AuthorityUnavailable("C09 unregistered StopReply group disposition")
+                        self._consume("owner_reply_cycle_stop_v1",proof[2],old[1],proof[3])
                 self._consume(kind, item_id, operation_id or self.operation_id,
                               _row_commitment(table, columns, old))
                 if table == "authority_d12_operation_originals_v1":
@@ -624,6 +931,17 @@ class _CoreTransform:
                     output.append(old)
                     continue
                 op = old[columns.index("operation_id")]
+                if table == "authority_v2_fences" and op.startswith("foreground-domain-"):
+                    verified = self.foreground_fences.get(op)
+                    if verified is None or tuple(old) != verified[0]:
+                        raise AuthorityUnavailable("C09 foreground actual finished fence/Graph disposition is unconfirmed; HOLD")
+                    if verified[1] == "preserved_exact":
+                        # A surviving Graph receipt needs this real immutable finish
+                        # on the next C09; it cannot be replaced by a guessed DTO.
+                        output.append(old)
+                        continue
+                    if verified[1] != "derived_removed":
+                        raise AuthorityUnavailable("C09 foreground fence disposition is unregistered")
                 if table == "authority_v2_mutations" and old[columns.index("mutation_kind")] == "deletion":
                     # Historical pending/accepted/closed originals remain byte exact.
                     output.append(old)
@@ -1076,7 +1394,12 @@ def build_authority_storage_rebase_connections_v1(*, core_db, execution_db, dele
         "authority_execution_recovery_facts_v4":(namespace,operation_id,canonical_serialize(asdict(frame))),
         "authority_c09_graph_rebase_issues_v1":(namespace,operation_id,canonical_serialize(asdict(issue))),
     }
-    current_originals["model_budget_originals"] = read_model_budget_originals_v1(core_db, namespace=namespace, operation_id=operation_id)
+    current_originals["model_budget_originals"] = read_model_budget_originals_v1(core_db, namespace=namespace, operation_id=operation_id, meter=current_c09_sql_meter_v2())
+    from ..runtime.c09_foreground_attempt_v1 import foreground_core_dispositions_v1
+    current_originals["foreground_fences"] = foreground_core_dispositions_v1(core_db,
+        control=control, operation_id=operation_id, issue=issue, mirror=graph_mirror)
+    current_originals["owner_reply_stops"]=_owner_stop_reply_core_dispositions_v1(core_db,
+        control=control,operation_id=operation_id,issue=issue,mirror=graph_mirror)
     transform = _CoreTransform(namespace=namespace,operation_id=operation_id,
         authority_id=seal.authority_id,pin_digest=pin.pin_digest,new_journal_id=fresh_id,
         new_anchor_nonce=saved_plan["details"]["new_anchor_nonce"],

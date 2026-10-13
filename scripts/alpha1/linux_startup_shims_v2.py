@@ -9,6 +9,18 @@ from pathlib import Path
 import re
 
 
+def selected_authority_command_v2(*, executable, package_root, deployment_path, selection_revision, cohort_digest):
+    """One exact final argv, shared by the fixed bootstrap and PID1 observer."""
+    if (any(not Path(value).is_absolute() for value in (executable, package_root, deployment_path))
+            or type(selection_revision) is not int or selection_revision < 0
+            or type(cohort_digest) is not str
+            or re.fullmatch(r'[0-9a-f]{64}', cohort_digest) is None):
+        raise ValueError('verified current startup selection required')
+    return (executable, '-B', str(Path(package_root)/'scripts/alpha1/authority_linux_service.py'),
+            '--config', deployment_path, '--selection-revision', str(selection_revision),
+            '--cohort-digest', cohort_digest)
+
+
 def startup_shim_sources_v2(*,profile_id,bootstrap_root='/opt/sylanne/bootstrap',control_directory='/etc/sylanne/maintenance'):
     if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}',profile_id) is None:
         raise ValueError('installed profile required')
@@ -54,9 +66,11 @@ if set(value)!={{'selection','package_root','deployment_path','profile_id','veri
     raise RuntimeError('fixed startup selection fields differ')
 if value['verification_scope']!='authority_full_cohort': raise RuntimeError('Authority requires complete private configuration verification')
 selection=value['selection']
-entry=Path(value['package_root'])/'scripts'/'alpha1'/'authority_linux_service.py'
-os.execv(sys.executable,[sys.executable,'-B',str(entry),'--config',value['deployment_path'],
-    '--selection-revision',str(selection['revision']),'--cohort-digest',selection['cohort_digest']])
+sys.path.insert(0,{str(Path(bootstrap_root)/'runtime')!r})
+from scripts.alpha1.linux_startup_shims_v2 import selected_authority_command_v2
+command=selected_authority_command_v2(executable=sys.executable,package_root=value['package_root'],
+    deployment_path=value['deployment_path'],selection_revision=selection['revision'],cohort_digest=selection['cohort_digest'])
+os.execv(command[0],command)
 '''
     plugin_init = f'''"""Fixed AstrBot package shim; a fresh Host resolves one protected cohort."""
 import importlib

@@ -50,7 +50,8 @@ class AuthorityServiceCore:
 
     def __init__(self, path, *, authorizer, deletion_verifier,
                  execution_verifier, effect_verifier, dispatch_verifier,
-                 create: bool = False, execution_redaction_c04_service=None):
+                 create: bool = False, execution_redaction_c04_service=None,
+                 selected_storage=None, storage_context=None, maintenance_basis=None):
         for name, value in (
             ("authorizer", authorizer), ("deletion_verifier", deletion_verifier),
             ("execution_verifier", execution_verifier),
@@ -86,7 +87,30 @@ class AuthorityServiceCore:
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
-        self._install_schema()
+        self._runtime_storage_v3 = None
+        if selected_storage is not None or maintenance_basis is not None:
+            from ..runtime_storage_v3 import (install_selected_runtime_storage_v3,
+                install_selected_maintenance_storage_v3,install_runtime_storage_schema_v3)
+            try:
+                if selected_storage is not None and maintenance_basis is not None:
+                    raise AuthorityUnavailable("business selection and maintenance basis are mutually exclusive")
+                if maintenance_basis is not None:
+                    from .daemon import _bootstrap_control_quantum_v3
+                    with _bootstrap_control_quantum_v3(maintenance_basis.basis.control):
+                        self._runtime_storage_v3=install_selected_maintenance_storage_v3(
+                            self._db,role="core",basis=maintenance_basis)
+                        install_runtime_storage_schema_v3(self._db,handle=self._runtime_storage_v3)
+                else:
+                    self._runtime_storage_v3=install_selected_runtime_storage_v3(
+                        self._db,role="core",selected=selected_storage,context=storage_context)
+                    install_runtime_storage_schema_v3(self._db,handle=self._runtime_storage_v3)
+            except BaseException:
+                if self._runtime_storage_v3 is not None:self._runtime_storage_v3.close()
+                self._db.close()
+                self._db=None
+                raise
+        else:
+            self._install_schema()
 
     def _install_schema(self) -> None:
         self._db.executescript("""
@@ -236,7 +260,9 @@ class AuthorityServiceCore:
             db.execute("INSERT INTO authority_meta(key,value) VALUES('service_mode','v2-only')")
 
     def _row(self, db, namespace: str):
-        row = db.execute(
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        read = c09_actual_root_read_v3(db)
+        row = read.execute(
             "SELECT holder,generation,phase,transfer_id,target,revocation_epoch,"
             "deletion_journal_id,deletion_seq,deletion_digest,deletion_phase,"
             "execution_journal_id,execution_seq,execution_digest,anchor_nonce "
@@ -247,7 +273,9 @@ class AuthorityServiceCore:
         return row
 
     def _id(self, db) -> str:
-        return db.execute(
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        read = c09_actual_root_read_v3(db)
+        return read.execute(
             "SELECT value FROM authority_meta WHERE key='authority_id'"
         ).fetchone()[0]
 
@@ -271,7 +299,8 @@ class AuthorityServiceCore:
         import hashlib
         payload = json.dumps(detail, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        db.execute(
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        _capture_write_v2(db,
             "INSERT INTO authority_events(namespace,kind,generation,detail_digest) "
             "VALUES(?,?,?,?)", (namespace, kind, generation, digest),
         )
@@ -452,13 +481,14 @@ class AuthorityServiceCore:
         if (type(services) is not dict or not services
                 or set(services) - {
                     "d06.association_activation.v2",
-                    "d06.association_activation.v3"}):
+                    "d06.association_activation.v3",
+                    "d06.association_activation.direct_seed.v4"}):
             raise AuthorityUnavailable("installed C04 redaction versions differ")
         for algorithm, service in services.items():
             if (type(service) is not AuthorityInternalWorkService
                     or not service.installed_runtime_verified
                     or service._component_signing_key is None
-                    or service.installed_algorithm_id != algorithm
+                    or algorithm not in service.installed_builds
                     or service.journal.namespace != namespace):
                 raise AuthorityUnavailable("formal C04 redaction verifier required")
         with self._lock:
@@ -565,7 +595,8 @@ class AuthorityServiceCore:
         from .c09_storage_control_v1 import InstalledC09StorageReaderV1
         if not isinstance(reader, InstalledC09StorageReaderV1):
             raise AuthorityUnavailable("installed C09 storage reader required")
-        context = reader.read_verified_current_storage_v1()
+        runtime=getattr(self,"_runtime_storage_v3",None)
+        context=(runtime.context if runtime is not None else reader.read_verified_current_storage_v1())
         member = next(m for m in context.manifest["members"] if m["role"] == "core")
         if member["resolved_path"] != str(self.path.resolve()):
             raise AuthorityUnavailable("Core outside C09 current manifest")
@@ -660,8 +691,9 @@ class AuthorityServiceCore:
         if db is not self._db or not db.in_transaction:
             raise AuthorityUnavailable("C09 continuation requires current Core transaction")
         from .c09_originals_archive_v1 import read_current_deletion_continuation_v1_locked
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
         transition = read_current_deletion_continuation_v1_locked(
-            db, namespace=namespace, operation_id=operation_id)
+            c09_actual_root_read_v3(db), namespace=namespace, operation_id=operation_id)
         if transition is None:
             raise AuthorityUnavailable("current C09 deletion continuation absent")
         self.verify_c09_deletion_transition_v1(
@@ -680,12 +712,14 @@ class AuthorityServiceCore:
         from .c09_originals_archive_v1 import read_current_deletion_continuation_v1_locked
         from ..runtime.restore_anchor import RestoreAnchor
         from .v2_contract import FencePermitV2, canonical_bytes
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        read = c09_actual_root_read_v3(db)
         context = self.require_current_storage_generation_locked(db, namespace=namespace, action="maintenance")
         prepared = context.prepared_original
         if (prepared is None or context.stage not in {"SWITCHED", "CLEANED", "RELEASED"}
                 or prepared["operation_id"] != operation_id
                 or prepared["anchor_transition_original"] != transition
-                or read_current_deletion_continuation_v1_locked(db, namespace=namespace, operation_id=operation_id) != transition
+                or read_current_deletion_continuation_v1_locked(read, namespace=namespace, operation_id=operation_id) != transition
                 or transition["authority_id"] != self._id(db)):
             raise AuthorityUnavailable("C09 transition detached authentication differs")
         after = RestoreAnchor(**transition["after_anchor"])
@@ -693,7 +727,7 @@ class AuthorityServiceCore:
         permit_body["pinned_anchor"] = RestoreAnchor(**permit_body["pinned_anchor"])
         permit = FencePermitV2(**permit_body)
         live = self._anchor(db, namespace, self._row(db, namespace))
-        fence = db.execute("SELECT permit FROM authority_v2_fences WHERE operation_id=?", (permit.operation_id,)).fetchone()
+        fence = read.execute("SELECT permit FROM authority_v2_fences WHERE operation_id=?", (permit.operation_id,)).fetchone()
         if live != after or permit.pinned_anchor != after or fence != (canonical_bytes(permit),):
             raise AuthorityUnavailable("C09 continuation no longer current")
         return transition
@@ -1168,9 +1202,7 @@ class AuthorityServiceCore:
             if (type(verifier) is not AuthorityInternalWorkService
                     or not verifier.installed_runtime_verified
                     or verifier._component_signing_key is None
-                    or verifier.installed_algorithm_id != binding.algorithm_ref
-                    or verifier.installed_build_digest !=
-                       binding.algorithm_build_digest
+                    or not verifier.accepts_installed_binding(binding)
                     or verifier.journal.namespace != journal.namespace
                     or verifier.journal.journal_id != journal_id
                     or verifier.journal.path.resolve() != journal.path.resolve()):
@@ -1702,6 +1734,8 @@ class AuthorityServiceCore:
     def close(self) -> None:
         with self._lock:
             if self._db is not None:
+                runtime=getattr(self,"_runtime_storage_v3",None)
+                if runtime is not None:runtime.close()
                 self._db.close()
                 self._db = None
 

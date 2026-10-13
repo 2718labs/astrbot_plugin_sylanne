@@ -148,3 +148,45 @@ def test_correction_head_and_page_cursor_hold_stale_source(tmp_path):
                    for item in current.candidates)
     finally:
         graph.close()
+
+
+@pytest.mark.parametrize("hours",(72,96))
+def test_controlled_future_read_preserves_created_source_and_ancestor_access(tmp_path,hours):
+    """Software read-time evaluation only; no Authority clock or elapsed claim."""
+    import time
+    from sylanne3.memory_types import access_key
+    registry=TypeRegistry()
+    for spec in D06DomainProvider.type_specs():registry.register(spec)
+    path=tmp_path/"temporal-memory.db"
+    graph=GraphStore(path,registry);repository=MemoryRepository(graph,*NS.as_tuple)
+    recorded=time.time()
+    try:
+        for index,(source_id,parents) in enumerate((("time-parent",()),("time-child",("time-parent",)))):
+            repository.ingest(Event(SCOPE,"time-ingest-"+source_id,recorded,"ingest",{}),
+                SourceRecord(source_id,"current fixture "+source_id,"alice","reported","reported",
+                    recorded,recorded,"controlled-read-fixture",("owner",),("context",),parents))
+        keys=tuple(key for name in ("time-parent","time-child") for key in
+            (source_key(*NS.as_tuple,name),access_key(*NS.as_tuple,name)))
+        before=graph.graph_snapshot(keys)
+        actual,proof=repository.read_source_evidence("time-child",audience="owner",purpose="context",
+            as_known_at=recorded+hours*3600)
+        assert actual is not None and actual.recorded_at==recorded and actual.parent_source_ids==("time-parent",)
+        assert repository.read_source_evidence("time-child",audience="foreign",purpose="context",
+            as_known_at=recorded+hours*3600)[0] is None
+        assert graph.graph_snapshot(keys)==before
+    finally:graph.close()
+    graph=GraphStore(path,registry);repository=MemoryRepository(graph,*NS.as_tuple)
+    try:
+        actual,proof=repository.read_source_evidence("time-child",audience="owner",purpose="context",
+            as_known_at=recorded+hours*3600)
+        assert actual is not None and actual.recorded_at==recorded
+        assert graph.graph_snapshot(keys)==before
+        now=time.time()
+        repository.set_access(Event(SCOPE,"time-parent-withdraw",now,"withdraw",{}),"time-parent",
+            audiences=("owner",),purposes=("context",),status="withdrawn",recorded_at=now)
+        assert repository.read_source_evidence("time-child",audience="owner",purpose="context",
+            as_known_at=recorded+hours*3600)[0] is None
+        assert graph.graph_snapshot(tuple(source_key(*NS.as_tuple,name) for name in
+            ("time-parent","time-child"))).versions==tuple(version for version in before.versions
+                if version.key.type_name=="memory.source")
+    finally:graph.close()

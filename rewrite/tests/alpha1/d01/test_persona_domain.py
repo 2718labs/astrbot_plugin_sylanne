@@ -184,3 +184,143 @@ class PersonaDomainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_registered_method_policy_changes_choice_without_changing_values_or_hard_eligibility():
+    from sylanne3.domains.d01 import (method_policy_state_v1, method_preference_edges_v1,
+        FULL_DRAFT_METHOD_V1, TONE_SAMPLE_METHOD_V1)
+    from sylanne3.domains.d07 import METHOD_CONDITION_IDS_V1
+    from sylanne3.domains.d08.personal_plan_v1 import QualifiedPersonalCandidateV1, select_personal_step_v2
+    from sylanne3.memory_types import source_key
+    mapping = (("candidate:full", FULL_DRAFT_METHOD_V1), ("candidate:sample", TONE_SAMPLE_METHOD_V1))
+    conditions = tuple((name, index < 6) for index, name in enumerate(METHOD_CONDITION_IDS_V1))
+    full = QualifiedPersonalCandidateV1("candidate:full", "action:full", "task:full", "a" * 64,
+        "eligible", 1, True, None, "quote:full")
+    sample = replace(full, candidate_ref="candidate:sample", action_ref="action:sample", node_id="task:sample",
+        semantic_digest="b" * 64, quote_ref="quote:sample")
+    kwargs = dict(decision_id="decision:method", candidates=(sample, full),
+        source_refs=(source_key("bot", "persona", "method-contract").token,), read_versions=())
+    actual_plan = plan()
+    view = PersonaDomain().project(actual_plan, context_tags=(), role_binding_complete=False)
+    before = PersonaDomain().evaluate_values(view, {ref: () for ref, _ in mapping})
+    for state, expected in (("ST0", "action:full"), ("ST2", "action:sample")):
+        claim = '{"schema":"d01.method-policy.v1","policy_id":"CP-tone-order","strategy_state":"' + state + '"}'
+        policy = method_policy_state_v1(claim)
+        scope, edges = method_preference_edges_v1(policy, mapping, conditions, complete=True)
+        assert scope == "applicable"
+        assert select_personal_step_v2(preference_edges=edges, **kwargs).chosen_action_ref == expected
+        assert PersonaDomain().evaluate_values(view, {ref: () for ref, _ in mapping}) == before
+    assert before.action_authorized is False and not before.rejected
+    _, edges = method_preference_edges_v1("ST2", mapping, conditions, complete=True)
+    blocked = select_personal_step_v2(preference_edges=edges,
+        **{**kwargs, "candidates": (replace(sample, hard_status="WAIT_BUDGET"), full)})
+    assert blocked.chosen_action_ref == "action:full"
+
+
+def test_method_policy_exclusions_missing_facts_and_conflict_do_not_manufacture_strategy():
+    from sylanne3.domains.d01 import (method_policy_state_v1, method_preference_edges_v1,
+        FULL_DRAFT_METHOD_V1, TONE_SAMPLE_METHOD_V1)
+    from sylanne3.domains.d07 import METHOD_CONDITION_IDS_V1
+    mapping = (("candidate:full", FULL_DRAFT_METHOD_V1), ("candidate:sample", TONE_SAMPLE_METHOD_V1))
+    values = {name: index < 6 for index, name in enumerate(METHOD_CONDITION_IDS_V1)}
+    for excluded in ("short_draft", "immediate_full_draft"):
+        conditions = tuple({**values, excluded: True}.items())
+        for state in ("ST0", "ST2"):
+            assert method_preference_edges_v1(state, mapping, conditions, complete=True) == (
+                "excluded", (("candidate:full", "candidate:sample"),))
+    for conditions, complete in ((tuple(values.items()), False),
+            (tuple({**values, "fact_permission_gap": True}.items()), True),
+            (tuple((key, value) for key, value in values.items() if key != "materials_complete"), True)):
+        assert method_preference_edges_v1("ST2", mapping, conditions, complete=complete) == ("unknown", ())
+    for claim in ("try a tone sample first", '{"schema":"old","policy_id":"CP-tone-order","strategy_state":"ST2"}',
+            '{"schema":"d01.method-policy.v1","policy_id":"CP-tone-order","strategy_state":true}'):
+        assert method_policy_state_v1(claim) is None
+
+
+def test_method_condition_scope_is_canonical_goal_revision_not_free_text():
+    import json
+    from sylanne3.domains.d07 import method_condition_question_v1, decode_method_condition_question_v1
+    key = AtomKey(Owner("activity", "bot", "persona", "activity:method"), "d08.goal.v1", "goal:method")
+    question = method_condition_question_v1(key.token, 2, "tone_multiple_legal_readings")
+    scope = decode_method_condition_question_v1(question)
+    assert scope["goal_ref"] == key.token and scope["goal_revision"] == 2
+    assert decode_method_condition_question_v1(json.dumps(scope, indent=2)) is None
+    assert decode_method_condition_question_v1("tone has several readings") is None
+    assert decode_method_condition_question_v1(question) != decode_method_condition_question_v1(
+        method_condition_question_v1(key.token, 3, "tone_multiple_legal_readings"))
+
+
+def _semantic_migration_fixture_v3():
+    from sylanne3.domains.d01.identity_v3 import RuntimeIdentityRef, SemanticIdentityRevision
+    from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+    original=plan();guard=OwnerAuthorizationGuardV1("authority","installation",original.namespace,1,"sha256:"+"b"*64,0,0)
+    stable=RuntimeIdentityRef.from_owner_guard(original.namespace,guard)
+    head=GraphVersion(PersonaDomain.plan_write(original).key,1)
+    value=SemanticIdentityRevision(stable,"identity",1,original.blocks[0].claim,None,head,head,
+        canonical_digest(original.blocks[0].claim),(),None,None,(),None,None,(),(),(),1.0,None,"legacy_migration")
+    return original,guard,value
+
+
+def test_semantic_v3_legacy_migration_codec_preserves_runtime_id_claim_and_outer_schema():
+    from sylanne3.domains.d01.identity_v3 import RuntimeIdentityRef, encode_semantic_identity_v3, decode_semantic_identity_v3
+    from dataclasses import fields
+    original,guard,payload=_semantic_migration_fixture_v3()
+    encoded=encode_semantic_identity_v3(payload)
+    assert decode_semantic_identity_v3(encoded)==payload
+    block=PersonaBlock("identity","semantic_identity",encoded,"read_only")
+    migrated=replace(original,version=2,blocks=(block,original.blocks[1]))
+    assert RuntimeIdentityRef.from_owner_guard(migrated.namespace,replace(guard,authorization_revision=2,authorization_head="sha256:"+"c"*64))==payload.runtime_identity
+    projected=PersonaDomain().project(migrated)
+    assert projected.blocks[0].claim==original.blocks[0].claim and projected.blocks[0].plasticity=="read_only"
+    assert tuple(field.name for field in fields(PersonaBlock))==("block_id","kind","claim","plasticity")
+    assert PersonaDomain.plan_write(migrated).key==PersonaDomain.plan_write(original).key
+    assert payload.support_original_refs==payload.trial_original_refs==() and payload.cumulative_diff==()
+
+
+def test_semantic_v3_declared_invalid_claim_and_two_family_boolean_growth_are_rejected():
+    from types import SimpleNamespace
+    from sylanne3.domains.d01.identity_v3 import encode_semantic_identity_v3, decode_semantic_identity_v3
+    original,_,payload=_semantic_migration_fixture_v3()
+    with unittest.TestCase().assertRaises(ValueError):PersonaBlock("identity","semantic_identity","old claim","growth")
+    with unittest.TestCase().assertRaises(ValueError):decode_semantic_identity_v3('{"schema":"d01.semantic-identity-revision.v3"')
+    from sylanne3.runtime.domain_production_erasure_v1 import DomainProductionErasureHold
+    with unittest.TestCase().assertRaises(DomainProductionErasureHold):decode_semantic_identity_v3('{"schema":"d01.semantic-identity-revision.v3"}')
+    encoded=encode_semantic_identity_v3(replace(payload,plasticity_policy_ref="policy:explicit",plasticity_policy_digest="a"*64))
+    grown_plan=replace(original,version=2,blocks=(PersonaBlock("identity","semantic_identity",encoded,"growth"),original.blocks[1]))
+    proposal=GrowthProposal("growth:deep",grown_plan.head_id,"identity","new self claim",("family:one","family:two"),True,"core")
+    with unittest.TestCase().assertRaises(ValueError):PersonaDomain().activate_revision(grown_plan,proposal)
+    with unittest.TestCase().assertRaises(ValueError):PersonaDomain().activate_revision(grown_plan,proposal,semantic_qualification=SimpleNamespace(
+        base_head=grown_plan.head_id,target_block="identity",replacement_claim=proposal.replacement_claim))
+    with unittest.TestCase().assertRaises(ValueError):PersonaDomain().activate_revision(grown_plan,replace(proposal,change_kind="local"))
+
+
+def test_semantic_v3_erasure_traces_references_inside_canonical_claim_and_bounds_bytes():
+    from sylanne3.domains.d01.identity_v3 import encode_semantic_identity_v3, decode_semantic_identity_v3
+    from sylanne3.runtime.domain_production_erasure_v1 import _references
+    from sylanne3.memory_types import source_key
+    original,_,payload=_semantic_migration_fixture_v3()
+    ref=source_key(*original.namespace.as_tuple,"actual-support").token
+    # Controlled codec fixture, not an adopted growth or authenticated Source.
+    administrative=replace(payload,revision_kind="administrative",support_original_refs=(ref,))
+    encoded=encode_semantic_identity_v3(administrative)
+    assert ref in set(_references(encoded))
+    with unittest.TestCase().assertRaises(ValueError):decode_semantic_identity_v3("x"*65537)
+    with unittest.TestCase().assertRaises(ValueError):encode_semantic_identity_v3(replace(payload,claim="x"*65537))
+
+
+def test_semantic_v3_initial_history_is_rejected_and_adoption_window_is_not_readout_ttl():
+    from sylanne3.domains.d01.identity_v3 import encode_semantic_identity_v3
+    from sylanne3.domains.d01.production_operations_v1 import SemanticCounterScopeV3
+    from sylanne3.runtime.domain_production_contracts_v1 import ProductionQueryCoverageV1
+    from sylanne3.runtime_contracts import QueryEpoch
+    from sylanne3.runtime.d01_production_operations_v1 import semantic_counter_binding_v3
+    original,_,payload=_semantic_migration_fixture_v3()
+    block=PersonaBlock("identity","semantic_identity",encode_semantic_identity_v3(payload),"read_only")
+    with unittest.TestCase().assertRaises(ValueError):replace(original,blocks=(block,original.blocks[1]))
+    assert payload.valid_until is None and payload.adopt_before is None
+    first=SemanticCounterScopeV3("d01.growth:identity:core",ProductionQueryCoverageV1(
+        QueryEpoch(original.namespace,"namespace",1),"d07.current_interpretation.v1",(),True,None),(),(),(),"qualified")
+    second=replace(first,coverage=replace(first.coverage,epoch=QueryEpoch(original.namespace,"namespace",2)))
+    assert semantic_counter_binding_v3(first)==semantic_counter_binding_v3(second)
+    assert not replace(first,qualification="unknown").complete
+    assert not replace(first,qualification="opposition").complete

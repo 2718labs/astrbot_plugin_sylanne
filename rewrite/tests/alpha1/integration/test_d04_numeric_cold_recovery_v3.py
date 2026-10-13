@@ -288,3 +288,27 @@ async def test_actual_full_loo_cold_restore_and_atomic_adoption(tmp_path, instal
             await asyncio.to_thread(queue.close)
         for resource in reversed(resources):
             resource.close()
+
+
+@pytest.mark.parametrize('failure', ('truncated', 'trailing', 'overrun', 'wrong_digest', 'wrong_length'))
+def test_numeric_restore_codec_rejects_incomplete_or_changed_bytes(failure):
+    import hashlib
+    import zlib
+    from sylanne3.authority_service.d04_numeric_restore_stream_v3 import _decode_packet
+    raw = b'{"original":"bounded exact bytes"}'
+    encoded = zlib.compress(raw, level=1)
+    digest = hashlib.sha256(raw).hexdigest()
+    assert _decode_packet(encoded, decoded_bytes=len(raw), decoded_digest=digest) == raw
+    length = len(raw)
+    if failure == 'truncated':
+        encoded = encoded[:-1]
+    elif failure == 'trailing':
+        encoded += b'additional-data'
+    elif failure == 'overrun':
+        length -= 1
+    elif failure == 'wrong_digest':
+        digest = '0' * 64
+    else:
+        length += 1
+    with pytest.raises(RuntimeError, match='numeric restoration'):
+        _decode_packet(encoded, decoded_bytes=length, decoded_digest=digest)

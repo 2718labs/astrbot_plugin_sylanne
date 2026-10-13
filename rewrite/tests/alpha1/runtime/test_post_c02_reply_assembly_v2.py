@@ -6,12 +6,13 @@ terminal, Owner guard, or result-read fact is grafted into this chain.
 """
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
 import httpx
 import json
+from pathlib import Path
 import sqlite3
 import ssl
 from threading import Thread
@@ -147,6 +148,7 @@ from sylanne3.host.mtls_transport import (
 from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
 from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
 from sylanne3.host.v2_fence_port import V2FencePort, VerifiedIngressClockV2
+from sylanne3.model_broker.artifact_phase_count_v1 import ArtifactPhaseCountPolicyV1
 from sylanne3.model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
     issue_first_ingress_encoding_request_v2,
@@ -177,6 +179,76 @@ from test_role_initialization_v2 import _resources
 from rewrite.host_tests.alpha1.test_astrbot_model_call import Manager
 
 
+@dataclass(frozen=True, slots=True)
+class M1PhaseFixtureInstallationV2:
+    """Protected initial configuration; the fresh issuer grants fixture scope later."""
+    profile_id: str
+    profile_root: Path
+    package_root: Path
+    data_dir: Path
+    authority_store: Path
+    server_certificate: Path
+    server_private_key: Path
+    administrator_certificate: Path
+    administrator_private_key: Path
+    initial_bundle: AdminInstallationBundle = field(repr=False)
+    counter_policy: ArtifactPhaseCountPolicyV1 = field(repr=False)
+    simulated_provider_key: Ed25519PrivateKey = field(repr=False)
+    c04_component_key: Path | None = None
+    c09_installation_assets: Path | None = None
+    c09_sdk_peer_cohort: Path | None = None
+
+    @classmethod
+    def from_protected_setup_v2(cls, setup_file):
+        from m1_artifact_draft_acceptance_support_v1 import load_m1_phase_fixture_installation_v2
+        return load_m1_phase_fixture_installation_v2(setup_file)
+
+    @property
+    def workflows(self):
+        return self.initial_bundle.model_workflows
+
+    @property
+    def foreground(self):
+        return self.initial_bundle.foreground
+
+    @property
+    def artifact_draft(self):
+        return self.initial_bundle.artifact_draft
+
+    @property
+    def private_reply_dispatch(self):
+        return self.initial_bundle.private_reply_dispatch
+
+    @property
+    def provider_billing_policy(self):
+        return self.initial_bundle.provider_billing_policy_v1
+
+    @property
+    def root_model_limits(self):
+        from sylanne3.runtime.foreground_call_plan_v1 import MODEL_DIMENSIONS
+        values = self.initial_bundle.installation_policy.root_lease.limits
+        return tuple(sorted((name, values[name]) for name in MODEL_DIMENSIONS))
+
+    @property
+    def root_model_max_ceiling(self):
+        from sylanne3.runtime.foreground_call_plan_v1 import MODEL_DIMENSIONS
+        values = self.initial_bundle.installation_policy.root_grant.max_ceiling
+        return tuple(sorted((name, values[name]) for name in MODEL_DIMENSIONS))
+
+    @property
+    def provider_configuration(self):
+        from sylanne3.model_broker.artifact_phase_count_v1 import FIXTURE_PROVIDER, FIXTURE_MODEL
+        return {"id": FIXTURE_PROVIDER, "type": "openai_chat_completion", "model": FIXTURE_MODEL}
+
+    @property
+    def tls_files(self):
+        directory = self.profile_root / self.profile_id
+        return {"ca.pem": directory / "trust-root.pem", "client.pem": directory / "client-cert.pem",
+            "client.key": directory / "client-key.pem", "server.pem": self.server_certificate,
+            "server.key": self.server_private_key, "second.pem": self.administrator_certificate,
+            "second.key": self.administrator_private_key}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("takeover_case", (
     "owned", "owned_no_observation_verifier", "timeout", "unknown"))
@@ -185,7 +257,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         after_c02=None, authority_server_builder=None,
         enable_d09_workbench=False, enable_c04_body_work=False,
         register_c04_domains=False,
-        extra_owner_capabilities=(), extra_owner_purposes=(),
+        extra_owner_capabilities=(), extra_owner_purposes=(), extra_root_work_kinds=(),
         ingress_text="hello", installed_package_root=None,
         after_role_initialization=None, continue_to_ingress=False,
         enable_d04_semantic_drive=False, enable_d04_joint_numeric=False,
@@ -194,7 +266,17 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         enable_d10_offline_ticks=False, enable_d11_life_source_note=False,
         enable_d13_paid_precompression=False, enable_c09_maintenance=False,
         d13_paid_deadline_after_seconds=300, life_before_root_operation_id=None,
-        private_reply_dispatch_policy=None, host_process_runner=None, c09_protected_root=None):
+        private_reply_dispatch_policy=None, host_process_runner=None, c09_protected_root=None,
+        initial_m1_configuration_builder=None, initial_phase_fixture_installation=None,
+        after_initial_source_projection=None, after_initial_self_registration=None, l02_restart_runner=None,
+        complete_c09_current_v3=False, c09_phase_setup_file=None):
+    if complete_c09_current_v3:
+        assert initial_phase_fixture_installation is not None and host_process_runner is None
+        assert c09_protected_root is not None and c09_phase_setup_file is not None
+    if l02_restart_runner is not None:
+        assert host_process_runner is None and c09_protected_root is None
+        assert initial_phase_fixture_installation is not None
+        assert enable_c09_maintenance and enable_d10_offline_ticks and enable_d04_root_cpu and enable_c04_body_work
     if (host_process_runner is None) != (c09_protected_root is None):
         raise ValueError("separate Life Host requires its original protected-root lifetime")
     if host_process_runner is not None and not (enable_c09_maintenance and enable_d10_offline_ticks
@@ -202,17 +284,28 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         raise ValueError("separate Life Host requires the complete installed fixture")
     parent_actor_case = None
     parent_host_store_closed = False
+    phase_initial = initial_phase_fixture_installation
+    if phase_initial is not None:
+        assert type(phase_initial) is M1PhaseFixtureInstallationV2
+        assert initial_m1_configuration_builder is None and natural_workflow_builder is None
+        assert phase_initial.profile_id == "reply"
     namespace = astrbot_namespace("platform-1", "10001", "persona-reply")
     authority_namespace = namespace_ref(namespace)
     installation_id = "installation-reply"
     source_id = "clock:reply"
     from pathlib import Path
     package_root = Path(installed_package_root) if installed_package_root is not None else tmp_path
+    if phase_initial is not None:
+        assert installed_package_root is not None and package_root == phase_initial.package_root
+        assert phase_initial.initial_bundle.installation_policy.namespace == namespace
+    graph_path = (phase_initial.data_dir / "host-data" / "sylanne3.sqlite3"
+        if phase_initial is not None else tmp_path / "business.db")
     manifest_path = package_root / "release-manifest.json"
     if installed_package_root is None:
         manifest_path.write_text('{"test":true}', encoding="utf-8")
     manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    files = loopback.AuthorityMtlsLoopbackTests._certificates(tmp_path)
+    files = (phase_initial.tls_files if phase_initial is not None else
+        loopback.AuthorityMtlsLoopbackTests._certificates(tmp_path))
     peer = MtlsPeerCredential(hashlib.sha256(ssl.PEM_cert_to_DER_cert(
         files["client.pem"].read_text(encoding="ascii"))).hexdigest())
     admin_peer = MtlsPeerCredential(hashlib.sha256(ssl.PEM_cert_to_DER_cert(
@@ -220,15 +313,22 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
     principal = OwnerPrincipalV1("paired-idp", "account", "incarnation-1")
     expected_creation = {}
     conversation_ref = '["platform-1:FriendMessage:123456","conversation-1"]'
-    d02, d11 = build_runtime_issuers(b"reply-issuer-key-" * 2)
+    if phase_initial is None:
+        d02, d11 = build_runtime_issuers(b"reply-issuer-key-" * 2)
+    else:
+        from sylanne3.runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+        d02 = D02ResourceIssuer(phase_initial.initial_bundle.d02_signing_key)
+        d11 = D11BudgetJobIssuer(d02, phase_initial.initial_bundle.d11_signing_key)
     provider_config = {
         "id": "provider-1", "type": "openai_chat_completion",
         "model": "model-1"}
+    if phase_initial is not None:
+        provider_config = phase_initial.provider_configuration
     config_digest = canonical_digest(provider_config)
     model_shared = dict(
-        provider_id="provider-1", model_id="model-1",
+        provider_id=provider_config["id"], model_id=provider_config["model"],
         provider_config_ref=installed_model_config_ref(
-            "provider-1", "model-1", config_digest),
+            provider_config["id"], provider_config["model"], config_digest),
         provider_config_digest=config_digest, audiences=(conversation_ref,),
         privacy_tier="private", required_capabilities=("text",),
         timeout_seconds=10.0)
@@ -245,12 +345,36 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             max_output_tokens=256 if enable_d13_paid_precompression else 32,
             quote_ceiling={"output_tokens": 256 if enable_d13_paid_precompression else 32},
             **model_shared))
-    if natural_workflow_builder is not None:
+    m1_initial = phase_initial
+    if phase_initial is not None:
+        workflows = phase_initial.workflows
+        private_reply_dispatch_policy = phase_initial.private_reply_dispatch
+    elif initial_m1_configuration_builder is not None:
+        from m1_artifact_draft_acceptance_support_v1 import M1InitialInstallationFixtureV1
+        assert natural_workflow_builder is None and private_reply_dispatch_policy is None
+        m1_initial = initial_m1_configuration_builder(namespace, authority_namespace,
+            installation_id, model_shared, workflows)
+        assert type(m1_initial) is M1InitialInstallationFixtureV1
+        workflows = m1_initial.workflows
+        private_reply_dispatch_policy = m1_initial.private_reply_dispatch
+    elif natural_workflow_builder is not None:
         workflows = natural_workflow_builder(workflows, model_shared)
-    deletion_journal = DeletionJournal(tmp_path / "deletion.db", create=True)
-    deletion_guard = AuthorityV2DeletionGuard(tmp_path / "deletion.db")
+    m1_kernel_clock = None
+    if m1_initial is not None:
+        from sylanne3.authority_service.linux_clock_v1 import LinuxKernelClockProviderV1
+        m1_kernel_clock = LinuxKernelClockProviderV1(source_id=source_id, maximum_error_seconds=0.5)
+
+    def paired_fixture_clock():
+        if m1_kernel_clock is None:
+            return time.time() + 0.2, "epoch:reply"
+        reading = m1_kernel_clock()
+        return reading.utc_seconds + reading.utc_error_seconds, reading.epoch
+
+    current_store_root=phase_initial.data_dir if complete_c09_current_v3 else tmp_path
+    deletion_journal = DeletionJournal(current_store_root / "deletion.db", create=True)
+    deletion_guard = AuthorityV2DeletionGuard(current_store_root / "deletion.db")
     execution = AuthorityV2ExecutionJournal(
-        tmp_path / "execution.db", namespace=authority_namespace,
+        current_store_root / "execution.db", namespace=authority_namespace,
         journal_id="execution", create=True)
     deletion_head = deletion_journal.latest_head()
     initial_deletion = JournalHead(
@@ -300,7 +424,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 and (holder is None or holder == "host:reply"))
 
     core = AuthorityServiceCore(
-        tmp_path / "authority.db", authorizer=authorizer,
+        phase_initial.authority_store if phase_initial is not None else tmp_path / "authority.db", authorizer=authorizer,
         deletion_verifier=lambda ns, before, current, phase:
             current == (bootstrap_deletion_head if ns == "ns:bootstrap"
                         else initial_deletion) and phase == "clear",
@@ -308,10 +432,12 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             (bootstrap_execution.verified_head() if ns == "ns:bootstrap"
              else execution.verified_head()) == current,
         effect_verifier=lambda *args: True,
-        dispatch_verifier=lambda *args: True, create=True)
+        dispatch_verifier=lambda *args: True, create=phase_initial is None)
     listener = None
     authority_loop = None
     authority_thread = None
+    c09_bootstrap = None
+    c09_daemon = None
     reverse_listener = None
     reverse_server = None
     graph_worker = None
@@ -330,7 +456,10 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         verified_affect = load_verified_affect_scheme(package_root, manifest_digest)
         domain_registry = verified_affect.registry
     graph_store = ProductionGraphStore(
-        tmp_path / "business.db", domain_registry.type_registry)
+        graph_path, domain_registry.type_registry)
+    phase_qualification = None
+    phase_provider_calls = None
+    m1_initialization_case = None
     model_http_client = None
     installed_model_selection = None
     encoding_workflow = workflows.encode
@@ -405,9 +534,9 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         model_store = AuthorityV2ModelEgressStore(
             core._db, create=True, lock=core._lock)
         model_verifier = PinnedCurrentModelEgressGraphVerifier(
-            tmp_path / "business.db", d11_issuer=d11,
+            graph_path, d11_issuer=d11,
             trusted_now_utc=time.time,
-            trusted_paired_clock=lambda: (time.time() + 0.2, "epoch:reply"))
+            trusted_paired_clock=paired_fixture_clock)
         model_service = AuthorityV2ModelEgressService(
             model_store, protected, graph_verifier=model_verifier,
             admin_model_policy=workflows)
@@ -419,7 +548,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                     or ticket.creation_operation_id != expected_creation.get("operation_id")
                     or ticket.creation_digest != expected_creation.get("digest")):
                 return False
-            with sqlite3.connect(tmp_path / "business.db") as db:
+            with sqlite3.connect(graph_path) as db:
                 row = db.execute(
                     "SELECT operation_id,digest FROM graph_namespace_provisioning_v2 "
                     "WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
@@ -430,7 +559,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
 
         server_kwargs = dict(
             core=core, v2_fences={authority_namespace: protected},
-            graph_db_path=tmp_path / "business.db",
+            graph_db_path=graph_path,
             utc_clock=lambda: datetime.now(timezone.utc),
             first_claim_verifier=first_claim,
             claimant_verifier=None,
@@ -456,9 +585,9 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 (admin_peer.certificate_sha256, "reply", namespace):
                     authority_namespace,
             },
-            clock_provider=lambda: AuthorityClockReadingV2(
-                source_id, time.time(), time.monotonic(), "epoch:reply",
-                True, 0.1),
+            clock_provider=(m1_kernel_clock if m1_kernel_clock is not None else
+                lambda: AuthorityClockReadingV2(source_id, time.time(), time.monotonic(),
+                    "epoch:reply", True, 0.1)),
             create_owner_schema=True,
             create_self_identity_schema=True,
             create_worker_result_schema=True,
@@ -493,7 +622,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                   await authority_server_builder(
                       server_kwargs=server_kwargs,
                       context={
-                          "graph_path": tmp_path / "business.db",
+                          "graph_path": graph_path,
                           "authority_path": tmp_path / "authority.db",
                           "core": core, "fences": fences,
                           "protected": protected, "peer": peer,
@@ -504,6 +633,8 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                           "workflows": workflows,
                           "model_store": model_store,
                           "model_service": model_service,
+                "m1_initial_configuration": m1_initial,
+                "m1_kernel_clock": m1_kernel_clock,
                           "owner_proofs": owner_proofs,
                           "owner_sessions": owner_sessions,
                           "pairing_source": pairing_source,
@@ -511,34 +642,70 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                           "deletion_journal": deletion_journal,
                           "execution_journal": execution,
                       }))
+        current_initial_assets=None
+        if complete_c09_current_v3:
+            current_initial_assets=dict(data_dir=phase_initial.data_dir,d02_issuer=d02,d11_issuer=d11,provider_configuration=provider_config,
+                reverse_profile=reverse_client.profile,core_authorizer=authorizer,
+                tls=AuthorityServerTlsConfig(str(files['server.pem']),str(files['server.key']),str(files['ca.pem']),
+                    timeout_seconds=30,max_message_bytes=65_536))
         initial_offline_storage = None
         if enable_d10_offline_ticks:
             from d11_offline_authority_acceptance_support_v1 import install_fresh_offline_storage_case_v1
             initial_offline_storage = install_fresh_offline_storage_case_v1(
                 core=core, protected=protected, execution=execution, graph_store=graph_store,
-                root=tmp_path, server_kwargs=server_kwargs, peer=peer, namespace=namespace,
+                root=current_store_root, server_kwargs=server_kwargs, peer=peer, namespace=namespace,
                 authority_namespace=authority_namespace, registry=domain_registry.type_registry,
-                protected_root=c09_protected_root)
+                protected_root=c09_protected_root,initial_m1_configuration=m1_initial,current_initial_assets=current_initial_assets)
+        if complete_c09_current_v3:
+            from sylanne3.authority_service.daemon import open_authority_daemon
+            assert initial_offline_storage.deployment_config is not None
+            from sylanne3.host.c09_controlled_sdk_bootstrap_v3 import (
+                close_controlled_sdk_authority_services_v3,read_controlled_sdk_root_descriptor_v3)
+            cfg=initial_offline_storage.deployment_config;factory=initial_offline_storage.maintenance_factory
+            descriptor=read_controlled_sdk_root_descriptor_v3(phase_initial.c09_sdk_peer_cohort,
+                config=cfg,inventory=factory.inventory,peer=factory.peer)
+            closed=await close_controlled_sdk_authority_services_v3(server=server,core=core,execution=execution,
+                deletion=deletion_guard,control=initial_offline_storage.storage_control)
+            factory.install_controlled_sdk_peer_registry_v3(root_descriptor=descriptor,closed_services=closed)
+            c09_bootstrap=open_authority_daemon(cfg)
+            c09_daemon=await c09_bootstrap.await_business_ready_v3()
+            server=c09_daemon.server;core=c09_daemon.core;deletion_guard=c09_daemon.deletion
+            execution=c09_daemon.execution[authority_namespace];protected=server._v2_fences[authority_namespace]
+            fences=protected.fences;pairing_source=c09_daemon.owner_pairings
+            owner_proofs=server._v2_owner_proofs;owner_sessions=server._v2_owner_sessions
+            model_service=server._v2_model_egress[authority_namespace];model_store=model_service._store
+            server_kwargs.update(core=core,v2_fences={authority_namespace:protected},owner_proofs=owner_proofs,
+                owner_sessions=owner_sessions,creation_pairing_source=pairing_source,v2_model_egress={authority_namespace:model_service})
+            initial_offline_storage.storage_control=c09_daemon.c09_control
+            initial_offline_storage.lease=c09_daemon.c09_control.lease
+            assert c09_daemon.config.c09_maintenance_factory is initial_offline_storage.maintenance_factory
         authority_loop = asyncio.new_event_loop()
         authority_thread = Thread(
             target=authority_loop.run_forever,
             name="reply-authority-test", daemon=True)
         authority_thread.start()
-        listener = await asyncio.to_thread(
-            lambda: asyncio.run_coroutine_threadsafe(
-                server.start(
-                    "127.0.0.1", 0,
-                    AuthorityServerTlsConfig(
-                        str(files["server.pem"]), str(files["server.key"]),
-                        str(files["ca.pem"]), timeout_seconds=30,
-                        max_message_bytes=65_536)),
-                authority_loop).result(timeout=30))
+        if complete_c09_current_v3:
+            listener = await asyncio.to_thread(
+                lambda:asyncio.run_coroutine_threadsafe(c09_daemon.start(),authority_loop).result(timeout=30))
+        else:
+            listener = await asyncio.to_thread(
+                lambda: asyncio.run_coroutine_threadsafe(
+                    server.start(
+                        "127.0.0.1", phase_initial.initial_bundle.tls_profile.port if phase_initial is not None else 0,
+                        AuthorityServerTlsConfig(
+                            str(files["server.pem"]), str(files["server.key"]),
+                            str(files["ca.pem"]), timeout_seconds=30,
+                            max_message_bytes=65_536)),
+                    authority_loop).result(timeout=30))
         address = listener.sockets[0].getsockname()[1]
         profile = AuthorityTlsProfile(
             "reply", "127.0.0.1", address, "localhost",
             server._authority_id(), files["ca.pem"], files["client.pem"],
             files["client.key"], timeout_seconds=30,
             max_message_bytes=65_536)
+        if phase_initial is not None:
+            profile = phase_initial.initial_bundle.tls_profile
+            assert profile.expected_authority_id == server._authority_id() and profile.port == address
         request = AuthorityProvisioningRequest(
             AUTHORITY_PROTOCOL, "reply", "astrbot_plugin_sylanne", "4.28.1",
             package_root, tmp_path, PublisherPackageIdentity(manifest_digest))
@@ -563,7 +730,8 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
              "output_tokens": 512 + (256 if enable_d13_paid_precompression else 0) + numeric_ceiling.get("output_tokens", 0),
              **({"input_tokens": (8192 if enable_d13_paid_precompression else 0) + numeric_ceiling.get("input_tokens", 0)}
                 if enable_d13_paid_precompression or numeric_ceiling else {}),
-             **({"thread_cpu_ms": (60000 if enable_d04_root_cpu else 1000) + (1000 if enable_d10_offline_ticks else 0) + (1000 if enable_d11_life_source_note else 0)} if enable_d09_workbench else {})},
+             **({"thread_cpu_ms": (60000 if enable_d04_root_cpu else 1000) + (1000 if enable_d10_offline_ticks else 0) + (1000 if enable_d11_life_source_note else 0)} if enable_d09_workbench else {}),
+             **(dict(m1_initial.root_model_limits) if m1_initial is not None else {})},
             {}, {}, {}, 1, "active")
         root_work_kinds = (
             "encode", "d06.encode_source", "d03.message_received",
@@ -599,6 +767,13 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             root_work_kinds += ("d10.life.source_note.v1",)
         if enable_d13_paid_precompression:
             root_work_kinds += ("d13.precompress.paid.v1",)
+        if m1_initial is not None:
+            from m1_artifact_draft_acceptance_support_v1 import M1_WORK_KINDS
+            root_work_kinds += M1_WORK_KINDS
+        if extra_root_work_kinds:
+            from sylanne3.runtime.issuers import D06_SOURCE_CORRECTION_WORK_KIND
+            assert tuple(extra_root_work_kinds) == (D06_SOURCE_CORRECTION_WORK_KIND,)
+            root_work_kinds += extra_root_work_kinds
         root_grant = BudgetLeaseGrant(
             "grant-reply", 1, *namespace.as_tuple, root_lease.lease_id,
             "USD", {"cpu_ms": d04_numeric_budget_cpu_ms if enable_d04_joint_numeric else 100,
@@ -617,6 +792,17 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             verified_affect.scheme.scheme_version if installed_package_root is not None else "scheme-1",
             verified_affect.scheme.operator_version if installed_package_root is not None else "operator-1",
             "policy-1", root_lease, root_grant)
+        if phase_initial is not None:
+            protected_policy = phase_initial.initial_bundle.installation_policy
+            assert (protected_policy.authority_namespace, protected_policy.installation_id,
+                protected_policy.manifest_digest, protected_policy.administrator_holder,
+                protected_policy.expected_authority_id, protected_policy.catalogue_hash,
+                protected_policy.scheme_version, protected_policy.operator_version) == (
+                authority_namespace, installation_id, manifest_digest, "host:reply", grant.authority_id,
+                policy.catalogue_hash, policy.scheme_version, policy.operator_version)
+            assert set(root_work_kinds) <= set(protected_policy.root_grant.allowed_work_kinds)
+            policy = protected_policy
+            root_lease, root_grant = policy.root_lease, policy.root_grant
         d13_paid_policy = None
         if enable_d13_paid_precompression:
             from sylanne3.runtime.d13_technical_policy import AdminD13PaidPrecompressionPolicyV1
@@ -643,19 +829,61 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             from sylanne3.runtime.d04_life_before_original_v1 import D04LifeBeforeCapturePolicyV1
             before_capture_policy = D04LifeBeforeCapturePolicyV1(namespace,
                 policy.installation_id, policy.manifest_digest, life_before_root_operation_id)
-        accounting_bundle = AdminInstallationBundle(
-            profile, policy, b"k" * 32, b"d" * 32,
-            model_workflows=workflows,
-            d13_paid_precompression=d13_paid_policy,
-            life_d04_before_capture_policy=before_capture_policy,
-            private_reply_dispatch=private_reply_dispatch_policy)
+        # Initial configuration only, before graph provisioning signs its root grant.
+        # Reuse the existing installed semantic/native policies and their original limits.
+        semantic_drive_policy = None
+        if enable_d04_semantic_drive:
+            from sylanne3.runtime.d04_semantic_policy import (
+                AdminD04SemanticDrivePolicyV1, MAPPING_VERSION, BASIS_VERSION, MECHANISMS)
+            semantic_drive_policy = AdminD04SemanticDrivePolicyV1(namespace, policy.installation_id,
+                root_grant.grant_id, root_grant.version, root_grant.lease_id,
+                MAPPING_VERSION, BASIS_VERSION,
+                {name:(0.125,0.0625,0.03125) for name in MECHANISMS},
+                {name:1.0 for name in MECHANISMS})
+        joint_numeric_policy = None
+        if enable_d04_joint_numeric:
+            from sylanne3.runtime.d04_numeric_policy_v3 import AdminD04JointNumericPolicyV3
+            joint_numeric_policy = AdminD04JointNumericPolicyV3(namespace, policy.installation_id,
+                root_grant.grant_id, root_grant.version, root_grant.lease_id,
+                100000, 256, 1e-8, 600)
+        if phase_initial is not None:
+            accounting_bundle = phase_initial.initial_bundle
+        else:
+            accounting_bundle = AdminInstallationBundle(
+                profile, policy, b"k" * 32, b"d" * 32,
+                model_workflows=workflows,
+                d13_paid_precompression=d13_paid_policy,
+                life_d04_before_capture_policy=before_capture_policy,
+                d04_semantic_drive=semantic_drive_policy, d04_joint_numeric=joint_numeric_policy,
+                private_reply_dispatch=private_reply_dispatch_policy,
+                **({"foreground": m1_initial.foreground, "artifact_draft": m1_initial.artifact_draft,
+                    "provider_billing_policy_v1": m1_initial.provider_billing_policy} if m1_initial is not None else {}))
+        if complete_c09_current_v3:
+            assert model_service is server._v2_model_egress[authority_namespace]
+            assert c09_daemon.config.natural_model_authorities_v2[authority_namespace].installation_bundle is accounting_bundle
+        elif m1_initial is not None:
+            # The initial typed bundle is available before graph provisioning
+            # issues its root grant and before any model request. Reconstruct
+            # the concrete reader instead of fabricating current proof fields.
+            from m1_artifact_draft_acceptance_support_v1 import assert_prebusiness_model_family_v1
+            original_model_service = model_service
+            model_verifier = PinnedCurrentModelEgressGraphVerifier(
+                graph_path, d11_issuer=d11, trusted_now_utc=time.time,
+                trusted_paired_clock=paired_fixture_clock,
+                artifact_draft_bundle=accounting_bundle)
+            model_service = AuthorityV2ModelEgressService(model_store, protected,
+                graph_verifier=model_verifier, admin_model_policy=workflows)
+            assert_prebusiness_model_family_v1(server, namespace=authority_namespace,
+                original=original_model_service, selected=model_service)
+            server._v2_model_egress[authority_namespace] = model_service
+            server_kwargs["v2_model_egress"][authority_namespace] = model_service
         bootstrap = object()
         suppression_registry = HostReplySuppressionRegistryV1()
         graph = GraphCoordinator(
             graph_store, bootstrap, holder="host:reply",
             content_fence_v2=port, d02_issuer=d02, d11_issuer=d11,
             d13_paid_precompression_policy=d13_paid_policy,
-            body_quote_authority=(D02BodyQuoteAuthority(hmac.digest(
+            body_quote_authority=(initial_offline_storage.body_authority if complete_c09_current_v3 else D02BodyQuoteAuthority(hmac.digest(
                 accounting_bundle.d02_signing_key,
                 b"sylanne3.d02.body_quote_original.v1\0"
                 + policy.installation_id.encode("utf-8"), "sha256"))
@@ -811,8 +1039,9 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             principal, registration.credential_id,
             registration.credential_epoch, "sylanne-owner-console",
             "http://localhost:6185")
-        if host_process_runner is not None:
-            from d11_life_parent_installation_support_v1 import prepare_parent_life_installation_v1
+        if host_process_runner is not None or l02_restart_runner is not None:
+            from d11_life_parent_installation_support_v1 import (prepare_parent_life_installation_v1,
+                prepare_parent_l02_installation_v1, authenticate_parent_l02_phase_v1)
             from d11_life_parent_actor_support_v1 import run_parent_life_actor_v1
             pairing_source.pair_actor(administrator_credential=admin_peer,
                 binding=OwnerActorBindingV1(grant.authority_id, installation_id,
@@ -841,14 +1070,21 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 "core_authorizer": authorizer, "server_kwargs": server_kwargs,
                 "model_store": model_store, "model_service": model_service,
                 "request": request, "execution": execution,
+                "m1_initial_configuration":m1_initial, "namespace_creation_operation_id":creation.operation_id,
+                "c09_daemon":c09_daemon,"c09_bootstrap":c09_bootstrap,
+                "c09_deployment_config":None if c09_daemon is None else c09_daemon.config,
+                "c09_maintenance_factory":None if c09_daemon is None else c09_daemon.config.c09_maintenance_factory,
+                "c09_phase_setup_file":c09_phase_setup_file,
+
             }
-            installation = prepare_parent_life_installation_v1(parent_actor_case,
+            parent_factory = prepare_parent_life_installation_v1 if l02_restart_runner is None else prepare_parent_l02_installation_v1
+            installation = parent_factory(parent_actor_case,
                 provider_config=provider_config,
                 reverse_profile=AdministratorHostReverseProfile("reply", installation_id,
                     authority_namespace, peer.certificate_sha256, files["server.pem"],
                     files["server.key"], files["ca.pem"]), reverse_bind_port=reverse_port,
                 owner_claim={"ticket": ticket, "operation": operation, "grant_value": grant_value},
-                c09_protected_root=c09_protected_root)
+                **({"c09_protected_root":c09_protected_root} if l02_restart_runner is None else {}))
             async def close_host_handles():
                 nonlocal port, admin_port, transport, admin_transport, client_transport
                 nonlocal reverse_listener, graph_worker, parent_host_store_closed
@@ -863,6 +1099,14 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                     if active_transport is not None: await active_transport.close()
                 transport = admin_transport = client_transport = None
                 graph_store.close(); parent_host_store_closed = True
+            if l02_restart_runner is not None:
+                from l02_restart_host_support_v1 import L02ParentAuthorityServicesV1
+                gate=parent_actor_case["c09_writer_gate"]
+                async def authenticate_phase(result, *, phase):
+                    return await asyncio.to_thread(authenticate_parent_l02_phase_v1,parent_actor_case,installation,
+                        result,phase=phase)
+                parent=L02ParentAuthorityServicesV1(gate.control,gate,close_host_handles,authenticate_phase,creation.operation_id)
+                return await l02_restart_runner(installation,parent)
             return await run_parent_life_actor_v1(parent_actor_case,
                 host_process_runner=host_process_runner, installation=installation,
                 close_host_handles=close_host_handles)
@@ -944,10 +1188,17 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             port.finish_fence, owner_scope,
             request_id="finish:reply-owner-check",
             request_digest="sha256:" + "e" * 64)
-        plan = PersonaPlan(
-            "plan:reply", namespace, 1,
-            (PersonaBlock("identity", "semantic_identity",
-                          "reliable companion", "read_only"),), (), True)
+        blocks = (PersonaBlock("identity", "semantic_identity", "reliable companion", "read_only"),)
+        if phase_initial is not None:
+            from sylanne3.host.model_workflows_v6 import AdminModelWorkflowsV6
+            if type(phase_initial.workflows) is AdminModelWorkflowsV6 and phase_initial.workflows.growth_cognition is not None:
+                from sylanne3.domains.d01 import METHOD_POLICY_SCHEMA_V1, METHOD_POLICY_ID_V1, method_policy_state_v1
+                from sylanne3.runtime_contracts import canonical_serialize
+                claim = canonical_serialize({"schema": METHOD_POLICY_SCHEMA_V1,
+                    "policy_id": METHOD_POLICY_ID_V1, "strategy_state": "ST0"})
+                assert method_policy_state_v1(claim) == "ST0"
+                blocks += (PersonaBlock(METHOD_POLICY_ID_V1, "strategy", claim, "growth"),)
+        plan = PersonaPlan("plan:reply", namespace, 1, blocks, (), True)
         role_receipt = await asyncio.to_thread(
             graph.commit_role_initialization_v2,
             namespace=namespace, operation_id="role-init-reply", plan=plan,
@@ -964,7 +1215,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             # actual independent Authority/mTLS fence and committed D01 root.
             # No C02/model call has happened at this boundary.
             graph._GraphCoordinator__scene_clock_policy = AdminIngressClockPolicy(source_id, 0.5, 2.0)
-            await after_role_initialization({
+            m1_initialization_case = {
                 "graph": graph, "store": graph_store, "namespace": namespace,
                 "authority_namespace": authority_namespace, "bootstrap": bootstrap,
                 "port": port, "core": core, "server": server, "fences": fences,
@@ -981,8 +1232,15 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 "authority_client": authority_client, "files": files,
                 "owner_loop": asyncio.get_running_loop(), "enable_d04_root_cpu": enable_d04_root_cpu,
                 "core_authorizer":authorizer,"server_kwargs":server_kwargs,"model_store":model_store,
-            })
-            if not continue_to_ingress:
+                "model_service":model_service,"m1_initial_configuration":m1_initial,
+                "m1_kernel_clock":m1_kernel_clock,
+                "c09_daemon":c09_daemon,"c09_bootstrap":c09_bootstrap,
+                "c09_deployment_config":None if c09_daemon is None else c09_daemon.config,
+                "c09_maintenance_factory":None if c09_daemon is None else c09_daemon.config.c09_maintenance_factory,
+                "c09_phase_setup_file":c09_phase_setup_file,
+            }
+            await after_role_initialization(m1_initialization_case)
+            if not continue_to_ingress and after_initial_self_registration is None:
                 return
             # First-use Owner operations use their independently owned V2FencePort
             # and may outlast this client's bounded idle TLS channel. Resume the
@@ -1034,14 +1292,17 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         graph._GraphCoordinator__scene_identity_port = scene_port
         graph._GraphCoordinator__scene_clock_policy = AdminIngressClockPolicy(
             source_id, 0.5, 2.0)
-        d03 = ContextProvider()
-        d03.compile_scheme({
-            "schema": "d03.context.scheme.v1",
-            "roles": ("scene_participant",), "norms": (),
-        }, None)
-        graph.register_provider(
-            bootstrap, "d03", d03, "d03.proposal.v1",
-            d03.descriptor.request_schema_hash)
+        if enable_d04_joint_numeric and "d03" in graph._GraphCoordinator__providers:
+            d03 = graph._GraphCoordinator__providers["d03"][0]
+        else:
+            d03 = ContextProvider()
+            d03.compile_scheme({
+                "schema": "d03.context.scheme.v1",
+                "roles": ("scene_participant",), "norms": (),
+            }, None)
+            graph.register_provider(
+                bootstrap, "d03", d03, "d03.proposal.v1",
+                d03.descriptor.request_schema_hash)
         with graph_store._lock:
             _, scene_epoch = graph._v2_graph_stamp(namespace)
         binding_request = RoleBindingRequest(
@@ -1093,51 +1354,152 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                            "not_applicable"))
         ingress_clock = AdminIngressClockPolicy(source_id, 0.5, 2.0)
         encoding = AdminIngressEncodingPolicy(
-            120.0, {"output_tokens": 128},
+            120.0, dict(m1_initial.workflows.encode.quote_ceiling) if m1_initial is not None else {"output_tokens": 128},
             "snapshot:reply-ingress", "resource:reply-ingress",
             "character:reply")
-        model_reply_mode = {"content": (
-            '{"event_summary":"A person said hello.",'
-            '"quoted_details":[{"quote":"hello",'
-            '"salience":0.5}],"possible_meanings":[],'
-            '"possible_feelings":[]}').replace("hello", ingress_text)}
-        model_http_client = httpx.AsyncClient(transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, json={
-                "id": "original-encoding-reply", "object": "chat.completion",
-                "created": 1, "model": "model-1", "choices": [{
-                    "index": 0, "finish_reason": "stop", "message": {
-                        "role": "assistant",
-                        "content": model_reply_mode["content"]},
-                }], "usage": {"prompt_tokens": 3,
-                              "completion_tokens": 5, "total_tokens": 8}})))
-        c09_provider_cache = None
-        if enable_c09_maintenance:
-            from c09_life_provider_cache_acceptance_v1 import ControlledLifeProviderCacheV1
-            c09_provider_cache = ControlledLifeProviderCacheV1(
-                tmp_path.parent / (tmp_path.name + '-c09-provider-cache'), provider_config)
-            if initial_offline_storage is None:
-                raise ValueError('C09 provider cache requires actual scoped storage installation')
-            c09_provider_cache.bind(authority_id=initial_offline_storage.storage_control.authority_id,
-                installation_id=initial_offline_storage.storage_control.installation_id,
-                namespace=authority_namespace)
-            mock_transport = model_http_client._transport
-            mock_transport.handler = c09_provider_cache.wrap(mock_transport.handler)
-        installed_provider = object.__new__(ProviderOpenAIOfficial)
-        installed_provider.provider_config = provider_config
-        installed_provider.model_name = "model-1"
-        installed_provider.client = AsyncOpenAI(
-            api_key="test-only", base_url="https://mock.invalid/v1",
-            http_client=model_http_client)
+        if phase_initial is None:
+            model_reply_mode = {"content": (
+                '{"event_summary":"A person said hello.",'
+                '"quoted_details":[{"quote":"hello",'
+                '"salience":0.5}],"possible_meanings":[],'
+                '"possible_feelings":[]}').replace("hello", ingress_text)}
+            model_http_client = httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={
+                    "id": "original-encoding-reply", "object": "chat.completion",
+                    "created": 1, "model": "model-1", "choices": [{
+                        "index": 0, "finish_reason": "stop", "message": {
+                            "role": "assistant",
+                            "content": model_reply_mode["content"]},
+                    }], "usage": {"prompt_tokens": 3,
+                                  "completion_tokens": 5, "total_tokens": 8}})))
+            if m1_initial is not None:
+                from m1_artifact_draft_acceptance_support_v1 import simulated_provider_response_v1
+                actual_mock = model_http_client._transport
+                actual_mock_handler = actual_mock.handler
+                actual_mock.handler = lambda request: simulated_provider_response_v1(
+                    m1_initial, request, actual_mock_handler(request))
+            c09_provider_cache = None
+            if enable_c09_maintenance:
+                from c09_life_provider_cache_acceptance_v1 import ControlledLifeProviderCacheV1
+                c09_provider_cache = ControlledLifeProviderCacheV1(
+                    tmp_path.parent / (tmp_path.name + '-c09-provider-cache'), provider_config)
+                if initial_offline_storage is None:
+                    raise ValueError('C09 provider cache requires actual scoped storage installation')
+                c09_provider_cache.bind(authority_id=initial_offline_storage.storage_control.authority_id,
+                    installation_id=initial_offline_storage.storage_control.installation_id,
+                    namespace=authority_namespace)
+                mock_transport = model_http_client._transport
+                mock_transport.handler = c09_provider_cache.wrap(mock_transport.handler)
+            installed_provider = object.__new__(ProviderOpenAIOfficial)
+            installed_provider.provider_config = provider_config
+            installed_provider.model_name = "model-1"
+            installed_provider.client = AsyncOpenAI(
+                api_key="test-only", base_url="https://mock.invalid/v1",
+                http_client=model_http_client)
+        else:
+            from m1_artifact_draft_acceptance_support_v1 import build_m1_phase_mock_client_v2
+            c09_provider_cache = None
+            if enable_c09_maintenance:
+                from c09_life_provider_cache_acceptance_v1 import ControlledLifeProviderCacheV1
+                c09_provider_cache=(initial_offline_storage.provider_cache if complete_c09_current_v3 else
+                    ControlledLifeProviderCacheV1(tmp_path.parent/(tmp_path.name+"-c09-provider-cache"),provider_config))
+                assert initial_offline_storage is not None
+                c09_provider_cache.bind(authority_id=initial_offline_storage.storage_control.authority_id,
+                    installation_id=initial_offline_storage.storage_control.installation_id,
+                    namespace=authority_namespace)
+            sdk, model_http_client, model_reply_mode, phase_provider_calls = build_m1_phase_mock_client_v2(
+                phase_initial,ingress_text,provider_cache=c09_provider_cache,positive_recall=complete_c09_current_v3)
+            installed_provider = object.__new__(ProviderOpenAIOfficial)
+            installed_provider.provider_config = provider_config
+            installed_provider.model_name = provider_config["model"]
+            installed_provider.client = sdk
+            from sylanne3.host.authority_profile import load_artifact_phase_local_fixture_bundle_v1
+            installed_bundle, phase_qualification = await load_artifact_phase_local_fixture_bundle_v1(
+                phase_initial.profile_id, profile_root=phase_initial.profile_root,
+                package_root=phase_initial.package_root, data_dir=phase_initial.data_dir,
+                provider_client=sdk, mock_transport=model_http_client._transport)
+            assert installed_bundle.installation_policy == policy
+            assert installed_bundle.model_workflows == workflows
+            assert installed_bundle.artifact_draft == m1_initial.artifact_draft
+            assert installed_bundle.ingress_clock == ingress_clock and installed_bundle.ingress_encoding == encoding
+            policy = installed_bundle.installation_policy
+            workflows = installed_bundle.model_workflows
+            ingress_clock, encoding = installed_bundle.ingress_clock, installed_bundle.ingress_encoding
+            authority_client, client_grant = phase_qualification.authority_client, phase_qualification.client_grant
+            # A dedicated fixture verifier/service is registered before C1.
+            # Its adapter invokes the original method in this authenticated task's scope.
+            original_model_service = model_service
+            model_verifier = PinnedCurrentModelEgressGraphVerifier(
+                graph_path, d11_issuer=d11, trusted_now_utc=time.time,
+                trusted_paired_clock=paired_fixture_clock, artifact_draft_bundle=installed_bundle)
+            model_service = AuthorityV2ModelEgressService(model_store, protected,
+                graph_verifier=model_verifier, admin_model_policy=workflows)
+            from m1_artifact_draft_acceptance_support_v1 import _bind_m1_phase_verifier_scope_v2
+            _bind_m1_phase_verifier_scope_v2(verifier=model_verifier, service=model_service, server=server,
+                namespace=authority_namespace, qualification=phase_qualification,
+                graph_db_path=graph_path, issuer=d11)
+            assert_prebusiness_model_family_v1(server, namespace=authority_namespace,
+                original=original_model_service, selected=model_service)
+            server._v2_model_egress[authority_namespace] = model_service
+            server_kwargs["v2_model_egress"][authority_namespace] = model_service
+            from sylanne3.host.v2_installation import V2InstallationAssembly
+            assembly = graph._GraphCoordinator__d04_installed_joint_assembly
+            assert type(assembly) is V2InstallationAssembly
+            graph._GraphCoordinator__d04_installed_joint_assembly = replace(assembly,
+                installation_policy=policy, installation_grant=client_grant, admin_bundle=installed_bundle,
+                ingress_clock=ingress_clock, ingress_encoding=encoding)
+            graph._GraphCoordinator__accounting_maintenance_port = InstalledAccountingMaintenancePort(
+                client=authority_client, bundle=installed_bundle, grant=client_grant,
+                owner_loop=asyncio.get_running_loop())
         model_context = Context(
             asyncio.Queue(), {}, None, Manager(installed_provider),
             None, None, None, None, None, None, None)
-        installed_bundle = AdminInstallationBundle(
-            profile, policy, b"k" * 32, b"d" * 32,
-            ingress_clock=ingress_clock,
-            ingress_encoding=encoding, model_workflows=workflows,
-            d13_paid_precompression=d13_paid_policy,
-            life_d04_before_capture_policy=before_capture_policy,
-            private_reply_dispatch=private_reply_dispatch_policy)
+        async def get_http_worker():
+            nonlocal graph_worker
+            if graph_worker is None:
+                graph_worker = await GraphWorker.start(
+                    lambda: graph_store, lambda _store: graph)
+            return graph_worker
+
+        phase_model_runtime = None
+        if phase_initial is not None:
+            from sylanne3.runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+            from sylanne3.host.authority_profile import bind_artifact_phase_local_fixture_components_v1
+            phase_worker = await get_http_worker()
+            phase_model_runtime = InstalledArtifactDraftModelRuntimeV1(graph=graph, bootstrap=bootstrap,
+                bundle=installed_bundle, worker=phase_worker, authority_client=authority_client,
+                client_grant=client_grant, context=model_context, owner_loop=asyncio.get_running_loop())
+            await phase_worker.call(lambda current_graph:
+                current_graph.install_artifact_draft_model_runtime_v1(bootstrap, phase_model_runtime))
+            await bind_artifact_phase_local_fixture_components_v1(phase_qualification,
+                graph=graph, bootstrap=bootstrap, model_runtime=phase_model_runtime)
+        if after_initial_self_registration is not None:
+            # The actual Core Self registration and protected installed clients exist.
+            # No Host first-ingress Source, C0 attention, paid C1 or C02 is adopted.
+            assert phase_initial is not None and m1_initialization_case is not None
+            from sylanne3.runtime.d11_life_contract_v1 import WORK_KIND as NOTE_WORK_KIND
+            assert NOTE_WORK_KIND in installed_bundle.installation_policy.root_grant.allowed_work_kinds
+            registered_case = {**m1_initialization_case,
+                "installed_bundle":installed_bundle,"authority_client":authority_client,"client_grant":client_grant,
+                "phase_fixture_qualification":phase_qualification,"phase_provider_calls":phase_provider_calls,
+                "phase_model_runtime":phase_model_runtime,"phase_worker":phase_worker,
+                "get_http_worker":get_http_worker,"self_registration":self_registration,
+                "namespace_creation":creation,"authority_loop":authority_loop}
+            assert not phase_provider_calls
+            await after_initial_self_registration(registered_case)
+            assert not phase_provider_calls
+            return
+        if phase_initial is None:
+            installed_bundle = AdminInstallationBundle(
+                profile, policy, b"k" * 32, b"d" * 32,
+                ingress_clock=ingress_clock,
+                ingress_encoding=encoding, model_workflows=workflows,
+                d13_paid_precompression=d13_paid_policy,
+                life_d04_before_capture_policy=before_capture_policy,
+                d04_semantic_drive=semantic_drive_policy, d04_joint_numeric=joint_numeric_policy,
+                private_reply_dispatch=private_reply_dispatch_policy,
+                **({"foreground": m1_initial.foreground, "artifact_draft": m1_initial.artifact_draft,
+                    "provider_billing_policy_v1": m1_initial.provider_billing_policy} if m1_initial is not None else {}))
         installed_model_selection = InstalledModelCapabilityPort(
             context=model_context, host_loop=asyncio.get_running_loop(),
             installed_namespace=namespace,
@@ -1174,6 +1536,47 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                     30.0, {"cpu_ms": 4}, "snapshot:reply-projection",
                     "resource:reply-projection"), ingress_clock)
             assert projection.status == "committed"
+            if after_initial_source_projection is not None:
+                # This actual Source/C0/D03 capture is an input prerequisite.
+                # The independent Owner Submit is the only management-task cause.
+                assert phase_initial is not None
+                from sylanne3.runtime.d11_life_contract_v1 import WORK_KIND as NOTE_WORK_KIND
+                assert NOTE_WORK_KIND in policy.root_grant.allowed_work_kinds
+                with graph_store._lock:
+                    from sylanne3.memory_types import source_key
+                    capture_source = source_key(*namespace.as_tuple, host.lineage.source_ref).token
+                captured = {**m1_initialization_case,
+                    "graph": graph, "store": graph_store, "bootstrap": bootstrap,
+                    "installed_bundle": installed_bundle, "policy": policy, "grant": grant,
+                    "authority_client": authority_client, "client_grant": client_grant,
+                    "phase_fixture_qualification": phase_qualification, "phase_provider_calls": phase_provider_calls,
+                    "phase_model_runtime": phase_model_runtime, "phase_worker": phase_worker,
+                    "source_ref": capture_source, "ingress": ingress, "source_capture_receipt": first_ingress,
+                    "arrival_receipt": arrival, "self_projection_receipt": projection,
+                    "get_http_worker": get_http_worker, "namespace_creation": creation,
+                    "observed": observed, "adapter": adapter, "host_context": host_context,
+                    "model_context": model_context, "model_reply_mode": model_reply_mode,
+                    "model_http_client": model_http_client, "model_service": model_service,
+                    "server": server, "reverse_server": reverse_server, "reverse_listener": reverse_listener,
+                    "reverse_client": reverse_client, "listener": listener, "transport": transport,
+                    "client_transport": client_transport, "deletion_journal": deletion_journal,
+                    "deletion_guard": deletion_guard, "core": core, "protected": protected,
+                    "execution": execution, "fences": fences, "core_authorizer": authorizer,
+                    "port": port, "files": files, "authority_loop": authority_loop,
+                    "peer": peer, "admin_peer": admin_peer, "model_store": model_store}
+                assert not phase_provider_calls
+                await after_initial_source_projection(captured)
+                assert not phase_provider_calls
+                return first_ingress, None
+            if phase_initial is not None and "phase_standing_approval" not in m1_initialization_case:
+                # The existing first-ingress projection is the actual signed Self
+                # mapping. The Owner approval precedes this invocation's paid C1.
+                from m1_artifact_draft_acceptance_support_v1 import approve_m1_phase_standing_predecision_v3
+                m1_initialization_case.update(installed_bundle=installed_bundle,
+                    authority_client=authority_client, client_grant=client_grant,
+                    phase_provider_calls=phase_provider_calls)
+                await phase_worker.call(lambda current_graph:
+                    approve_m1_phase_standing_predecision_v3(m1_initialization_case))
             baseline = await asyncio.to_thread(
                 graph.commit_d04_encoding_baseline_v1,
                 bootstrap, namespace, job_id, ingress_operation_id,
@@ -1210,7 +1613,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 context=model_context, host_loop=asyncio.get_running_loop(),
                 trusted_umo="platform-1:FriendMessage:123456",
                 descriptor=ModelProviderDescriptor(
-                    "provider-1", "astrbot-4.28.1", "model-1",
+                    provider_config["id"], "astrbot-4.28.1", provider_config["model"],
                     frozenset({"text"}), frozenset({"consolidation"}),
                     frozenset({"private"}), "credential:astrbot-installed",
                     "unknown", False, False),
@@ -1280,15 +1683,22 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
 
         first_ingress, c02 = await _commit_c02_message(
             host, ingress)
-        reply_bundle = replace(
-            installed_bundle,
-            d07_attention=AdminD07AttentionPolicy(
-                300.0 if enable_c04_body_work and enable_d04_joint_numeric else 30.0,
-                {"cpu_ms": 1}, "snapshot:reply-attention",
-                "resource:reply-attention"),
-            private_reply_dispatch=AdminPrivateReplyDispatchPolicy(
-                120.0, {"cpu_ms": 1}, "snapshot:reply-dispatch",
-                "resource:reply-dispatch", 800, 120.0))
+        if after_initial_source_projection is not None:
+            assert c02 is None
+            return
+        if phase_initial is None:
+            reply_bundle = replace(
+                installed_bundle,
+                d07_attention=AdminD07AttentionPolicy(
+                    300.0 if enable_c04_body_work and enable_d04_joint_numeric else 30.0,
+                    {"cpu_ms": 1}, "snapshot:reply-attention",
+                    "resource:reply-attention"),
+                private_reply_dispatch=(m1_initial.private_reply_dispatch if m1_initial is not None else
+                    AdminPrivateReplyDispatchPolicy(120.0, {"cpu_ms": 1}, "snapshot:reply-dispatch",
+                        "resource:reply-dispatch", 800, 120.0)))
+        else:
+            reply_bundle = installed_bundle
+            assert reply_bundle.d07_attention is not None and reply_bundle.private_reply_dispatch is not None
         graph._GraphCoordinator__dispatch_clock_policy = ingress_clock
         async def commit_c02_attention(receipt):
             attention_inputs = await asyncio.to_thread(
@@ -1353,15 +1763,20 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             # channel. This direct permanent fixture does the same after the
             # previous long-running work, without retrying any business RPC.
             from dataclasses import asdict
-            previous_identity = asdict(client_grant)
-            assert (await authority_client.status_v2()).state == "paired"
-            current_grant = await authority_client.installation_grant_v2()
-            assert current_grant is not None
-            current_identity = asdict(current_grant)
-            previous_identity.pop("channel_binding_sha256")
-            current_identity.pop("channel_binding_sha256")
-            assert previous_identity == current_identity
-            client_grant = current_grant
+            if phase_initial is None:
+                previous_identity = asdict(client_grant)
+                assert (await authority_client.status_v2()).state == "paired"
+                current_grant = await authority_client.installation_grant_v2()
+                assert current_grant is not None
+                current_identity = asdict(current_grant)
+                previous_identity.pop("channel_binding_sha256")
+                current_identity.pop("channel_binding_sha256")
+                assert previous_identity == current_identity
+                client_grant = current_grant
+            else:
+                from sylanne3.host.authority_profile import require_artifact_phase_fixture_qualification_v1
+                current = require_artifact_phase_fixture_qualification_v1(installed_bundle, client_grant=client_grant)
+                assert current is phase_qualification and client_grant is current.client_grant
             graph._GraphCoordinator__self_identity_port = InstalledCurrentSelfIdentityPort(
                 client=authority_client, bundle=installed_bundle, grant=client_grant,
                 owner_loop=asyncio.get_running_loop())
@@ -1391,10 +1806,11 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 IngressLineage(source_id, "reported", "onebot",
                                "external_report", "reported_claim",
                                "not_applicable"))
-            model_reply_mode["content"] = json.dumps({
-                "event_summary": text, "quoted_details": [],
-                "possible_meanings": [], "possible_feelings": [],
-            }, sort_keys=True, separators=(",", ":"))
+            if phase_initial is None:
+                model_reply_mode["content"] = json.dumps({
+                    "event_summary": text, "quoted_details": [],
+                    "possible_meanings": [], "possible_feelings": [],
+                }, sort_keys=True, separators=(",", ":"))
             first, second = await _commit_c02_message(second_host, second_ingress)
             if commit_attention:
                 await commit_c02_attention(second)
@@ -1402,16 +1818,24 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
 
         if after_c02 is not None:
             await after_c02({
+                "c09_daemon":c09_daemon,"c09_bootstrap":c09_bootstrap,
+                "c09_deployment_config":None if c09_daemon is None else c09_daemon.config,
+                "c09_maintenance_factory":None if c09_daemon is None else c09_daemon.config.c09_maintenance_factory,
+                "c09_phase_setup_file":c09_phase_setup_file,
+                "get_http_worker": get_http_worker,
                 "graph": graph, "store": graph_store,
                 "namespace": namespace, "authority_namespace": authority_namespace,
                 "bootstrap": bootstrap, "c02": c02,
+                "namespace_creation": creation,
+                "phase_standing_approval": (m1_initialization_case["phase_standing_approval"]
+                    if phase_initial is not None else None),
                 "commit_second_c02": commit_second_c02,
                 "source_ref": attention_source, "attention_receipt": attention_receipt,
                 "port": port, "core": core, "fences": fences,
                 "core_authorizer": authorizer,
                 "protected": protected, "execution": execution,
                 "server": server, "reverse_server": reverse_server,
-                "reverse_client": reverse_client,
+                "reverse_listener": reverse_listener, "reverse_client": reverse_client,
                 "files": files, "listener": listener,
                 "authority_loop": authority_loop,
                 "admin_port": admin_port,
@@ -1432,6 +1856,8 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 "pairing_source": pairing_source,
                 "authority_client": authority_client,
                 "client_grant": client_grant, "installed_bundle": reply_bundle,
+                "phase_fixture_qualification": phase_qualification, "phase_provider_calls": phase_provider_calls,
+                "phase_model_runtime": phase_model_runtime,
                 "policy": policy, "principal": principal,
                 "owner_session_token": owner_guard_token,
                 "owner_session_request": owner_guard_request,
@@ -1490,7 +1916,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             context=model_context, host_loop=asyncio.get_running_loop(),
             trusted_umo="platform-1:FriendMessage:123456",
             descriptor=ModelProviderDescriptor(
-                "provider-1", "astrbot-4.28.1", "model-1",
+                provider_config["id"], "astrbot-4.28.1", provider_config["model"],
                 frozenset({"text"}), frozenset({"proposal"}),
                 frozenset({"private"}), "credential:astrbot-installed",
                 "unknown", False, False),
@@ -1885,7 +2311,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                             begin=begin_dispatch_handoff) as replay_decision:
                         assert replay_decision.replay
                     assert len(onebot_sends) == 1
-                    with sqlite3.connect(tmp_path / "business.db") as claim_db:
+                    with sqlite3.connect(graph_path) as claim_db:
                         claim_row = claim_db.execute(
                             "SELECT revision,valid FROM graph_atoms "
                             "WHERE token=? AND bot=? AND persona=?",
@@ -1900,9 +2326,14 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
     finally:
         if graph_worker is not None:
             await graph_worker.close()
+            parent_host_store_closed = True
         if reverse_listener is not None:
             reverse_listener.close()
             await reverse_listener.wait_closed()
+        if phase_qualification is not None:
+            from sylanne3.host.authority_profile import revoke_artifact_phase_local_fixture_qualification_v1
+            revoke_artifact_phase_local_fixture_qualification_v1(phase_qualification)
+            await phase_qualification.authority_client._transport.close()
         if model_http_client is not None:
             await model_http_client.aclose()
         if admin_port is not None:
@@ -1920,7 +2351,9 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 if listener is not None:
                     listener.close()
                     await listener.wait_closed()
-                if server is not None:
+                if c09_bootstrap is not None:
+                    await c09_bootstrap.aclose()
+                elif server is not None:
                     await server.aclose()
             await asyncio.to_thread(
                 lambda: asyncio.run_coroutine_threadsafe(
@@ -1928,11 +2361,14 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             authority_loop.call_soon_threadsafe(authority_loop.stop)
             await asyncio.to_thread(authority_thread.join, 30)
             authority_loop.close()
+        elif c09_bootstrap is not None:
+            await c09_bootstrap.aclose()
         if parent_actor_case is not None and parent_actor_case.get("c09_authority_store") is not None:
             parent_actor_case["c09_authority_store"].close()
         if not parent_host_store_closed:
             graph_store.close()
-        core.close()
+        if c09_bootstrap is None:
+            core.close()
         if "graph" in locals():
             actual_d04 = getattr(graph, "_actual_d04_authority_acceptance_v3", None)
             if actual_d04 is not None:

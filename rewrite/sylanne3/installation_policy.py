@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from .authority_service.contract import identifier
 from .runtime.budget import BudgetLease
-from .runtime_contracts import NamespaceId
+from .runtime_contracts import NamespaceId, canonical_digest
 
 if TYPE_CHECKING:
     from .runtime.issuers import BudgetLeaseGrant
@@ -136,3 +136,13 @@ class AdminInstallationPolicy:
 
 
 __all__ = ["AdminInstallationPolicy"]
+
+
+def model_capability_ref(provider_id: str, model: str) -> str:
+    """Canonical selector for one configured provider and its current model."""
+    if (type(provider_id) is not str or not provider_id
+            or type(model) is not str or not model):
+        raise ValueError("provider ID and model must be nonempty strings")
+    return "astrbot-model:" + canonical_digest({
+        "schema": "sylanne.astrbot.installed-model.v1", "provider_id": provider_id, "model": model,
+    })

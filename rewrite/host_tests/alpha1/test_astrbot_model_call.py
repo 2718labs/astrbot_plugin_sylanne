@@ -254,7 +254,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.provider.provider_config["model"] = "changed"
         assert await replier.selected_d13_main_installation_v1() is None
 
-    async def test_d13_preflight_matches_main_wire_but_holds_without_exact_counter(self):
+    async def test_d13_preflight_preserves_unknown_optional_count_and_main_identity(self):
         _, encoder, replier = self.v2_adapters()
         window, plan, _ = d13_plan_case()
         main = await replier.selected_d13_main_installation_v1()
@@ -262,10 +262,10 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         frozen = freeze_d13_precompression_request_v1(window, plan, main)
 
         selected = await replier.preflight_d13_precompression_v1(frozen)
-        assert selected.status == "hold"
+        assert selected.status == "ready"
         assert selected.wire_digest == frozen.wire_digest
         assert selected.exact_input_tokens is None
-        assert "exact installed-provider tokenizer unavailable" in selected.reason
+        assert selected.reason is None
         assert (await encoder.preflight_d13_precompression_v1(frozen)).status == "hold"
 
         changed = replace(frozen, wire_digest="0" * 64)
@@ -274,6 +274,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.manager.selected = object()
         assert "selected conversation model" in (
             await replier.preflight_d13_precompression_v1(frozen)).reason
+        assert self.requests == []  # Observing the wire grants no model admission.
 
     async def test_natural_stage_wire_strips_internal_provider_selector(self):
         bundle, encoder, replier = self.v2_adapters()
@@ -355,7 +356,49 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                                             "provider_id": "spoofed"})
             assert adapter._request_allowed(bad) is False
 
-    async def test_d04_installed_appraisal_wire_uses_selected_provider_once(self):
+    async def test_life_numeric_sdk_slot_requires_actual_v3_or_v4_installation_object(self):
+        from sylanne3.host.model_workflows_v3 import AdminModelWorkflowsV3
+        from sylanne3.host.model_workflows_v4 import AdminModelWorkflowsV4
+        bundle, _, _ = self.v2_adapters()
+        numeric = replace(bundle.model_workflows.encode,
+            work_kind="d06.encode_internal_life_numeric", purpose="consolidation",
+            template_version="sylanne.d06.internal_life_numeric.v1",
+            quote_ceiling={"input_tokens": 64, "output_tokens": 64,
+                "model_tokens": 128, "model_microusd": 12})
+        limits = {"input_tokens": 128, "output_tokens": 128,
+            "model_tokens": 256, "model_microusd": 24}
+        base_policy = bundle.installation_policy
+        policy = replace(base_policy, root_lease=replace(base_policy.root_lease, limits=limits),
+            root_grant=replace(base_policy.root_grant, max_ceiling=limits,
+                allowed_work_kinds=(*base_policy.root_grant.allowed_work_kinds, numeric.work_kind)))
+        for version, container_type in ((3, AdminModelWorkflowsV3), (4, AdminModelWorkflowsV4)):
+            container = container_type(version, bundle.model_workflows.encode,
+                bundle.model_workflows.reply, life_numeric=numeric)
+            current = replace(bundle, installation_policy=policy, model_workflows=container)
+            port = InstalledModelCapabilityPort(context=self.context,
+                host_loop=asyncio.get_running_loop(), installed_namespace=policy.namespace,
+                installation_bundle=current)
+            async def accepts(selected, namespace=policy.namespace):
+                return await asyncio.to_thread(port.verify_admin_selection, namespace, selected)
+            assert await accepts(numeric)
+            assert not await accepts(replace(numeric))
+            assert not await accepts(replace(numeric, work_kind="unknown_workflow"))
+            assert not await accepts(numeric, NamespaceId("foreign-bot", "persona"))
+            self.provider.provider_config["model"] = "wrong-installed-model"
+            try:
+                assert not await accepts(numeric)
+            finally:
+                self.provider.provider_config["model"] = "model-1"
+            denied = replace(current, installation_policy=replace(policy,
+                root_grant=replace(policy.root_grant,
+                    allowed_work_kinds=base_policy.root_grant.allowed_work_kinds)))
+            denied_port = InstalledModelCapabilityPort(context=self.context,
+                host_loop=asyncio.get_running_loop(), installed_namespace=policy.namespace,
+                installation_bundle=denied)
+            assert not await asyncio.to_thread(denied_port.verify_admin_selection, policy.namespace, numeric)
+            assert self.requests == []
+
+    async def test_d04_installed_appraisal_uses_bound_slot_when_umo_differs(self):
         bundle, encoder, replier = self.v2_adapters()
         config = replier._admin_model
         workflow = replace(
@@ -390,6 +433,16 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             context=self.context, host_loop=asyncio.get_running_loop(),
             trusted_umo=UMO, descriptor=self.descriptor,
             admin_model=workflow, installation_bundle=bundle)
+        dialogue = object.__new__(ProviderOpenAIOfficial)
+        dialogue.provider_config = {
+            "id": "dialogue-2", "type": "openai_chat_completion", "model": "dialogue-2",
+        }
+        dialogue.model_name = "dialogue-2"
+        dialogue.client = self.shared_client
+        self.manager.provider_insts.append(dialogue)
+        self.manager.inst_map["dialogue-2"] = dialogue
+        self.manager.selected = dialogue
+        assert await replier.selected_d13_main_installation_v1() is None
         base = call_request()
         authority = replace(
             base.envelope.authority, worker_fence=1,
@@ -414,12 +467,22 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         assert (await adapter.invoke_admitted(
             request, admission, asyncio.Event())).status == "completed"
         assert len(self.requests) == 1
+        assert self.manager.seen_umo == [UMO]
         sent = json.loads(self.requests[0][1].content)
         assert "provider_id" not in sent
         assert sent["messages"] == request.payload["messages"]
         assert not adapter._request_allowed(replace(
             request, payload={**request.payload, "provider_id": "another"}))
         assert not replier._request_allowed(request)
+        self.manager.inst_map[workflow.provider_id] = dialogue
+        next_request = replace(request, call_id=uuid4().hex)
+        next_admission = replace(admission,
+                                 admission_id=hashlib.sha256(next_request.call_id.encode()).hexdigest(),
+                                 call_id=next_request.call_id,
+                                 request_digest=next_request.digest)
+        assert adapter._request_allowed(next_request)
+        rejected = await adapter.invoke_admitted(next_request, next_admission, asyncio.Event())
+        assert rejected.status == "not_dispatched" and len(self.requests) == 1
 
     async def test_v2_same_model_has_distinct_encoding_and_reply_scope(self):
         bundle, encoder, replier = self.v2_adapters()
@@ -906,6 +969,103 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.to_thread(thread.join, 1)
             host_loop.close()
+
+
+    async def test_sdk_m1_finite_http_encoding_and_signed_fixture_bill(self):
+        """Actual SDK HTTP/codec only, no Core admission or installation claim."""
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from rewrite.host_tests.alpha1.sdk_m1_fixture_contract_v1 import EPISODES
+        from rewrite.host_tests.alpha1.sdk_m1_model_fixture_v1 import FiniteSdkM1ModelFixtureV1
+        from rewrite.tests.alpha1.runtime.test_encoding_call_binding import _request, SOURCE
+        from sylanne3.model_broker.first_ingress_encoding import (
+            FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION, parse_first_ingress_encoding_result,
+            parse_artifact_task_intent_v1,
+        )
+        from sylanne3.model_broker.provider_billing_receipt_v1 import (
+            EXTENSION_KEY, ProviderBillingPolicyV1, verify_provider_billing_receipt_v1,
+            provider_billing_request_metadata_v1,
+        )
+        from sylanne3.model_broker import natural_review
+        from sylanne3.runtime_contracts import canonical_serialize
+        key = Ed25519PrivateKey.generate()
+        private_hex = key.private_bytes(serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw, serialization.NoEncryption()).hex()
+        public_hex = key.public_key().public_bytes(serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw).hex()
+        policy = self.bundle.installation_policy
+        billing = ProviderBillingPolicyV1(policy.namespace, policy.installation_id,
+            policy.manifest_digest, self.admin_model.provider_id, self.admin_model.model_id,
+            self.admin_model.provider_config_digest, "fixture:sdk-m1-final-charge", 1,
+            public_hex, "fixture_simulated_charge")
+        installed, _, _ = self.v2_adapters()
+        encode = replace(installed.model_workflows.encode,
+            template_version=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION,
+            max_output_tokens=1024, quote_ceiling={"output_tokens": 1024})
+        bundle = replace(installed,
+            model_workflows=replace(installed.model_workflows, encode=encode),
+            provider_billing_policy_v1=billing)
+        helper = FiniteSdkM1ModelFixtureV1({"schema": "sylanne.sdk-m1-model-fixture.v1",
+            "provider_id": billing.provider_id, "model_id": billing.model_id,
+            "provider_config_digest": billing.provider_config_digest,
+            "billing_private_key_hex": private_hex, "filename": "m1-draft.txt",
+            "max_episode_calls": 6, "max_auxiliary_calls": 2, "max_total_calls": 12,
+            "episodes": list(EPISODES)})
+        source = replace(SOURCE, text=EPISODES[0]["task_text"])
+        call = _request(source=source, max_output_tokens=1024,
+            template_version=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION)
+        payload = dict(call.payload)
+        messages = [{"role": "system", "content": payload["system_prompt"]},
+            {"role": "user", "content": payload["prompt"]}]
+        http = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: helper.respond(request, installed_bundle=bundle)), trust_env=False)
+        client = AsyncOpenAI(api_key="local fixture canary", base_url="http://127.0.0.1:19661/v1",
+            http_client=http, max_retries=0)
+        try:
+            # A refused response must not register source correlation or spend a slot.
+            with self.assertRaisesRegex(ValueError, "original installed output ceiling"):
+                await client.chat.completions.create(model=billing.model_id, messages=messages,
+                    stream=False, max_completion_tokens=1,
+                    **provider_billing_request_metadata_v1(billing, call))
+            self.assertEqual(helper.calls, [])
+            self.assertEqual(helper._source_episodes, {})
+            completion = await client.chat.completions.create(model=billing.model_id,
+                messages=messages, stream=False, max_completion_tokens=call.max_output_tokens,
+                **provider_billing_request_metadata_v1(billing, call))
+            result = {"text": completion.choices[0].message.content}
+            candidate = parse_first_ingress_encoding_result(result, source,
+                template_version=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION)
+            self.assertEqual(candidate.event_summary, source.text)
+            task = parse_artifact_task_intent_v1(result, source)
+            self.assertEqual((task.kind, task.filename, task.source_quote),
+                (EPISODES[0]["intent_kind"], "m1-draft.txt", source.text))
+            usage = {"input_tokens": completion.usage.prompt_tokens,
+                "output_tokens": completion.usage.completion_tokens, "cached_input_tokens": 0}
+            bill = verify_provider_billing_receipt_v1(billing, request=call,
+                provider_call_ref=completion.id, response_model=completion.model, usage=usage,
+                raw=completion.model_extra[EXTENSION_KEY])
+            self.assertEqual((bill.evidence_kind, bill.final_charged_amount), ("fixture_simulated_charge", 7))
+            self.assertEqual(helper.calls[0]["call_id"], call.call_id)
+            with self.assertRaisesRegex(ValueError, "call identity was replayed"):
+                await client.chat.completions.create(model=billing.model_id, messages=messages,
+                    stream=False, max_completion_tokens=call.max_output_tokens,
+                    **provider_billing_request_metadata_v1(billing, call))
+            self.assertEqual(len(helper.calls), 1)
+            actual = {"schema": "sylanne.d09.context_reply_output.v3", "body": "原件",
+                "units": [{"start": 0, "end": 2, "kind": "fact", "basis_ids": ["basis"],
+                    "speech_act": "assert", "promise_grant_id": None, "slot_ids": []}],
+                "semantic_segments": [{"start": 0, "end": 2}]}
+            digest = natural_review.generation_output_digest_from_generation(actual)
+            helper._generation_episodes[digest] = 0  # Controlled parser negative, not a real generation.
+            changed = {"schema": natural_review.INPUT_SCHEMA_V2, "generation_output_digest": digest,
+                "generation_output_schema": actual["schema"], "body": "篡改", "units": actual["units"],
+                "semantic_segments": actual["semantic_segments"]}
+            with self.assertRaises(ValueError):
+                helper._candidate([{"role": "system", "content": natural_review.SYSTEM_MESSAGE_V2},
+                    {"role": "user", "content": canonical_serialize(changed)}], bundle)
+            self.assertEqual(len(helper.calls), 1)
+        finally:
+            await client.close()
 
 
 if __name__ == "__main__":

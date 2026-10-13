@@ -12,7 +12,7 @@ from ..contracts import canonical_json
 from ..graph_types import owner_grant_key, validate_owner_grant_v1
 from ..runtime.c09_erasure_plan_original_v1 import (
     C09ErasurePlanOriginalV1, current_c09_source_read_versions_v1,
-    read_c09_erasure_plan_original_v1,
+    read_c09_erasure_plan_original_v1, read_c09_erasure_plan_original_versioned_v2,
 )
 from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, canonical_digest
 from .contract import AuthorityUnavailable
@@ -37,8 +37,20 @@ class PinnedCurrentErasurePlanGraphVerifier:
         if not path.is_absolute():
             raise ValueError("Graph database path must be absolute")
         self._path = path.resolve(strict=True)
+        self._source_plan_control_v2 = None
         if not self._path.is_file():
             raise ValueError("pinned Graph database is not a file")
+
+    def install_source_plan_control_v2(self, control):
+        from .c09_paged_capture_control_v2 import InstalledC09PagedCaptureControlV2
+        if type(control) is not InstalledC09PagedCaptureControlV2:
+            raise AuthorityUnavailable("actual protected C09 Source-plan control required")
+        control._registered()
+        if control.maintenance.current_source_location._graph_db_path != self._path:
+            raise AuthorityUnavailable("C09 Source-plan verifier crosses the installed Graph")
+        if self._source_plan_control_v2 is not None and self._source_plan_control_v2 is not control:
+            raise AuthorityUnavailable("C09 Source-plan verifier is already installed")
+        self._source_plan_control_v2 = control
 
     def verify(self, *, namespace: NamespaceId, operation_id: str,
                source_id: str, anchor, grant_digest: str,
@@ -46,16 +58,28 @@ class PinnedCurrentErasurePlanGraphVerifier:
                applied_epoch: int, storage_admission=None,
                owner_proof=None, owner_guard=None, holder=None) -> C09ErasurePlanOriginalV1:
         try:
+            control = self._source_plan_control_v2
+            location = None if control is None else control.current_source_plan_selection_v2(namespace)
             with closing(sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)) as db:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
                 try:
-                    return self._check(db, namespace, operation_id, source_id,
+                    result = self._check(db, namespace, operation_id, source_id,
                                        anchor, grant_digest, installation_id,
                                        principal, applied_epoch, storage_admission,
                                        owner_proof, owner_guard, holder)
                 finally:
                     db.execute("ROLLBACK")
+            from ..runtime.c09_source_plan_barrier_v2 import C09SourcePlanCaptureV2
+            if type(result) is C09SourcePlanCaptureV2:
+                if location is None:
+                    raise AuthorityUnavailable("C09 V2 plan verifier lacks actual installed resource selection")
+                location.require_current()
+                if any(getattr(result, name) != getattr(location, name) for name in (
+                        "source_location_digest", "selected_storage_generation",
+                        "selected_manifest_digest", "selected_pointer_version")):
+                    raise AuthorityUnavailable("C09 V2 plan selected installation changed")
+            return result
         except Exception as exc:
             raise AuthorityUnavailable("current pinned C09 Graph plan unavailable") from exc
 
@@ -63,8 +87,9 @@ class PinnedCurrentErasurePlanGraphVerifier:
     def _check(db, namespace, operation_id, source_id, anchor,
                grant_digest, installation_id, principal, applied_epoch,
                storage_admission, owner_proof, owner_guard, holder):
+        from ..runtime.c09_source_plan_barrier_v2 import C09SourcePlanCaptureV2,read_c09_source_work_v2,require_c09_source_stamp_v2,seal_c09_source_plan_v2
         ns = namespace.as_tuple
-        original = read_c09_erasure_plan_original_v1(db, namespace, operation_id)
+        original = read_c09_erasure_plan_original_versioned_v2(db, namespace, operation_id)
         if (original is None or original.root_source_ids != (source_id,)
                 or original.owner_grant_digest != grant_digest):
             raise ValueError("C09 plan identity differs")
@@ -104,7 +129,7 @@ class PinnedCurrentErasurePlanGraphVerifier:
         row = db.execute(
             "SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? "
             "AND persona=?", (key.token, *ns)).fetchone()
-        if row is None or row[2] != 1 or row[0] != 1:
+        if row is None or row[2] != 1 or row[0] != (original.owner_revision if type(original) is C09SourcePlanCaptureV2 else 1):
             raise ValueError("C09 Owner grant unavailable")
         grant = _canonical(row[1])
         validate_owner_grant_v1(grant)
@@ -145,9 +170,16 @@ class PinnedCurrentErasurePlanGraphVerifier:
                     or admission.activation_generation != target.activation_generation
                     or admission.revocation_epoch != target.revocation_epoch):
                 raise ValueError("C09 actual Owner storage continuation differs")
-        if original.read_versions != current_c09_source_read_versions_v1(
-                db, namespace, source_id):
-            raise ValueError("C09 source ancestry changed")
+        if type(original) is C09SourcePlanCaptureV2:
+            state=read_c09_source_work_v2(db,namespace,operation_id)
+            if state is None or state['phase']!='plan_complete':raise ValueError('actual complete C09 V2 Source capture absent')
+            require_c09_source_stamp_v2(db,namespace,state)
+            if seal_c09_source_plan_v2(db,namespace,operation_id)!=original:
+                raise ValueError('actual Source EOF/header differs from stored V2 plan')
+        elif type(original) is C09ErasurePlanOriginalV1:
+            if original.read_versions != current_c09_source_read_versions_v1(db,namespace,source_id):
+                raise ValueError("C09 source ancestry changed")
+        else:raise ValueError('unregistered current C09 plan original')
         return original
 
 

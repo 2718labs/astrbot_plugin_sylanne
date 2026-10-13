@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..contracts import canonical_json
 from ..domains.d08.execution import ActionIntent
 from ..graph_types import AtomKey, Owner
@@ -98,11 +99,7 @@ def install_schema(db) -> None:
 
 
 def _graph_revision(db, key: AtomKey, value: object, kind: str) -> int:
-    row = db.execute(
-        "SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? "
-        "AND persona=? AND type_name=?",
-        (key.token, key.owner.bot, key.owner.persona, key.type_name),
-    ).fetchone()
+    row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=? AND type_name=?', parameters=(key.token, key.owner.bot, key.owner.persona, key.type_name))
     if (row is None or row[2] != 1 or type(row[0]) is not int or row[0] < 1
             or row[1] != canonical_json(value)):
         raise ValueError(f"current {kind} graph row differs")

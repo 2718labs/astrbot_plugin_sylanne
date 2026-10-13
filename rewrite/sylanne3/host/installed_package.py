@@ -73,9 +73,29 @@ def verify_backend_candidate_qualification(
         package_root, expected_manifest_digest,
         available_cpu_features=available_cpu_features,
     )
-    is_snapshot = installed.build_mode == "snapshot-alpha1-test"
-    if (not installed.verified or installed.build_mode not in {"backend-alpha1-candidate", "snapshot-alpha1-test"}
-            or installed.candidate_scope != ("alpha1-test" if is_snapshot else "backend-only")):
+    return _qualify_verified_backend_candidate_v1(
+        package_root, expected_manifest_digest, installed,
+    )
+
+
+def _qualify_verified_backend_candidate_v1(
+    package_root: Path | str,
+    expected_manifest_digest: str,
+    installed: InstalledPackageVerification,
+) -> BackendCandidateQualification:
+    """Continue this call's actual package verification without rescanning it.
+
+    Both public callers obtain a fresh full-file verification immediately before
+    entering here. This private result is never cached or accepted as a public
+    caller input; qualification still rereads the manifest and actual assets.
+    """
+    if (type(installed) is not InstalledPackageVerification
+            or installed.manifest_digest != expected_manifest_digest):
+        return BackendCandidateQualification(False, "candidate_package_unverified")
+    is_alpha2 = installed.build_mode == "alpha2-candidate"
+    is_snapshot = installed.build_mode in {"snapshot-alpha1-test", "alpha2-candidate"}
+    if (not installed.verified or installed.build_mode not in {"backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}
+            or installed.candidate_scope != ("alpha2-local" if is_alpha2 else "alpha1-test" if is_snapshot else "backend-only")):
         return BackendCandidateQualification(False, "candidate_package_unverified")
     root = Path(package_root).absolute()
     try:
@@ -91,18 +111,25 @@ def verify_backend_candidate_qualification(
             "sylanne.backend-alpha1-candidate-qualification.v1": False,
             "sylanne.backend-alpha1-candidate-qualification.v2": True,
             "sylanne.alpha1-test-snapshot-qualification.v1": True,
+            "sylanne.alpha2-local-qualification.v1": True,
         }
         if type(qualification) is not dict or qualification.get("schema") not in schemas:
             raise ValueError("qualification_schema_invalid")
         production = schemas[qualification["schema"]]
         if is_snapshot:
-            from .alpha1_test_snapshot_v1 import QUALIFICATION_SCHEMA, validate_test_snapshot_manifest_v1
-            if qualification["schema"] != QUALIFICATION_SCHEMA:
-                raise ValueError("test_snapshot_qualification_schema_invalid")
-            validate_test_snapshot_manifest_v1(manifest)
-        elif qualification["schema"] == "sylanne.alpha1-test-snapshot-qualification.v1":
+            from .alpha1_test_snapshot_v1 import (QUALIFICATION_SCHEMA, ALPHA2_QUALIFICATION_SCHEMA,
+                validate_test_snapshot_manifest_v1, validate_alpha2_candidate_manifest_v1)
+            expected_schema = ALPHA2_QUALIFICATION_SCHEMA if is_alpha2 else QUALIFICATION_SCHEMA
+            if qualification["schema"] != expected_schema:
+                raise ValueError("candidate_qualification_schema_invalid")
+            if is_alpha2:
+                validate_alpha2_candidate_manifest_v1(manifest)
+            else:
+                validate_test_snapshot_manifest_v1(manifest)
+        elif qualification["schema"] in {"sylanne.alpha1-test-snapshot-qualification.v1",
+                "sylanne.alpha2-local-qualification.v1"}:
             raise ValueError("test_snapshot_mode_required")
-        runtime_scope = ("backend-production-acceptance" if production
+        runtime_scope = ("backend-local-alpha2-acceptance" if is_alpha2 else "backend-production-acceptance" if production
                          else "limited-diagnostics")
         effect_gate = ("requires_installed_authority_and_current_effect_admission"
                        if production else "disabled")
@@ -110,9 +137,12 @@ def verify_backend_candidate_qualification(
             "catalogue_runtime_verified", "migration_validated",
             "formal_alpha1_source_freeze", "full_host_acceptance",
         ]
+        if is_alpha2:
+            from .alpha1_test_snapshot_v1 import ALPHA2_UNMET_GATES
+            expected_gates = ALPHA2_UNMET_GATES
         if (not isinstance(qualification, dict)
-                or qualification.get("status") != ("alpha1_test_snapshot" if is_snapshot else "backend_candidate")
-                or qualification.get("product_status") != ("test_snapshot" if is_snapshot else "candidate_only")
+                or qualification.get("status") != ("alpha2_candidate" if is_alpha2 else "alpha1_test_snapshot" if is_snapshot else "backend_candidate")
+                or qualification.get("product_status") != ("test_snapshot" if is_snapshot and not is_alpha2 else "candidate_only")
                 or qualification.get("runtime_scope") != runtime_scope
                 or qualification.get("message_processing") != effect_gate
                 or qualification.get("outbound_sending") != effect_gate
@@ -283,12 +313,11 @@ def verify_installed_backend_runtime_v1(
     )
     if not installed.verified:
         return installed
-    if installed.build_mode in {"backend-alpha1-candidate", "snapshot-alpha1-test"}:
-        qualified = verify_backend_candidate_qualification(
-            package_root, expected_manifest_digest,
-            available_cpu_features=available_cpu_features,
+    if installed.build_mode in {"backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
+        qualified = _qualify_verified_backend_candidate_v1(
+            package_root, expected_manifest_digest, installed,
         )
-        if qualified.qualified and qualified.runtime_scope == "backend-production-acceptance":
+        if qualified.qualified and qualified.runtime_scope in {"backend-production-acceptance", "backend-local-alpha2-acceptance"}:
             return replace(installed, runtime_scope=qualified.runtime_scope,
                            catalogue_hash=qualified.catalogue_hash)
         return replace(installed, verified=False, reason="runtime_unqualified")
@@ -448,7 +477,7 @@ def verify_installed_package(
     native = manifest.get("native")
     entries = manifest.get("files")
     if (not isinstance(version, str) or not version
-            or mode not in {"dev-probe", "formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test"}
+            or mode not in {"dev-probe", "formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}
             or not isinstance(target, dict) or not isinstance(native, dict)
             or not isinstance(entries, list) or not entries):
         return invalid
@@ -457,6 +486,12 @@ def verify_installed_package(
         try:
             from .alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
             validate_test_snapshot_manifest_v1(manifest)
+        except (ValueError, TypeError, KeyError):
+            return invalid
+    elif mode == "alpha2-candidate":
+        try:
+            from .alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1
+            validate_alpha2_candidate_manifest_v1(manifest)
         except (ValueError, TypeError, KeyError):
             return invalid
     qualifier = manifest.get("backend_qualification")
@@ -512,7 +547,7 @@ def verify_installed_package(
     native_path = f"rewrite/sylanne3/_native/{os_name}-{arch}/{_NATIVE_NAMES[os_name]}"
     if native_path not in listed or native != listed[native_path]:
         return invalid
-    if mode in {"backend-alpha1-candidate", "snapshot-alpha1-test"}:
+    if mode in {"backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
         required = {
             "rewrite/sylanne3/domain_registry.py",
             "rewrite/sylanne3/host/legacy_data_preflight.py",

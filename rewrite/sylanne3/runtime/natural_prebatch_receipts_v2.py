@@ -77,6 +77,7 @@ def issue_natural_pregrant_social_receipts_v2(
     original_scope_proof: NaturalScopedQueryProofV2,
     context: ContextProvider, scope: FenceScope, *,
     now_utc: float, valid_until_utc: float,
+    natural_catalogue_original_receiver=None,
 ) -> NaturalPrebatchSocialEvidenceV2:
     """Issue current D03/D05 checks before a five-check grant exists.
 
@@ -175,7 +176,8 @@ def issue_natural_pregrant_social_receipts_v2(
                 raise ValueError("social criterion changed")
             criteria_atoms.append(atom)
         role = context.provide_required_check(
-            intent, role_read, valid_until=valid_until_utc)
+            intent, role_read, valid_until=valid_until_utc,
+            natural_catalogue_original_receiver=natural_catalogue_original_receiver)
         boundary = issue_prebatch_boundary_check_v1(
             intent, schema, boundary_read, audience_scope=material.audience_id,
             scene_ref=material.scene_id, now_utc=now_utc,

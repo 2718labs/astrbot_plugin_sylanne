@@ -373,6 +373,44 @@ def stage_current_c04_prepare_v3(
             or owner_value["grant_id"] != owner.grant_id
             or owner_value["activation_generation"] != authority.activation_generation):
         raise C04PrepareHold("C04 current Owner graph original differs")
+    cpu_policy = cpu_authority.read_policy(db, namespace, cpu_policy_id, cpu_policy_version)
+    if cpu_policy.installation_id != installation_id or cpu_policy.algorithm_ref != ALGORITHM_ID_V3:
+        raise C04PrepareHold("installed CPU policy or algorithm differs")
+    resource = cpu_authority.request_quote(
+        db, namespace=namespace, policy_id=cpu_policy_id, policy_version=cpu_policy_version,
+        envelope=envelope, owner=owner, d11_issuer=d11_issuer,
+        algorithm_ref=ALGORITHM_ID_V3, now_utc=now_utc)
+    versions = {row.key.token: row.revision for row in originals.reads}
+    for target in work.targets:
+        versions[target.condition.current_checkpoint.ref] = target.condition.current_checkpoint.revision
+    versions[owner_key.token] = owner_revision
+    resources = _prepare_c04_body_resources_v3(db, envelope=envelope, resource=resource,
+        body_policy_id=body_policy_id, body_policy_version=body_policy_version,
+        reservation_id=reservation_id, d02_issuer=d02_issuer, body_authority=body_authority,
+        now_utc=now_utc, original_reads=tuple(GraphVersion(AtomKey.from_token(ref), revision)
+            for ref, revision in sorted(versions.items())))
+    return C04PrepareStageV3(resources.envelope, resource, resources.body, work, execution_id,
+        owner_key.token, owner_revision, canonical_digest(owner_value),
+        resources.body_profile_ref, resources.body_profile_revision,
+        resources.body_state_ref, resources.body_state_revision, resources.read_versions)
+
+
+@dataclass(frozen=True, slots=True)
+class C04BodyResourcesV3:
+    envelope: CommandEnvelope
+    body: OriginalFixedBodyReservation
+    body_profile_ref: str
+    body_profile_revision: int
+    body_state_ref: str
+    body_state_revision: int
+    read_versions: tuple[GraphVersion, ...]
+
+
+def _prepare_c04_body_resources_v3(db, *, envelope, resource, body_policy_id, body_policy_version,
+        reservation_id, d02_issuer, body_authority, now_utc, original_reads):
+    """Common fixed Body/CPU materialization; only qualified Owner/Self wrappers call."""
+    _transaction(db)
+    namespace, identity = envelope.authority.namespace, envelope.identity
     body_policy = body_authority.policy(db, namespace, body_policy_id, body_policy_version)
     if body_policy.work_kind != C04_INTERNAL_CPU_WORK_KIND or body_policy.valid_until < envelope.deadline_utc:
         raise C04PrepareHold("installed C04 fixed Body policy differs or expires")
@@ -393,10 +431,7 @@ def stage_current_c04_prepare_v3(
     if len(inventory) > 1024:
         raise C04PrepareHold("current body reservation inventory exceeds bound")
     reservations = []
-    versions = {row.key.token: row.revision for row in originals.reads}
-    for target in work.targets:
-        checkpoint = target.condition.current_checkpoint
-        versions[checkpoint.ref] = checkpoint.revision
+    versions = {version.key.token: version.revision for version in original_reads}
     for ref, revision, value, valid in inventory:
         key = AtomKey.from_token(ref)
         if valid != 1:
@@ -409,13 +444,6 @@ def stage_current_c04_prepare_v3(
     if (len({item.reservation_id for item in reservations}) != len(reservations)
             or len({item.effect_id for item in reservations}) != len(reservations)):
         raise C04PrepareHold("body reservation inventory is ambiguous")
-    cpu_policy = cpu_authority.read_policy(db, namespace, cpu_policy_id, cpu_policy_version)
-    if cpu_policy.installation_id != installation_id or cpu_policy.algorithm_ref != ALGORITHM_ID_V3:
-        raise C04PrepareHold("installed CPU policy or algorithm differs")
-    resource = cpu_authority.request_quote(
-        db, namespace=namespace, policy_id=cpu_policy_id, policy_version=cpu_policy_version,
-        envelope=envelope, owner=owner, d11_issuer=d11_issuer,
-        algorithm_ref=ALGORITHM_ID_V3, now_utc=now_utc)
     d02_issuer.issue_quote(db, resource)
     post_quote = replace(envelope, version_guard=replace(envelope.version_guard,
         resource_lease_versions=(VersionedRef(resource.quote_id, resource.version),)))
@@ -430,14 +458,10 @@ def stage_current_c04_prepare_v3(
         if db.execute("SELECT 1 FROM graph_atoms WHERE token=?", (ref,)).fetchone() is not None:
             raise C04PrepareHold("new C04 body graph key already exists")
         versions[ref] = 0
-    versions.update({owner_key.token: owner_revision,
-        profile_write.key.token: profile_revision, state_key.token: state_revision})
-    return C04PrepareStageV3(
-        post_quote, resource, body, work, execution_id,
-        owner_key.token, owner_revision, canonical_digest(owner_value),
-        profile_write.key.token, profile_revision, state_key.token, state_revision,
-        tuple(GraphVersion(AtomKey.from_token(ref), revision)
-              for ref, revision in sorted(versions.items())))
+    versions.update({profile_write.key.token: profile_revision, state_key.token: state_revision})
+    return C04BodyResourcesV3(post_quote, body, profile_write.key.token, profile_revision,
+        state_key.token, state_revision, tuple(GraphVersion(AtomKey.from_token(ref), revision)
+            for ref, revision in sorted(versions.items())))
 
 
 def record_committed_current_c04_prepare_v3(

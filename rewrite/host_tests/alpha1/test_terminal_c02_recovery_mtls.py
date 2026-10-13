@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, replace
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
 import ssl
 import tempfile
+import time
 
 import pytest
 
@@ -21,12 +22,13 @@ from sylanne3.authority_service.mtls_server import (
 )
 from sylanne3.authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
 from sylanne3.authority_service.v2_terminal_c02_recovery_contract import to_wire
+from sylanne3.authority_service.v2_model_egress_contract import model_observation_to_wire_v1
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL, AuthorityHandshake, AuthorityProvisioningRequest,
     PublisherPackageIdentity,
 )
 from sylanne3.host.mtls_transport import (
-    AuthorityTlsProfile, MtlsAuthorityTransport, _Session,
+    AuthorityChannelUnavailable, AuthorityTlsProfile, MtlsAuthorityTransport, _Session,
 )
 from sylanne3.host.terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
 from sylanne3.runtime_contracts import InstallationGrantV2
@@ -43,9 +45,26 @@ def test_terminal_c02_ack_is_required_on_pinned_mtls_channel(tmp_path, monkeypat
             peer_digest = hashlib.sha256(peer_der).hexdigest()
             server = object.__new__(AuthorityRpcServer)
 
+            channel_events = []
+
             async def dispatch(method, wire_request, credential, binding,
                                handshake_binding, command):
                 assert credential.certificate_sha256 == peer_digest
+                if method == "handshake":
+                    assert command is None and handshake_binding is None
+                    assert wire_request == {
+                        "protocol": AUTHORITY_V2_PROTOCOL, "profile_id": "test",
+                        "plugin_name": "astrbot_plugin_sylanne", "host_api_version": "4.28.1",
+                        "manifest_sha256": "a" * 64,
+                    }
+                    channel_events.append(("handshake", hashlib.sha256(binding).hexdigest()))
+                    return {
+                        "state": "paired", "publisher_trusted": True,
+                        "installation_authority_id": request.original_key.authority_id,
+                        "installation_identity_ref": "installed",
+                        "channel_binding_sha256": hashlib.sha256(binding).hexdigest(),
+                    }
+                channel_events.append((method, hashlib.sha256(binding).hexdigest()))
                 assert command == {"namespace": request.original_key.authority_namespace,
                                    "read_request": to_wire(request)}
                 if method == "terminal_c02_recovery_query_v1":
@@ -59,7 +78,7 @@ def test_terminal_c02_ack_is_required_on_pinned_mtls_channel(tmp_path, monkeypat
                 delivery = service.prepare(credential="ok", request=request)
                 return _DeferredWorkerDelivery(
                     {"result": {"request": to_wire(request),
-                                "observation": asdict(delivery.observation)},
+                                "observation": model_observation_to_wire_v1(delivery.observation)},
                      "channel_binding_sha256": hashlib.sha256(binding).hexdigest()},
                     service, "ok", delivery)
 
@@ -126,7 +145,8 @@ def test_terminal_c02_ack_is_required_on_pinned_mtls_channel(tmp_path, monkeypat
                     wire_request, sort_keys=True, separators=(",", ":"),
                     ensure_ascii=True).encode()).hexdigest()
                 transport._sessions["test"] = _Session(
-                    reader, writer, binding, wire_digest)
+                    reader, writer, binding, wire_digest,
+                    handshake_started_at=time.monotonic())
                 provision = AuthorityProvisioningRequest(
                     AUTHORITY_PROTOCOL, "test", "astrbot_plugin_sylanne", "4.28.1",
                     Path(directory), Path(directory), PublisherPackageIdentity("a" * 64))
@@ -171,6 +191,66 @@ def test_terminal_c02_ack_is_required_on_pinned_mtls_channel(tmp_path, monkeypat
                     read_request=request)
                 assert queried_attempt == attempt and queried_fact == fact
                 assert await pinned_query.query_finished() == fact
+
+                # Renew the paired registration over this same actual TLS
+                # stream. Renewal must not mark a business dispatch.
+                session = transport._sessions["test"]
+                session.handshake_started_at = time.monotonic() - 20.0
+                before_renew = len(channel_events)
+
+                def on_dispatch():
+                    channel_events.append(("dispatch_hook", binding))
+
+                renewed_query = await transport._content_rpc(
+                    provision, handshake, "terminal_c02_recovery_query_v1", command,
+                    protocol=AUTHORITY_V2_PROTOCOL, _on_dispatch=on_dispatch)
+                assert renewed_query["read_fact"] == to_wire(fact)
+                assert transport._sessions["test"] is session
+                assert channel_events[before_renew:] == [
+                    ("handshake", binding), ("dispatch_hook", binding),
+                    ("terminal_c02_recovery_query_v1", binding),
+                ]
+
+                # A business write failure after a successful same-channel
+                # renewal remains uncertain and is never retried.
+                class FailBusinessWrite:
+                    def __init__(self, stream):
+                        self.stream = stream
+                        self.methods = []
+
+                    def write(self, frame):
+                        method = json.loads(frame)["method"]
+                        self.methods.append(method)
+                        if method != "handshake":
+                            raise OSError("fixture business write failure")
+                        self.stream.write(frame)
+
+                    async def drain(self):
+                        await self.stream.drain()
+
+                    def is_closing(self):
+                        return self.stream.is_closing()
+
+                    def close(self):
+                        self.stream.close()
+
+                    async def wait_closed(self):
+                        await self.stream.wait_closed()
+
+                failing_writer = FailBusinessWrite(writer)
+                session.writer = failing_writer
+                session.handshake_started_at = time.monotonic() - 20.0
+                before_failure = len(channel_events)
+                with pytest.raises(AuthorityChannelUnavailable, match="transport unavailable"):
+                    await transport._content_rpc(
+                        provision, handshake, "terminal_c02_recovery_query_v1", command,
+                        protocol=AUTHORITY_V2_PROTOCOL, _on_dispatch=on_dispatch)
+                assert failing_writer.methods == ["handshake", "terminal_c02_recovery_query_v1"]
+                assert channel_events[before_failure:] == [
+                    ("handshake", binding), ("dispatch_hook", binding),
+                ]
+                assert "test" not in transport._sessions
+                assert writer.is_closing()
                 writer.close()
                 await writer.wait_closed()
             finally:

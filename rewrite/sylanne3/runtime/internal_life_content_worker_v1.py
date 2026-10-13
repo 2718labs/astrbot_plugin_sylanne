@@ -95,6 +95,10 @@ def read_plan_internal_life_acquire_v1(db, *, namespace, activity_id, operation_
 
 def _current(db, frame, request, readers):
     from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+    from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+    from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+    from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+    from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..model_broker.internal_life_content_v1 import internal_life_content_ids_v1, TEMPLATE_VERSION
     read = CurrentDomainReadV1(frame); read.check(db)
     cause = read_current_internal_life_encoding_cause_v1(db, frame=frame,
@@ -105,7 +109,7 @@ def _current(db, frame, request, readers):
     frozen = thaw_internal_life_content_request_v1(json.loads(prepared.frozen_json))
     bundle = readers.life_content_bundle
     workflow = bundle.model_workflows.life_content
-    if (type(bundle.model_workflows) is not AdminModelWorkflowsV3 or workflow is None
+    if (type(bundle.model_workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7) or workflow is None
             or (workflow.work_kind, workflow.purpose, workflow.template_version) !=
                 (WORK_KIND, 'consolidation', TEMPLATE_VERSION)
             or prepared.occurrence_digest != canonical_digest(plain_v1(cause.occurrence.event))

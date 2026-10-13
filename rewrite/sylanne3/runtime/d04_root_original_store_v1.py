@@ -8,6 +8,7 @@ or issue a numeric adoption credential.
 
 from __future__ import annotations
 
+
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -67,7 +68,8 @@ def _transaction(db: sqlite3.Connection) -> None:
 
 
 def _versions(encoded: str) -> tuple[GraphVersion, ...]:
-    rows = json.loads(encoded)
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    rows = background_json_loads_v3(encoded)
     if type(rows) is not list:
         raise ValueError("graph versions are invalid")
     return tuple(GraphVersion(AtomKey.from_token(token), revision)
@@ -76,23 +78,25 @@ def _versions(encoded: str) -> tuple[GraphVersion, ...]:
 
 def _receipt(db: sqlite3.Connection, namespace: NamespaceId,
              operation_id: str) -> CommitReceipt:
-    row = db.execute(
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'activity_id', 'effect_id', 'commit_seq', 'receipt_json'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
         "FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         raise D04RootOriginalHold("root commit receipt is absent")
-    event = db.execute(
+    event = _producer_original_point_v3(db, table='graph_events', columns=('reads', 'revisions', 'epoch_revision'), key_columns=('bot', 'persona', 'session', 'event_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))(namespace.as_tuple + (row[1], operation_id)), legacy_reader=lambda: db.execute(
         "SELECT reads,revisions,epoch_revision FROM graph_events "
         "WHERE bot=? AND persona=? AND session=? AND event_id=?",
         namespace.as_tuple + (row[1], operation_id),
-    ).fetchone()
+    ).fetchone())
     if event is None:
         raise D04RootOriginalHold("root graph event is absent")
     try:
-        data = json.loads(row[4])
-        if (canonical_json(data) != row[4] or type(data) is not dict
+        data = background_json_loads_v3(row[4])
+        if (not background_json_matches_v3(row[4],data) or type(data) is not dict
                 or type(data.get("ledger_refs")) is not list
                 or type(data.get("outbox_refs")) is not list):
             raise ValueError("noncanonical receipt")

@@ -174,10 +174,14 @@ def read_plan_internal_life_content_v1(db, *, namespace, activity_id, operation_
 def prepare_internal_life_content_in_transaction_v1(db, *, frame, request, installed_readers, installed_bundle):
     from ..host.authority_profile import AdminInstallationBundle
     from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+    from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+    from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+    from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+    from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..model_broker.natural_reply import NaturalReplyInstallationV2
     read=CurrentDomainReadV1(frame);read.check(db)
     if (type(request) is not PrepareInternalLifeContentRequestV1 or type(installed_bundle) is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows) is not AdminModelWorkflowsV3):
+            or type(installed_bundle.model_workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7)):
         raise TypeError('actual installed Life content request/workflow version required')
     cause=read_current_internal_life_encoding_cause_v1(db,frame=frame,
         request=EncodeInternalLifeRequestV1(request.episode_ref,request.causal_operation_id),installed_readers=installed_readers)

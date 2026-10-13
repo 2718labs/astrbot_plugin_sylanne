@@ -58,9 +58,9 @@ def policy_identity(installation, clock, encoding, fingerprint: str,
     })
 
 
-def trusted_upper(clock_reading) -> float:
-    """Advance the paired UTC upper bound with local monotonic time only."""
-    elapsed = time.monotonic() - clock_reading.monotonic_after_seconds
+def trusted_upper_at_v4(clock_reading, monotonic_now: float) -> float:
+    """The existing paired-clock arithmetic at one actual consumer reading."""
+    elapsed = monotonic_now - clock_reading.monotonic_after_seconds
     if elapsed < 0 or not math.isfinite(elapsed):
         raise ValueError("paired ingress monotonic clock changed")
     upper = math.nextafter(
@@ -68,6 +68,11 @@ def trusted_upper(clock_reading) -> float:
     if not math.isfinite(upper):
         raise ValueError("paired ingress clock upper bound is invalid")
     return upper
+
+
+def trusted_upper(clock_reading) -> float:
+    """Advance the paired UTC upper bound with local monotonic time only."""
+    return trusted_upper_at_v4(clock_reading, time.monotonic())
 
 
 def finish_digest(attempt_id: str, permit_token: str, operation_id: str,

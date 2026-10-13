@@ -136,6 +136,8 @@ def internal_life_result_to_wire_v2(value):
     if type(value) is InternalLifeModelResultReadRequestV2:return plain_v1(value)
     if type(value) is not InternalLifeModelResultReadV2:raise TypeError('closed Life model-result DTO required')
     data=plain_v1(value)
+    from .v2_model_egress_contract import model_observation_to_wire_v1
+    data['observation']=model_observation_to_wire_v1(value.observation)
     data['terminal_receipt']=terminal_wire(value.terminal_receipt)
     return data
 
@@ -154,14 +156,10 @@ def internal_life_result_from_wire_v2(raw,kind):
         data['namespace']=NamespaceId(**_shape(data['namespace'],NamespaceId))
     else:
         data['request']=internal_life_result_from_wire_v2(data['request'],InternalLifeModelResultReadRequestV2)
-        observation=_shape(data['observation'],ModelEgressObservationV1)
-        for name in ('usage','cost'):
-            pairs=observation[name]
-            if (type(pairs) is not list or len(pairs)>64 or any(type(pair) is not list or len(pair)!=2
-                    or type(pair[0]) is not str or type(pair[1]) is not int for pair in pairs)):
-                raise ValueError('Life model-result observation amount pairs differ')
-            observation[name]=tuple(tuple(pair) for pair in pairs)
-        data['observation']=ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data['observation']=model_observation_from_wire_v1(data['observation'])
+        if len(data['observation'].usage)>64 or len(data['observation'].cost)>64:
+            raise ValueError('Life model-result observation amount pairs differ')
         data['terminal_receipt']=terminal_from_wire(data['terminal_receipt'],ModelTerminalReceiptV2)
     result=kind(**data)
     if canonical_serialize(internal_life_result_to_wire_v2(result))!=canonical_serialize(raw):

@@ -89,6 +89,8 @@ async def run_parent_life_actor_v1(case, *, host_process_runner, installation, c
     gate = case['c09_writer_gate']
     original = {name: case[name] for name in ('core', 'server', 'd02_issuer', 'd11_issuer',
         'c09_writer_gate', 'c09_provider_cache', 'c09_authority_graph_store', 'c09_cold_fixture')}
+    if case.get('c09_daemon') is not None:
+        original.update({name:case[name] for name in ('c09_daemon','c09_deployment_config','c09_maintenance_factory')})
     async with AsyncExitStack() as lifetime:
         authenticated_once = False
         async def authenticate_completed(locators):
@@ -113,7 +115,9 @@ async def run_parent_life_actor_v1(case, *, host_process_runner, installation, c
             authenticated_once = True
             return merged
         parent = ParentAuthorityServicesV1(control=gate.control, gate=gate,
-            close_host_handles=close_host_handles, authenticate_completed=authenticate_completed)
+            close_host_handles=close_host_handles,authenticate_completed=authenticate_completed,
+            daemon=case.get('c09_daemon'),deployment_config=case.get('c09_deployment_config'),
+            maintenance_factory=case.get('c09_maintenance_factory'))
         result = await host_process_runner(installation, parent)
         if not authenticated_once:
             raise ValueError('Host runner did not authenticate completed originals')

@@ -90,13 +90,17 @@ def stage_focus_life_project_in_transaction_v1(db, *, frame, request, installed_
     for audience in frame.envelope.authority.audience:
         for purpose in ("context", "consolidation"):
             read.source_family(db, (request.source_ref,), purpose=purpose, audience=audience)
-    profile, body, reservations = installed_readers.body_readers._current_body(db, read)
-    policies = db.execute("SELECT policy_id,version FROM d02_fixed_body_policies_v1 WHERE bot=? AND persona=? AND status='active'",
-        ns.as_tuple).fetchall()
-    prices = [installed_readers.body_readers.body_quote_authority.policy(db, ns, ref, version) for ref, version in policies]
-    prices = [value for value in prices if value.work_kind == WORK_KIND and value.profile == profile]
-    if len(prices) != 1 or BodyDomain().check_work_start(body, reservations,
-            additional_cost=prices[0].component.fixed_cost).status != "clear":
+    policies = db.execute("SELECT policy_id,version FROM d02_fixed_body_policies_v1 WHERE bot=? AND persona=? "
+        "AND status='active' AND json_extract(policy_json,'$.work_kind')=? ORDER BY policy_id,version LIMIT 2",
+        (*ns.as_tuple, WORK_KIND)).fetchall()
+    if len(policies) != 1:
+        raise MissingProductionOriginalV1("unique_installed_source_note_focus_policy")
+    policy_id, policy_version = policies[0]
+    price = installed_readers.body_readers.body_quote_authority.policy(db, ns, policy_id, policy_version)
+    profile, body, reservations = installed_readers.body_readers._current_body(db, read, price.profile.profile_id)
+    if (price.work_kind != WORK_KIND or price.profile != profile
+            or BodyDomain().check_work_start(body, reservations,
+                additional_cost=price.component.fixed_cost).status != "clear"):
         raise MissingProductionOriginalV1("actual_project_focus_body_resources")
     budget_ref = frame.envelope.parent_budget_lease_ref
     budget = get_budget_lease(db, budget_ref)

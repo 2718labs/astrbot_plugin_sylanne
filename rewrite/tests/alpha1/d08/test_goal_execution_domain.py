@@ -999,3 +999,113 @@ def test_natural_preparation_allows_rhetoric_without_using_c02_as_claim_source()
             plan=greeting_plan, evidence=evidence, snapshot=missing_trigger,
             d06_candidates=(), access_epoch=2, deletion_epoch=0, now_utc=10.0,
         )
+
+
+def test_personal_selection_scc_records_conflict_and_is_order_independent():
+    from sylanne3.domains.d08.personal_plan_v1 import QualifiedPersonalCandidateV1, select_personal_step_v2
+    from sylanne3.memory_types import source_key
+    source = source_key("bot", "persona", "choice").token
+    left = QualifiedPersonalCandidateV1("candidate:a", "action:a", "task:a", "a" * 64,
+        "eligible", 3, True, None, "quote:a")
+    right = replace(left, candidate_ref="candidate:b", action_ref="action:b", node_id="task:b",
+        semantic_digest="b" * 64, irreversible_exposure=1, quote_ref="quote:b")
+    kwargs = dict(decision_id="decision:scc", preference_edges=(("candidate:a", "candidate:b"),
+        ("candidate:b", "candidate:a")), source_refs=(source,), read_versions=(VersionedRef(source, 1),))
+    first = select_personal_step_v2(candidates=(left, right), **kwargs)
+    second = select_personal_step_v2(candidates=(right, left), **kwargs)
+    assert first == second
+    assert first.chosen_action_ref == "action:b"
+    assert first.sccs == (("candidate:a", "candidate:b"),)
+    assert first.conflict_refs == ("candidate:a", "candidate:b")
+
+
+def test_personal_selection_material_tie_waits_but_identical_semantics_use_stable_id():
+    from sylanne3.domains.d08.personal_plan_v1 import QualifiedPersonalCandidateV1, select_personal_step_v2
+    from sylanne3.memory_types import source_key
+    source = source_key("bot", "persona", "tie").token
+    left = QualifiedPersonalCandidateV1("candidate:a", "action:a", "task:a", "a" * 64,
+        "eligible", 1, True, None, "quote:a")
+    right = replace(left, candidate_ref="candidate:b", action_ref="action:b", node_id="task:b", semantic_digest="b" * 64)
+    kwargs = dict(decision_id="decision:tie", preference_edges=(), source_refs=(source,), read_versions=())
+    unresolved = select_personal_step_v2(candidates=(right, left), **kwargs)
+    assert unresolved.chosen_action_ref is None
+    assert unresolved.unknown_reason == "PREFERENCE_CONFLICT_UNRESOLVED"
+    identical = select_personal_step_v2(candidates=(replace(right, semantic_digest=left.semantic_digest), left), **kwargs)
+    assert identical.chosen_action_ref == "action:a"
+
+
+def test_personal_selection_unknown_cost_and_original_effect_never_rank_as_zero():
+    from sylanne3.domains.d08.personal_plan_v1 import QualifiedPersonalCandidateV1, select_personal_step_v2
+    from sylanne3.memory_types import source_key
+    source = source_key("bot", "persona", "unknown").token
+    legal = QualifiedPersonalCandidateV1("candidate:legal", "action:legal", "task:legal", "c" * 64,
+        "eligible", 3, True, None, "quote:legal")
+    unknown_cost = replace(legal, candidate_ref="candidate:fee", action_ref="action:fee", hard_status="WAIT_COST_EVIDENCE",
+        irreversible_exposure=0, quote_ref=None)
+    unknown_effect = replace(unknown_cost, candidate_ref="candidate:effect", action_ref="action:effect",
+        hard_status="WAIT_ORIGINAL_EFFECT", pending_original_effects=("effect:original",))
+    decision = select_personal_step_v2(decision_id="decision:unknown", candidates=(unknown_effect, legal, unknown_cost),
+        preference_edges=(("candidate:fee", "candidate:legal"),), source_refs=(source,), read_versions=())
+    assert decision.chosen_action_ref == "action:legal"
+    assert decision.unknown_refs == ("effect:original",)
+    assert dict(decision.rejected_reasons)["candidate:fee"] == "WAIT_COST_EVIDENCE"
+
+
+def test_personal_selection_actual_commitment_precedes_soft_preference_and_numeric_gap_is_preserved():
+    from sylanne3.domains.d08.personal_plan_v1 import QualifiedPersonalCandidateV1, select_personal_step_v2
+    from sylanne3.memory_types import source_key
+    source = source_key("bot", "persona", "obligation").token
+    obligation = QualifiedPersonalCandidateV1("candidate:owed", "action:owed", "task:owed", "a" * 64,
+        "eligible", 2, True, None, "quote:owed", established_commitment=True)
+    optional = replace(obligation, candidate_ref="candidate:optional", action_ref="action:optional", established_commitment=False)
+    kwargs = dict(decision_id="decision:obligation", preference_edges=(("candidate:optional", "candidate:owed"),),
+        source_refs=(source,), read_versions=())
+    selected = select_personal_step_v2(candidates=(optional, obligation), **kwargs)
+    assert selected.chosen_action_ref == "action:owed"
+    gap = select_personal_step_v2(candidates=(replace(obligation, numeric_discriminator_unresolved=True),),
+        **{**kwargs, "preference_edges": ()})
+    assert gap.chosen_action_ref is None
+    assert gap.unknown_reason == "NUMERIC_DISCRIMINATOR_UNRESOLVED"
+
+
+def test_personal_plan_dependency_cycle_is_rejected_instead_of_collapsed_as_preference_scc():
+    from sylanne3.domains.d08.personal_plan_v1 import PersonalPlanV1, PlanNodeV2
+    from sylanne3.graph_types import AtomKey, Owner
+    from sylanne3.memory_types import source_key
+    source = source_key("bot", "persona", "plan").token
+    goal_ref = AtomKey(Owner("activity", "bot", "persona", "activity:plan"), "d08.goal.v1", "goal:plan").token
+    predicate = GoalPredicate("artifact_verified", "registered:postcondition", (), 0.0, None)
+    first = PlanNodeV2("task:a", "persona:persona", ("task:b",), "artifact_draft_v1", predicate,
+        True, None, "resource:cpu", observable_postconditions=(predicate,), cost_ceiling=(("thread_cpu_ms", 10),))
+    second = replace(first, node_id="task:b", depends_on=("task:a",))
+    with pytest.raises(ValueError, match="acyclic"):
+        PersonalPlanV1("plan:cycle", 1, goal_ref, 1, "active", "persona:persona", (first, second), (), (), (),
+            ("user_stop",), (source,), (VersionedRef(source, 1),), None)
+
+
+def test_personal_method_mapping_is_owned_by_exact_plan_and_legacy_decode_is_narrow():
+    from sylanne3.domains.d08.personal_plan_v1 import PersonalPlanV1, PlanNodeV2, PLAN_TYPE, decode_personal_plan_type_v1
+    from sylanne3.domains.d01.production_operations_v1 import plain_v1
+    from sylanne3.runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+    from sylanne3.memory_types import source_key
+    source = source_key("bot", "persona", "method-mapping").token
+    goal_ref = AtomKey(Owner("activity", "bot", "persona", "activity:method"), "d08.goal.v1", "goal:method").token
+    predicate = GoalPredicate("artifact_verified", "registered:postcondition", (), 0.0, None)
+    node = PlanNodeV2("task:method", "persona:persona", (), "artifact_draft_v1", predicate, True, None,
+        "resource:cpu", observable_postconditions=(predicate,), cost_ceiling=(("thread_cpu_ms", 10),))
+    original = PersonalPlanV1("plan:method", 1, goal_ref, 1, "active", "persona:persona", (node,),
+        ("candidate:a", "candidate:b"), (), (), ("user_stop",), (source,), (VersionedRef(source, 1),), None,
+        method_candidates=(("candidate:b", "method:b"), ("candidate:a", "method:a")))
+    assert original.method_candidates == (("candidate:a", "method:a"), ("candidate:b", "method:b"))
+    for mapping in ((("candidate:other", "method:a"),), (("candidate:a", "method:a"), ("candidate:a", "method:b"))):
+        with pytest.raises(ValueError, match="method identity"):
+            replace(original, method_candidates=mapping)
+    raw = plain_v1(original)
+    assert decode_personal_plan_type_v1(PLAN_TYPE, raw) == original
+    legacy = {name: value for name, value in raw.items() if name != "method_candidates"}
+    assert decode_personal_plan_type_v1(PLAN_TYPE, legacy).method_candidates == ()
+    assert decode_typed_production_value_v1(legacy, PersonalPlanV1).method_candidates == ()
+    with pytest.raises(ValueError):
+        decode_personal_plan_type_v1(PLAN_TYPE, {**legacy, "unregistered": []})
+    with pytest.raises(ValueError):
+        decode_typed_production_value_v1({**legacy, "unregistered": []}, PersonalPlanV1)

@@ -179,7 +179,11 @@ def to_wire(value: ContextReplyResultReadRequestV1 |
     if type(value) not in {ContextReplyResultReadRequestV1,
                            ContextReplyPaidResultReadV2}:
         raise TypeError("typed context reply read wire required")
-    return json.loads(canonical_serialize(asdict(value)))
+    data = json.loads(canonical_serialize(asdict(value)))
+    if type(value) is ContextReplyPaidResultReadV2:
+        from .v2_model_egress_contract import model_observation_to_wire_v1
+        data["provider_observation"] = model_observation_to_wire_v1(value.provider_observation)
+    return data
 
 
 def from_wire(raw: object, kind: type):
@@ -199,10 +203,8 @@ def from_wire(raw: object, kind: type):
         data["original_seal"] = ContextReplyOriginalSealV2(**seal)
         data["frozen_request"] = _frozen(data["frozen_request"])
         data["terminal_receipt"] = ModelTerminalReceiptV2(**data["terminal_receipt"])
-        observed = dict(data["provider_observation"])
-        for name in ("usage", "cost"):
-            observed[name] = tuple(tuple(pair) for pair in observed[name])
-        data["provider_observation"] = ModelEgressObservationV1(**observed)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data["provider_observation"] = model_observation_from_wire_v1(data["provider_observation"])
         data["current_read_versions"] = tuple(GraphVersion(
             AtomKey(Owner(**item["key"]["owner"]),
                     item["key"]["type_name"], item["key"]["name"]),

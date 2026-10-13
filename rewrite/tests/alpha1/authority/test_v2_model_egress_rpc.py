@@ -498,3 +498,46 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
             next(fixture)
         except StopIteration:
             pass
+
+
+def test_admin_v3_c02_encoding_policy_matches_request_and_refuses_foreign_model(tmp_path):
+    """C02's normal encoding policy must remain usable beside named V6 routes."""
+    from rewrite.tests.alpha1.authority.test_v2_model_egress_store import connection
+    from sylanne3.host.authority_profile import AdminModelWorkflowV2
+    from sylanne3.host.model_workflows_v3 import AdminModelWorkflowsV3
+    from sylanne3.model_broker.first_ingress_encoding import (
+        FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+    )
+    from sylanne3.model_broker.reply_language import REPLY_TEMPLATE_VERSION
+
+    ceiling = {"input_tokens": 1000, "output_tokens": 256,
+               "model_tokens": 1256, "model_microusd": 100}
+    common = dict(provider_id="provider-1", model_id="model-1",
+        provider_config_ref=installed_model_config_ref("provider-1", "model-1", "d" * 64),
+        provider_config_digest="d" * 64, audiences=("owner",), privacy_tier="private",
+        required_capabilities=("text",), timeout_seconds=20.0,
+        max_output_tokens=256, quote_ceiling=ceiling)
+    encode = AdminModelWorkflowV2(work_kind="d06.encode_source", purpose="consolidation",
+        template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, **common)
+    reply = AdminModelWorkflowV2(work_kind="reply", purpose="proposal",
+        template_version=REPLY_TEMPLATE_VERSION, **common)
+    policy = AdminModelWorkflowsV3(3, encode, reply)
+    base = broker_request()
+    envelope = replace(base.envelope,
+        identity=replace(base.identity, phase="encode", operation_id="job-operation"),
+        authority=replace(base.envelope.authority, actor="worker", issuer_domain="d11",
+            purpose="consolidation", audience=("owner",), worker_fence=7))
+    request = replace(base, envelope=envelope, call_id="call-1",
+        provider_id=encode.provider_id, model_id=encode.model_id,
+        prompt_template_digest=FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+        privacy_tier=encode.privacy_tier, required_capabilities=frozenset(encode.required_capabilities),
+        timeout_seconds=encode.timeout_seconds, max_output_tokens=encode.max_output_tokens)
+    original = intent(request_digest=request.digest,
+                      budget_ceiling=tuple(sorted(ceiling.items())))
+    with connection(tmp_path / "c02-policy-authority.db") as db:
+        service = AuthorityV2ModelEgressService(
+            AuthorityV2ModelEgressStore(db, create=True), admin_model_policy=policy)
+        assert service._admin_model_matches(original, request)
+        foreign = replace(request, model_id="other-model")
+        foreign_intent = replace(original, model_id=foreign.model_id, request_digest=foreign.digest)
+        assert not service._admin_model_matches(foreign_intent, foreign)

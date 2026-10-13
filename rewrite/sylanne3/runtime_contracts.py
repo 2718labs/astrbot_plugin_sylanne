@@ -8,6 +8,7 @@ opaque capability references and validate proposals at the commit boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
+from contextlib import contextmanager
 from enum import Enum
 import hashlib
 import json
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from .authority_service.v2_contract import (
     AuthorityCurrentEffectSnapshotV2, FencePermitV2,
 )
+from .contracts import _CANONICAL_OUTPUT_METER, canonical_json
 from .graph_types import AtomKey, GraphVersion, GraphWrite, NamespaceEpoch, Owner
 from .runtime.restore_anchor import RestoreAnchor
 from .runtime_journal import RecoveryConstraintFootprint
@@ -36,8 +38,9 @@ _CONTENT_REALITIES = frozenset({
 })
 _EVIDENCE_ELIGIBILITY = frozenset({"eligible", "ineligible", "qualified"})
 _ACTUALITY = frozenset({"actual", "not_actual", "unknown", "not_applicable"})
+PERSISTENT_JOB_REF_KIND = "persistent_job"
 _BUNDLE_PARTS = frozenset({
-    "experience", "choice", "d02_settlement", "cost_settlement", "persistent_job", "outbox"
+    "experience", "choice", "d02_settlement", "cost_settlement", PERSISTENT_JOB_REF_KIND, "outbox"
 })
 
 
@@ -144,13 +147,33 @@ def _canonical_value(value: object, active: set[int]) -> object:
     raise TypeError(f"unsupported canonical value: {type(value).__name__}")
 
 
+
+
+@contextmanager
+def meter_canonical_outputs(meter):
+    """Account real serializer outputs in the caller's existing reserved quantum."""
+    token = _CANONICAL_OUTPUT_METER.set(meter)
+    try:
+        yield meter
+    finally:
+        _CANONICAL_OUTPUT_METER.reset(token)
+
+
+def current_canonical_output_meter():
+    return _CANONICAL_OUTPUT_METER.get()
+
+
 def canonical_serialize(value: object) -> str:
     """Return stable UTF-8 JSON text for supported DTO and JSON values."""
 
-    return json.dumps(
+    text = json.dumps(
         _canonical_value(value, set()), sort_keys=True, separators=(",", ":"),
         ensure_ascii=True, allow_nan=False,
     )
+    meter = _CANONICAL_OUTPUT_METER.get()
+    if meter is not None:
+        meter.charge_encode(len(text))  # ensure_ascii makes characters == UTF-8 bytes.
+    return text
 
 
 def canonical_digest(value: object) -> str:
@@ -181,6 +204,16 @@ class NamespaceId:
         if not isinstance(key, AtomKey):
             raise TypeError("key must be AtomKey")
         return cls(key.owner.bot, key.owner.persona)
+
+
+def namespace_ref(namespace: NamespaceId) -> str:
+    """Bounded content-free identity shared by independent authorities."""
+    if not isinstance(namespace, NamespaceId):
+        raise TypeError("namespace must be NamespaceId")
+    return "ns:sha256:" + hashlib.sha256(
+        canonical_json(list(namespace.as_tuple)).encode("utf-8")
+    ).hexdigest()
+
 
 
 class NamespaceRuntimeState(str, Enum):
@@ -619,8 +652,8 @@ class DomainProposal:
         writes = _typed_tuple(self.typed_writes, GraphWrite, "typed_writes")
         if any(NamespaceId.from_key(write.key) != self.envelope.authority.namespace for write in writes):
             raise ValueError("proposal writes cannot cross namespace")
-        object.__setattr__(self, "typed_writes",
-                           tuple(GraphWrite(write.key, write.value, write.dependencies) for write in writes))
+        from .graph_types import clone_graph_write_v3
+        object.__setattr__(self, "typed_writes", tuple(clone_graph_write_v3(write) for write in writes))
         if not isinstance(self.dependencies, DependencySet):
             raise TypeError("dependencies must be DependencySet")
         refs = (self.dependencies.current_invalidation + self.dependencies.historical_provenance
@@ -727,7 +760,7 @@ class DomainBundle:
             "experience": bool(self.experience_refs), "choice": bool(self.choice_refs),
             "d02_settlement": bool(self.d02_settlement_refs),
             "cost_settlement": bool(self.d11_cost_settlement_refs),
-            "persistent_job": bool(self.persistent_job_refs), "outbox": bool(self.outbox_refs),
+            PERSISTENT_JOB_REF_KIND: bool(self.persistent_job_refs), "outbox": bool(self.outbox_refs),
         }
         missing = sorted(part for item in proposals for part in item.required_bundle_parts if not present[part])
         if missing:
@@ -790,6 +823,11 @@ class DomainBundle:
     @property
     def digest(self) -> str:
         """Digest the complete immutable bundle for idempotency/conflict checks."""
+        if any(write.key.type_name == "memory.source" for proposal in self.proposals for write in proposal.typed_writes):
+            from .runtime.owner_material_source_storage_v3 import issued_owner_source_bundle_digest_v3
+            sealed_digest = issued_owner_source_bundle_digest_v3(self)
+            if sealed_digest is not None:
+                return sealed_digest
         if self.root_adoption is not None:
             return self.root_digest_with(self.root_adoption)
         if self.product_advance is None:
@@ -1304,6 +1342,14 @@ class ModelInputFrameV1:
 CONTEXT_REPLY_WORKFLOW_V1 = "sylanne.d09.context_reply.v1"
 NATURAL_REPLY_GENERATION_WORKFLOW_V2 = "sylanne.d09.context_reply_input.v2"
 NATURAL_REPLY_REVIEW_WORKFLOW_V1 = "sylanne.d09.natural_reply_review.v1"
+NATURAL_REPLY_GENERATION_WORKFLOW_V3 = "sylanne.d09.context_reply_input.v3"
+NATURAL_REPLY_GENERATION_WORKFLOW_V4 = "sylanne.d09.context_reply_input.v4"
+NATURAL_REPLY_GENERATION_WORKFLOW_V5 = "sylanne.d09.context_reply_input.v5"
+NATURAL_REPLY_REVIEW_WORKFLOW_V2 = "sylanne.d09.natural_reply_review.v2"
+CONTACT_GENERATION_WORKFLOW_V1 = "sylanne.d09.contact_generation.v1"
+CONTACT_REVIEW_WORKFLOW_V1 = "sylanne.d09.contact_review.v1"
+D04_APPRAISAL_TEMPLATE_V1 = "sylanne.d04.appraisal_template.v1"
+D04_APPRAISAL_WORK_KIND = "d04.appraisal"
 
 
 def context_reply_graph_guard_digest_v2(
@@ -1582,6 +1628,14 @@ __all__ = [
     "CONTEXT_REPLY_WORKFLOW_V1", "ContextReplyOriginalSealV2",
     "context_reply_graph_guard_digest_v2",
     "NATURAL_REPLY_GENERATION_WORKFLOW_V2", "NATURAL_REPLY_REVIEW_WORKFLOW_V1",
+    "NATURAL_REPLY_GENERATION_WORKFLOW_V3",
+    "NATURAL_REPLY_GENERATION_WORKFLOW_V4",
+    "NATURAL_REPLY_GENERATION_WORKFLOW_V5",
+    "NATURAL_REPLY_REVIEW_WORKFLOW_V2",
+    "CONTACT_GENERATION_WORKFLOW_V1",
+    "CONTACT_REVIEW_WORKFLOW_V1",
+    "D04_APPRAISAL_TEMPLATE_V1",
+    "D04_APPRAISAL_WORK_KIND",
     "NaturalReplyGenerationOriginalSealV2", "NaturalReplyReviewOriginalSealV2",
     "NaturalReplyPaidReviewReceiptV2",
 ]

@@ -135,7 +135,11 @@ def to_wire(value: ReplyWorkerModelResultReadRequestV1 |
     if type(value) not in {ReplyWorkerModelResultReadRequestV1,
                            ReplyWorkerModelResultReadV1}:
         raise TypeError("typed reply worker result required")
-    return json.loads(canonical_serialize(asdict(value)))
+    data = json.loads(canonical_serialize(asdict(value)))
+    if type(value) is ReplyWorkerModelResultReadV1:
+        from .v2_model_egress_contract import model_observation_to_wire_v1
+        data["observation"] = model_observation_to_wire_v1(value.observation)
+    return data
 
 
 def from_wire(raw: object, kind: type):
@@ -156,17 +160,8 @@ def from_wire(raw: object, kind: type):
         data["audience"] = tuple(data["audience"])
     else:
         data["request"] = from_wire(data["request"], ReplyWorkerModelResultReadRequestV1)
-        observation = data["observation"]
-        if type(observation) is not dict or set(observation) != {
-                field.name for field in fields(ModelEgressObservationV1)}:
-            raise ValueError("reply observation wire fields differ")
-        observation = dict(observation)
-        for name in ("usage", "cost"):
-            amounts = observation[name]
-            if type(amounts) is not list or any(type(pair) is not list for pair in amounts):
-                raise ValueError("reply observation amount pairs differ")
-            observation[name] = tuple(tuple(pair) for pair in amounts)
-        data["observation"] = ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        data["observation"] = model_observation_from_wire_v1(data["observation"])
         terminal = data["terminal_receipt"]
         if type(terminal) is not dict or set(terminal) != {
                 field.name for field in fields(ModelTerminalReceiptV2)}:

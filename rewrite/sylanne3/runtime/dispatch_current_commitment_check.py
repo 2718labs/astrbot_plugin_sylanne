@@ -133,19 +133,20 @@ def _require_prepared_claimed_delta(
 
 
 def _current_atom(db, namespace: NamespaceId, snapshot: GraphSnapshot,
-                  type_name: str, name: str):
-    rows = db.execute(
+                  type_name: str, name: str, *, prepared_inventory=None):
+    rows = (db.execute(
         "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
         "AND type_name=? AND name=?",
         namespace.as_tuple + (type_name, name),
     ).fetchall()
+        if prepared_inventory is None else prepared_inventory.atom_rows(db,namespace,prepared_inventory.query,(type_name,),('token','revision','value','valid'),valid_only=False,name=name))
     if len(rows) != 1:
         raise ValueError(f"current {type_name} is absent or ambiguous")
     token, revision, encoded, valid = rows[0]
     key = AtomKey.from_token(token)
     atom = snapshot.get(key)
     if (valid != 1 or atom is None or not atom.valid
-            or atom.revision != revision or atom.value != json.loads(encoded)):
+            or atom.revision != revision or atom.value != (json.loads(encoded) if prepared_inventory is None else encoded)):
         raise ValueError(f"current {type_name} graph atom changed")
     spec = next(item for item in GoalExecutionProvider().register_types()
                 if item.name == type_name)
@@ -159,10 +160,11 @@ def read_current_commitment_criteria_v1(
     witness: OwnerDispatchWitnessV1,
     authority_snapshot: AuthorityDispatchSnapshotV1,
     effect: CurrentEffectReadV2, *, now_utc: float,
+    prepared_inventory=None,
 ) -> CurrentD08CriteriaEvidenceV1:
     """Bind the fixed v1 rule to durable admission and one current graph epoch."""
     if (not db.in_transaction or type(namespace) is not NamespaceId
-            or type(snapshot) is not GraphSnapshot or type(query) is not QueryEpoch
+            or (type(snapshot) is not GraphSnapshot if prepared_inventory is None else snapshot is not prepared_inventory.projection) or type(query) is not QueryEpoch
             or type(intent) is not ActionIntent or type(schema) is not ActionSchemaRecord
             or type(claimed) is not MutationReceiptV2
             or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
@@ -170,17 +172,21 @@ def read_current_commitment_criteria_v1(
     if (len(snapshot.epochs) != 1
             or query != QueryEpoch(namespace, "all", snapshot.epochs[0].revision)):
         raise ValueError("D08 criteria needs a full current graph query")
-    rows = db.execute(
-        "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=?",
-        namespace.as_tuple,
-    ).fetchall()
-    by_token = {atom.key.token: atom for atom in snapshot.atoms}
-    if (len(rows) != len(by_token) or len(by_token) != len(snapshot.atoms)
-            or any(token not in by_token or by_token[token].revision != revision
-                   or by_token[token].value != json.loads(encoded)
-                   or by_token[token].valid != bool(valid)
-                   for token, revision, encoded, valid in rows)):
-        raise ValueError("D08 criteria graph snapshot is incomplete")
+    if prepared_inventory is None:
+        rows = db.execute(
+            "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchall()
+        by_token = {atom.key.token: atom for atom in snapshot.atoms}
+        if (len(rows) != len(by_token) or len(by_token) != len(snapshot.atoms)
+                or any(token not in by_token or by_token[token].revision != revision
+                       or by_token[token].value != json.loads(encoded)
+                       or by_token[token].valid != bool(valid)
+                       for token, revision, encoded, valid in rows)):
+            raise ValueError("D08 criteria graph snapshot is incomplete")
+    else:
+        prepared_inventory.require_for(context,claimed.pending.binding,claimed,db,authority_snapshot=authority_snapshot)
+        prepared_inventory.require_current(db,namespace,query,snapshot)
     initial_seq = _require_prepared_claimed_delta(
         claimed, context, authority_snapshot)
     binding = claimed.pending.binding
@@ -211,19 +217,19 @@ def read_current_commitment_criteria_v1(
             or schema.intent_digest != canonical_digest(intent)):
         raise ValueError("D08 current schema differs from admitted action")
     schema_atom, current_schema = _current_atom(
-        db, namespace, snapshot, "d08.action_schema.v1", schema.schema_ref)
+        db, namespace, snapshot, "d08.action_schema.v1", schema.schema_ref, prepared_inventory=prepared_inventory)
     if (current_schema != schema
             or schema_atom.key.owner.kind != "activity"
             or schema_atom.key.owner.subject != intent.identity.activity_id):
         raise ValueError("D08 current schema graph atom differs")
-    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query)
+    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query, prepared_inventory=prepared_inventory)
     if tuple(item for item in facts.action_intents
              if item.action_id == intent.action_id) != (intent,):
         raise ValueError("D08 current action differs from admission")
     observed = read_current_d08_observed_versions(
         db, namespace, snapshot, query, intent.action_id, context, witness,
-        authority_snapshot, effect)
-    _, goal = _current_atom(db, namespace, snapshot, "d08.goal.v1", intent.goal_ref)
+        authority_snapshot, effect, prepared_inventory=prepared_inventory)
+    _, goal = _current_atom(db, namespace, snapshot, "d08.goal.v1", intent.goal_ref, prepared_inventory=prepared_inventory)
     specs = tuple(item for item in intent.required_checks
                   if item.check_kind == "commitment_conflict")
     receipts = tuple(item for item in admission.check_receipts

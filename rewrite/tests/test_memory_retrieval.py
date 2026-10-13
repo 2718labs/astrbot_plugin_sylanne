@@ -296,5 +296,34 @@ class MemoryRetrievalTests(unittest.TestCase):
         self.assertEqual(after.hits, ())
 
 
+    def test_source_content_predicate_runs_only_after_actual_lineage_authorization(self):
+        from unittest.mock import patch
+        self.ingest(self.source("allowed", "needle"))
+        self.ingest(self.source("private", "needle secret", audiences=("owner",), purposes=("context",)))
+        matched = []
+        predicate = MemoryRetriever._predicate
+
+        def observe(record, query, terms):
+            matched.append(record.source_id)
+            self.assertNotEqual(record.source_id, "private")
+            return predicate(record, query, terms)
+
+        with patch.object(self.retriever, "_predicate", side_effect=observe):
+            result = self.retriever.search(MemoryQuery("source", terms=("needle",)),
+                audience="public", purpose="expression")
+        self.assertEqual(matched, ["allowed"])
+        self.assertEqual([hit.record.source_id for hit in result.hits], ["allowed"])
+
+    def test_interpretation_content_predicate_cannot_match_a_private_supporting_source(self):
+        from unittest.mock import patch
+        self.ingest(self.source("private", "private evidence", audiences=("owner",), purposes=("context",)))
+        self.repository.interpret(self.event("private-interpretation"), InterpretationRecord(
+            "private-i", ("private",), "bridge", "needle private interpretation", "reported", 10, 5, 20))
+        with patch.object(self.retriever, "_predicate", side_effect=AssertionError("unauthorized body was matched")):
+            result = self.retriever.search(MemoryQuery("interpretation", terms=("needle",)),
+                audience="public", purpose="expression")
+        self.assertEqual(result.hits, ())
+
+
 if __name__ == "__main__":
     unittest.main()

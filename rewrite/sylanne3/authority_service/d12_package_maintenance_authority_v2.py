@@ -17,6 +17,7 @@ from .d12_package_maintenance_contract_v2 import build_d12_package_intent_v2,pac
 from .d12_package_owner_observation_v2 import observe_current_package_owner_v2
 from .d12_package_bootstrap_v2 import BOOTSTRAPS,BOOT_DDL
 from .v2_owner_session import from_wire as session_from_wire,_canonical
+from .graph_catalogue_upgrade_v1 import require_selected_catalogue_target_in_tx_v1
 
 ACCEPTANCES='authority_d12_package_acceptances_v2'
 HEADS='authority_d12_package_heads_v2'
@@ -49,8 +50,8 @@ class InstalledD12PackageMaintenanceAuthorityV2:
         if supervisor_journal is not None:
             from .d12_package_supervisor_journal_v2 import InstalledPackageSupervisorJournalV2
             if type(supervisor_journal) is not InstalledPackageSupervisorJournalV2 or supervisor_journal.policy!=policy['supervisor_policy_digest']:raise TypeError('actual independently verified supervisor journal required')
-        from .d12_installed_supervisor_v1 import InstalledD12SystemdSupervisorV1
-        if authority_supervisor is not None and (type(authority_supervisor) is not InstalledD12SystemdSupervisorV1 or authority_supervisor.config.unit_name==lifecycle.supervisor.config.unit_name):raise TypeError('distinct actual fixed Authority supervisor required')
+        from .d12_installed_supervisor_v1 import is_installed_supervisor_v1,supervisor_identity_v1
+        if authority_supervisor is not None and (not is_installed_supervisor_v1(authority_supervisor) or supervisor_identity_v1(authority_supervisor.config)==supervisor_identity_v1(lifecycle.supervisor.config)):raise TypeError('distinct actual fixed Authority supervisor required')
         self.authority_supervisor=authority_supervisor
         self.lifecycle=lifecycle;self.files=package_files;self.journal=supervisor_journal;self.policy=policy
         self.status=lifecycle.status_service;self.core=lifecycle.core;self.fences=lifecycle.fences
@@ -82,6 +83,7 @@ class InstalledD12PackageMaintenanceAuthorityV2:
         return row,intent
 
     def _current_accepted_owner(self,db,row):
+        require_selected_catalogue_target_in_tx_v1(db,self.lifecycle)
         request=session_from_wire({'kind':'owner_session_login_request_v1',**json.loads(row[6])})
         sessions=self.status.sessions
         sessions._current_key(db,request)
@@ -106,6 +108,7 @@ class InstalledD12PackageMaintenanceAuthorityV2:
             'expected_lifecycle_epoch':expected_lifecycle_epoch}
         request_digest=canonical_digest(requested)
         with self.core._tx() as db:
+            require_selected_catalogue_target_in_tx_v1(db,self.lifecycle)
             prior=db.execute(f'SELECT 1 FROM {ACCEPTANCES} WHERE namespace=? AND operation_id=?',(self.namespace,operation_id)).fetchone()
             if prior:
                 row,intent=self._row(db,operation_id)

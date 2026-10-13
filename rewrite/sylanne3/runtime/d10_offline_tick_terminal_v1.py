@@ -120,11 +120,12 @@ def offline_tick_adoption_operation_id_v1(binding):
 def read_plan_current_offline_tick_terminal_v1(db, *, namespace, activity_id, operation_kind, request):
     if operation_kind != "adopt_offline_tick" or type(request) is not AdoptCurrentOfflineTickRequestV1:
         raise TypeError("exact registered offline tick adoption request required")
+    from .domain_background_read_v3 import background_point_v3,background_json_loads_v3
     keys, originals = [owner_grant_key(*namespace.as_tuple)], [request.prepared_original_ref]
-    row = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared_tick' AND original_ref=?",
-        (*namespace.as_tuple, request.prepared_original_ref)).fetchone()
+    row=background_point_v3(db,table=TABLE,columns=('payload_json',),key_columns=('bot','persona','kind','original_ref'),key=(*namespace.as_tuple,'prepared_tick',request.prepared_original_ref),
+        legacy_reader=lambda:db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared_tick' AND original_ref=?",(*namespace.as_tuple,request.prepared_original_ref)).fetchone())
     if row:
-        raw = json.loads(row[0])
+        raw = background_json_loads_v3(row[0])
         binding = raw["binding"]
         if binding["activity_id"] != activity_id:
             raise ValueError("offline adoption must retain actual original activity")
@@ -254,10 +255,15 @@ def record_offline_tick_terminal_after_cas_v1(db, *, issuer, staged, graph_recei
     writes = tuple(write for member in (staged.memory_stage, staged.runtime_stage) for proposal in member.proposals for write in proposal.typed_writes)
     if set(versions) != {write.key for write in writes}:
         raise ValueError("offline terminal adoption contains another actual member set")
+    from ..runtime_storage_v3 import runtime_storage_v3
     for write in writes:
-        actual = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (write.key.token, versions[write.key])).fetchone()
-        if actual != (graph_receipt.operation_id, canonical_serialize(write.value), 1):
-            raise ValueError("offline terminal source/job/cost did not adopt as one actual bundle")
+        if runtime_storage_v3(db)is not None:
+            require_fresh_offline_graph_write_after_cas_v3(db,write=write,revision=versions[write.key],receipt=graph_receipt)
+        else:
+            actual=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
+                (write.key.token,versions[write.key])).fetchone()
+            if actual!=(graph_receipt.operation_id,canonical_serialize(write.value),1):
+                raise ValueError('offline terminal source/job/cost did not adopt as one actual bundle')
     ids = offline_tick_ids_v1(binding.namespace, binding.schedule_ref, binding.scheduled_at_utc)
     value = AdoptedOfflineTickOriginalV1(binding.namespace, ids["result"], graph_receipt.operation_id,
         binding.prepared_original_ref, staged.prepared.digest, staged.terminal,
@@ -277,12 +283,14 @@ def record_offline_tick_terminal_after_cas_v1(db, *, issuer, staged, graph_recei
 
 
 def read_adopted_offline_tick_original_v1(db, *, namespace, result_ref, issuer):
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='adopted_tick' AND original_ref=?", (*namespace.as_tuple, result_ref)).fetchone()
+    from .domain_background_read_v3 import background_point_v3,background_plain_original_digest_v3
+    row=background_point_v3(db,table=TABLE,columns=('producing_operation_id','payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'),key=(*namespace.as_tuple,'adopted_tick',result_ref),legacy_reader=lambda:db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='adopted_tick' AND original_ref=?", (*namespace.as_tuple, result_ref)).fetchone())
     if row is None:
         return None
     value = _decode_json(row[1], AdoptedOfflineTickOriginalV1)
-    digest = canonical_digest(plain_v1(value))
+    digest = background_plain_original_digest_v3(row[1],value)
     issuer._signer.verify(SIGN_KIND, canonical_serialize((namespace, "adopted_tick", result_ref, digest)), row[3])
     if value.namespace != namespace or value.result_ref != result_ref or row[:1] != (value.producing_operation_id,) or digest != row[2]:
         raise ValueError("offline actual adopted original identity/content differs")
@@ -292,6 +300,7 @@ def read_adopted_offline_tick_original_v1(db, *, namespace, result_ref, issuer):
 
 def validate_adopted_offline_tick_history_v1(db, value):
     """Exact immutable job/source/cost membership, independent of current job."""
+    from .domain_background_read_v3 import background_history_v3
     namespace, result_ref = value.namespace, value.result_ref
     receipt = _decode_json(value.graph_receipt_json, CommitReceipt)
     actual = db.execute("SELECT digest,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
@@ -308,8 +317,7 @@ def validate_adopted_offline_tick_history_v1(db, value):
         history = db.execute("SELECT event_id,valid FROM graph_history WHERE token=? AND revision=?", (ref, refs[ref].revision)).fetchone()
         if history != (value.producing_operation_id, 1):
             raise ValueError("offline adopted original lost its actual member history")
-    job_row = db.execute("SELECT value FROM graph_history WHERE token=? AND revision=?",
-        (job_ref, refs[job_ref].revision)).fetchone()
+    job_row=background_history_v3(db,job_ref,refs[job_ref].revision,columns=('value',))
     job = _decode_json(job_row[0], RuntimeJobValue)
     actual = {} if value.terminal.status == "unknown" else {"thread_cpu_ms": value.terminal.actual_cpu_ms}
     if ((job.bot_id, job.persona_id, job.activity_id, job.operation_id, job.job_id, job.work_kind,
@@ -321,3 +329,50 @@ def validate_adopted_offline_tick_history_v1(db, value):
             or job.usage_digest != canonical_digest(actual)):
         raise ValueError("offline adopted historical job identity/result/usage differs from its terminal")
     return value
+
+
+def require_fresh_offline_graph_write_after_cas_v3(db,*,write,revision,receipt):
+    """Compare this typed write against the actual new cell to byte EOF in same W01."""
+    from ..runtime_storage_v3 import (runtime_storage_v3,runtime_storage_quantum_v3,
+        _runtime_bounded_fixed_row_v3,begin_runtime_cell_read_v3,_operation)
+    from .owner_material_source_storage_v3 import CanonicalValueStreamV3
+    handle=runtime_storage_v3(db);operation=_operation(handle)
+    if not db.in_transaction or operation.closed or revision<1:
+        raise ValueError('fresh offline member requires its current W01 operation and transaction')
+    namespace=NamespaceId.from_key(write.key)
+    if not any(version.key==write.key and version.revision==revision for version in receipt.write_versions):
+        raise ValueError('fresh offline member is outside the actual W01 write versions')
+    with runtime_storage_quantum_v3(db)as meter:
+        handle.require_current(meter)
+        metadata=_runtime_bounded_fixed_row_v3(db,meter,'graph_history',
+            ('event_bot','event_persona','event_session','event_id','valid','value_cell_id'),
+            'token=? AND revision=?',(write.key.token,revision))
+        if metadata is None or metadata[:5]!=(*namespace.as_tuple,receipt.activity_id,receipt.operation_id,1):
+            raise ValueError('fresh offline history is outside its exact actual atomic event')
+        cell=begin_runtime_cell_read_v3(db,metadata[5],erasure_owner_ref=write.key.token)
+    if cell.header[0]!='canonical-json.ascii.v1':raise ValueError('fresh offline Graph cell has another canonical codec')
+    operation.retain(131072)
+    expected=CanonicalValueStreamV3(write.value)
+    actual_buffer=expected_buffer=b'';actual_offset=expected_offset=0
+    actual_eof=expected_eof=False
+    while not(actual_eof and expected_eof):
+        with runtime_storage_quantum_v3(db)as meter:
+            handle.require_current(meter)
+            if actual_offset==len(actual_buffer) and not actual_eof:
+                actual_buffer=cell.read_fragment(meter=meter);actual_offset=0
+                if actual_buffer is None:actual_buffer=b'';cell.finish(meter=meter);actual_eof=True
+            if expected_offset==len(expected_buffer) and not expected_eof:
+                expected_buffer=expected.read_fragment(meter);expected_offset=0
+                if expected_buffer is None:expected_buffer=b'';expected_eof=True
+            count=min(len(actual_buffer)-actual_offset,len(expected_buffer)-expected_offset)
+            if actual_buffer[actual_offset:actual_offset+count]!=expected_buffer[expected_offset:expected_offset+count]:
+                raise ValueError('fresh offline history bytes differ from the actual staged typed write')
+            actual_offset+=count;expected_offset+=count
+            if(actual_eof and expected_offset<len(expected_buffer) or expected_eof and actual_offset<len(actual_buffer)):
+                raise ValueError('fresh offline history ends outside its exact typed write EOF')
+    with runtime_storage_quantum_v3(db)as meter:
+        handle.require_current(meter)
+        current=_runtime_bounded_fixed_row_v3(db,meter,'graph_history',
+            ('event_bot','event_persona','event_session','event_id','valid','value_cell_id'),
+            'token=? AND revision=?',(write.key.token,revision))
+        if current!=metadata:raise ValueError('fresh offline member locator changed during actual EOF')

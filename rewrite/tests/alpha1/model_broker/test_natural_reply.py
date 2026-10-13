@@ -63,6 +63,65 @@ def output(body="You said the door might be open."):
     }]}
 
 
+def test_semantic_v3_template_is_explicit_and_legacy_wire_rejects_it():
+    from dataclasses import asdict
+    from sylanne3.model_broker.natural_reply_history_v4 import (
+        INPUT_SCHEMA_V5, FROZEN_SCHEMA_V5, NaturalReplyInputV4,
+        freeze_natural_reply_request_v4, thaw_natural_reply_request_v4,
+        parse_natural_reply_output_v4,
+    )
+    from sylanne3.model_broker.natural_reply_history_v3 import D13NaturalHistorySelectionV1
+    from sylanne3.domains.d09.natural_reply import (
+        NATURAL_REPLY_OUTPUT_SCHEMA_V3, natural_semantic_ranges_v3,
+    )
+    legacy = frozen()
+    plan = legacy.input.plan
+    selection = D13NaturalHistorySelectionV1(
+        "a" * 64, 0, (), (), (), (plan.scene_ref, plan.audience_ref),
+        plan.scene_ref, plan.audience_ref, plan.audience_id, 140.0, 0, 0, 1, None, (),
+        canonical_digest({"stable_history": (), "recent_history": (), "detail_history": (),
+                          "coverage": (), "gaps": ()}), "policy:history", "b" * 64)
+    current_input = NaturalReplyInputV4(
+        replace(legacy.input.question, audience_ref=plan.audience_ref), plan, (), (),
+        selection, (), 100.0, 130.0, INPUT_SCHEMA_V5)
+    current = freeze_natural_reply_request_v4(current_input, legacy.installation)
+    assert current.schema == FROZEN_SCHEMA_V5
+    assert thaw_natural_reply_request_v4(asdict(current)) == current
+    reply = output()
+    reply.update(schema=NATURAL_REPLY_OUTPUT_SCHEMA_V3,
+                 semantic_segments=[{"start": 0, "end": len(reply["body"])}])
+    with pytest.raises(ValueError, match="shape"):
+        parse_natural_reply_output_v2(json.dumps(reply), legacy)
+    legacy_history = freeze_natural_reply_request_v4(
+        replace(current_input, schema="sylanne.d09.context_reply_input.v4"), legacy.installation)
+    with pytest.raises(ValueError, match="shape"):
+        parse_natural_reply_output_v4(json.dumps(reply), legacy_history)
+    parsed = parse_natural_reply_output_v4(json.dumps(reply), current)
+    assert parsed.output_digest == canonical_digest(reply)
+    assert natural_semantic_ranges_v3(reply) == ((0, len(reply["body"])),)
+    assert current.model_request_digest != legacy.model_request_digest
+
+
+def test_semantic_manifest_rejects_a_qualifier_or_code_split_and_over_four_bubbles():
+    from sylanne3.domains.d09.natural_reply import (
+        NATURAL_REPLY_OUTPUT_SCHEMA_V3, natural_semantic_ranges_v3,
+    )
+    reply = output("You said it might be open.")
+    reply.update(schema=NATURAL_REPLY_OUTPUT_SCHEMA_V3,
+                 semantic_segments=[{"start": 0, "end": 12}, {"start": 12, "end": len(reply["body"])}])
+    with pytest.raises(ValueError, match="qualified claim"):
+        natural_semantic_ranges_v3(reply)
+    reply = {"schema": NATURAL_REPLY_OUTPUT_SCHEMA_V3,
+             "body": "```py\nx = 1\n```", "units": [],
+             "semantic_segments": [{"start": 0, "end": 6}, {"start": 6, "end": 15}]}
+    with pytest.raises(ValueError, match="fenced code"):
+        natural_semantic_ranges_v3(reply)
+    reply = {"schema": NATURAL_REPLY_OUTPUT_SCHEMA_V3, "body": "12345", "units": [],
+             "semantic_segments": [{"start": i, "end": i + 1} for i in range(5)]}
+    with pytest.raises(ValueError, match="finite"):
+        natural_semantic_ranges_v3(reply)
+
+
 def test_three_message_wire_keeps_qualified_limits_and_stable_prefix():
     request = frozen()
     assert [item.role for item in request.messages] == ["system", "user", "user"]

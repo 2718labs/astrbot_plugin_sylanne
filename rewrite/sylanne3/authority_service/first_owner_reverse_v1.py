@@ -8,7 +8,7 @@ from contextlib import ExitStack
 from .contract import AuthorityUnavailable
 from .v2_owner_contract import OwnerAuthorizationOperationV1,OwnerAuthorizationReceiptV1,OwnerClaimTicketV1,OwnerGraphCommitProofV1,from_wire,to_wire
 from .v2_owner_session import OwnerSessionLoginRequestV1
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from ..graph_types import validate_owner_grant_v1,owner_grant_policy_digest_v1
 from ..runtime_contracts import canonical_digest
 

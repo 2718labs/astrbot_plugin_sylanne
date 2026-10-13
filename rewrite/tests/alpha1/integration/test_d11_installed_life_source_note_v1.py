@@ -77,6 +77,11 @@ def _installed_life_service(case, *, register_host_process=True):
     graph, server = case["graph"], case["server"]
     bridge = server._v2_execution[case["authority_namespace"]]
     bundle = graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle
+    if case.get('c09_daemon') is not None:
+        service=server._d11_life_services_v1[case['authority_namespace']]
+        assert type(service) is AuthorityD11LifeServiceV1 and service.bridge is bridge
+        assert case['c09_daemon'].server is server and case['c09_daemon'].core is case['core']
+        return service
     service = AuthorityD11LifeServiceV1(bridge=bridge, owner_tickets=server._v2_owner_tickets,
         namespace=case["namespace"], installation_id=case["policy"].installation_id,
         manifest_digest=case["manifest_digest"], graph_db_path=owner_service.graph_path,
@@ -147,9 +152,21 @@ def _prepare_owner_context_and_focus(case, *, project_ref, source_ref, audience)
     bindings = tuple(json.loads(value) for value, valid in rows if valid and json.loads(value)["status"] == "active")
     roles = tuple(sorted({"project_worker", *(binding["social_role"] for binding in bindings)}))
     norms = tuple(sorted({norm for binding in bindings for norm in binding["norm_refs"]}))
-    with domain_owner(case) as (authority, lease):
-        catalogue = graph.adopt_current_context_catalogue_v1(authority, lease, operation_id=str(uuid4()),
-            roles=roles, norms=norms, budget_ref=case["policy"].root_grant.lease_id)
+    if "initial_context_catalogue" in case:
+        catalogue = case["initial_context_catalogue"]
+        # Initial root compilation preserved this exact formally accepted field.
+        # The following production Context preparation independently qualifies
+        # its current adopted candidate, Owner, Source and role inventory.
+        from sylanne3.domains.d03.context import ContextProvider
+        from sylanne3.domains.d12.types import character_draft_key
+        from sylanne3.runtime.d12_domain_scheme_compile_v1 import CONTEXT_SCHEME_FIELD
+        expected = ContextProvider().compile_scheme(
+            {"schema": "d03.context.scheme.v1", "roles": roles, "norms": norms}, None)
+        assert _head(case, character_draft_key(ns).token)[1]["fields"][CONTEXT_SCHEME_FIELD] == json.loads(canonical_serialize(expected))
+    else:
+        with domain_owner(case) as (authority, lease):
+            catalogue = graph.adopt_current_context_catalogue_v1(authority, lease, operation_id=str(uuid4()),
+                roles=roles, norms=norms, budget_ref=case["policy"].root_grant.lease_id)
     assert catalogue["graph_receipt"]["status"] == "committed"
     assert catalogue["compatibility"]["status"] == "compatible_static_catalogue"
     assert tuple(catalogue["compatibility"]["roles"]) == roles
@@ -164,13 +181,30 @@ def _prepare_owner_context_and_focus(case, *, project_ref, source_ref, audience)
 async def run_installed_owner_life_case(tmp_path, installed_d04_root, *,
         natural_workflow_builder=None, after_episode_async=None, enable_c09_maintenance=False, life_before_root_operation_id=None,
         enable_d04_semantic_drive=False, enable_d04_joint_numeric=False,
-        host_process_runner=None, c09_protected_root=None):
+        host_process_runner=None,c09_protected_root=None,initial_phase_fixture_installation=None,
+        complete_c09_current_v3=False,c09_phase_setup_file=None):
     initialized = {}
 
     async def after_role(case):
         initialized.update(case)
         def install():
-            initialize_owner_root_v3(case, root_operation_id=life_before_root_operation_id)
+            initial_context = None
+            if enable_d04_joint_numeric:
+                registration = case["domain_registry"].registrations["d03"]
+                case["graph"].register_provider(case["bootstrap"], "d03", registration.provider,
+                    registration.proposal_schema, registration.proposal_schema_hash)
+                def initial_context():
+                    with domain_owner(case) as (authority, lease):
+                        accepted = case["graph"].adopt_current_context_catalogue_v1(authority, lease,
+                            operation_id=str(uuid4()), roles=("project_worker", "scene_participant"),
+                            norms=(), budget_ref=case["policy"].root_grant.lease_id)
+                    assert accepted["graph_receipt"]["status"] == "committed"
+                    catalogue = accepted["compatibility"]
+                    case["graph"]._GraphCoordinator__providers["d03"][0].compile_scheme(
+                        {"schema": "d03.context.scheme.v1", "roles": tuple(catalogue["roles"]), "norms": tuple(catalogue["norms"])}, None)
+                    case["initial_context_catalogue"] = accepted
+            initialize_owner_root_v3(case, root_operation_id=life_before_root_operation_id,
+                before_root_compile=initial_context)
             if life_before_root_operation_id is not None:
                 graph = case["graph"]
                 graph.install_life_before_capture_policy_v1(case["bootstrap"],
@@ -188,7 +222,27 @@ async def run_installed_owner_life_case(tmp_path, installed_d04_root, *,
                 registration = case["domain_registry"].registrations[domain]
                 case["graph"].register_provider(case["bootstrap"], domain, registration.provider,
                     registration.proposal_schema, registration.proposal_schema_hash)
+            if complete_c09_current_v3:
+                from m1_artifact_draft_acceptance_support_v1 import install_m1_owner_body_and_catalogue_v1
+                from d11_offline_authority_acceptance_support_v1 import install_phase_fixture_recall_owner_policies_v1
+                for domain in ('d01','d03','d06','d07','d08'):
+                    registration=case['domain_registry'].registrations[domain]
+                    case['graph'].register_provider(case['bootstrap'],domain,registration.provider,
+                        registration.proposal_schema,registration.proposal_schema_hash)
+                install_m1_owner_body_and_catalogue_v1(case)
+                install_phase_fixture_recall_owner_policies_v1(case)
             initialized["life_service"] = _installed_life_service(case)
+            if complete_c09_current_v3:
+                from c09_life_authority_phase_support_v1 import persist_life_cold_fixture_v1
+                daemon=case['c09_daemon'];factory=daemon.config.c09_maintenance_factory;control=daemon.c09_control
+                case['c09_cold_fixture']=persist_life_cold_fixture_v1(control.key_path.parent/'life-cold-installation.json',
+                    core=daemon.core,control=control,namespace=case['namespace'],peer=case['peer'],
+                    subject=case['client_grant'].subject,holder=case['policy'].administrator_holder,
+                    package_root=case['package_root'],manifest_digest=case['manifest_digest'],inventory=factory.inventory,
+                    target_directory=factory.target_directory,runtime_issuer_signing_key=case['installed_bundle'].d11_signing_key,
+                    admin_d02_signing_key=case['installed_bundle'].d02_signing_key,provider_cache=case['c09_provider_cache'],
+                    deployment_config=daemon.config,phase_setup_file=case['c09_phase_setup_file'])
+
             initialized.update(case)
         await asyncio.to_thread(install)
 
@@ -393,7 +447,8 @@ async def run_installed_owner_life_case(tmp_path, installed_d04_root, *,
                 finally:
                     db.execute('ROLLBACK')
             return {**case,'episode_ref':episode_key.token,'life_activity_id':activity,
-                'life_causal_operation_id':progress_receipt['operation_id'],'life_audience':audience}
+                'life_causal_operation_id':progress_receipt['operation_id'],'life_audience':audience,
+                'life_source_execution_id':prepared.binding.execution_id}
         completed=await asyncio.to_thread(accept)
         # No await or second worker entry occurs while the synchronous Life
         # acceptance holds the actual graph lock/SQL transaction.
@@ -404,7 +459,8 @@ async def run_installed_owner_life_case(tmp_path, installed_d04_root, *,
     # service. Run its authorized migrations before the first Owner/business
     # write, so recovery and the selected four stores use the same mode.
     await real_owner_case(tmp_path, "owned", installed_package_root=installed_d04_root,
-        natural_workflow_builder=natural_workflow_builder,
+        natural_workflow_builder=natural_workflow_builder,initial_phase_fixture_installation=initial_phase_fixture_installation,
+        complete_c09_current_v3=complete_c09_current_v3,c09_phase_setup_file=c09_phase_setup_file,
         after_role_initialization=after_role, continue_to_ingress=True, after_c02=after_c02,
         enable_d09_workbench=True, enable_d04_root_cpu=True, enable_c04_body_work=True,
         enable_d10_offline_ticks=True, enable_d11_life_source_note=True,

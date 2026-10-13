@@ -222,17 +222,21 @@ def read_d11_root_freeze_v3(
 ) -> D11RootFreezeOriginalV3 | None:
     """Read only a verified signed original and its historical budget reserve."""
     _transaction(db, issuer)
-    row = db.execute(
-        "SELECT original_json,signature FROM runtime_d11_d04_root_freezes_v3 "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone()
+    from .domain_background_read_v3 import background_point_v3,background_json_loads_v3,background_json_matches_v3,background_verify_signature_v3,background_typed_original_digest_v3
+    def exact(encoded,label):
+        raw=background_json_loads_v3(encoded)
+        if not background_json_matches_v3(encoded,raw):raise ValueError(label+" is noncanonical")
+        return raw
+    row=background_point_v3(db,table='runtime_d11_d04_root_freezes_v3',columns=('original_json','signature'),
+        key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation_id),legacy_reader=lambda:db.execute(
+            'SELECT original_json,signature FROM runtime_d11_d04_root_freezes_v3 WHERE bot=? AND persona=? AND operation_id=?',
+            (*namespace.as_tuple,operation_id)).fetchone())
     if row is None:
         return None
     encoded, signature = row
     try:
-        issuer._signer.verify(_SIGN_KIND, encoded, signature)
-        raw = _json_exact(encoded, "signed freeze")
+        background_verify_signature_v3(issuer._signer,_SIGN_KIND,encoded,signature)
+        raw = exact(encoded,"signed freeze")
         if type(raw) is not dict or set(raw) != {
                 field.name for field in fields(D11RootFreezeOriginalV3)}:
             raise ValueError("freeze fields differ")
@@ -240,7 +244,7 @@ def read_d11_root_freeze_v3(
         raw["quote_ceiling"] = tuple(tuple(item) for item in raw["quote_ceiling"])
         original = D11RootFreezeOriginalV3(**raw)
         if (original.namespace != namespace or original.operation_id != operation_id
-                or canonical_digest(_content(original)) != original.original_digest):
+                or background_typed_original_digest_v3(db,encoded,_content(original)) != original.original_digest):
             raise ValueError("freeze identity differs")
         grant, grant_sig = issuer.signed_budget_grant_at_version(
             db, original.parent_budget_lease_ref, original.grant_version)
@@ -249,22 +253,20 @@ def read_d11_root_freeze_v3(
                 or grant.allowed_work_kinds != (ROOT_WORK_KIND_V3,)
                 or tuple(sorted(grant.max_ceiling.items())) != original.quote_ceiling):
             raise ValueError("signed root grant differs")
-        reservation = db.execute(
-            "SELECT digest,lease_id,receipt_json FROM runtime_budget_operations "
-            "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-            namespace.as_tuple + (original.reserve_operation_id,),
-        ).fetchone()
+        reservation=background_point_v3(db,table='runtime_budget_operations',columns=('digest','lease_id','receipt_json'),
+            key_columns=('bot_id','persona_id','operation_id','phase'),key=(*namespace.as_tuple,original.reserve_operation_id,'reserve'),
+            legacy_reader=lambda:db.execute("SELECT digest,lease_id,receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+                (*namespace.as_tuple,original.reserve_operation_id)).fetchone())
         if (reservation is None or reservation[0] != original.reserve_digest
                 or reservation[1] != original.parent_budget_lease_ref
-                or canonical_digest(_json_exact(reservation[2], "reserve receipt"))
+                or canonical_digest(exact(reservation[2],"reserve receipt"))
                    != original.reserve_receipt_digest):
             raise ValueError("root budget reservation differs")
-        quote_row = db.execute(
-            "SELECT digest,ceiling_json FROM runtime_budget_reservations "
-            "WHERE lease_id=? AND operation_id=?",
-            (original.parent_budget_lease_ref, original.reserve_operation_id),
-        ).fetchone()
-        quote = None if quote_row is None else _json_exact(quote_row[1], "reserve quote")
+        quote_row=background_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json'),
+            key_columns=('lease_id','operation_id'),key=(original.parent_budget_lease_ref,original.reserve_operation_id),
+            legacy_reader=lambda:db.execute('SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
+                (original.parent_budget_lease_ref,original.reserve_operation_id)).fetchone())
+        quote = None if quote_row is None else exact(quote_row[1],"reserve quote")
         if (quote_row is None or quote_row[0] != original.reserve_digest
                 or type(quote) is not dict
                 or tuple(sorted(quote.items()))

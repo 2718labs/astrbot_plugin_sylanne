@@ -110,7 +110,11 @@ class HostLifecycleStageV1:
 
 def read_current_host_lifecycle_scope_v1(db, *, namespace, issuer, now_utc):
     from .d11_offline_originals_v1 import TABLE, read_current_d11_offline_value_v1, read_current_d11_offline_original_ref_v1, _utc
-    rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' ORDER BY original_ref LIMIT 129", namespace.as_tuple).fetchall()
+    from .domain_background_read_v3 import background_rows_v3, background_graph_head_v3, background_json_loads_v3
+    rows = background_rows_v3(db, table=TABLE, columns=('original_ref',),
+        group_columns=('bot','persona','kind'), group=(*namespace.as_tuple,'registered_schedule'),
+        order_columns=('original_ref',), limit=129,
+        legacy_reader=lambda: db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='registered_schedule' ORDER BY original_ref LIMIT 129", namespace.as_tuple).fetchall())
     if len(rows) > 128:
         raise MissingProductionOriginalV1("bounded_actual_offline_schedule_lifecycle_audience")
     latest = {}
@@ -118,10 +122,11 @@ def read_current_host_lifecycle_scope_v1(db, *, namespace, issuer, now_utc):
         schedule = read_current_d11_offline_value_v1(db, namespace=namespace, original_ref=ref, issuer=issuer)
         if schedule.schedule_id not in latest or latest[schedule.schedule_id].revision < schedule.revision:
             latest[schedule.schedule_id] = schedule
-    owner_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (owner_grant_key(*namespace.as_tuple).token,)).fetchone()
+    actual_owner_row = background_graph_head_v3(db, namespace, owner_grant_key(*namespace.as_tuple))
+    owner_row = None if actual_owner_row is None else (actual_owner_row[1], actual_owner_row[2])
     if owner_row is None or owner_row[1] != 1:
         raise MissingProductionOriginalV1("actual_current_owner_host_lifecycle_scope")
-    owner = json.loads(owner_row[0])
+    owner = background_json_loads_v3(owner_row[0])
     active = tuple(schedule for schedule in latest.values() if _utc(schedule.starts_at_utc).timestamp() <= now_utc < _utc(schedule.valid_until_utc).timestamp())
     audiences = set().union(*(set(schedule.audiences) for schedule in active)) if active else {"owner"}
     purposes = set().union(*(set(schedule.purposes) for schedule in active)) if active else {"context", "audit"}

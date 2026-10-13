@@ -6,13 +6,17 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+import json
 
 from ..host.authority_profile import AdminModelWorkflowV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.natural_reply import (
     TEMPLATE_DIGEST as GENERATION_TEMPLATE_DIGEST,
 )
-from ..model_broker.natural_review import REVIEW_TEMPLATE_DIGEST
+from ..model_broker.natural_review import (
+    REVIEW_TEMPLATE_DIGEST, REVIEW_TEMPLATE_DIGEST_V2, REVIEW_TEMPLATE_VERSION_V2,
+    INPUT_SCHEMA_V2,
+)
 from ..runtime.natural_reply_job_v2 import (
     NaturalReplyJobHold, read_original_call_binding,
     read_original_preparation,
@@ -76,10 +80,11 @@ class PinnedNaturalOriginalCallIdentityVerifierV2:
         )
         if stage == "generation":
             from ..model_broker.natural_reply_history_v3 import TEMPLATE_VERSION as V3_TEMPLATE_VERSION
-            from ..model_broker.natural_reply_history_v4 import TEMPLATE_VERSION as V4_TEMPLATE_VERSION
-            allowed = (expected[:2], ("natural_generation", V3_TEMPLATE_VERSION), ("natural_generation", V4_TEMPLATE_VERSION))
+            from ..model_broker.natural_reply_history_v4 import TEMPLATE_VERSION as V4_TEMPLATE_VERSION, TEMPLATE_VERSION_V5
+            allowed = (expected[:2], ("natural_generation", V3_TEMPLATE_VERSION),
+                       ("natural_generation", V4_TEMPLATE_VERSION), ("natural_generation", TEMPLATE_VERSION_V5))
         else:
-            allowed = (expected[:2],)
+            allowed = (expected[:2], ("natural_review", REVIEW_TEMPLATE_VERSION_V2))
         if (workflow.work_kind, workflow.template_version) not in allowed:
             return None
         try:
@@ -101,6 +106,12 @@ class PinnedNaturalOriginalCallIdentityVerifierV2:
                         expected = ("natural_generation", seal.template_version,
                                     natural_generation_template_digest(frozen))
                         if workflow.template_version != seal.template_version:
+                            return None
+                    else:
+                        semantic = json.loads(frozen.canonical_input).get("schema") == INPUT_SCHEMA_V2
+                        expected = ("natural_review", REVIEW_TEMPLATE_VERSION_V2 if semantic else NATURAL_REPLY_REVIEW_WORKFLOW_V1,
+                                    REVIEW_TEMPLATE_DIGEST_V2 if semantic else REVIEW_TEMPLATE_DIGEST)
+                        if workflow.template_version != seal.template_version or seal.template_version != expected[1]:
                             return None
                     installed = frozen.installation
                     if (seal.installation_id != self._installation_id

@@ -23,7 +23,7 @@ from ...graph_types import AtomKey, GraphAtom, GraphSnapshot, Owner
 from ...memory_types import source_key
 from ...runtime.restore_anchor import RestoreAnchor
 from ...runtime_contracts import (
-    CheckReceipt, FenceScope, QueryEpoch, VersionedRef, canonical_digest,
+    CheckReceipt, FenceScope, NamespaceId, QueryEpoch, VersionedRef, canonical_digest,
 )
 from .execution import (
     ActionCancellationState, ActionIntent, ActionSchema, ActionSchemaRecord,
@@ -71,6 +71,18 @@ class DispatchCheckScopeV2:
 
 
 def _current_atom(db, snapshot: GraphSnapshot, key: AtomKey) -> GraphAtom:
+    from ...runtime.dispatch_current_projection import _bound_dispatch_projection_v3
+    from ...runtime.current_graph_full_read_v3 import require_bound_graph_full_atom_v3
+    namespace = NamespaceId.from_key(key)
+    query = QueryEpoch(namespace,"all",snapshot.epochs[0].revision)
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot)
+    if fixed is not None:
+        current = require_bound_graph_full_atom_v3(db,namespace,query,key)
+        atom = snapshot.get(key)
+        if (current is None or atom is None or not current.valid or not atom.valid
+                or current.key!=key or atom.key!=key or atom.revision!=current.revision or atom.value!=current.value):
+            raise ValueError(f"current D08 {key.type_name} row differs from its prepared typed head")
+        return atom
     rows = db.execute(
         "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
         "AND bot=? AND persona=?",
@@ -104,7 +116,11 @@ def read_dispatch_check_scope_v2(
     """
     from ...authority_service.v2_execution_bridge import CurrentEffectReadV2
 
-    if (not db.in_transaction or type(snapshot) is not GraphSnapshot
+    from ...runtime.dispatch_current_projection import _bound_dispatch_projection_v3
+    if type(scope) is not FenceScope:
+        raise ValueError("installed D08 write scope required")
+    fixed = _bound_dispatch_projection_v3(db,scope.namespace,query,snapshot=snapshot,source_metadata=True)
+    if (not db.in_transaction
             or type(query) is not QueryEpoch or type(scope) is not FenceScope
             or type(effect) is not CurrentEffectReadV2
             or type(authority_snapshot) is not AuthorityCurrentEffectSnapshotV2
@@ -185,7 +201,15 @@ def read_dispatch_check_scope_v2(
     if (source is None or source != source_key(
             *namespace.as_tuple, source.owner.subject or "")):
         raise ValueError("D08 reply source is not a canonical D06 graph address")
-    source_atom = _current_atom(db, snapshot, source)
+    if fixed is None:
+        source_atom = _current_atom(db, snapshot, source)
+        source_version = VersionedRef(source_atom.key.token,source_atom.revision)
+    else:
+        from ...runtime.current_graph_full_read_v3 import require_bound_graph_full_source_metadata_for_barrier_v3
+        source_metadata = require_bound_graph_full_source_metadata_for_barrier_v3(db,namespace,source)
+        if source_metadata.source_key!=source or not source_metadata.valid or source_metadata.revision<1:
+            raise ValueError("D08 actual Source metadata pin is unavailable")
+        source_version = VersionedRef(source.token,source_metadata.revision)
     goal = d08_types["d08.goal.v1"].validator(goal_atom.value)
     stored_schema = d08_types["d08.action_schema.v1"].validator(schema_atom.value)
     cancellation = d08_types["d08.action_cancellation.v1"].validator(
@@ -285,8 +309,8 @@ def read_dispatch_check_scope_v2(
         intent, schema, current, valid_until=float(expiry))
     if receipt.result != "pass" or receipt.coverage != "full":
         raise ValueError("D08 current provider did not pass")
-    positive = tuple(VersionedRef(atom.key.token, atom.revision) for atom in (
-        source_atom, goal_atom, action_atom, schema_atom, cancellation_atom))
+    positive = (source_version,) + tuple(VersionedRef(atom.key.token, atom.revision) for atom in (
+        goal_atom, action_atom, schema_atom, cancellation_atom))
     commitments = tuple(VersionedRef(item.key.token, item.revision)
                         for item in facts.graph_versions
                         if item.key.type_name == "d08.commitment.v1")

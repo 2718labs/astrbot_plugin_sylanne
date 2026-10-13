@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from .model_broker.first_ingress_encoding import ENCODING_TEMPLATE_VERSIONS
+
 import asyncio
 from .host.model_workflows_v3 import AdminModelWorkflowsV3
+from .host.model_workflows_v4 import AdminModelWorkflowsV4
+from .host.model_workflows_v5 import AdminModelWorkflowsV5
+from .host.model_workflows_v6 import AdminModelWorkflowsV6
+from .host.model_workflows_v7 import AdminModelWorkflowsV7
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -30,6 +36,7 @@ from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.legacy_data_preflight import inspect_native_data_dir_v1
+from .host.managed_data_layout_v1 import ManagedDataLayoutError, support_export_root_v1
 from .host.reply_suppression import HostReplySuppressionRegistryV1
 from .host.reply_suppression import HostReplySuppressionEvidenceV1
 from .host.reply_takeover import HostReplyTakeoverReadyV1
@@ -393,6 +400,10 @@ def _installed_c04_cpu_quote_authority_v1(
 class RuntimeContext:
     """Own the production graph bootstrap and expose one bounded host ingress."""
 
+    @property
+    def local_module_admission(self):
+        return self._local_module_admission
+
     def __init__(
         self,
         data_dir: Path,
@@ -404,7 +415,13 @@ class RuntimeContext:
         owner_principal_resolver: Callable[[str, NamespaceId], OwnerPrincipalV1 | None] | None = None,
         scene_identity_port: SceneIdentityPort | None = None,
         model_selection_port: object | None = None,
+        local_module_admission: object | None = None,
     ) -> None:
+        from .runtime.local_module_admission_v1 import LocalModuleAdmissionV1
+        self._local_module_admission = (LocalModuleAdmissionV1.from_config_v1(None)
+            if local_module_admission is None else local_module_admission)
+        if type(self.local_module_admission) is not LocalModuleAdmissionV1:
+            raise TypeError("frozen local module admission required")
         if owner_principal_resolver is not None and not callable(owner_principal_resolver):
             raise TypeError("owner_principal_resolver must be callable")
         if scene_identity_port is not None and not callable(getattr(scene_identity_port, "verify", None)):
@@ -429,6 +446,11 @@ class RuntimeContext:
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
+        self._v2_artifact_draft_model_runtime_v1 = None
+        self._artifact_draft_resume_task_v1 = None
+        self._artifact_draft_rescan_requested_v1 = False
+        self._artifact_draft_active_cycles_v1 = set()
+        self._artifact_draft_stopping_v1 = False
         self._v2_coordinator: GraphCoordinator | None = None
         self._v2_bootstrap: object | None = None
         self._v2_port: V2FencePort | None = None
@@ -537,11 +559,17 @@ class RuntimeContext:
                 policy.manifest_digest,
                 available_cpu_features=installation.available_cpu_features,
             )
-            if not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance"}:
+            if not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}:
                 self.health = RuntimeHealth(
                     "blocked", ("installed_package",),
                     package.reason if not package.verified else "formal-alpha1 package required",
                 )
+                return self.health
+
+            try:
+                data_layout = await asyncio.to_thread(installation.require_data_layout_v1)
+            except (OSError, ManagedDataLayoutError) as exc:
+                self.health = RuntimeHealth("blocked", ("migration_required",), str(exc))
                 return self.health
 
             try:
@@ -553,10 +581,6 @@ class RuntimeContext:
                     "resumed installation requires its independent original bootstrap readiness")
                 return self.health
 
-            if inspect_native_data_dir_v1(self._data_dir).status == "migration_required":
-                self.health = RuntimeHealth("blocked", ("migration_required",),
-                                            "unmigrated plugin data needs explicit migration proof")
-                return self.health
             self._data_dir.mkdir(parents=True, exist_ok=True)
 
             cost_transport = None
@@ -617,7 +641,7 @@ class RuntimeContext:
                         grant=client_grant, owner_loop=loop)
                     workflows = bundle.model_workflows
                     if (bundle.installation_policy == policy
-                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                             and type(workflows.natural_generation)
                             is AdminModelWorkflowV2
                             and type(workflows.natural_review)
@@ -673,10 +697,11 @@ class RuntimeContext:
                 and cost_transport is None)
             d04_output_policy = None
             c04_build_digest = None
+            c04_direct_seed_build_digest = None
             c04_authority_port = None
             try:
                 from .host.installed_d04_output_policy import load_installed_d04_output_policy_v1
-                from .host.installed_d06_build import verify_d06_algorithm_build, ALGORITHM_ID_V3
+                from .host.installed_d06_build import verify_d06_algorithm_build, ALGORITHM_ID_V3, ALGORITHM_ID_V4
                 from .runtime.c04_authority_port_v3 import InstalledC04AuthorityPortV3
                 d04_output_policy = await asyncio.to_thread(
                     load_installed_d04_output_policy_v1,
@@ -686,6 +711,11 @@ class RuntimeContext:
                     verify_d06_algorithm_build, installation.package_root,
                     policy.manifest_digest, require_formal=False, require_backend_runtime=True, algorithm_id=ALGORITHM_ID_V3)
                 c04_build_digest = verified_c04["build_digest"].removeprefix("sha256:")
+                verified_direct_seed = await asyncio.to_thread(
+                    verify_d06_algorithm_build, installation.package_root,
+                    policy.manifest_digest, require_formal=False, require_backend_runtime=True,
+                    algorithm_id=ALGORITHM_ID_V4)
+                c04_direct_seed_build_digest = verified_direct_seed["build_digest"].removeprefix("sha256:")
                 if natural_authority_client is not None and natural_owner_loop is not None:
                     c04_authority_port = InstalledC04AuthorityPortV3(
                         client=natural_authority_client, bundle=bundle,
@@ -695,6 +725,7 @@ class RuntimeContext:
                 # still require these exact installed dependencies themselves.
                 d04_output_policy = None
                 c04_build_digest = None
+                c04_direct_seed_build_digest = None
                 c04_authority_port = None
 
             from .host.installed_package_history_v1 import build_installed_host_d04_history_v1
@@ -710,9 +741,11 @@ class RuntimeContext:
             def make_store():
                 if installation.storage_admission is not None:
                     installation.storage_admission.require_current_process_v1()
+                current_layout = installation.require_data_layout_v1()
+                if current_layout != data_layout:
+                    raise ManagedDataLayoutError("installed Graph selection changed before open")
                 return ProductionGraphStore(
-                    (installation.storage_admission.graph_path if installation.storage_admission is not None
-                     else self._data_dir / "sylanne3.sqlite3"), self._domains.type_registry,
+                    current_layout.graph_path, self._domains.type_registry,
                 )
 
             provision = None
@@ -770,6 +803,12 @@ class RuntimeContext:
                 d02_issuer = D02ResourceIssuer(installation.d02_signing_key)
                 body_quote_authority = _installed_body_quote_authority_v1(installation)
                 c04_cpu_quote_authority = _installed_c04_cpu_quote_authority_v1(installation)
+                counter_cpu_quote_authority = None
+                if type(bundle.model_workflows) is AdminModelWorkflowsV7:
+                    from .runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
+                    counter_cpu_quote_authority = D13CounterCpuQuotePolicyAuthorityV1(hmac.digest(
+                        installation.d11_signing_key,
+                        b"sylanne3.d13.counter.cpu_quote_policy.v1\0" + policy.installation_id.encode(), "sha256"))
                 d11_job_issuer = D11BudgetJobIssuer(
                     d02_issuer, installation.d11_signing_key)
                 d03_registration = self._domains.registrations.get("d03")
@@ -799,7 +838,7 @@ class RuntimeContext:
                 workflows = (bundle.model_workflows
                              if type(bundle) is AdminInstallationBundle else None)
                 workflow = (workflows.encode
-                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3) else None)
+                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7) else None)
                 if (type(workflow) is AdminModelWorkflowV2
                         and bundle.installation_policy == policy
                         and bundle.ingress_encoding == installation.ingress_encoding
@@ -807,7 +846,7 @@ class RuntimeContext:
                         and installation.ingress_model is None
                         and workflow.work_kind == "d06.encode_source"
                         and workflow.purpose == "consolidation"
-                        and workflow.template_version == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                        and workflow.template_version in ENCODING_TEMPLATE_VERSIONS
                         and type(installation.ingress_encoding) is AdminIngressEncodingPolicy
                         and set(workflow.required_capabilities) <= {"text"}
                         and all(amount <= installation.ingress_encoding.quote_ceiling.get(dimension, 0)
@@ -842,15 +881,18 @@ class RuntimeContext:
                                 privacy_tier=workflow.privacy_tier,
                                 timeout_seconds=workflow.timeout_seconds,
                                 max_output_tokens=workflow.max_output_tokens,
+                                template_version=workflow.template_version,
                             )
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
+                    local_module_admission=self.local_module_admission,
                     content_fence_v2=port,
                     d02_issuer=d02_issuer,
                     d11_issuer=d11_job_issuer,
                     body_quote_authority=body_quote_authority,
                     c04_cpu_quote_authority=c04_cpu_quote_authority,
                     c04_algorithm_build_digest=c04_build_digest,
+                    c04_direct_seed_build_digest=c04_direct_seed_build_digest,
                     c04_authority_port_v3=c04_authority_port,
                     d04_installed_joint_assembly=installation,
                     d04_installed_joint_output_policy=d04_output_policy,
@@ -906,8 +948,10 @@ class RuntimeContext:
                     available_cpu_features=installation.available_cpu_features, historical_compatibility=d04_history)
                 from .runtime.d12_installed_services_v1 import install_d12_services_v1
                 d12_backend_port = install_d12_services_v1(coordinator, bootstrap=bootstrap)
+                if counter_cpu_quote_authority is not None:
+                    coordinator.install_d13_counter_cpu_quote_authority_v1(bootstrap, counter_cpu_quote_authority)
                 if bundle.model_workflows.contact_generation is not None:
-                    if type(bundle.model_workflows) is AdminModelWorkflowsV3:
+                    if type(bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
                         coordinator.install_contact_model_runtime_v2(bootstrap, bundle)
                     else:
                         coordinator.install_contact_model_runtime_v1(bootstrap, bundle)
@@ -918,7 +962,7 @@ class RuntimeContext:
                 selection = self._model_selection_port
                 if (type(selection) is InstalledModelCapabilityPort
                         and type(bundle) is AdminInstallationBundle
-                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                         and selection._installation_bundle is bundle
                         and selection._installed_namespace == policy.namespace
                         and selection._host_loop is natural_owner_loop
@@ -1014,8 +1058,12 @@ class RuntimeContext:
             self._v2_authority_client = natural_authority_client
             self._v2_authority_client_grant = natural_client_grant
             self._v2_authority_loop = natural_owner_loop
-            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
-                    and bundle.model_workflows.d07_cognition is not None
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                    and (bundle.model_workflows.d07_cognition is not None
+                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                             and bundle.model_workflows.d07_relationship_cognition is not None)
+                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                             and bundle.model_workflows.growth_cognition is not None))
                     and type(natural_authority_client) is AuthorityClient
                     and natural_owner_loop is asyncio.get_running_loop()):
                 from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
@@ -1030,10 +1078,26 @@ class RuntimeContext:
                     graph._GraphCoordinator__body_quote_authority = service.body_authority
                     return service
                 self._v2_d07_execution_service = await self._worker.call(install_d07)
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                    and bundle.artifact_draft is not None and bundle.foreground is not None
+                    and type(natural_authority_client) is AuthorityClient
+                    and type(natural_client_grant) is InstallationGrantV2
+                    and natural_owner_loop is asyncio.get_running_loop()):
+                from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+                selected_context = self._model_selection_port._context if type(self._model_selection_port) is InstalledModelCapabilityPort else None
+                def install_artifact_draft(graph):
+                    service = InstalledArtifactDraftModelRuntimeV1(graph=graph, bootstrap=self._v2_bootstrap,
+                        bundle=bundle, worker=self._worker, authority_client=natural_authority_client,
+                        client_grant=natural_client_grant, context=selected_context, owner_loop=natural_owner_loop)
+                    graph.install_artifact_draft_model_runtime_v1(self._v2_bootstrap, service)
+                    return service
+                self._v2_artifact_draft_model_runtime_v1 = await self._worker.call(install_artifact_draft)
             owner_loop = asyncio.get_running_loop()
             def install_followup_wake(graph):
-                graph._GraphCoordinator__domain_followup_wake_v1 = lambda: owner_loop.call_soon_threadsafe(
-                    self.resume_pending_domain_followups_v1, installation)
+                def wake():
+                    owner_loop.call_soon_threadsafe(self.resume_pending_domain_followups_v1, installation)
+                    owner_loop.call_soon_threadsafe(self.resume_pending_artifact_drafts_v1, installation)
+                graph._GraphCoordinator__domain_followup_wake_v1 = wake
                 graph._GraphCoordinator__host_lifecycle_wake_v1 = lambda: owner_loop.call_soon_threadsafe(
                     self.resume_host_lifecycle_observation_v1)
                 graph._GraphCoordinator__offline_recovery_wake_v1 = lambda: owner_loop.call_soon_threadsafe(
@@ -1284,6 +1348,7 @@ class RuntimeContext:
         try:
             continuation = InstalledPrivateReplyContinuationV1(
                 worker=worker, authority=scoped, lease=scoped_lease,
+                local_module_admission=self.local_module_admission,
                 fence_port=port, policy=policy, grant=grant,
                 server=server, claim_writer=writer,
                 context=host_context, candidates=candidates,
@@ -1421,6 +1486,7 @@ class RuntimeContext:
             return ContactDispatchResultV3('hold', str(exc))
         try:
             continuation = InstalledContactContinuationV3(worker=worker, authority=authority,
+                local_module_admission=self.local_module_admission,
                 lease=lease, fence_port=port, policy=policy, grant=grant, server=server,
                 claim_writer=writer, context=context, candidates=candidates,
                 clock_policy=bundle.ingress_clock)
@@ -1512,7 +1578,8 @@ class RuntimeContext:
                         with store._lock:
                             return tuple(row[0] for row in store._db.execute(
                                 "SELECT dedupe_key FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? "
-                                "AND state IN ('pending','waiting') AND dedupe_key>? ORDER BY dedupe_key LIMIT 32",
+                                "AND state IN ('pending','waiting') AND event_kind NOT IN ('artifact_task_wait_registered','artifact_task_amendment_adopted') "
+                                "AND dedupe_key>? ORDER BY dedupe_key LIMIT 32",
                                 (*installation.installation_policy.namespace.as_tuple, cursor)))
                     keys = await self._worker.call(page)
                     if not keys:
@@ -1521,8 +1588,19 @@ class RuntimeContext:
                         if self._domain_followup_stopping:
                             break
                         try:
-                            await self._worker.call(lambda graph, selected=key: graph.consume_current_domain_followup_v1(
+                            raw = await self._worker.call(lambda graph, selected=key: graph.consume_current_domain_followup_v1(
                                 self._v2_bootstrap, installation.admin_bundle, dedupe_key=selected))
+                            progress = self._consume_background_graph_result_v3(raw)
+                            from .runtime.domain_background_read_v3 import (
+                                BackgroundFollowupProgressV3, require_background_followup_progress_v3)
+                            if type(progress) is BackgroundFollowupProgressV3:
+                                progress = require_background_followup_progress_v3(progress)
+                                if progress.status == "child_ready":
+                                    from .runtime.domain_followup_consumer_v1 import consume_background_followup_child_v3
+                                    child = await self._worker.call(lambda graph, handoff=progress.handoff:
+                                        consume_background_followup_child_v3(graph, self._v2_bootstrap,
+                                            installation.admin_bundle, handoff=handoff))
+                                    self._consume_background_graph_result_v3(child)
                         except Exception as exc:
                             self._domain_followup_last_hold = type(exc).__name__
                         cursor = key
@@ -1534,6 +1612,17 @@ class RuntimeContext:
                 if self._domain_followup_rescan_requested and not self._domain_followup_stopping:
                     asyncio.get_running_loop().call_soon(self.resume_pending_domain_followups_v1, installation)
         self._domain_followup_task = asyncio.create_task(consume())
+
+    @staticmethod
+    def _consume_background_graph_result_v3(result):
+        from .graph_worker import OwnedGraphStorageResultV3
+        if type(result) is not OwnedGraphStorageResultV3:
+            return result
+        value, retention = result.take_value_v3()
+        try:
+            return value
+        finally:
+            retention.release()
 
     def resume_host_lifecycle_observation_v1(self):
         """Record a paired runtime boundary only when actual Owner rights exist."""
@@ -1550,6 +1639,7 @@ class RuntimeContext:
                 while not self._offline_recovery_stopping:
                     closed = await self._worker.call(lambda graph, selected=cursor:
                         close_pre_reconnect_offline_page_v1(self, graph, after_ref=selected))
+                    closed = self._consume_background_graph_result_v3(closed)
                     self._offline_recovery_last_status = closed
                     if closed["status"] == "held":
                         self._host_lifecycle_last_status = closed
@@ -1565,6 +1655,7 @@ class RuntimeContext:
                 result = await self._worker.call(lambda graph: record_current_host_lifecycle_v1(
                     graph, self._v2_bootstrap, self._v2_model_bundle,
                     observer=self._host_lifecycle_observer, observation=observation))
+                result = self._consume_background_graph_result_v3(result)
                 self._host_lifecycle_last_status = result
                 if result.get("schema") == "sylanne.domain-production-receipt.v1" and result.get("coverage") == "complete":
                     self._host_lifecycle_startup_receipt = result
@@ -1587,6 +1678,7 @@ class RuntimeContext:
                 from .runtime.d10_offline_recovery_driver_v1 import recover_current_offline_tick_v1
                 while not self._offline_recovery_stopping and self.health.status in {"ready", "limited"}:
                     result = await self._worker.call(lambda graph: recover_current_offline_tick_v1(self, graph))
+                    result = self._consume_background_graph_result_v3(result)
                     self._offline_recovery_last_status = result
                     if result["status"] != "progressed":
                         break
@@ -1741,15 +1833,27 @@ class RuntimeContext:
             coordinator=self._v2_coordinator, bootstrap=self._v2_bootstrap,
         )
 
+    async def prepare_installed_owner_onboarding_ports_v1(self) -> InstalledOwnerOnboardingPorts:
+        """Construct the synchronous installed ports on the existing Graph worker."""
+        if self._worker is None:
+            raise RuntimeError("installed Owner onboarding authority is unavailable")
+        def construct(graph):
+            if graph is not self._v2_coordinator:
+                raise RuntimeError("installed Owner onboarding coordinator differs from the current worker")
+            return self.installed_owner_onboarding_ports()
+        return await self._worker.call(construct)
+
     def workbench_transport(self, *, pairing: CurrentOwnerPairingPort | None = None,
                             owner_grants: CurrentOwnerGrantPort | None = None,
                             onboarding: OnboardingPolicyResolver,
-                            origin: str) -> WorkbenchHttpTransport:
+                            origin: str, owner_identity=None, csrf=None) -> WorkbenchHttpTransport:
         """Compose D12 from the installed V2 port or explicit trusted ports."""
         if self._worker is None or not self._v2_namespace_provisioned:
             raise RuntimeError("v2 graph namespace is unavailable")
         if (pairing is None) != (owner_grants is None):
             raise TypeError("Owner pairing and grant ports must be supplied together")
+        reply_control_port = None
+        bundle = self._v2_model_bundle
         if pairing is None:
             policy = self._v2_policy
             port = self._v2_port
@@ -1766,14 +1870,18 @@ class RuntimeContext:
                     or grant.installation_id != policy.installation_id
                     or not isinstance(origin, str) or not origin.startswith("https://")):
                 raise RuntimeError("installed Owner workbench authority is unavailable")
+            from .host.owner_stop_reply_port_v1 import InstalledOwnerStopReplyPortV1
+            reply_control_port = InstalledOwnerStopReplyPortV1(client=self._v2_authority_client,
+                bundle=bundle, grant=self._v2_authority_client_grant)
             pairing = BoundOwnerSessions(
                 authority=port, worker=self._worker, bootstrap=self._v2_bootstrap,
                 owner_actor=self._v2_owner_actor, namespace=policy.namespace,
                 authority_id=policy.expected_authority_id,
-                installation_id=policy.installation_id, origin=origin,
+                installation_id=policy.installation_id, origin=origin, identity=owner_identity,
                 operation_status_port=(self._v2_d12_backend_port.operation_status_port
                     if self._v2_d12_backend_port is not None else None),
-                package_maintenance_port=self._v2_package_maintenance_port)
+                package_maintenance_port=self._v2_package_maintenance_port,
+                reply_control_port=reply_control_port)
             owner_grants = GraphCurrentOwnerGrantPort(
                 self._v2_coordinator, self._v2_bootstrap,
                 namespace=policy.namespace, activation_generation=1,
@@ -1786,8 +1894,7 @@ class RuntimeContext:
             raise TypeError("trusted onboarding policy resolver is required")
         sessions = CurrentOwnerDashboardSessions(pairing)
         bundle = self._v2_model_bundle
-        support_export_root = self._data_dir / "support_exports"
-        support_export_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        support_export_root = support_export_root_v1(self._data_dir, create=True)
         service = AsyncGraphWorkbenchService(
             self._worker, DurableOwnerGrantResolver(owner_grants),
             CurrentDomainViewRegistry(lambda: self._domains), onboarding,
@@ -1808,9 +1915,13 @@ class RuntimeContext:
             authority_loop=self._v2_authority_loop,
             backend_operation_port=self._v2_d12_backend_port,
             package_maintenance_port=self._v2_package_maintenance_port)
+        from .workbench_api.owner_stop_reply_transport_v1 import InstalledOwnerReplyControlTransportV1
         transport = WorkbenchHttpTransport(
-            service, sessions, BoundCsrfTokens(),
-            TransportConfig(origin, self._package_root / "resources" / "workbench"))
+            service, sessions, BoundCsrfTokens() if csrf is None else csrf,
+            TransportConfig(origin, self._package_root / "resources" / "workbench"),
+            reply_controls=(InstalledOwnerReplyControlTransportV1(reply_control_port,
+                project_stop=self.project_owner_stop_reply_v1)
+                if reply_control_port is not None else None))
         self._workbench_owner_sessions = (
             pairing if isinstance(pairing, BoundOwnerSessions) else None)
         return transport
@@ -2440,7 +2551,7 @@ class RuntimeContext:
         if (type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy != policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or type(bundle.model_workflows.reply) is not AdminModelWorkflowV2):
             return None
         main = bundle.model_workflows.reply
@@ -3030,7 +3141,7 @@ class RuntimeContext:
                 or server.profile.namespace != policy.authority_namespace
                 or server.profile.installation_id != grant.installation_id
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3114,6 +3225,414 @@ class RuntimeContext:
         except Exception:
             return False
 
+    async def project_owner_stop_reply_v1(self, *, original_ref):
+        from .host.owner_stop_reply_port_v1 import InstalledOwnerStopReplyPortV1
+        bundle = self._v2_model_bundle
+        if (type(bundle) is not AdminInstallationBundle or self._worker is None
+                or self._v2_bootstrap is None or not self._v2_namespace_provisioned
+                or self._v2_authority_client is None or self._v2_authority_client_grant is None):
+            return {"status": "held", "missing_inputs": ["actual_installed_owner_stop_projection"]}
+        port = InstalledOwnerStopReplyPortV1(client=self._v2_authority_client, bundle=bundle,
+            grant=self._v2_authority_client_grant)
+        try:
+            _, original = await port.read_owner_stop_reply_projection_v1(original_ref=original_ref)
+            return await self._worker.call(lambda graph: graph.project_current_owner_stop_reply_v1(
+                self._v2_bootstrap, bundle, original_ref=original_ref, operation_id=original.operation_id))
+        except Exception as exc:
+            return {"status": "held", "reason_code": type(exc).__name__,
+                "missing_inputs": ["actual_current_owner_stop_projection"]}
+
+    def resume_pending_artifact_drafts_v1(self, installation):
+        if self._artifact_draft_stopping_v1 or self._v2_artifact_draft_model_runtime_v1 is None or self._worker is None:
+            return
+        if self._artifact_draft_resume_task_v1 is not None and not self._artifact_draft_resume_task_v1.done():
+            self._artifact_draft_rescan_requested_v1 = True
+            return
+        self._artifact_draft_rescan_requested_v1 = False
+        async def resume():
+            try:
+                items = await self._worker.call(lambda graph: graph.discover_current_artifact_draft_resumes_v1(
+                    self._v2_bootstrap, installation.admin_bundle))
+                for item in items:
+                    if self._artifact_draft_stopping_v1:
+                        break
+                    await self.run_post_c02_artifact_draft_v1(installation, **item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_artifact_resume_refusal_v1 = type(exc).__name__
+            finally:
+                self._artifact_draft_resume_task_v1 = None
+                if self._artifact_draft_rescan_requested_v1 and not self._artifact_draft_stopping_v1:
+                    asyncio.get_running_loop().call_soon(self.resume_pending_artifact_drafts_v1, installation)
+        self._artifact_draft_resume_task_v1 = asyncio.create_task(resume())
+
+    async def run_post_c02_artifact_draft_v1(self, installation, *, c02_operation_id, source_ref, fresh_cause_hint=False):
+        if self._artifact_draft_stopping_v1:
+            return {"status": "held", "missing_inputs": ["actual_running_host"]}
+        if c02_operation_id in self._artifact_draft_active_cycles_v1:
+            return {"status": "original_continuation_scheduled", "c02_operation_id": c02_operation_id}
+        self._artifact_draft_active_cycles_v1.add(c02_operation_id)
+        try:
+            completed = await self._worker.call(lambda graph:
+                graph.read_current_completed_artifact_method_v2(self._v2_bootstrap, installation.admin_bundle,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref))
+            if completed is not None:
+                return completed
+            progress = await self._worker.call(lambda graph:
+                graph.read_current_artifact_method_finalization_progress_v2(self._v2_bootstrap, installation.admin_bundle,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref))
+            if progress is not None:
+                return await self._finalize_current_artifact_method_v2(installation, progress)
+            from .host.authority_profile import AdminArtifactDraftPolicyV3, AdminArtifactStandingScopeV3
+            from .host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+            declared = installation.admin_bundle.artifact_draft
+            if (fresh_cause_hint and type(declared) in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}
+                    and type(declared.standing_scope) is AdminArtifactStandingScopeV3):
+                selected = await self._worker.call(lambda graph:
+                    graph.read_current_post_c02_artifact_phase_resume_v2(self._v2_bootstrap, installation.admin_bundle,
+                        c02_operation_id=c02_operation_id, source_ref=source_ref))
+                if selected is None:
+                    structure = await self._worker.call(lambda graph:
+                        graph.prepare_current_post_c02_artifact_task_structure_v3(self._v2_bootstrap, installation.admin_bundle,
+                            c02_operation_id=c02_operation_id, source_ref=source_ref))
+                    if structure["status"] == "held":
+                        return structure
+                    if structure["status"] == "task_structure_prepared":
+                        await self._worker.call(lambda graph:
+                            graph.prepare_current_post_c02_artifact_phase_choice_v3(self._v2_bootstrap, installation.admin_bundle,
+                                c02_operation_id=c02_operation_id, source_ref=source_ref))
+            result = await self._run_post_c02_artifact_draft_once_v1(installation,
+                c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
+            if result["status"] not in {"artifact_phase_file_structurally_verified", "artifact_phase_check_verified"}:
+                return result
+            from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
+            completed_selector = result["selector"]
+            sequence = artifact_draft_phase_sequence_v2(completed_selector.method_ref)
+            for _ in range(completed_selector.phase_index + 1, len(sequence)):
+                progress = await self._worker.call(lambda graph:
+                    graph.read_current_post_c02_artifact_phase_resume_v2(self._v2_bootstrap,
+                        installation.admin_bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+                selected = progress["selector"]
+                if (selected.task != completed_selector.task or selected.method_ref != completed_selector.method_ref
+                        or selected.phase_index != completed_selector.phase_index + 1
+                        or not result["checkpoint"]):
+                    raise ValueError("phase continuation lacks its actual committed next-phase checkpoint")
+                result = await self._run_post_c02_artifact_draft_once_v1(installation,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=True)
+                if result["status"] not in {"artifact_phase_file_structurally_verified", "artifact_phase_check_verified"}:
+                    return result
+                completed_selector = result["selector"]
+            return await self._finalize_current_artifact_method_v2(installation, result)
+        finally:
+            self._artifact_draft_active_cycles_v1.remove(c02_operation_id)
+
+    async def _run_post_c02_artifact_draft_once_v1(self, installation, *, c02_operation_id, source_ref, fresh_cause_hint=False):
+        from .host.installed_foreground_artifact_driver_v1 import run_installed_post_c02_artifact_draft_v1
+        if not fresh_cause_hint:
+            await self.reconcile_original_artifact_draft_cost_v1(installation, c02_operation_id=c02_operation_id)
+        result = await run_installed_post_c02_artifact_draft_v1(self, installation,
+            c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
+        if result["status"] == "artifact_draft_phase_content_adopted":
+            return await self._run_current_artifact_phase_file_v2(installation, result)
+        if result["status"] != "artifact_draft_content_adopted":
+            return result
+        bundle = installation.admin_bundle
+        if result["target_mode"] == "replace":
+            operations = ("revise_existing_artifact_v1", "propose_artifact_draft_action",
+                "prepare_artifact_draft_body", "input:register_artifact_draft_plan_v3", "prepare_life")
+        elif result["target_mode"] == "create":
+            operations = ("compose_artifact_goal_plan", "create_artifact_project",
+                "propose_artifact_draft_action", "prepare_artifact_draft_body", "initialize_project_checkpoint",
+                "input:register_artifact_draft_plan_v3", "prepare_life")
+        else:
+            raise ValueError("artifact task lost its actual frozen create/replace variant")
+        for operation in operations:
+            try:
+                adopted = await self._worker.call(lambda graph: graph.run_current_post_c02_artifact_draft_operation_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id,
+                    source_ref=source_ref, operation_kind=operation))
+            except Exception as exc:
+                return {"status": "held", "reason_code": type(exc).__name__,
+                    "operation_kind": operation, "missing_inputs": ["actual_current_artifact_stage_original"]}
+            if ((operation != "prepare_life" and adopted.get("coverage") != "complete")
+                    or adopted.get("receipt", {}).get("status") != "committed"):
+                return {"status": "held", "operation_kind": operation, "original": adopted}
+        prepared = tuple(item for item in adopted["produced_originals"] if item["kind"] == "d11.life_prepared")
+        if len(prepared) != 1:
+            return {"status": "held", "missing_inputs": ["actual_committed_draft_life_preparation"]}
+        try:
+            progress = await self._worker.call(lambda graph: graph.run_prepared_source_note_v1(self._v2_bootstrap,
+                namespace=bundle.installation_policy.namespace, prepared_original_ref=prepared[0]["original_ref"]))
+        except Exception as exc:
+            return {"status": "held", "reason_code": type(exc).__name__,
+                "missing_inputs": ["original_draft_execution_readback_and_self_adoption"]}
+        if progress.state != "adopted_completed":
+            return {"status": progress.state, "prepared_original_ref": progress.prepared_original_ref}
+        for operation in ("input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"):
+            try:
+                adopted = await self._worker.call(lambda graph: graph.run_current_post_c02_artifact_draft_operation_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation))
+            except Exception as exc:
+                return {"status": "held", "reason_code": type(exc).__name__, "operation_kind": operation,
+                    "missing_inputs": ["actual_draft_outcome_progress_and_checkpoint"]}
+            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
+                return {"status": "held", "operation_kind": operation, "original": adopted}
+        return {"status": "artifact_completed_verified", "selector": result["selector"],
+            "c02_operation_id": c02_operation_id, "source_ref": source_ref,
+            "prepared_original_ref": progress.prepared_original_ref, "adoption": progress.adoption,
+            "checkpoint": adopted}
+
+    async def _run_current_artifact_phase_file_v2(self, installation, model_result):
+        """Complete one real phase file without settling the whole method early."""
+        from .model_broker.artifact_draft_v1 import ArtifactDraftPhaseSelectorV2
+        phase = model_result["selector"]
+        if type(phase) is not ArtifactDraftPhaseSelectorV2 or not phase.generation:
+            raise ValueError("phase file driver requires actual adopted generation content")
+        bundle = installation.admin_bundle
+        arguments = {"c02_operation_id": phase.task.c02_operation_id, "source_ref": model_result["source_ref"]}
+        operations = ("propose_artifact_draft_phase_action_v2", "prepare_artifact_draft_body",
+            "input:register_artifact_phase_draft_plan_v2", "prepare_life")
+        for operation in operations:
+            try:
+                adopted = await self._worker.call(lambda graph:
+                    graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
+                        operation_kind=operation, **arguments))
+            except (RuntimeError, ValueError) as exc:
+                return {"status": "held", "selector": phase, "operation_kind": operation,
+                    "reason_code": type(exc).__name__, "missing_inputs": ["actual_current_phase_file_stage_original"]}
+            if ((operation != "prepare_life" and adopted.get("coverage") != "complete")
+                    or adopted.get("receipt", {}).get("status") != "committed"):
+                return {"status": "held", "selector": phase, "operation_kind": operation, "original": adopted}
+        prepared = tuple(value for value in adopted["produced_originals"] if value["kind"] == "d11.life_prepared")
+        if len(prepared) != 1:
+            return {"status": "held", "selector": phase,
+                "missing_inputs": ["actual_committed_phase_file_preparation"]}
+        progress = await self._worker.call(lambda graph: graph.run_prepared_source_note_v1(self._v2_bootstrap,
+            namespace=phase.task.namespace, prepared_original_ref=prepared[0]["original_ref"]))
+        if progress.state != "adopted_completed":
+            return {"status": progress.state, "selector": phase,
+                "prepared_original_ref": progress.prepared_original_ref}
+        verified = await self._worker.call(lambda graph:
+            graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
+                operation_kind="verify_artifact_draft_phase_v2", **arguments))
+        if verified.get("coverage") != "complete" or verified.get("receipt", {}).get("status") != "committed":
+            return {"status": "held", "selector": phase, "operation_kind": "verify_artifact_draft_phase_v2",
+                "original": verified, "prepared_original_ref": progress.prepared_original_ref}
+        checkpoint = await self._worker.call(lambda graph:
+            graph.checkpoint_current_artifact_phase_v2(self._v2_bootstrap, bundle, **arguments))
+        return {"status": "artifact_phase_file_structurally_verified",
+            "selector": phase, **arguments, "prepared_original_ref": progress.prepared_original_ref,
+            "adoption": progress.adoption, "verification": verified, "checkpoint": checkpoint}
+
+    async def _finalize_current_artifact_method_v2(self, installation, result):
+        phase = result["selector"]
+        from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
+        if phase.phase_kind != "check" or phase.phase_index != len(artifact_draft_phase_sequence_v2(phase.method_ref)) - 1:
+            raise ValueError("method finalization requires its actual last check phase")
+        bundle = installation.admin_bundle
+        arguments = {"c02_operation_id": result["c02_operation_id"], "source_ref": result["source_ref"]}
+        progress = await self._worker.call(lambda graph:
+            graph.read_current_artifact_method_finalization_progress_v2(self._v2_bootstrap, bundle, **arguments))
+        if progress is None or progress["selector"] != phase:
+            raise ValueError("method finalization lost its actual complete checkpoint")
+        registered = progress["registered_milestone"]
+        if registered is None:
+            registered = await self._worker.call(lambda graph:
+                graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
+                    operation_kind="register_artifact_task_milestone_v2", **arguments))
+        if registered.get("coverage") != "complete" or registered.get("receipt", {}).get("status") != "committed":
+            return {"status": "held", "operation_kind": "register_artifact_task_milestone_v2", "original": registered, **arguments}
+        for operation in ("input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"):
+            adopted = await self._worker.call(lambda graph:
+                graph.run_current_post_c02_artifact_method_final_operation_v2(self._v2_bootstrap, bundle,
+                    operation_kind=operation, **arguments))
+            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
+                return {"status": "held", "operation_kind": operation, "original": adopted, **arguments}
+        return {"status": "artifact_method_settled", "selector": phase, "milestone": registered,
+            "settlement": adopted, **arguments}
+
+    async def reconcile_original_artifact_draft_cost_v1(self, installation, *, c02_operation_id):
+        from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1, recover_original_artifact_draft_model_cost_v1
+        model = self._v2_artifact_draft_model_runtime_v1
+        if (type(model) is not InstalledArtifactDraftModelRuntimeV1
+                or type(installation) is not V2InstallationAssembly or installation.admin_bundle is not model.bundle):
+            return {"status": "held", "missing_inputs": ["actual_installed_artifact_expense_reader"]}
+        try:
+            return await recover_original_artifact_draft_model_cost_v1(model, c02_operation_id=c02_operation_id)
+        except Exception as exc:
+            return {"status": "held", "reason_code": type(exc).__name__,
+                "missing_inputs": ["original_artifact_terminal_financial_fact"]}
+
+    async def prepare_post_c02_recall_need_v1(self, installation, *, c02_operation_id, source_ref):
+        if installation.admin_bundle.d06_recall is None:
+            return {"status": "not_configured"}
+        async with asyncio.timeout(installation.admin_bundle.d06_recall.read_timeout_seconds):
+            result = await self._worker.call(lambda graph: graph.prepare_current_post_c02_recall_need_v1(
+                self._v2_bootstrap, installation.admin_bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref))
+        return {"status": result["need"]["routing"], **result}
+
+    async def resume_original_post_c02_recall_v1(self, installation, *, c02_operation_id, source_ref):
+        """Consume only old C3 identities; each following operation is freshly admitted."""
+        from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+        bundle, service = self._v2_model_bundle, self._v2_d07_execution_service
+        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                or type(service) is not InstalledD07ExecutionServiceV1 or service.bundle is not bundle):
+            return {"status": "held", "missing_inputs": ["actual_installed_original_recall_service"]}
+        async def read():
+            return await self._worker.call(lambda graph: graph.read_current_ingress_recall_resume_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+        current = await read()
+        if current["routing"] is None:
+            child = await service.execute_current_d07_job_v1(current["c3_job"])
+            if child.get("status") != "adopted":
+                return {"status": child.get("status", "original_c3_pending"), "c3": child}
+            current = await read()
+        routing = current["routing"]
+        if routing is None:
+            raise RuntimeError("original C3 completion has no actual adopted routing")
+        if routing["stop_reason"] != "search_required":
+            if routing["stop_reason"] == "no_history_needed":
+                if current["parent_phase"] not in {"queued", "running"}:
+                    return {"status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
+                await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            return {"status": routing["stop_reason"], "routing": routing}
+        if current["c04_prepared"] is None:
+            if current["parent_phase"] not in {"queued", "running"}:
+                return {"status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
+            await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            if current["selection"] is None:
+                await self._worker.call(lambda graph: graph.select_current_post_c02_ingress_recall_seed_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+                current = await read()
+            if current["selection"][0].selected_source_ref is None:
+                return {"status": "c03_no_eligible_source", "routing": routing}
+            from .runtime.c04_self_scope_v4 import PREPARE_OPERATION
+            await self._worker.call(lambda graph: graph.run_current_post_c02_ingress_c04_operation_v4(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id,
+                source_ref=source_ref, operation_kind=PREPARE_OPERATION))
+        result = await self._worker.call(lambda graph: graph.advance_current_post_c02_ingress_c04_v4(
+            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+        if result["status"] == "recollection_adopted":
+            current = await read()
+            if current["parent_phase"] not in {"queued", "running"}:
+                return {"status": "held", "missing_inputs": ["actual_c04_adopted_parent_queue_transition"]}
+            await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+        return result
+
+    async def run_post_c02_recall_v1(self, installation, *, c02_operation_id, source_ref):
+        """Ordinary ingress consumes actual C3/C03 originals before any C04 activity."""
+        result = await self.prepare_post_c02_recall_need_v1(installation,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+        if result["status"] in {"not_configured", "no_search"}:
+            return result
+        if result["status"] == "semantic_route_required":
+            history = await self._worker.call(lambda graph: graph.run_current_post_c02_task_no_search_v1(
+                self._v2_bootstrap, installation.admin_bundle,c02_operation_id=c02_operation_id,source_ref=source_ref))
+            if history["status"] == "no_search":
+                return {**result,"status":"no_search","need":history["need"],"task_no_search":history}
+            if history["status"] != "not_applicable":
+                return {**result,"status":"held","task_no_search":history}
+            result = {**result,"task_no_search":history}
+        bundle, service = self._v2_model_bundle, self._v2_d07_execution_service
+        from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+        from .runtime.d07_ingress_recall_preparation_v1 import OPERATION
+        from .runtime.d07_ingress_recall_result_v1 import read_adopted_ingress_recall_routing_v1
+        from .runtime.jobs import get_job
+        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                or type(service) is not InstalledD07ExecutionServiceV1 or service.bundle is not bundle):
+            return {**result, "status": "unconfigured_c3", "missing_inputs": ["actual_installed_self_c3_execution_service"]}
+        prepared = await self._worker.call(lambda graph: graph.run_current_post_c02_ingress_recall_model_operation_v1(
+            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=OPERATION))
+        job = await self._worker.call(lambda graph: get_job(
+            graph._GraphCoordinator__store._db, prepared["continuation_ref"]))
+        execution = await service.execute_current_d07_job_v1(job)
+        if execution.get("status") != "adopted":
+            return {**result, "status": execution.get("status", "actual_c3_pending"), "c3": execution}
+        def read_routing(graph):
+            store = graph._GraphCoordinator__store
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN")
+                try:
+                    return read_adopted_ingress_recall_routing_v1(db, namespace=bundle.installation_policy.namespace,
+                        c02_operation_id=c02_operation_id, issuer=graph._GraphCoordinator__d11_issuer)
+                finally:
+                    db.rollback()
+        routing = await self._worker.call(read_routing)
+        if routing is None:
+            raise RuntimeError("C3 reported adoption without its actual W01 routing original")
+        if routing["stop_reason"] != "search_required":
+            if routing["stop_reason"] == "no_history_needed":
+                current = await self._worker.call(lambda graph: graph.read_current_ingress_recall_resume_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+                if current["parent_phase"] not in {"queued", "running"}:
+                    return {**result, "status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
+                await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            return {**result, "status": routing["stop_reason"], "c3": execution, "routing": routing}
+        await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+        selection = await self._worker.call(lambda graph: graph.select_current_post_c02_ingress_recall_seed_v1(
+            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+        if selection["selection"]["selected_source_ref"] is None:
+            return {**result, "status": "c03_no_eligible_source", "c3": execution,
+                "routing": routing, "c03": selection}
+        from .runtime.c04_self_scope_v4 import PREPARE_OPERATION
+        preparation = await self._worker.call(lambda graph:
+            graph.run_current_post_c02_ingress_c04_operation_v4(self._v2_bootstrap, bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=PREPARE_OPERATION))
+        native = await self._worker.call(lambda graph:
+            graph.advance_current_post_c02_ingress_c04_v4(self._v2_bootstrap, bundle,
+                c02_operation_id=c02_operation_id, source_ref=source_ref))
+        if native["status"] == "recollection_adopted":
+            await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+        return {**result, "status": native["status"], "c3": execution,
+            "routing": routing, "c03": selection, "c04_preparation": preparation, "c04": native}
+
+    async def begin_post_c02_foreground_cycle_v1(self, *, installation, c02_operation_id, source_ref):
+        """Only the live committed-input path asks W01 to create its actual cycle."""
+        bundle, policy = self._v2_model_bundle, self._v2_policy
+        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                or type(bundle) is not AdminInstallationBundle or bundle.installation_policy is not policy
+                or self._worker is None or self._v2_bootstrap is None or not self._v2_namespace_provisioned):
+            return {"status": "held", "missing_inputs": ["actual_installed_foreground_worker"]}
+        if "d11.foreground_cycle.v1" not in policy.root_grant.allowed_work_kinds:
+            return {"status": "legacy", "coverage": "not_configured"}
+        try:
+            created = await self._worker.call(lambda graph: graph.prepare_post_c02_foreground_cycle_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            if created.get("coverage") != "complete" or created.get("receipt", {}).get("status") != "committed":
+                return {"status": "held", "original": created}
+            acquired = await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            mode = await self._worker.call(lambda graph: graph.read_current_post_c02_foreground_mode_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            return {"status": "current", "creation": created, "acquisition": acquired, "mode": mode["mode"],
+                "coverage": "actual_cycle_current_source_and_protected_reply_budget"}
+        except Exception as exc:
+            return {"status": "held", "reason_code": type(exc).__name__, "missing_inputs": ["actual_foreground_cycle_qualification"]}
+
+    async def checkpoint_post_c02_foreground_wait_v1(self, *, installation, c02_operation_id, source_ref):
+        bundle = self._v2_model_bundle
+        if type(bundle) is not AdminInstallationBundle or "d11.foreground_cycle.v1" not in bundle.installation_policy.root_grant.allowed_work_kinds:
+            return {"status": "legacy", "coverage": "not_configured"}
+        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                or self._worker is None or self._v2_bootstrap is None):
+            return {"status": "held", "missing_inputs": ["actual_installed_foreground_worker"]}
+        try:
+            result = await self._worker.call(lambda graph: graph.checkpoint_post_c02_foreground_wait_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+            return {"status": "waiting", "original": result,
+                "missing_inputs": ["next_registered_personal_step_original"]}
+        except Exception as exc:
+            return {"status": "held", "reason_code": type(exc).__name__, "missing_inputs": ["actual_foreground_checkpoint_qualification"]}
+
     async def prepare_post_c02_natural_generation_v2(
         self, *, installation: V2InstallationAssembly,
         server: object, listener: object, candidates: object,
@@ -3130,7 +3649,7 @@ class RuntimeContext:
                 or type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3176,6 +3695,7 @@ class RuntimeContext:
         self, installation: V2InstallationAssembly, *, context,
         trusted_umo: str, saved: SavedNaturalPreparationV2,
         server: object, candidates: object, listener: object = None,
+        fresh_reply: bool = False,
     ):
         """Resume one original through review, final admission and P2.
 
@@ -3194,12 +3714,28 @@ class RuntimeContext:
         return await self._run_installed_natural_chain_stages_v2(
             installation, context=context, trusted_umo=trusted_umo,
             saved=saved, server=server, listener=listener,
-            candidates=candidates)
+            candidates=candidates, fresh_reply=fresh_reply)
+
+    async def _maintain_installed_natural_disposition_v1(self, installation, parent_original_id):
+        """Record only original no-content continuation facts; no new send/model."""
+        if (type(installation) is not V2InstallationAssembly or self._worker is None
+                or self._v2_bootstrap is None or self._v2_port is None
+                or installation.installation_policy is not self._v2_policy
+                or installation.installation_grant != self._v2_installation_grant):
+            return {"status":"disposition_projection_pending"}
+        try:
+            return await self._worker.call(lambda graph: graph.maintain_natural_batch_disposition_v1(
+                self._v2_bootstrap, installation.installation_policy.namespace, parent_original_id))
+        except Exception as exc:
+            # This cannot classify a failed check as cancellation or an unknown
+            # effect as unsent. The durable execution originals remain authoritative.
+            return {"status":"disposition_projection_pending","missing_kind":type(exc).__name__}
 
     async def _run_installed_natural_chain_stages_v2(
         self, installation: V2InstallationAssembly, *, context,
         trusted_umo: str, saved: SavedNaturalPreparationV2,
         server: object, listener: object, candidates: object,
+        fresh_reply: bool = False,
     ):
         """Resume original paid stages, admit final once, then recover P2."""
         from .host.installed_natural_reply_driver import (
@@ -3218,12 +3754,15 @@ class RuntimeContext:
                 or progress.generation.original_operation_id !=
                    saved.seal.original_operation_id):
             return None
-        final_id = saved.frozen.input.plan.final_operation_id
-        if progress.final_operation_id is not None:
-            if progress.final_operation_id != final_id:
+        witness = await self._read_installed_natural_resume_witness_v3(installation, saved)
+        if witness is None:
+            await self._maintain_installed_natural_disposition_v1(installation, c02_id)
+            return None
+        if witness.mode == "recovery-only":
+            if not witness.child_identities:
                 return None
             return await self.dispatch_committed_natural_reply_v2(
-                installation, operation_id=final_id, context=context,
+                installation, operation_id=witness.child_identities[witness.segment_index][0], context=context,
                 server=server, listener=listener, candidates=candidates)
 
         generation_saved = await self.read_installed_natural_stage_preparation_v2(
@@ -3260,19 +3799,92 @@ class RuntimeContext:
         if (type(reviewed) is not InstalledNaturalReviewProgressV2
                 or reviewed.status != "paid_review_current_hold"):
             return None
-        final = await self._commit_installed_natural_final_v2(
-            installation, generation_saved)
-        if (type(final) is not CommitReceipt
-                or final.operation_id != final_id
-                or final.status not in {"committed", "duplicate"}):
+        identities = await self._read_installed_natural_batch_identity_v3(installation, generation_saved)
+        if identities is None:
             return None
-        return await self.dispatch_committed_natural_reply_v2(
-            installation, operation_id=final_id, context=context,
-            server=server, listener=listener, candidates=candidates)
+        result = None
+        first_index = witness.segment_index if witness.mode == "resume-original-child" else 0
+        for index in range(first_index, len(identities)):
+            operation_id, effect_id = identities[index]
+            final = await self._commit_installed_natural_final_v2(
+                installation, generation_saved, segment_index=index)
+            if (type(final) is not CommitReceipt
+                    or (final.operation_id, final.effect_id) != (operation_id, effect_id)
+                    or final.status not in {"committed", "duplicate"}):
+                await self._maintain_installed_natural_disposition_v1(installation, c02_id)
+                return (replace(result, status="hold", reason="remaining semantic bubble was not admitted; earlier effect retained")
+                        if result is not None else None)
+            result = await self.dispatch_committed_natural_reply_v2(
+                installation, operation_id=operation_id, context=context,
+                server=server, listener=listener, candidates=candidates,
+                fresh_dispatch=True)
+            # A replay is a factual recovery, never permission to start the next
+            # bubble. UNKNOWN or a failed current check leaves the remainder idle.
+            await self._maintain_installed_natural_disposition_v1(installation, c02_id)
+            if result is None or result.status != "accepted":
+                return result
+        return result
+
+    async def _read_installed_natural_resume_witness_v3(self, installation, saved):
+        """Ask the real Graph/Authority reader; fresh/cold caller flags confer no scope."""
+        if (type(installation) is not V2InstallationAssembly or type(saved) is not SavedNaturalPreparationV2
+                or self._worker is None or self._v2_bootstrap is None or self._v2_port is None
+                or installation.installation_policy is not self._v2_policy
+                or installation.installation_grant != self._v2_installation_grant):
+            return None
+        policy, grant = installation.installation_policy, installation.installation_grant
+        def read(graph):
+            anchor = self._v2_port.current_anchor(namespace=policy.namespace,
+                authority_namespace=policy.authority_namespace)
+            lease, capability = graph.grant(self._v2_bootstrap, actor=grant.administrator_holder,
+                issuer_domain="d11", namespace=policy.namespace, domains=("d08", "d09", "d11"),
+                activation_generation=anchor.activation_generation,
+                operation_id=saved.frozen.input.plan.final_operation_id)
+            try:
+                authority = AuthorityContext(grant.administrator_holder, "d11", capability,
+                    policy.namespace, ("activity",), "expression", ("internal",),
+                    policy.root_grant.policy_ref, anchor.activation_generation)
+                return graph.read_natural_original_resume_witness_v3(
+                    authority, lease, saved.parent_original_id, installation.admin_bundle)
+            finally:
+                graph.release_authority_lease(self._v2_bootstrap, lease)
+        try:
+            return await self._worker.call(read)
+        except Exception:
+            return None
+
+    async def _read_installed_natural_batch_identity_v3(self, installation, saved):
+        """Read stable child refs; every child still obtains its own current admission."""
+        if (type(installation) is not V2InstallationAssembly
+                or type(saved) is not SavedNaturalPreparationV2 or saved.stage != "generation"
+                or self._worker is None or self._v2_bootstrap is None or self._v2_port is None
+                or installation.installation_policy is not self._v2_policy
+                or installation.installation_grant != self._v2_installation_grant):
+            return None
+        policy, grant = installation.installation_policy, installation.installation_grant
+        def read(graph):
+            anchor = self._v2_port.current_anchor(namespace=policy.namespace,
+                authority_namespace=policy.authority_namespace)
+            lease, capability = graph.grant(self._v2_bootstrap, actor=grant.administrator_holder,
+                issuer_domain="d11", namespace=policy.namespace, domains=("d08", "d09", "d11"),
+                activation_generation=anchor.activation_generation,
+                operation_id=saved.frozen.input.plan.final_operation_id)
+            try:
+                authority = AuthorityContext(grant.administrator_holder, "d11", capability,
+                    policy.namespace, ("activity",), "expression", ("internal",),
+                    policy.root_grant.policy_ref, anchor.activation_generation)
+                return graph.read_natural_reply_batch_identity_v3(authority, lease, saved.parent_original_id)
+            finally:
+                graph.release_authority_lease(self._v2_bootstrap, lease)
+        try:
+            return await self._worker.call(read)
+        except Exception:
+            return None
 
     async def _commit_installed_natural_final_v2(
         self, installation: V2InstallationAssembly,
         saved: SavedNaturalPreparationV2,
+        *, segment_index: int = 0,
     ) -> CommitReceipt | None:
         """Let W01 alone read both paid originals and atomically admit P2."""
         if (type(installation) is not V2InstallationAssembly
@@ -3306,6 +3918,11 @@ class RuntimeContext:
                     GraphCoordinator, "commit_post_c02_natural_final_v2", None))):
             return None
         port, bootstrap = self._v2_port, self._v2_bootstrap
+        identities = await self._read_installed_natural_batch_identity_v3(installation, saved)
+        if (identities is None or type(segment_index) is not int
+                or not 0 <= segment_index < len(identities)):
+            return None
+        expected_operation, expected_effect = identities[segment_index]
 
         def commit(graph: GraphCoordinator) -> CommitReceipt:
             anchor = port.current_anchor(
@@ -3316,7 +3933,7 @@ class RuntimeContext:
                 issuer_domain="d11", namespace=policy.namespace,
                 domains=("d08", "d09", "d11"),
                 activation_generation=anchor.activation_generation,
-                operation_id=plan.final_operation_id)
+                operation_id=expected_operation)
             try:
                 authority = AuthorityContext(
                     grant.administrator_holder, "d11", capability,
@@ -3324,7 +3941,7 @@ class RuntimeContext:
                     (plan.audience_id,), policy.root_grant.policy_ref,
                     anchor.activation_generation)
                 return graph.commit_post_c02_natural_final_v2(
-                    authority, lease, saved.seal.c02_operation_id, bundle)
+                    authority, lease, saved.seal.c02_operation_id, bundle, segment_index=segment_index)
             finally:
                 graph.release_authority_lease(bootstrap, lease)
 
@@ -3334,8 +3951,8 @@ class RuntimeContext:
             return None
         return (receipt if type(receipt) is CommitReceipt
                 and receipt.status in {"committed", "duplicate"}
-                and receipt.operation_id == plan.final_operation_id
-                and receipt.effect_id == plan.final_effect_id
+                and receipt.operation_id == expected_operation
+                and receipt.effect_id == expected_effect
                 and len(receipt.outbox_refs) == 1
                 else None)
 
@@ -3360,7 +3977,7 @@ class RuntimeContext:
         if (type(policy) is not AdminInstallationPolicy
                 or type(grant) is not InstallationGrantV2
                 or type(bundle) is not AdminInstallationBundle
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
                 or type(bundle.model_workflows.natural_review)
                    is not AdminModelWorkflowV2
                 or generation_saved.seal.namespace != policy.namespace
@@ -3413,7 +4030,7 @@ class RuntimeContext:
     async def dispatch_committed_natural_reply_v2(
         self, installation: V2InstallationAssembly, *,
         operation_id: str, context: object, server: object,
-        listener: object, candidates: object,
+        listener: object, candidates: object, fresh_dispatch: bool = False,
     ):
         """Recover an admitted original before attempting the P2 handoff."""
         from .host.installed_dispatch_route import InstalledDispatchRoutePort
@@ -3474,6 +4091,7 @@ class RuntimeContext:
         try:
             continuation = InstalledNaturalReplyContinuationV2(
                 worker=worker, authority=authority, lease=lease,
+                local_module_admission=self.local_module_admission,
                 fence_port=port, policy=policy, grant=grant,
                 server=server, natural_claim_writer=writer,
                 context=context, candidates=candidates,
@@ -3481,7 +4099,13 @@ class RuntimeContext:
                 adapter_ref="astrbot:onebot:call_action")
             driver = NaturalReplyDispatchDriverV2(
                 worker, authority, lease, continuation)
-            result = await driver.run_once(operation_id=operation_id)
+            if fresh_dispatch:
+                witness = await worker.call(lambda graph: graph.read_natural_dispatch_resume_witness_v3(
+                    authority, lease, operation_id, bundle))
+                fresh_dispatch = (witness.mode == "resume-original-child"
+                    and witness.child_identities[witness.segment_index][0] == operation_id)
+            result = await driver.run_once(
+                operation_id=operation_id, fresh_dispatch=fresh_dispatch)
             if result.original is not None:
                 try:
                     await worker.call(lambda graph: graph.record_natural_outbound_observation_v1(
@@ -4630,6 +5254,9 @@ class RuntimeContext:
 
     async def stop(self) -> RuntimeHealth:
         async with self._lock:
+            self._artifact_draft_stopping_v1 = True
+            if self._artifact_draft_resume_task_v1 is not None:
+                await self._artifact_draft_resume_task_v1
             if "v2_fence_recovery" in self.health.missing_capabilities:
                 return self.health
             if self._host_lifecycle_startup_task is not None:

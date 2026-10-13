@@ -386,5 +386,27 @@ class RuntimeBudgetJobsClockTests(unittest.TestCase):
         self.assertIsNone(deferred.monotonic_deadline)
 
 
+    def test_persisted_original_deadline_future_96h_and_rollback_never_renew(self):
+        """Software clock functions; no production Authority time or Root renewal."""
+        now=datetime.now(UTC)
+        target=now+timedelta(seconds=20)
+        utc=lambda value:value.isoformat().replace("+00:00","Z")
+        original=PersistentDeadline("deadline-temporal",utc(target),None,"UTC","policy:original-temporal")
+        put_deadline(self.db,original,"deadline-temporal-put","9"*64)
+        self.db.commit();self.reopen()
+        loaded=get_deadline(self.db,original.deadline_id)
+        before=self.db.execute("SELECT * FROM runtime_deadlines ORDER BY deadline_id").fetchall()
+        first=rebuild_deadline(loaded,wall_now_utc=utc(now),monotonic_now=900.0,clock_trusted=True)
+        restart=rebuild_deadline(loaded,wall_now_utc=utc(now),monotonic_now=10.0,clock_trusted=True)
+        self.assertEqual(first.remaining_seconds,restart.remaining_seconds)
+        self.assertEqual(first.remaining_seconds,20.0)
+        rollback=rebuild_deadline(loaded,wall_now_utc=utc(now-timedelta(hours=96)),monotonic_now=10.0,clock_trusted=False)
+        expired=rebuild_deadline(loaded,wall_now_utc=utc(now+timedelta(hours=96)),monotonic_now=10.0,clock_trusted=True)
+        self.assertEqual(rollback.status,"deferred");self.assertIsNone(rollback.monotonic_deadline)
+        self.assertEqual(expired.status,"expired");self.assertEqual(expired.remaining_seconds,0.0)
+        self.assertEqual(get_deadline(self.db,original.deadline_id),original)
+        self.assertEqual(self.db.execute("SELECT * FROM runtime_deadlines ORDER BY deadline_id").fetchall(),before)
+
+
 if __name__ == "__main__":
     unittest.main()

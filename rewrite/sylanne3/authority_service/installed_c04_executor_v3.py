@@ -17,6 +17,8 @@ from typing import Callable
 from ..contracts import canonical_json
 from .. import memory_association as activation_kernel
 from ..domains.d06 import c04_work_algorithm_v3 as algorithm
+from ..domains.d06 import c04_work_algorithm_v4 as algorithm_v4
+from ..runtime.c04_direct_seed_v4 import AssociationWorkInputV4, AssociationWorkResultV4
 from ..runtime.c04_v3_contracts import AssociationWorkInputV3, AssociationWorkResultV3
 from ..runtime_contracts import NamespaceId
 from .contract import AuthorityUnavailable, JournalHead
@@ -29,6 +31,7 @@ from .v2_execution_bridge import AuthorityV2ExecutionBridge
 
 
 ALGORITHM_ID = algorithm.ALGORITHM_ID
+ALGORITHM_ID_V4 = algorithm_v4.ALGORITHM_ID
 
 
 _OUTPUT_SCHEMA = "sylanne.d06.association-work-terminal-output.v3"
@@ -39,12 +42,25 @@ _OUTPUT_FIELDS = {"schema", "algorithm_id", "algorithm_build_digest",
 def decode_completed_c04_output_v3(
     binding: InternalWorkBindingV1, terminal: InternalWorkTerminalV2,
 ) -> AssociationWorkResultV3:
+    return _decode_completed_c04_output(binding, terminal, algorithm_id=ALGORITHM_ID,
+        schema=_OUTPUT_SCHEMA, result_type=AssociationWorkResultV3)
+
+
+def decode_completed_c04_output_v4(
+    binding: InternalWorkBindingV1, terminal: InternalWorkTerminalV2,
+) -> AssociationWorkResultV4:
+    return _decode_completed_c04_output(binding, terminal, algorithm_id=ALGORITHM_ID_V4,
+        schema="sylanne.d06.association-work-terminal-output.direct_seed.v4",
+        result_type=AssociationWorkResultV4)
+
+
+def _decode_completed_c04_output(binding, terminal, *, algorithm_id, schema, result_type):
     """Strictly decode signed completed bytes before adopting any V3 result."""
     if (type(binding) is not InternalWorkBindingV1 or
             type(terminal) is not InternalWorkTerminalV2 or
             terminal.status != "completed" or
-            binding.algorithm_ref != ALGORITHM_ID or
-            terminal.algorithm_id != ALGORITHM_ID or
+            binding.algorithm_ref != algorithm_id or
+            terminal.algorithm_id != algorithm_id or
             terminal.binding_digest != binding.binding_digest or
             terminal.input_digest != binding.input_digest or
             terminal.build_fingerprint != binding.algorithm_build_digest or
@@ -54,20 +70,20 @@ def decode_completed_c04_output_v3(
         envelope = json.loads(terminal.output_json)
         if (type(envelope) is not dict or set(envelope) != _OUTPUT_FIELDS or
                 canonical_json(envelope) != terminal.output_json or
-                envelope["schema"] != _OUTPUT_SCHEMA or
-                envelope["algorithm_id"] != ALGORITHM_ID or
+                envelope["schema"] != schema or
+                envelope["algorithm_id"] != algorithm_id or
                 envelope["algorithm_build_digest"] !=
                 "sha256:" + binding.algorithm_build_digest or
                 envelope["input_digest"] != "sha256:" + binding.input_digest or
                 envelope["result_digest"] != "sha256:" + terminal.result_digest):
             raise ValueError("terminal envelope differs")
-        result = AssociationWorkResultV3.from_json(envelope["result_json"])
+        result = result_type.from_json(envelope["result_json"])
         from ..graph_coordinator import namespace_ref
 
         if ((result.algorithm_id, result.algorithm_build_digest,
              result.input_digest, result.result_digest,
              result.operation_id) !=
-            (ALGORITHM_ID, envelope["algorithm_build_digest"],
+            (algorithm_id, envelope["algorithm_build_digest"],
              envelope["input_digest"], envelope["result_digest"],
              binding.operation_id) or
                 namespace_ref(result.namespace) != binding.namespace):
@@ -98,16 +114,22 @@ class InstalledC04ExecutorV3:
     def execute(self, binding: InternalWorkBindingV1) -> InternalWorkJournalInspectionV1:
         """Start once; every existing claim is query-only and never re-run."""
         if (type(binding) is not InternalWorkBindingV1 or
-                binding.algorithm_ref != ALGORITHM_ID or
-                binding.algorithm_build_digest !=
-                self._service.installed_build_digest):
+                binding.algorithm_ref not in {ALGORITHM_ID, ALGORITHM_ID_V4} or
+                not self._service.accepts_installed_binding(binding)):
             raise AuthorityUnavailable("installed C04 algorithm/build identity differs")
         observed = self._service.inspect(binding)
         if observed.claim is not None:
             return observed
         work = self._frozen_input_reader(binding)
-        if (type(work) is not AssociationWorkInputV3 or
-                work.algorithm_id != ALGORITHM_ID or
+        input_type, activate, decoder, output_schema = (
+            (AssociationWorkInputV4, algorithm_v4.activate_association_work_v4,
+             decode_completed_c04_output_v4,
+             "sylanne.d06.association-work-terminal-output.direct_seed.v4")
+            if binding.algorithm_ref == ALGORITHM_ID_V4 else
+            (AssociationWorkInputV3, algorithm.activate_association_work_v3,
+             decode_completed_c04_output_v3, _OUTPUT_SCHEMA))
+        if (type(work) is not input_type or
+                work.algorithm_id != binding.algorithm_ref or
                 work.algorithm_build_digest !=
                 "sha256:" + binding.algorithm_build_digest or
                 work.input_digest != "sha256:" + binding.input_digest or
@@ -125,7 +147,7 @@ class InstalledC04ExecutorV3:
         claim = self._service.begin(binding)
         start = time.thread_time_ns()
         try:
-            result = algorithm.activate_association_work_v3(work)
+            result = activate(work)
         except Exception:
             elapsed = time.thread_time_ns() - start
             result = None
@@ -135,8 +157,8 @@ class InstalledC04ExecutorV3:
         if result is not None:
             try:
                 output = canonical_json({
-                    "schema": _OUTPUT_SCHEMA,
-                    "algorithm_id": ALGORITHM_ID,
+                    "schema": output_schema,
+                    "algorithm_id": binding.algorithm_ref,
                     "algorithm_build_digest": "sha256:" + binding.algorithm_build_digest,
                     "input_digest": work.input_digest,
                     "result_digest": result.result_digest,
@@ -151,14 +173,14 @@ class InstalledC04ExecutorV3:
                 binding.binding_digest, claim.mutation_id,
                 _phase_id(binding.binding_digest, "terminal"),
                 "failed", (elapsed + 999_999) // 1_000_000,
-                ALGORITHM_ID, binding.algorithm_build_digest, binding.input_digest,
+                binding.algorithm_ref, binding.algorithm_build_digest, binding.input_digest,
                 None, None, None, None, None, "0" * 64)
         else:
             terminal = InternalWorkTerminalV2(
                 binding.binding_digest, claim.mutation_id,
                 _phase_id(binding.binding_digest, "terminal"),
                 "completed", (elapsed + 999_999) // 1_000_000,
-                ALGORITHM_ID, binding.algorithm_build_digest, binding.input_digest,
+                binding.algorithm_ref, binding.algorithm_build_digest, binding.input_digest,
                 result.result_digest.removeprefix("sha256:"), output,
                 "internal-work:component:" + binding.binding_digest,
                 "0" * 64, "0" * 64, "0" * 64)
@@ -169,7 +191,7 @@ class InstalledC04ExecutorV3:
         terminal = replace(
             terminal, execution_signature=self._service.sign_execution_terminal(terminal))
         if terminal.status == "completed":
-            decode_completed_c04_output_v3(binding, terminal).validate_input(work)
+            decoder(binding, terminal).validate_input(work)
         self._service.terminal(
             binding, claim, terminal,
             before_head=JournalHead(claim_append.journal_id,
@@ -177,7 +199,7 @@ class InstalledC04ExecutorV3:
         return self._service.inspect(binding)
 
 
-def compose_installed_c04_executor_v3(
+def compose_installed_c04_service_v3(
     *, bridge: AuthorityV2ExecutionBridge,
     namespace: NamespaceId,
     graph_db_path: str | Path,
@@ -187,8 +209,9 @@ def compose_installed_c04_executor_v3(
     credential: object,
     resource_issuer,
     budget_issuer,
+    self_identity_read_credential: object | None = None,
     install_bridge_verifier: bool = True,
-) -> tuple[AuthorityInternalWorkService, InstalledC04ExecutorV3]:
+) -> AuthorityInternalWorkService:
     """Install C04 from pinned formal package and immutable W01 originals.
 
     The manifest hash must come from administrator installation state outside
@@ -211,12 +234,15 @@ def compose_installed_c04_executor_v3(
     if not graph_path.is_file():
         raise AuthorityUnavailable("pinned C04 graph database is unavailable")
     from ..host.installed_d06_build import (
-        ENTRY_PATH_V3, KERNEL_PATH, verify_d06_algorithm_build,
+        ENTRY_PATH_V3, ENTRY_PATH_V4, KERNEL_PATH, verify_d06_algorithm_build,
     )
     try:
         build = verify_d06_algorithm_build(
             Path(package_root), trusted_manifest_sha256,
             require_formal=False, require_backend_runtime=True, algorithm_id=ALGORITHM_ID)
+        build_v4 = verify_d06_algorithm_build(
+            Path(package_root), trusted_manifest_sha256,
+            require_formal=False, require_backend_runtime=True, algorithm_id=ALGORITHM_ID_V4)
     except (OSError, TypeError, ValueError) as exc:
         raise AuthorityUnavailable("production-qualified D06 package bytes are unverified") from exc
     digest = build.get("build_digest") if type(build) is dict else None
@@ -226,6 +252,8 @@ def compose_installed_c04_executor_v3(
     package_path = Path(package_root).resolve(strict=True)
     if (Path(algorithm.__file__).resolve(strict=True) !=
             (package_path / ENTRY_PATH_V3).resolve(strict=True) or
+            Path(algorithm_v4.__file__).resolve(strict=True) !=
+            (package_path / ENTRY_PATH_V4).resolve(strict=True) or
             Path(activation_kernel.__file__).resolve(strict=True) !=
             (package_path / KERNEL_PATH).resolve(strict=True)):
         raise AuthorityUnavailable("loaded D06 code differs from verified installation")
@@ -242,9 +270,12 @@ def compose_installed_c04_executor_v3(
             if frozen:
                 from ..runtime.c04_frozen_association_original_v3 import (
                     read_c04_frozen_association_original_v3,
+                    read_c04_frozen_association_original_v4,
                 )
-                original = read_c04_frozen_association_original_v3(
-                    db, namespace, binding)
+                reader = (read_c04_frozen_association_original_v4
+                          if binding.algorithm_ref == ALGORITHM_ID_V4 else
+                          read_c04_frozen_association_original_v3)
+                original = reader(db, namespace, binding)
             else:
                 from ..runtime.c04_internal_work_original_v1 import (
                     read_c04_internal_work_prepared_v1,
@@ -263,12 +294,14 @@ def compose_installed_c04_executor_v3(
         claim_exclusive_c04_v3, terminal_exclusive_c04_v3,
         reconcile_exclusive_c04_v3)
     current_reader = InstalledC04CurrentReaderV3(namespace=namespace, graph_path=graph_path,
-        resource_issuer=resource_issuer, budget_issuer=budget_issuer)
+        resource_issuer=resource_issuer, budget_issuer=budget_issuer,
+        foreground_observer=bridge._current_foreground_reply_scope_observer_v1)
 
     def claim_port(binding, claim, before_head, prepared):
         return claim_exclusive_c04_v3(bridge,
             credential=credential, binding=binding, claim=claim,
-            before_head=before_head, prepared=prepared, current_reader=current_reader)
+            before_head=before_head, prepared=prepared, current_reader=current_reader,
+            self_identity_read_credential=self_identity_read_credential)
 
     def terminal_port(binding, claim, terminal, before_head):
         return terminal_exclusive_c04_v3(bridge,
@@ -285,19 +318,52 @@ def compose_installed_c04_executor_v3(
         component_signing_key=component_signing_key,
         installed_build_digest=digest.removeprefix("sha256:"),
         installed_build_attestation=build,
+        installed_build_attestations=(build_v4,),
         trusted_manifest_sha256=trusted_manifest_sha256,
         original_reconciler=lambda binding, phase: reconcile_exclusive_c04_v3(
             bridge, credential=credential, binding=binding, phase=phase),
     )
-    executor = InstalledC04ExecutorV3(
-        service, frozen_input_reader=lambda binding: read_graph_original(
-            binding, frozen=True))
+    service._installed_current_reader_v3 = current_reader
     if type(install_bridge_verifier) is not bool:
         raise AuthorityUnavailable("C04 bridge verifier install mode differs")
     if install_bridge_verifier:
         bridge.install_internal_work_terminal_verifier(service.verify_installed_terminal)
+    service._installed_frozen_input_reader = lambda binding: read_graph_original(binding, frozen=True)
+    return service
+
+
+def compose_installed_c04_executor_v3(
+    *, bridge: AuthorityV2ExecutionBridge,
+    namespace: NamespaceId,
+    graph_db_path: str | Path,
+    package_root: str | Path,
+    trusted_manifest_sha256: str,
+    component_signing_key: bytes,
+    credential: object,
+    resource_issuer,
+    budget_issuer,
+    self_identity_read_credential: object | None = None,
+    install_bridge_verifier: bool = True,
+) -> tuple[AuthorityInternalWorkService, InstalledC04ExecutorV3]:
+    """Add the executor to the same formally installed historical service."""
+    service = compose_installed_c04_service_v3(
+        bridge=bridge,
+        namespace=namespace,
+        graph_db_path=graph_db_path,
+        package_root=package_root,
+        trusted_manifest_sha256=trusted_manifest_sha256,
+        component_signing_key=component_signing_key,
+        credential=credential,
+        resource_issuer=resource_issuer,
+        budget_issuer=budget_issuer,
+        self_identity_read_credential=self_identity_read_credential,
+        install_bridge_verifier=install_bridge_verifier)
+    executor = InstalledC04ExecutorV3(service,
+        frozen_input_reader=service._installed_frozen_input_reader)
+    executor._current_reader = service._installed_current_reader_v3
     return service, executor
 
 
 __all__ = ["ALGORITHM_ID", "InstalledC04ExecutorV3",
-           "compose_installed_c04_executor_v3", "decode_completed_c04_output_v3"]
+           "compose_installed_c04_executor_v3", "compose_installed_c04_service_v3", "decode_completed_c04_output_v3",
+           "decode_completed_c04_output_v4", "ALGORITHM_ID_V4"]

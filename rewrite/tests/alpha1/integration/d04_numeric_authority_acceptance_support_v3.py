@@ -61,6 +61,26 @@ def install_actual_numeric_authority_case_v3(case, *, owner_loop):
             grant=case["client_grant"],owner_loop=owner_loop)
         graph._GraphCoordinator__c04_authority_port_v3=existing.port
         return existing
+    daemon=case.get('c09_daemon')
+    if daemon is not None:
+        from sylanne3.authority_service.daemon import AuthorityDaemon
+        from sylanne3.authority_service.d04_root_execution_service_v3 import AuthorityD04RootExecutionServiceV3
+        assert type(daemon) is AuthorityDaemon and daemon.core is core and daemon.server is case['server']
+        assert daemon.config.natural_model_authorities_v2[namespace].installation_bundle is bundle
+        control=daemon.c09_control;initial=graph._initial_offline_storage_case_v1
+        assert initial.storage_control is control and initial.lease is control.lease
+        numeric=daemon.server._d04_numeric_services_v3[namespace]
+        root=daemon.server._d04_root_services_v3[namespace]
+        c04=daemon.server._v3_internal_work_services[namespace]
+        assert type(numeric) is AuthorityD04NumericServiceV3 and numeric.bridge is bridge
+        assert type(root) is AuthorityD04RootExecutionServiceV3 and root.bridge is bridge
+        assert c04.journal is bridge.journal
+        port=InstalledC04AuthorityPortV3(client=case['authority_client'],bundle=bundle,
+            grant=case['client_grant'],owner_loop=owner_loop)
+        graph._GraphCoordinator__c04_authority_port_v3=port
+        result=ActualNumericAuthorityCaseV3(numeric,port,control,control.lease,initial.protected_directory,root)
+        graph._actual_d04_authority_acceptance_v3=result
+        return result
     initial=getattr(graph,"_initial_offline_storage_case_v1",None)
     if initial is None and getattr(core,"_c09_storage_reader_v1",None) is not None:
         raise AssertionError("numeric fixture must not replace an existing current storage selection")

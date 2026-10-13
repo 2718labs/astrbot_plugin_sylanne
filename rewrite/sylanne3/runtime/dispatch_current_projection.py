@@ -12,6 +12,7 @@ from ..domains.d05.relationship import BoundaryRule, BoundaryRuleReadSet, Relati
 from ..graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion
 from ..runtime_contracts import NamespaceId, QueryEpoch, VersionedRef, canonical_digest
 from .dispatch_source_correction_barrier import read_source_correction_barrier
+from ..runtime_storage_v3 import runtime_storage_v3
 
 
 @dataclass(frozen=True)
@@ -27,8 +28,46 @@ class CurrentDispatchProjectionV1:
     missing_sources: tuple[str, ...] = ()
 
 
+
+def _bound_dispatch_projection_v3(db,namespace,query,*,snapshot=None,prepared_inventory=None,source_metadata=False):
+    from ..authority_service.current_authority_graph_read_v3 import (
+        authority_graph_projection_for_db_v3,AuthorityGraphProjectionV3)
+    authority=authority_graph_projection_for_db_v3(db,namespace)
+    if authority is not None:
+        if type(authority)is not AuthorityGraphProjectionV3:
+            raise TypeError('actual independently issued Authority projection required')
+        authority.require_current_v3()
+        if (query!=QueryEpoch(namespace,'all',authority.work.graph_stamp[0])
+                or snapshot is not None and snapshot is not authority
+                or prepared_inventory is not None and prepared_inventory is not authority):
+            raise ValueError('Authority projection differs from its actual Work/snapshot/query')
+        return authority
+    from .current_graph_full_read_v3 import (
+        CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3,
+        require_bound_graph_full_read_proof_for_db_v3,require_bound_graph_full_read_v3)
+    if runtime_storage_v3(db) is None and prepared_inventory is None:
+        if snapshot is not None and type(snapshot) is not GraphSnapshot:
+            raise TypeError('legacy dispatch requires its actual GraphSnapshot')
+        return None
+    families=frozenset({CURRENT_DISPATCH_FAMILY_V3,SOURCE_METADATA_FAMILY_V3} if source_metadata
+        else {CURRENT_DISPATCH_FAMILY_V3})
+    proof=require_bound_graph_full_read_proof_for_db_v3(db,namespace,required_families=families)
+    if prepared_inventory is not None and prepared_inventory is not proof:
+        raise ValueError('explicit dispatch inventory differs from its actual qualified bound proof')
+    projection,actual_query=require_bound_graph_full_read_v3(proof.graph,db,namespace,required_families=families)
+    if actual_query!=query:
+        raise ValueError('dispatch fixed projection differs from the actual FULL bound query')
+    if snapshot is not None and snapshot is not projection:
+        from .dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3,PreparedCurrentDispatchSuccessorInventoryV3
+        if type(proof) not in (PreparedCurrentDispatchInventoryV3,PreparedCurrentDispatchSuccessorInventoryV3) or snapshot is not proof.projection:
+            raise ValueError('dispatch snapshot is not the exact ordinary or qualified IV projection')
+        return proof.projection
+    return projection
+
+
 def read_current_dispatch_projection(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
+    *, prepared_inventory=None,
 ) -> CurrentDispatchProjectionV1:
     """Reject a partial/stale read set while SQLite still holds the graph write lock."""
     if not db.in_transaction:
@@ -44,28 +83,41 @@ def read_current_dispatch_projection(
     ).fetchone()
     if (row[0] if row else 0) != query.revision:
         raise ValueError("dispatch projection graph epoch changed")
-    by_token = {atom.key.token: atom for atom in snapshot.atoms}
-    if len(by_token) != len(snapshot.atoms):
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
+    from ..authority_service.current_authority_graph_read_v3 import AuthorityGraphProjectionV3,require_authority_graph_type_rows_v3
+    authority_rows=None
+    if type(fixed)is AuthorityGraphProjectionV3:
+        authority_rows=require_authority_graph_type_rows_v3(db,namespace,('d03.role_binding','d05.boundary_rule'),('token','revision','value'))
+        projection_atoms=fixed.atoms_for(('d03.role_binding','d05.boundary_rule'))
+    else:
+        projection_atoms = snapshot.atoms if fixed is None else fixed.atoms_for_types_v3(('d03.role_binding','d05.boundary_rule'))
+    by_token = {atom.key.token: atom for atom in projection_atoms}
+    if len(by_token) != len(projection_atoms):
         raise ValueError("dispatch projection read set repeats a graph key")
     typed: dict[str, list[GraphAtom]] = {
         "d03.role_binding": [], "d05.boundary_rule": [],
     }
-    rows = db.execute(
-        "SELECT token,revision,value,type_name FROM graph_atoms "
-        "WHERE bot=? AND persona=? AND type_name IN "
-        "('d03.role_binding','d05.boundary_rule') AND valid=1 ORDER BY token",
-        namespace.as_tuple,
-    ).fetchall()
+    from .current_graph_full_read_v3 import require_bound_graph_full_atom_rows_v3
+    if authority_rows is not None:
+        rows=tuple((token,revision,value,AtomKey.from_token(token).type_name)for token,revision,value in authority_rows)
+    else:
+        rows = (db.execute(
+            "SELECT token,revision,value,type_name FROM graph_atoms "
+            "WHERE bot=? AND persona=? AND type_name IN "
+            "('d03.role_binding','d05.boundary_rule') AND valid=1 ORDER BY token",
+            namespace.as_tuple,
+        ).fetchall()
+            if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,('d03.role_binding','d05.boundary_rule'),('token','revision','value','type_name')))
     for token, revision, encoded, type_name in rows:
         atom = by_token.get(token)
         if (atom is None or not atom.valid or atom.revision != revision
                 or atom.key != AtomKey.from_token(token)
-                or atom.value != json.loads(encoded)):
+                or atom.value != (json.loads(encoded) if fixed is None else encoded)):
             raise ValueError("dispatch projection omits or changed a current domain row")
         typed[type_name].append(atom)
     observed = {atom.key.token for group in typed.values() for atom in group}
     if any(atom.key.type_name in typed and atom.valid
-           and atom.key.token not in observed for atom in snapshot.atoms):
+           and atom.key.token not in observed for atom in projection_atoms):
         raise ValueError("dispatch projection snapshot has an unbacked domain row")
     roles = tuple(typed["d03.role_binding"])
     boundaries = tuple(typed["d05.boundary_rule"])
@@ -76,7 +128,7 @@ def read_current_dispatch_projection(
             missing.append(f"boundary_source_refs_unavailable:{atom.key.token}")
             continue
         barrier = read_source_correction_barrier(
-            db, namespace, query, tuple(refs), dependent_ref=atom.key.token,
+            db, namespace, query, tuple(refs), dependent_ref=atom.key.token, prepared_inventory=prepared_inventory,
         )
         missing.extend(barrier.missing_sources)
     return CurrentDispatchProjectionV1(
@@ -92,6 +144,7 @@ def read_current_dispatch_projection(
 def derive_current_domain_reads(
     db, projection: CurrentDispatchProjectionV1, request: RoleBindingRequest,
     context: ContextProvider,
+    *, prepared_inventory=None,
 ) -> tuple[RoleBindingResolution, BoundaryRuleReadSet]:
     """Decode complete current D03/D05 rows; this is not dispatch admission."""
     if not db.in_transaction:
@@ -111,23 +164,32 @@ def derive_current_domain_reads(
     ).fetchone()
     if (row[0] if row else 0) != projection.graph_epoch:
         raise ValueError("current domain projection epoch changed")
+    query = QueryEpoch(namespace,"all",projection.graph_epoch)
+    fixed = _bound_dispatch_projection_v3(db,namespace,query,prepared_inventory=prepared_inventory)
     projected = projection.role_bindings + projection.boundary_rules
     by_token = {atom.key.token: atom for atom in projected}
     if len(by_token) != len(projected):
         raise ValueError("current domain projection repeats a graph key")
-    rows = db.execute(
-        "SELECT token,revision,value,type_name FROM graph_atoms "
-        "WHERE bot=? AND persona=? AND type_name IN "
-        "('d03.role_binding','d05.boundary_rule') AND valid=1 ORDER BY token",
-        namespace.as_tuple,
-    ).fetchall()
+    from .current_graph_full_read_v3 import require_bound_graph_full_atom_rows_v3
+    from ..authority_service.current_authority_graph_read_v3 import AuthorityGraphProjectionV3,require_authority_graph_type_rows_v3
+    if type(fixed)is AuthorityGraphProjectionV3:
+        actual_rows=require_authority_graph_type_rows_v3(db,namespace,('d03.role_binding','d05.boundary_rule'),('token','revision','value'))
+        rows=tuple((token,revision,value,AtomKey.from_token(token).type_name)for token,revision,value in actual_rows)
+    else:
+        rows = (db.execute(
+            "SELECT token,revision,value,type_name FROM graph_atoms "
+            "WHERE bot=? AND persona=? AND type_name IN "
+            "('d03.role_binding','d05.boundary_rule') AND valid=1 ORDER BY token",
+            namespace.as_tuple,
+        ).fetchall()
+            if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,('d03.role_binding','d05.boundary_rule'),('token','revision','value','type_name')))
     if len(rows) != len(projected):
         raise ValueError("current domain projection omits a current row")
     for token, revision, encoded, type_name in rows:
         atom = by_token.get(token)
         if (atom is None or not atom.valid or atom.key.type_name != type_name
                 or (atom.key.owner.bot, atom.key.owner.persona) != namespace.as_tuple
-                or atom.revision != revision or atom.value != json.loads(encoded)):
+                or atom.revision != revision or atom.value != (json.loads(encoded) if fixed is None else encoded)):
             raise ValueError("current domain projection row changed")
 
     role_spec = next(spec for spec in context.type_specs()
@@ -162,6 +224,8 @@ def derive_current_domain_reads(
         QueryEpoch(namespace, "d03.role_binding", projection.graph_epoch),
         resolved.valid_until, request,
     )
+    from ..domains.d03.context import _rebind_role_catalogue_original_v4
+    _rebind_role_catalogue_original_v4(context, resolved, role_read, db=db)
 
     rules = []
     for atom in projection.boundary_rules:

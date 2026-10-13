@@ -5,7 +5,7 @@ import asyncio
 
 from ..authority_service.v2_model_egress_contract import ModelEgressDraftV1
 from ..model_broker.broker import ModelProviderDescriptor
-from .astrbot_model_call import AstrBotModelProvider
+from .astrbot_model_call import AstrBotModelProvider, LocalModelCapacityDeniedV1
 from .model_egress_executor import HostModelEgressExecutor
 from .v2_installation import V2InstallationAssembly
 from .authority_client import AuthorityClient, AuthoritySelection
@@ -73,8 +73,17 @@ async def _run_appraisal_on_installed_channel_v3(runtime, bundle, workflow, clie
     except Exception:
         # A completed original skips execution and proceeds to current adoption.
         return await worker.call(lambda graph: graph.adopt_post_c02_appraisal_v3(bootstrap, bundle, **args))
+    descriptor = ModelProviderDescriptor(workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
+        frozenset({"text"}), frozenset({workflow.purpose}), frozenset({workflow.privacy_tier}),
+        workflow.provider_config_ref, "unknown", False, False)
+    adapter = AstrBotModelProvider(context=context, host_loop=asyncio.get_running_loop(), trusted_umo=trusted_umo,
+        descriptor=descriptor, admin_model=workflow, installation_bundle=bundle)
+    executor = HostModelEgressExecutor(authority=client, bundle=bundle, grant=client_grant, adapter=adapter, local_module_admission=runtime.local_module_admission)
     if sealed_intent is None:
-        record, permit = await client.model_prepare_fenced_v1(bundle, client_grant, draft=draft, expected_anchor=anchor)
+        try:
+            record, permit = await executor.prepare_once(draft=draft, expected_anchor=anchor, request=call)
+        except LocalModelCapacityDeniedV1:
+            return {"status": "model_capacity_hold", "job_id": job.job_id}
     else:
         record, permit = await client.model_recover_fenced_v1(bundle, client_grant, intent=sealed_intent)
         if record.intent != sealed_intent:
@@ -86,12 +95,6 @@ async def _run_appraisal_on_installed_channel_v3(runtime, bundle, workflow, clie
     if record.state == "prepared":
         await worker.call(lambda graph: graph.seal_appraisal_egress_v3(bootstrap, bundle.installation_policy.namespace,
             intent=record.intent, permit=permit))
-        descriptor = ModelProviderDescriptor(workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
-            frozenset({"text"}), frozenset({workflow.purpose}), frozenset({workflow.privacy_tier}),
-            workflow.provider_config_ref, "unknown", False, False)
-        adapter = AstrBotModelProvider(context=context, host_loop=asyncio.get_running_loop(), trusted_umo=trusted_umo,
-            descriptor=descriptor, admin_model=workflow, installation_bundle=bundle)
-        executor = HostModelEgressExecutor(authority=client, bundle=bundle, grant=client_grant, adapter=adapter)
         terminal = await executor.execute_once(intent=record.intent, expected_anchor=anchor, request=call, appraisal_original=original)
         if terminal is None:
             return {"status": "original_terminal_unknown", "job_id": job.job_id}

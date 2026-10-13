@@ -22,8 +22,8 @@ from ..domains.d08.execution import (
     RequiredCheckRegistry,
 )
 from ..domains.d09.natural_batch import (
-    NATURAL_BATCH_SCHEMA_V2, prepare_natural_verified_batch_proposal_v2,
-    validate_natural_verified_batch_value_v2,
+    NATURAL_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V3, rebind_natural_verified_batch_proposal, natural_batch_segment_count,
+    validate_natural_verified_batch_value,
 )
 from ..domains.d09.natural_reply import NaturalFinalActionCandidateV2
 from ..graph_types import AtomKey
@@ -170,12 +170,12 @@ def inspect_natural_final_d11_v2(
                                      namespace.as_tuple,
                                      "d08.communication_intent_grant.v1")
         batch = _current_value(db, candidate.batch_ref,
-                               namespace.as_tuple, NATURAL_BATCH_SCHEMA_V2)
+                               namespace.as_tuple, AtomKey.from_token(candidate.batch_ref).type_name)
         intent = validator["d08.action_intent.v1"](action_value)
         schema_record = validator["d08.action_schema.v1"](schema_value)
         grant = validator["d08.communication_intent_grant.v1"](grant_value)
-        validate_natural_verified_batch_value_v2(batch)
-        frozen_batch = prepare_natural_verified_batch_proposal_v2(final, grant)
+        validate_natural_verified_batch_value(batch)
+        frozen_batch = rebind_natural_verified_batch_proposal(final, grant, batch)
         if (not isinstance(schema_record, ActionSchemaRecord)
                 or frozen_batch.write is None
                 or frozen_batch.write.key.token != candidate.batch_ref
@@ -287,7 +287,7 @@ def inspect_natural_final_d11_v2(
                 or job.effect_id != identity.effect_id
                 or outbox.phase != "pending"
                 or outbox.payload_ref != natural_dispatch_segment_payload_ref_v2(
-                    candidate.batch_ref, 0)
+                    candidate.batch_ref, batch["segment"]["position"])
                 or outbox.effect_id != identity.effect_id
                 or outbox.idempotency_key
                    != bundle.idempotency_keys[0]

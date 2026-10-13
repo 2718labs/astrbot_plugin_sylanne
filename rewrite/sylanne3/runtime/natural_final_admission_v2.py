@@ -22,7 +22,10 @@ from ..domains.d08.natural_final import (
 )
 from ..domains.d08.natural_plan import natural_route_semantic_digest_v2
 from ..domains.d09 import D09ExpressionProvider
-from ..domains.d09.natural_batch import prepare_natural_verified_batch_proposal_v2
+from ..domains.d09.natural_batch import (
+    prepare_natural_verified_batch_proposal_v2,
+    prepare_natural_verified_batch_proposal_v3,
+)
 from ..domains.d09.natural_reply import NaturalFinalActionCandidateV2
 from ..graph_types import AtomKey, GraphVersion, GraphWrite, Owner
 from ..runtime_contracts import (
@@ -161,6 +164,9 @@ def prepare_natural_final_bundle_v2(
     budget_grant: BudgetLeaseGrant,
     pre_reserved_job: PersistentJob,
     now_utc: float,
+    semantic_plan=None,
+    generation_output: dict | None = None,
+    segment_index: int = 0,
 ) -> NaturalFinalBundleStageV2:
     """Assemble a natural-only D08/D09/D11 bundle for W01's same-tx admission.
 
@@ -206,7 +212,10 @@ def prepare_natural_final_bundle_v2(
                    "d08.action_schema.v1", "d08.action_cancellation.v1"}
             or len(staged_d08.typed_writes) != 4):
         return hold("final_identity_or_staged_action_changed")
-    natural = prepare_natural_verified_batch_proposal_v2(final, grant)
+    natural = (prepare_natural_verified_batch_proposal_v3(
+        final, grant, plan=semantic_plan, generation_output=generation_output,
+        segment_index=segment_index) if semantic_plan is not None else
+        prepare_natural_verified_batch_proposal_v2(final, grant))
     if natural.write is None:
         return hold("natural_paid_verified_batch_hold")
     namespace, identity = envelope.authority.namespace, envelope.identity
@@ -266,7 +275,8 @@ def prepare_natural_final_bundle_v2(
             *namespace.as_tuple, identity.activity_id, identity.operation_id,
             identity.effect_id, AtomKey.from_token(outbox_ref).name,
             AtomKey.from_token(job_ref).name, job_ref,
-            natural_dispatch_segment_payload_ref_v2(natural.write.key.token, 0),
+            natural_dispatch_segment_payload_ref_v2(natural.write.key.token,
+                                                  natural.write.value["segment"]["position"]),
             idempotency_key, "pending", envelope.authority.activation_generation,
         )
         d11 = DomainProposal(
@@ -313,6 +323,7 @@ def prepare_natural_final_action_stage_v2(
     grant: BudgetLeaseGrant,
     anchor: RestoreAnchor,
     now_utc: float,
+    semantic_segment: bool = False,
 ) -> NaturalFinalActionStageV2:
     """Stage a fresh natural action and five specs, never their PASS receipts.
 
@@ -338,6 +349,12 @@ def prepare_natural_final_action_stage_v2(
     namespace = envelope.authority.namespace
     goal_id, action_id, schema_id = post_c02_reply_action_ids_v2(
         material.c02_operation_id, material.source_ref.ref)
+    if semantic_segment:
+        digest = canonical_digest({"schema": "sylanne.d08.natural-bubble-actions.v3",
+            "parent_original_id": material.c02_operation_id,
+            "source_ref": material.source_ref.ref, "operation_id": material.final_operation_id,
+            "effect_id": material.final_effect_id})
+        goal_id, action_id, schema_id = (prefix + digest for prefix in ("goal:", "action:", "schema:"))
     if (envelope.identity.activity_id != material.final_activity_id
             or envelope.identity.operation_id != material.final_operation_id
             or envelope.identity.effect_id != material.final_effect_id

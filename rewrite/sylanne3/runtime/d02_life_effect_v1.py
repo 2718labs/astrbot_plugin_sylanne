@@ -2,7 +2,7 @@
 import json
 
 from ..runtime_contracts import canonical_digest
-from .d11_life_contract_v1 import LifeBodyComponentContractV1, WORK_KIND
+from .d11_life_contract_v1 import LifeBodyComponentContractV1, WORK_KIND, life_work_kind_v1
 from .d11_life_terminal_v1 import read_adopted_life_original_v1
 from .d11_life_preparation_v1 import TABLE, read_prepared_life_v1
 from .d11_life_contract_v1 import life_from_wire_v1, D11LifeTerminalV1
@@ -17,12 +17,13 @@ def require_life_body_quote_v1(db, *, prepared, issuer, resource_issuer, body_qu
     quote = resource_issuer.original_signed_quote(db, contract.resource_quote_ref, contract.resource_quote_version)
     body = body_quote_authority.original_body_quote(db, contract.body_quote_ref, contract.body_quote_version, quote, quote.operation_id)
     b = prepared.binding
+    work_kind = life_work_kind_v1(b)
     from .d02_life_body_preparation_v1 import require_life_body_preparation_v1
     require_life_body_preparation_v1(db,prepared=prepared,issuer=issuer,resource_issuer=resource_issuer,body_quote_authority=body_quote_authority)
     if (canonical_digest(quote) != contract.resource_quote_digest or canonical_digest(body) != contract.body_quote_digest
             or (quote.bot_id, quote.persona_id, quote.activity_id, quote.operation_id, quote.effect_id) !=
                 (*b.namespace.as_tuple, b.activity_id, contract.body_prepare_operation_id, b.effect_id)
-            or body.work_kind != WORK_KIND or quote.work_kind != WORK_KIND
+            or body.work_kind != work_kind or quote.work_kind != work_kind
             or contract.component_id not in {part.component_id for part in body.components}):
         raise ValueError("Life Body quote/component differs from real execution identity")
     from .domain_production_read_plans_v1 import _committed
@@ -78,7 +79,8 @@ def read_life_body_effect_v1(readers, db, read, request):
     if not policies:
         raise MissingProductionOriginalV1("installed_life_body_effect_policy")
     policy, policy_original = readers._policy(read, policies[0])
-    if (policy.profile_id, policy.work_kind, policy.component_id) != (profile.profile_id, WORK_KIND, contract.component_id):
+    work_kind = life_work_kind_v1(terminal.binding)
+    if (policy.profile_id, policy.work_kind, policy.component_id) != (profile.profile_id, work_kind, contract.component_id):
         raise ValueError("Life actual Body effect policy differs")
     component = next(part for part in body.components if part.component_id == contract.component_id)
     from .d11_types import runtime_cost_settlement_key
@@ -89,5 +91,5 @@ def read_life_body_effect_v1(readers, db, read, request):
     settlement = read.head(db, contract.settlement_ref)
     from ..domains.d02.production_operations_v1 import CurrentBodyEffectInputsV1
     return CurrentBodyEffectInputsV1(state, reservation, body, contract.component_id, terminal.original_ref,
-        contract.settlement_ref, WORK_KIND, policy.fatigue_increase, policy.load_increase, component.fixed_cost,
+        contract.settlement_ref, work_kind, policy.fatigue_increase, policy.load_increase, component.fixed_cost,
         original, policy_original, (cost,), bool(settlement.revision))

@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 import json
 import math
 
+from ..runtime_storage_v3 import read_graph_row_v3
 from ..domains.d06 import D06DomainProvider, SourceGrantRead
 from ..domains.d08 import GoalExecutionProvider
 from ..domains.d09 import D09ExpressionProvider
@@ -124,11 +125,7 @@ def read_current_admission_facts(
     # The snapshot was supplied by the graph coordinator; compare every
     # positive and negative read with SQLite rather than trusting that object.
     for atom in snapshot.atoms:
-        row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
-            "AND bot=? AND persona=?",
-            (atom.key.token, *namespace.as_tuple),
-        ).fetchone()
+        row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(atom.key.token, *namespace.as_tuple))
         if ((row is None and (atom.revision != 0 or atom.valid))
                 or (row is not None and (atom.revision != row[0]
                     or atom.valid != bool(row[2])

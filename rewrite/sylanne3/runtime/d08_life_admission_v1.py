@@ -28,9 +28,149 @@ LIFE_ADMISSION_TYPES_V1 = ("d01.persona_activation.v1","d03.entity_anchor","d03.
     "d08.action_intent.v1","d08.action_schema.v1","d08.action_outcome.v1","d08.action_cancellation.v1",
     "d02.body_state.v1","d02.body_profile.v1","d02.reservation.v1","d12.active_scheme_head.v1")
 
-def life_criterion_ref_v1(kind):
+def life_criterion_ref_v1(kind, *, recipe_id="d10.source-note.v1"):
     if kind not in dict(PAIRS): raise ValueError("closed source-note check kind required")
-    return "d10.source-note.v1:" + kind
+    if recipe_id not in {"d10.source-note.v1", "artifact_draft_v1"}:
+        raise ValueError("closed registered Life recipe criteria required")
+    return recipe_id + ":" + kind
+
+
+@dataclass(frozen=True, slots=True)
+class DraftActionRootV1:
+    action_intent_ref: str
+    action_intent_digest: str
+    action_operation_id: str
+    activity_id: str
+    effect_id: str
+    project_ref: str
+    recipe_ref: str
+    input_source_ref: str
+    audiences: tuple[str, ...]
+    target_entity_ref: str
+    role_binding_ref: str
+    context_commitments: tuple[tuple[str, int, str, str, str], ...]
+    write_commitments: tuple[tuple[str, int, str], ...]
+    receipt_digest: str
+    schema: str = "d08.artifact-draft-action-original.v1"
+
+    def __post_init__(self):
+        if (self.schema != "d08.artifact-draft-action-original.v1" or not self.audiences
+                or not 1 <= len(self.write_commitments) <= 32
+                or len({row[0] for row in self.write_commitments}) != len(self.write_commitments)
+                or {row[0] for row in self.context_commitments} !=
+                   {self.target_entity_ref, self.role_binding_ref, self.project_ref}):
+            raise ValueError("draft action requires actual adopted Action/context receipt membership")
+
+
+def draft_action_root_from_wire_v1(raw):
+    if type(raw) is not dict or set(raw) != {f.name for f in fields(DraftActionRootV1)}:
+        raise ValueError("draft action original closed fields differ")
+    value = dict(raw)
+    value["audiences"] = tuple(value["audiences"])
+    for name in ("context_commitments", "write_commitments"):
+        value[name] = tuple(tuple(row) for row in value[name])
+    result = DraftActionRootV1(**value)
+    if plain_v1(result) != raw:
+        raise ValueError("draft action original is not canonical")
+    return result
+
+
+@dataclass(frozen=True,slots=True)
+class DraftActionRootSkeletonV1:
+    project: object
+    recipe: object
+    action_intent: object
+    input_source: object
+    input_access: object
+    activity_id: str
+    effect_id: str
+    attempt_id: str
+    operation_id: str
+    audiences: tuple[str,...]
+    target: object
+    content: object
+    postcondition_build_digest: str
+
+    def __post_init__(self):
+        from .d11_life_contract_v1 import LifeInputRefV1
+        from .d11_artifact_draft_contract_v1 import DraftFileTargetV1,FrozenDraftContentV1
+        if (any(type(getattr(self,name)) is not LifeInputRefV1 for name in
+                ("project","recipe","action_intent","input_source","input_access"))
+                or type(self.target) is not DraftFileTargetV1 or type(self.content) is not FrozenDraftContentV1
+                or type(self.audiences) is not tuple or not self.audiences):
+            raise TypeError("actual Action root skeleton requires exact adopted typed commitments")
+        from .d11_offline_originals_v1 import _digest
+        _digest(self.postcondition_build_digest)
+
+
+def record_draft_action_root_v1(db, *, frame, plan, issuer):
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
+    from .d11_life_preparation_v1 import _record, _draft_plan_current_v1
+    from .d04_root_original_store_v1 import _receipt
+    from .d08_personal_plan_v1 import DraftActionRootSkeletonV2
+    if type(plan) not in {RegisteredDraftFilePlanV3,DraftActionRootSkeletonV1,DraftActionRootSkeletonV2}:
+        raise TypeError("actual final draft plan or adopted Action-only skeleton required")
+    read = CurrentDomainReadV1(frame)
+    action, _ = _draft_plan_current_v1(db, read, plan)
+    entities = tuple(atom for atom in read.complete_inventory(db, "d03.entity_anchor")
+        if atom.valid and atom.value["entity_id"] == action.target_ref)
+    if len(entities) != 1:
+        raise MissingProductionOriginalV1("actual_draft_project_entity")
+    entity = entities[0]
+    roles = tuple(atom for atom in read.complete_inventory(db, "d03.role_binding")
+        if atom.valid and atom.value["target_entity_ref"] == action.target_ref
+        and atom.value["subject_persona_ref"] == "persona:" + frame.envelope.authority.namespace.persona_id
+        and atom.value["group_ref"] is None and atom.value["scene_ref"] is None)
+    if len(roles) != 1:
+        raise MissingProductionOriginalV1("actual_unambiguous_draft_project_role")
+    context = []
+    for atom in (entity, roles[0], read.head(db, plan.project.ref, required=True)):
+        operation = _adopted(db, read, atom)
+        receipt = _receipt(db, frame.envelope.authority.namespace, operation)
+        context.append((atom.key.token, atom.revision, canonical_digest(atom.value), operation, canonical_digest(receipt)))
+    receipt = _receipt(db, frame.envelope.authority.namespace, plan.operation_id)
+    from ..runtime_storage_v3 import read_graph_history_v3
+    from .current_method_learning_read_v3 import method_post_commit_atom_digest_v3
+    writes = []
+    for version in receipt.write_versions:
+        row = read_graph_history_v3(
+            db, version.key.token, version.revision,
+            columns=("event_id", "value", "valid"),
+            namespace=frame.envelope.authority.namespace.as_tuple)
+        if row is None or row[0] != plan.operation_id or row[2] != 1:
+            raise ValueError("draft action actual producing member history differs")
+        atom = read.head(db, version.key, required=True)
+        if atom.revision != version.revision or _adopted(db, read, atom) != plan.operation_id:
+            raise ValueError("draft action producing member revision or value differs")
+        writes.append((version.key.token, version.revision,
+            method_post_commit_atom_digest_v3(db, atom)))
+    root = DraftActionRootV1(plan.action_intent.ref, plan.action_intent.digest, plan.operation_id,
+        plan.activity_id, plan.effect_id, plan.project.ref, plan.recipe.ref, plan.input_source.ref, plan.audiences,
+        entity.key.token, roles[0].key.token, tuple(context), tuple(writes), canonical_digest(receipt))
+    return _record(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind="draft_action",
+        ref="life-draft-root:" + plan.operation_id, operation_id=plan.operation_id, value=root)
+
+
+def require_draft_action_root_v1(db, *, namespace, action_intent_ref, issuer):
+    from .d11_life_preparation_v1 import TABLE, _read
+    from .d04_root_original_store_v1 import _receipt
+    rows = db.execute("SELECT original_ref FROM " + TABLE +
+        " WHERE bot=? AND persona=? AND kind='draft_action' AND json_extract(payload_json,'$.action_intent_ref')=?",
+        (*namespace.as_tuple, action_intent_ref)).fetchall()
+    if len(rows) != 1:
+        raise MissingProductionOriginalV1("actual_signed_artifact_draft_action_root")
+    raw, operation = _read(db, issuer=issuer, namespace=namespace, kind="draft_action", ref=rows[0][0])
+    root = draft_action_root_from_wire_v1(raw)
+    receipt = _receipt(db, namespace, operation)
+    if (operation != root.action_operation_id or canonical_digest(receipt) != root.receipt_digest
+            or {(v.key.token, v.revision) for v in receipt.write_versions} !=
+               {(ref, revision) for ref, revision, digest in root.write_commitments}):
+        raise ValueError("draft signed root lost its actual adopted Action receipt")
+    for ref, revision, digest in root.write_commitments:
+        row = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (ref, revision)).fetchone()
+        if row is None or row[0] != operation or row[2] != 1 or canonical_digest(json.loads(row[1])) != digest:
+            raise ValueError("draft root lost its actual immutable history member")
+    return root
 
 class InstalledLifeAdmissionReaderV1:
     def __init__(self, *, issuer, resource_issuer, body_quote_authority, execution_inventory, scope):
@@ -73,11 +213,17 @@ class LifeActionAdmissionOriginalV1:
 
 
 def _adopted(db,read,atom):
-    history=db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
-        (atom.key.token,atom.revision)).fetchone()
-    if history is None or history[1:] != (canonical_serialize(atom.value),1):
-        raise MissingProductionOriginalV1("actual_life_input_adoption:"+atom.key.type_name)
-    read.committed_operation(db,history[0])
+    from .current_method_learning_read_v3 import read_bound_method_adoption_v3
+    handled, event_id = read_bound_method_adoption_v3(db, atom)
+    if handled:
+        read.committed_operation(db, event_id)
+        return event_id
+    from ..runtime_storage_v3 import read_graph_history_v3
+    history = read_graph_history_v3(
+        db, atom.key.token, atom.revision, columns=("event_id", "value", "valid"))
+    if history is None or history[1:] != (canonical_serialize(atom.value), 1):
+        raise MissingProductionOriginalV1("actual_life_input_adoption:" + atom.key.type_name)
+    read.committed_operation(db, history[0])
     return history[0]
 
 
@@ -112,7 +258,7 @@ def _source_rights(db,read,refs,audiences):
             for audience in audiences: read.source_family(db,tuple(refs),purpose=purpose,audience=audience)
 
 
-def evaluate_life_admission_v1(db,*,frame,prepared,reader):
+def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work):
     from .d11_life_preparation_v1 import _plan_current,_verify_life_current_budget_v1
     from ..domains.d03.context import EntityAnchor,RoleBinding,RoleBindingRequest,_tuple_payload
     from ..domains.d05.relationship import BoundaryRule,RelationshipProvider,_tuple_payload as d05_payload
@@ -121,16 +267,30 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader):
     from .d02_life_effect_v1 import require_life_body_quote_v1
     from ..domains.d02 import BodyState,BodyProfile,_reservation
     from .d02_production_operations_v1 import SettledBodyEffectPolicyV1
-    from .d11_life_contract_v1 import WORK_KIND
+    from .d11_life_contract_v1 import life_work_kind_v1
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
     if type(reader) is not InstalledLifeAdmissionReaderV1 or not db.in_transaction: raise TypeError("actual installed Life admission reader required")
     read=CurrentDomainReadV1(frame);read.check(db)
     b,p=prepared.binding,prepared.plan;ns=b.namespace
+    if type(new_work) is not bool:
+        raise TypeError("Life admission requires its explicit new-work or historical purpose")
+    if new_work and type(p) is RegisteredDraftFilePlanV3:
+        from .d08_project_control_v1 import project_control_basis_v1, require_current_project_plan_for_new_work_v1
+        _, _, plan_head, _, _ = project_control_basis_v1(db, namespace=ns, project_ref=p.project.ref)
+        read.head(db, plan_head.key, required=True)
+        require_current_project_plan_for_new_work_v1(db, namespace=ns, plan_ref=plan_head.key.token)
+    work_kind = life_work_kind_v1(b)
     if (reader.execution_inventory.namespace!=ns or reader.execution_inventory.authority_id!=b.authority_id
             or reader.execution_inventory.installation_id!=b.installation_id or reader.execution_inventory.manifest_digest!=b.manifest_digest):
         raise ValueError("Life mixed inventory installation differs")
     action,source=_plan_current(db,read,p)
     from .d08_source_note_action_v1 import require_source_note_action_original_v1
-    root=require_source_note_action_original_v1(db,namespace=ns,action_intent_ref=p.action_intent.ref,issuer=reader.issuer)
+    root=(require_draft_action_root_v1(db,namespace=ns,action_intent_ref=p.action_intent.ref,issuer=reader.issuer)
+        if type(p) is RegisteredDraftFilePlanV3 else
+        require_source_note_action_original_v1(db,namespace=ns,action_intent_ref=p.action_intent.ref,issuer=reader.issuer))
+    if type(p) is RegisteredDraftFilePlanV3:
+        from .d11_life_preparation_v1 import require_draft_authority_inputs_v1
+        require_draft_authority_inputs_v1(db, frame=frame, plan=p, issuer=reader.issuer)
     if (root.action_operation_id,root.action_intent_digest,root.activity_id,root.effect_id,root.project_ref,root.recipe_ref,root.input_source_ref,root.audiences) != (b.operation_id,p.action_intent.digest,b.activity_id,b.effect_id,p.project.ref,p.recipe.ref,p.input_source.ref,p.audiences):
         raise ValueError("Life signed root original differs from exact frozen registered plan")
     if _adopted(db,read,read.head(db,p.action_intent.ref,required=True)) != b.operation_id:
@@ -138,11 +298,13 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader):
     read.committed_operation(db,b.operation_id)
     if action.purpose!="consolidation" or action.effect_scope!=(b.artifact_ref,) or {(s.check_kind,s.provider_id) for s in action.required_checks}!=set(PAIRS):
         raise ValueError("fixed internal source-note action/check/effect scope differs")
-    if any(s.criteria_version!=life_criterion_ref_v1(s.check_kind) or s.subject_ref!="persona:"+ns.persona_id
+    if any(s.criteria_version!=life_criterion_ref_v1(s.check_kind, recipe_id=p.recipe_id) or s.subject_ref!="persona:"+ns.persona_id
             or s.action_ref!=action.action_id or s.purpose!=action.purpose for s in action.required_checks):
         raise ValueError("Life Action does not name installed fixed source-note criteria")
     inventories={kind:read.complete_inventory(db,kind) for kind in LIFE_ADMISSION_TYPES_V1}
-    scope=LifeSemanticScopeV1(ns,p.project.ref,p.input_source.ref,root.target_entity_ref,
+    from .d11_life_scope_v1 import DraftLifeSemanticScopeV1
+    scope_kind=DraftLifeSemanticScopeV1 if type(p) is RegisteredDraftFilePlanV3 else LifeSemanticScopeV1
+    scope=scope_kind(ns,p.project.ref,p.input_source.ref,root.target_entity_ref,
         action.target_ref,action.action_id,action.goal_ref,action.commitment_refs,p.audiences,frame.now_utc)
     def typed(kind, *, action_ids=None):
         result=[]
@@ -204,7 +366,7 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader):
             rules.append(rule)
     for audience in p.audiences:
         boundary=RelationshipProvider().provide_required_check(subject_persona_ref="persona:"+ns.persona_id,target_entity_ref=action.target_ref,
-            action_kind="source_note",audience_scope=audience,scene_ref=None,at_time=frame.now_utc,rules=tuple(rules),coverage_complete=True)
+            action_kind=action.action_kind,audience_scope=audience,scene_ref=None,at_time=frame.now_utc,rules=tuple(rules),coverage_complete=True)
         if boundary.result!="pass": raise MissingProductionOriginalV1("current_life_internal_boundary")
     _source_rights(db,read,(p.input_source.ref,),p.audiences)
     attention=None
@@ -255,7 +417,7 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader):
     if len(states)!=1 or len(profiles)!=1: raise MissingProductionOriginalV1("current_life_body_profile_state")
     state=BodyState(**states[0].value);raw=dict(profiles[0].value);raw["namespace"]=NamespaceId(**raw["namespace"])
     raw["applicable_axes"],raw["work_kinds"]=tuple(raw["applicable_axes"]),tuple(raw["work_kinds"]);profile=BodyProfile(**raw)
-    if state.version!=states[0].revision or profile.version!=profiles[0].revision or profile.namespace!=ns or WORK_KIND not in profile.work_kinds:
+    if state.version!=states[0].revision or profile.version!=profiles[0].revision or profile.namespace!=ns or work_kind not in profile.work_kinds:
         raise ValueError("current Life Body qualification changed")
     policy=db.execute("SELECT revision,payload_json,payload_digest,signature FROM graph_d02_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? AND kind='effect' ORDER BY revision DESC LIMIT 1",
         (*ns.as_tuple,contract.effect_policy_ref)).fetchone()
@@ -263,7 +425,7 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader):
     reader.issuer._signer.verify("d11.d02-production-policy.v1",policy[1],policy[3]);raw=json.loads(policy[1])
     if canonical_digest(raw)!=policy[2] or canonical_serialize(raw)!=policy[1]: raise ValueError("Life Body policy original changed")
     raw["namespace"]=NamespaceId(**raw["namespace"]);policy_value=SettledBodyEffectPolicyV1(**raw)
-    if ((policy_value.profile_id,policy_value.work_kind,policy_value.component_id)!=(body.profile_id,WORK_KIND,part.component_id)
+    if ((policy_value.profile_id,policy_value.work_kind,policy_value.component_id)!=(body.profile_id,work_kind,part.component_id)
             or not any(pin.policy_ref==contract.effect_policy_ref and pin.revision==policy[0] and pin.policy_digest==policy[2] for pin in frame.installed_policy_refs)):
         raise MissingProductionOriginalV1("pinned_current_life_body_effect_policy")
     deadline=min(frame.envelope.deadline_utc,attention.ticket.valid_until,quote.valid_until_utc,
@@ -273,7 +435,7 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader):
     query_versions=tuple(VersionedRef("life-query:"+page.type_id,page.epoch.revision) for page in frame.query_coverage)
     current=(*versions,*query_versions,VersionedRef("life-execution:"+reader.execution_inventory.anchor.execution_journal_id,reader.execution_inventory.anchor.execution_seq),
         VersionedRef(b.quote_id,b.quote_version))
-    specs=tuple(replace(s,required_input_versions=(*current,VersionedRef(life_criterion_ref_v1(s.check_kind),1))) for s in action.required_checks)
+    specs=tuple(replace(s,required_input_versions=(*current,VersionedRef(life_criterion_ref_v1(s.check_kind, recipe_id=p.recipe_id),1))) for s in action.required_checks)
     checks=tuple(CheckReceipt(s.check_kind,s.subject_ref,s.action_ref,s.purpose,s.required_input_versions,"full","pass",deadline,s.provider_id) for s in specs)
     return {"schema":"d08.life-admission-evidence.v1","checks":plain_v1(checks),"effective_specs":plain_v1(specs),
         "focus_ref":attention.focus_version.key.token,"ticket_ref":attention.ticket_version.key.token,
@@ -319,7 +481,7 @@ def record_life_action_admission_after_cas_v1(db,*,preparation,prepared,receipt)
         raise ValueError("Life admission receipt is not the actual same-transaction CAS")
     template=_frame_template(preparation.frame)
     frame=rebuild_life_admission_frame_v1(db,prepared=prepared,template_json=template,now_utc=preparation.frame.now_utc)
-    evidence=evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=preparation.admission_reader)
+    evidence=evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=preparation.admission_reader,new_work=True)
     value=LifeActionAdmissionOriginalV1(prepared.binding.digest,prepared.binding.plan_digest,prepared.binding.operation_id,
         prepared.prepare_operation_id,canonical_digest(receipt),prepared.graph_revision,prepared.graph_epoch,
         tuple(a.key.token for a in frame.snapshot.atoms),template,canonical_serialize(evidence))
@@ -348,7 +510,7 @@ def require_current_life_action_admission_v1(db,*,prepared,reader,now_utc,frame=
     if evidence["criteria_build_digest"]!=prepared.binding.algorithm_build_digest or {(c["check_kind"],c["issuer"]) for c in evidence["checks"]}!=set(PAIRS) or any(c["coverage"]!="full" or c["result"]!="pass" for c in evidence["checks"]):
         raise ValueError("Life signed admission is not the installed five-provider pass")
     if frame is None: frame=rebuild_life_admission_frame_v1(db,prepared=prepared,template_json=value.frame_template_json,now_utc=now_utc)
-    evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=reader)
+    evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=reader,new_work=False)
     return value
 
 

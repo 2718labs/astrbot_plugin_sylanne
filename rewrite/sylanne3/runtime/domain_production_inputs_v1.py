@@ -26,15 +26,25 @@ from ..runtime_contracts import CommitReceipt, NamespaceId, QueryEpoch, canonica
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1, production_read_plan_v1, raw_registered_input_v1, raw_head_value_v1
 from .d02_production_operations_v1 import PassiveBodyPolicyV1, SettledBodyEffectPolicyV1, CompletedActionBodyComponentV1
 from .d05_production_operations_v1 import InstalledRelationshipPolicyV1, BoundaryIntentOriginalV1
+from ..domains.d05.relationship_revision_v2 import InstalledRelationshipPolicyV2
 from .d08_production_operations_v1 import JointPlanIntentOriginalV1, PartyConsentEvidenceV1
 from .d10_production_operations_v1 import RegisteredLifePlanV1, RegisteredLifeOutcomeV1, RegisteredOfflineIntervalV1
 from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2
+from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
 from .domain_production_contracts_v1 import ProductionPolicyRefV1, ProductionQueryCoverageV1, StagedDomainOperationV1
-from .d07_execution_v1 import D07SemanticQuestionV1
+from .d07_execution_v1 import D07SemanticQuestionV1, D07RelationshipSemanticQuestionV2
+from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
 from ..domains.d07 import SimulationRequest
 from .d10_offline_inputs_v1 import (
     RegisterCurrentOfflineScheduleInputRequestV1, RegisterCurrentOfflineIntervalInputRequestV1,
     derive_current_offline_schedule_v1, derive_current_offline_interval_v1, record_current_offline_schedule_after_commit_v1,
+)
+
+
+from .d01_production_operations_v1 import (
+    RegisterIdentityPlasticityPolicyRequestV3, RegisterIdentityTrialObserverPolicyRequestV3,
+    PrepareSemanticGrowthInputRequestV3, StartSemanticGrowthTrialRequestV3,
+    IDENTITY_INPUT_KINDS_V3, read_plan_identity_input_v3,
 )
 
 
@@ -90,7 +100,7 @@ class RecordCurrentBodyComponentInputRequestV1:
 
 @dataclass(frozen=True, slots=True)
 class InstallCurrentRelationshipInputRequestV1:
-    policy: InstalledRelationshipPolicyV1
+    policy: InstalledRelationshipPolicyV1 | InstalledRelationshipPolicyV2
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +163,12 @@ class RegisterCurrentLifePlanInputRequestV2:
 
 
 @dataclass(frozen=True, slots=True)
+class RegisterCurrentDraftFilePlanInputRequestV3:
+    original_ref: str
+    plan: RegisteredDraftFilePlanV3
+
+
+@dataclass(frozen=True, slots=True)
 class RegisterCurrentLifeOutcomeInputRequestV2:
     original_ref: str
     outcome: RegisteredLifeOutcomeV2
@@ -161,7 +177,7 @@ class RegisterCurrentLifeOutcomeInputRequestV2:
 @dataclass(frozen=True, slots=True)
 class RegisterCurrentSemanticQuestionInputRequestV1:
     original_ref: str
-    question: D07SemanticQuestionV1
+    question: D07SemanticQuestionV1 | D07RelationshipSemanticQuestionV2 | D07MethodGrowthSemanticQuestionV2
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,8 +186,28 @@ class RegisterCurrentSimulationInputRequestV1:
     simulation: SimulationRequest
 
 
+from .d02_artifact_phase_price_v1 import RegisterCurrentArtifactPhasePricePolicyRequestV1
+from .artifact_task_text_extent_v1 import RegisterArtifactTaskTextExtentRequestV1
+from ..model_broker.artifact_draft_v1 import ArtifactDraftPhaseSelectorV2
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterCurrentPhaseDraftFilePlanInputRequestV2:
+    selector: ArtifactDraftPhaseSelectorV2
+
+    def __post_init__(self):
+        if type(self.selector) is not ArtifactDraftPhaseSelectorV2 or not self.selector.generation:
+            raise TypeError("phase file registration accepts only its exact generation selector")
+
+
 _PRODUCERS = {
+    "register_artifact_task_text_extent": ("d08", RegisterArtifactTaskTextExtentRequestV1),
+    "register_artifact_phase_price_policy": ("d02", RegisterCurrentArtifactPhasePricePolicyRequestV1),
     "freeze_values": ("d01", FreezeCurrentValuesInputRequestV1),
+    "register_identity_plasticity_policy_v3": ("d01", RegisterIdentityPlasticityPolicyRequestV3),
+    "register_identity_trial_observer_policy_v3": ("d01", RegisterIdentityTrialObserverPolicyRequestV3),
+    "prepare_semantic_growth_input_v3": ("d01", PrepareSemanticGrowthInputRequestV3),
+    "start_semantic_growth_trial_v3": ("d01", StartSemanticGrowthTrialRequestV3),
     "prepare_growth_input": ("d01", PrepareCurrentGrowthInputRequestV1),
     "derive_growth_trial": ("d01", DeriveCurrentGrowthTrialInputRequestV1),
     "initialize_body": ("d02", InstallCurrentBodyInputRequestV1),
@@ -189,6 +225,8 @@ _PRODUCERS = {
     "register_life_plan": ("d10", RegisterCurrentLifePlanInputRequestV1),
     "register_life_outcome": ("d10", RegisterCurrentLifeOutcomeInputRequestV1),
     "register_life_plan_v2": ("d10", RegisterCurrentLifePlanInputRequestV2),
+    "register_artifact_draft_plan_v3": ("d10", RegisterCurrentDraftFilePlanInputRequestV3),
+    "register_artifact_phase_draft_plan_v2": ("d10", RegisterCurrentPhaseDraftFilePlanInputRequestV2),
     "register_life_outcome_v2": ("d10", RegisterCurrentLifeOutcomeInputRequestV2),
     "register_semantic_question": ("d07", RegisterCurrentSemanticQuestionInputRequestV1),
     "register_simulation": ("d07", RegisterCurrentSimulationInputRequestV1),
@@ -219,7 +257,9 @@ def input_operation_for_request_v1(producer_kind):
     capability = ("d02.body_policy.install" if producer_kind == "initialize_body" else
         "workbench.activate" if producer_kind in {
             "install_passive_body_policy", "install_body_effect_policy",
-            "install_relationship_policy", "set_contact_policy", "register_offline_schedule"} else "workbench.create")
+            "install_relationship_policy", "set_contact_policy", "register_offline_schedule",
+            "register_artifact_phase_price_policy", "register_identity_plasticity_policy_v3",
+            "register_identity_trial_observer_policy_v3"} else "workbench.create")
     return DomainInputProducerRegistrationV1(domain, producer_kind, request_type, capability)
 
 
@@ -236,14 +276,42 @@ def _checked_request(producer_kind, request):
     return registration
 
 
-def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_kind, request):
+def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_kind, request, installed_readers=None):
     registration = _checked_request(producer_kind, request)
+    if producer_kind == "register_artifact_phase_draft_plan_v2":
+        from .d11_life_product_adapter_v1 import read_plan_current_phase_draft_file_registration_v2
+        return read_plan_current_phase_draft_file_registration_v2(db, namespace=namespace,
+            activity_id=activity_id, request=request, installed_readers=installed_readers)
+    if producer_kind == "register_artifact_phase_price_policy":
+        from .domain_production_contracts_v1 import ProductionReadPlanV1
+        return ProductionReadPlanV1((), (owner_grant_key(*namespace.as_tuple),), (),
+            (request.policy_ref,) if request.expected_revision else ())
+    if producer_kind in IDENTITY_INPUT_KINDS_V3:
+        return read_plan_identity_input_v3(db,namespace=namespace,producer_kind=producer_kind,request=request)
     types, keys, roots, originals = [], [owner_grant_key(*namespace.as_tuple)], [], []
     persona = Owner("persona", *namespace.as_tuple)
     if registration.domain == "d01":
         types += ["d01.persona_activation.v1", "d01.persona_plan.v1"]
     if producer_kind == "freeze_values":
-        types += ["d08.action_intent.v1", "d07.attention_ticket.v1", "d03.world_event", "d03.role_binding"]
+        types += ["d08.action_intent.v1", "d07.attention_ticket.v1", "d03.world_event", "d03.role_binding",
+            "d08.personal_plan.v1", "d08.goal.v1", "d07.current_interpretation.v1"]
+        from .d01_production_operations_v1 import method_condition_read_inputs_v1
+        plan_rows = db.execute("SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND type_name='d08.personal_plan.v1' AND valid=1 ORDER BY token LIMIT 129", namespace.as_tuple).fetchall()
+        if len(plan_rows) > 128:
+            raise MissingProductionOriginalV1("complete_current_method_plan_inventory")
+        goal_keys = []
+        for token, encoded in plan_rows:
+            plan_value = json.loads(encoded)
+            if plan_value["state"] == "active" and plan_value.get("method_candidates"):
+                keys.append(AtomKey.from_token(token))
+                goal_keys.append(AtomKey.from_token(plan_value["goal_ref"]))
+                roots.extend(plan_value["source_refs"])
+        keys.extend(goal_keys)
+        condition_keys, condition_roots, condition_originals = method_condition_read_inputs_v1(db, namespace, tuple(goal_keys))
+        keys.extend(condition_keys)
+        roots.extend(condition_roots)
+        originals.extend(condition_originals)
     elif producer_kind == "prepare_growth_input":
         keys.append(AtomKey.from_token(request.interpretation_ref))
         types.append("d07.current_interpretation.v1")
@@ -254,6 +322,16 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
             raise ValueError("growth trial must name actual adopted life progress or settled action outcome")
         keys.append(key)
         originals += [request.growth_proposal_ref, request.settled_progress_ref]
+        intent=raw_registered_input_v1(db,"graph_d01_production_inputs_v1",namespace,request.growth_proposal_ref)
+        if intent and intent.get("schema")=="d01.growth-intent.v2":
+            originals.extend((intent["plasticity_policy_ref"],intent["observer_policy_ref"]))
+            rows=db.execute("SELECT original_ref,payload_json FROM graph_d01_production_inputs_v1 WHERE bot=? AND persona=? "
+                "AND kind='identity_trial_start_v3' ORDER BY original_ref LIMIT 129",namespace.as_tuple).fetchall()
+            if len(rows)>128:raise MissingProductionOriginalV1("bounded_deep_identity_trial_inventory")
+            for ref,encoded in rows:
+                start=json.loads(encoded)
+                if (start["growth_proposal_ref"],start["completed_trial_ref"])==(request.growth_proposal_ref,request.original_ref):
+                    originals.append(ref);keys.append(AtomKey.from_token(start["planned_progress_ref"]))
         actual = raw_head_value_v1(db, namespace, key)
         if actual:
             if key.type_name == "d10.life_progress.v1":
@@ -296,6 +374,9 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
     elif producer_kind == "install_relationship_policy":
         if request.policy.namespace != namespace:
             raise ValueError("relationship policy namespace differs from real Owner")
+        if type(request.policy) is InstalledRelationshipPolicyV2:
+            roots.extend(request.policy.policy_source_refs)
+            roots.extend(rule.authored_prior_source_ref for rule in request.policy.dimension_rules if rule.authored_prior_source_ref is not None)
     elif producer_kind == "register_boundary_intent":
         keys.append(AtomKey.from_token(request.intent.boundary_ref))
         roots += list(request.intent.next_rule.source_refs)
@@ -324,7 +405,7 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         keys.append(AtomKey(persona, "d10.proactive_opportunity.v1", request.opportunity.opportunity_id))
         originals.append(request.opportunity.opportunity_id)
         types += ["d03.entity_anchor", "d03.account_binding"]
-    elif producer_kind == "register_life_plan_v2":
+    elif producer_kind in {"register_life_plan_v2", "register_artifact_draft_plan_v3"}:
         from .d11_life_product_adapter_v1 import life_plan_read_inputs_v1
         return life_plan_read_inputs_v1(db, namespace=namespace, plan=request.plan)
     elif producer_kind == "register_life_outcome_v2":
@@ -370,6 +451,20 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
                 roots += list(target["source_refs"])
                 keys += [AtomKey.from_token(ref) for ref in target["current_goal_refs"]]
         roots += list(request.question.source_refs)
+        if type(request.question) is D07RelationshipSemanticQuestionV2:
+            keys.append(request.question.cycle_ref.key)
+            keys.append(AtomKey.from_token(request.question.trigger_original_ref))
+            from .foreground_cycle_v1 import foreground_cycle_from_wire_v1
+            from .jobs import get_job
+            cycle = foreground_cycle_from_wire_v1(get_job(db, request.question.cycle_ref.key.name).continuation)
+            keys.append(AtomKey.from_token(cycle.source_ref))
+            policy = db.execute("SELECT payload_json FROM graph_d05_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? AND revision=?",
+                (*namespace.as_tuple, request.question.policy_ref, request.question.policy_revision)).fetchone()
+            if policy:
+                roots.extend(json.loads(policy[0])["policy_source_refs"])
+        elif type(request.question) is D07MethodGrowthSemanticQuestionV2:
+            keys.extend((request.question.cycle_ref.key, request.question.proposal_head.key, request.question.source_head.key))
+            originals.extend((request.question.proposal_head.key.token, request.question.c02_operation_id))
     elif producer_kind == "register_simulation":
         roots += list(request.simulation.snapshot_refs)
     elif producer_kind == "register_offline_schedule":
@@ -400,6 +495,8 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         for (encoded,) in rows:
             value = json.loads(encoded)
             refs = tuple(value.get("source_refs", value.get("creation_evidence_refs", ())))
+            if producer_kind == "freeze_values" and type_name in {"d07.current_interpretation.v1", "d08.personal_plan.v1", "d08.goal.v1"}:
+                continue
             if producer_kind == "freeze_values" and (type_name == "d03.role_binding"
                     or type_name == "d03.world_event" and not set(refs) <= set(roots)):
                 continue
@@ -414,12 +511,40 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
 
 def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installed_readers):
     registration = _checked_request(producer_kind, request)
+    if producer_kind == "register_artifact_task_text_extent":
+        from .artifact_task_text_extent_v1 import stage_register_artifact_task_text_extent_v1
+        return StagedDomainInputV1(registration, request,
+            stage_register_artifact_task_text_extent_v1(db, frame=frame, request=request,
+                installed_readers=installed_readers))
+    if producer_kind == "register_artifact_phase_price_policy":
+        from .d02_artifact_phase_price_v1 import stage_register_current_artifact_phase_price_policy_in_transaction_v1
+        stage = stage_register_current_artifact_phase_price_policy_in_transaction_v1(db, frame=frame,
+            request=request, installed_readers=installed_readers)
+        return StagedDomainInputV1(registration, request, stage)
+    if producer_kind == "register_artifact_phase_draft_plan_v2":
+        from .d11_life_product_adapter_v1 import derive_current_phase_draft_file_plan_v2
+        from .d01_production_operations_v1 import waiting_stage_v1
+        try:
+            derive_current_phase_draft_file_plan_v2(db, frame=frame, request=request, installed_readers=installed_readers)
+            stage = stage_result_v1(frame, "d10", "input:" + producer_kind, request,
+                provenance={"producer_kind": producer_kind, "input_request_digest": canonical_digest(plain_v1(request))})
+        except MissingProductionOriginalV1 as missing:
+            stage = waiting_stage_v1(frame, "d10", "input:" + producer_kind, request, missing)
+        return StagedDomainInputV1(registration, request, stage)
     read = CurrentDomainReadV1(frame)
     read.check(db)
     ns, writes = frame.envelope.authority.namespace, ()
     policy_original = None
     schema = registration.domain + ".proposal.v1"
-    if producer_kind == "initialize_body":
+    if producer_kind in {"register_identity_plasticity_policy_v3","register_identity_trial_observer_policy_v3"}:
+        installed_readers.validate_identity_policy_registration_v3(db,frame,request.policy)
+    elif producer_kind == "start_semantic_growth_trial_v3":
+        installed_readers.validate_semantic_trial_start_v3(db,frame,request)
+    elif producer_kind == "prepare_semantic_growth_input_v3":
+        installed_readers._identity_policy_v3(db,read,request.plasticity_policy_ref,require_growth=True)
+        read.head(db,request.interpretation_ref,required=True)
+        read.original(request.trigger_original_ref)
+    elif producer_kind == "initialize_body":
         policy = request.policy
         if policy.profile.namespace != ns:
             raise ValueError("body initialization namespace differs")
@@ -507,29 +632,36 @@ def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installe
     return StagedDomainInputV1(registration, request, stage)
 
 
-def _post_commit_frame(db, frame, request):
+def _post_commit_frame(db, frame, request, *, _successor_v3=None):
     """Read real post-CAS heads/epoch; never assume a synthetic +1 receipt."""
     ns = frame.envelope.authority.namespace
-    row = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", ns.as_tuple).fetchone()
-    if row is None:
-        raise ValueError("input producer lost its actual post-commit namespace epoch")
-    epoch = NamespaceEpoch(*ns.as_tuple, row[0])
-    atoms = []
-    for prior in frame.snapshot.atoms:
-        current = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?", (prior.key.token, *ns.as_tuple)).fetchone()
-        atoms.append(GraphAtom(prior.key, current[0], json.loads(current[1]), bool(current[2])) if current else GraphAtom(prior.key, 0, {}, False))
-    snapshot = GraphSnapshot(tuple(atoms), (epoch,))
-    coverage = []
-    for page in frame.query_coverage:
-        rows = db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
-                          (*ns.as_tuple, page.type_id)).fetchall()
-        if len(rows) > 128:
-            raise ValueError("input producer post-CAS scope unexpectedly became incomplete")
-        coverage.append(ProductionQueryCoverageV1(QueryEpoch(ns, page.epoch.scope_ref, epoch.revision), page.type_id,
-            tuple(GraphVersion(AtomKey.from_token(ref), rev) for ref, rev in rows), True, None))
+    if _successor_v3 is not None:
+        from .current_method_learning_read_v3 import PreparedMethodPostCommitV3
+        if type(_successor_v3) is not PreparedMethodPostCommitV3:
+            raise TypeError("actual Method post-commit successor required")
+        snapshot, coverage = _successor_v3.snapshot_and_coverage_v3(frame)
+        epoch = snapshot.epochs[0]
+    else:
+        row = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", ns.as_tuple).fetchone()
+        if row is None:
+            raise ValueError("input producer lost its actual post-commit namespace epoch")
+        epoch = NamespaceEpoch(*ns.as_tuple, row[0])
+        atoms = []
+        for prior in frame.snapshot.atoms:
+            current = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?", (prior.key.token, *ns.as_tuple)).fetchone()
+            atoms.append(GraphAtom(prior.key, current[0], json.loads(current[1]), bool(current[2])) if current else GraphAtom(prior.key, 0, {}, False))
+        snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+        coverage = []
+        for page in frame.query_coverage:
+            rows = db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
+                              (*ns.as_tuple, page.type_id)).fetchall()
+            if len(rows) > 128:
+                raise ValueError("input producer post-CAS scope unexpectedly became incomplete")
+            coverage.append(ProductionQueryCoverageV1(QueryEpoch(ns, page.epoch.scope_ref, epoch.revision), page.type_id,
+                tuple(GraphVersion(AtomKey.from_token(ref), rev) for ref, rev in rows), True, None))
     policies = list(frame.installed_policy_refs)
     policy = getattr(request, "policy", None)
-    if type(policy) in {PassiveBodyPolicyV1, SettledBodyEffectPolicyV1, InstalledRelationshipPolicyV1}:
+    if type(policy) in {PassiveBodyPolicyV1, SettledBodyEffectPolicyV1, InstalledRelationshipPolicyV1, InstalledRelationshipPolicyV2}:
         policies = [item for item in policies if not (item.policy_ref == policy.policy_ref and item.revision == policy.revision)]
         policies.append(ProductionPolicyRefV1(policy.policy_ref, policy.revision, canonical_digest(plain_v1(policy))))
     envelope = replace(frame.envelope, version_guard=replace(frame.envelope.version_guard,
@@ -552,6 +684,15 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
     CurrentDomainReadV1(frame).committed_operation(db, actual_receipt.operation_id)
     frame = _post_commit_frame(db, frame, request)
     kind, operation = registration.producer_kind, actual_receipt.operation_id
+    if kind in {"register_identity_plasticity_policy_v3","register_identity_trial_observer_policy_v3"}:
+        return (installed_readers.register_identity_policy_after_commit_v3(db,frame=frame,
+            producing_operation_id=operation,policy=request.policy),)
+    if kind == "prepare_semantic_growth_input_v3":
+        return installed_readers.freeze_semantic_growth_after_commit_v3(db,frame=frame,
+            producing_operation_id=operation,request=request)
+    if kind == "start_semantic_growth_trial_v3":
+        return (installed_readers.start_semantic_trial_after_commit_v3(db,frame=frame,
+            producing_operation_id=operation,request=request),)
     if kind == "freeze_values":
         return installed_readers.freeze_current_values_from_graph_v1(db, frame=frame,
             producing_operation_id=operation, candidate_set_ref=request.candidate_set_ref, context_ref=request.context_ref)
@@ -562,6 +703,12 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
         return (installed_readers.derive_current_growth_trial_from_adopted_progress_v1(db,
             frame=frame, producing_operation_id=operation, original_ref=request.original_ref,
             growth_proposal_ref=request.growth_proposal_ref, settled_progress_ref=request.settled_progress_ref),)
+    if kind == "register_artifact_task_text_extent":
+        return ()  # Its signed original follows actual generic adoption below.
+    if kind == "register_artifact_phase_price_policy":
+        from .d02_artifact_phase_price_v1 import record_current_artifact_phase_price_policy_after_commit_v1
+        return record_current_artifact_phase_price_policy_after_commit_v1(db, frame=frame,
+            request=request, stage=stage, actual_receipt=actual_receipt, installed_readers=installed_readers)
     if kind == "initialize_body":
         installed_readers.body_quote_authority.install_policy(db, request.policy)
         return ()
@@ -583,13 +730,27 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
     if kind == "register_life_plan":
         return (installed_readers.record_current_life_plan_v1(db, frame=frame, original_ref=request.original_ref,
             producing_operation_id=operation, plan=request.plan),)
-    if kind == "register_life_plan_v2":
+    if kind == "register_artifact_phase_draft_plan_v2":
+        from .d11_life_product_adapter_v1 import derive_current_phase_draft_file_plan_v2, artifact_phase_draft_plan_ref_v2
+        from .d11_life_preparation_v1 import record_registered_life_plan_v2
+        from ..host.installed_d11_life_build_v1 import read_installed_d11_life_build_v1
+        plan = derive_current_phase_draft_file_plan_v2(db, frame=frame, request=request, installed_readers=installed_readers)
+        graph = installed_readers.role_clock_reader.graph
+        assembly = graph._GraphCoordinator__d04_installed_joint_assembly
+        build = read_installed_d11_life_build_v1(assembly.package_root,
+            assembly.installation_policy.manifest_digest, recipe_id=plan.recipe_id)
+        return (record_registered_life_plan_v2(db, frame=frame, issuer=installed_readers.issuer,
+            original_ref=artifact_phase_draft_plan_ref_v2(request.selector), producing_operation_id=operation,
+            plan=plan, installed_build=build, body_quote_authority=graph._GraphCoordinator__body_quote_authority),)
+    if kind in {"register_life_plan_v2", "register_artifact_draft_plan_v3"}:
         from .d11_life_preparation_v1 import record_registered_life_plan_v2
         from ..host.installed_d11_life_build_v1 import read_installed_d11_life_build_v1
         assembly = installed_readers.role_clock_reader.graph._GraphCoordinator__d04_installed_joint_assembly
-        build = read_installed_d11_life_build_v1(assembly.package_root, assembly.installation_policy.manifest_digest)
+        build = read_installed_d11_life_build_v1(assembly.package_root,
+            assembly.installation_policy.manifest_digest, recipe_id=request.plan.recipe_id)
         return (record_registered_life_plan_v2(db, frame=frame, issuer=installed_readers.issuer,
-            original_ref=request.original_ref, producing_operation_id=operation, plan=request.plan, installed_build=build),)
+            original_ref=request.original_ref, producing_operation_id=operation, plan=request.plan, installed_build=build,
+            body_quote_authority=installed_readers.role_clock_reader.graph._GraphCoordinator__body_quote_authority),)
     if kind == "register_life_outcome_v2":
         from .d10_life_outcome_v2 import record_current_life_outcome_v2
         return (record_current_life_outcome_v2(db, frame=frame, issuer=installed_readers.issuer,

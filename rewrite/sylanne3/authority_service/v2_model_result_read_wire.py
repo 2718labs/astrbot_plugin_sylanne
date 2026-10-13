@@ -6,7 +6,7 @@ from dataclasses import asdict, fields
 import json
 
 from ..runtime_contracts import NamespaceId, canonical_serialize
-from .v2_model_egress_contract import ModelEgressObservationV1, ModelTerminalReceiptV2
+from .v2_model_egress_contract import ModelTerminalReceiptV2
 from .v2_model_result_read_contract import ModelResultReadRequestV1, ModelResultReadV1
 from .v2_owner_session import (
     OwnerSessionLoginRequestV1, from_wire as session_from_wire,
@@ -20,18 +20,15 @@ def _shape(raw, kind):
     return dict(raw)
 
 
-def _pairs(raw):
-    if type(raw) is not list or any(type(item) is not list for item in raw):
-        raise ValueError("model result amount pairs differ")
-    return tuple(tuple(item) for item in raw)
-
-
 def to_wire(value: ModelResultReadRequestV1 | ModelResultReadV1) -> dict:
     if type(value) not in {ModelResultReadRequestV1, ModelResultReadV1}:
         raise TypeError("typed model result read wire value required")
     plain = json.loads(canonical_serialize(asdict(value)))
     if type(value) is ModelResultReadRequestV1:
         plain["owner_session_request"] = session_to_wire(value.owner_session_request)
+    else:
+        from .v2_model_egress_contract import model_observation_to_wire_v1
+        plain["observation"] = model_observation_to_wire_v1(value.observation)
     return plain
 
 
@@ -50,10 +47,8 @@ def from_wire(raw: object, kind):
         result = ModelResultReadRequestV1(**shaped)
     elif kind is ModelResultReadV1:
         shaped = _shape(raw, kind)
-        observation = _shape(shaped["observation"], ModelEgressObservationV1)
-        for name in ("usage", "cost"):
-            observation[name] = _pairs(observation[name])
-        shaped["observation"] = ModelEgressObservationV1(**observation)
+        from .v2_model_egress_contract import model_observation_from_wire_v1
+        shaped["observation"] = model_observation_from_wire_v1(shaped["observation"])
         shaped["terminal_receipt"] = ModelTerminalReceiptV2(
             **_shape(shaped["terminal_receipt"], ModelTerminalReceiptV2))
         result = ModelResultReadV1(**shaped)

@@ -70,12 +70,13 @@ def record_installed_c04_interpretation_policy_v3(
 def read_installed_c04_interpretation_policy_v3(
     db, namespace, prepared, *, installation_id, manifest_digest,
 ):
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     if not db.in_transaction:
         raise ValueError("W01 current code-policy transaction required")
     binding = prepared.binding
-    row = db.execute("SELECT payload_json,payload_digest FROM graph_c04_code_policy_originals_v3 "
+    row = _producer_original_point_v3(db,table='graph_c04_code_policy_originals_v3',columns=('payload_json', 'payload_digest'),key_columns=("bot","persona","operation_id"),key=(*namespace.as_tuple, binding.operation_id),legacy_reader=lambda: db.execute("SELECT payload_json,payload_digest FROM graph_c04_code_policy_originals_v3 "
                      "WHERE bot=? AND persona=? AND operation_id=?",
-                     (*namespace.as_tuple, binding.operation_id)).fetchone()
+                     (*namespace.as_tuple, binding.operation_id)).fetchone())
     expected = _payload(binding_digest=binding.binding_digest, installation_id=installation_id,
                         manifest_digest=manifest_digest, algorithm_build_digest=binding.algorithm_build_digest)
     if row != (canonical_json(expected), canonical_digest(expected)):

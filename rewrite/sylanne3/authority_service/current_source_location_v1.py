@@ -54,8 +54,16 @@ class _IssuedCurrentSourceLocationV1:
 def _material(value):
     result={name:getattr(value,name) for name in value.__dataclass_fields__ if name!='context'}
     context=value.context
+    prepared=context.prepared_original
+    if prepared is None or type(prepared) is dict:
+        prepared_commitment=canonical_digest(prepared)
+    else:
+        from .c09_paged_recovery_facts_v2 import C09VerifiedLegacyPreparedSummaryV2
+        if type(prepared) is not C09VerifiedLegacyPreparedSummaryV2 or prepared._control is not context._reader:
+            raise AuthorityUnavailable('actual streamed legacy PREPARED context required')
+        prepared_commitment=canonical_digest(('sylanne3.c09.verified-legacy-context.v2',prepared['prepared_digest']))
     result['context_commitment']=(context.control_path,context.pointer_version,context.manifest_digest,
-        context.storage_generation,context.stage,canonical_digest(context.manifest),canonical_digest(context.prepared_original))
+        context.storage_generation,context.stage,canonical_digest(context.manifest),prepared_commitment)
     return result
 
 
@@ -71,18 +79,21 @@ class InstalledCurrentSourceLocationQualifierV1:
         self._fences=fences;self._scoped=scoped;self._control=control;self.core=fences.core
         self._graph_db_path=Path(graph_db_path).resolve(strict=True)
         self.namespace_id=namespace_id;self.namespace=fences.namespace;self.installation_id=installation_id
-        self._issued={};self._issued_lock=threading.RLock();self._inventory_views={}
+        self._issued={};self._issued_lock=threading.RLock();self._inventory_views={};self._life_intervals={}
 
     def _outside_sql(self):
         if any(getattr(store,'_db',None) is None or store._db.in_transaction
                 for store in (self.core,self._fences.deletion,self._fences.execution)):
             raise AuthorityUnavailable('current location observation must precede caller SQL/freezes')
 
-    def _issue(self,**fields):
+    def _issue(self,*,life_interval=None,**fields):
         value=_IssuedCurrentSourceLocationV1(**fields);key=id(value);commitment=canonical_digest(_material(value))
         def retire(_):
-            with self._issued_lock:self._issued.pop(key,None)
-        with self._issued_lock:self._issued[key]=(weakref.ref(value,retire),commitment,value.context)
+            with self._issued_lock:
+                self._issued.pop(key,None);self._life_intervals.pop(key,None)
+        with self._issued_lock:
+            self._issued[key]=(weakref.ref(value,retire),commitment,value.context)
+            if life_interval is not None:self._life_intervals[key]=life_interval
         return value
 
     def _require_issued(self,value,purpose=None):
@@ -130,9 +141,10 @@ class InstalledCurrentSourceLocationQualifierV1:
         self._fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=anchor)
         return anchor,current[0]
 
-    def _observe(self,*,purpose,credential,subject,permit=None,accepted_receipt=None):
+    def _observe(self,*,purpose,credential,subject,permit=None,accepted_receipt=None,life_interval=None):
         self._outside_sql();context=self._control.read_verified_current_storage_v1()
-        context.require_current('business' if purpose=='business' else 'maintenance')
+        business=purpose in {'business','d11_life_interval'}
+        context.require_current('business' if business else 'maintenance')
         control_operation=self._pointer(context);manifests,prepared,locations,commitments=self._lineage(context)
         current_members={m['role']:m for m in context.manifest['members']}
         if (Path(current_members['core']['resolved_path'])!=self.core.path.resolve()
@@ -145,10 +157,12 @@ class InstalledCurrentSourceLocationQualifierV1:
             anchor=self._fences._current_locked(db,deletion,execution,require_clear=False)
             if current_members['deletion']['incarnation_or_journal_id']!=anchor.deletion_journal_id or deletion.journal_id!=anchor.deletion_journal_id:
                 raise AuthorityUnavailable('selected deletion journal differs from actual current anchor')
-            if purpose=='business':
+            if business:
                 if self.core._row(db,self.namespace)[9]!='clear':raise AuthorityUnavailable('business namespace is not clear')
                 self._fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=anchor)
                 holder=self.core._row(db,self.namespace)[0]
+                if purpose=='d11_life_interval':
+                    before,prepared_original,interval_commitments=self._life_interval_in_tx(db,life_interval,permit,subject,anchor)
             else:anchor,holder=self._accepted_in_tx(db,accepted_receipt,subject)
         graph_uri=self._graph_db_path.as_uri()+'?mode=ro'
         immutable=False
@@ -159,15 +173,22 @@ class InstalledCurrentSourceLocationQualifierV1:
         try:
             graph.execute('PRAGMA query_only=ON');graph.execute('BEGIN')
             metadata, epoch, incarnations = read_graph_location_in_tx_v1(graph,
-                namespace_id=self.namespace_id, namespace=self.namespace, purpose=purpose, anchor=anchor,
+                namespace_id=self.namespace_id, namespace=self.namespace,
+                purpose='business' if purpose=='d11_life_interval' else purpose,
+                anchor=before if purpose=='d11_life_interval' else anchor,
                 accepted_receipt=accepted_receipt, manifests=manifests, prepared=prepared)
+            if purpose=='d11_life_interval':
+                actual=graph.execute('SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?',self.namespace_id.as_tuple).fetchone()
+                if actual!=(prepared_original.requirements_json,prepared_original.graph_revision) or epoch.revision!=prepared_original.graph_epoch:
+                    raise AuthorityUnavailable('own Life interval lost its exact prepared Graph/CAS stamp')
         finally:graph.close()
         if immutable and any(Path(str(self._graph_db_path)+suffix).exists() for suffix in ('-wal','-shm','-journal')):
             raise AuthorityUnavailable('closed Graph acquired a companion during location observation')
         for member in context.manifest['members']:self._control.verify_member_v1(member,prepared=False)
-        context.require_current('business' if purpose=='business' else 'maintenance')
+        context.require_current('business' if business else 'maintenance')
         if self._pointer(context)!=control_operation:raise AuthorityUnavailable('current location control operation changed')
-        value=self._issue(purpose=purpose,namespace_id=self.namespace_id,authority_namespace=self.namespace,installation_id=self.installation_id,
+        value=self._issue(life_interval=None if life_interval is None else (*life_interval,interval_commitments),
+            purpose=purpose,namespace_id=self.namespace_id,authority_namespace=self.namespace,installation_id=self.installation_id,
             graph_db_path=str(self._graph_db_path),current_graph_metadata=metadata,graph_epoch=epoch,core_anchor=anchor,holder=holder,
             graph_incarnations=tuple(incarnations),execution_locations=locations,
             selected_files=tuple((m['role'],m['resolved_path'],m['device'],m['file_id'],m['incarnation_or_journal_id']) for m in context.manifest['members']),
@@ -187,6 +208,111 @@ class InstalledCurrentSourceLocationQualifierV1:
         self._fences._require_permit(credential=credential,subject=subject,permit=permit)
         return self._observe(purpose='business',credential=credential,subject=subject,permit=permit)
 
+    def observe_d11_draft_observation_for_fence_v1(self,*,credential,subject,permit,service,binding,request):
+        """Observe this Life executor's independently admitted draft read fence."""
+        from .d11_life_service_v1 import AuthorityD11LifeServiceV1
+        from ..runtime.d11_life_contract_v1 import D11DraftExecutionBindingV1
+        from ..runtime.d11_artifact_draft_contract_v1 import DraftFileObservationRequestV1
+        if (type(service) is not AuthorityD11LifeServiceV1 or type(binding) is not D11DraftExecutionBindingV1
+                or type(request) is not DraftFileObservationRequestV1
+                or service.bridge.core is not self.core or service.fences is not self._fences
+                or service.bridge.journal is not self._fences.execution
+                or service.bridge.deletion is not self._fences.deletion
+                or service.namespace!=self.namespace_id or service.installation_id!=self.installation_id
+                or service.graph_path!=self._graph_db_path or service.current_source_location is not self
+                or credential is not service.credential or subject!=service._subject
+                or type(permit) is not FencePermitV2 or permit.operation!='read'
+                or permit.operation_id!=request.current_read_permit_ref
+                or canonical_digest(permit)!=request.current_read_permit_digest):
+            raise AuthorityUnavailable('draft observation requires this exact executor and its admitted read permit')
+        service._draft_observation_selector_v1(binding,request)
+        self.core._require(credential,'execution',self.namespace)
+        return self._observe(purpose='business',credential=credential,subject=subject,permit=permit)
+
+    def observe_d11_life_claim_for_fence_v1(self,*,credential,subject,permit,service,binding):
+        """Observe only this installed Life executor's actual first-claim gate."""
+        from .d11_life_service_v1 import AuthorityD11LifeServiceV1
+        from ..runtime.d11_life_contract_v1 import LIFE_BINDING_TYPES
+        if (type(service) is not AuthorityD11LifeServiceV1 or type(binding) not in LIFE_BINDING_TYPES
+                or service.bridge.core is not self.core or service.fences is not self._fences
+                or service.bridge.journal is not self._fences.execution
+                or service.bridge.deletion is not self._fences.deletion
+                or service.namespace!=self.namespace_id or service.installation_id!=self.installation_id
+                or service.graph_path!=self._graph_db_path or service.current_source_location is not self
+                or credential is not service.credential or subject!=service._subject
+                or type(permit) is not FencePermitV2 or permit.operation!='write'
+                or permit.operation_id!=service._gate_id(binding,'claim')):
+            raise AuthorityUnavailable('Life claim requires this exact installed executor and actual claim permit')
+        service._binding(binding)
+        self.core._require(credential,'execution',self.namespace)
+        return self._observe(purpose='business',credential=credential,subject=subject,permit=permit)
+
+    def observe_d11_life_interval_for_fence_v1(self,*,credential,subject,permit,service,binding):
+        """Only an actual Life service can qualify its exact original own interval."""
+        from .d11_life_service_v1 import AuthorityD11LifeServiceV1
+        from ..runtime.d11_life_contract_v1 import LIFE_BINDING_TYPES
+        if (type(service) is not AuthorityD11LifeServiceV1 or type(binding) not in LIFE_BINDING_TYPES
+                or service.bridge.core is not self.core or service.fences is not self._fences
+                or service.bridge.journal is not self._fences.execution
+                or service.bridge.deletion is not self._fences.deletion
+                or service.namespace!=self.namespace_id or service.installation_id!=self.installation_id
+                or service.graph_path!=self._graph_db_path or service.current_source_location is not self
+                or credential is not service.credential or subject!=service._subject
+                or type(permit) is not FencePermitV2 or permit.operation not in {'write','accounting'}):
+            raise AuthorityUnavailable('own Life interval requires this exact installed service and current permit')
+        service._binding(binding)
+        self.core._require(credential,'execution',self.namespace)
+        self._outside_sql()
+        from ..runtime.d11_life_preparation_v1 import read_prepared_life_v1
+        from contextlib import closing
+        with closing(sqlite3.connect(self._graph_db_path.as_uri()+'?mode=ro',uri=True,isolation_level=None)) as db:
+            db.execute('PRAGMA query_only=ON');db.execute('BEGIN')
+            prepared=read_prepared_life_v1(db,binding=binding,issuer=service.issuer)
+        if prepared is None:raise AuthorityUnavailable('own Life interval actual signed preparation absent')
+        return self._observe(purpose='d11_life_interval',credential=credential,subject=subject,
+            permit=permit,life_interval=(service,binding,prepared))
+
+    def _life_interval_in_tx(self,db,interval,permit,subject,anchor):
+        """No head tolerance: authenticate and reread the same exact signed rows."""
+        from .d11_life_journal_v1 import read_life_rows_locked_v1
+        from .d11_life_bridge_v1 import _same_location
+        from ..runtime_contracts import canonical_digest
+        service,binding,prepared=interval[:3]
+        journal=service.bridge.journal
+        with journal.freeze_writes():
+            head,claim,terminal,claim_row,terminal_row=read_life_rows_locked_v1(journal,binding)
+        source,source_row=service._gate(db,binding,'claim');before=source.pinned_anchor
+        if (claim is None or source_row[6]!='finished' or source_row[8:10]!=
+                (source.operation_id+':consumed','sha256:'+canonical_digest((binding.digest,claim.original_ref,claim.claim_digest)))
+                or not _same_location(before,anchor) or source.holder!=self.core._row(db,self.namespace)[0]
+                or claim.payload.prepared_digest!=prepared.digest
+                or claim_row[0]!=before.execution_seq+1 or claim_row[5]!=before.execution_digest
+                or head.journal_id!=anchor.execution_journal_id
+                or (head.seq,head.digest)!=(anchor.execution_seq,anchor.execution_digest)):
+            raise AuthorityUnavailable('own Life interval is not its actual consumed original claim')
+        service._verify_payload(claim.payload)
+        if terminal is None:
+            continuation,row=service._gate(db,binding,'terminal')
+            if ((head.seq,head.digest)!=(claim.claim_sequence,claim.claim_digest)
+                    or row[6]!='active' or continuation!=permit or continuation.pinned_anchor!=anchor
+                    or continuation.command_digest!='sha256:'+canonical_digest((binding.digest,claim.claim_digest))):
+                raise AuthorityUnavailable('claim-only Life interval lacks its exact active original continuation')
+        else:
+            service._verify_payload(terminal.payload)
+            if (terminal_row[0]!=claim_row[0]+1 or terminal_row[5]!=claim_row[6]
+                    or (head.seq,head.digest)!=(terminal.terminal_sequence,terminal.terminal_digest)):
+                raise AuthorityUnavailable('completed Life interval contains foreign, interleaved or later entries')
+            continuation,row=service._gate(db,binding,'terminal')
+            if (row[6]!='finished' or row[8:10]!=(continuation.operation_id+':consumed',
+                    'sha256:'+canonical_digest((binding.digest,terminal.original_ref,terminal.terminal_digest)))
+                    or continuation.command_digest!='sha256:'+canonical_digest((binding.digest,claim.claim_digest))):
+                raise AuthorityUnavailable('own Life terminal lost its exact consumed accounting gate')
+        self._fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=anchor)
+        service._prepared_anchor_common_v1(prepared,before)
+        commitments=(binding.digest,prepared.digest,before,claim.claim_digest,
+            None if terminal is None else terminal.terminal_digest)
+        return before,prepared,commitments
+
     def observe_accepted_erasure_location_v1(self,*,credential,subject,accepted_mutation_id):
         self._outside_sql()
         receipt=self._scoped.read_ancestor_receipt(credential=credential,subject=subject,mutation_id=accepted_mutation_id)
@@ -199,17 +325,24 @@ class InstalledCurrentSourceLocationQualifierV1:
         if self._pointer(value.context)!=value.control_operation_id:raise AuthorityUnavailable('location control operation expired')
         current, anchor = require_current_source_anchor_in_tx_v1(db, namespace=self.namespace,
             expected_anchor=value.core_anchor, holder=value.holder)
-        if value.purpose=='business':
+        if value.purpose in {'business','d11_life_interval'}:
             if current[9]!='clear':raise AuthorityUnavailable('location observation cannot open business during erasure')
             from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
             require_lifecycle_admission_in_tx_v1(db,self.namespace,action='graph_read')
             self._fences.fences.validate_fence_locked(db,value.permit,subject=value.subject,current_anchor=anchor)
+            if value.purpose=='d11_life_interval':
+                interval=self._life_intervals.get(id(value))
+                if interval is None:raise AuthorityUnavailable('actual private own Life interval observation absent')
+                if self._life_interval_in_tx(db,interval[:3],value.permit,value.subject,anchor)[2]!=interval[3]:
+                    raise AuthorityUnavailable('own Life interval original changed after qualification')
         elif value.purpose=='accepted_erasure':self._accepted_in_tx(db,value.accepted_receipt,value.subject)
         else:raise AuthorityUnavailable('unknown current location purpose')
         return value
 
     def require_graph_snapshot_v1(self,db,observation,*,graph_db_path=None):
-        value=self._require_issued(observation,'business')
+        value=self._require_issued(observation)
+        if value.purpose not in {'business','d11_life_interval'}:
+            raise AuthorityUnavailable('business or exact own Life graph observation required')
         if type(db) is not sqlite3.Connection or not db.in_transaction:raise AuthorityUnavailable('location binding requires the actual Graph read transaction')
         actual=Path(db.execute('PRAGMA database_list').fetchone()[2]).resolve(strict=True)
         if actual!=self._graph_db_path or graph_db_path is not None and Path(graph_db_path).resolve(strict=True)!=actual:

@@ -23,6 +23,14 @@ def _hold(message: str):
     raise UnavailableGuard(message)
 
 
+def _window_original_point_v6(db,*,table,columns,key_columns,key):
+    from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_graph_attachment_v3
+    bound,row=read_bound_authority_graph_attachment_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if bound:return row
+    return db.execute('SELECT '+','.join(columns)+' FROM '+table+' WHERE '+
+        ' AND '.join(name+'=?'for name in key_columns),key).fetchone()
+
+
 def _reply_ingress_identity_locked(db, namespace, ingress_operation_id):
     from .ingress_observation import read_committed_ingress_identity
     rows = db.execute(
@@ -54,12 +62,9 @@ def _current_d13_inbound_inputs_locked_v1(db, namespace, ingress_operation_id,
         raise RuntimeError("D13 inbound inputs require the held graph transaction")
     identity = _reply_ingress_identity_locked(db, namespace, ingress_operation_id)
     source_ref = source_key(*namespace.as_tuple, identity["source_ref"]).token
-    seal = db.execute(
-        "SELECT schema,bundle_digest,bundle_json FROM "
-        "graph_first_ingress_c02_committed_seals_v2 WHERE "
-        "bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (c02_operation_id,),
-    ).fetchone()
+    seal = _window_original_point_v6(db,table='graph_first_ingress_c02_committed_seals_v2',
+        columns=('schema','bundle_digest','bundle_json'),key_columns=('bot','persona','operation_id'),
+        key=namespace.as_tuple+(c02_operation_id,))
     operation = db.execute(
         "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
         "AND operation_id=?", namespace.as_tuple + (c02_operation_id,),
@@ -88,11 +93,22 @@ def _current_d13_inbound_inputs_locked_v1(db, namespace, ingress_operation_id,
     if epoch_row is None:
         raise UnavailableGuard("D13 graph epoch is absent; HOLD")
     epoch = QueryEpoch(namespace, "all", epoch_row[0])
+    from ..authority_service.current_authority_graph_read_v3 import (
+        _authority_attachment_owner_v3,AuthorityRouteMetadataInventoryV6,
+        require_authority_collection_source_v6,authority_collection_source_atom_v6)
+    work=_authority_attachment_owner_v3(db)
+    inventory=None if work is None else AuthorityRouteMetadataInventoryV6(work)
     binding = read_current_reply_entity_route_binding_v2(
-        db, namespace, route, epoch,
-        now_utc=now_utc)
+        db, namespace, route, epoch,now_utc=now_utc,prepared_inventory=inventory)
+    material=None if work is None else require_authority_collection_source_v6(work,binding=binding)
 
     def atom(version):
+        if work is not None:
+            value=(authority_collection_source_atom_v6(work,material,version.key.token)
+                if version.key.type_name=='memory.source'else work.projection.get(version.key))
+            if not value.valid or value.revision!=version.revision:
+                raise UnavailableGuard('D13 inbound actual current atom changed; HOLD')
+            return value
         row = db.execute(
             "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
             (version.key.token,),
@@ -121,12 +137,33 @@ def _current_d13_inbound_inputs_locked_v1(db, namespace, ingress_operation_id,
         raise UnavailableGuard("D13 access or deletion epoch is absent; HOLD")
     return binding, arrival, account, source, access, epoch, authority_epochs
 
-def read_current_d13_window_for_authority_v1(
+def _authority_window_dependency_v6():
+    from ..authority_service.current_authority_graph_read_v3 import AuthorityGraphAttachmentRequiredV3
+    from ..authority_service.current_authority_graph_read_v3 import AuthorityCollectionSourceRequiredV6
+    return (AuthorityGraphAttachmentRequiredV3,AuthorityCollectionSourceRequiredV6)
+
+
+def _read_current_d13_window_for_authority_v1(db,namespace,scene_ref,conversation_ref,max_slots,now_utc,*,
+        before_sequence=None,expected_activation_generation=None,expected_owner_authorization_head=None,
+        _collector_context=None,_page_observation=None):
+    program=_current_d13_window_program_v6(db,namespace,scene_ref,conversation_ref,max_slots,now_utc,
+        before_sequence=before_sequence,expected_activation_generation=expected_activation_generation,
+        expected_owner_authorization_head=expected_owner_authorization_head,
+        _collector_context=_collector_context,_page_observation=_page_observation)
+    while True:
+        try:dependency=next(program)
+        except StopIteration as complete:return complete.value
+        if dependency is not None:raise dependency
+
+
+def _current_d13_window_program_v6(
     db: sqlite3.Connection, namespace: NamespaceId, scene_ref: str,
     conversation_ref: str, max_slots: int, now_utc: float, *,
     before_sequence: int | None = None,
     expected_activation_generation: int | None = None,
     expected_owner_authorization_head: str | None = None,
+    _collector_context=None,
+    _page_observation=None,
 ) -> ConversationWindowProjectionV1:
     """Rebuild current source/access/correction closure in a caller-owned SQL view."""
     from ..graph_coordinator import D13InboundTurnReceiptV1, UnavailableGuard
@@ -158,12 +195,11 @@ def read_current_d13_window_for_authority_v1(
             before_sequence is not None and
             (type(before_sequence) is not int or before_sequence < 1)):
         raise ValueError("D13 current window needs a pinned bounded DB view")
+    if _collector_context is not None:
+        _collector_context.require_current(db, namespace, scene_ref, conversation_ref)
     conversation = conversation_ref
-    recovery = db.execute(
-        "SELECT schema,requirements_json,graph_revision FROM "
-        "graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
-        namespace.as_tuple,
-    ).fetchone()
+    recovery=_window_original_point_v6(db,table='graph_recovery_metadata_v2',
+        columns=('schema','requirements_json','graph_revision'),key_columns=('bot','persona'),key=namespace.as_tuple)
     epoch_row = db.execute(
         "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
         namespace.as_tuple,
@@ -177,7 +213,13 @@ def read_current_d13_window_for_authority_v1(
             type(recovery[2]) is not int or recovery[2] < 1 or
             type(epoch_row[0]) is not int or epoch_row[0] < 1):
         raise UnavailableGuard("D13 graph recovery identity differs; HOLD")
+    from ..authority_service.current_authority_graph_read_v3 import _authority_attachment_owner_v3
+    authority_work=_authority_attachment_owner_v3(db)
     def current_atom(key):
+        if authority_work is not None:
+            atom=authority_work.projection.get(key)
+            if not atom.valid:raise UnavailableGuard('D13 actual Authority window atom unavailable; HOLD')
+            return atom
         row = db.execute(
             "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
             (key.token,),
@@ -199,13 +241,9 @@ def read_current_d13_window_for_authority_v1(
             or activation.value["graph_incarnation"]
             != grant.value["graph_incarnation"]):
         raise UnavailableGuard("D13 current activation differs; HOLD")
-    proof_row = db.execute(
-        "SELECT operation_id,request_digest,grant_id,grant_digest,"
-        "graph_incarnation,graph_access_epoch,graph_epoch,"
-        "graph_receipt_digest,proof_json FROM "
-        "graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
-        namespace.as_tuple,
-    ).fetchone()
+    proof_row=_window_original_point_v6(db,table='graph_owner_issue_operations_v1',
+        columns=('operation_id','request_digest','grant_id','grant_digest','graph_incarnation','graph_access_epoch',
+            'graph_epoch','graph_receipt_digest','proof_json'),key_columns=('bot','persona'),key=namespace.as_tuple)
     if proof_row is None:
         raise UnavailableGuard("D13 Owner issue proof is absent; HOLD")
     proof = OwnerGraphCommitProofV1(
@@ -217,16 +255,24 @@ def read_current_d13_window_for_authority_v1(
             or proof_row[2] != grant.value["grant_id"]):
         raise UnavailableGuard("D13 Owner issue proof differs; HOLD")
 
-    scene_rows = db.execute(
-        "SELECT token,revision,value FROM graph_atoms WHERE bot=? "
-        "AND persona=? AND owner_kind='scene' AND subject=? "
-        "AND type_name='d03.role_binding' AND valid=1 LIMIT 2",
-        namespace.as_tuple + (scene_ref,),
-    ).fetchall()
+    if authority_work is None:
+        scene_rows = db.execute(
+            "SELECT token,revision,value FROM graph_atoms WHERE bot=? "
+            "AND persona=? AND owner_kind='scene' AND subject=? "
+            "AND type_name='d03.role_binding' AND valid=1 LIMIT 2",
+            namespace.as_tuple + (scene_ref,),
+        ).fetchall()
+    else:
+        scene_rows=[]
+        for token,head in authority_work.heads.items():
+            key=AtomKey.from_token(token)
+            if key.type_name=='d03.role_binding'and key.owner.kind=='scene'and key.owner.subject==scene_ref and head[1]:
+                atom=authority_work.projection.get(key);scene_rows.append((token,atom.revision,atom.value))
+                if len(scene_rows)==2:break
     if len(scene_rows) != 1:
         raise UnavailableGuard("D13 current scene binding unavailable; HOLD")
     scene_key = AtomKey.from_token(scene_rows[0][0])
-    scene_value = json.loads(scene_rows[0][2])
+    scene_value = json.loads(scene_rows[0][2])if authority_work is None else scene_rows[0][2]
     scene_binding = RoleBinding(**{
         **scene_value,
         "norm_refs": tuple(scene_value["norm_refs"]),
@@ -243,14 +289,21 @@ def read_current_d13_window_for_authority_v1(
             or scene_binding.effective_until is not None
             and now_utc >= scene_binding.effective_until):
         raise UnavailableGuard("D13 scene binding is not current; HOLD")
-    scene_receipt = db.execute(
-        "SELECT r.receipt_json FROM graph_history AS h "
-        "JOIN graph_scene_binding_receipts_v1 AS r "
-        "ON r.bot=h.event_bot AND r.persona=h.event_persona "
-        "AND r.operation_id=h.event_id WHERE h.token=? AND "
-        "h.revision=? AND h.event_session='d03-scene-binding'",
-        (scene_key.token, scene_rows[0][1]),
-    ).fetchone()
+    if authority_work is None:
+        scene_receipt = db.execute(
+            "SELECT r.receipt_json FROM graph_history AS h "
+            "JOIN graph_scene_binding_receipts_v1 AS r "
+            "ON r.bot=h.event_bot AND r.persona=h.event_persona "
+            "AND r.operation_id=h.event_id WHERE h.token=? AND "
+            "h.revision=? AND h.event_session='d03-scene-binding'",
+            (scene_key.token, scene_rows[0][1]),
+        ).fetchone()
+    else:
+        event=db.execute('SELECT event_bot,event_persona,event_id,event_session FROM graph_history WHERE token=? AND revision=?',
+            (scene_key.token,scene_rows[0][1])).fetchone()
+        scene_receipt=(None if event is None or event[3]!='d03-scene-binding'else
+            _window_original_point_v6(db,table='graph_scene_binding_receipts_v1',columns=('receipt_json',),
+                key_columns=('bot','persona','operation_id'),key=tuple(event[:3])))
     if scene_receipt is None:
         raise UnavailableGuard("D13 scene binding seal is absent; HOLD")
     scene_seal = json.loads(scene_receipt[0])
@@ -286,7 +339,8 @@ def read_current_d13_window_for_authority_v1(
     turns = []
     audience_ref = None
     raw_bytes = 0
-    for sequence in range(start, end + 1):
+    def read_record(sequence):
+        nonlocal audience_ref, raw_bytes
         slot = current_atom(turn_slot_key(
             namespace, scene_ref, conversation, sequence))
         validate_turn_slot_v1(slot.value)
@@ -297,18 +351,24 @@ def read_current_d13_window_for_authority_v1(
         reads[slot.key.token] = VersionedRef(slot.key.token, slot.revision)
         completion_key = turn_completion_key(
             namespace, scene_ref, conversation, sequence)
-        completion_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (completion_key.token,),
-        ).fetchone()
+        if authority_work is None:
+            completion_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (completion_key.token,),
+            ).fetchone()
+        else:
+            completion_atom=authority_work.projection.get(completion_key)
+            completion_row=(None if completion_atom.revision==0 else
+                (completion_atom.revision,completion_atom.value,int(completion_atom.valid)))
         if completion_row is None:
+            if _page_observation is not None:
+                _page_observation['unclosed'].append(sequence)
             gaps.append((sequence, sequence))
-            continue
+            return
         if completion_row[2] != 1:
             raise UnavailableGuard("D13 turn completion is invalid; HOLD")
-        completion = GraphAtom(
-            completion_key, completion_row[0],
-            json.loads(completion_row[1]), True)
+        completion = (GraphAtom(completion_key,completion_row[0],json.loads(completion_row[1]),True)
+            if authority_work is None else completion_atom)
         validate_turn_completion_v1(completion.value)
         if (completion.value["slot_ref"] != slot.key.token
                 or completion.value["direction"]
@@ -321,8 +381,10 @@ def read_current_d13_window_for_authority_v1(
             completion.key.token, completion.revision)
         if slot.value["direction"] == "outbound":
             if now_utc >= completion.value["trusted_utc"] + 72 * 60 * 60:
+                if _page_observation is not None:
+                    _page_observation['expired'].append(sequence)
                 gaps.append((sequence, sequence))
-                continue
+                return
             from .d13_outbound_observation_v1 import read_current_outbound_turn_v1
             turn, outbound_reads = read_current_outbound_turn_v1(
                 db, namespace, slot, completion, now_utc=now_utc)
@@ -335,10 +397,12 @@ def read_current_d13_window_for_authority_v1(
                 raise UnavailableGuard("D13 window raw text exceeds bound; HOLD")
             reads.update((ref.ref, ref) for ref in outbound_reads)
             turns.append(turn)
-            continue
+            return
         if now_utc >= completion.value["trusted_utc"] + 72 * 60 * 60:
+            if _page_observation is not None:
+                _page_observation['expired'].append(sequence)
             gaps.append((sequence, sequence))
-            continue
+            return
         history = db.execute(
             "SELECT event_session,event_id FROM graph_history "
             "WHERE token=? AND revision=?",
@@ -347,12 +411,9 @@ def read_current_d13_window_for_authority_v1(
         if history is None or history[0] != "d13-inbound-turn":
             raise UnavailableGuard("D13 original inbound seal is absent; HOLD")
         ingress_operation_id = history[1]
-        saved = db.execute(
-            "SELECT c02_operation_id,receipt_json FROM "
-            "graph_d13_inbound_turn_attempts_v1 WHERE bot=? AND "
-            "persona=? AND ingress_operation_id=?",
-            namespace.as_tuple + (ingress_operation_id,),
-        ).fetchone()
+        saved=_window_original_point_v6(db,table='graph_d13_inbound_turn_attempts_v1',
+            columns=('c02_operation_id','receipt_json'),key_columns=('bot','persona','ingress_operation_id'),
+            key=namespace.as_tuple+(ingress_operation_id,))
         if saved is None or saved[1] is None:
             raise UnavailableGuard("D13 inbound operation is uncommitted; HOLD")
         receipt = D13InboundTurnReceiptV1(**json.loads(saved[1]))
@@ -370,6 +431,12 @@ def read_current_d13_window_for_authority_v1(
         ).fetchone()
         if completion_history != history:
             raise UnavailableGuard("D13 completion event differs; HOLD")
+        if authority_work is not None:
+            record=authority_work.collection_record
+            if record is None or record.get('sequence')!=sequence or record.get('scene_ref')!=scene_ref or record.get('conversation_ref')!=conversation:
+                authority_work.collection_record={'slot':slot,'completion':completion,'sequence':sequence,
+                    'scene_ref':scene_ref,'conversation_ref':conversation,'ingress_operation_id':ingress_operation_id,
+                    'c02_operation_id':saved[0]}
         binding, arrival, account, source, access, _, _ = (
             _current_d13_inbound_inputs_locked_v1(
                 db, namespace, ingress_operation_id, saved[0], now_utc))
@@ -426,8 +493,21 @@ def read_current_d13_window_for_authority_v1(
             source_record.speaker_id, source_record.text,
             completion.value["trusted_utc"], "confirmed",
             completion.value["tool_state"]))
+    yield None
+    for sequence in range(start, end + 1):
+        while True:
+            try:
+                read_record(sequence)
+                break
+            except _authority_window_dependency_v6() as required:
+                yield required
+        yield None
     if audience_ref is None:
-        raise UnavailableGuard("D13 page has no current inbound audience; HOLD")
+        if _collector_context is None:
+            raise UnavailableGuard("D13 page has no current inbound audience; HOLD")
+        _collector_context.require_current(db, namespace, scene_ref, conversation_ref)
+        audience_ref = _collector_context.window.audience_ref
+        reads.update((ref.ref, ref) for ref in _collector_context.window.read_set)
     authority_epochs = db.execute(
         "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
         "WHERE bot=? AND persona=?", namespace.as_tuple,
@@ -446,6 +526,14 @@ def read_current_d13_window_for_authority_v1(
         activation.value["activation_generation"],
         _merge_ranges(gaps))
     return result
+
+
+def read_current_d13_window_for_authority_v1(db, namespace, scene_ref, conversation_ref, max_slots, now_utc, *,
+        before_sequence=None, expected_activation_generation=None, expected_owner_authorization_head=None):
+    # Legacy public semantics deliberately retain the empty-page HOLD.
+    return _read_current_d13_window_for_authority_v1(db, namespace, scene_ref, conversation_ref, max_slots, now_utc,
+        before_sequence=before_sequence, expected_activation_generation=expected_activation_generation,
+        expected_owner_authorization_head=expected_owner_authorization_head)
 
 
 def read_current_d13_frozen_window_for_authority_v1(

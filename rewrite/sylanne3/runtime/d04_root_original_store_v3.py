@@ -62,20 +62,20 @@ def _body(original: D04RootOriginalV3) -> dict:
 
 
 def _event_and_history(db: sqlite3.Connection, original: D04RootOriginalV3) -> None:
+    from .domain_background_read_v3 import background_point_v3,background_history_v3,background_json_loads_v3,background_json_matches_v3
     output = json.loads(original.output_json)
     rows = output.get("rows")
     if (type(rows) is not list or not rows
             or canonical_digest(tuple(tuple(row) for row in rows))
                != original.write_set_digest):
         raise D04RootOriginalV3Hold("V3 root write set differs")
-    event = db.execute(
-        "SELECT digest,revisions,epoch_revision FROM graph_events "
-        "WHERE bot=? AND persona=? AND session=? AND event_id=?",
-        (*original.namespace.as_tuple, "d04.authored_root.v3", original.operation_id),
-    ).fetchone()
+    event=background_point_v3(db,table='graph_events',columns=('digest','revisions','epoch_revision'),
+        key_columns=('bot','persona','session','event_id'),key=(*original.namespace.as_tuple,'d04.authored_root.v3',original.operation_id),
+        legacy_reader=lambda:db.execute('SELECT digest,revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?',
+            (*original.namespace.as_tuple,'d04.authored_root.v3',original.operation_id)).fetchone())
     if event is None or event[0] != original.graph_event_digest:
         raise D04RootOriginalV3Hold("V3 root graph event is absent")
-    revisions = json.loads(event[1])
+    revisions = background_json_loads_v3(event[1])
     if revisions != [[row[0], 1] for row in rows]:
         raise D04RootOriginalV3Hold("V3 root graph revisions differ")
     receipt = {"status": "committed", "revisions": revisions,
@@ -91,15 +91,10 @@ def _event_and_history(db: sqlite3.Connection, original: D04RootOriginalV3) -> N
         if (revision != 1 or key.owner.kind != "persona"
                 or NamespaceId.from_key(key) != original.namespace):
             raise D04RootOriginalV3Hold("V3 root address differs")
-        history = db.execute(
-            "SELECT value,valid FROM graph_history WHERE token=? AND revision=1 "
-            "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-            (ref, *original.namespace.as_tuple, "d04.authored_root.v3",
-             original.operation_id),
-        ).fetchone()
-        if history != (canonical_json(value), 1):
+        history=background_history_v3(db,ref,1,columns=('value','valid','event_bot','event_persona','event_session','event_id'))
+        if (history is None or history[1:]!=(1,*original.namespace.as_tuple,'d04.authored_root.v3',original.operation_id)
+                or not background_json_matches_v3(history[0],value)):
             raise D04RootOriginalV3Hold("V3 root graph history differs")
-
 
 def record_d04_root_original_v3(
     db: sqlite3.Connection, *, namespace: NamespaceId, operation_id: str,
@@ -162,21 +157,21 @@ def read_d04_root_original_v3(db: sqlite3.Connection, *,
                               operation_id: str) -> D04RootOriginalV3:
     if type(db) is not sqlite3.Connection or not db.in_transaction:
         raise D04RootOriginalV3Hold("V3 root read needs a fenced graph transaction")
-    row = db.execute(
-        "SELECT original_json,original_digest FROM graph_d04_root_originals_v3 "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, operation_id),
-    ).fetchone()
+    from .domain_background_read_v3 import background_point_v3,background_json_loads_v3,background_json_matches_v3,background_typed_original_digest_v3
+    row=background_point_v3(db,table='graph_d04_root_originals_v3',columns=('original_json','original_digest'),
+        key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation_id),legacy_reader=lambda:db.execute(
+            'SELECT original_json,original_digest FROM graph_d04_root_originals_v3 WHERE bot=? AND persona=? AND operation_id=?',
+            (*namespace.as_tuple,operation_id)).fetchone())
     if row is None:
         raise D04RootOriginalV3Hold("V3 root original is absent")
     try:
-        body = json.loads(row[0])
-        if canonical_serialize(body) != row[0] or body["namespace"] != json.loads(canonical_serialize(namespace)):
+        body = background_json_loads_v3(row[0])
+        if not background_json_matches_v3(row[0],body) or body["namespace"] != json.loads(canonical_serialize(namespace)):
             raise ValueError("V3 root original bytes differ")
         original = D04RootOriginalV3(**{**body, "namespace": namespace,
                                        "original_digest": row[1]})
         if (original.operation_id != operation_id
-                or canonical_digest(_body(original)) != original.original_digest):
+                or background_typed_original_digest_v3(db,row[0],_body(original)) != original.original_digest):
             raise ValueError("V3 root original digest differs")
         _event_and_history(db, original)
         return original

@@ -154,7 +154,7 @@ def validate_turn_outbound_observation_v1(value: dict) -> None:
                             ("batch_ref", "d09.verified_segment_batch.v1"),
                             ("source_ref", "memory.source"), ("access_ref", "memory.access")):
         actual = AtomKey.from_token(_string(value[name], name)).type_name
-        allowed = ({type_name, "d09.natural_verified_segment_batch.v2"}
+        allowed = ({type_name, "d09.natural_verified_segment_batch.v2", "d09.natural_verified_segment_batch.v3"}
                    if name == "batch_ref" else {type_name})
         if actual not in allowed:
             raise ValueError(f"outbound {name} type differs")
@@ -341,11 +341,11 @@ def _outbound_segment(batch):
     """Explicit batch-version dispatch; never relabel a paid natural batch."""
     if type(batch) is not GraphAtom or not batch.valid:
         raise ValueError("current outbound batch required")
-    if batch.key.type_name == "d09.natural_verified_segment_batch.v2":
-        from .natural_batch import validate_natural_verified_batch_value_v2
+    if batch.key.type_name in {"d09.natural_verified_segment_batch.v2", "d09.natural_verified_segment_batch.v3"}:
+        from .natural_batch import validate_natural_verified_batch_value
         from ...runtime.dispatch_candidate import natural_dispatch_segment_payload_ref_v2
-        validate_natural_verified_batch_value_v2(batch.value)
-        return batch.value["segment"], natural_dispatch_segment_payload_ref_v2(batch.key.token, 0)
+        validate_natural_verified_batch_value(batch.value)
+        return batch.value["segment"], natural_dispatch_segment_payload_ref_v2(batch.key.token, batch.value["segment"]["position"])
     if batch.key.type_name == "d09.verified_segment_batch.v1":
         segments = batch.value.get("segments")
         if type(segments) is list and len(segments) == 1 and type(segments[0]) is dict:

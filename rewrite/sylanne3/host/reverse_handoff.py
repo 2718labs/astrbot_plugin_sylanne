@@ -79,6 +79,7 @@ class _Registration:
     claim_writer: Callable
     witness: OwnerDispatchWitnessV1 | None = None
     snapshot: AuthorityDispatchSnapshotV1 | None = None
+    contact_policy_capsule: object | None = None
     task: asyncio.Task | None = None
     receipt: DispatchGraphClaimReceiptV1 | None = None
 
@@ -171,13 +172,16 @@ class HostReverseGraphClaimServer:
                 async with self._lock:
                     if self._registration is registration:
                         self._registration = None
+                from ..runtime.contact_dispatch_host_v3 import _PreparedContactP2WriterV1
+                if type(registration.claim_writer) is _PreparedContactP2WriterV1:
+                    registration.claim_writer.close()
 
     async def _claim(self, message: object) -> DispatchGraphClaimReceiptV1:
         profile = self.profile
-        if (type(message) is not dict or set(message) != {
-                "profile_id", "installation_id", "namespace", "context",
-                "binding", "claimed_receipt", "owner_witness",
-                "authority_snapshot"}
+        ordinary_fields = {"profile_id", "installation_id", "namespace", "context",
+            "binding", "claimed_receipt", "owner_witness", "authority_snapshot"}
+        if (type(message) is not dict or set(message) not in (
+                ordinary_fields, ordinary_fields | {"contact_policy_capsule"})
                 or (message["profile_id"], message["installation_id"],
                     message["namespace"]) !=
                    (profile.profile_id, profile.installation_id, profile.namespace)):
@@ -203,6 +207,16 @@ class HostReverseGraphClaimServer:
         )
         require_exact_owner_witness(profile, context, binding, witness)
         require_exact_authority_snapshot(context, witness, snapshot)
+        contact_capsule = None
+        if "contact_policy_capsule" in message:
+            from ..authority_service.contact_p2_contract_v1 import (
+                contact_p2_policy_capsule_from_wire_v1, require_exact_contact_p2_policy_capsule_v1,
+            )
+            contact_capsule = contact_p2_policy_capsule_from_wire_v1(message["contact_policy_capsule"])
+            require_exact_contact_p2_policy_capsule_v1(context,binding,claimed,witness,snapshot,contact_capsule)
+        elif binding.origin.proactive_contact is True:
+            raise RuntimeError("Contact reverse has no current Core policy capsule")
+        recheck_contact = False
         async with self._lock:
             registration = self._registration
             if (registration is None or registration.context != context
@@ -213,16 +227,36 @@ class HostReverseGraphClaimServer:
                 raise RuntimeError("reverse graph claim Owner witness changed")
             if registration.snapshot is not None and registration.snapshot != snapshot:
                 raise RuntimeError("reverse graph claim Authority snapshot changed")
-            if registration.receipt is not None:
+            if registration.task is not None:
+                prior = registration.contact_policy_capsule
+                if contact_capsule is not None and prior is not None:
+                    from dataclasses import replace
+                    if (contact_capsule.observed_at_utc < prior.observed_at_utc
+                            or replace(contact_capsule,observed_at_utc=prior.observed_at_utc) != prior):
+                        raise RuntimeError("Contact reverse current policy capsule changed")
+                elif prior != contact_capsule:
+                    raise RuntimeError("Contact reverse current policy variant changed")
+            if registration.receipt is not None and contact_capsule is None:
                 return registration.receipt
+            recheck_contact = contact_capsule is not None and registration.task is not None
             if registration.task is None:
                 registration.witness = witness
                 registration.snapshot = snapshot
+                registration.contact_policy_capsule = contact_capsule
+                args = (context, binding, claimed, witness, snapshot)
+                if contact_capsule is not None:
+                    from ..runtime.contact_dispatch_host_v3 import require_prepared_contact_p2_writer_v1
+                    require_prepared_contact_p2_writer_v1(registration.claim_writer)
+                    args = (*args, contact_capsule)
                 registration.task = asyncio.create_task(registration.window.call(
-                    registration.claim_writer, context, binding, claimed,
-                    witness, snapshot))
+                    registration.claim_writer, *args))
             task = registration.task
         receipt = await asyncio.shield(task)
+        if recheck_contact:
+            from ..runtime.contact_dispatch_host_v3 import require_prepared_contact_p2_writer_v1
+            actual_writer = require_prepared_contact_p2_writer_v1(registration.claim_writer)
+            receipt = await registration.window.call(actual_writer.recheck,context,binding,claimed,
+                witness,snapshot,contact_capsule,receipt)
         if (type(receipt) is not DispatchGraphClaimReceiptV1
                 or receipt.context_digest != canonical_digest(context)
                 or receipt.graph_namespace != binding.graph_namespace

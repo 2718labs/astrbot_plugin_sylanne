@@ -71,7 +71,7 @@ class VerifiedDeletionAppendV2:
 
 
 class AuthorityV2DeletionGuard:
-    def __init__(self, path):
+    def __init__(self, path, *, selected_storage=None, storage_context=None, maintenance_basis=None):
         self.path = Path(path)
         if not self.path.is_file():
             raise AuthorityUnavailable("independent deletion journal is absent")
@@ -90,14 +90,35 @@ class AuthorityV2DeletionGuard:
             self._db.execute("PRAGMA synchronous=FULL")
             if self._db.execute("PRAGMA synchronous").fetchone()[0] < 2:
                 raise AuthorityUnavailable("deletion journal is not FULL synchronous")
-            with self.freeze_writes():
-                self.verified_head()
+            self._runtime_storage_v3 = None
+            if selected_storage is not None and maintenance_basis is not None:
+                raise AuthorityUnavailable("business selection and maintenance basis are mutually exclusive")
+            if maintenance_basis is not None:
+                from ..runtime_storage_v3 import install_selected_maintenance_storage_v3
+                from .daemon import _bootstrap_control_quantum_v3
+                with _bootstrap_control_quantum_v3(maintenance_basis.basis.control):
+                    self._runtime_storage_v3 = install_selected_maintenance_storage_v3(
+                        self._db,role="deletion",basis=maintenance_basis)
+            elif selected_storage is not None:
+                from ..runtime_storage_v3 import install_selected_runtime_storage_v3
+                self._runtime_storage_v3 = install_selected_runtime_storage_v3(
+                    self._db,role="deletion",selected=selected_storage,context=storage_context)
+            else:
+                with self.freeze_writes():
+                    self.verified_head()
         except BaseException:
             self._db.close()
             self._db = None
             raise
 
     def _check_schema(self):
+        selected = getattr(self,'_c09_selected_journal_proof_v3',None)
+        if selected is not None:
+            from .c09_graph_application_v1 import SelectedC09JournalProofV3
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            if type(selected) is not SelectedC09JournalProofV3:
+                raise AuthorityUnavailable('actual private selected deletion schema proof required')
+            return selected.require_schema_locked(self,'deletion',meter=current_c09_sql_meter_v2())
         objects = {(kind, name): ddl for kind, name, ddl in self._db.execute(
             "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
         legacy = {
@@ -167,7 +188,8 @@ class AuthorityV2DeletionGuard:
             raise AuthorityUnavailable("deletion and Authority transactions required")
         kind, observed_journal_id, metadata = self._check_schema()
         version = int(metadata["schema_version"]) if kind == "v2" else None
-        row = authority_db.execute(
+        from .c09_graph_application_v1 import c09_actual_root_read_v3
+        row = c09_actual_root_read_v3(authority_db).execute(
             "SELECT value FROM authority_meta WHERE key='deletion_v2_tail_migration'").fetchone()
         if row is None:
             if version == 2:
@@ -352,7 +374,7 @@ class AuthorityV2DeletionGuard:
                              ensure_ascii=True).encode()
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
-    def _require_persisted_pending(self, pending, *, core, fences) -> None:
+    def _require_persisted_pending(self, pending, *, core, fences, selected_proof=None) -> None:
         """Read the live Authority ledger under deletion→Authority lock order."""
         from .v2_fence_store import AuthorityV2FenceStore
         from .core import AuthorityServiceCore
@@ -391,7 +413,7 @@ class AuthorityV2DeletionGuard:
                     or namespace_row[0] != permit.holder
                     or namespace_row[2] != "active" or namespace_row[9] != expected[0]):
                 raise AuthorityUnavailable("Authority deletion owner or anchor differs")
-            fences.require_prior_deletion_transition_locked(db, pending, core=core)
+            fences.require_prior_deletion_transition_locked(db, pending, core=core,selected_proof=selected_proof)
             row = fences._row(db, permit.operation_id)
             mutation = fences.mutation_locked(db, pending.mutation_id)
             if (row is None or row[6] != "active"
@@ -405,8 +427,14 @@ class AuthorityV2DeletionGuard:
                     or receipt is not None or updated is not None):
                 raise AuthorityUnavailable("deletion ledger differs from requested append")
 
-    def _inspect_pending_locked(self, pending: DeletionPendingV1):
-        """Classify 0/1/>1 rows after full chain verification."""
+    def _inspect_pending_locked(self, pending: DeletionPendingV1, *, selected_proof=None):
+        """Classify the append after full-chain or complete selected-prefix verification."""
+        if selected_proof is not None:
+            from .c09_graph_application_v1 import SelectedC09JournalProofV3
+            from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+            if type(selected_proof) is not SelectedC09JournalProofV3:
+                raise AuthorityUnavailable('actual private selected append proof required')
+            return selected_proof.inspect_pending_locked(self,pending,meter=current_c09_sql_meter_v2())
         head = self.verified_head()
         before = pending.before_anchor
         if head.journal_id != before.deletion_journal_id:
@@ -458,20 +486,31 @@ class AuthorityV2DeletionGuard:
             raise AuthorityUnavailable("deletion barrier and cleanup phases remain HOLD")
         return self.append_transition(pending, core=core, fences=fences)
 
-    def append_transition(self, pending: DeletionPendingV1, *, core, fences):
+    def append_transition(self, pending: DeletionPendingV1, *, core, fences, selected_proof=None):
         """One FULL-WAL typed phase append; Authority pending is durable first.
 
         This is an internal storage port. A trusted service must authenticate
         Owner, graph barrier, or cleanup evidence before preparing the phase.
         """
         with self.freeze_writes():
-            self._require_persisted_pending(pending, core=core, fences=fences)
-            existing = self._inspect_pending_locked(pending)
+            self._require_persisted_pending(pending, core=core, fences=fences,selected_proof=selected_proof)
+            existing = self._inspect_pending_locked(pending,selected_proof=selected_proof)
             if existing is not None:
                 return existing
             body = self._pending_body(pending)
             self._append_allowed = True
             try:
+                if selected_proof is not None:
+                    from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+                    values = tuple(body[name] for name in ('seq','schema','kind','append_id','mutation_id','request_digest',
+                        'namespace','operation_id','phase','subject','holder','token_digest','fence_epoch','revision',
+                        'before_seq','before_digest','evidence_digest')) + (
+                        json.dumps(body['roots'],separators=(',', ':'),ensure_ascii=True),body['epoch'],body['policy_ref'],
+                        body['previous'],pending.expected_append_digest)
+                    from ..runtime.c09_paged_sql_v2 import _sql_scalar_size_v2
+                    meter = current_c09_sql_meter_v2()
+                    meter.charge_write(sum(_sql_scalar_size_v2(value) for value in values))
+                    meter.count_mutation()
                 self._db.execute(
                     "INSERT INTO authority_deletion_v2_tail VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (body["seq"], body["schema"], body["kind"], body["append_id"],
@@ -485,11 +524,13 @@ class AuthorityV2DeletionGuard:
                      pending.expected_append_digest))
             finally:
                 self._append_allowed = False
-            return self._inspect_pending_locked(pending)
+            return self._inspect_pending_locked(pending,selected_proof=selected_proof)
 
     def close(self):
         with self._lock:
             if self._db is not None:
+                runtime=getattr(self,"_runtime_storage_v3",None)
+                if runtime is not None:runtime.close()
                 self._db.close()
                 self._db = None
 

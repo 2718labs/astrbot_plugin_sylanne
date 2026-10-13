@@ -119,10 +119,12 @@ def natural_private_scope_from_binding_v2(
     from ..model_broker.natural_reply import FrozenNaturalReplyRequestV2
     from ..model_broker.natural_reply_history_v3 import FrozenNaturalReplyRequestV3
     from ..model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4
+    from ..model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6
+    from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7
     from .reply_entity_route_v2 import CurrentReplyEntityRouteBindingV2
 
     if (type(binding) is not CurrentReplyEntityRouteBindingV2
-            or type(frozen) not in (FrozenNaturalReplyRequestV2, FrozenNaturalReplyRequestV3, FrozenNaturalReplyRequestV4)):
+            or type(frozen) not in (FrozenNaturalReplyRequestV2, FrozenNaturalReplyRequestV3, FrozenNaturalReplyRequestV4,FrozenNaturalReplyRequestV6,FrozenNaturalReplyRequestV7)):
         raise NaturalScopedQueryHold("typed original route and input required")
     plan = frozen.input.plan
     if (plan.namespace != binding.namespace
@@ -154,9 +156,11 @@ def assert_original_scoped_d06_projection_v2(
     from ..model_broker.natural_reply import FrozenNaturalReplyRequestV2
     from ..model_broker.natural_reply_history_v3 import FrozenNaturalReplyRequestV3
     from ..model_broker.natural_reply_history_v4 import FrozenNaturalReplyRequestV4
+    from ..model_broker.natural_reply_history_v6 import FrozenNaturalReplyRequestV6
+    from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7
 
     if (type(proof) is not NaturalScopedQueryProofV2
-            or type(frozen) not in (FrozenNaturalReplyRequestV2, FrozenNaturalReplyRequestV3, FrozenNaturalReplyRequestV4)
+            or type(frozen) not in (FrozenNaturalReplyRequestV2, FrozenNaturalReplyRequestV3, FrozenNaturalReplyRequestV4,FrozenNaturalReplyRequestV6,FrozenNaturalReplyRequestV7)
             or frozen.input.plan.namespace != proof.scope.namespace
             or frozen.input.plan.audience_id != proof.scope.audience_id
             or frozen.input.plan.scene_id != proof.scope.scene_ref
@@ -236,7 +240,7 @@ def _current(db, key: AtomKey) -> tuple[int, dict]:
     return row[0], _decoded(row[1])
 
 
-def _d06_closure(db, scope: NaturalPrivateScopeV2) -> tuple[ScopedAtomEvidenceV2, ...]:
+def _d06_closure(db, scope: NaturalPrivateScopeV2, *, prepared_inventory=None) -> tuple[ScopedAtomEvidenceV2, ...]:
     namespace = scope.namespace
     pending = [AtomKey.from_token(ref).owner.subject for ref in scope.source_roots]
     visited: set[str] = set()
@@ -251,9 +255,33 @@ def _d06_closure(db, scope: NaturalPrivateScopeV2) -> tuple[ScopedAtomEvidenceV2
         source = source_key(*namespace.as_tuple, source_id)
         access = access_key(*namespace.as_tuple, source_id)
         correction = source_correction_head_key(namespace, source_id)
-        source_revision, source_value = _current(db, source)
-        access_revision, access_value = _current(db, access)
-        record = SourceRecord.from_dict(source_value)
+        from ..authority_service.current_authority_graph_read_v3 import (
+            require_authority_source_metadata_v3)
+        authority_source = (require_authority_source_metadata_v3(
+            db, namespace, source.token) if prepared_inventory is None else None)
+        if authority_source is not None:
+            from .dispatch_initial_source_read_v3 import _SourceMetadataRecordV3
+            authority_source.require_current_v3()
+            source_revision = authority_source.revision
+            access_atom = authority_source.work.projection.get(access)
+            if not access_atom.valid or access_atom.revision < 1:
+                raise NaturalScopedQueryHold("D06 current access is absent")
+            access_revision, access_value = access_atom.revision, access_atom.value
+            record = _SourceMetadataRecordV3(authority_source.metadata)
+        elif prepared_inventory is None:
+            source_revision, source_value = _current(db, source)
+            access_revision, access_value = _current(db, access)
+            record = SourceRecord.from_dict(source_value)
+        else:
+            from .dispatch_initial_source_read_v3 import _SourceMetadataRecordV3
+            witness=prepared_inventory.source_metadata(db,namespace,prepared_inventory.query,source,require_grant=False)
+            source_revision=witness.revision
+            access_atom=prepared_inventory.projection.get(access)
+            if access_atom is None or not access_atom.valid or access_atom.revision<1:
+                raise NaturalScopedQueryHold("D06 current access is absent")
+            access_revision,access_value=access_atom.revision,access_atom.value
+            prepared_inventory.operation.retain(4096)
+            record=_SourceMetadataRecordV3(witness.metadata)
         validate_access(access_value)
         if (record.source_id != source_id
                 or access_value["source_id"] != source_id
@@ -270,7 +298,14 @@ def _d06_closure(db, scope: NaturalPrivateScopeV2) -> tuple[ScopedAtomEvidenceV2
         ).fetchone()
         if correction_row is not None:
             raise NaturalScopedQueryHold("D06 source correction head is present")
-        for item in (_evidence(source.token, source_revision, source_value),
+        source_evidence = (
+            ScopedAtomEvidenceV2(source.token, source_revision,
+                authority_source.canonical_semantic_digest)
+            if authority_source is not None else
+            _evidence(source.token, source_revision, source_value)
+            if prepared_inventory is None else
+            ScopedAtomEvidenceV2(source.token, source_revision, witness.payload_sha256))
+        for item in (source_evidence,
                      _evidence(access.token, access_revision, access_value),
                      ScopedAtomEvidenceV2(correction.token, 0, None)):
             result[item.token] = item
@@ -279,19 +314,38 @@ def _d06_closure(db, scope: NaturalPrivateScopeV2) -> tuple[ScopedAtomEvidenceV2
 
 
 def read_natural_scoped_query_proof_v2(
-    db, scope: NaturalPrivateScopeV2, *, now_utc: float,
+    db, scope: NaturalPrivateScopeV2, *, now_utc: float, prepared_inventory=None,
 ) -> NaturalScopedQueryProofV2:
     """Scan every current D03/D05 row for this private route in one SQLite tx."""
     if (not db.in_transaction or type(scope) is not NaturalPrivateScopeV2
             or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
         raise NaturalScopedQueryHold("current transactional private scope required")
     namespace = scope.namespace
-    rows = db.execute(
-        "SELECT token,revision,value,type_name FROM graph_atoms WHERE bot=? "
-        "AND persona=? AND valid=1 AND type_name IN "
-        "('d03.account_binding','d03.role_binding','d05.boundary_rule') "
-        "ORDER BY token", namespace.as_tuple,
-    ).fetchall()
+    authority_rows = None
+    if prepared_inventory is None:
+        from ..authority_service.current_authority_graph_read_v3 import (
+            require_authority_graph_type_rows_v3)
+        authority_rows = require_authority_graph_type_rows_v3(
+            db, namespace, ("d03.account_binding", "d03.role_binding",
+                "d05.boundary_rule"), ("token", "revision", "value"))
+    if authority_rows is not None:
+        rows = tuple((token, revision, value, AtomKey.from_token(token).type_name)
+            for token, revision, value in authority_rows)
+    elif prepared_inventory is None:
+        rows = db.execute(
+            "SELECT token,revision,value,type_name FROM graph_atoms WHERE bot=? "
+            "AND persona=? AND valid=1 AND type_name IN "
+            "('d03.account_binding','d03.role_binding','d05.boundary_rule') "
+            "ORDER BY token", namespace.as_tuple,
+        ).fetchall()
+    else:
+        from .dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
+        if type(prepared_inventory)is not PreparedCurrentDispatchInventoryV3:
+            raise NaturalScopedQueryHold("actual private full-EOF natural inventory required")
+        projection=prepared_inventory.require_current(db,namespace,prepared_inventory.query)
+        rows=tuple((atom.key.token,atom.revision,atom.value,atom.key.type_name)
+            for atom in projection.atoms_for_types_v3(frozenset({'d03.account_binding','d03.role_binding','d05.boundary_rule'}))if atom.valid)
+        rows=tuple(sorted(rows,key=lambda row:row[0]))
     accounts, roles, boundaries = [], [], []
     try:
         role_request = RoleBindingRequest(
@@ -302,7 +356,7 @@ def read_natural_scoped_query_proof_v2(
             if ((key.owner.bot, key.owner.persona) != namespace.as_tuple
                     or key.type_name != type_name):
                 raise NaturalScopedQueryHold("scanned row identity differs")
-            value = _decoded(raw)
+            value = _decoded(raw) if prepared_inventory is None and authority_rows is None else raw
             if type_name == "d03.account_binding":
                 item = AccountBinding(**value)
                 if key.name != item.account_id:
@@ -344,13 +398,13 @@ def read_natural_scoped_query_proof_v2(
             raise NaturalScopedQueryHold("private route matching set is ambiguous")
         return NaturalScopedQueryProofV2(
             scope, tuple(sorted(accounts)), tuple(sorted(roles)),
-            tuple(sorted(boundaries)), _d06_closure(db, scope))
+            tuple(sorted(boundaries)), _d06_closure(db, scope,prepared_inventory=prepared_inventory))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise NaturalScopedQueryHold("private route graph scan is invalid") from exc
 
 
 def assert_natural_scoped_query_current_v2(
-    db, original: NaturalScopedQueryProofV2, *, now_utc: float,
+    db, original: NaturalScopedQueryProofV2, *, now_utc: float, prepared_inventory=None,
 ) -> NaturalScopedQueryProofV2:
     """Return the fresh read only when keys, versions and semantics match.
 
@@ -360,7 +414,7 @@ def assert_natural_scoped_query_current_v2(
     if type(original) is not NaturalScopedQueryProofV2:
         raise NaturalScopedQueryHold("original typed scope proof required")
     current = read_natural_scoped_query_proof_v2(
-        db, original.scope, now_utc=now_utc)
+        db, original.scope, now_utc=now_utc,prepared_inventory=prepared_inventory)
     if current != original:
         raise NaturalScopedQueryHold("private route or D06 closure changed")
     return current
@@ -375,3 +429,18 @@ __all__ = [
     "read_natural_scoped_query_proof_v2",
     "assert_natural_scoped_query_current_v2",
 ]
+
+
+def assert_current_natural_producer_scope_v1(db, original, frozen, *, now_utc, read_versions=None):
+    """Compose unchanged Source proof with actual live producer verification.
+
+    Producer heads remain in the adopted plan/read set; they are never stored
+    as fake Source members of d06_closure. Frozen input fields stay unchanged.
+    """
+    assert_original_scoped_d06_projection_v2(original, frozen)
+    assert_natural_scoped_query_current_v2(db, original, now_utc=now_utc)
+    from .natural_producer_qualification_v1 import assert_live_frozen_producer_basis_v1
+    required = assert_live_frozen_producer_basis_v1(frozen, now_utc=now_utc)
+    if read_versions is not None and any(row not in read_versions for row in required):
+        raise NaturalScopedQueryHold("actual producer read set is incomplete")
+    return required

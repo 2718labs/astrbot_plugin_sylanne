@@ -237,3 +237,45 @@ __all__ = [
     "record_c09_erasure_plan_original_v1",
     "current_c09_source_read_versions_v1",
 ]
+
+
+
+SOURCE_PLAN_ORIGINAL_DDL_V2 = 'CREATE TABLE graph_c09_erasure_plans_v2 (bot TEXT NOT NULL,persona TEXT NOT NULL,operation_id TEXT NOT NULL,original_json TEXT NOT NULL,PRIMARY KEY(bot,persona,operation_id))'
+
+
+def install_c09_erasure_plan_schema_v2(db):
+    db.execute(SOURCE_PLAN_ORIGINAL_DDL_V2.replace("CREATE TABLE ","CREATE TABLE IF NOT EXISTS ",1))
+    for action in ("UPDATE","DELETE"):
+        db.execute("CREATE TRIGGER IF NOT EXISTS graph_c09_erasure_plans_v2_"+action.lower()+"_immutable BEFORE "+action+" ON graph_c09_erasure_plans_v2 BEGIN SELECT RAISE(ABORT,'C09 V2 Source plan immutable'); END")
+
+
+def read_c09_erasure_plan_original_v2(db,namespace,operation_id):
+    from .c09_source_plan_barrier_v2 import C09SourcePlanCaptureV2
+    row=db.execute('SELECT original_json FROM graph_c09_erasure_plans_v2 WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation_id)).fetchone()
+    if row is None:return None
+    original=C09SourcePlanCaptureV2.from_wire(json.loads(row[0]))
+    if original.namespace!=namespace or original.operation_id!=operation_id or canonical_serialize(original.to_wire())!=row[0]:
+        raise ValueError('C09 V2 Source plan original canonical identity differs')
+    return original
+
+
+def record_c09_erasure_plan_original_v2(db,original):
+    from .c09_source_plan_barrier_v2 import C09SourcePlanCaptureV2,seal_c09_source_plan_v2
+    if not db.in_transaction or type(original) is not C09SourcePlanCaptureV2:
+        raise ValueError('C09 V2 actual Source plan transaction required')
+    if seal_c09_source_plan_v2(db,original.namespace,original.operation_id)!=original:
+        raise ValueError('C09 V2 plan lacks actual captured Source EOF/count/seal')
+    prior=read_c09_erasure_plan_original_v2(db,original.namespace,original.operation_id)
+    if prior is not None:
+        if prior!=original:raise ValueError('C09 V2 Source plan replay differs')
+        return prior
+    db.execute('INSERT INTO graph_c09_erasure_plans_v2 VALUES(?,?,?,?)',(*original.namespace.as_tuple,original.operation_id,canonical_serialize(original.to_wire())))
+    return original
+
+
+def read_c09_erasure_plan_original_versioned_v2(db,namespace,operation_id):
+    """Explicit table/schema dispatch; no failed-V2 downgrade to V1."""
+    new=read_c09_erasure_plan_original_v2(db,namespace,operation_id)
+    old=read_c09_erasure_plan_original_v1(db,namespace,operation_id)
+    if new is not None and old is not None:raise ValueError('C09 operation has two plan versions')
+    return new if new is not None else old

@@ -15,6 +15,7 @@ import math
 from ..domains.d09.natural_reply import (
     NATURAL_REPLY_OUTPUT_SCHEMA_V2, NaturalExpressionPlanV2,
     QualifiedExpressionUnitV2,
+    NATURAL_REPLY_OUTPUT_SCHEMA_V3, natural_semantic_ranges_v3,
 )
 from ..runtime_contracts import (
     NATURAL_REPLY_GENERATION_WORKFLOW_V2, VersionedRef,
@@ -48,6 +49,19 @@ TEMPLATE_DIGEST = canonical_digest({
     "output_schema": OUTPUT_SCHEMA, "layout": "system/stable_user/dynamic_user",
     "system_message": SYSTEM_MESSAGE,
 })
+OUTPUT_SCHEMA_V3 = NATURAL_REPLY_OUTPUT_SCHEMA_V3
+SYSTEM_MESSAGE_V3 = SYSTEM_MESSAGE.replace(
+    "exactly schema, body, units.", "exactly schema, body, units, semantic_segments."
+).replace(NATURAL_REPLY_OUTPUT_SCHEMA_V2, OUTPUT_SCHEMA_V3) + (
+    " semantic_segments is an ordered list of 1 to 4 {start,end} ranges partitioning "
+    "the complete body. Use one bubble for a short answer and 2 to 4 only for distinct "
+    "complete meanings. Do not split by punctuation. Keep claims, code blocks, lists "
+    "and required qualifiers intact. Every prefix of the bubble list must preserve "
+    "the original meaning: put attribution, negation, uncertainty, simulation and "
+    "restrictions in the same bubble as the assertion, never postpone them. No "
+    "dedicated segmentation call is available."
+)
+
 
 
 def _d13_block(ref: VersionedRef) -> bool:
@@ -250,11 +264,16 @@ def _parse_natural_reply_output_payload(text, frozen) -> UntrustedNaturalReplyOu
         data = json.loads(text, object_pairs_hook=_unique_fields)
     except json.JSONDecodeError as exc:
         raise ValueError("natural generation output is not JSON") from exc
-    if (type(data) is not dict or set(data) != {"schema", "body", "units"}
-            or data["schema"] != OUTPUT_SCHEMA or type(data["body"]) is not str
+    semantic_batch = getattr(frozen, "schema", None) in {"sylanne.d09.frozen_natural_request.v5", "sylanne.d09.frozen_natural_request.v6", "sylanne.d09.frozen_natural_request.v7"}
+    expected_fields = {"schema", "body", "units"} | ({"semantic_segments"} if semantic_batch else set())
+    if (type(data) is not dict or set(data) != expected_fields
+            or data["schema"] != (OUTPUT_SCHEMA_V3 if semantic_batch else OUTPUT_SCHEMA)
+            or type(data["body"]) is not str
             or len(data["body"]) > 2048 or type(data["units"]) is not list
             or len(data["units"]) > 16):
         raise ValueError("natural generation output shape differs")
+    if semantic_batch:
+        natural_semantic_ranges_v3(data)
     status = validate_expression_output_units_v2(data, frozen.input.plan)
     return UntrustedNaturalReplyOutputV2(
         frozen.frozen_input_digest, frozen.qualified_units_digest,
@@ -268,14 +287,22 @@ def validate_expression_output_units_v2(data, plan, *, require_all_slots=True):
     The calling parser checks its own wire schema and size. This function
     neither issues a qualified source nor authenticates a paid model result.
     """
+    return _validate_expression_output_scope_v2(data,
+        basis_kinds={unit.basis_id:unit.kind.value for unit in plan.units},
+        allowed_grants={ref.ref for ref in plan.promise_grants},
+        required_slots=plan.required_slots,allowed_speech_acts=plan.allowed_speech_acts,
+        require_all_slots=require_all_slots)
+
+
+def _validate_expression_output_scope_v2(data, *, basis_kinds, allowed_grants,
+        required_slots, allowed_speech_acts, require_all_slots=True):
+    """Same pure scope algorithm for decoded originals; this grants no authority."""
     body, units = data["body"], data["units"]
     if not body and not units:
         return "no_reply_hold"
     if (not body or not units
             or any(ord(ch) < 32 and ch not in "\n\t" for ch in body)):
         raise ValueError("natural generation body and units differ")
-    basis = {unit.basis_id: unit for unit in plan.units}
-    allowed_grants = {ref.ref for ref in plan.promise_grants}
     covered_slots: set[str] = set()
     cursor = 0
     for item in units:
@@ -292,15 +319,15 @@ def validate_expression_output_units_v2(data, plan, *, require_all_slots=True):
                 or type(ids) is not list or not ids
                 or any(type(value) is not str for value in ids)
                 or len(ids) != len(set(ids))
-                or any(value not in basis for value in ids)
+                or any(value not in basis_kinds for value in ids)
                 or type(slots) is not list
                 or any(type(value) is not str for value in slots)
                 or len(slots) != len(set(slots))
-                or any(value not in plan.required_slots for value in slots)
+                or any(value not in required_slots for value in slots)
                 or type(kind) is not str
-                or any(basis[value].kind.value != kind for value in ids)
+                or any(basis_kinds[value] != kind for value in ids)
                 or type(act) is not str
-                or act not in plan.allowed_speech_acts
+                or act not in allowed_speech_acts
                 or (act == "promise" and (type(grant) is not str
                                           or grant not in allowed_grants))
                 or (act != "promise" and grant is not None)):
@@ -308,7 +335,7 @@ def validate_expression_output_units_v2(data, plan, *, require_all_slots=True):
         covered_slots.update(slots)
         cursor = end
     if (body[cursor:].strip()
-            or (require_all_slots and not set(plan.required_slots).issubset(covered_slots))):
+            or (require_all_slots and not set(required_slots).issubset(covered_slots))):
         raise ValueError("natural generation leaves text or required slots uncovered")
     return "untrusted_content_candidate"
 

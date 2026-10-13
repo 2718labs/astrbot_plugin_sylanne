@@ -24,8 +24,8 @@ from ..domains.d08.execution import (
     ActionSchema, ActionSchemaRecord, GoalExecutionProvider,
 )
 from ..domains.d08.natural_plan import natural_route_semantic_digest_v2
-from ..domains.d09.natural_batch import validate_natural_verified_batch_value_v2
-from ..graph_coordinator import namespace_ref
+from ..domains.d09.natural_batch import validate_natural_verified_batch_value, natural_batch_segment_count
+from ..runtime_contracts import namespace_ref
 from ..graph_types import AtomKey, GraphWrite
 from ..runtime_contracts import CommitReceipt, NamespaceId, canonical_digest
 from .dispatch_admission import (
@@ -52,6 +52,24 @@ from .reply_model_job import CurrentReplyRouteManifestV2
 
 class NaturalDispatchClaimHold(RuntimeError):
     """One final natural predicate is unavailable or changed."""
+
+
+def require_natural_action_uncancelled_v3(db, namespace, evidence, cancel_epoch: int) -> None:
+    """Read the existing durable D08 cancellation head in the held snapshot."""
+    action_key = AtomKey.from_token(evidence.action_ref)
+    key = AtomKey(action_key.owner, "d08.action_cancellation.v1", action_key.name)
+    row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                     (key.token, *namespace.as_tuple)).fetchone()
+    if row is None or row[1] != 1:
+        raise NaturalDispatchClaimHold("natural cancellation head is unavailable")
+    validator = next(spec.validator for spec in GoalExecutionProvider().register_types()
+                     if spec.name == key.type_name)
+    state = validator(json.loads(row[0]))
+    if (state.action_id != action_key.name or state.action_digest != evidence.action_digest
+            or state.activity_id != action_key.owner.subject
+            or state.effect_id != evidence.effect_id or state.state != "active"
+            or state.cancel_epoch != cancel_epoch):
+        raise NaturalDispatchClaimHold("natural reply was durably cancelled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +115,7 @@ def prepare_natural_dispatch_claim_v2(
     if load_admission(db, namespace, admission.admission_ref) != admission_receipt:
         raise NaturalDispatchClaimHold("committed natural admission differs")
     try:
-        validate_natural_verified_batch_value_v2(batch)
+        validate_natural_verified_batch_value(batch)
         require_exact_reverse_handoff_identity(
             namespace_ref(namespace), context, binding, claimed)
         require_exact_authority_snapshot(context, witness, authority_snapshot)
@@ -139,11 +157,13 @@ def prepare_natural_dispatch_claim_v2(
             or (evidence.operation_id, evidence.effect_id)
                != (request.operation_id, request.effect_id)
             or request.payload_ref != natural_dispatch_segment_payload_ref_v2(
-                evidence.batch_ref, 0)
-            or request.segment_index != 0 or request.segment_count != 1
+                evidence.batch_ref, batch["segment"]["position"])
+            or request.segment_index != batch["segment"]["position"]
+            or request.segment_count != natural_batch_segment_count(batch)
             or request.proactive_contact):
         raise NaturalDispatchClaimHold("committed natural admission or effect differs")
     paid, segment = batch["paid_review"], batch["segment"]
+    require_natural_action_uncancelled_v3(db, namespace, evidence, request.cancel_epoch)
     history = db.execute(
         "SELECT value,valid FROM graph_history WHERE token=? AND event_bot=? "
         "AND event_persona=? AND event_session=? AND event_id=?",

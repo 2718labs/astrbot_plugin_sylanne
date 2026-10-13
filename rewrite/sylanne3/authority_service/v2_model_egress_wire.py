@@ -19,10 +19,16 @@ from ..runtime_contracts import (
 from .v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
+    ModelEgressObservationV1, model_observation_to_wire_v1, model_observation_from_wire_v1,
+    host_model_completion_to_wire_v2, host_model_completion_from_wire_v2,
 )
 
 
 def _plain(value):
+    if type(value) is ModelEgressObservationV1:
+        return model_observation_to_wire_v1(value)
+    if type(value) is HostObservedModelCompletionV2:
+        return host_model_completion_to_wire_v2(value)
     if is_dataclass(value) and not isinstance(value, type):
         return {field.name: _plain(getattr(value, field.name)) for field in fields(value)}
     if type(value) is frozenset:
@@ -42,7 +48,7 @@ def to_wire(value):
     if type(value) not in {ModelEgressDraftV1, ModelEgressIntentV1,
                            ModelEgressRecoveryV1, ModelCallRequest,
                            ModelAdmissionV2, HostObservedModelCompletionV2,
-                           ModelTerminalReceiptV2}:
+                           ModelTerminalReceiptV2, ModelEgressObservationV1}:
         raise ValueError("unsupported model wire type")
     plain = _plain(value)
     # Reject NaN and other values that cannot cross the stdlib JSON transport.
@@ -66,6 +72,45 @@ def _pairs(value):
     return tuple(tuple(_list(item)) for item in _list(value))
 
 
+def command_envelope_from_wire_v2(value):
+    """Decode the existing exact formal envelope without fabricating a model body."""
+    envelope = _shape(value, CommandEnvelope)
+    authority = _shape(envelope["authority"], AuthorityContext)
+    authority["namespace"] = NamespaceId(**_shape(authority["namespace"], NamespaceId))
+    for name in ("owner_scope", "audience"):
+        authority[name] = tuple(_list(authority[name]))
+    guard = _shape(envelope["version_guard"], VersionGuard)
+    reads = []
+    for item in _list(guard["read_versions"]):
+        version = _shape(item, GraphVersion)
+        key = _shape(version["key"], AtomKey)
+        key["owner"] = Owner(**_shape(key["owner"], Owner))
+        version["key"] = AtomKey(**key)
+        reads.append(GraphVersion(**version))
+    guard["read_versions"] = tuple(reads)
+    queries = []
+    for item in _list(guard["query_epochs"]):
+        query = _shape(item, QueryEpoch)
+        query["namespace"] = NamespaceId(**_shape(query["namespace"], NamespaceId))
+        queries.append(QueryEpoch(**query))
+    guard["query_epochs"] = tuple(queries)
+    for name in ("source_grant_refs", "focus_lease_versions", "resource_lease_versions"):
+        guard[name] = tuple(VersionedRef(**_shape(item, VersionedRef))
+                            for item in _list(guard[name]))
+    qualification = _shape(envelope["source_qualification"], SourceQualification)
+    qualification["source_refs"] = tuple(_list(qualification["source_refs"]))
+    envelope["identity"] = OperationIdentity(**_shape(envelope["identity"], OperationIdentity))
+    envelope["authority"] = AuthorityContext(**authority)
+    envelope["version_guard"] = VersionGuard(**guard)
+    envelope["source_qualification"] = SourceQualification(**qualification)
+    for name in ("input_refs", "causation"):
+        envelope[name] = tuple(_list(envelope[name]))
+    result = CommandEnvelope(**envelope)
+    if _plain(result) != value:
+        raise ValueError("noncanonical command envelope wire value")
+    return result
+
+
 def from_wire(value, kind):
     if kind in {ModelEgressDraftV1, ModelEgressIntentV1}:
         shaped = _shape(value, kind)
@@ -82,44 +127,12 @@ def from_wire(value, kind):
     elif kind in {ModelAdmissionV2, ModelTerminalReceiptV2}:
         result = kind(**_shape(value, kind))
     elif kind is HostObservedModelCompletionV2:
-        shaped = _shape(value, kind)
-        shaped["usage"] = _pairs(shaped["usage"])
-        shaped["cost"] = _pairs(shaped["cost"])
-        result = kind(**shaped)
+        result = host_model_completion_from_wire_v2(value)
+    elif kind is ModelEgressObservationV1:
+        result = model_observation_from_wire_v1(value)
     elif kind is ModelCallRequest:
         shaped = _shape(value, ModelCallRequest)
-        envelope = _shape(shaped["envelope"], CommandEnvelope)
-        authority = _shape(envelope["authority"], AuthorityContext)
-        authority["namespace"] = NamespaceId(**_shape(authority["namespace"], NamespaceId))
-        for name in ("owner_scope", "audience"):
-            authority[name] = tuple(_list(authority[name]))
-        guard = _shape(envelope["version_guard"], VersionGuard)
-        reads = []
-        for item in _list(guard["read_versions"]):
-            version = _shape(item, GraphVersion)
-            key = _shape(version["key"], AtomKey)
-            key["owner"] = Owner(**_shape(key["owner"], Owner))
-            version["key"] = AtomKey(**key)
-            reads.append(GraphVersion(**version))
-        guard["read_versions"] = tuple(reads)
-        queries = []
-        for item in _list(guard["query_epochs"]):
-            query = _shape(item, QueryEpoch)
-            query["namespace"] = NamespaceId(**_shape(query["namespace"], NamespaceId))
-            queries.append(QueryEpoch(**query))
-        guard["query_epochs"] = tuple(queries)
-        for name in ("source_grant_refs", "focus_lease_versions", "resource_lease_versions"):
-            guard[name] = tuple(VersionedRef(**_shape(item, VersionedRef))
-                                for item in _list(guard[name]))
-        qualification = _shape(envelope["source_qualification"], SourceQualification)
-        qualification["source_refs"] = tuple(_list(qualification["source_refs"]))
-        envelope["identity"] = OperationIdentity(**_shape(envelope["identity"], OperationIdentity))
-        envelope["authority"] = AuthorityContext(**authority)
-        envelope["version_guard"] = VersionGuard(**guard)
-        envelope["source_qualification"] = SourceQualification(**qualification)
-        for name in ("input_refs", "causation"):
-            envelope[name] = tuple(_list(envelope[name]))
-        shaped["envelope"] = CommandEnvelope(**envelope)
+        shaped["envelope"] = command_envelope_from_wire_v2(shaped["envelope"])
         shaped["required_capabilities"] = frozenset(_list(shaped["required_capabilities"]))
         result = ModelCallRequest(**shaped)
     else:
@@ -129,4 +142,4 @@ def from_wire(value, kind):
     return result
 
 
-__all__ = ["from_wire", "to_wire"]
+__all__ = ["from_wire", "to_wire", "command_envelope_from_wire_v2"]

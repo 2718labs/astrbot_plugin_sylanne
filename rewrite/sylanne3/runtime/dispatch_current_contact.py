@@ -41,6 +41,7 @@ def read_current_contact(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
     intent: ActionIntent, policy_id: str, opportunity_id: str, *, now: float,
     current_policy=None, scope=None, continuation: ContactContinuation | None = None,
+    prepared_inventory=None,
 ) -> CurrentContactReadV1:
     """Verify the full contact namespace inventory under caller-held BEGIN IMMEDIATE.
 
@@ -51,7 +52,7 @@ def read_current_contact(
     """
     if not db.in_transaction:
         raise ValueError("contact read requires the graph write transaction")
-    if (type(namespace) is not NamespaceId or type(snapshot) is not GraphSnapshot
+    if (type(namespace) is not NamespaceId or (type(snapshot) is not GraphSnapshot if prepared_inventory is None else snapshot is not prepared_inventory.projection)
             or type(query) is not QueryEpoch or type(intent) is not ActionIntent):
         raise TypeError("typed namespace, snapshot, epoch and action are required")
     if (len(snapshot.epochs) != 1
@@ -68,11 +69,12 @@ def read_current_contact(
     if len(by_token) != len(atoms):
         raise ValueError("contact snapshot repeats a graph key")
     placeholders = ",".join("?" for _ in _CONTACT_TYPES)
-    rows = db.execute(
+    rows = (db.execute(
         "SELECT token,revision,value,type_name FROM graph_atoms "
         f"WHERE bot=? AND persona=? AND type_name IN ({placeholders}) "
         "AND valid=1 ORDER BY token", namespace.as_tuple + _CONTACT_TYPES,
     ).fetchall()
+        if prepared_inventory is None else prepared_inventory.atom_rows(db,namespace,query,_CONTACT_TYPES,('token','revision','value','type_name')))
     if len(rows) != len(atoms):
         raise ValueError("contact snapshot omits or invents a current row")
     policy_rows, opportunity_rows, claims = [], [], []
@@ -83,7 +85,7 @@ def read_current_contact(
         atom = by_token.get(token)
         if (atom is None or atom.key != AtomKey.from_token(token)
                 or atom.key.type_name != type_name or atom.revision != revision
-                or atom.value != json.loads(encoded)
+                or atom.value != (json.loads(encoded) if prepared_inventory is None else encoded)
                 or atom.key.owner.kind != "persona"
                 or (atom.key.owner.bot, atom.key.owner.persona) != namespace.as_tuple):
             raise ValueError("contact graph row changed")
@@ -146,9 +148,15 @@ def read_current_contact(
     if (grant["authority_id"] != policy_atom.value["approval_authority_id"]
             or grant["installation_id"] != policy_atom.value["installation_id"]):
         raise ValueError("policy approval authority differs from Owner grant")
-    source_key, source_value = current_binding(
-        opportunity.source_ref, opportunity_atom.value["source_revision"])
-    if SourceRecord.from_dict(source_value).source_id != source_key.owner.subject:
+    if prepared_inventory is None:
+        source_key, source_value = current_binding(opportunity.source_ref,opportunity_atom.value["source_revision"])
+        source_id = SourceRecord.from_dict(source_value).source_id
+    else:
+        source_key = AtomKey.from_token(opportunity.source_ref)
+        source = prepared_inventory.source_metadata(db,namespace,query,source_key,
+            revision=opportunity_atom.value["source_revision"])
+        source_id = source.metadata['source_id']
+    if source_id != source_key.owner.subject:
         raise ValueError("opportunity source identity changed")
     access = access_key(*namespace.as_tuple, source_key.owner.subject)
     _, access_value = current_binding(access.token, opportunity_atom.value["access_revision"])
@@ -189,7 +197,7 @@ def read_current_contact(
     from .dispatch_source_correction_barrier import read_source_correction_barrier
     correction = read_source_correction_barrier(db, namespace, query,
         tuple(dict.fromkeys((opportunity.source_ref, *intent.source_refs))),
-        dependent_ref=intent.action_id)
+        dependent_ref=intent.action_id, prepared_inventory=prepared_inventory)
     missing.extend(correction.missing_sources)
     receipt = CheckReceipt(spec[0].check_kind, spec[0].subject_ref, spec[0].action_ref,
                            spec[0].purpose, spec[0].required_input_versions, "full",

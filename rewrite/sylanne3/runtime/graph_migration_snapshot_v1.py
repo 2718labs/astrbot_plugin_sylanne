@@ -7,10 +7,11 @@ Unknown tables and records without a provable namespace owner stop sealing.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from hashlib import sha256
 import json
 import re
+import sqlite3
 
 from ..contracts import canonical_json
 from ..graph_store import (
@@ -72,6 +73,8 @@ _DIRECT = frozenset("""
  graph_d08_joint_plan_intents_v1 graph_d08_party_consents_v1
  graph_d10_production_inputs_v1 graph_d10_observed_ticks_v1
  graph_d11_offline_originals_v1
+ graph_d11_derived_cache_payloads_v1 graph_d13_derived_activations_v6 graph_d13_wire_evidence_v6 graph_d13_core_wire_evidence_v1
+ graph_d13_paid_owner_guard_links_v3
  graph_d07_execution_originals_v1 graph_d07_stage_attempts_v1 graph_d07_accounting_attempts_v1
  graph_d07_behavior_original_v1
  graph_d07_attention_issuance_v1 graph_d07_attention_decisions_v2 graph_d07_observed_focus_v2 graph_d07_deferred_release_v2
@@ -100,6 +103,7 @@ _DIRECT = frozenset("""
  graph_job_acquire_receipts_v2 graph_job_acquire_rejections_v2
  graph_namespace_provision_intents_v2 graph_namespace_provisioning_v2
  graph_migration_import_receipts_v1
+ graph_catalogue_upgrades_v1 graph_catalogue_upgrade_batches_v1 graph_catalogue_upgrade_frontier_v1
  graph_natural_generation_acquires_v2 graph_natural_generation_attempts_v2
  graph_natural_generation_scopes_v2 graph_natural_generation_terminals_v2
  graph_natural_generation_output_reads_v2
@@ -147,7 +151,16 @@ _CATALOGUE = frozenset({"graph_type_catalog", "graph_type_authority"})
 _SIGNED_JSON = frozenset(('runtime_budget_grants', 'runtime_resource_quotes', 'runtime_resource_outcomes', 'runtime_d03_arrival_quote_policies', 'runtime_private_reply_dispatch_policies_v1', 'runtime_d04_baseline_quote_policies', 'runtime_d03_self_projection_quote_policies', 'runtime_d06_c02_quote_policies', 'runtime_d06_correction_quote_policies'))
 _CLOCK_LINKED = frozenset({"runtime_character_clocks", "runtime_clock_operations"})
 _SPECIAL = _CLOCK_LINKED | frozenset({"graph_history"}) | _TOKEN_LINKED | _LEASE_LINKED | _SIGNED_JSON
-_KNOWN = _DIRECT | _SPECIAL | _GLOBAL_EMPTY | _CATALOGUE
+_LIFE_TABLES = frozenset({"graph_d11_life_originals_v1", "graph_d11_life_artifact_stage_v1"})
+_LIFE_KINDS = frozenset({
+    "source_note_action", "draft_action", "activity_scope", "draft_root_capability",
+    "draft_observation_admission", "life_body_preparation", "action_admission", "plan",
+    "outcome", "prepared", "accounting_prepared", "adoption_bridge", "adoption_receipt",
+    "historical_accounting_gate", "historical_accounting_receipt", "experience", "adopted_life",
+    "c4_frozen", "c4_prepared", "c4_request", "c4_call", "c4_result", "c4_paid", "c4_adopted",
+    "foreground_post_c02_cause",
+})
+_KNOWN = _DIRECT | _SPECIAL | _GLOBAL_EMPTY | _CATALOGUE | _LIFE_TABLES
 
 
 class IncompleteMigrationClosure(ValueError):
@@ -215,6 +228,8 @@ def _json_value(value: object) -> object:
         return [_json_value(item) for item in value]
     if type(value) is dict:
         return {key: _json_value(item) for key, item in value.items()}
+    if type(value) is bytes:
+        return {"sqlite_blob_hex": value.hex()}  # Digest encoding only; imported rows keep the original BLOB.
     if value is None or type(value) in (str, int, float, bool):
         return value
     raise IncompleteMigrationClosure("snapshot contains a non-JSON database value")
@@ -336,6 +351,13 @@ def _clock_row_owner(table, columns, row, originals):
 
 def _routed_rows(db, table: str, columns: tuple[str, ...],
                  namespace: NamespaceId) -> tuple[tuple[object, ...], ...]:
+    if table in _LIFE_TABLES:
+        selected = []
+        for row in db.execute("SELECT * FROM "+table):
+            owner, _, _ = _validate_life_row(table, columns, row)
+            if owner == namespace:
+                selected.append(row)
+        return tuple(selected)
     if table in _CLOCK_LINKED:
         source = "runtime_d11_owner_role_clock_originals_v1"
         originals = _clock_original_index(_columns(db, source), tuple(db.execute(f"SELECT * FROM {source}")))
@@ -437,6 +459,17 @@ def _routed_rows(db, table: str, columns: tuple[str, ...],
                         raise IncompleteMigrationClosure("budget parent crosses namespace")
         if table == "runtime_jobs":
             for row in rows:
+                if row[columns.index("work_kind")] == "d11.foreground_cycle.v1":
+                    from .jobs import get_job
+                    from .foreground_cycle_v1 import foreground_job_source_refs_v1
+                    job = get_job(db, row[columns.index("job_id")])
+                    if job.continuation.get("schema") == "d11.owner-source-note-task-continuation.v2":
+                        from .owner_source_note_task_contract_v1 import OwnerSourceNoteTaskContinuationV2, owner_source_note_task_from_wire_v1
+                        source_refs = owner_source_note_task_from_wire_v1(dict(job.continuation), OwnerSourceNoteTaskContinuationV2).source_refs
+                        if any(NamespaceId.from_key(AtomKey.from_token(ref)) != namespace for ref in source_refs):
+                            raise IncompleteMigrationClosure("Owner task source crosses namespace")
+                    else:
+                        foreground_job_source_refs_v1(job)
                 budget_ref = row[columns.index("budget_ref")]
                 if budget_ref:
                     owner = db.execute(
@@ -456,6 +489,220 @@ def _routed_rows(db, table: str, columns: tuple[str, ...],
     raise IncompleteMigrationClosure(f"unreviewed table {table}")
 
 
+def _validate_life_schema(db) -> None:
+    from .d11_life_preparation_v1 import DDL
+    from .d11_life_source_note_v1 import STAGE_DDL
+    from .domain_production_erasure_v1 import TABLE_COLUMNS
+    expected = sqlite3.connect(":memory:")
+    try:
+        expected.execute(DDL)
+        expected.execute(STAGE_DDL)
+        for table in _LIFE_TABLES:
+            actual = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            wanted = expected.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            objects = "SELECT type,name,sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') ORDER BY type,name"
+            if (actual != wanted or _columns(db, table) != TABLE_COLUMNS[table]
+                    or tuple(db.execute("PRAGMA table_info("+table+")")) != tuple(expected.execute("PRAGMA table_info("+table+")"))
+                    or tuple(db.execute(objects, (table,))) != tuple(expected.execute(objects, (table,)))):
+                raise IncompleteMigrationClosure("Life durable schema differs: "+table)
+    finally:
+        expected.close()
+
+
+def _require_life_typed_namespace(value, namespace) -> None:
+    from .d11_life_contract_v1 import LifeInputRefV1
+    from .d10_offline_tick_execution_v1 import OfflineTickGraphReadV1
+    if type(value) is NamespaceId:
+        if value != namespace:
+            raise ValueError("Life typed namespace differs")
+    elif type(value) is AtomKey:
+        if NamespaceId.from_key(value) != namespace:
+            raise ValueError("Life typed Graph reference crosses namespace")
+    elif type(value) in {LifeInputRefV1, OfflineTickGraphReadV1}:
+        if NamespaceId.from_key(AtomKey.from_token(value.ref)) != namespace:
+            raise ValueError("Life registered read reference crosses namespace")
+    elif is_dataclass(value):
+        for field in fields(value):
+            _require_life_typed_namespace(getattr(value, field.name), namespace)
+    elif type(value) in {tuple, list}:
+        for item in value:
+            _require_life_typed_namespace(item, namespace)
+    elif type(value) is dict:
+        for item in value.values():
+            _require_life_typed_namespace(item, namespace)
+
+
+def _validate_life_row(table, columns, row, expected_namespace=None):
+    from .domain_production_erasure_v1 import (
+        DomainProductionErasureHold, TABLE_COLUMNS, _json, validate_domain_production_row_v1,
+    )
+    from .c09_life_originals_v1 import decode_life_original_content_v1
+    from ..graph_coordinator import namespace_ref
+    from ..runtime_contracts import canonical_serialize
+    try:
+        if columns != TABLE_COLUMNS[table] or type(row) is not tuple or len(row) != len(columns):
+            raise ValueError("Life columns or row width differs")
+        data = dict(zip(columns, row))
+        namespace = NamespaceId(data["bot"], data["persona"])
+        if expected_namespace is not None and namespace != expected_namespace:
+            raise ValueError("Life row crosses snapshot namespace")
+        if table == "graph_d11_life_originals_v1" and data["kind"] not in _LIFE_KINDS:
+            raise ValueError("unregistered Life snapshot kind")
+        kind, ref, raw, digest = validate_domain_production_row_v1(
+            table, columns, row, authority_namespace=namespace_ref(namespace))
+        if table == "graph_d11_life_originals_v1":
+            if canonical_serialize(_json(data["payload_json"])) != data["payload_json"]:
+                raise ValueError("Life original JSON is not canonical")
+            decoded = decode_life_original_content_v1(kind, data["payload_json"])
+        else:
+            if canonical_serialize(raw).encode("utf-8") != data["artifact_bytes"]:
+                raise ValueError("Life artifact bytes are not canonical")
+            if type(data["binding_digest"]) is not str or not re.fullmatch("[0-9a-f]{64}", data["binding_digest"]):
+                raise ValueError("Life stage binding digest differs")
+            if (type(data["execution_id"]) is not str or not data["execution_id"]
+                    or data["adopted_operation_id"] is not None and
+                    (type(data["adopted_operation_id"]) is not str or not data["adopted_operation_id"])):
+                raise ValueError("Life stage execution/adoption identity differs")
+            decoded = raw
+        _require_life_typed_namespace(decoded, namespace)
+        return namespace, data, decoded
+    except (DomainProductionErasureHold, ValueError, TypeError, KeyError) as exc:
+        raise IncompleteMigrationClosure("Life durable row is not closed") from exc
+
+
+def _check_life_producer_row(data, operation, columns, namespace) -> None:
+    from .domain_production_erasure_v1 import DomainProductionErasureHold, _json
+    try:
+        sequence = operation[columns.index("commit_seq")]
+        raw = _json(operation[columns.index("receipt_json")])
+        if type(sequence) is not int or sequence < 1 or type(raw) is not dict:
+            raise ValueError("Life producer has no actual committed sequence")
+        if data["kind"] in {"c4_paid", "c4_result"}:
+            # These two finite originals use the existing model-cost receipt ABI,
+            # rather than the ordinary Graph CommitReceipt JSON shape.
+            from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1
+            from .model_cost_settlement import original_model_cost_operation_id_v1
+            if set(raw) != {"original_model_cost", "original_intent_digest", "terminal_receipt_digest",
+                    "quote_id", "quote_version", "work_kind", "accounting_attempt_id"} or raw["work_kind"] != "artifact_draft_v1":
+                raise ValueError("C4 producer financial receipt variant differs")
+            paid = decode_artifact_draft_original_v1("c4_paid", raw["original_model_cost"])
+            if (paid.operation_id != data["producing_operation_id"] or paid.commit_seq != sequence
+                    or paid.operation_id != original_model_cost_operation_id_v1(namespace, paid.call_id)
+                    or NamespaceId.from_key(AtomKey.from_token(paid.cost_ref)) != namespace
+                    or (raw["terminal_receipt_digest"], raw["quote_id"], raw["quote_version"]) !=
+                       (paid.terminal_receipt_digest, paid.quote_id, paid.quote_version)):
+                raise ValueError("C4 producer lost exact original financial identity")
+        elif raw.get("commit_seq") != sequence:
+            raise ValueError("Life producer committed receipt differs")
+    except (DomainProductionErasureHold, ValueError, TypeError, KeyError) as exc:
+        raise IncompleteMigrationClosure("Life original lost its exact committed producer receipt") from exc
+
+
+def _check_life_entries(entries, namespace) -> None:
+    from .d11_life_source_note_v1 import generate_source_note_bytes_v1
+    from .domain_production_erasure_v1 import _json
+    originals = {}
+    prepared = {}
+    operations_columns, operations_rows = entries["graph_bundle_operations"]
+    operations = {row[operations_columns.index("operation_id")]: row for row in operations_rows}
+    for table in _LIFE_TABLES:
+        columns, rows = entries[table]
+        for row in rows:
+            _, data, value = _validate_life_row(table, columns, row, namespace)
+            if table == "graph_d11_life_originals_v1":
+                operation = operations.get(data["producing_operation_id"])
+                if operation is None or (
+                        operation[operations_columns.index("bot")], operation[operations_columns.index("persona")]) != namespace.as_tuple:
+                    raise IncompleteMigrationClosure("Life original lost its committed same-namespace producer")
+                _check_life_producer_row(data, operation, operations_columns, namespace)
+                key = (data["kind"], data["original_ref"])
+                if key in originals:
+                    raise IncompleteMigrationClosure("duplicate Life original identity")
+                originals[key] = (data, value)
+                if data["kind"] == "prepared":
+                    key = (value.binding.execution_id, value.binding.digest)
+                    if key in prepared:
+                        raise IncompleteMigrationClosure("duplicate Life execution preparation")
+                    prepared[key] = (data, value)
+    for data, value in prepared.values():
+        admission = originals.get(("action_admission", value.admission_ref))
+        if (admission is None or admission[0]["producing_operation_id"] != value.prepare_operation_id
+                or admission[0]["payload_digest"] != value.admission_digest
+                or admission[1].binding_digest != value.binding.digest
+                or admission[1].plan_digest != value.binding.plan_digest):
+            raise IncompleteMigrationClosure("Life preparation lost its exact action admission")
+    columns, rows = entries["graph_d11_life_artifact_stage_v1"]
+    for row in rows:
+        _, data, _ = _validate_life_row("graph_d11_life_artifact_stage_v1", columns, row, namespace)
+        prior = prepared.get((data["execution_id"], data["binding_digest"]))
+        if prior is None:
+            raise IncompleteMigrationClosure("Life stage has no exact prepared execution")
+        _, value = prior
+        from .d11_life_contract_v1 import D11LifeExecutionBindingV1, RegisteredLifePlanV2
+        # This SQLite BLOB is produced only by the fixed SourceNote writer.
+        # Draft execution produces an external file and its separate typed witness.
+        if type(value.binding) is not D11LifeExecutionBindingV1 or type(value.plan) is not RegisteredLifePlanV2:
+            raise IncompleteMigrationClosure("SourceNote stage has another registered execution recipe")
+        if (value.binding.artifact_ref != data["artifact_ref"]
+                or generate_source_note_bytes_v1(value) != data["artifact_bytes"]):
+            raise IncompleteMigrationClosure("Life stage differs from its fixed prepared source note")
+        operation = data["adopted_operation_id"]
+        if operation is not None:
+            adopted = originals.get(("adopted_life", data["artifact_ref"]))
+            from .d11_life_contract_v1 import D11LifeTerminalV1, life_from_wire_v1
+            if adopted is None or adopted[0]["producing_operation_id"] != operation:
+                raise IncompleteMigrationClosure("Life stage lost its actual adoption")
+            terminal = life_from_wire_v1(adopted[1]["terminal"], D11LifeTerminalV1)
+            if (terminal.binding != value.binding
+                    or terminal.payload.artifact_digest != data["artifact_digest"]
+                    or terminal.payload.artifact_length != data["artifact_length"]):
+                raise IncompleteMigrationClosure("Life stage differs from its adopted terminal")
+
+
+def _check_life_db_joins(db) -> None:
+    from .c09_life_originals_v1 import (
+        validate_life_original_joins_v1, validate_foreground_responsibility_archive_closure_v1,
+    )
+    from .domain_production_erasure_v1 import DomainProductionErasureHold
+    from .jobs import _job_from_row
+    try:
+        validate_life_original_joins_v1(db)
+        for row in db.execute("SELECT * FROM runtime_jobs WHERE work_kind='d11.foreground_cycle.v1'"):
+            job = _job_from_row(row)
+            if job.continuation.get("schema") == "d11.owner-source-note-task-continuation.v2":
+                from .c09_life_originals_v1 import validate_owner_task_responsibility_archive_closure_v2
+                validate_owner_task_responsibility_archive_closure_v2(db, namespace=NamespaceId(job.bot_id, job.persona_id), job=job)
+            else:
+                validate_foreground_responsibility_archive_closure_v1(
+                    db, namespace=NamespaceId(job.bot_id, job.persona_id), job=job)
+    except (DomainProductionErasureHold, ValueError, TypeError, KeyError) as exc:
+        raise IncompleteMigrationClosure("Life durable composite joins differ") from exc
+
+
+def _check_paid_owner_link_entries_v3(db, entries, namespace):
+    """Snapshot routing retains exact metadata; current Core/Owner qualification remains deferred."""
+    from ..authority_service.v3_owner_paid_guard_observation import (
+        GRAPH_TABLE, GRAPH_COLUMNS, GRAPH_DDL_MAP, validate_paid_owner_guard_link_row_v3)
+    if GRAPH_TABLE not in entries:
+        return
+    expected = tuple(sorted(("table" if name == GRAPH_TABLE else "trigger", name, ddl)
+        for name, ddl in GRAPH_DDL_MAP.items()))
+    actual = tuple(db.execute("SELECT type,name,sql FROM sqlite_master "
+        "WHERE tbl_name=? AND sql IS NOT NULL ORDER BY type,name", (GRAPH_TABLE,)))
+    if actual != expected:
+        raise IncompleteMigrationClosure("paid Owner link durable schema differs")
+    columns, rows = entries[GRAPH_TABLE]
+    if columns != GRAPH_COLUMNS:
+        raise IncompleteMigrationClosure("paid Owner link exact columns differ")
+    for row in rows:
+        try:
+            actual_namespace = validate_paid_owner_guard_link_row_v3(row)
+        except ValueError as error:
+            raise IncompleteMigrationClosure("paid Owner link durable row is not closed") from error
+        if actual_namespace != namespace:
+            raise IncompleteMigrationClosure("paid Owner link crosses snapshot namespace")
+
+
 def _inventory(db, namespace: NamespaceId):
     names = _table_names(db)
     unknown = names - _KNOWN
@@ -468,6 +715,7 @@ def _inventory(db, namespace: NamespaceId):
     if missing := required - names:
         raise IncompleteMigrationClosure(
             "missing required tables: " + ", ".join(sorted(missing)))
+    _validate_life_schema(db)
     tables = []
     for name in sorted(names):
         if name in _CATALOGUE or name in _GLOBAL_EMPTY:
@@ -478,6 +726,10 @@ def _inventory(db, namespace: NamespaceId):
         # Sorting encoded rows makes the digest independent of SQLite scan order.
         ordered = tuple(sorted(rows, key=lambda row: canonical_json(_json_value(row))))
         tables.append((name, columns, ordered))
+    entries = {name: (columns, rows) for name, columns, rows in tables}
+    _check_life_entries(entries, namespace)
+    _check_paid_owner_link_entries_v3(db, entries, namespace)
+    _check_life_db_joins(db)
     return tuple(tables)
 
 
@@ -581,6 +833,16 @@ def _check_empty_target_in_tx(db, snapshot: NamespaceGraphSnapshotV1) -> None:
 def _check_snapshot_rows(db, snapshot: NamespaceGraphSnapshotV1) -> None:
     namespace = snapshot.namespace.as_tuple
     entries = {name: (columns, rows) for name, columns, rows in snapshot.tables}
+    _check_life_entries(entries, snapshot.namespace)
+    _check_paid_owner_link_entries_v3(db, entries, snapshot.namespace)
+    from .domain_production_erasure_v1 import DERIVED_STORE_TABLES_V6, TABLE_COLUMNS, validate_domain_production_row_v1
+    for table in DERIVED_STORE_TABLES_V6:
+        if table in entries:
+            columns, rows = entries[table]
+            if columns != TABLE_COLUMNS[table]:
+                raise IncompleteMigrationClosure('derived cache snapshot has another exact table layout')
+            for row in rows:
+                validate_domain_production_row_v1(table, columns, row)
     clock_columns, clock_rows = entries.get("runtime_d11_owner_role_clock_originals_v1", ((), ()))
     clock_originals = _clock_original_index(clock_columns, clock_rows) if clock_columns else {}
     lease_columns, leases = entries["runtime_budget_leases"]
@@ -629,6 +891,29 @@ def _check_snapshot_rows(db, snapshot: NamespaceGraphSnapshotV1) -> None:
                     columns.index("cause_lease_id")] not in lease_ids:
                 raise IncompleteMigrationClosure("budget debt cause is absent")
             if name == "runtime_jobs":
+                if row[columns.index("work_kind")] == "d11.foreground_cycle.v1":
+                    from .jobs import _job_from_row
+                    from .foreground_cycle_v1 import foreground_cycle_from_wire_v1, foreground_job_source_refs_v1
+                    job = _job_from_row(row)
+                    if job.continuation.get("schema") == "d11.owner-source-note-task-continuation.v2":
+                        from .owner_source_note_task_execution_v1 import decode_owner_source_note_task_job_v1
+                        from .jobs import _job_dict
+                        from .owner_source_note_task_contract_v1 import OwnerSourceNoteTaskContinuationV2
+                        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+                        decode_owner_source_note_task_job_v1(_job_dict(job),namespace=snapshot.namespace)
+                        continuation = decode_typed_production_value_v1(dict(job.continuation),OwnerSourceNoteTaskContinuationV2)
+                        for source_ref in continuation.source_refs:
+                            key = AtomKey.from_token(source_ref)
+                            if key.type_name != 'memory.source' or NamespaceId.from_key(key) != snapshot.namespace:
+                                raise IncompleteMigrationClosure('Owner task source closure crossed snapshot namespace')
+                    else:
+                        foreground_job_source_refs_v1(job)
+                        child_ref = foreground_cycle_from_wire_v1(job.continuation).call_plan.protected_reply_lease_ref
+                        budget_columns, budget_rows = entries["runtime_budget_leases"]
+                        child = tuple(value for value in budget_rows if value[budget_columns.index("lease_id")] == child_ref)
+                        if (len(child) != 1 or child[0][budget_columns.index("parent_id")] != job.budget_ref
+                                or (child[0][budget_columns.index("bot_id")], child[0][budget_columns.index("persona_id")]) != namespace):
+                            raise IncompleteMigrationClosure("foreground protected child lost its exact original parent/namespace")
                 budget = row[columns.index("budget_ref")]
                 if budget and budget not in lease_ids:
                     raise IncompleteMigrationClosure("job budget is absent")
@@ -651,14 +936,15 @@ def _check_snapshot_rows(db, snapshot: NamespaceGraphSnapshotV1) -> None:
 
 def _read_import_receipt_locked(db, namespace: NamespaceId,
                                 transfer_id: str) -> TargetGraphImportReceiptV1 | None:
-    row = db.execute(
-        "SELECT snapshot_digest,closure_digest,source_graph_revision,"
-        "target_graph_revision,receipt_json FROM graph_migration_import_receipts_v1 "
-        "WHERE bot=? AND persona=? AND transfer_id=?",
-        (*namespace.as_tuple, transfer_id)).fetchone()
+    from .domain_background_read_v3 import background_point_v3,background_json_loads_v3
+    row=background_point_v3(db,table='graph_migration_import_receipts_v1',columns=(
+        'snapshot_digest','closure_digest','source_graph_revision','target_graph_revision','receipt_json'),
+        key_columns=('bot','persona','transfer_id'),key=(*namespace.as_tuple,transfer_id),legacy_reader=lambda:db.execute(
+            'SELECT snapshot_digest,closure_digest,source_graph_revision,target_graph_revision,receipt_json FROM graph_migration_import_receipts_v1 WHERE bot=? AND persona=? AND transfer_id=?',
+            (*namespace.as_tuple,transfer_id)).fetchone())
     if row is None:
         return None
-    data = json.loads(row[4])
+    data = background_json_loads_v3(row[4])
     if type(data) is not dict or set(data) != set(
             TargetGraphImportReceiptV1.__dataclass_fields__):
         raise IncompleteMigrationClosure("migration import receipt shape differs")

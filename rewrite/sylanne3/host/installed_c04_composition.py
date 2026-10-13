@@ -10,7 +10,7 @@ from ..authority_service.installed_c04_executor_v2 import (
 )
 from ..authority_service.internal_work_service import AuthorityInternalWorkService
 from ..authority_service.v2_execution_bridge import AuthorityV2ExecutionBridge
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from ..runtime_contracts import NamespaceId
 from .authority_profile import (
     load_admin_c04_signing_key, load_admin_installation_policy,

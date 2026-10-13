@@ -28,7 +28,7 @@ from .v2_owner_contract import (
     decode_bytes,
 )
 from .v2_owner_session import AuthorityV2OwnerSessionStore, OwnerSessionLoginRequestV1
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 
 
 _TICKETS = """CREATE TABLE authority_owner_claim_tickets_v1 (
@@ -197,6 +197,9 @@ class AuthorityV2OwnerTicketStore:
                 db.execute(_REVOKE_PENDING)
                 db.execute(_REVOKE_COMMITTED)
             self._check_schema(db)
+            if create:
+                from .v3_owner_paid_guard_observation import install_owner_paid_guard_observations_v3
+                install_owner_paid_guard_observations_v3(db)
 
     @staticmethod
     def _present(db: sqlite3.Connection) -> set[str]:
@@ -1079,6 +1082,52 @@ class AuthorityV2OwnerTicketStore:
                 if pending is None or pending[0].principal != request.principal:
                     raise AuthorityUnavailable("Owner session differs from current grant")
             return guard
+
+    def observe_paid_guard_for_fence_v3(self, *, credential: object,
+            authority_namespace: str, installation_id: str, subject: str,
+            permit: FencePermitV2, business_operation_id: str,
+            request_digest: str, phase: str):
+        """Persist an actual guard observation in the same live Core fence transaction."""
+        from .v3_owner_paid_guard_observation import _record_owner_paid_guard_observation_v3
+        identifier(authority_namespace, 'authority_namespace')
+        identifier(installation_id, 'installation_id')
+        identifier(subject, 'subject')
+        identifier(business_operation_id, 'business_operation_id')
+        if (type(permit) is not FencePermitV2 or permit.operation!='write'
+                or permit.namespace!=authority_namespace or permit.subject!=subject
+                or phase not in {'schedule','acquire'}):
+            raise AuthorityUnavailable('paid Owner observation requires exact named write fence')
+        self._core._require(credential, 'owner_guard_read', authority_namespace, permit.holder)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            self._check_schema(db)
+            AuthorityV2FenceStore._check_schema(db)
+            AuthorityV2FenceStore._require_no_migration(db)
+            namespace_row=self._core._row(db,authority_namespace)
+            if (namespace_row[0]!=permit.holder or namespace_row[1]!=permit.generation
+                    or namespace_row[2]!='active' or namespace_row[3] is not None
+                    or namespace_row[9]!='clear'
+                    or self._core._anchor(db,authority_namespace,namespace_row)!=permit.pinned_anchor):
+                raise AuthorityUnavailable('paid Owner observation Authority anchor is no longer current')
+            row=AuthorityV2FenceStore._row(db,permit.operation_id)
+            if (row is None or row[1]!=authority_namespace or row[2]!=subject or row[3]!=permit.token
+                    or row[6]!='active' or row[7]!=fence_canonical_bytes(permit) or row[10] is not None
+                    or AuthorityV2FenceStore._permit(row)!=permit or permit.authority_id!=self._core._id(db)
+                    or db.execute("SELECT 1 FROM authority_v2_mutations WHERE namespace=? AND state='pending' LIMIT 1",
+                        (authority_namespace,)).fetchone() is not None):
+                raise AuthorityUnavailable('paid Owner observation fence is no longer current')
+            guard=self._checked_current_head(db,authority_namespace)
+            if (guard is None or guard.authority_id!=permit.authority_id
+                    or guard.installation_id!=installation_id
+                    or namespace_ref(guard.namespace)!=authority_namespace
+                    or guard.authorization_revision!=1 or guard.pending_revoke_operation_id is not None
+                    or guard.minimum_revocation_revision!=0 or guard.minimum_revocation_epoch!=0):
+                raise OwnerAuthorizationBarrier('paid Owner guard is not the active original issue')
+            head=db.execute('SELECT authority_namespace,issue_operation_id,current_operation_id,revision,state,guard_bytes '
+                'FROM authority_owner_authorization_heads_v1 WHERE authority_namespace=?',(authority_namespace,)).fetchone()
+            return _record_owner_paid_guard_observation_v3(db,authority_namespace=authority_namespace,
+                business_operation_id=business_operation_id,request_digest=request_digest,phase=phase,
+                guard=guard,permit=permit,head=head)
 
     def reserve_revoke(self, *, credential: object, authority_namespace: str,
                        operation: OwnerAuthorizationOperationV1,

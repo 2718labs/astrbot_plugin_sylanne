@@ -30,7 +30,8 @@ def life_content_workflows(base,shared):
         max_output_tokens=128,quote_ceiling={'output_tokens':128},**shared))
 
 
-async def run_installed_life_content_preparation_case(tmp_path,installed_d04_root, *, acquire=False, after_acquire=None, worker_v2=False, enable_c09_maintenance=False, host_process_runner=None, c09_protected_root=None):
+async def run_installed_life_content_preparation_case(tmp_path,installed_d04_root, *, acquire=False, after_acquire=None, worker_v2=False, enable_c09_maintenance=False, host_process_runner=None,c09_protected_root=None,initial_phase_fixture_installation=None,
+        complete_c09_current_v3=False,c09_phase_setup_file=None):
     async def after_episode(case):
         def accept():
             graph,store,ns=case['graph'],case['store'],case['namespace']
@@ -115,9 +116,11 @@ async def run_installed_life_content_preparation_case(tmp_path,installed_d04_roo
             if not acquire: raise ValueError('after-acquire requires actual acquisition')
             await after_acquire(case)
     await run_installed_owner_life_case(tmp_path,installed_d04_root,
-        natural_workflow_builder=life_content_workflows,after_episode_async=after_episode,
+        natural_workflow_builder=life_content_workflows if initial_phase_fixture_installation is None else None,after_episode_async=after_episode,
         enable_c09_maintenance=enable_c09_maintenance,
-        host_process_runner=host_process_runner, c09_protected_root=c09_protected_root)
+        host_process_runner=host_process_runner,c09_protected_root=c09_protected_root,
+        initial_phase_fixture_installation=initial_phase_fixture_installation,complete_c09_current_v3=complete_c09_current_v3,
+        c09_phase_setup_file=c09_phase_setup_file)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from dataclasses import asdict
 import time
 
 from ..runtime_contracts import canonical_digest
+from ..contracts import canonical_json
 from .contract import AuthorityUnavailable, JournalHead
 from .independent_append_guard_v3 import independent_append_core_guard_v3
 
@@ -53,9 +54,6 @@ def _require_owner(bridge, db, current):
     if principal != head.issue_operation.principal:
         raise AuthorityUnavailable("C04 current Owner principal differs")
     sessions = bridge._owner_tickets._owner_sessions
-    sessions._current_pairing_source.require_current_actor_in_tx(db,
-        authority_namespace=bridge.namespace, installation_id=bridge._owner_installation_id,
-        actor_id=current.actor, principal=principal)
     key = db.execute("SELECT credential_id,credential_epoch FROM authority_owner_credentials_v1 "
         "WHERE authority_namespace=? AND installation_id=? AND principal_json=?",
         (bridge.namespace, bridge._owner_installation_id, _principal(principal))).fetchone()
@@ -68,6 +66,42 @@ def _require_owner(bridge, db, current):
         principal=principal, credential_id=key[0], credential_epoch=key[1],
         audience="owner", dashboard_origin="https://installed.invalid")
     sessions._current_key(db, request)
+    if current.current_self is None:
+        sessions._current_pairing_source.require_current_actor_in_tx(db,
+            authority_namespace=bridge.namespace, installation_id=bridge._owner_installation_id,
+            actor_id=current.actor, principal=principal)
+    else:
+        from .v2_self_identity_service import AuthorityV2SelfIdentityService
+        from .v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
+        from .owner_stop_reply_v1 import require_reply_scope_not_stopped_in_tx_v1
+        observer = bridge._current_foreground_reply_scope_observer_v1
+        value = current.current_self
+        if (observer is None or type(value) is not AuthorityCurrentSelfIdentityV1
+                or observer.self_identity._core is not bridge.core
+                or value.installation_id != bridge._owner_installation_id
+                or value.authority_namespace != bridge.namespace
+                or value.self_entity_ref != current.actor
+                or value.owner_authorization_revision != head.guard.authorization_revision
+                or value.owner_authorization_head != head.guard.authorization_head
+                or value.owner_minimum_revocation_revision != head.guard.minimum_revocation_revision
+                or value.owner_revocation_epoch != head.guard.minimum_revocation_epoch):
+            raise AuthorityUnavailable("Self C04 observed mapping/Owner head changed before claim")
+        mapping = AuthorityV2SelfIdentityService._head(db, bridge.namespace)
+        if (mapping is None or mapping[7] != "active"
+                or mapping[0] != canonical_json(asdict(value.namespace))
+                or mapping[1:8] != (value.installation_id, value.manifest_digest,
+                    value.mapping_id, value.self_entity_ref, value.mapping_revision,
+                    value.mapping_revocation_epoch, "active")
+                or mapping[8:10] != (value.registration_operation_id, value.registration_digest)):
+            raise AuthorityUnavailable("Self C04 actual mapping was revoked or replaced before claim")
+        owner_storage = observer.self_identity._owner_storage
+        if owner_storage is None or owner_storage._head_in_tx(db) != head:
+            raise AuthorityUnavailable("Self C04 current storage Owner head changed before claim")
+        owner_storage._background_identity_in_tx(db, head)
+        require_reply_scope_not_stopped_in_tx_v1(db,
+            authority_namespace=bridge.namespace, installation_id=bridge._owner_installation_id,
+            activation_generation=value.activation_generation,
+            actual_cycle_identity=current.reply_scope, action="c04_claim")
 
 
 def _gate(bridge, db, binding, phase):
@@ -117,7 +151,8 @@ def reconcile_exclusive_c04_v3(bridge, *, credential, binding, phase):
         return bridge.core._anchor(db, bridge.namespace, bridge.core._row(db, bridge.namespace))
 
 
-def claim_exclusive_c04_v3(bridge, *, credential, binding, claim, before_head, prepared, current_reader):
+def claim_exclusive_c04_v3(bridge, *, credential, binding, claim, before_head, prepared, current_reader,
+        self_identity_read_credential=None):
     from .c04_current_execution_v3 import InstalledC04CurrentReaderV3
     if type(current_reader) is not InstalledC04CurrentReaderV3:
         raise AuthorityUnavailable("C04 claim needs its concrete installed current reader")
@@ -135,7 +170,8 @@ def claim_exclusive_c04_v3(bridge, *, credential, binding, claim, before_head, p
     if observed.claim is not None:
         raise AuthorityUnavailable("C04 execution right is already consumed; inspect its original")
     try:
-        current = current_reader.read_current(binding, permit.pinned_anchor)
+        current = current_reader.read_current(binding, permit.pinned_anchor,
+            credential=self_identity_read_credential, permit=permit)
         if current.prepared != prepared:
             raise AuthorityUnavailable("C04 current preparation differs from original request")
         with independent_append_core_guard_v3(bridge) as (db, deletion):

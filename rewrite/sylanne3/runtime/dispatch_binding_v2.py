@@ -18,7 +18,7 @@ from ..authority_service.v2_contract import (
     FencePermitV2,
 )
 from ..dispatch_runtime import DispatchRequest
-from ..graph_coordinator import namespace_ref
+from ..runtime_contracts import namespace_ref
 from .dispatch_admission import DispatchAdmissionReceiptV1, _request_matches
 from ..runtime_contracts import NamespaceId, canonical_digest
 from ..runtime_journal import RecoveryConstraintFootprint

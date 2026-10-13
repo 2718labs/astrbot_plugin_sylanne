@@ -18,7 +18,7 @@ from sylanne3.workbench_api import (
     WorkbenchService,
 )
 from sylanne3.workbench_api.http_transport import (
-    COMMAND_ROUTE, SYLANNE_OWNER_SESSION_COOKIE, TransportConfig,
+    BoundCsrfTokens, COMMAND_ROUTE, SYLANNE_OWNER_SESSION_COOKIE, TransportConfig,
     WorkbenchHttpTransport,
 )
 from tests.alpha1.d12.test_owner_graph_lease import (
@@ -55,9 +55,8 @@ async def test_registered_astrbot_command_reads_current_creator_draft(
             return (session if username == "dashboard-user"
                     and session_hint == OWNER_TOKEN else None)
 
-    class Csrf:
-        def validate(self, *, session, token):
-            return session.session_id == "signed-owner-session" and token == "csrf-token"
+    csrf = BoundCsrfTokens()
+    csrf_token = csrf.issue(session=session)
 
     class Registry:
         def view_types(self, *_):
@@ -75,7 +74,7 @@ async def test_registered_astrbot_command_reads_current_creator_draft(
     class Request:
         username = "dashboard-user"
         content_type = "application/json"
-        headers = {"origin": "https://dashboard.local", "x-csrf-token": "csrf-token"}
+        headers = {"origin": "https://dashboard.local", "x-csrf-token": csrf_token}
         cookies = {SYLANNE_OWNER_SESSION_COOKIE: OWNER_TOKEN}
 
         async def body(self):
@@ -84,20 +83,33 @@ async def test_registered_astrbot_command_reads_current_creator_draft(
     service = WorkbenchService(GraphWorkbenchIssuer(
         coordinator, GrantResolver(), Registry(), scheme_port=coordinator))
     transport = WorkbenchHttpTransport(
-        service, SessionResolver(), Csrf(),
+        service, SessionResolver(), csrf,
         TransportConfig("https://dashboard.local", Path(tmp_path)))
     context = SimpleNamespace(registered_web_apis=[])
     context.register_web_api = lambda route, handler, methods, description: (
         context.registered_web_apis.append((route, handler, methods, description)))
-    mount = WorkbenchHostMount()
+    setup_reads = []
+    def drifted_model_observation():
+        setup_reads.append(True)
+        raise AssertionError("an authorized D12 read must not depend on model selection")
+    mount = WorkbenchHostMount(setup_provider=drifted_model_observation)
     mount.attach_transport(transport)
     with patch("astrbot.api.web.request", Request()):
         mount.register(context)
         handler, _ = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST")
         response = await handler()
+        Request.headers["x-csrf-token"] = "invalid-csrf"
+        rejected = await handler()
+        assert rejected.status_code == 403
+        assert json.loads(rejected.body)["problem"]["code"] == "csrf_denied"
+        Request.headers["x-csrf-token"] = csrf_token
+        Request.cookies = {}
+        missing_owner = await handler()
+        assert missing_owner.status_code == 401
     body = json.loads(response.body)
     assert response.status_code == 200, body
     assert body["status"] == "ready"
     assert body["projection"]["schema"] == "d12.creator_draft_view.v1"
     assert body["projection"]["fields"] == {"d01.voice": "clear"}
+    assert setup_reads == []

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import ExitStack, nullcontext
 import secrets
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
 from ..runtime_contracts import NamespaceId
 from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+from ..host.model_workflows_v4 import AdminModelWorkflowsV4
+from ..host.model_workflows_v5 import AdminModelWorkflowsV5
+from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.first_ingress_encoding import (
@@ -33,8 +38,8 @@ class AuthorityV2ModelEgressService:
     def __init__(self, store: AuthorityV2ModelEgressStore,
                  fences: AuthorityV2FenceService | None = None, *,
                  graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
-                 admin_model_policy: (AdminIngressModelPolicy |
-                                      AdminModelWorkflowsV2 | None) = None,
+                 admin_model_policy: (AdminIngressModelPolicy | AdminModelWorkflowsV2 |
+                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | None) = None,
                  source_location=None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
@@ -47,7 +52,8 @@ class AuthorityV2ModelEgressService:
             raise TypeError("administrator-pinned model egress graph verifier required")
         if (admin_model_policy is not None
                 and type(admin_model_policy) not in (
-                    AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3)):
+                    AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3,
+                    AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)):
             raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
@@ -58,11 +64,57 @@ class AuthorityV2ModelEgressService:
         # callers remain compatible, but cannot dispatch after a storage rebase
         # without the installed current-location qualification below.
         self._source_location = None
+        self._d13_provider_http_counter_v1 = None
         if source_location is not None:
             self.install_current_source_location_v1(source_location)
+        from .model_capacity_v1 import install_model_capacity_functions_v1
+        install_model_capacity_functions_v1(self._store._db)
         from .d07_model_timing_v1 import install_d07_model_timing_schema_v1
         with self._store._tx() as db:
             install_d07_model_timing_schema_v1(db)
+
+    def install_d13_provider_http_counter_v1(self, counter):
+        from .d13_core_counter_service_v1 import InstalledD13CoreCounterServiceV1
+        from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+        if (type(counter) is not InstalledD13CoreCounterServiceV1
+                or type(self._admin_model_policy) is not AdminModelWorkflowsV7
+                or counter.core._db is not self._store._db or counter.fences is not self._fences
+                or self._d13_provider_http_counter_v1 is not None):
+            raise AuthorityUnavailable('provider HTTP counter must be the exact installed model/Core instance')
+        self._d13_provider_http_counter_v1=counter
+
+    def bind_observed_d13_provider_http_v1(self, *, credential, subject, holder, intent, admission, content):
+        counter=self._d13_provider_http_counter_v1
+        if counter is None or intent.namespace!=self._fences.namespace:
+            raise AuthorityUnavailable('actual installed V7 provider HTTP counter unavailable')
+        self._fences.core._require(credential,'model_egress',self._fences.namespace,holder)
+        with self._fences._frozen() as (db,deletion_head,execution_head,deletion_history):
+            record=self._store.read_locked(db,intent)
+            actual_admission,report,terminal=self._store.read_admission_locked(db,intent)
+            row=self._fences.fences._row(db,intent.operation_id)
+            anchor=self._fences._current_locked(db,deletion_head,execution_head,holder=holder,
+                generation=intent.authority_activation_generation)
+            if (subject!=intent.subject or actual_admission!=admission or report is not None or terminal is not None
+                    or record.state!='dispatch_started' or row is None or row[6]!='active'
+                    or canonical_digest(asdict(anchor))!=intent.anchor_digest):
+                raise AuthorityUnavailable('provider HTTP capture crossed original live model admission')
+            permit=self._fences.fences._permit(row)
+            self._fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=anchor)
+        location=self._source_location.observe_business_for_fence_v1(credential=credential,subject=subject,permit=permit)
+        if self._graph_verifier.complete_graph_current(intent,source_location=self._source_location,
+                location_observation=location,model_service=self,credential=credential,subject=subject,permit=permit) is not True:
+            raise AuthorityUnavailable('provider HTTP capture lacks actual current Source/job/reservation')
+        with self._fences._frozen() as (db,deletion_head,execution_head,deletion_history):
+            actual_anchor=self._fences._current_locked(db,deletion_head,execution_head,holder=holder,
+                generation=intent.authority_activation_generation)
+            if actual_anchor!=anchor:raise AuthorityUnavailable('provider HTTP original anchor changed')
+            self._fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=actual_anchor)
+            self._source_location.require_current_in_tx_v1(db,location)
+            from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+            require_lifecycle_admission_in_tx_v1(db,intent.namespace,action='first_model_dispatch')
+            from .d13_provider_http_admission_v1 import record_observed_provider_http_v1
+            return record_observed_provider_http_v1(db,counter=counter,intent=intent,admission=admission,
+                actual_content=content,now_utc=self._graph_verifier._clock())
 
     def install_current_source_location_v1(self, qualifier):
         """Bind once during installed assembly, never through a wire request."""
@@ -76,6 +128,135 @@ class AuthorityV2ModelEgressService:
                    and self._source_location is not qualifier):
             raise AuthorityUnavailable("same installed model fence and Graph location qualifier required")
         self._source_location = qualifier
+        from .current_authority_graph_read_v3 import install_authority_graph_read_controller_v3
+        install_authority_graph_read_controller_v3(self._graph_verifier,service=self,source_location=qualifier)
+
+    def _require_reply_scope_in_tx_v1(self, db, scope, anchor, *, action):
+        if scope is None:
+            return
+        from .owner_stop_reply_v1 import require_reply_scope_not_stopped_in_tx_v1
+        if scope.service.core is not self._fences.core:
+            raise AuthorityUnavailable("model reply scope crossed its actual Core")
+        require_reply_scope_not_stopped_in_tx_v1(db,
+            authority_namespace=self._fences.namespace,
+            installation_id=scope.service.installation_id,
+            activation_generation=anchor.activation_generation,
+            actual_cycle_identity=scope, action=action)
+
+    def _artifact_draft_admin_matches_v1(self, intent, request):
+        from ..host.authority_profile import AdminInstallationBundle
+        from ..runtime.d11_artifact_draft_model_v1 import installed_artifact_draft_workflow_v1
+        from ..model_broker.artifact_draft_v1 import (ArtifactDraftInputV1,
+            TEMPLATE_DIGEST, TEMPLATE_VERSION, WORK_KIND, artifact_draft_from_wire_v1,
+            artifact_draft_model_ids_v1, artifact_draft_provider_messages_v1)
+        verifier = self._graph_verifier
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+            return False
+        bundle = verifier._artifact_draft_bundle
+        if (type(bundle) is not AdminInstallationBundle
+                or bundle.model_workflows is not self._admin_model_policy):
+            return False
+        workflow = installed_artifact_draft_workflow_v1(bundle)
+        artifact_draft_provider_messages_v1(request)
+        frozen = artifact_draft_from_wire_v1(dict(request.payload)["input"], ArtifactDraftInputV1)
+        ids = artifact_draft_model_ids_v1(frozen.selector)
+        installation = bundle.installation_policy
+        authority = request.envelope.authority
+        ceiling = dict(intent.budget_ceiling)
+        return (
+            workflow is bundle.model_workflows.artifact_draft
+            and (workflow.work_kind, workflow.purpose, workflow.template_version)
+                == (WORK_KIND, "consolidation", TEMPLATE_VERSION)
+            and frozen.selector.namespace == authority.namespace == installation.namespace
+            and intent.namespace == installation.authority_namespace == self._fences.namespace
+            and intent.authority_id == installation.expected_authority_id
+            and request.digest == intent.request_digest
+            and (request.call_id, intent.call_id, intent.job_id, request.identity.operation_id,
+                 intent.operation_id, intent.acquire_operation_id, intent.budget_reservation_operation_id)
+                == (ids["call"], ids["call"], ids["job"], ids["acquire"],
+                    ids["acquire"], ids["acquire"], ids["prepare"])
+            and authority.actor == intent.subject
+            and authority.issuer_domain == "d11"
+            and authority.activation_generation == intent.authority_activation_generation
+            and authority.worker_fence == intent.worker_fence
+            and authority.purpose == "consolidation"
+            and request.identity.phase == WORK_KIND
+            and request.prompt_template_digest == TEMPLATE_DIGEST
+            and bool(authority.audience) and set(authority.audience) <= set(workflow.audiences)
+            and request.privacy_tier == workflow.privacy_tier
+            and request.required_capabilities == frozenset(workflow.required_capabilities)
+            and (request.provider_id, intent.provider_id) == (workflow.provider_id, workflow.provider_id)
+            and (request.model_id, intent.model_id) == (workflow.model_id, workflow.model_id)
+            and intent.provider_config_digest == workflow.provider_config_digest
+            and request.max_output_tokens == intent.max_output_tokens == workflow.max_output_tokens
+            and request.timeout_seconds == workflow.timeout_seconds
+            and set(ceiling) == {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+            and request.max_output_tokens <= ceiling["output_tokens"]
+            and all(amount <= workflow.quote_ceiling[dimension] for dimension, amount in ceiling.items()))
+
+    def _artifact_draft_admin_matches_v2(self, intent, request):
+        from ..host.authority_profile import (
+            AdminInstallationBundle, AdminArtifactDraftPolicyV3, AdminArtifactDraftToolScopeV2,
+            is_installed_artifact_draft_phase_slot_v2,
+        )
+        from ..model_broker.artifact_draft_v1 import (
+            TEMPLATE_DIGEST_V2, TEMPLATE_VERSION_V2, WORK_KIND,
+            artifact_draft_input_from_wire_v2, artifact_draft_model_ids_v2,
+            artifact_draft_provider_messages_v2, artifact_draft_phase_token_limits_v2,
+        )
+        from ..domains.d01 import TONE_SAMPLE_METHOD_V1
+        from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+        from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+        from ..host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, require_paired_phase_frozen_target_v4
+        verifier = self._graph_verifier
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+            return False
+        bundle = verifier._artifact_draft_bundle
+        if (type(bundle) is not AdminInstallationBundle or bundle.model_workflows is not self._admin_model_policy
+                or type(bundle.artifact_draft) not in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}):
+            return False
+        workflow = bundle.artifact_draft.phase_model_workflow
+        if not is_installed_artifact_draft_phase_slot_v2(bundle, workflow):
+            return False
+        artifact_draft_provider_messages_v2(request)
+        frozen = artifact_draft_input_from_wire_v2(dict(request.payload)["input"])
+        ids = artifact_draft_model_ids_v2(frozen.selector)
+        limits = artifact_draft_phase_token_limits_v2(frozen.selector)
+        tool_scope = bundle.artifact_draft.tool_scope
+        if type(bundle.artifact_draft) is AdminArtifactDraftPairedPolicyV4:
+            tool_scope = require_paired_phase_frozen_target_v4(bundle.artifact_draft,frozen)
+        if (frozen.selector.method_ref == TONE_SAMPLE_METHOD_V1
+                and (type(tool_scope) is not AdminArtifactDraftToolScopeV2
+                    or tool_scope.maximum_artifact_version < 2)):
+            return False
+        installation = bundle.installation_policy
+        authority = request.envelope.authority
+        ceiling = dict(intent.budget_ceiling)
+        return (
+            (workflow.work_kind, workflow.purpose, workflow.template_version) == (WORK_KIND, "consolidation", TEMPLATE_VERSION_V2)
+            and frozen.selector.task.namespace == authority.namespace == installation.namespace
+            and intent.namespace == installation.authority_namespace == self._fences.namespace
+            and intent.authority_id == installation.expected_authority_id
+            and request.digest == intent.request_digest
+            and (request.call_id, intent.call_id, intent.job_id, request.identity.operation_id,
+                 intent.operation_id, intent.acquire_operation_id, intent.budget_reservation_operation_id)
+                == (ids["call"], ids["call"], ids["job"], ids["acquire"], ids["acquire"], ids["acquire"], ids["prepare"])
+            and authority.actor == intent.subject and authority.issuer_domain == "d11"
+            and authority.activation_generation == intent.authority_activation_generation
+            and authority.worker_fence == intent.worker_fence and authority.purpose == "consolidation"
+            and request.identity.phase == WORK_KIND and request.prompt_template_digest == TEMPLATE_DIGEST_V2
+            and bool(authority.audience) and set(authority.audience) <= set(workflow.audiences)
+            and request.privacy_tier == workflow.privacy_tier
+            and request.required_capabilities == frozenset(workflow.required_capabilities)
+            and (request.provider_id, intent.provider_id) == (workflow.provider_id, workflow.provider_id)
+            and (request.model_id, intent.model_id) == (workflow.model_id, workflow.model_id)
+            and intent.provider_config_digest == workflow.provider_config_digest
+            and request.max_output_tokens == intent.max_output_tokens == min(workflow.max_output_tokens, limits["output_tokens"])
+            and 0 < request.timeout_seconds <= workflow.timeout_seconds
+            and set(ceiling) == {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+            and ceiling["input_tokens"] <= limits["input_tokens"] and ceiling["output_tokens"] <= limits["output_tokens"]
+            and request.max_output_tokens <= ceiling["output_tokens"]
+            and all(amount <= workflow.quote_ceiling[dimension] for dimension, amount in ceiling.items()))
 
     def _admin_model_matches(self, intent: ModelEgressIntentV1,
                              request: ModelCallRequest | None) -> bool:
@@ -83,8 +264,13 @@ class AuthorityV2ModelEgressService:
         policy = self._admin_model_policy
         if type(request) is not ModelCallRequest:
             return False
+        if request.identity.phase == "artifact_draft_v1":
+            from ..model_broker.artifact_draft_v1 import TEMPLATE_DIGEST_V2
+            if request.prompt_template_digest == TEMPLATE_DIGEST_V2:
+                return self._artifact_draft_admin_matches_v2(intent, request)
+            return self._artifact_draft_admin_matches_v1(intent, request)
         authority = request.envelope.authority
-        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3):
+        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
             if request.identity.phase == "d13.precompress":
                 from ..model_broker.d13_precompression import (
                     TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
@@ -142,20 +328,36 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.natural_reply_history_v4 import TEMPLATE_DIGEST as V4_TEMPLATE_DIGEST, TEMPLATE_VERSION as V4_TEMPLATE_VERSION
                     if request.prompt_template_digest == V4_TEMPLATE_DIGEST:
                         TEMPLATE_VERSION, TEMPLATE_DIGEST = V4_TEMPLATE_VERSION, V4_TEMPLATE_DIGEST
+                    from ..model_broker.natural_reply_history_v4 import TEMPLATE_DIGEST_V5, TEMPLATE_VERSION_V5
+                    if request.prompt_template_digest == TEMPLATE_DIGEST_V5:
+                        TEMPLATE_VERSION, TEMPLATE_DIGEST = TEMPLATE_VERSION_V5, TEMPLATE_DIGEST_V5
+                    from ..model_broker.natural_reply_history_v6 import TEMPLATE_DIGEST as V6_TEMPLATE_DIGEST, TEMPLATE_VERSION as V6_TEMPLATE_VERSION
+                    if request.prompt_template_digest == V6_TEMPLATE_DIGEST:
+                        if type(policy) is not AdminModelWorkflowsV6 or workflow is None or workflow.template_version != V6_TEMPLATE_VERSION:
+                            raise AuthorityUnavailable("V6 natural wire requires its actual named installed V6 workflow")
+                        TEMPLATE_VERSION, TEMPLATE_DIGEST = V6_TEMPLATE_VERSION, V6_TEMPLATE_DIGEST
+                    from ..model_broker.natural_reply_history_v7 import TEMPLATE_DIGEST as V7_TEMPLATE_DIGEST,TEMPLATE_VERSION as V7_TEMPLATE_VERSION
+                    if request.prompt_template_digest==V7_TEMPLATE_DIGEST:
+                        if type(policy) is not AdminModelWorkflowsV7 or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
+                            raise AuthorityUnavailable('V7 natural wire requires its actual named installed V7 workflow')
+                        TEMPLATE_VERSION,TEMPLATE_DIGEST=V7_TEMPLATE_VERSION,V7_TEMPLATE_DIGEST
                     expected = ("natural_generation", "proposal",
                                 TEMPLATE_VERSION, TEMPLATE_DIGEST)
                 elif request.identity.phase == "natural_review":
                     from ..model_broker.natural_review import (
                         REVIEW_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION,
+                        REVIEW_TEMPLATE_DIGEST_V2, REVIEW_TEMPLATE_VERSION_V2,
                     )
                     workflow = policy.natural_review
+                    if request.prompt_template_digest == REVIEW_TEMPLATE_DIGEST_V2:
+                        REVIEW_TEMPLATE_VERSION, REVIEW_TEMPLATE_DIGEST = REVIEW_TEMPLATE_VERSION_V2, REVIEW_TEMPLATE_DIGEST_V2
                     expected = ("natural_review", "proposal",
                                 REVIEW_TEMPLATE_VERSION, REVIEW_TEMPLATE_DIGEST)
                 elif request.identity.phase in {"contact_generation", "contact_review"}:
                     from ..model_broker.contact_expression_v1 import (GENERATION_TEMPLATE_VERSION,
                         GENERATION_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                         REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
-                    if type(policy) is AdminModelWorkflowsV3:
+                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
                         from ..model_broker.contact_expression_v2 import (
                             GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                             REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
@@ -172,9 +374,23 @@ class AuthorityV2ModelEgressService:
                     workflow = policy.appraisal
                     expected = ("d04.appraisal", "proposal", APPRAISAL_TEMPLATE, APPRAISAL_DIGEST)
                 elif request.identity.phase == "d07.cognition":
-                    from ..model_broker.d07_cognition_v1 import TEMPLATE_VERSION as D07_TEMPLATE, TEMPLATE_DIGEST as D07_DIGEST
+                    from ..model_broker.d07_cognition_v1 import D07_COGNITION_TEMPLATE_DIGESTS_V1
                     workflow = policy.d07_cognition
-                    expected = ("d07.cognition", "proposal", D07_TEMPLATE, D07_DIGEST)
+                    from ..model_broker.d07_cognition_v1 import TEMPLATE_DIGEST
+                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7} and request.prompt_template_digest == TEMPLATE_DIGEST:
+                        verifier = self._graph_verifier
+                        if verifier is None:
+                            return False
+                        workflow = verifier.read_current_named_d07_model_workflow_v3(intent, request)
+                        installed_named = (policy.d07_relationship_cognition,)
+                        if type(policy) is AdminModelWorkflowsV6:
+                            installed_named += (policy.growth_cognition,)
+                        if workflow is None or not any(workflow is named for named in installed_named):
+                            return False
+                    if workflow is None or workflow.template_version not in D07_COGNITION_TEMPLATE_DIGESTS_V1:
+                        return False
+                    expected = ("d07.cognition", "proposal", workflow.template_version,
+                        D07_COGNITION_TEMPLATE_DIGESTS_V1[workflow.template_version])
                 elif request.identity.phase == "post_c02_reply_model":
                     workflow = policy.reply
                     expected = ("reply", "proposal", REPLY_TEMPLATE_VERSION,
@@ -184,13 +400,13 @@ class AuthorityV2ModelEgressService:
             else:
                 if request.identity.phase == "internal_life_content_v2":
                     from ..model_broker.internal_life_content_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) is not AdminModelWorkflowsV3:
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
                         return False
                     workflow = policy.life_content
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
                 elif request.identity.phase == "internal_life_numeric_v1":
                     from ..model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) is not AdminModelWorkflowsV3:
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
                         return False
                     workflow = policy.life_numeric
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
@@ -198,10 +414,10 @@ class AuthorityV2ModelEgressService:
                     return False  # No Life command/result verifier is installed yet.
                 else:
                     # Keep the existing encoding scope and checks unchanged.
+                    from ..model_broker.first_ingress_encoding import encoding_template_digest_v1
                     workflow = policy.encode
-                    expected = ("d06.encode_source", "consolidation",
-                                FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
-                                FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
+                    expected = ("d06.encode_source", "consolidation", workflow.template_version,
+                                encoding_template_digest_v1(workflow.template_version))
             if (workflow is None
                     or (workflow.work_kind, workflow.purpose,
                     workflow.template_version,
@@ -268,6 +484,121 @@ class AuthorityV2ModelEgressService:
             and request.timeout_seconds == policy.timeout_seconds
         )
 
+    def model_capacity_reconcile_v1(self, *, credential, subject: str, holder: str,
+            expected_anchor: RestoreAnchor, installation_id: str,
+            draft: ModelEgressDraftV1 | None = None, close_prepared: bool = False):
+        """Fresh content-free facts and optional unsent closure; never issue a permit."""
+        from .model_capacity_v1 import (model_capacity_census_locked_v1,
+            retained_model_capacity_match_locked_v1)
+        from .v2_contract import FenceNeverBegunReceiptV2,canonical_bytes,decode_bytes
+        if self._fences is None or type(expected_anchor) is not RestoreAnchor:
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        identifier(subject,"subject")
+        identifier(holder,"holder")
+        identifier(installation_id,"installation_id")
+        if (type(close_prepared) is not bool
+                or draft is not None and type(draft) is not ModelEgressDraftV1
+                or close_prepared and draft is None
+                or expected_anchor.namespace != self._fences.namespace):
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        if draft is not None and (draft.namespace,draft.subject,draft.authority_id) != (
+                self._fences.namespace,subject,expected_anchor.authority_id):
+            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+        self._fences.core._require(credential,"model_egress",self._fences.namespace,holder)
+        with self._fences._frozen() as (db,deletion_head,execution_head,_):
+            anchor = self._fences._current_locked(db,deletion_head,execution_head,holder=holder,
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+            status = "census"
+            exclude = None
+            draft_digest = None if draft is None else canonical_digest(asdict(draft))
+            if draft is not None:
+                retained = retained_model_capacity_match_locked_v1(db,draft,installation_id)
+                original = self._store.capacity_original_locked_v1(db,draft)
+                if retained:
+                    status = "retained"
+                elif original is None:
+                    status = "absent"
+                    row = db.execute("SELECT request_id,request_digest,"
+                        "CASE WHEN length(receipt)<=16384 THEN receipt END "
+                        "FROM authority_v2_never_begun WHERE operation_id=?",
+                        (draft.operation_id,)).fetchone()
+                    request_id = "model-capacity-close:" + draft_digest
+                    rejection_digest = "sha256:" + draft_digest
+                    if row is not None:
+                        try:
+                            saved = decode_bytes(row[2])
+                        except (TypeError,ValueError,UnicodeError) as exc:
+                            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED") from exc
+                        if (type(saved) is not FenceNeverBegunReceiptV2
+                                or row != (request_id,rejection_digest,canonical_bytes(saved))
+                                or (saved.authority_id,saved.namespace,saved.subject,
+                                    saved.installation_id,saved.holder,saved.operation_id,
+                                    saved.request_id,saved.request_digest) !=
+                                    (anchor.authority_id,self._fences.namespace,subject,
+                                    installation_id,holder,draft.operation_id,request_id,rejection_digest)):
+                            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+                        status = "never_begun"
+                    elif close_prepared:
+                        self._fences.fences.reject_unbegun_content_fence_locked(db,
+                            subject=subject,installation_id=installation_id,holder=holder,
+                            generation=anchor.activation_generation,operation_id=draft.operation_id,
+                            current_anchor=anchor,request_id=request_id,request_digest=rejection_digest)
+                        status = "never_begun"
+                    elif self._fences.fences._row(db,draft.operation_id) is not None:
+                        raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+                else:
+                    intent,state = original
+                    row = self._fences.fences._row(db,intent.operation_id)
+                    if row is None:
+                        raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+                    permit = self._fences.fences._permit(row)
+                    if (permit.operation != "model_egress" or (permit.authority_id,permit.namespace,
+                            permit.subject,permit.holder) !=
+                            (anchor.authority_id,self._fences.namespace,subject,holder)
+                            or (intent.fence_token,intent.fence_epoch,intent.fence_revision,
+                                intent.anchor_digest) != (permit.token,permit.fence_epoch,
+                                permit.revision,canonical_digest(asdict(permit.pinned_anchor)))
+                            or not self._store.is_fence_bound_locked(db,intent)
+                            or row[10] is not None):
+                        raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+                    installed = db.execute("SELECT installation_id FROM authority_model_original_identity_v2 "
+                        "WHERE call_id=?",(intent.call_id,)).fetchone()
+                    admission = db.execute("SELECT json_extract(admission_json,'$.installation_id') "
+                        "FROM authority_model_admissions_v2 WHERE call_id=?",(intent.call_id,)).fetchone()
+                    if (installed is not None and installed != (installation_id,)
+                            or admission is not None and admission != (installation_id,)):
+                        raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+                    status = "unresolved"
+                    if state == "prepared" and admission is None:
+                        if close_prepared:
+                            self._fences.fences.finish_current_prepared_model_not_dispatched_locked(
+                                db,permit,intent=intent,current_anchor=anchor,subject=subject,holder=holder)
+                            row = self._fences.fences._row(db,intent.operation_id)
+                        expected_finish = self._fences.fences.model_terminal_finish_digest(
+                            intent,permit,"not_dispatched")
+                        if row[6] == "finished" and (row[8],row[9]) == (intent.call_id,expected_finish):
+                            status = "not_dispatched"
+                        elif row[6] == "active":
+                            status = "prepared"
+                            exclude = (intent.namespace,intent.call_id,intent.operation_id,intent.request_digest)
+                    elif state == "observed":
+                        # SQL census release requires the exact paired terminal and finished fence.
+                        selected = model_capacity_census_locked_v1(db,self._fences.namespace,
+                            selected=(intent.namespace,intent.call_id,intent.operation_id,intent.request_digest))
+                        if selected.pop("selected_released"):
+                            status = "terminal"
+            fact = model_capacity_census_locked_v1(db,self._fences.namespace)
+            if exclude is not None:
+                available = model_capacity_census_locked_v1(db,self._fences.namespace,exclude=exclude)
+                fact["capacity_available"] = available["capacity_available"]
+            return {"status":status,**fact,"call_id":None if draft is None else draft.call_id,
+                "request_digest":None if draft is None else draft.request_digest,
+                "authority_id":anchor.authority_id,"namespace":self._fences.namespace,
+                "subject":subject,"installation_id":installation_id,
+                "current_anchor_digest":canonical_digest(asdict(anchor)),"draft_digest":draft_digest}
+
     def prepare_fenced(self, *, credential, subject: str, holder: str,
                        draft: ModelEgressDraftV1,
                        expected_anchor: RestoreAnchor,
@@ -295,47 +626,71 @@ class AuthorityV2ModelEgressService:
                 or expected_anchor.namespace != self._fences.namespace):
             raise AuthorityUnavailable("model intent differs from authenticated Authority anchor")
         self._fences.core._require(credential, "model_egress", self._fences.namespace, holder)
-        with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
-            anchor = self._fences._current_locked(
-                db, deletion_head, execution_head, holder=holder,
-                generation=expected_anchor.activation_generation)
-            if anchor != expected_anchor:
-                raise AuthorityUnavailable("model egress anchor changed")
-            old = self._store._read(db, draft.call_id)
-            job_row = db.execute(
-                "SELECT call_id FROM authority_model_egress_v1 WHERE namespace=? "
-                "AND json_extract(identity_json,'$.job_id')=?",
-                (draft.namespace, draft.job_id),
-            ).fetchone()
-            if job_row is not None and job_row[0] != draft.call_id:
-                raise AuthorityUnavailable("model job already has a call identity")
-            fence_row = self._fences.fences._row(db, draft.operation_id)
-            if old is not None and fence_row is None:
-                raise AuthorityUnavailable("passive model record has no atomic fence")
-            if old is not None and not self._store.is_fence_bound_locked(db, old.intent):
-                raise AuthorityUnavailable("passive model record has no atomic binding")
-            if old is None and fence_row is not None:
-                raise AuthorityUnavailable("model fence operation already exists without typed record")
-            if old is not None and ModelEgressDraftV1.from_intent(old.intent) != draft:
-                raise AuthorityUnavailable("model egress identity changed")
-            permit = self._fences.fences.begin_fence_locked(
-                db, subject=subject, holder=holder, operation="model_egress",
-                current_anchor=anchor, operation_id=draft.operation_id)
-            intent = ModelEgressIntentV1(
-                **asdict(draft), fence_token=permit.token,
-                fence_epoch=permit.fence_epoch, fence_revision=permit.revision,
-                anchor_digest=canonical_digest(asdict(permit.pinned_anchor)))
-            if old is not None and old.intent != intent:
-                raise AuthorityUnavailable("persisted model fence differs from typed record")
-            record = self._store.prepare_locked(db, intent)
-            if old is None:
-                self._store.bind_fence_locked(db, intent)
-            if intent.binding_digest is not None:
-                if installation_id is None:
-                    raise AuthorityUnavailable("original model installation is absent")
-                self._store.bind_original_identity_locked(
-                    db, intent, installation_id)
-            return record, permit
+        from .model_reply_scope_observation_v3 import retain_authority_model_reply_scope_observation_v3
+        from ..runtime_storage_v3 import runtime_storage_v3
+        scope_observation_required = (self._source_location is not None
+                                      or runtime_storage_v3(self._fences.core._db) is not None)
+        scope_observation = (
+            retain_authority_model_reply_scope_observation_v3(
+                self._graph_verifier, model_service=self, credential=credential,
+                subject=subject, holder=holder, intent=draft,
+                expected_anchor=expected_anchor)
+            if scope_observation_required else nullcontext())
+        with scope_observation:
+            reply_scope = ((self._graph_verifier.observe_current_reply_scope_for_model_v1(
+                               draft, model_service=self, credential=credential, subject=subject,
+                               holder=holder, expected_anchor=expected_anchor)
+                           if scope_observation_required else
+                           self._graph_verifier.observe_current_reply_scope_for_model_v1(draft))
+                           if self._graph_verifier is not None else None)
+            if reply_scope is not None and installation_id != reply_scope.service.installation_id:
+                raise AuthorityUnavailable("model preparation crossed its installed reply scope")
+            with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
+                anchor = self._fences._current_locked(
+                    db, deletion_head, execution_head, holder=holder,
+                    generation=expected_anchor.activation_generation)
+                if anchor != expected_anchor:
+                    raise AuthorityUnavailable("model egress anchor changed")
+                self._require_reply_scope_in_tx_v1(db, reply_scope, anchor, action="model_prepare")
+                old = self._store._read(db, draft.call_id)
+                job_row = db.execute(
+                    "SELECT call_id FROM authority_model_egress_v1 WHERE namespace=? "
+                    "AND json_extract(identity_json,'$.job_id')=?",
+                    (draft.namespace, draft.job_id),
+                ).fetchone()
+                if job_row is not None and job_row[0] != draft.call_id:
+                    raise AuthorityUnavailable("model job already has a call identity")
+                fence_row = self._fences.fences._row(db, draft.operation_id)
+                if old is not None and fence_row is None:
+                    raise AuthorityUnavailable("passive model record has no atomic fence")
+                if old is not None and not self._store.is_fence_bound_locked(db, old.intent):
+                    raise AuthorityUnavailable("passive model record has no atomic binding")
+                if old is None and fence_row is not None:
+                    raise AuthorityUnavailable("model fence operation already exists without typed record")
+                if old is not None and ModelEgressDraftV1.from_intent(old.intent) != draft:
+                    raise AuthorityUnavailable("model egress identity changed")
+                from .model_capacity_v1 import require_model_capacity_locked_v1
+                require_model_capacity_locked_v1(db,self._fences.namespace,
+                    exclude=None if old is None else (old.intent.namespace,old.intent.call_id,
+                        old.intent.operation_id,old.intent.request_digest))
+                permit = self._fences.fences.begin_fence_locked(
+                    db, subject=subject, holder=holder, operation="model_egress",
+                    current_anchor=anchor, operation_id=draft.operation_id)
+                intent = ModelEgressIntentV1(
+                    **asdict(draft), fence_token=permit.token,
+                    fence_epoch=permit.fence_epoch, fence_revision=permit.revision,
+                    anchor_digest=canonical_digest(asdict(permit.pinned_anchor)))
+                if old is not None and old.intent != intent:
+                    raise AuthorityUnavailable("persisted model fence differs from typed record")
+                record = self._store.prepare_locked(db, intent)
+                if old is None:
+                    self._store.bind_fence_locked(db, intent)
+                if intent.binding_digest is not None:
+                    if installation_id is None:
+                        raise AuthorityUnavailable("original model installation is absent")
+                    self._store.bind_original_identity_locked(
+                        db, intent, installation_id)
+                return record, permit
 
     def lookup_original_intent_v1(
         self, *, credential, subject: str, holder: str, authority_id: str,
@@ -617,67 +972,102 @@ class AuthorityV2ModelEgressService:
                 raise AuthorityUnavailable("model dispatch lacks original fence binding")
             if record.state != "prepared":
                 raise AuthorityUnavailable("model dispatch admission cannot repeat")
-        # No journal or Authority lock is held during this independent read.
-        location_observation = None
-        try:
-            if self._source_location is not None:
-                location_observation = self._source_location.observe_business_for_fence_v1(
-                    credential=credential, subject=subject, permit=permit)
-            elif deletion_history:
-                raise AuthorityUnavailable("installed post-erasure model location unavailable")
-            graph_current = self._graph_verifier is not None
-            if graph_current:
-                if location_observation is None:
-                    graph_current = self._graph_verifier.complete_graph_current(intent) is True
-                else:
-                    graph_current = self._graph_verifier.complete_graph_current(
-                        intent, source_location=self._source_location,
-                        location_observation=location_observation) is True
-        except Exception:
-            graph_current = False
-        try:
-            policy_current = self._admin_model_matches(intent, request)
-        except Exception:
-            policy_current = False
-        if not graph_current or not policy_current:
-            self._finish_prepared_not_dispatched_fenced(
-                credential=credential, subject=subject, holder=holder,
-                intent=intent, expected_anchor=expected_anchor)
-            if not graph_current:
-                raise AuthorityUnavailable("HOLD: complete current model graph is unavailable")
-            raise AuthorityUnavailable("HOLD: independent administrator model policy is unavailable")
-        try:
-            with self._fences._frozen() as (db, deletion_head, execution_head,
-                                           deletion_history):
-                anchor = self._fences._current_locked(
-                    db, deletion_head, execution_head, holder=holder,
-                    generation=expected_anchor.activation_generation)
-                if anchor != expected_anchor:
-                    raise AuthorityUnavailable("model dispatch anchor changed")
-                row = self._fences.fences._row(db, intent.operation_id)
-                if row is None or self._fences.fences._permit(row) != permit:
-                    raise AuthorityUnavailable("original model dispatch permit changed")
-                if location_observation is not None:
-                    self._source_location.require_current_in_tx_v1(db, location_observation)
-                from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
-                require_lifecycle_admission_in_tx_v1(db, intent.namespace, action="first_model_dispatch")
-                record = self._store._record_dispatch_started_fenced_locked(
-                    db, intent, permit, self._fences.fences, anchor)
-                if admission is not None:
-                    self._store.record_admission_locked(db, intent, admission)
-                if request is not None and request.identity.phase == "d07.cognition":
-                    from .d07_model_timing_v1 import record_d07_model_start_locked_v1
-                    record_d07_model_start_locked_v1(db, intent, admission)
-                return record, permit
-        except AuthorityUnavailable:
-            # A competing successful CAS must never be reclassified as unsent.
+        from .model_reply_scope_observation_v3 import retain_authority_model_reply_scope_observation_v3
+        from ..runtime_storage_v3 import runtime_storage_v3
+        scope_observation_required = (self._source_location is not None
+                                      or runtime_storage_v3(self._fences.core._db) is not None)
+        with ExitStack() as scope_observation:
+            # No journal or Authority lock is held during this independent read.
+            location_observation = None
+            reply_scope = None
             try:
+                if scope_observation_required:
+                    scope_observation.enter_context(
+                        retain_authority_model_reply_scope_observation_v3(
+                            self._graph_verifier, model_service=self, credential=credential,
+                            subject=subject, holder=holder, intent=intent,
+                            expected_anchor=expected_anchor, permit=permit))
+                if self._graph_verifier is not None:
+                    reply_scope = (
+                        self._graph_verifier.observe_current_reply_scope_for_model_v1(
+                            intent, model_service=self, credential=credential, subject=subject,
+                            holder=holder, expected_anchor=expected_anchor, permit=permit)
+                        if scope_observation_required else
+                        self._graph_verifier.observe_current_reply_scope_for_model_v1(intent))
+                    if (reply_scope is not None and admission is not None
+                            and admission.installation_id != reply_scope.service.installation_id):
+                        raise AuthorityUnavailable("model admission crossed its installed reply scope")
+                if self._source_location is not None:
+                    location_observation = self._source_location.observe_business_for_fence_v1(
+                        credential=credential, subject=subject, permit=permit)
+                elif deletion_history:
+                    raise AuthorityUnavailable("installed post-erasure model location unavailable")
+                graph_current = self._graph_verifier is not None
+                if graph_current:
+                    if location_observation is None:
+                        graph_current = self._graph_verifier.complete_graph_current(
+                            intent, model_service=self, credential=credential, subject=subject, permit=permit) is True
+                    else:
+                        graph_current = self._graph_verifier.complete_graph_current(
+                            intent, source_location=self._source_location,
+                            location_observation=location_observation, model_service=self,
+                            credential=credential, subject=subject, permit=permit) is True
+            except Exception:
+                graph_current = False
+            try:
+                policy_current = self._admin_model_matches(intent, request)
+            except Exception:
+                policy_current = False
+            if not graph_current or not policy_current:
                 self._finish_prepared_not_dispatched_fenced(
                     credential=credential, subject=subject, holder=holder,
                     intent=intent, expected_anchor=expected_anchor)
+                if not graph_current:
+                    raise AuthorityUnavailable("HOLD: complete current model graph is unavailable")
+                raise AuthorityUnavailable("HOLD: independent administrator model policy is unavailable")
+            try:
+                with self._fences._frozen() as (db, deletion_head, execution_head,
+                                               deletion_history):
+                    anchor = self._fences._current_locked(
+                        db, deletion_head, execution_head, holder=holder,
+                        generation=expected_anchor.activation_generation)
+                    if anchor != expected_anchor:
+                        raise AuthorityUnavailable("model dispatch anchor changed")
+                    row = self._fences.fences._row(db, intent.operation_id)
+                    if row is None or self._fences.fences._permit(row) != permit:
+                        raise AuthorityUnavailable("original model dispatch permit changed")
+                    if location_observation is not None:
+                        self._source_location.require_current_in_tx_v1(db, location_observation)
+                    self._require_reply_scope_in_tx_v1(db, reply_scope, anchor, action="model_admit")
+                    from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                    require_lifecycle_admission_in_tx_v1(db, intent.namespace, action="first_model_dispatch")
+                    from .model_capacity_v1 import require_model_capacity_locked_v1
+                    require_model_capacity_locked_v1(db,self._fences.namespace,
+                        exclude=(intent.namespace,intent.call_id,intent.operation_id,intent.request_digest))
+                    record = self._store._record_dispatch_started_fenced_locked(
+                        db, intent, permit, self._fences.fences, anchor)
+                    if admission is not None:
+                        self._store.record_admission_locked(db, intent, admission)
+                        from ..model_broker.natural_reply_history_v7 import TEMPLATE_DIGEST as V7_TEMPLATE_DIGEST
+                        if request is not None and request.prompt_template_digest==V7_TEMPLATE_DIGEST:
+                            if self._d13_provider_http_counter_v1 is None:
+                                raise AuthorityUnavailable('V7 actual provider HTTP admission counter is missing')
+                            from .d13_provider_http_admission_v1 import stage_expected_provider_http_v1
+                            stage_expected_provider_http_v1(db,counter=self._d13_provider_http_counter_v1,
+                                intent=intent,request=request,admission=admission,now_utc=self._graph_verifier._clock())
+                    if request is not None and request.identity.phase == "d07.cognition":
+                        from .d07_model_timing_v1 import record_d07_model_start_locked_v1
+                        record_d07_model_start_locked_v1(db, intent, admission)
+                    return record, permit
             except AuthorityUnavailable:
-                pass
-            raise
+                # A competing successful CAS must never be reclassified as unsent.
+                try:
+                    self._finish_prepared_not_dispatched_fenced(
+                        credential=credential, subject=subject, holder=holder,
+                        intent=intent, expected_anchor=expected_anchor)
+                except AuthorityUnavailable:
+                    pass
+                raise
 
     def admit_dispatch_once(self, *, credential, subject: str, holder: str,
                             intent: ModelEgressIntentV1,
@@ -750,6 +1140,12 @@ class AuthorityV2ModelEgressService:
             saved, report_digest, receipt = self._store.read_admission_locked(db, intent)
             if saved != admission:
                 raise AuthorityUnavailable("original model admission differs")
+            if type(self._admin_model_policy) is AdminModelWorkflowsV7 and intent.job_id.startswith('natural-generation-job:'):
+                if self._d13_provider_http_counter_v1 is None:
+                    raise AuthorityUnavailable('V7 completion requires actual installed HTTP original verifier')
+                from .d13_provider_http_admission_v1 import require_recorded_provider_http_binding_v1
+                require_recorded_provider_http_binding_v1(db,counter=self._d13_provider_http_counter_v1,
+                    intent=intent,admission=admission)
             if receipt is None:
                 return None
             record = self._store.read_locked(db, intent)

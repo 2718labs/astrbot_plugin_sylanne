@@ -21,6 +21,13 @@ from .restore_anchor import RestoreAnchor
 
 TABLE = "graph_d04_installed_stage_attempts_v3"
 STAGES = frozenset({"interpretation", "prepare", "acquire", "seal_call", "settle", "adopt", "drive", "numeric_prepare", "numeric_adopt", "c04_encoding"})
+NEW_STAGE_MODULES_V1 = {
+    "interpretation": ("d04", "d11"), "prepare": ("d04", "d11"),
+    "acquire": ("d04", "d11"), "seal_call": ("d04", "d11"),
+    "adopt": ("d04", "d11"), "drive": ("d04", "d11"),
+    "numeric_prepare": ("d04", "d11"), "numeric_adopt": ("d04", "d11"),
+    "c04_encoding": ("d04", "d06", "d11"), "settle": (),
+}
 
 _TIMING_PHASES = frozenset({"installed_stage_total", "authority_owner_clock", "sql_transaction", "stage_callback",
     "drive", "root_freeze", "prior_adoption", "prepare_inspect", "queue_wait", "terminal_persist", "cpu_settle",
@@ -119,6 +126,8 @@ def _run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
     anchor = port.current_anchor(namespace=namespace, authority_namespace=target.authority_namespace)
     if not graph._anchor_matches(target, anchor):
         raise StaleRead("D04 installed stage Graph/Authority anchor differs")
+    if saved is None or saved[9] is None:
+        graph.local_module_admission.require_v1(NEW_STAGE_MODULES_V1[stage], "d04-stage:" + stage)
     if saved is not None:
         if saved[:5] != (stage, c02_operation_id, source_ref, request_digest, attempt):
             raise ValueError("D04 installed stage original identity conflict")

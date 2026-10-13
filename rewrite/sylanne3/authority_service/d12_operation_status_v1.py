@@ -54,6 +54,7 @@ class InstalledD12OperationStatusServiceV1:
         self._target_owner_readers = {}
         self._source_graphs = {installation_id: self.source}
         self._control_status_readers = {}
+        self._stop_reply_status_readers = {}
 
     def install_schema(self, administrator_credential):
         self.core._require(administrator_credential, "d12_operation_install", self.namespace)
@@ -207,6 +208,15 @@ class InstalledD12OperationStatusServiceV1:
             raise AuthorityUnavailable("lifecycle status reader installation differs")
         self._control_status_readers[reader.installation_id] = reader
 
+    def install_owner_stop_reply_status_reader_v1(self, reader):
+        from .owner_stop_reply_v1 import InstalledOwnerStopReplyServiceV1
+        if (type(reader) is not InstalledOwnerStopReplyServiceV1
+                or reader.core is not self.core or reader.status_service is not self
+                or reader.namespace != self.namespace
+                or reader.installation_id in self._stop_reply_status_readers):
+            raise AuthorityUnavailable("reply stop status reader installation differs")
+        self._stop_reply_status_readers[reader.installation_id] = reader
+
     def persist_derived_original_in_tx_v1(self, db, *, source_row, original):
         if db is not self.core._db or not db.in_transaction:
             raise AuthorityUnavailable("derived D12 original requires its existing Core transaction")
@@ -307,6 +317,13 @@ class InstalledD12OperationStatusServiceV1:
             original = self._authenticate_original_row_in_tx(db, row, actor=actor,
                 token=session_token, request=session_request)
             if refresh and original.kind == "control":
+                plan = json.loads(row[7])
+                if plan.get("schema") == "d12.registered_owner_stop_reply.v1":
+                    reader = self._stop_reply_status_readers.get(session_request.installation_id)
+                    if reader is None:
+                        raise AuthorityUnavailable("reply stop status reader is unavailable")
+                    projected = reader.read_status_original_in_tx_v1(db, source_row=row, original=original)
+                    return self.persist_derived_original_in_tx_v1(db, source_row=row, original=projected)
                 reader=self._control_status_readers.get(original.result.object_ref.removeprefix("installation:"))
                 if reader is not None:
                     projected = reader.read_status_original_in_tx_v1(db, original=original)

@@ -229,9 +229,13 @@ def record_d11_offline_original_in_transaction_v1(db, *, issuer, frame, kind, or
 
 
 def read_current_d11_offline_value_v1(db, *, namespace, original_ref, issuer):
+    from .domain_background_read_v3 import (read_bound_background_offline_original_rows_v3,
+        background_json_loads_v3,background_json_matches_v3,background_json_digest_v3,background_history_v3)
     if not table_exists_v1(db, TABLE):
         return None
-    rows = db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+    background,rows=read_bound_background_offline_original_rows_v3(db,namespace,original_ref)
+    if not background:
+        rows = db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
         " WHERE bot=? AND persona=? AND original_ref=? LIMIT 2", (*namespace.as_tuple, original_ref)).fetchall()
     if not rows:
         return None
@@ -241,19 +245,19 @@ def read_current_d11_offline_value_v1(db, *, namespace, original_ref, issuer):
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     if kind not in _KINDS:
         raise ValueError("unregistered offline original kind")
-    raw = json.loads(wire)
+    raw = background_json_loads_v3(wire)
     value = decode_typed_production_value_v1(raw, _KINDS[kind])
-    if canonical_serialize(raw) != wire or canonical_digest(raw) != digest or value.namespace != namespace:
+    if not background_json_matches_v3(wire,raw) or background_json_digest_v3(wire,raw) != digest or value.namespace != namespace:
         raise ValueError("offline signed original bytes/namespace changed")
     issuer._signer.verify(SIGN_KIND, canonical_serialize((namespace, kind, original_ref, digest)), signature)
     from .domain_production_read_plans_v1 import _committed
     _committed(db, namespace, operation)
     if kind in {"host_disconnect", "host_reconnect"}:
-        row = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (value.source_ref, value.source_revision)).fetchone()
+        row = background_history_v3(db,value.source_ref,value.source_revision,columns=('event_id','value','valid'))
         if row is None or row[0] != operation or row[2] != 1:
             raise ValueError("lifecycle signed original lost its actual admitted source history")
         from ..memory_types import SourceRecord
-        source = SourceRecord.from_dict(json.loads(row[1]))
+        source = SourceRecord.from_dict(background_json_loads_v3(row[1]))
         if source.occurred_at != _utc(value.observed_at_utc).timestamp():
             raise ValueError("lifecycle original time differs from its actual source")
     return value
@@ -262,9 +266,19 @@ def read_current_d11_offline_value_v1(db, *, namespace, original_ref, issuer):
 def read_current_d11_offline_original_ref_v1(db, *, namespace, original_ref, issuer):
     if not table_exists_v1(db, TABLE):
         return None
-    rows = db.execute("SELECT kind,original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND "
-        "(original_ref=? OR kind IN ('host_disconnect','host_reconnect') AND json_extract(payload_json,'$.source_ref')=?) LIMIT 2",
-        (*namespace.as_tuple, original_ref, original_ref)).fetchall()
+    from .domain_background_read_v3 import (read_bound_background_offline_original_rows_v3,
+        background_offline_lifecycle_lookup_v3,background_point_v3,background_json_loads_v3)
+    background, actual_rows=read_bound_background_offline_original_rows_v3(db,namespace,original_ref)
+    if background:
+        rows=[(row[0],original_ref) for row in actual_rows]
+        if AtomKey.from_token(original_ref).type_name=='memory.source' if original_ref.startswith('[') else False:
+            for lifecycle_kind in ('host_disconnect','host_reconnect'):
+                rows.extend((lifecycle_kind,ref) for ref,_ in background_offline_lifecycle_lookup_v3(db,namespace,
+                    kind=lifecycle_kind,field='source_ref',value=original_ref,legacy_reader=lambda:()))
+    else:
+        rows = db.execute("SELECT kind,original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND "
+            "(original_ref=? OR kind IN ('host_disconnect','host_reconnect') AND json_extract(payload_json,'$.source_ref')=?) LIMIT 2",
+            (*namespace.as_tuple, original_ref, original_ref)).fetchall()
     if not rows:
         return None
     if len(rows) != 1:
@@ -282,12 +296,15 @@ def read_current_d11_offline_original_ref_v1(db, *, namespace, original_ref, iss
     if kind == "accounting_prepared":
         from .d11_offline_accounting_v1 import D11OfflineAccountingPreparedV1, read_offline_accounting_prepared_v1
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
-        row = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='accounting_prepared' AND original_ref=?",
-            (*namespace.as_tuple, actual_ref)).fetchone()
-        locator = decode_typed_production_value_v1(json.loads(row[0]), D11OfflineAccountingPreparedV1)
+        row=background_point_v3(db,table=TABLE,columns=('payload_json',),key_columns=('bot','persona','kind','original_ref'),
+            key=(*namespace.as_tuple,'accounting_prepared',actual_ref),legacy_reader=lambda:db.execute(
+                "SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='accounting_prepared' AND original_ref=?",
+                (*namespace.as_tuple,actual_ref)).fetchone())
+        locator = decode_typed_production_value_v1(background_json_loads_v3(row[0]), D11OfflineAccountingPreparedV1)
         value = read_offline_accounting_prepared_v1(db, binding=locator.binding, issuer=issuer, resource_issuer=issuer.resource_issuer)
         return ProductionOriginalRefV1("d11.offline_accounting_prepared", original_ref, canonical_digest(plain_v1(value)))
     value = read_current_d11_offline_value_v1(db, namespace=namespace, original_ref=actual_ref, issuer=issuer)
     versions = ((GraphVersion(AtomKey.from_token(value.source_ref), value.source_revision),)
         if kind in {"host_disconnect", "host_reconnect"} else ())
-    return ProductionOriginalRefV1("d11." + kind, original_ref, canonical_digest(plain_v1(value)), versions)
+    digest=actual_rows[0][3] if background and actual_ref==original_ref else canonical_digest(plain_v1(value))
+    return ProductionOriginalRefV1("d11." + kind, original_ref, digest, versions)

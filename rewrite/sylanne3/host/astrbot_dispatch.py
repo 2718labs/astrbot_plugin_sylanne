@@ -116,7 +116,7 @@ class NaturalGraphTextPayloadResolver:
         segment, evidence = result
         try:
             payload_ref = natural_dispatch_segment_payload_ref_v2(
-                evidence.batch_ref, 0)
+                evidence.batch_ref, request.segment_index)
         except (TypeError, ValueError) as exc:
             raise DispatchBlocked("natural batch reference is invalid") from exc
         if (evidence.operation_id != request.operation_id
@@ -182,7 +182,8 @@ class AstrBotV2TextSender:
                  clock_policy: AdminIngressClockPolicy,
                  record_observation: Callable[
                      [HandoffStartV2, PlatformObservationV2], Awaitable[object]],
-                 send_timeout_seconds: float = 30.0) -> None:
+                 send_timeout_seconds: float = 30.0,
+                 local_module_admission=None) -> None:
         if (not isinstance(context, Context)
                 or not isinstance(candidates, SceneCandidateCatalog)
                 or not callable(getattr(resolver, "resolve", None))
@@ -201,6 +202,10 @@ class AstrBotV2TextSender:
         self._clock_policy = clock_policy
         self._record_observation = record_observation
         self._send_timeout_seconds = float(send_timeout_seconds)
+        from ..runtime.local_module_admission_v1 import LocalModuleAdmissionV1
+        if local_module_admission is not None and type(local_module_admission) is not LocalModuleAdmissionV1:
+            raise TypeError("sender requires the frozen native module admission")
+        self._local_module_admission = local_module_admission or LocalModuleAdmissionV1()
 
     async def send(self, *, decision: HandoffDecisionWindow,
                    binding: ExecutionBindingV2,
@@ -212,6 +217,8 @@ class AstrBotV2TextSender:
                 or type(request) is not DispatchRequest):
             raise DispatchBlocked("typed fresh V2 handoff, binding and command required")
         origin = binding.origin
+        required = ("d08", "d09", "d10", "d11") if request.proactive_contact else ("d08", "d09", "d11")
+        self._local_module_admission.require_v1(required, "dispatch:platform_first_send")
         if (request.namespace != binding.graph_namespace
                 or request.operation_id != binding.operation_id
                 or request.effect_id != origin.effect_id

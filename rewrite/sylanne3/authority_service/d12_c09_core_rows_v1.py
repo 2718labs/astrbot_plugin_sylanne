@@ -10,8 +10,12 @@ from .contract import AuthorityUnavailable
 from .d12_target_registry_v1 import D12TargetLeaseOriginalV1
 from .d12_target_owner_admission_v1 import target_admission_from_wire_v1
 from .v2_owner_session import from_wire as session_from_wire, _canonical
+from .graph_catalogue_upgrade_v1 import (
+    TABLE as CATALOGUE_TABLE, COLUMNS as CATALOGUE_COLUMNS, validate_catalogue_upgrade_core_row_v1,
+)
 
 COLUMNS = {
+    CATALOGUE_TABLE: CATALOGUE_COLUMNS,
     "authority_d12_operation_originals_v1": ("authority_namespace", "operation_id", "original_ref", "original_json",
         "actor", "session_request_json", "owner_head", "plan_json", "source_original_ref"),
     "authority_d12_target_leases_v1": ("lease_ref", "record_json", "state", "transfer_id"),
@@ -31,6 +35,11 @@ def validate_d12_core_row_v1(table, columns, row):
     if columns != COLUMNS.get(table) or len(row) != len(columns):
         raise AuthorityUnavailable("C09 D12 Core row schema differs")
     try:
+        if table == CATALOGUE_TABLE:
+            validate_catalogue_upgrade_core_row_v1(columns, row)
+            if row[11] != 'completed':
+                raise ValueError('C09 cannot retire pending catalogue conversion')
+            return row[0], 'catalogue_upgrade_operation', row[1], row[1]
         if table == "authority_d12_operation_originals_v1":
             original = decode_original(json.loads(row[3]))
             plan = json.loads(row[7])
@@ -49,6 +58,9 @@ def validate_d12_core_row_v1(table, columns, row):
                         or digest(plan) != original.plan_digest or not row[8].startswith("d12original:")):
                     raise ValueError("transfer plan/origin differs")
             elif original.kind == "control":
+                if plan.get("schema") == "d12.registered_owner_stop_reply.v1":
+                    from .owner_stop_reply_v1 import validate_owner_stop_reply_core_row_v1
+                    return validate_owner_stop_reply_core_row_v1(row)
                 from .d12_lifecycle_contract_v1 import D12InstallationControlIntentV1
                 from ..runtime.lifecycle_operations_v1 import ControlCommandV1
                 command = ControlCommandV1.from_wire(plan["input"])

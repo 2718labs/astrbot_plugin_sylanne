@@ -17,7 +17,7 @@ from .budget import BudgetReceipt, get_budget_lease, settle_budget, _settlement_
 from .d11_life_preparation_v1 import life_ids_from_binding_v1
 from .d11_life_accounting_v1 import read_life_accounting_prepared_v1
 from .d11_life_preparation_v1 import TABLE, SIGN_KIND
-from .d11_life_contract_v1 import WORK_KIND, ALGORITHM_ID
+from .d11_life_contract_v1 import WORK_KIND, ALGORITHM_ID, life_work_kind_v1, D11DraftExecutionBindingV1
 from .d11_types import (RuntimeCostSettlement, RuntimeJobValue, runtime_job_key, runtime_cost_settlement_key,
     cost_settlement_from_runtime, cost_settlement_graph_write, job_graph_write, reconcile_runtime_write)
 from .jobs import get_job, _save_job
@@ -31,7 +31,7 @@ _RECEIPT_FIELDS = frozenset({"schema", "operation_id", "binding_digest", "accoun
 
 def historical_accounting_receipt_from_wire_v1(raw):
     if (type(raw) is not dict or set(raw) != _RECEIPT_FIELDS
-            or raw["schema"] != "d11.life-historical-cost-receipt.v1"
+            or raw["schema"] not in {"d11.life-historical-cost-receipt.v1", "d11.draft-historical-cost-receipt.v1"}
             or raw["adoption_status"] != "not_adopted"
             or raw["status"] not in {"completed", "failed", "unknown"}
             or raw["cost_status"] not in {"settled", "overrun", "pending_confirmation"}
@@ -40,7 +40,10 @@ def historical_accounting_receipt_from_wire_v1(raw):
             or any(type(row) is not dict or set(row) != {"ref", "revision", "digest"}
                 or type(row["revision"]) is not int or row["revision"] < 1 for row in raw["write_commitments"])
             or len({row["ref"] for row in raw["write_commitments"]}) != len(raw["write_commitments"])
-            or (raw["status"] == "unknown" and (raw["actual_cpu_ms"] is not None or raw["cost_status"] != "pending_confirmation"))
+            or (raw["status"] == "unknown" and raw["schema"] == "d11.life-historical-cost-receipt.v1" and (raw["actual_cpu_ms"] is not None or raw["cost_status"] != "pending_confirmation"))
+            or (raw["schema"] == "d11.draft-historical-cost-receipt.v1" and (
+                raw["actual_cpu_ms"] is None and raw["cost_status"] != "pending_confirmation"
+                or raw["actual_cpu_ms"] is not None and (type(raw["actual_cpu_ms"]) is not int or raw["actual_cpu_ms"] < 0 or raw["cost_status"] not in {"settled", "overrun"})))
             or (raw["status"] != "unknown" and (type(raw["actual_cpu_ms"]) is not int or raw["actual_cpu_ms"] < 0
                 or raw["cost_status"] not in {"settled", "overrun"}))):
         raise ValueError("life historical accounting receipt fields differ")
@@ -99,7 +102,7 @@ def _event_id(binding):
 
 
 def _actual(gate):
-    return None if gate.status == "unknown" else {"thread_cpu_ms": gate.actual_cpu_ms}
+    return None if gate.actual_cpu_ms is None else {"thread_cpu_ms": gate.actual_cpu_ms}
 
 
 def _stage_cost_and_job(db, gate):
@@ -109,7 +112,7 @@ def _stage_cost_and_job(db, gate):
         raise ValueError("life existing settlement needs its authenticated composite receipt")
     settled = settle_budget(db, binding.parent_budget_lease_ref, binding.reservation_operation_id,
         binding.reservation_digest, _actual(gate), execution_revoked=True)
-    if settled.status not in ({"pending_confirmation"} if gate.status == "unknown" else {"settled", "overrun"}):
+    if settled.status not in ({"pending_confirmation"} if gate.actual_cpu_ms is None else {"settled", "overrun"}):
         raise ValueError("life historical actual CPU settlement differs")
     ids = life_ids_from_binding_v1(binding)
     cost = cost_settlement_from_runtime(db, bot_id=binding.namespace.bot_id, persona_id=binding.namespace.persona_id,
@@ -126,8 +129,8 @@ def _stage_cost_and_job(db, gate):
         atom = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (projection.key.token,)).fetchone()
         if ((job.operation_id, job.activity_id, job.bot_id, job.persona_id, job.work_kind,
                 job.budget_ref, job.resource_ref, job.fence, job.lease_holder, job.cancel_epoch) ==
-                (binding.operation_id, binding.activity_id, *binding.namespace.as_tuple, WORK_KIND,
-                binding.parent_budget_lease_ref, ALGORITHM_ID, binding.job_fence, binding.job_holder, binding.job_cancel_epoch)
+                (binding.operation_id, binding.activity_id, *binding.namespace.as_tuple, life_work_kind_v1(binding),
+                binding.parent_budget_lease_ref, binding.algorithm_id, binding.job_fence, binding.job_holder, binding.job_cancel_epoch)
                 and job.phase in {"running", "draining"} and job.effect_id == binding.effect_id
                 and job.snapshot_ref == "life-input:" + binding.input_digest[:48]
                 and job.deadline_utc == binding.deadline_utc
@@ -213,12 +216,12 @@ def validate_life_historical_accounting_composite_v1(db, *, gate, result, requir
     if (cost_value is None or canonical_digest(cost_value) != result["cost_digest"]
             or cost_value["actual"] != _actual(gate) or cost_value["execution_revoked"] is not True
             or cost_value["status"] != result["cost_status"]
-            or cost_value["unconfirmed"] != ({"thread_cpu_ms": binding.cpu_ceiling_ms} if gate.status == "unknown" else {})):
+            or cost_value["unconfirmed"] != ({"thread_cpu_ms": binding.cpu_ceiling_ms} if gate.actual_cpu_ms is None else {})):
         raise ValueError("life historical full actual cost or retained unknown ceiling differs")
     budget_row = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
         "AND operation_id=? AND phase='settle'", (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone()
     budget_receipt = _decode_json(budget_row[0], BudgetReceipt)
-    expected_status = ("pending_confirmation" if gate.status == "unknown" else
+    expected_status = ("pending_confirmation" if gate.actual_cpu_ms is None else
         "overrun" if gate.actual_cpu_ms > binding.cpu_ceiling_ms else "settled")
     lease = get_budget_lease(db, binding.parent_budget_lease_ref)
     if ((budget_receipt.operation_id, budget_receipt.digest, budget_receipt.lease_id, budget_receipt.status) !=
@@ -228,7 +231,7 @@ def validate_life_historical_accounting_composite_v1(db, *, gate, result, requir
     expected_cost = RuntimeCostSettlement(*binding.namespace.as_tuple, binding.activity_id,
         historical_accounting_operation_id_v1(binding), binding.effect_id, ids["reservation"], binding.parent_budget_lease_ref,
         lease.currency, binding.reservation_operation_id, expected_status, {"thread_cpu_ms": binding.cpu_ceiling_ms},
-        _actual(gate), {"thread_cpu_ms": binding.cpu_ceiling_ms} if gate.status == "unknown" else {},
+        _actual(gate), {"thread_cpu_ms": binding.cpu_ceiling_ms} if gate.actual_cpu_ms is None else {},
         "settle", binding.reservation_operation_id, hashlib.sha256(budget_row[0].encode("utf-8")).hexdigest(), None, True)
     if cost_value != plain_v1(expected_cost):
         raise ValueError("life historical cost key and full reservation/receipt identity differ")
@@ -237,8 +240,8 @@ def validate_life_historical_accounting_composite_v1(db, *, gate, result, requir
                 job_previous.effect_id, job_previous.job_id, job_previous.work_kind, job_previous.parent_budget_lease_ref,
                 job_previous.resource_ref, job_previous.fence, job_previous.lease_holder, job_previous.cancel_epoch,
                 job_previous.snapshot_ref, job_previous.deadline_utc) !=
-                (binding.operation_id, binding.activity_id, *binding.namespace.as_tuple, binding.effect_id, binding.job_id, WORK_KIND,
-                binding.parent_budget_lease_ref, ALGORITHM_ID, binding.job_fence, binding.job_holder, binding.job_cancel_epoch,
+                (binding.operation_id, binding.activity_id, *binding.namespace.as_tuple, binding.effect_id, binding.job_id, life_work_kind_v1(binding),
+                binding.parent_budget_lease_ref, binding.algorithm_id, binding.job_fence, binding.job_holder, binding.job_cancel_epoch,
                 "life-input:" + binding.input_digest[:48], binding.deadline_utc)
                 or job_previous.phase not in {"running", "draining"}
                 or job_value.phase != result["job_disposition"]
@@ -325,7 +328,7 @@ def reconcile_historical_life_cost_v1(graph, bootstrap, *, binding):
                 execution_seq=anchor.execution_seq, execution_digest=anchor.execution_digest, revocation_epoch=anchor.revocation_epoch)
             store.cas_graph_recovery_metadata(metadata, replacement, _capability=graph._GraphCoordinator__graph_capability)
             versions = {version.key: version.revision for version in receipt.revisions}
-            result = {"schema": "d11.life-historical-cost-receipt.v1",
+            result = {"schema": "d11.draft-historical-cost-receipt.v1" if type(binding) is D11DraftExecutionBindingV1 else "d11.life-historical-cost-receipt.v1",
                 "operation_id": historical_accounting_operation_id_v1(binding), "binding_digest": binding.digest,
                 "accounting_original_digest": gate.accounting_original_digest, "prepared_digest": gate.prepared_digest,
                 "claim_digest": gate.claim_digest, "terminal_digest": gate.terminal_digest, "gate_digest": gate.digest,

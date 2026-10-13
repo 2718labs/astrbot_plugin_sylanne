@@ -20,6 +20,43 @@ COHORT_SCHEMA = 'sylanne3.d12.configuration-cohort.v2'
 ROLES = ('deployment', 'assets', 'host_profile')
 
 
+def _validate_process_deployment_v2(deployment, policy):
+    """Bind the static process spec without embedding its containing cohort.
+
+    The selected cohort is bound later by the protected selection and the live
+    launch observation.  Keeping that digest in this configuration would make
+    the file hash (and therefore the cohort hash) depend on itself.
+    """
+    from .installed_process_supervisor_v1 import InstalledProcessSupervisorSpecV2
+
+    expected = {
+        'schema', 'assets_path', 'package_root', 'trusted_manifest_sha256',
+        'profile_id', 'inventory_path', 'inventory_sha256', 'host_uid', 'host_gid',
+        'host_supervisor_provider', 'admission_socket', 'target_directory',
+        'provider_cache', 'host_observation', 'host_lifecycle',
+    }
+    raw = deployment.get('host_supervisor_provider')
+    lifecycle = deployment.get('host_lifecycle')
+    if (set(deployment) != expected or type(raw) is not dict
+            or set(raw) != set(InstalledProcessSupervisorSpecV2.__dataclass_fields__)
+            or type(lifecycle) is not dict
+            or set(lifecycle) != {'supervisor', 'drain_timeout_seconds'}
+            or lifecycle['supervisor'] != raw):
+        raise AuthorityUnavailable('closed process deployment/spec binding differs')
+    spec = InstalledProcessSupervisorSpecV2(**raw)
+    if (spec.service_role != 'host'
+            or spec.installation_id != policy['installation_id']
+            or spec.authority_id != policy['expected_authority_id']
+            or spec.profile_id != deployment['profile_id']
+            or spec.namespace_cohort != (policy['authority_namespace'],)
+            or spec.expected_uid != deployment['host_uid']
+            or spec.expected_gid != deployment['host_gid']
+            or spec.selection_control_directory != '/etc/sylanne/maintenance'
+            or type(lifecycle['drain_timeout_seconds']) is not int
+            or not 1 <= lifecycle['drain_timeout_seconds'] <= 3600):
+        raise AuthorityUnavailable('process supervision changes installed identity or scope')
+
+
 @dataclass(frozen=True, slots=True)
 class ConfigurationFileV2:
     role: str
@@ -83,7 +120,9 @@ def derive_cohort_identity_commitment_v2(*, deployment, assets, profile, package
         raise AuthorityUnavailable('actual configuration objects required')
     if type(package) is not RegisteredPackageV2:
         raise TypeError('registered package required')
-    if (deployment.get('schema') != 'sylanne3.authority.linux-deployment.v1'
+    if (deployment.get('schema') not in {
+                'sylanne3.authority.linux-deployment.v1',
+                'sylanne3.authority.linux-deployment.v2'}
             or assets.get('schema') != 'sylanne3.authority.installed-assets.v1'
             or profile.get('schema') != 2 or type(profile.get('schema')) is not int):
         raise AuthorityUnavailable('known installed configuration schemas required')
@@ -122,6 +161,8 @@ def derive_cohort_identity_commitment_v2(*, deployment, assets, profile, package
             or c04.get('package_root') != package.package_root
             or c04.get('formal_manifest_sha256') != package.manifest_sha256):
         raise AuthorityUnavailable('configuration package pins do not agree')
+    if deployment['schema'] == 'sylanne3.authority.linux-deployment.v2':
+        _validate_process_deployment_v2(deployment, policy)
     # These are all and only the fields changed by selecting registered code.
     d, a, p = copy.deepcopy(deployment), copy.deepcopy(assets), copy.deepcopy(profile)
     d['package_root'] = '<selected-package-root>'

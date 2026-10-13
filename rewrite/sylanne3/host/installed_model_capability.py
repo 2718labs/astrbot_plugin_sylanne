@@ -16,9 +16,10 @@ from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from .authority_profile import (
     AdminIngressEncodingPolicy, AdminIngressModelPolicy, AdminModelWorkflowV2,
-    AdminInstallationBundle, installed_model_config_ref,
+    AdminInstallationBundle, installed_model_config_ref, is_installed_artifact_draft_slot_v1,
+    is_installed_life_numeric_slot_v1,
 )
-from ..installation_policy import AdminInstallationPolicy
+from ..installation_policy import AdminInstallationPolicy, model_capability_ref
 from ..runtime_contracts import NamespaceId, canonical_digest
 from ..workbench_api.d01_onboarding import VerifiedModelCapability
 
@@ -26,14 +27,6 @@ from ..workbench_api.d01_onboarding import VerifiedModelCapability
 _SCHEMA = "sylanne.astrbot.installed-model.v1"
 
 
-def model_capability_ref(provider_id: str, model: str) -> str:
-    """Canonical selector for one configured provider and its current model."""
-    if (type(provider_id) is not str or not provider_id
-            or type(model) is not str or not model):
-        raise ValueError("provider ID and model must be nonempty strings")
-    return "astrbot-model:" + canonical_digest({
-        "schema": _SCHEMA, "provider_id": provider_id, "model": model,
-    })
 
 
 class InstalledModelCapabilityPort:
@@ -219,7 +212,9 @@ class InstalledModelCapabilityPort:
                         and selection is not workflows.context_reply
                         and selection is not workflows.natural_generation
                         and selection is not workflows.natural_review
-                        and selection is not workflows.appraisal)
+                        and selection is not workflows.appraisal
+                        and not is_installed_artifact_draft_slot_v1(bundle,selection)
+                        and not is_installed_life_numeric_slot_v1(bundle,selection))
                     or type(policy) is not AdminInstallationPolicy
                     or policy.namespace != namespace
                     or selection.work_kind not in policy.root_grant.allowed_work_kinds

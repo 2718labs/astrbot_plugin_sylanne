@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import sqlite3
+import pytest
 
 from sylanne3.domains.d06 import source_correction_head_key
 from sylanne3.domains.d06.qualified_expression import (
@@ -103,6 +104,39 @@ def test_natural_paraphrase_mechanical_pass_still_requires_paid_semantic_review(
     assert result.missing == (
         "current_qualification_recompute", "independent_paid_semantic_review",
     )
+
+
+@pytest.mark.parametrize(("first_items", "last_item"), (
+    ("- First report.\n", "- Second report."),
+    ("1. First report.\n", "2. Second report."),
+    ("- First report.\n  Nested detail.\n", "- Second report."),
+    ("- First report.\n\n", "- Second report."),
+))
+def test_semantic_bubbles_keep_a_complete_list_across_qualified_claims(first_items, last_item):
+    from sylanne3.domains.d09.natural_reply import natural_semantic_ranges_v3
+
+    plan, reads, old = _case()
+    split, list_end = len(first_items), len(first_items + last_item)
+    body = first_items + last_item + "\n\nAfterward, the report ended."
+    output = {"schema": "sylanne.d09.context_reply_output.v3", "body": body,
+        "units": [{**old["units"][0], "start": start, "end": end}
+                  for start, end in ((0, split), (split, list_end), (list_end, len(body)))],
+        "semantic_segments": [{"start": 0, "end": list_end},
+                              {"start": list_end, "end": len(body)}]}
+    # Both current references and individual claim boundaries are valid. A
+    # complete list may be followed by another bubble, still requiring C6.
+    result = mechanically_verify_natural_reply_v2(
+        output, plan=plan, current_reads=reads, now_utc=110.0)
+    assert result.status == "mechanical_verified_semantic_hold"
+    assert "independent_paid_semantic_review" in result.missing
+    output["semantic_segments"] = [{"start": 0, "end": split},
+                                   {"start": split, "end": len(body)}]
+    with pytest.raises(ValueError, match="semantic boundary splits a Markdown list block"):
+        natural_semantic_ranges_v3(output)
+    refused = mechanically_verify_natural_reply_v2(
+        output, plan=plan, current_reads=reads, now_utc=110.0)
+    assert refused.status == "hold"
+    assert refused.missing == ("output_semantic_manifest",)
 
 
 def test_d09_typed_visible_limit_compiles_and_changes_natural_reply_eligibility():

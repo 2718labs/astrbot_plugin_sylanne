@@ -7,7 +7,10 @@ import json
 import os
 from pathlib import Path
 from typing import Mapping
-from uuid import UUID
+from ..host.managed_data_layout_v1 import (
+    require_managed_file_v1, support_export_filename_v1, support_export_files_v1,
+    support_export_root_v1,
+)
 
 
 SCHEMA = "d12.support_view_status.v1"
@@ -18,14 +21,11 @@ def write_view_status_export_v1(
     workspace: Mapping[str, object],
 ) -> dict[str, object]:
     """Write one immutable, content-free manifest under a trusted directory."""
-    try:
-        parsed = UUID(operation_id)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("canonical support operation id is required") from exc
-    if parsed.version != 4 or str(parsed) != operation_id:
-        raise ValueError("canonical support operation id is required")
-    if not isinstance(root, Path) or not root.is_dir() or root.is_symlink():
+    filename = support_export_filename_v1(operation_id)
+    if not isinstance(root, Path):
         raise ValueError("trusted support export directory is unavailable")
+    support_export_files_v1(root)
+    root = support_export_root_v1(root.parent)
     diagnostics = workspace.get("view_diagnostics")
     if type(diagnostics) not in (tuple, list):
         raise ValueError("current view diagnostics are unavailable")
@@ -73,11 +73,9 @@ def write_view_status_export_v1(
     manifest = {**payload, "payload_sha256": digest}
     encoded = (json.dumps(manifest, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False) + "\n").encode("utf-8")
-    root = root.resolve(strict=True)
-    path = root / f"{operation_id}.json"
-    if path.exists() or path.is_symlink():
-        if path.is_symlink() or path.resolve(strict=True).parent != root:
-            raise ValueError("support export path is not a regular managed file")
+    path = root / filename
+    if path.exists():
+        require_managed_file_v1(path, root)
         if path.read_bytes() != encoded:
             raise ValueError("support export operation has a different current snapshot")
     else:

@@ -8,7 +8,8 @@ from ...runtime_contracts import canonical_digest
 from ...runtime.domain_production_contracts_v1 import ProductionOriginalRefV1
 from ..d01.production_operations_v1 import plain_v1, require_locator_v1, stage_result_v1
 from .audience import qualify_contribution_for_audience
-from .relationship import BoundaryRule, RelationshipContribution, RelationshipProvider
+from .relationship import (BoundaryRule, RelationshipContribution, RelationshipProvider,
+    decode_relationship_projection_payload_v1, translate_relationship_projection_v2)
 from .source_correction import compile_d05_source_reevaluation
 
 
@@ -59,6 +60,8 @@ class CurrentRelationshipContributionInputsV1:
     policy_original: ProductionOriginalRefV1
     entity_original: ProductionOriginalRefV1
     existing_contribution: RelationshipContribution | None
+    qualification_keys: tuple[AtomKey, ...] = ()
+    existing_contribution_valid: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,11 +94,11 @@ def compile_adopt_current_relationship_contribution_v1(frame, request, inputs):
         raise ValueError("relationship current issuer scope or installed dimensions changed")
     key = AtomKey(Owner("relation", *ns.as_tuple, request.subject_entity_ref), "d05.contribution", item.key)
     prior = inputs.existing_contribution
-    duplicate = prior == item
+    duplicate = prior == item and inputs.existing_contribution_valid
     if prior is not None and (prior.key != item.key or item.contribution_revision != prior.contribution_revision + 1):
         if not duplicate:
             raise ValueError("relationship revision must replace the same canonical contribution")
-    write = GraphWrite(key, plain_v1(item))
+    write = GraphWrite(key, plain_v1(item), inputs.qualification_keys)
     # The original audience qualifier examines a committed contribution. For
     # preparation use the exact proposed head in the otherwise current view;
     # the runtime independently rereads the family before this compiler.
@@ -108,14 +111,37 @@ def compile_adopt_current_relationship_contribution_v1(frame, request, inputs):
         if qualification.status != "eligible":
             raise ValueError("relationship audience/source qualification unavailable")
     projection_key = AtomKey(key.owner, "d05.relationship_projection", request.dimension)
-    projection = GraphWrite(projection_key, {"subject_entity_ref": request.subject_entity_ref,
-        "dimension": request.dimension, "status": "source_qualified"}, (key,))
+    prior_projection = frame.snapshot.get(projection_key)
+    status, influence_status = "source_qualified", "not_evaluated"
+    if item.semantics in {"recollection", "simulation"}:
+        influence_status = "unapplied_pending"
+    if any(atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
+           and atom.value["target_dimension"] == request.dimension
+           and atom.value["semantics"] in {"recollection", "simulation"} for atom in frame.snapshot.atoms):
+        influence_status = "unapplied_pending"
+    if any(atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
+           and atom.value["target_dimension"] == request.dimension
+           and atom.value.get("identity_status") == "legacy_unresolved" for atom in frame.snapshot.atoms):
+        influence_status = "legacy_unresolved"
+    if prior_projection is not None and prior_projection.revision > 0:
+        prior_projection_value = decode_relationship_projection_payload_v1(prior_projection.value)
+        if prior_projection_value["status"] == "held_source_correction":
+            status = "held_source_correction"
+    # Keep all current contributions in this dimension in the invalidation
+    # closure. A later contribution must not erase an earlier source fence.
+    contribution_dependencies = tuple(dict.fromkeys((key, *(atom.key for atom in frame.snapshot.atoms
+        if atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
+        and atom.value["target_dimension"] == request.dimension))))
+    projection_value = translate_relationship_projection_v2({"subject_entity_ref": request.subject_entity_ref,
+        "dimension": request.dimension, "status": status}, source_qualification="qualified")
+    projection_value["influence_status"] = influence_status
+    projection = GraphWrite(projection_key, projection_value, contribution_dependencies)
     writes = () if duplicate else (write, projection)
     provider = _provider(inputs.policy_dimensions, inputs.policy_semantics)
     stage = stage_result_v1(frame, "d05", "adopt_relationship_contribution", request, writes=writes,
         provenance={"contribution": item, "duplicate": duplicate, "trigger": inputs.trigger_original,
             "policy": inputs.policy_original, "entity": inputs.entity_original},
-        contribution_keys=() if duplicate else (item.key,),
+        contribution_keys=() if prior is not None or item.legacy_alias_keys else (item.key,),
         receiver_events=() if duplicate else (("d08", "relationship_changed_requires_action_recheck"),),
         proposal_schema="d05.proposal.v1", proposal_hash=provider.descriptor.request_schema_hash)
     for proposal in stage.proposals:
@@ -161,7 +187,9 @@ def compile_reevaluate_current_relationship_v1(frame, request):
         writes.append(GraphWrite(atom.key, plain_v1(held), (candidate.correction_head.key, candidate.correction_source.key)))
     for ref in candidate.blocked_projection_refs:
         atom = frame.snapshot.get(AtomKey.from_token(ref))
-        writes.append(GraphWrite(atom.key, {**atom.value, "status": "held_source_correction"},
+        value = translate_relationship_projection_v2(atom.value, source_qualification="unavailable")
+        value["status"] = "held_source_correction"
+        writes.append(GraphWrite(atom.key, value,
             (candidate.correction_head.key,)))
     return stage_result_v1(frame, "d05", "reevaluate_relationship", request, writes=tuple(writes),
         provenance={"reevaluation": candidate, "historical_contributions_preserved": candidate.affected_contribution_refs},

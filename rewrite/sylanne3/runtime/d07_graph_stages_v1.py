@@ -122,6 +122,8 @@ def _write_stage(graph, bootstrap, bundle, *, job_id, phase, commit, accounting=
     with store._lock:
         saved = store._db.execute(f"SELECT job_id,phase,request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,permit_json,receipt_json FROM {TABLE} "
             "WHERE bot=? AND persona=? AND stage_operation_id=?", (*ns.as_tuple, operation_id)).fetchone()
+        if phase in {"acquire", "adopt"} and (saved is None or saved[8] is None):
+            graph.local_module_admission.require_v1(("d07", "d11"), "d07-stage:" + phase)
         if saved is None:
             store._db.execute("BEGIN IMMEDIATE")
             try:
@@ -239,7 +241,7 @@ def acquire_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id):
         if job.phase != "queued" or job.fence != 0 or job.cancel_epoch:
             return {"status": "original_execution_hold", "job_id": job_id}
         require_current_d07_content_reads_v1(db, prepared, issuer=service.d11_issuer)
-        workflow = service._configured()
+        workflow = service._configured(prepared)
         holder = graph._GraphCoordinator__content_fence_v2.installation_grant.subject
         old_atom = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone()
         if old_atom is None:
@@ -250,7 +252,24 @@ def acquire_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id):
         refs = tuple(s.source_ref.ref for s in frozen.input.sources)
         deadline = min(datetime.fromisoformat(acquired.deadline_utc.replace("Z", "+00:00")).timestamp(),
             datetime.fromisoformat(acquired.lease_expires_utc.replace("Z", "+00:00")).timestamp())
-        reads = _content_versions(db, service.d11_issuer, prepared)
+        content_reads = _content_versions(db, service.d11_issuer, prepared)
+        member_writes = (job_graph_write(acquired),)
+        extra = None
+        from .d07_execution_v1 import D07RelationshipPreparedV2
+        from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
+        if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2}:
+            from .foreground_call_plan_v1 import register_current_named_c3_in_transaction_v2
+            cycle_write, cycle_revision = register_current_named_c3_in_transaction_v2(db,
+                prepared=prepared, issuer=service.d11_issuer, now_utc=now,
+                installed_bundle=bundle, owner_guard=guard)
+            member_writes += (cycle_write,)
+            binding_kind = "relationship_c3" if type(prepared) is D07RelationshipPreparedV2 else "method_growth_c3"
+            extra = {binding_kind: {"cycle_ref": prepared.cycle_ref.key.token,
+                "before_cycle_digest": prepared.cycle_digest, "before_call_plan_digest": prepared.call_plan_digest,
+                "call_id": prepared.call_id, "semantic_question_digest": prepared.semantic_question_digest}}
+        reads = content_reads
+        if len(member_writes) == 2:
+            reads = tuple(v for v in reads if v.key != cycle_write.key) + (GraphVersion(cycle_write.key, cycle_revision + 1),)
         versions = dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? AND ref='current' "
             "AND kind IN ('scheme','operator','policy')", prepared.namespace.as_tuple).fetchall())
         authority = AuthorityContext(holder, "d11", "d07-original:" + prepared.digest, prepared.namespace,
@@ -271,8 +290,9 @@ def acquire_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id):
             frozenset(workflow.required_capabilities), workflow.privacy_tier, TEMPLATE_DIGEST,
             json.loads(frozen.canonical_wire), workflow.timeout_seconds, workflow.max_output_tokens)
         seal_d07_request_in_transaction_v1(db, service.d11_issuer, prepared, call)
+        member_reads = (*content_reads, GraphVersion(job_graph_write(acquired).key, old_atom[0]))
         _commit_graph_stage(graph, db, metadata, epoch, prepared, acquire_id, "execution_acquired", now,
-            (job_graph_write(acquired),), (*reads, GraphVersion(job_graph_write(acquired).key, old_atom[0])))
+            member_writes, member_reads, extra=extra)
         return {"status": "acquired", "job_id": job_id}
     return _write_stage(graph, bootstrap, bundle, job_id=job_id, phase="acquire", commit=commit)
 
@@ -281,6 +301,7 @@ def read_acquired_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id):
     service = _service(graph, bootstrap, bundle)
     ns, policy = bundle.installation_policy.namespace, bundle.installation_policy
     port = graph._GraphCoordinator__content_fence_v2
+    now = trusted_upper(port.read_ingress_clock(bundle.ingress_clock))
     with service._store._lock:
         prepared = _prepared(graph, service, job_id)
         job = get_job(service._db, job_id)
@@ -289,7 +310,7 @@ def read_acquired_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id):
         metadata, _ = graph._v2_graph_stamp(ns)
     authority = AuthorityContext(port.installation_grant.subject, "d11", "d07-original-read:" + job_id,
         ns, ("activity", "event", "persona", "scene"), "proposal", prepared.audience,
-        service._configured().provider_config_ref, metadata.requirements.activation_generation)
+        service._configured(prepared).provider_config_ref, metadata.requirements.activation_generation)
     owner = []
     def observe(scope):
         pair = port.get_current_owner_guard_for_fence(namespace=ns, authority_namespace=policy.authority_namespace, permit=scope.permit)
@@ -309,11 +330,29 @@ def read_acquired_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id):
             if (job.phase != "running" or job.cancel_epoch or job.fence != call.envelope.authority.worker_fence
                     or job.lease_holder != call.envelope.authority.actor):
                 raise ValueError("D07 original acquired worker identity changed")
-            frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
-            sources = tuple((s.record.source_id, s.source_ref.version) for s in frozen.input.sources)
+            from .d07_execution_v1 import D07IngressRecallPreparedV1
+            if type(prepared) is D07IngressRecallPreparedV1:
+                from ..model_broker.d07_cognition_v1 import thaw_d07_ingress_recall_request_v1
+                from .d07_ingress_recall_acquisition_v1 import ingress_recall_acquire_operation_id_v1, ACQUIRE_OPERATION
+                from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+                from ..authority_service.d07_current_execution_v1 import _require_current_ingress_recall_parent_v1
+                acquired = read_adopted_domain_operation_v1(db, ns,
+                    ingress_recall_acquire_operation_id_v1(ns, prepared.c02_operation_id))
+                if (acquired is None or acquired["operation_kind"] != ACQUIRE_OPERATION
+                        or acquired["payload"]["provenance"]["prepared_digest"] != prepared.digest
+                        or acquired["payload"]["provenance"]["request_digest"] != call.digest):
+                    raise ValueError("Self C3 read lacks its actual adopted acquisition")
+                frozen = thaw_d07_ingress_recall_request_v1(json.loads(prepared.frozen_json))
+                _require_current_ingress_recall_parent_v1(db, prepared=prepared, frozen=frozen, request=call,
+                    issuer=service.d11_issuer, installed_bundle=bundle, now=now)
+                input_sources = (frozen.input.cue, *frozen.input.known_sources)
+            else:
+                frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
+                input_sources = frozen.input.sources
+            sources = tuple((s.record.source_id, s.source_ref.version) for s in input_sources)
             access = []
             from ..memory_types import access_key
-            for source in frozen.input.sources:
+            for source in input_sources:
                 row = db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?",
                     (access_key(*ns.as_tuple, source.record.source_id).token,)).fetchone()
                 if row is None or row[1] != 1:
