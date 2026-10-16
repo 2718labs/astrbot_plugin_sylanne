@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { createManagement } from './use-management.ts'
+import {pendingBeta1Attempts} from './api/beta1-owner.ts'
 import { createSetup } from './use-setup.ts'
 import { createConfiguration } from './use-configuration.ts'
 import { ConfigurationApi } from './api/configuration.ts'
@@ -38,6 +39,7 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
   const creator = createCreatorConfiguration(api, () => transportReady() && state.auth==='authenticated'&&state.dashboard==='authenticated'&&state.owner==='unlocked'&&!state.busy&&scopeValid.value, () => state.scope, fail)
   const management = createManagement(api, () => transportReady() && state.auth === 'authenticated' && state.dashboard === 'authenticated' && state.owner === 'unlocked' && !state.busy && api.hasSession, fail)
   watch(() => [state.auth, state.dashboard, state.owner, state.busy] as const, () => {
+    if(state.auth!=='authenticated'||state.owner!=='unlocked'||state.dashboard!=='authenticated')pendingBeta1Attempts.clear()
     if (state.auth !== 'authenticated' || state.dashboard !== 'authenticated' || state.owner !== 'unlocked' || state.busy) management.invalidate()
   }, { flush: 'sync' })
   let revision = 0, viewRevision = 0, workspaceRevision = 0, authRevision = 0, activeView: ViewType | null = null, selectedEntry = ''
@@ -251,9 +253,14 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
     },
   }
   const replyControls = { read: (scope: string, cursor: string | null = null) => api.readReplyControls(scope, cursor), stop: (request: import('./api/reply-controls.ts').StopReplyRequest) => api.stopReply(request), status: (scope: string, originalRef: string) => api.readReplyControlStatus(scope, originalRef) }
+  async function ownerRequest<T>(request:()=>Promise<T>):Promise<T>{try{return await request()}catch(error){fail(error);throw error}}
+  const beta1 = { prepareCommand:(scope:string,input:import('./api/beta1-owner.ts').JointCommandSelectionInput,operationId:string)=>ownerRequest(()=>api.prepareJointCommand(scope,input,operationId)), freezeCommand:(scope:string,input:import('./api/beta1-owner.ts').PreparedJointCommand,operationId:string)=>ownerRequest(()=>api.freezeNamedJointCommand(scope,input,operationId)), prepareNode:(scope:string,windowRef:string,nodeId:string,operationId:string)=>ownerRequest(()=>api.prepareNamedJointNode(scope,windowRef,nodeId,operationId)), submit:(scope:string,kind:import('./api/beta1-owner.ts').Beta1Kind,input:import('./api/beta1-owner.ts').Beta1Input,operationId:string)=>ownerRequest(()=>api.submitBeta1Owner(scope,kind,input,operationId)), read:(scope:string,domain:Exclude<import('./api/beta1-owner.ts').Beta1Domain,'self'>,refs:string[])=>ownerRequest(()=>api.readBeta1OwnerState(scope,domain,refs)) }
+  const selfView = { read: (scope:string,blockIds:string[]=[]) => ownerRequest(()=>api.readCurrentSelfView(scope,blockIds)) }
+  const generalGrowth = { submit: (scope:string,kind:import('./api/general-growth.ts').GeneralGrowthKind,
+    input:import('./api/general-growth.ts').GeneralGrowthInput,operationId:string) => api.submitGeneralGrowth(scope,kind,input,operationId) }
   const projectContext = { read: (scope:string) => api.readOwnerProjectContexts(scope),
     adopt: (scope:string,options:import('./api/project-context.ts').ProjectContextOptions,item:import('./api/project-context.ts').ProjectContextItem,
       role:string,norms:string[],operationId:string) => api.adoptOwnerProjectContext(scope,options,item,role,norms,operationId) }
-  return { state, setup, configuration, creator, management, relations, artifacts, projectControls, sourceCorrections, ownerTasks, ownerMaterials, replyControls, projectContext, requiresHttps, canRead, canNextView, viewPaging, nextView: () => state.viewType ? readView(state.viewType, true) : Promise.resolve(), runtimeReadable, scopeValid, canSignedLogin, checkSession, connect: checkSession, setScope, beginOwnerLogin, completeOwnerLogin, cancelChallenge, dismissLogin, logout, openWorkspace, readView, selectArchive, invalidateView, invalidateNavigation }
+  return { state, setup, configuration, creator, management, relations, artifacts, projectControls, sourceCorrections, ownerTasks, ownerMaterials, replyControls, projectContext, generalGrowth, selfView, beta1, requiresHttps, canRead, canNextView, viewPaging, nextView: () => state.viewType ? readView(state.viewType, true) : Promise.resolve(), runtimeReadable, scopeValid, canSignedLogin, checkSession, connect: checkSession, setScope, beginOwnerLogin, completeOwnerLogin, cancelChallenge, dismissLogin, logout, openWorkspace, readView, selectArchive, invalidateView, invalidateNavigation }
 }
 export type BackendController = ReturnType<typeof useBackend>

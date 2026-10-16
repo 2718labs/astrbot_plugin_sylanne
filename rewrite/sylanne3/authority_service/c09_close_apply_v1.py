@@ -375,12 +375,15 @@ class InstalledC09CloseApplyV1:
         with closing(sqlite3.connect(Path(member["resolved_path"]).as_uri() + "?mode=ro", uri=True)) as db:
             db.execute("BEGIN")
             certificate = self.graph_application._certificate_locked(db, context, operation_id)
+            from ..runtime.c09_paged_capture_contract_v2 import GraphErasureRebaseCertificateV2
+            new_incarnation=(certificate.candidate.new_incarnation if type(certificate)is GraphErasureRebaseCertificateV2
+                else certificate.new_incarnation)
             ack = self.graph_application._read_ack_locked(db, operation_id)
             row = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
                 "WHERE bot=? AND persona=?", self.graph_application.namespace.as_tuple).fetchone()
             if (ack is None or ack["ack_digest"] != release["graph_ack_digest"] or row is None
                     or row[1] < ack["graph_revision"]
-                    or json.loads(row[0])["graph_incarnation"] != certificate.new_incarnation):
+                    or json.loads(row[0])["graph_incarnation"] != new_incarnation):
                 raise AuthorityUnavailable("C09 current cold Graph application differs")
         with self.service.core._lock:
             db = self.service.core._db

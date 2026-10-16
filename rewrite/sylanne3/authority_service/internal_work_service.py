@@ -132,7 +132,12 @@ class AuthorityInternalWorkService:
                 and attestation.get("status") == "local_alpha2_package_bytes_only"
                 and attestation.get("runtime_scope") == "backend-local-alpha2-acceptance"
             )
-            if not formal and not candidate and not local_alpha2:
+            server_beta1 = (
+                attestation.get("package_mode") == "beta1-candidate"
+                and attestation.get("status") == "beta1_server_test_package_bytes_only"
+                and attestation.get("runtime_scope") == "backend-beta1-server-test"
+            )
+            if not formal and not candidate and not local_alpha2 and not server_beta1:
                 raise ValueError("D06 diagnostics cannot obtain production runtime attestation")
             algorithm_id = attestation["algorithm_id"]
             if algorithm_id in self.installed_builds:

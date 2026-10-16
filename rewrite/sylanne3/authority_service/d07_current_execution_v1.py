@@ -8,6 +8,7 @@ import json
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize, AuthorityContext
 from .v2_model_egress_contract import ModelEgressIntentV1, ModelEgressObservationV1, ModelTerminalReceiptV2
 from .d07_model_timing_v1 import D07ModelTimingOriginalV1
+from ..runtime.natural_producer_qualification_v1 import _producer_original_point_v3
 
 SCHEMA = "d07.authority-cognition-result-read.v1"
 
@@ -108,13 +109,13 @@ def read_current_d07_execution_graph_v1(db, intent, issuer, now, *, allow_unseal
                 datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp())):
         raise ValueError("D07 once-only current worker/original differs")
     require_current_d07_content_reads_v1(db, prepared, issuer=issuer)
-    atom = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone()
+    atom = _producer_original_point_v3(db, table='graph_atoms', columns=('value', 'valid'), key_columns=('token',), key=(job_graph_write(job).key.token,), legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone())
     if atom is None or atom[1] != 1 or json.loads(atom[0]) != job_graph_write(job).value:
         raise ValueError("D07 actual current Graph job projection differs")
-    rights = db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+    rights = _producer_original_point_v3(db, table='graph_authority_epochs', columns=('access_epoch', 'delete_epoch'), key_columns=('bot', 'persona'), key=namespace.as_tuple, legacy_reader=lambda: db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?", namespace.as_tuple).fetchone())
     if rights != (intent.access_epoch, intent.delete_epoch) or rights != (prepared.access_epoch, prepared.delete_epoch):
         raise ValueError("D07 current source rights changed")
-    metadata = db.execute("SELECT requirements_json FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+    metadata = _producer_original_point_v3(db, table='graph_recovery_metadata_v2', columns=('requirements_json',), key_columns=('bot', 'persona'), key=namespace.as_tuple, legacy_reader=lambda: db.execute("SELECT requirements_json FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", namespace.as_tuple).fetchone())
     if metadata is None:
         raise ValueError("D07 actual current Authority anchor absent")
     anchor = json.loads(metadata[0])
@@ -133,12 +134,13 @@ def read_current_d07_execution_graph_v1(db, intent, issuer, now, *, allow_unseal
         require_budget_family_admissible(db, lease.lease_id)
     if (lease.bot_id, lease.persona_id) != namespace.as_tuple:
         raise ValueError("D07 budget crosses namespace")
-    reserved = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
-        (lease.lease_id, prepared.operation_id)).fetchone()
+    reserved = _producer_original_point_v3(db, table='runtime_budget_reservations', columns=('digest', 'ceiling_json', 'state'), key_columns=('lease_id', 'operation_id'), key=(lease.lease_id, prepared.operation_id), legacy_reader=lambda: db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+        (lease.lease_id, prepared.operation_id)).fetchone())
     allowed = {"reserved", "settled", "overrun", "unknown", "partial_unknown", "partial_overrun"} if allow_accounted_result else {"reserved"}
     if reserved is None or reserved[0] != prepared.reservation_digest or reserved[2] not in allowed or json.loads(reserved[1]) != dict(quote.ceiling):
         raise ValueError("D07 actual reserved workflow budget unavailable")
     from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1
+    expected_purpose="proposal"
     if type(prepared) is D07IngressRecallPreparedV1:
         from ..model_broker.d07_cognition_v1 import thaw_d07_ingress_recall_request_v1, RECALL_TEMPLATE_DIGEST_V1
         frozen = thaw_d07_ingress_recall_request_v1(json.loads(prepared.frozen_json))
@@ -146,18 +148,39 @@ def read_current_d07_execution_graph_v1(db, intent, issuer, now, *, allow_unseal
         _require_current_ingress_recall_parent_v1(db, prepared=prepared, frozen=frozen,
             request=request, issuer=issuer, installed_bundle=installed_bundle, now=now)
     else:
-        frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
-        template_digest = TEMPLATE_DIGEST
+        from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,require_current_general_growth_prepared_v1
+        if type(prepared)is D07GeneralGrowthPreparedV1:
+            from ..model_broker.general_growth_cognition_v1 import thaw_general_growth_cognition_request_v1,TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST
+            frozen=thaw_general_growth_cognition_request_v1(json.loads(prepared.frozen_json))
+            template_digest=GENERAL_TEMPLATE_DIGEST
+            expected_purpose="consolidation"
+            require_current_general_growth_prepared_v1(db,issuer=issuer,prepared=prepared,
+                installed_bundle=installed_bundle,now=now,frozen=frozen)
+        else:
+            frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
+            template_digest = TEMPLATE_DIGEST
     if (request.call_id != prepared.call_id or request.prompt_template_digest != template_digest
             or dict(request.payload) != json.loads(frozen.canonical_wire) or request.identity.phase != WORK_KIND
             or request.envelope.authority.namespace != namespace or request.envelope.authority.actor != intent.subject
             or request.envelope.authority.worker_fence != intent.worker_fence or request.identity.operation_id != intent.operation_id
             or request.envelope.parent_budget_lease_ref != intent.budget_lease_id
-            or request.envelope.authority.audience != prepared.audience or request.envelope.authority.purpose != "proposal"
+            or request.envelope.authority.audience != prepared.audience or request.envelope.authority.purpose != expected_purpose or prepared.purpose!=expected_purpose
             or (intent.provider_id, intent.model_id, intent.provider_config_digest, intent.max_output_tokens) !=
                (frozen.installation.provider_id, frozen.installation.model_id,
                 frozen.installation.provider_config_digest, frozen.installation.max_output_tokens)):
         raise ValueError("D07 actual typed model request differs from frozen installed wire")
+    from ..runtime.d07_execution_v1 import D07ReflectionPreparedV3
+    if type(prepared) is D07ReflectionPreparedV3:
+        from ..runtime.d07_reflection_execution_v1 import read_reflection_continuation_v3,require_current_reflection_parent_v3
+        continuation=read_reflection_continuation_v3(db,issuer,namespace,prepared.reflection_continuation_ref)
+        if continuation is None or continuation[1]!=prepared.reflection_continuation_digest:
+            raise ValueError("reflection egress lost its exact original continuation")
+        _,parent,_,_=require_current_reflection_parent_v3(db,issuer=issuer,namespace=namespace,
+            continuation=continuation[0],now_utc=now)
+        if parent.activation_generation!=prepared.activation_generation:
+            raise ValueError("reflection egress changed its original parent activation")
+        if request.envelope.deadline_utc>prepared.original_deadline_utc:
+            raise ValueError("reflection egress extended its parent original deadline")
     if _clock_original(db, issuer, namespace, _clock_from_json(prepared.clock_mapping_json)) != prepared.clock_original_digest:
         raise ValueError("D07 exact signed role clock original changed")
     return prepared, job, frozen
@@ -210,8 +233,8 @@ def _require_current_ingress_recall_parent_v1(db, *, prepared, frozen, request, 
         raise ValueError("Self C3 differs from its actual adopted Need/C02/cancellation original")
     owner = decode_typed_production_value_v1(json.loads(prepared.owner_guard_json), ProductionOwnerGuardV1)
     authority = decode_typed_production_value_v1(json.loads(prepared.self_authority_json), AuthorityContext)
-    owner_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-        (owner.grant_ref,)).fetchone()
+    owner_row = _producer_original_point_v3(db, table='graph_atoms', columns=('revision', 'value', 'valid'), key_columns=('token',), key=(owner.grant_ref,), legacy_reader=lambda: db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+        (owner.grant_ref,)).fetchone())
     if (owner_row is None or owner_row[2] != 1 or owner_row[0] != owner.grant_revision
             or canonical_digest(json.loads(owner_row[1])) != owner.grant_digest
             or authority.namespace != prepared.namespace or authority.purpose != prepared.purpose
@@ -219,8 +242,8 @@ def _require_current_ingress_recall_parent_v1(db, *, prepared, frozen, request, 
         raise ValueError("Self C3 lost its exact upstream Owner guard or initiating Self scope")
     cycle = get_job(db, AtomKey.from_token(prepared.cycle_job_ref).name)
     continuation = foreground_cycle_from_wire_v1(cycle.continuation)
-    parent_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
-        (prepared.cycle_job_ref,)).fetchone()
+    parent_row = _producer_original_point_v3(db, table='graph_atoms', columns=('value', 'valid'), key_columns=('token',), key=(prepared.cycle_job_ref,), legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
+        (prepared.cycle_job_ref,)).fetchone())
     attempts = tuple(attempt for attempt in continuation.call_plan.attempts if attempt.slot == "C3")
     if (cycle.work_kind != "d11.foreground_cycle.v1"
             or cycle.phase in {"completed", "failed", "cancelled", "draining", "pending_confirmation"}
@@ -244,8 +267,8 @@ def _require_current_ingress_recall_parent_v1(db, *, prepared, frozen, request, 
             or need.responsibility_ref != prepared.responsibility_ref
             or responsibility.c02_operation_id != prepared.c02_operation_id or now >= need.deadline_utc):
         raise ValueError("Self C3 current responsibility or original deadline differs")
-    mapping_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
-        (self_mapping_key(prepared.namespace).token,)).fetchone()
+    mapping_row = _producer_original_point_v3(db, table='graph_atoms', columns=('value', 'valid'), key_columns=('token',), key=(self_mapping_key(prepared.namespace).token,), legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
+        (self_mapping_key(prepared.namespace).token,)).fetchone())
     if mapping_row is None or mapping_row[1] != 1:
         raise ValueError("Self C3 current Self mapping absent")
     mapping = decode_typed_production_value_v1(json.loads(mapping_row[0]), SelfIdentityMapping)

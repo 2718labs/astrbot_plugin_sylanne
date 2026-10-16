@@ -568,6 +568,7 @@ class D09ExpressionProvider:
                 ("receipt_refs", "str_list"), ("version", "positive_int"),
             )),
         )
+        from ..d03.world_history_v1 import world_type_specs_v1
         from .contact_batch_v2 import contact_batch_type_specs_v2
         from .contact_batch_v3 import contact_batch_type_specs_v3
         from .natural_disposition_v1 import natural_disposition_type_spec_v1
@@ -600,7 +601,7 @@ class D09ExpressionProvider:
                          "owners": ("activity",), "role": "state", "immutable": True,
                          "version": 3, "fields": "v2 plus whole reviewed semantic_manifest and selected_index 0..3; child position 0",
                      })),
-        )
+        ) + world_type_specs_v1("d09")
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
@@ -619,6 +620,10 @@ class D09ExpressionProvider:
             raise ValueError("proposal is not a D09 expression proposal")
         if proposal.proposal_schema_hash != _D09_PROPOSAL_SCHEMA_HASH:
             raise ValueError("D09 proposal schema hash is not recognized")
+        from ..d03.world_history_v1 import EXPRESSION_TYPE
+        if any(write.key.type_name==EXPRESSION_TYPE for write in proposal.typed_writes):
+            from ...runtime.world_owner_read_v3 import require_world_staged_proposal_v3
+            require_world_staged_proposal_v3(proposal)
         specs = {spec.name: spec for spec in self.register_types()}
         for write in proposal.typed_writes:
             spec = specs.get(write.key.type_name)

@@ -6,6 +6,7 @@ from dataclasses import asdict, fields
 
 from ..runtime.restore_anchor import RestoreAnchor
 from .v2_accounting_contract import (
+    ModelNoDispatchAccountingGrantV1, ModelNoDispatchAccountingRequestV1,
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
 from .v2_contract import FencePermitV2, from_wire as fence_from_wire
@@ -22,6 +23,12 @@ def _shape(value, kind):
 
 
 def to_wire(value):
+    if type(value) is ModelNoDispatchAccountingRequestV1:
+        return {"operation_id": value.operation_id, "witness": model_to_wire(value.witness),
+            "expected_anchor": asdict(value.expected_anchor), "schema": value.schema}
+    if type(value) is ModelNoDispatchAccountingGrantV1:
+        return {"permit": fence_to_wire(value.permit), "call_id": value.call_id,
+            "reservation_digest": value.reservation_digest, "witness_digest": value.witness_digest, "schema": value.schema}
     if type(value) is AccountingMaintenanceRequestV1:
         return {
             "operation_id": value.operation_id,
@@ -43,6 +50,19 @@ def to_wire(value):
 
 
 def from_wire(value, kind):
+    if kind is ModelNoDispatchAccountingRequestV1:
+        from .v2_model_egress_contract import ModelNoDispatchWitnessV1
+        shaped = dict(_shape(value, kind))
+        shaped["witness"] = model_from_wire(shaped["witness"], ModelNoDispatchWitnessV1)
+        shaped["expected_anchor"] = RestoreAnchor(**_shape(shaped["expected_anchor"], RestoreAnchor))
+        result = kind(**shaped)
+        if to_wire(result) != value: raise ValueError("noncanonical no-dispatch accounting request")
+        return result
+    if kind is ModelNoDispatchAccountingGrantV1:
+        shaped = dict(_shape(value, kind)); shaped["permit"] = fence_from_wire(shaped["permit"])
+        result = kind(**shaped)
+        if to_wire(result) != value: raise ValueError("noncanonical no-dispatch accounting grant")
+        return result
     if kind is AccountingMaintenanceRequestV1:
         shaped = dict(_shape(value, kind))
         shaped["intent"] = model_from_wire(shaped["intent"], ModelEgressIntentV1)

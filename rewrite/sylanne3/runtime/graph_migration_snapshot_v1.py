@@ -49,6 +49,7 @@ _DIRECT = frozenset("""
  graph_c04_code_policy_originals_v3 graph_c04_adoptions_v3 graph_owner_domain_attempts_v3
  graph_c04_historical_accounting_v1 graph_c04_historical_job_closures_v1
  graph_c04_adoption_provenance_v3
+ graph_c09_rebase_certificates_v1 graph_c09_rebase_certificates_v2 graph_c09_erased_keys_v1
  graph_c09_cumulative_applications_v1
  d11_c04_cpu_cost_originals_v1
  d02_c04_body_cost_originals_v1
@@ -62,16 +63,24 @@ _DIRECT = frozenset("""
  graph_d04_joint_numeric_originals_v1 graph_d04_joint_output_originals_v1 graph_d04_joint_output_closures_v1
  graph_d04_originals_v3 graph_d04_root_originals_v3
  runtime_d11_d04_root_freezes_v2 runtime_d11_d04_root_freezes_v3
+ graph_world_revision_index_v1 graph_world_revision_erasure_barriers_v1
  graph_domain_production_originals_v1 graph_domain_production_outbox_v1
+ graph_contact_effect_originals_v1
+ graph_contact_effect_accounting_attempts_v1
  graph_contact_model_originals_v1
  graph_contact_model_originals_v2
  graph_contact_expression_plan_originals_v2
+ graph_contact_expression_plan_originals_v3
+ graph_contact_plan_streams_v3
  graph_contact_owner_invocations_v3
+ graph_contact_background_invocations_v1
+ graph_contact_background_scheduler_v3
  graph_internal_life_content_originals_v1 graph_internal_life_worker_originals_v2 graph_internal_life_paid_originals_v2
  graph_d01_production_inputs_v1 graph_d02_production_policies_v1 graph_d02_action_components_v1
  graph_d05_production_policies_v1 graph_d05_boundary_intents_v1
- graph_d08_joint_plan_intents_v1 graph_d08_party_consents_v1
+ graph_d08_joint_plan_intents_v1 graph_d08_party_consents_v1 graph_d08_joint_node_originals_v1
  graph_d10_production_inputs_v1 graph_d10_observed_ticks_v1
+ graph_joint_window_managed_guards_v1 graph_habit_managed_execution_v1
  graph_d11_offline_originals_v1
  graph_d11_derived_cache_payloads_v1 graph_d13_derived_activations_v6 graph_d13_wire_evidence_v6 graph_d13_core_wire_evidence_v1
  graph_d13_paid_owner_guard_links_v3
@@ -351,6 +360,14 @@ def _clock_row_owner(table, columns, row, originals):
 
 def _routed_rows(db, table: str, columns: tuple[str, ...],
                  namespace: NamespaceId) -> tuple[tuple[object, ...], ...]:
+    from .c09_contact_effect_accounting_v1 import GRAPH_TABLES, require_financial_schema_v1, validate_graph_financial_row_v1
+    if table in GRAPH_TABLES:
+        require_financial_schema_v1(db, table)
+        selected = []
+        for row in db.execute("SELECT * FROM " + table):
+            validate_graph_financial_row_v1(table, columns, row)
+            if row[:2] == namespace.as_tuple: selected.append(row)
+        return tuple(selected)
     if table in _LIFE_TABLES:
         selected = []
         for row in db.execute("SELECT * FROM "+table):

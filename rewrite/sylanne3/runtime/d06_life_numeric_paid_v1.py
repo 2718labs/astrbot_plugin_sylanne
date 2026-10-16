@@ -46,6 +46,20 @@ def life_numeric_model_draft_v1(db, *, namespace, issuer, job_id, metadata, epoc
     return p, b, model, draft
 
 
+def append_current_life_numeric_call_seal_v3(db, *, namespace, issuer, intent, permit, state, prepared_digest, binding_digest, request_digest):
+    from .current_life_numeric_paid_write_v3 import require_current_life_numeric_call_seal_v3
+    from ..authority_service.v2_model_egress_wire import to_wire as model_to_wire
+    from ..authority_service.v2_contract import to_wire as fence_to_wire
+    raw = require_current_life_numeric_call_seal_v3(state, db, intent, permit)
+    if (prepared_digest,binding_digest,request_digest) != (raw["prepared_digest"],raw["binding_digest"],raw["request_digest"]):
+        raise ValueError("Life numeric current call seal changed its actual qualified originals")
+    _record(db, namespace=namespace, issuer=issuer, kind="numeric_call_v1", ref=intent.job_id,
+        operation_id=intent.acquire_operation_id, value={"schema":"d06.internal-life-numeric-call.v1",
+            "prepared_digest":prepared_digest,"binding_digest":binding_digest,"request_digest":request_digest,
+            "intent":model_to_wire(intent),"permit":fence_to_wire(permit)})
+    return {"schema":"d06.internal-life-numeric-call.v1","job_id":intent.job_id,
+        "prepared_digest":prepared_digest,"binding_digest":binding_digest,"request_digest":request_digest}
+
 def seal_life_numeric_call_v1(db, *, namespace, issuer, intent, permit, metadata, epoch):
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1, ModelEgressDraftV1
     from ..authority_service.v2_model_egress_wire import to_wire
@@ -85,7 +99,19 @@ def read_life_numeric_cost_commit_v1(db,*,namespace,issuer,prepared,intent,termi
     from ..authority_service.v2_model_egress_wire import to_wire
     if sealed is None or sealed['intent']!=to_wire(intent):raise ValueError('Life cost lacks authenticated sealed call')
     op=original_model_cost_operation_id_v1(namespace,prepared.call_id)
-    row=db.execute('SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,op)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    from ..authority_service.life_numeric_source_read_v3 import read_bound_numeric_result_cost_point_v3
+    handled,full=read_bound_native_numeric_point_v3(db,table='graph_bundle_operations',
+        columns=('digest','activity_id','effect_id','commit_seq','receipt_json'),
+        key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,op))
+    if not handled:
+        handled,full=read_bound_numeric_result_cost_point_v3(db,table='graph_bundle_operations',
+            columns=('digest','activity_id','effect_id','commit_seq','receipt_json'),
+            key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,op))
+    if handled:
+        row=None if full is None else full[1:]
+    else:
+        row=db.execute('SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,op)).fetchone()
     if row is None:raise ValueError('Life actual paid cost COMMIT absent')
     raw=json.loads(row[3])
     if type(raw) is not dict or set(raw)!={'original_model_cost','original_intent_digest','terminal_receipt_digest','quote_id','quote_version','work_kind','accounting_attempt_id'} or canonical_json(raw)!=row[3]:
@@ -95,9 +121,27 @@ def read_life_numeric_cost_commit_v1(db,*,namespace,issuer,prepared,intent,termi
     for n in ('quote_version','commit_seq','graph_revision','graph_epoch'):
         if type(c[n]) is not int or c[n]<1:raise ValueError('Life cost version is not strict positive integer')
     cost=OriginalModelCostCommitV1(**c);quote=issuer.resource_issuer.original_signed_quote(db,prepared.quote_id,prepared.quote_version)
-    budget=db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",(*namespace.as_tuple,prepared.prepare_operation_id)).fetchone()
-    reservation=db.execute('SELECT state,digest FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',(quote.parent_budget_lease_ref,prepared.prepare_operation_id)).fetchone()
-    attempt=db.execute('SELECT state,attempt_id FROM graph_original_model_cost_attempts_v1 WHERE bot=? AND persona=? AND call_id=?',(*namespace.as_tuple,prepared.call_id)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,budget=read_bound_native_numeric_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(*namespace.as_tuple,prepared.prepare_operation_id,'settle'))
+    if not handled:
+        handled,budget=read_bound_numeric_result_cost_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),key_columns=('bot_id','persona_id','operation_id','phase'),key=(*namespace.as_tuple,prepared.prepare_operation_id,'settle'))
+    if not handled:
+        budget=db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",(*namespace.as_tuple,prepared.prepare_operation_id)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,reservation=read_bound_native_numeric_point_v3(db,table='runtime_budget_reservations',columns=('state', 'digest'),
+        key_columns=('lease_id', 'operation_id'),key=(quote.parent_budget_lease_ref,prepared.prepare_operation_id))
+    if not handled:
+        handled,reservation=read_bound_numeric_result_cost_point_v3(db,table='runtime_budget_reservations',columns=('state','digest'),key_columns=('lease_id','operation_id'),key=(quote.parent_budget_lease_ref,prepared.prepare_operation_id))
+    if not handled:
+        reservation=db.execute('SELECT state,digest FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',(quote.parent_budget_lease_ref,prepared.prepare_operation_id)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,attempt=read_bound_native_numeric_point_v3(db,table='graph_original_model_cost_attempts_v1',columns=('state', 'attempt_id'),
+        key_columns=('bot', 'persona', 'call_id'),key=(*namespace.as_tuple,prepared.call_id))
+    if not handled:
+        handled,attempt=read_bound_numeric_result_cost_point_v3(db,table='graph_original_model_cost_attempts_v1',columns=('state','attempt_id'),key_columns=('bot','persona','call_id'),key=(*namespace.as_tuple,prepared.call_id))
+    if not handled:
+        attempt=db.execute('SELECT state,attempt_id FROM graph_original_model_cost_attempts_v1 WHERE bot=? AND persona=? AND call_id=?',(*namespace.as_tuple,prepared.call_id)).fetchone()
     digest=canonical_digest(asdict(terminal))
     if (budget is None or reservation!=('settled',prepared.reservation_digest)
             or attempt!=('committed',raw['accounting_attempt_id']) or raw['original_intent_digest']!=canonical_digest(asdict(intent))
@@ -110,12 +154,29 @@ def read_life_numeric_cost_commit_v1(db,*,namespace,issuer,prepared,intent,termi
         raise ValueError('Life actual cost/quote/settlement/original call linkage differs')
     key=AtomKey.from_token(cost.cost_ref)
     if key.type_name!='runtime.cost_settlement' or NamespaceId.from_key(key)!=namespace:raise ValueError('Life cost locator differs')
-    event=db.execute('SELECT reads,revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?',(*namespace.as_tuple,prepared.activity_id,op)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,event=read_bound_native_numeric_point_v3(db,table='graph_events',columns=('reads', 'revisions', 'epoch_revision'),
+        key_columns=('bot', 'persona', 'session', 'event_id'),key=(*namespace.as_tuple,prepared.activity_id,op))
+    if not handled:
+        handled,event=read_bound_numeric_result_cost_point_v3(db,table='graph_events',columns=('reads','revisions','epoch_revision'),key_columns=('bot','persona','session','event_id'),key=(*namespace.as_tuple,prepared.activity_id,op))
+    if not handled:
+        event=db.execute('SELECT reads,revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?',(*namespace.as_tuple,prepared.activity_id,op)).fetchone()
     def pair(encoded,rev):
         a=json.loads(encoded)
         return type(a) is list and len(a)==1 and type(a[0]) is list and len(a[0])==2 and type(a[0][0]) is str and a[0][0]==key.token and type(a[0][1]) is int and a[0][1]==rev and canonical_json(a)==encoded
-    history=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(key.token,)).fetchone()
-    head=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+    handled,history=read_bound_native_numeric_history_v3(db,key.token,1,('event_id', 'value', 'valid'))
+    if not handled:
+        handled,history=read_bound_numeric_result_cost_point_v3(db,table='graph_history',columns=('event_id','value','valid'),key_columns=('token','revision'),key=(key.token,1))
+    if not handled:
+        history=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(key.token,)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,head=read_bound_native_numeric_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),
+        key_columns=('token',),key=(key.token,))
+    if not handled:
+        handled,head=read_bound_numeric_result_cost_point_v3(db,table='graph_atoms',columns=('revision','value','valid'),key_columns=('token',),key=(key.token,))
+    if not handled:
+        head=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
     if (event is None or not pair(event[0],0) or not pair(event[1],1) or event[2]!=cost.graph_epoch
             or history is None or history[0]!=op or history[2]!=1 or head!=(1,history[1],1)):
         raise ValueError('Life cost actual exact event/history/immutable head differs')
@@ -162,6 +223,15 @@ def record_life_numeric_paid_result_v1(db, *, namespace, issuer, job_id, result_
         operation_id=cost.operation_id, value=raw)
 
 
+def require_life_numeric_paid_membership_v3(*, producing_operation_id, prepared_digest,
+        binding_digest, cost_value, cost_digest, result_request_digest, prepared, binding, model, cost):
+    """Pure original membership predicate; it grants no read or mutation authority."""
+    if (producing_operation_id != cost.operation_id or prepared_digest != prepared.digest
+            or binding_digest != binding.digest or cost_value != plain_v1(cost)
+            or cost_digest != canonical_digest(cost) or result_request_digest != model.digest):
+        raise ValueError('Life numeric paid original lost exact cost/worker membership')
+
+
 def _verify_life_numeric_paid_original_v1(db, *, namespace, issuer, job_id, signed_original):
     from ..authority_service.current_life_numeric_v1 import LifeNumericModelResultReadV1, life_numeric_result_from_wire_v1
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
@@ -180,10 +250,11 @@ def _verify_life_numeric_paid_original_v1(db, *, namespace, issuer, job_id, sign
     result.require_original(intent, p, p.frozen, b)
     cost = read_life_numeric_cost_commit_v1(db, namespace=namespace, issuer=issuer, prepared=p,
         intent=intent, terminal=result.terminal_receipt)
-    if (saved[1] != cost.operation_id or raw['prepared_digest'] != p.digest or raw['binding_digest'] != b.digest
-            or raw['cost'] != plain_v1(cost) or raw['cost_digest'] != canonical_digest(cost)
-            or result.request.model_request_digest != model.digest):
-        raise ValueError('Life numeric paid original lost exact cost/worker membership')
+    require_life_numeric_paid_membership_v3(
+        producing_operation_id=saved[1], prepared_digest=raw['prepared_digest'],
+        binding_digest=raw['binding_digest'], cost_value=raw['cost'], cost_digest=raw['cost_digest'],
+        result_request_digest=result.request.model_request_digest,
+        prepared=p, binding=b, model=model, cost=cost)
     return p, b, result, cost, canonical_digest(raw)
 
 

@@ -43,8 +43,14 @@ def read_plan_contact_expression_v1(db, *, namespace, activity_id, operation_kin
     route_keys, route_sources = contact_route_read_inputs_v1(db, namespace, request.target_route_ref)
     keys.extend(route_keys)
     roots, originals = list(route_sources), []
-    for (wire,) in db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d05.boundary_rule' AND valid=1", namespace.as_tuple):
-        roots.extend(json.loads(wire)["source_refs"])
+    from .contact_initial_plan_source_v3 import initial_contact_plan_read_roots_v3
+    initial_roots=initial_contact_plan_read_roots_v3(db,namespace,request)
+    if initial_roots is not None:
+        roots=list(initial_roots)
+    else:
+        from .domain_background_read_v3 import background_inventory_v3
+        for atom in background_inventory_v3(db,namespace,'d05.boundary_rule',valid_only=True):
+            roots.extend(atom.value['source_refs'])
     opportunity = raw_head_value_v1(db, namespace, AtomKey.from_token(request.opportunity_ref))
     if opportunity is not None:
         roots.append(opportunity["source_ref"])

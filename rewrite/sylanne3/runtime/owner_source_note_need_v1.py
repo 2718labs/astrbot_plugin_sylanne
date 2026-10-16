@@ -89,9 +89,10 @@ class OwnerSourceNoteNeedOriginalV2:
 
 
 class InstalledOwnerSourceNoteNeedReadersV1:
-    def __init__(self,key,*,issuer,installed_bundle,body_quote_authority):
+    def __init__(self,key,*,issuer,installed_bundle,body_quote_authority,body_readers):
         if key is not _READERS_KEY: raise TypeError('Owner Need uses its actual installed Self factory')
         self.issuer,self.installed_bundle,self.body_quote_authority = issuer,installed_bundle,body_quote_authority
+        self.body_readers = body_readers
 
 
 def install_owner_source_note_need_readers_v1(graph):
@@ -99,7 +100,11 @@ def install_owner_source_note_need_readers_v1(graph):
     if type(graph) is not GraphCoordinator: raise TypeError('actual installed Graph coordinator required')
     assembly = graph._GraphCoordinator__d04_installed_joint_assembly
     if assembly is None: raise MissingProductionOriginalV1('actual_Owner_Need_installed_bundle')
-    return InstalledOwnerSourceNoteNeedReadersV1(_READERS_KEY,issuer=graph._GraphCoordinator__d11_issuer,
+    from .d02_production_operations_v1 import InstalledD02ProductionReadersV1
+    body = InstalledD02ProductionReadersV1(issuer=graph._GraphCoordinator__d11_issuer,
+        body_quote_authority=graph._GraphCoordinator__body_quote_authority,
+        role_clock_reader=graph._GraphCoordinator__d04_semantic_mapping_reader)
+    return InstalledOwnerSourceNoteNeedReadersV1(_READERS_KEY,body_readers=body,issuer=graph._GraphCoordinator__d11_issuer,
         installed_bundle=assembly.admin_bundle,body_quote_authority=graph._GraphCoordinator__body_quote_authority)
 
 
@@ -156,8 +161,19 @@ def _actual_current_need(db, *, frame, request, readers):
         origin = db.execute('SELECT event_id FROM graph_history WHERE token=? AND revision=?',(member.key.token,member.revision)).fetchone()
         if origin is None: raise MissingProductionOriginalV1('actual_Owner_Need_focus_producer')
         adopted = read_adopted_domain_operation_v1(db,ns,origin[0])
-        if adopted is None or adopted['operation_kind'] != 'focus_life_project':
-            raise ValueError('Owner Need focus must come from the actual explicit project producer')
+        if adopted is None or adopted['operation_kind'] not in {'focus_life_project','focus_owner_source_note_task_v1'}:
+            raise ValueError('Owner Need focus must come from its actual explicit project producer')
+        if adopted['operation_kind'] == 'focus_owner_source_note_task_v1':
+            from .d07_life_project_focus_v1 import FocusOwnerSourceNoteTaskRequestV1, owner_task_focus_operation_id_v1
+            command = decode_typed_production_value_v1(adopted['payload']['request'], FocusOwnerSourceNoteTaskRequestV1)
+            provenance = adopted['payload']['provenance']
+            if (command != FocusOwnerSourceNoteTaskRequestV1(auth.original_ref,key.token)
+                    or origin[0] != owner_task_focus_operation_id_v1(ns,auth)
+                    or provenance['authorization_original_digest'] != auth.digest
+                    or provenance['owner_project_ref'] != auth.request.project_ref
+                    or provenance['owner_project_source_ref'] != auth.request.body_source_ref
+                    or provenance['owner_focus_selection'] != 'owner_task_project'):
+                raise ValueError('Owner Need focus belongs to another signed task or project')
         read.committed_operation(db,origin[0])
     for kind in LEDGER_TYPES: read.complete_inventory(db,kind)
     coverage = tuple(page for page in frame.query_coverage if page.type_id in LEDGER_TYPES)
@@ -206,6 +222,7 @@ def require_current_owner_source_note_need_v1(db, *, frame, original_ref, instal
     from ..domains.d08.personal_candidate_v1 import CurrentPersonalNeedQualificationV1
     keys = {version.key for version in actual['read_versions']}
     versions = tuple(GraphVersion(key,CurrentDomainReadV1(frame).head(db,key).revision) for key in sorted(keys,key=lambda key:key.token))
+    original = replace(original,read_versions=tuple(GraphVersion(version.key,CurrentDomainReadV1(frame).head(db,version.key).revision) if version.key == old.task_job_head.key else version for version in original.read_versions))
     return CurrentPersonalNeedQualificationV1(original,current.plan_head,current.goal_head,versions,current.ledger_coverage,
         True,False,(),current.original_deadline_utc)
 

@@ -126,9 +126,22 @@ class QualifiedExpressionUnitCandidate:
 
 
 def _expression_material_projection_v3(material,prepared,db,namespace,source_ref,audiences):
+    from ...runtime.contact_initial_plan_source_v3 import (PreparedInitialContactPlanSourceMaterialV3,
+        require_initial_contact_expression_projection_v3)
+    if type(material)is PreparedInitialContactPlanSourceMaterialV3:
+        return require_initial_contact_expression_projection_v3(material,db=db,prepared=prepared,namespace=namespace,
+            source_ref=source_ref,audiences=audiences)
     from ...runtime.current_graph_source_material_v3 import PreparedCurrentSourceMaterialV3
     from ...authority_service.current_authority_graph_read_v3 import (
         PreparedAuthoritySourceMaterialV3,require_authority_expression_projection_v3)
+    from ...runtime.contact_domain_source_v3 import PreparedContactDomainSourceMaterialV3,require_contact_domain_expression_projection_v3
+    if type(material) is PreparedContactDomainSourceMaterialV3:
+        return require_contact_domain_expression_projection_v3(material,db=db,prepared=prepared,
+            namespace=namespace,source_ref=source_ref,audiences=audiences)
+    from ...runtime.contact_host_source_v3 import PreparedContactHostSourceMaterialV3,require_contact_host_expression_projection_v3
+    if type(material)is PreparedContactHostSourceMaterialV3:
+        return require_contact_host_expression_projection_v3(material,db=db,prepared=prepared,
+            namespace=namespace,source_ref=source_ref,audiences=audiences)
     if type(material)is PreparedAuthoritySourceMaterialV3:
         return require_authority_expression_projection_v3(material,db=db,prepared=prepared,
             namespace=namespace,source_ref=source_ref,audiences=audiences)

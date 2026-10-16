@@ -162,42 +162,31 @@ class D13PaidRecoveryV1:
 
 
 def paid_d13_scene_ledger_in_transaction_v1(db, namespace, scene_ref, *, now_utc):
-    """DB-only scene exclusion and immutable source-version deduplication."""
+    """Consume complete scene-job metadata; the original WRITE updates states."""
     _transaction(db)
-    rows = db.execute(
-        "SELECT job_ref,input_digest,state,expires_at_utc FROM "
-        "graph_d13_paid_scene_jobs_v1 WHERE bot=? AND persona=? AND scene_ref=?",
-        namespace.as_tuple + (scene_ref,),
-    ).fetchall()
+    from .d13_standby_read_v3 import current_d13_scene_ledger_metadata_v3
+    proof, rows, blocks = current_d13_scene_ledger_metadata_v3(db, namespace, scene_ref, now_utc)
     outstanding = False
     for job_ref, _digest, state, expires in rows:
         if state in {"queued", "running"}:
-            # Expired unresolved external work remains excluded until recovery.
             outstanding = True
         elif state == "standby":
-            job = get_job(db, job_ref)
-            token = AtomKey(Owner("persona", *namespace.as_tuple),
-                            "d13.compressed_turn_block.v2", job.result_ref).token
-            atom = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
-                              (token,)).fetchone()
-            if atom is not None and atom[1] == 1:
-                block = json.loads(atom[0])
-                if block.get("status") == "active":
-                    db.execute("UPDATE graph_d13_paid_scene_jobs_v1 SET state='active' "
-                               "WHERE bot=? AND persona=? AND job_ref=?",
-                               namespace.as_tuple + (job_ref,))
-                elif block.get("status") == "standby" and now_utc < expires:
-                    outstanding = True
-                else:
-                    db.execute("UPDATE graph_d13_paid_scene_jobs_v1 SET state='retired' "
-                               "WHERE bot=? AND persona=? AND job_ref=?",
-                               namespace.as_tuple + (job_ref,))
+            _job, _token, head, metadata = blocks[job_ref]
+            status = metadata[1] if head is not None and head[2] == 1 else None
+            if status == "active":
+                next_state = "active"
+            elif status == "standby" and now_utc < expires:
+                outstanding = True
+                continue
             else:
-                db.execute("UPDATE graph_d13_paid_scene_jobs_v1 SET state='retired' "
-                           "WHERE bot=? AND persona=? AND job_ref=?",
-                           namespace.as_tuple + (job_ref,))
+                next_state = "retired"
+            db.execute("UPDATE graph_d13_paid_scene_jobs_v1 SET state=? "
+                "WHERE bot=? AND persona=? AND job_ref=? AND state='standby'",
+                (next_state, *namespace.as_tuple, job_ref))
+            if db.execute("SELECT changes()").fetchone() != (1,):
+                raise ValueError("D13 ledger original standby state changed")
+            proof.record_scene_ledger_state_v3(job_ref, next_state)
     return outstanding, frozenset(row[1] for row in rows)
-
 
 def schedule_paid_d13_in_transaction_v1(
     db, intent: D13PaidPrecompressionIntentV1,
@@ -218,14 +207,14 @@ def schedule_paid_d13_in_transaction_v1(
            and phase in {"queued", "running", "waiting", "deferred"}
            for encoded, phase in other_jobs):
         outstanding = True
-    if db.execute("SELECT 1 FROM graph_atoms WHERE bot=? AND persona=? "
-                  "AND type_name='d13.compressed_turn_block.v2' AND valid=1 "
-                  "AND json_extract(value,'$.conversation_ref')=? "
-                  "AND json_extract(value,'$.status')='standby' "
-                  "AND json_extract(value,'$.expires_at_utc')>? LIMIT 1",
-                  ns.as_tuple + (current_window.conversation_ref,
-                                 current_window.trusted_utc)).fetchone() is not None:
-        outstanding = True
+    from .d13_standby_read_v3 import current_d13_standby_v3
+    from .d13_paid_original_read_v3 import d13_paid_current_reader_v3
+    reader = d13_paid_current_reader_v3(db)
+    if reader is None or reader.parent is None:
+        raise ValueError("D13 schedule requires its actual complete standby and Source Work")
+    has_standby, _deadline = current_d13_standby_v3(reader.graph, db, reader.authority,
+        scene_ref=reader.scene_ref, window=current_window)
+    outstanding = outstanding or has_standby
     if outstanding or intent.plan.input_digest in attempted:
         raise ValueError("D13 scene already has pending work or this source was attempted")
     quote = issue_paid_precompression_quote_v1(
@@ -369,9 +358,14 @@ def record_paid_d13_result_read_in_transaction_v1(
 
 def read_paid_d13_evidence_in_transaction_v1(db, original, call):
     _transaction(db)
-    row = db.execute("SELECT read_attempt_id,payload_json,payload_digest FROM "
-                     "graph_d13_paid_result_reads_v1 WHERE bot=? AND persona=? AND job_ref=?",
-                     original.namespace.as_tuple + (original.binding.job_ref,)).fetchone()
+    from .d13_paid_original_read_v3 import d13_paid_original_point_v3
+    bound, row = d13_paid_original_point_v3(db, table="graph_d13_paid_result_reads_v1",
+        columns=("read_attempt_id","payload_json","payload_digest"),
+        key_columns=("bot","persona","job_ref"), key=(*original.namespace.as_tuple,original.binding.job_ref))
+    if not bound:
+        row = db.execute("SELECT read_attempt_id,payload_json,payload_digest FROM "
+                         "graph_d13_paid_result_reads_v1 WHERE bot=? AND persona=? AND job_ref=?",
+                         original.namespace.as_tuple + (original.binding.job_ref,)).fetchone()
     if row is None:
         return None
     payload = json.loads(row[1])
@@ -390,9 +384,14 @@ def read_paid_d13_evidence_in_transaction_v1(db, original, call):
 
 def read_paid_d13_settlement_in_transaction_v1(db, original, evidence):
     _transaction(db)
-    row = db.execute("SELECT payload_json,payload_digest FROM "
-                     "graph_d13_paid_cost_receipts_v1 WHERE bot=? AND persona=? AND job_ref=?",
-                     original.namespace.as_tuple + (original.binding.job_ref,)).fetchone()
+    from .d13_paid_original_read_v3 import d13_paid_original_point_v3, d13_paid_current_reader_v3
+    bound, row = d13_paid_original_point_v3(db, table="graph_d13_paid_cost_receipts_v1",
+        columns=("payload_json","payload_digest"),
+        key_columns=("bot","persona","job_ref"), key=(*original.namespace.as_tuple,original.binding.job_ref))
+    if not bound:
+        row = db.execute("SELECT payload_json,payload_digest FROM "
+                         "graph_d13_paid_cost_receipts_v1 WHERE bot=? AND persona=? AND job_ref=?",
+                         original.namespace.as_tuple + (original.binding.job_ref,)).fetchone()
     if row is None:
         return None
     payload = json.loads(row[0])
@@ -403,10 +402,15 @@ def read_paid_d13_settlement_in_transaction_v1(db, original, evidence):
                        payload["cost_write"]["value"],
                        tuple(AtomKey.from_token(token)
                              for token in payload["cost_write"]["dependencies"]))
-    atom = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",
-                      (write.key.token,)).fetchone()
-    if atom is None or atom[1] != 1 or json.loads(atom[0]) != write.value:
-        raise ValueError("D13 paid cost graph original is absent or invalid")
+    reader = d13_paid_current_reader_v3(db)
+    if reader is not None:
+        atom = reader.paid_cost_atom
+        if atom is None or atom.key != write.key or not atom.valid or atom.value != write.value:
+            raise ValueError("D13 paid cost lacks its actual same-Work graph EOF")
+    else:
+        atom = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
+        if atom is None or atom[1] != 1 or json.loads(atom[0]) != write.value:
+            raise ValueError("D13 paid cost graph original is absent or invalid")
     return D13PaidSettlementV1(evidence.evidence_digest,
                               BudgetReceipt(**payload["receipt"]), write)
 

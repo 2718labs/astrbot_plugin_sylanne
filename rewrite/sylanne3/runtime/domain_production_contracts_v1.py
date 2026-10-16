@@ -277,8 +277,20 @@ class StagedDomainOperationV1:
             raise ValueError("production staging exceeds its hard bounds")
         if any(NamespaceId.from_key(v.key) != self.namespace for v in self.read_versions):
             raise ValueError("production staging reads span namespaces")
+        companions = tuple(p for p in self.proposals if p.domain != self.domain)
+        if companions:
+            from .d10_habit_v1 import habit_occurrence_companion_matches_v1
+            from .habit_schedule_driver_v1 import habit_schedule_companion_matches_v1
+            semantic = tuple(p for p in companions if not (
+                habit_occurrence_companion_matches_v1(self,p) or habit_schedule_companion_matches_v1(self,p)))
+            if semantic:
+                from .domain_mesh_tick_v1 import require_semantic_mesh_stage_v1
+                trace = require_semantic_mesh_stage_v1(self)
+                if (len(semantic) != 1 or semantic[0].domain != 'd11'
+                        or semantic[0].typed_writes != (trace.tick_write,)):
+                    raise ValueError('Only exact named Habit companions and the unique signed D11 tick may cross domains')
         for p in self.proposals:
-            if (p.domain != self.domain or p.envelope.authority.namespace != self.namespace
+            if (p.envelope.authority.namespace != self.namespace
                     or p.envelope.identity.operation_id != self.operation_id
                     or p.envelope.identity.activity_id != self.activity_id):
                 raise ValueError("production staging proposal identity/domain differs")
@@ -345,3 +357,17 @@ class DomainOperationReceiptV1:
                 type(row) is not tuple or len(row) != 2 or any(type(v) is not str or not v for v in row)
                 for row in self.job_states):
             raise ValueError("production receipt job states must be explicit")
+
+
+def actual_frame_read_versions_v1(frame):
+    """Pure stage readset; private Source frames add their actual header CAS facts."""
+    from .named_joint_binding_write_v1 import named_joint_host_frame_read_versions_v3
+    named=named_joint_host_frame_read_versions_v3(frame)
+    if named is not None:return named
+    from .current_habit_source_read_v3 import current_habit_frame_read_versions_v3
+    from .semantic_recovery_source_v3 import current_semantic_recovery_frame_read_versions_v3
+    cold=current_semantic_recovery_frame_read_versions_v3(frame)
+    from .artifact_frame_control_reads_v3 import current_artifact_model_frame_read_versions_v3
+    artifact=current_artifact_model_frame_read_versions_v3(frame)
+    if artifact is not None:return artifact
+    return current_habit_frame_read_versions_v3(frame)if cold is None else cold

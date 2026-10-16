@@ -148,6 +148,13 @@ class D07SimulationInputsV1:
     execution: D07ExecutionOriginalV1 | None = None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class D07SimulationInputsV2(D07SimulationInputsV1):
+    forecast_plan_ref: str
+    forecast_plan_digest: str
+    forecast_mode: str
+
+
 @dataclass(frozen=True, slots=True)
 class D07CurrentBehaviorStageV1:
     envelope: CommandEnvelope
@@ -411,6 +418,10 @@ def run_current_simulation_v1(envelope: CommandEnvelope,
         "dedicated_budget": inputs.dedicated_budget_ref,
         "dedicated_budget_original": inputs.dedicated_budget_original_ref,
         "content_reality": "hypothetical", "external_evidence_eligibility": "none"}
+    if type(inputs)is D07SimulationInputsV2:
+        if inputs.forecast_mode!='declared_forecast':raise ValueError('registered typed simulation forecast mode differs')
+        provenance.update(forecast_plan_ref=inputs.forecast_plan_ref,forecast_plan_digest=inputs.forecast_plan_digest,
+            forecast_mode=inputs.forecast_mode)
     execution = inputs.execution
     if execution is None:
         return _stage(envelope, inputs.snapshot, "simulation", request, (), provenance,

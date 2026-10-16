@@ -126,7 +126,7 @@ def load_installed_d04_semantic_profile_v3(package_root, trusted_manifest_sha256
     verified = verify_installed_backend_runtime_v1(root, trusted_manifest_sha256,
         available_cpu_features=available_cpu_features)
     if (not verified.verified or verified.manifest_digest != trusted_manifest_sha256
-            or verified.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}):
+            or verified.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}):
         raise ValueError("D04 semantic profile requires verified installed runtime bytes")
     manifest_path, path = _safe_file(root, "release-manifest.json"), _safe_file(root, PROFILE_PATH)
     if manifest_path is None or path is None:

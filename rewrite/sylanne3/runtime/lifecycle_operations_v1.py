@@ -362,8 +362,11 @@ method names and positional/keyword contracts below are the installation API.
                 return self.store.original(owner.namespace, original_ref)
 
     def _command(self, authority, lease, *, operation_id, request_digest,
-                 capability, commit, domains=()):
+                 capability, commit, domains=(), job_cancel_request=None):
         if self.command_executor is not None:
+            if job_cancel_request is not None:
+                return self.command_executor(authority,lease,operation_id=operation_id,request_digest=request_digest,
+                    capability=capability,commit=commit,domains=domains,job_cancel_request=job_cancel_request)
             return self.command_executor(authority, lease, operation_id=operation_id,
                 request_digest=request_digest, capability=capability, commit=commit, domains=domains)
         with self.owner_command_fence(authority, lease, capability=capability) as owner:
@@ -579,6 +582,7 @@ method names and positional/keyword contracts below are the installation API.
         with self._operations:
             return self._command(authority, lease, operation_id=operation_id,
                 request_digest=request_digest, capability="workbench.control", commit=commit,
+                job_cancel_request=command if command.control=="cancel_job"else None,
                 domains=("d11",) if command.control == "cancel_job" else (
                     (command.object_ref.split(":", 1)[0],) if command.object_ref.split(":", 1)[0]
                     in {"d01", "d02", "d03", "d04", "d05", "d06", "d07", "d08", "d09", "d10", "d11", "d12", "d13"} else ()))

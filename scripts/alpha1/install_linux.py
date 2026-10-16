@@ -126,12 +126,17 @@ def check_request(request):
         "budget_max_ceiling", "currency", "budget_valid_until_utc", "model_audiences", "onebot_account",
         "onebot_adapter_ref", "provider_cache", "host_lifecycle", "d04_semantic_drive", "d04_joint_numeric",
         "d13_wire_policy", "d13_wire_counter", "d13_precompression", "d13_paid_precompression", "d07_cognition"}
-    version4 = request.get("schema") == "sylanne3.linux-install-request.v4"
-    process = request.get("schema") in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}
+    version5 = request.get("schema") == "sylanne3.linux-install-request.v5"
+    version4 = request.get("schema") in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
+    process = request.get("schema") in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
     if process:
         fields = fields - {"host_systemd_unit"} | {"host_process_command"}
     if version4:
         fields |= {"foreground", "artifact_draft"}
+        if version5:
+            fields |= {"general_growth_cognition", "natural_template_pair_v1"}
+            if "habit_runtime" in request:
+                fields.add("habit_runtime")
         if "astrbot_namespace_v1" in request:
             fields.add("astrbot_namespace_v1")
         if "d06_recall" in request:
@@ -142,8 +147,10 @@ def check_request(request):
             fields.add("natural_template_pair_v1")
         if "d13_counter_installation_v1" in request:
             fields.add("d13_counter_installation_v1")
-    if set(request) != fields or request["schema"] not in {"sylanne3.linux-install-request.v2", "sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}:
+    if set(request) != fields or request["schema"] not in {"sylanne3.linux-install-request.v2", "sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}:
         raise ValueError("installation request fields differ; use the bundled request template")
+    if "habit_runtime" in request and (not version5 or type(request["habit_runtime"]) is not bool):
+        raise ValueError("Habit runtime is an explicit fresh v5 installation boolean")
     if type(request["profile_id"]) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", request["profile_id"]):
         raise ValueError("profile_id is invalid")
     from sylanne3.authority_service.installed_platform_observation import parse_installed_onebot_account_v2
@@ -196,6 +203,8 @@ def check_request(request):
     for name in ("d13_wire_policy", "d13_wire_counter", "d13_precompression", "d13_paid_precompression", "d07_cognition"):
         if request[name] is not None and type(request[name]) is not dict:
             raise ValueError(name + " must be an explicit object or null")
+    if version5 and request["general_growth_cognition"] is not None and type(request["general_growth_cognition"]) is not dict:
+        raise ValueError("General workflow must be an explicit object or null")
     if request["d13_wire_counter"] is not None and request["d13_wire_policy"] is None:
         raise ValueError("counter requires its explicit signed full-wire policy")
     if (type(request["provider_cache"]) is not dict
@@ -204,6 +213,25 @@ def check_request(request):
     if version4:
         pair=natural_template_pair_v1(request)
         from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
+        if version5:
+            from sylanne3.model_broker.natural_review import REVIEW_TEMPLATE_VERSION_V2
+            if pair != (V7_TEMPLATE, REVIEW_TEMPLATE_VERSION_V2):
+                raise ValueError("version-5 installation requires the exact inherited V7 natural template pair")
+            general_raw = request["general_growth_cognition"]
+            if general_raw is not None:
+                from sylanne3.host.model_workflows_v4 import model_workflow_v4_from_payload
+                from sylanne3.model_broker.general_growth_cognition_v1 import PURPOSE, TEMPLATE_VERSION, WORK_KIND
+                workflow = model_workflow_v4_from_payload(general_raw)
+                if ((workflow.work_kind, workflow.purpose, workflow.template_version) != (WORK_KIND, PURPOSE, TEMPLATE_VERSION)
+                        or set(workflow.quote_ceiling) != {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+                        or workflow.quote_ceiling["input_tokens"] > 6000
+                        or workflow.quote_ceiling["output_tokens"] > 1000
+                        or workflow.quote_ceiling["model_tokens"] > 7000
+                        or workflow.max_output_tokens > 1000):
+                    raise ValueError("General workflow must match the exact named template and original finite quote caps")
+                for name, amount in workflow.quote_ceiling.items():
+                    if amount > request["budget_limits"].get(name, 0) or amount > request["budget_max_ceiling"].get(name, 0):
+                        raise ValueError("General quote exceeds the signed root limits")
         if pair[0]==V7_TEMPLATE:
             from sylanne3.authority_service.d13_installed_counter_factory_v1 import validate_d13_counter_initial_spec_v1
             validate_d13_counter_initial_spec_v1(request.get("d13_counter_installation_v1"))
@@ -260,7 +288,7 @@ def natural_template_pair_v1(request):
     selected = request.get("natural_template_pair_v1")
     if selected is None:
         return legacy
-    if (request.get("schema") != "sylanne3.linux-install-request.v4"
+    if (request.get("schema") not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
             or type(selected) is not dict
             or set(selected) != {"schema", "generation", "review"}
             or selected["schema"] != "sylanne3.initial-natural-template-pair.v1"):
@@ -363,7 +391,7 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
         if any(workflows['d07_cognition'].get(name) != common[name]
                for name in ('provider_id', 'model_id', 'provider_config_ref', 'provider_config_digest')):
             raise ValueError('D07 cognition must explicitly match the installed main provider configuration')
-    if request['schema'] == 'sylanne3.linux-install-request.v4':
+    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5'}:
         workflows['version'] = 4
         workflows['artifact_draft'] = None
         if request['artifact_draft'] is not None:
@@ -380,6 +408,18 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
         workflows['version'] = 6
         workflows['d07_relationship_cognition'] = None
         workflows['growth_cognition'] = None
+    if request['schema'] == 'sylanne3.linux-install-request.v5':
+        if generation_template != NATURAL_GENERATION_V7:
+            raise ValueError('V8 workflows require their exact inherited V7 natural wire')
+        workflows['version'] = 8
+        workflows['d07_relationship_cognition'] = None
+        workflows['growth_cognition'] = None
+        configured = request['general_growth_cognition']
+        workflows['general_growth_cognition'] = None
+        if configured is not None:
+            if any(configured[name] != common[name] for name in ('provider_id', 'model_id', 'provider_config_ref', 'provider_config_digest')):
+                raise ValueError('General workflow must use the exact installed main provider configuration')
+            workflows['general_growth_cognition'] = dict(configured)
     local = dict(deadline_after_seconds=300.0, quote_ceiling=request["local_quote"],
         snapshot_ref="installed:snapshot:v1", resource_ref="installed:resource:v1")
     kinds = ["d06.encode_source", "reply", "natural_generation", "natural_review", APPRAISAL_KIND,
@@ -390,13 +430,21 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
     for setting, kind in (("d13_precompression", "d13.precompress"),
                           ("d13_paid_precompression", "d13.precompress.paid.v1"),
                           ("d07_cognition", "d07.cognition")):
-        if request[setting] is not None:
+        if request[setting] is not None and kind not in kinds:
             kinds.append(kind)
+    if request["schema"] == "sylanne3.linux-install-request.v5":
+        from sylanne3.authority_service.conditioned_child_contract_v1 import ROOT_WORK_KIND
+        kinds.append(ROOT_WORK_KIND)
+        if request.get("habit_runtime", False):
+            kinds.extend(("habit_subscription_v1", "d10.life.source_note.v1"))
+    if request["schema"] == "sylanne3.linux-install-request.v5" and request["general_growth_cognition"] is not None:
+        if "d07.cognition" not in kinds:
+            kinds.append("d07.cognition")
     if generation_template == NATURAL_GENERATION_V7:
         # Issue the distinct bounded counter CPU step only in this new Root.
         # The existing Root ceiling and expiry are unchanged.
         kinds.append('d13.full_http_counter.v1')
-    if request['schema'] == 'sylanne3.linux-install-request.v4':
+    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5'}:
         kinds.append('d11.foreground_cycle.v1')
         if request['artifact_draft'] is not None:
             kinds.extend(('artifact_draft_v1', 'd10.life.artifact_draft.v1'))
@@ -423,7 +471,7 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
     for name in ("d04_semantic_drive", "d04_joint_numeric", "d13_precompression", "d13_paid_precompression", "d13_wire_counter"):
         if request[name] is not None:
             profile[name] = request[name]
-    if request['schema'] == 'sylanne3.linux-install-request.v4':
+    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5'}:
         if "astrbot_namespace_v1" in request:
             profile["astrbot_namespace_v1"] = request["astrbot_namespace_v1"]
         profile['foreground'] = request['foreground']
@@ -449,6 +497,16 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
             provider_id=request["provider_id"], model_id=request["model_id"],
             max_output_tokens=request["model_quote"]["output_tokens"])
         profile["d13_wire_policy"] = configured
+    if request.get("habit_runtime", False):
+        from sylanne3.host.habit_runtime_policy_v1 import HabitRuntimePolicyV1
+        from sylanne3.runtime.issuers import BudgetLeaseGrant
+        from sylanne3.runtime_contracts import canonical_digest
+        grant = BudgetLeaseGrant(**{**policy["root_grant"],
+            "allowed_work_kinds": tuple(policy["root_grant"]["allowed_work_kinds"])})
+        profile["habit_runtime_policy"] = asdict(HabitRuntimePolicyV1(namespace=namespace,
+            installation_id=installation_id, manifest_digest=manifest_pin,
+            root_lease_id=policy["root_lease"]["lease_id"], root_grant_id=grant.grant_id,
+            root_grant_version=grant.version, root_grant_digest=canonical_digest(grant)))
     parsed = _policy_from_payload(profile)
     from sylanne3.host.authority_profile import _d13_wire_policy_from_payload, _d13_wire_counter_from_payload
     _d13_wire_policy_from_payload(profile, parsed)
@@ -462,7 +520,7 @@ def preflight_profile(args, request):
     """Validate real pinned assets and full policy before touching system paths."""
     from sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
     archive_manifest(args.package, args.package_sha256, args.manifest_sha256)
-    if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}:
+    if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}:
         verify_host_process_command_v3(request["host_process_command"])
     with tempfile.TemporaryDirectory(prefix="sylanne-install-preflight-") as directory:
         with zipfile.ZipFile(args.package) as archive:
@@ -628,7 +686,7 @@ def install(args, request, manifest):
         host_lifecycle=request["host_lifecycle"],
         host_observation=dict(adapter_ref=request["onebot_adapter_ref"], account_ref=json.dumps(request["onebot_account"], separators=(",", ":")),
             clock_source_ref="linux:kernel-adjtimex:v1"))
-    process = request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}
+    process = request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
     if process:
         deployment["schema"] = "sylanne3.authority.linux-deployment.v2"
     else:
@@ -703,21 +761,44 @@ def request_template_v4():
     return value
 
 
+def request_template_v5():
+    from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION
+    from sylanne3.model_broker.natural_review import REVIEW_TEMPLATE_VERSION_V2
+    value = request_template_v4()
+    value["schema"] = "sylanne3.linux-install-request.v5"
+    value["natural_template_pair_v1"] = {"schema": "sylanne3.initial-natural-template-pair.v1",
+        "generation": TEMPLATE_VERSION, "review": REVIEW_TEMPLATE_VERSION_V2}
+    value["general_growth_cognition"] = None
+    value["habit_runtime"] = False
+    return value
+
+
 def configuration_plan_v4(request):
     """Review static scopes and exact budgets without issuing a responsibility."""
-    if request["schema"] != "sylanne3.linux-install-request.v4":
+    if request["schema"] not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}:
         return None
     kinds = ["d11.foreground_cycle.v1"]
+    if request["schema"] == "sylanne3.linux-install-request.v5":
+        from sylanne3.authority_service.conditioned_child_contract_v1 import ROOT_WORK_KIND
+        kinds.append(ROOT_WORK_KIND)
+        if request.get("habit_runtime", False):
+            kinds.extend(("habit_subscription_v1", "d10.life.source_note.v1"))
     draft = request["artifact_draft"]
+    if request["schema"] == "sylanne3.linux-install-request.v5" and request["general_growth_cognition"] is not None:
+        kinds.append("d07.cognition")
     if draft is not None:
         kinds.extend(("artifact_draft_v1", "d10.life.artifact_draft.v1"))
         if draft["observation_policy"] is not None:
             kinds.append("d11.life.artifact_observation.v1")
     return dict(foreground=request["foreground"], artifact_draft=draft,
+        **({"habit_runtime": request.get("habit_runtime", False)}
+            if request["schema"] == "sylanne3.linux-install-request.v5" else {}),
         **({"astrbot_namespace_v1": request["astrbot_namespace_v1"]} if "astrbot_namespace_v1" in request else {}),
         **({"d06_recall": request["d06_recall"]} if "d06_recall" in request else {}),
         **({"natural_template_pair_v1": request["natural_template_pair_v1"]}
            if request.get("natural_template_pair_v1") is not None else {}),
+        **({"general_growth_cognition": request["general_growth_cognition"]}
+           if request["schema"] == "sylanne3.linux-install-request.v5" else {}),
         installed_export_path="/var/lib/sylanne/export" if draft is not None else None,
         added_work_kinds=kinds, root_budget_limits=request["budget_limits"],
         root_budget_max_ceiling=request["budget_max_ceiling"],
@@ -728,7 +809,7 @@ def configuration_plan_v4(request):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", action="store_true", help="Print an intentionally non-installable template; every limit requires review")
-    parser.add_argument("--template-version", choices=(2, 3, 4), type=int, default=2)
+    parser.add_argument("--template-version", choices=(2, 3, 4, 5), type=int, default=2)
     parser.add_argument("--package", type=Path)
     parser.add_argument("--package-sha256")
     parser.add_argument("--manifest-sha256")
@@ -742,7 +823,7 @@ def main():
     if args.template:
         if args.install:
             parser.error("--template cannot install")
-        template = {2: request_template_v2, 3: request_template_v3, 4: request_template_v4}[args.template_version]()
+        template = {2: request_template_v2, 3: request_template_v3, 4: request_template_v4, 5: request_template_v5}[args.template_version]()
         print(json.dumps(template, ensure_ascii=False, indent=2))
         return
     if any(value is None for value in (args.package, args.package_sha256, args.manifest_sha256, args.request)):
@@ -762,11 +843,11 @@ def main():
         preflight_profile(args, request)
         print(json.dumps(dict(status="plan_only", package_sha256=args.package_sha256, manifest_sha256=args.manifest_sha256,
             model_selection=selection.to_dict() if selection is not None else None,
-            **({"foreground_configuration": configuration_plan_v4(request)} if request["schema"] == "sylanne3.linux-install-request.v4" else {}),
+            **({"foreground_configuration": configuration_plan_v4(request)} if request["schema"] in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"} else {}),
             configuration_semantics="fresh_install_only; existing installations require the qualified package/configuration change protocol",
             changes=["new /opt/sylanne code", "new /etc/sylanne service/profile and local credentials", "new /var/lib/sylanne four-store cohort",
                      "AstrBot plugin link", ("fixed process supervisor specs staged; no process started"
-                          if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4"}
+                          if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
                          else "systemd unit staged, not enabled or started")], model_calls=0, platform_sends=0)))
         return
     install(args, request, manifest)

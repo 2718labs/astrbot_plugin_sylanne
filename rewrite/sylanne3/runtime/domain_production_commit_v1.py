@@ -45,6 +45,201 @@ _ACTIVE = {}
 _FOREGROUND_VALIDATED = {}
 _FOREGROUND_APPLIED = {}
 
+_GENERAL_GROWTH_COMMIT_KINDS_V1=frozenset(('freeze_general_growth_intent_v1',
+    'register_general_growth_trial_start_v1','derive_general_growth_trial_v1','adopt_general_growth_v1'))
+_GENERAL_GROWTH_PRECAS_VALIDATED_V1={}
+
+class _GeneralGrowthVerifiedProvenanceV1:
+    def __init__(self,witness,db,encoded):
+        from ..runtime_storage_v3 import runtime_storage_v3,_operation
+        self.witness,self.db,self.encoded=witness,db,encoded
+        handle=runtime_storage_v3(db)
+        if handle is None:raise ValueError('General growth requires its actual installed runtime retention handle')
+        self.operation=_operation(handle);self.provenance=None
+    def _runtime_retained_heap_bytes_v3(self):
+        from sys import getsizeof
+        from dataclasses import is_dataclass,fields
+        seen=set()
+        def size(value):
+            if id(value)in seen:return 0
+            seen.add(id(value));result=getsizeof(value)
+            if type(value)is dict:result+=sum(size(k)+size(v)for k,v in value.items())
+            elif type(value)in(list,tuple):result+=sum(size(v)for v in value)
+            elif is_dataclass(value):
+                result+=getsizeof(value.__dict__)if hasattr(value,'__dict__')else 0
+                result+=sum(size(getattr(value,f.name))for f in fields(value))
+            return result
+        return getsizeof(self)+size(self.encoded)+size(self.provenance)
+    def decode_v1(self):
+        from sys import getsizeof
+        quote=escape=number=False
+        objects=arrays=strings=numbers=keys=digits=literals=0
+        for character in self.encoded:
+            if quote:
+                if escape:escape=False
+                elif character=='\\':escape=True
+                elif character=='"':quote=False
+                continue
+            if character=='"':quote=True;strings+=1;number=False
+            elif character=='{':objects+=1;number=False
+            elif character=='[':arrays+=1;number=False
+            elif character==':':keys+=1;number=False
+            elif character in '-0123456789':
+                if not number:numbers+=1;number=True
+                if character in '0123456789':digits+=1
+            elif character in '.eE+':pass
+            elif character in 'tfn':literals+=1;number=False
+            else:number=False
+        nodes=objects+arrays+strings+numbers+literals
+        dictionaries=objects*(getsizeof({})+8*(8+24))+keys*(4*8+3*24)
+        lists=arrays*(getsizeof([])+8*8)+nodes*2*8
+        text=strings*getsizeof(chr(0x10000))+4*len(self.encoded)
+        numeric=numbers*(getsizeof(0)+4)+4*((4*digits+29)//30)
+        # The JSON map, typed validation, and its canonical plain map coexist.
+        # Dataclass slots/dictionaries are bounded by their corresponding JSON
+        # object's actual field count; tuple construction uses the array census.
+        typed=objects*(2*getsizeof({})+getsizeof(self)+getsizeof(self.__dict__))+keys*(8+24)+arrays*getsizeof(())+nodes*8
+        bound=3*(dictionaries+lists+text+numeric)+typed+5*(4*len(self.encoded)+getsizeof(''))
+        self.operation.register_retained_state_v3(self)
+        try:
+            self.operation.reserve_retained_state_growth_v3(self,bound)
+            try:
+                payload=json.loads(self.encoded)
+                from .domain_production_erasure_v1 import validate_domain_stage_provenance_v1
+                kind=self.witness.operation.operation_kind
+                validate_domain_stage_provenance_v1('d01',kind,payload['provenance'])
+                from .domain_production_erasure_v1 import (_general_growth_provenance_types_v1,
+                    decode_typed_production_value_v1)
+                self.provenance=({name:(raw if cls is None else decode_typed_production_value_v1(raw,cls))
+                    for name,cls in _general_growth_provenance_types_v1(kind).items()
+                    for raw in (payload['provenance'][name],)}if payload['provenance']else {})
+            finally:self.operation.finish_retained_state_growth_v3(self)
+        except BaseException:
+            self.close_v1();raise
+    def close_v1(self):
+        self.operation.unregister_retained_state_v3(self);self.provenance=None
+
+
+from contextlib import contextmanager
+from threading import get_ident
+from ..runtime_contracts import CommitReceipt
+_GENERAL_GROWTH_POSTCAS_V1={}
+
+
+def _general_growth_post_cas_metadata_v1(db,namespace):
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3,_runtime_bounded_fixed_row_v3
+    with runtime_storage_quantum_v3(db)as meter:
+        epoch=_runtime_bounded_fixed_row_v3(db,meter,'graph_epochs',('revision',),
+            'bot=? AND persona=?',namespace.as_tuple)
+        requirements=_runtime_bounded_fixed_row_v3(db,meter,'graph_recovery_metadata_v2',
+            ('schema','requirements_json','graph_revision'),'bot=? AND persona=?',namespace.as_tuple)
+    return epoch,requirements
+
+@contextmanager
+def _general_growth_post_cas_v1(witness,db,primary,receipt):
+    pre=_GENERAL_GROWTH_PRECAS_VALIDATED_V1.get(id(witness))
+    if (pre is None or pre[0] is not witness or pre[1] is not db or _ACTIVE.get(id(witness)) is not witness
+            or primary.original_payload_json!=pre[2] or type(receipt) is not CommitReceipt
+            or receipt.status!='committed' or receipt.operation_id!=primary.operation_id
+            or receipt.operation_digest!=witness.bundle.digest
+            or receipt.read_versions!=witness.frame.envelope.version_guard.read_versions
+            or witness.scope.operation!='write' or db is not witness.graph._GraphCoordinator__store._db
+            or not db.in_transaction or not witness.graph._GraphCoordinator__store._lock._is_owned()):
+        raise ValueError('General growth post-CAS requires its actual successful verified W01')
+    first_three=witness.operation.operation_kind!='adopt_general_growth_v1'
+    if first_three and (primary.jobs or any(p.typed_writes for p in witness.bundle.proposals)):
+        raise ValueError('General input signing cannot carry Source/Owner/Control or business writes')
+    expected_keys={write.key for proposal in witness.bundle.proposals for write in proposal.typed_writes}
+    if {version.key for version in receipt.write_versions}!=expected_keys:
+        raise ValueError('General growth actual receipt write members differ from its verified bundle')
+    epoch,requirements=_general_growth_post_cas_metadata_v1(db,primary.namespace)
+    if epoch is None or requirements is None:
+        raise ValueError('General growth actual post-CAS metadata is absent')
+    from ..graph_store import GraphStore
+    metadata=GraphStore._decode_recovery(requirements,primary.namespace)
+    if not witness.graph._anchor_matches(metadata.requirements,witness.scope.pinned_anchor):
+        raise ValueError('General growth post-CAS changed Source/Owner/Control anchor')
+    if pre[3].operation.closed or pre[3].provenance is None:
+        raise ValueError('General growth verified provenance retention ended before its actual receipt')
+    _GENERAL_GROWTH_POSTCAS_V1[id(witness)]=(witness,db,primary,receipt,pre[2],get_ident(),epoch,requirements,pre[3])
+    try:yield witness
+    finally:_GENERAL_GROWTH_POSTCAS_V1.pop(id(witness),None)
+
+
+def require_general_growth_after_cas_witness_v1(witness,*,db,frame,producing_operation_id,request,receipt,operation_kind):
+    entry=_GENERAL_GROWTH_POSTCAS_V1.get(id(witness))
+    if (entry is None or entry[0] is not witness or entry[1] is not db or entry[3] is not receipt
+            or frame is not witness.frame or request is not witness.request or entry[5]!=get_ident()
+            or operation_kind not in _GENERAL_GROWTH_COMMIT_KINDS_V1
+            or operation_kind!=witness.operation.operation_kind or producing_operation_id!=entry[2].operation_id
+            or witness.runtime.graph is not witness.graph or witness.scope.operation!='write'
+            or not db.in_transaction or not witness.graph._GraphCoordinator__store._lock._is_owned()
+            or entry[2].original_payload_json!=entry[4]):
+        raise ValueError('General original signing crossed its exact same-transaction post-CAS handle')
+    epoch,metadata=_general_growth_post_cas_metadata_v1(db,entry[2].namespace)
+    if (epoch,metadata)!=(entry[6],entry[7]):
+        raise ValueError('General input signing lost its actual post-CAS metadata')
+    if entry[8].operation.closed or entry[8].provenance is None:
+        raise ValueError('General growth same-CAS provenance retention ended')
+    return entry[8].provenance
+
+
+def _record_general_growth_after_cas_v1(readers,db,*,witness,frame,primary,request,receipt):
+    kind=primary.operation_kind
+    if kind=='freeze_general_growth_intent_v1':
+        return readers.freeze_current_general_growth_after_commit_v1(db,frame=frame,
+            producing_operation_id=primary.operation_id,request=request,receipt=receipt,witness=witness)
+    if kind=='register_general_growth_trial_start_v1':
+        return (readers.start_current_general_growth_trial_after_commit_v1(db,frame=frame,
+            producing_operation_id=primary.operation_id,request=request,receipt=receipt,witness=witness),)
+    if kind=='derive_general_growth_trial_v1':
+        return (readers.derive_current_general_growth_trial_from_adopted_progress_v1(db,frame=frame,
+            producing_operation_id=primary.operation_id,request=request,receipt=receipt,witness=witness),)
+    return ()
+
+
+def _record_general_growth_pre_cas_validation_v1(witness,graph,db,bundle):
+    if (type(witness) is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness)) is not witness
+            or witness.operation.operation_kind not in _GENERAL_GROWTH_COMMIT_KINDS_V1
+            or witness.graph is not graph or db is not graph._GraphCoordinator__store._db
+            or not db.in_transaction or not graph._GraphCoordinator__store._lock._is_owned()):
+        raise ValueError('General growth requires its real active W01 pre-CAS witness')
+    owner_task=getattr(witness.runtime,'_active_owner_task_issuance_v1',None)
+    foreground=getattr(witness.runtime,'_active_foreground_issuance_v1',None)
+    if owner_task is not None:
+        issued,_=_require_owner_task_witness_v1(witness,graph,db,bundle)
+        rebuilt_frame,rebuilt,_=witness.runtime.compile_owner_task_in_transaction_v1(db,
+            operation=witness.operation,request=witness.request,envelope=witness.frame.envelope,
+            scope=witness.scope,issued=issued,now_utc=witness.frame.now_utc,
+            external_originals=witness.external_originals)
+    elif foreground is not None:
+        issued,_=_require_foreground_witness_v1(witness,graph,db,bundle)
+        rebuilt_frame,rebuilt,_=witness.runtime.compile_foreground_in_transaction(db,
+            operation=witness.operation,request=witness.request,envelope=witness.frame.envelope,
+            scope=witness.scope,issued=issued,now_utc=witness.frame.now_utc,
+            external_originals=witness.external_originals)
+    else:
+        rebuilt_frame,rebuilt,_=witness.runtime.compile_in_transaction(db,operation=witness.operation,
+            request=witness.request,envelope=witness.frame.envelope,scope=witness.scope,
+            owner=witness.owner,guard=witness.guard,now_utc=witness.frame.now_utc,
+            external_originals=witness.external_originals)
+    primary,proposals,*_= _members(rebuilt)
+    if not proposals:
+        registration=graph._GraphCoordinator__providers[witness.operation.domain]
+        proposals=(DomainProposal(witness.operation.domain,registration[1],registration[2],
+            witness.frame.envelope,(),DependencySet(),(),()),)
+    if (rebuilt_frame!=witness.frame or rebuilt!=witness.stage or proposals!=bundle.proposals
+            or primary.operation_kind!=witness.operation.operation_kind):
+        raise ValueError('General growth actual qualification or provenance changed before its CAS')
+    pre=_GENERAL_GROWTH_PRECAS_VALIDATED_V1.get(id(witness))
+    if pre is None:
+        holder=_GeneralGrowthVerifiedProvenanceV1(witness,db,primary.original_payload_json)
+        holder.decode_v1()
+        _GENERAL_GROWTH_PRECAS_VALIDATED_V1[id(witness)]=(witness,db,primary.original_payload_json,holder)
+    elif pre[0]is not witness or pre[1]is not db or pre[2]!=primary.original_payload_json:
+        raise ValueError('General growth exact verified payload changed in its actual CAS')
+    return witness
+
 
 def require_owner_stop_projection_commit_v1(witness, graph, db, bundle=None):
     from types import SimpleNamespace
@@ -134,6 +329,13 @@ def apply_foreground_cycle_before_graph_write_v1(witness, graph, db):
     if type(getattr(witness, "stage", None)) is SelfC04AdoptionStageV4:
         return apply_self_c04_adoption_once_v4(witness, graph, db)
     """The fixed W01 guard calls this after current CAS guards, before projection reconciliation."""
+    from .habit_schedule_driver_v1 import HabitScheduleStageV1,apply_habit_schedule_jobs_in_transaction_v1
+    if type(getattr(witness,'stage',None))is HabitScheduleStageV1:
+        if _ACTIVE.get(id(witness))is not witness or _FOREGROUND_VALIDATED.get(id(witness))is not witness or id(witness)in _FOREGROUND_APPLIED:
+            raise ValueError('Habit job mirrors require their exact privately validated same-W01 witness')
+        apply_habit_schedule_jobs_in_transaction_v1(db,stage=witness.stage,frame=witness.frame)
+        _FOREGROUND_APPLIED[id(witness)]=witness
+        return True
     from .cancel_owner_source_note_task_v1 import CancelOwnerSourceNoteTaskStageV1,apply_cancel_owner_source_note_task_in_transaction_v1
     if type(getattr(witness,'stage',None)) is CancelOwnerSourceNoteTaskStageV1:
         if (_ACTIVE.get(id(witness)) is not witness or _FOREGROUND_VALIDATED.get(id(witness)) is not witness
@@ -197,6 +399,46 @@ def apply_foreground_cycle_before_graph_write_v1(witness, graph, db):
     return True
 
 
+def _rebuild_current_habit_stage_v1(runtime,db,*,operation,request,frame,stage,scope):
+    from .habit_control_issuance_v1 import require_habit_control_issuance_v1 as require_habit_activity_issuance_v1
+    from .habit_activity_runtime_v1 import require_current_habit_commit_v1
+    from .current_habit_source_read_v3 import require_habit_compile_inputs_v3
+    from .domain_production_registry_v1 import stage_installed_domain_operation_v1
+    from .d01_production_operations_v1 import CurrentDomainReadV1
+    issued=runtime._active_habit_issuance_v1
+    evidence=require_habit_activity_issuance_v1(issued,runtime.graph,scope)
+    require_current_habit_commit_v1(runtime,db,operation=operation,request=request,frame=frame,stage=stage,scope=scope)
+    if getattr(runtime,'_active_owner_task_issuance_v1',None)is not None or runtime._active_foreground_issuance_v1 is not None or frame.envelope.authority.actor!=evidence.current_self.self_entity_ref:raise ValueError('Habit restage cannot borrow another issuance or actor')
+    from .habit_maintenance_frame_v1 import CurrentHabitMaintenanceFrameV1,CurrentHabitMaintenanceReadV1
+    read=CurrentHabitMaintenanceReadV1(frame)if type(frame)is CurrentHabitMaintenanceFrameV1 else CurrentDomainReadV1(frame)
+    read.check(db)
+    _,_,_,readers=require_habit_compile_inputs_v3(db,graph=runtime.graph,scope=scope,issued=issued,operation=operation,request=request,now_utc=frame.now_utc)
+    rebuilt=stage_installed_domain_operation_v1(db,operation=operation,frame=frame,request=request,installed_readers=readers)
+    require_current_habit_commit_v1(runtime,db,operation=operation,request=request,frame=frame,stage=rebuilt,scope=scope)
+    if rebuilt!=stage:raise ValueError('Habit actual Source/Owner/Root/phase stage changed before its original CAS')
+    return rebuilt
+
+
+def _require_current_habit_witness_v1(witness,graph,db,bundle):
+    from .habit_control_issuance_v1 import require_habit_control_issuance_v1 as require_habit_activity_issuance_v1
+    from .habit_activity_runtime_v1 import require_current_habit_commit_v1
+    issued=witness.runtime._active_habit_issuance_v1
+    evidence=require_habit_activity_issuance_v1(issued,graph,witness.scope)
+    require_current_habit_commit_v1(witness.runtime,db,operation=witness.operation,request=witness.request,frame=witness.frame,stage=witness.stage,scope=witness.scope)
+    if witness.owner is not None or witness.guard!=evidence.owner_guard or witness.frame.envelope!=bundle.envelope:raise ValueError('Habit actual witness changed its independent Owner/Source command')
+    from .d11_life_preparation_v1 import LifePreparationStageV1,verify_life_preparation_in_transaction_v1
+    if type(witness.stage)is LifePreparationStageV1:
+        from .d11_life_preparation_commit_v1 import life_preparation_bundle_v1
+        verify_life_preparation_in_transaction_v1(db,witness.stage,issuer=graph._GraphCoordinator__d11_issuer,resource_issuer=graph._GraphCoordinator__d02_issuer)
+        if life_preparation_bundle_v1(graph,witness.stage)!=bundle:raise ValueError('Habit Life witness changed the actual job and single occurrence same-CAS bundle')
+    else:
+        rebuilt=_rebuild_current_habit_stage_v1(witness.runtime,db,operation=witness.operation,request=witness.request,frame=witness.frame,stage=witness.stage,scope=witness.scope)
+        if _members(rebuilt)[1]!=bundle.proposals:raise ValueError('Habit exact rebuilt proposal set differs from its original bundle')
+        from .habit_schedule_driver_v1 import HabitScheduleStageV1
+        if type(rebuilt)is HabitScheduleStageV1:_FOREGROUND_VALIDATED[id(witness)]=witness
+    return witness
+
+
 def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
     from .c04_ingress_preparation_v4 import _SelfC04CommitV4, require_self_c04_prepare_commit_v4
     from .c04_ingress_adoption_v4 import SelfC04AdoptionStageV4, require_self_c04_adoption_commit_v4
@@ -248,6 +490,39 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
             or not graph._anchor_matches(v2_write[0].requirements, witness.scope.pinned_anchor)):
         raise ValueError('installed domain commit witness/current Graph fence differs')
     witness.runtime._current()
+    primary_census,*_=_members(witness.stage)
+    from .habit_census_provenance_v1 import require_current_habit_census_payload_v1
+    require_current_habit_census_payload_v1(witness.frame,json.loads(primary_census.original_payload_json))
+    from .named_joint_binding_write_v1 import current_named_joint_write_v1,require_named_joint_commit_witness_v1
+    if current_named_joint_write_v1(witness.runtime)is not None:
+        return require_named_joint_commit_witness_v1(witness,graph,db,bundle)
+    from .conditioned_child_write_v1 import current_conditioned_child_write_v1,require_conditioned_child_witness_v1
+    if current_conditioned_child_write_v1(witness.runtime)is not None:
+        return require_conditioned_child_witness_v1(witness,graph,db,bundle)
+    if witness.runtime._active_habit_issuance_v1 is not None:
+        return _require_current_habit_witness_v1(witness,graph,db,bundle)
+    from .habit_schedule_driver_v1 import HabitScheduleStageV1,stage_record_habit_window_cue_v1
+    if type(witness.stage)is HabitScheduleStageV1:
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        readers=installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+        if witness.operation.operation_kind=='record_habit_window_cue_v1':
+            rebuilt=stage_record_habit_window_cue_v1(db,frame=witness.frame,request=witness.request,installed=readers)
+        else:
+            from .d10_habit_v1 import stage_current_habit_operation_v1
+            rebuilt=stage_current_habit_operation_v1(db,frame=witness.frame,request=witness.request,installed_readers=readers,operation_kind=witness.operation.operation_kind)
+        if rebuilt!=witness.stage or witness.stage.stage.proposals!=bundle.proposals:raise ValueError('Habit subscription actual current Source/job/CAS transition changed')
+        _FOREGROUND_VALIDATED[id(witness)]=witness
+        return witness
+    if witness.operation.operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import verify_contact_prospective_stage_v1
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        readers=installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+        verify_contact_prospective_stage_v1(db,frame=witness.frame,request=witness.request,installed_readers=readers,stage=witness.stage)
+        if witness.stage.proposals!=bundle.proposals:raise ValueError('Contact prospective barrier-only bundle changed')
+        return witness
+    from .contact_plan_physical_write_v3 import PreparedContactPlanPhysicalV3,require_contact_plan_commit_v3
+    if type(witness.stage) is PreparedContactPlanPhysicalV3:
+        return require_contact_plan_commit_v3(witness,graph,db,bundle,v2_write)
     from .owner_material_source_storage_v3 import (
         StagedDomainOperationV3,require_owner_material_sealed_stage_v3,
     )
@@ -260,6 +535,8 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
                 or witness.stage.proposals!=bundle.proposals):
             raise ValueError('sealed Owner Source operation or actual W01 proposals changed')
         return witness
+    if witness.operation.operation_kind in _GENERAL_GROWTH_COMMIT_KINDS_V1:
+        return _record_general_growth_pre_cas_validation_v1(witness,graph,db,bundle)
     from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
     if type(witness.stage) is OwnerStopReplyProjectionStageV1:
         return require_owner_stop_projection_commit_v1(witness, graph, db, bundle)
@@ -499,6 +776,8 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
 
 
 def _members(stage):
+    from .habit_schedule_driver_v1 import HabitScheduleStageV1
+    if type(stage)is HabitScheduleStageV1:return stage.stage,stage.stage.proposals,(),(),()
     from .owner_material_source_storage_v3 import StagedDomainOperationV3
     if type(stage) is StagedDomainOperationV3:
         stage.prepared.require_current()
@@ -596,6 +875,13 @@ def _members(stage):
 
 def commit_installed_domain_operation_v1(runtime, db, *, operation, request, frame, stage,
         readers, scope, owner, guard, metadata, epoch, process_lease, external_originals=()):
+    from .d07_source_owner_read_v3 import require_d07_source_stage_v3
+    require_d07_source_stage_v3(db,stage)
+    from .current_d07_simulation_source_read_v3 import require_current_d07_simulation_stage_v3
+    require_current_d07_simulation_stage_v3(db,stage)
+    if runtime._active_habit_issuance_v1 is not None:
+        from .habit_activity_runtime_v1 import require_current_habit_commit_v1
+        require_current_habit_commit_v1(runtime,db,operation=operation,request=request,frame=frame,stage=stage,scope=scope)
     from .c04_ingress_preparation_v4 import SelfC04PreparationStageV4, commit_self_c04_prepare_v4
     from .c04_ingress_adoption_v4 import SelfC04AdoptionStageV4, commit_self_c04_adopt_v4
     if type(stage) in {SelfC04PreparationStageV4, SelfC04AdoptionStageV4}:
@@ -691,12 +977,22 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     from .owner_material_source_storage_v3 import (
         StagedDomainOperationV3,require_owner_material_sealed_stage_v3,
     )
-    if type(stage) is StagedDomainOperationV3:
+    from .named_joint_binding_write_v1 import current_named_joint_write_v1,rebuild_named_joint_stage_v1
+    if current_named_joint_write_v1(runtime)is not None:
+        rebuilt_frame,rebuilt,_=rebuild_named_joint_stage_v1(runtime,db,operation=operation,request=request,frame=frame,scope=scope)
+    elif runtime._active_habit_issuance_v1 is not None:
+        rebuilt_frame=frame
+        rebuilt=_rebuild_current_habit_stage_v1(runtime,db,operation=operation,request=request,frame=frame,stage=stage,scope=scope)
+    elif type(stage) is StagedDomainOperationV3:
         if owner_task is not None or issued is not None:
             raise ValueError('Owner Source preparation cannot borrow foreground/task issuance')
         require_owner_material_sealed_stage_v3(
             stage,runtime,db,frame=frame,request=request,scope=scope,
             installed_readers=readers)
+        rebuilt_frame,rebuilt=frame,stage
+    elif operation.operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import verify_contact_prospective_stage_v1
+        verify_contact_prospective_stage_v1(db,frame=frame,request=request,installed_readers=readers,stage=stage)
         rebuilt_frame,rebuilt=frame,stage
     elif owner_task is not None:
         if issued is not None:raise ValueError('Owner task and foreground issuances overlap')
@@ -715,6 +1011,9 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     if type(stage) is LifeBodyPreparationStageV1:
         issue_life_body_quotes_before_cas_v1(db, frame=frame, staged=stage, installed_readers=readers)
     primary, proposals, experiences, settlements, paid_costs = _members(stage)
+    if type(primary) is StagedDomainOperationV1:
+        from .domain_mesh_tick_v1 import verify_semantic_mesh_composition_v1
+        verify_semantic_mesh_composition_v1(db,frame=frame,stage=primary)
     if any(job.phase != 'waiting' or job.lease_holder is not None or job.fence or job.cancel_epoch
             or job.resource_ref != 'resource:unallocated' for job in primary.jobs):
         raise ValueError('pure domain staging can only persist unallocated waiting work')
@@ -771,7 +1070,35 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         raise ValueError('actual Owner operation original is absent')
     owner_task=getattr(runtime,'_active_owner_task_issuance_v1',None)
     issued = getattr(runtime, "_active_foreground_issuance_v1", None)
-    if owner_task is not None:
+    from .conditioned_child_write_v1 import current_conditioned_child_write_v1
+    conditioned=current_conditioned_child_write_v1(runtime)
+    if conditioned is not None:
+        from .conditioned_child_issuance_v1 import require_conditioned_child_issuance_v1
+        from ..authority_service.conditioned_child_contract_v1 import conditioned_child_finish_digest_v1
+        selector=conditioned[2];child=conditioned[3]
+        evidence=require_conditioned_child_issuance_v1(child,graph,scope)
+        if(owner_task is not None or issued is not None or runtime._active_habit_issuance_v1 is not None
+                or evidence.selector!=selector or attempt!=(canonical_digest(selector),scope.operation_id)):
+            raise ValueError('conditioned actual W01 attempt changed its private issued selector or borrowed another writer')
+        finish_digest=conditioned_child_finish_digest_v1(selector,scope.permit)
+    elif runtime._active_habit_issuance_v1 is not None:
+        from .habit_control_issuance_v1 import (require_habit_control_issuance_v1 as require_habit_activity_issuance_v1,
+            habit_control_request_digest_v1 as habit_activity_request_digest_v1,
+            habit_control_finish_digest_v1 as habit_activity_finish_digest_v1)
+        habit=runtime._active_habit_issuance_v1
+        evidence=require_habit_activity_issuance_v1(habit,graph,scope)
+        saved_permit=db.execute('SELECT permit_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',(*primary.namespace.as_tuple,primary.operation_id)).fetchone()
+        if owner_task is not None or issued is not None or attempt[0]!=habit_activity_request_digest_v1(evidence.request)or attempt[1]!=evidence.request.operation_id or saved_permit!=(canonical_json(to_wire(scope.permit)),):raise ValueError('Habit original attempt changed its full selector, exact same permit or independent issuance')
+        finish_digest=habit_activity_finish_digest_v1(habit,graph,scope)
+    elif current_named_joint_write_v1(runtime)is not None:
+        from .named_joint_binding_issuance_v1 import require_named_joint_issuance_v1,named_joint_finish_digest_v1
+        named=current_named_joint_write_v1(runtime);reader,named_issued,named_scope,named_frame=named
+        evidence=require_named_joint_issuance_v1(named_issued,graph,scope)
+        if(owner_task is not None or issued is not None or scope is not named_scope or frame is not named_frame
+                or attempt[:2]!=(canonical_digest(evidence.request),evidence.request.operation_id)):
+            raise ValueError('Named Joint actual W01 attempt changed its private selector or Scope')
+        finish_digest=named_joint_finish_digest_v1(evidence.request,scope.permit)
+    elif owner_task is not None:
         from .owner_source_note_task_issuance_v1 import require_owner_source_note_task_issuance_v1
         evidence=require_owner_source_note_task_issuance_v1(owner_task,graph,scope)
         if attempt[0]!=canonical_digest(evidence.request):
@@ -786,19 +1113,69 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     else:
         finish_digest = 'sha256:' + canonical_digest({'schema': 'w01.owner-domain-write.v3',
             'operation_id': primary.operation_id, 'request_digest': attempt[0], 'permit_token': scope.permit.token})
+    general_original=None
+    general_produced=()
+    numeric_trace_produced=None
+    numeric_encoding_produced=None
+    numeric_drive_produced=None
     _ACTIVE[id(witness)] = witness
     try:
+        from .d07_general_growth_attention_v1 import capture_actual_general_growth_outcome_before_cas_v1
+        general_growth_capture = capture_actual_general_growth_outcome_before_cas_v1(witness, db)
         receipt = graph._commit_domain_bundle_fenced(bundle, process_lease, in_transaction=True,
             v2_write=(metadata, epoch, finish_id, finish_digest, canonical_json(to_wire(scope.permit))),
             now_utc=frame.now_utc, domain_production_issuance_v1=witness)
         if type(stage) in {CancelOwnerSourceNoteTaskStageV1, OwnerSourceNoteTaskStageV1, ForegroundCycleStageV1, D07IngressRecallAcquisitionStageV1, D07IngressRecallResultStageV1, ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2, OwnerStopReplyProjectionStageV1} and _FOREGROUND_APPLIED.get(id(witness)) is not witness:
             raise ValueError("foreground actual W01 guard did not apply its frozen job stage")
+        from .habit_schedule_driver_v1 import HabitScheduleStageV1
+        if type(stage)is HabitScheduleStageV1 and _FOREGROUND_APPLIED.get(id(witness))is not witness:raise ValueError('Habit actual W01 guard did not apply its exact subscription mirrors')
+        if conditioned is not None:
+            conditioned_original=record_adopted_domain_operation_v1(db,primary,receipt)
+            if conditioned[2].phase=='child':
+                from .current_conditioned_self_read_v3 import record_conditioned_followup_child_disposition_after_cas_v3
+                record_conditioned_followup_child_disposition_after_cas_v3(witness,db,frame=frame,stage=primary,
+                    receipt=receipt,original=conditioned_original)
+        from .joint_window_management_v1 import record_joint_window_management_after_cas_v1
+        record_joint_window_management_after_cas_v1(db,witness=witness,primary=primary,receipt=receipt,issuer=graph._GraphCoordinator__d11_issuer)
+        from .d10_habit_v1 import record_habit_managed_execution_after_cas_v1
+        record_habit_managed_execution_after_cas_v1(db,witness=witness,primary=primary,receipt=receipt,issuer=graph._GraphCoordinator__d11_issuer)
+        from .d06_life_numeric_drive_v1 import LifeNumericDriveStageV1,bind_active_numeric_drive_inputs_v3
+        if type(stage)is LifeNumericDriveStageV1:
+            from .d06_life_numeric_commit_v1 import record_life_numeric_math_stage_v1
+            with bind_active_numeric_drive_inputs_v3(db,witness=witness,receipt=receipt):
+                numeric_drive_produced=record_life_numeric_math_stage_v1(db,stage,readers.issuer,receipt,drive_commit_witness_v3=witness)
+        from .d04_life_encoding_baseline_v1 import LifeEncodingBaselineStageV1
+        if type(stage)is LifeEncodingBaselineStageV1:
+            from .c04_encoding_context_original_v3 import bind_actual_w01_life_encoding_inputs_v3
+            from .d06_life_numeric_commit_v1 import record_life_numeric_math_stage_v1,require_current_life_encoding_write_v3
+            require_current_life_encoding_write_v3(db,witness=witness,stage=stage,receipt=receipt)
+            with bind_actual_w01_life_encoding_inputs_v3(db,witness=witness,receipt=receipt):
+                numeric_encoding_produced=record_life_numeric_math_stage_v1(db,stage,readers.issuer,receipt,
+                    encoding_commit_witness_v3=witness)
+        from .d06_life_numeric_trace_v1 import LifeNumericTraceStageV1
+        if type(stage)is LifeNumericTraceStageV1:
+            from .d06_life_numeric_commit_v1 import record_life_numeric_math_stage_v1
+            numeric_trace_produced=record_life_numeric_math_stage_v1(db,stage,readers.issuer,receipt,
+                trace_commit_witness_v3=witness)
+        if operation.operation_kind in _GENERAL_GROWTH_COMMIT_KINDS_V1 and primary.coverage=='complete':
+            with _general_growth_post_cas_v1(witness,db,primary,receipt):
+                general_original=record_adopted_domain_operation_v1(db,primary,receipt)
+                general_produced=_record_general_growth_after_cas_v1(readers,db,witness=witness,
+                    frame=frame,primary=primary,request=request,receipt=receipt)
+        from .habit_followup_source_v3 import record_habit_followup_before_witness_release_v3
+        record_habit_followup_before_witness_release_v3(witness,db,frame=frame,stage=primary,receipt=receipt)
     finally:
         _ACTIVE.pop(id(witness), None)
         _FOREGROUND_VALIDATED.pop(id(witness), None)
         _FOREGROUND_APPLIED.pop(id(witness), None)
+        pre=_GENERAL_GROWTH_PRECAS_VALIDATED_V1.pop(id(witness),None)
+        if pre is not None:pre[3].close_v1()
+        _GENERAL_GROWTH_POSTCAS_V1.pop(id(witness),None)
     from .domain_production_inputs_v1 import StagedDomainInputV1, record_current_domain_input_after_commit_v1
-    produced = ()
+    produced = general_produced
+    if primary.operation_kind=="register_current_habit_source_note_life_plan_v1":
+        from .d10_habit_v1 import record_habit_source_note_life_plan_after_cas_v1
+        produced=(record_habit_source_note_life_plan_after_cas_v1(db,frame=frame,stage=primary,receipt=receipt,installed=readers),)
     from .contact_plan_adoption_v2 import ContactPlanStageV2,record_contact_plan_after_cas_v2
     if type(stage) is ContactPlanStageV2:
         from .domain_production_contracts_v1 import ProductionOriginalRefV1
@@ -834,7 +1211,10 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
             issuer=readers.issuer, receipt=receipt),)
     from .d06_life_numeric_commit_v1 import life_numeric_math_stages_v1, record_life_numeric_math_stage_v1
     if type(stage) in life_numeric_math_stages_v1():
-        produced = (record_life_numeric_math_stage_v1(db, stage, readers.issuer, receipt),)
+        produced = ((numeric_drive_produced,) if numeric_drive_produced is not None
+            else (numeric_trace_produced,) if numeric_trace_produced is not None
+            else (numeric_encoding_produced,) if numeric_encoding_produced is not None
+            else (record_life_numeric_math_stage_v1(db, stage, readers.issuer, receipt),))
     from .ingress_artifact_task_scope_v1 import IngressArtifactTaskScopeStageV1
     from .artifact_task_observer_v1 import ArtifactTaskSettlementStageV1
     if type(stage) in {IngressArtifactTaskScopeStageV1,ArtifactTaskSettlementStageV1}:
@@ -849,7 +1229,26 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         root_original = record_draft_root_registration_after_commit_v1(db, graph=graph,
             issued=runtime._active_draft_root_registration_v1, frame=frame, receipt=receipt, issuer=readers.issuer)
         produced = (*produced, root_original)
-    original = record_adopted_domain_operation_v1(db, primary, receipt)
+    original=(general_original if general_original is not None else record_adopted_domain_operation_v1(db,primary,receipt))
+    if operation.operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"}:
+        from .d03_world_history_v1 import record_world_assertion_after_commit_v1
+        produced=(*produced,record_world_assertion_after_commit_v1(db,stage=primary,receipt=receipt,installed_readers=readers))
+    if operation.operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import record_contact_prospective_after_commit_v1,contact_prospective_original_ref_v1,SIGN_KIND
+        from .domain_production_contracts_v1 import ProductionOriginalRefV1
+        birth=record_contact_prospective_after_commit_v1(db,graph=graph,stage=primary,receipt=receipt)
+        produced=(*produced,ProductionOriginalRefV1(SIGN_KIND,
+            contact_prospective_original_ref_v1(primary.namespace,request.contact_id,primary.operation_id),birth.digest))
+    from .d07_general_growth_attention_v1 import record_actual_general_growth_outcome_after_cas_v1
+    general_growth_trigger_original = record_actual_general_growth_outcome_after_cas_v1(db,
+        capture=general_growth_capture, receipt=receipt, causal_original=original)
+    if general_growth_trigger_original is not None:
+        produced = (*produced, general_growth_trigger_original)
+    from .d07_general_growth_attention_v1 import record_general_growth_attention_after_cas_v1
+    general_growth_attention_original = record_general_growth_attention_after_cas_v1(db,
+        frame=frame, stage=primary, receipt=receipt, issuer=graph._GraphCoordinator__d11_issuer)
+    if general_growth_attention_original is not None:
+        produced = (*produced, general_growth_attention_original)
     if type(stage) is CancelOwnerSourceNoteTaskStageV1:
         from .cancel_owner_source_note_task_v1 import record_cancel_owner_source_note_task_after_cas_v1
         produced=(*produced,*record_cancel_owner_source_note_task_after_cas_v1(db,frame=frame,
@@ -906,6 +1305,21 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         proof_write = next(write for proposal in primary.proposals for write in proposal.typed_writes if write.key.type_name == PROVENANCE)
         validate_internal_life_episode_history_v2(db, decode_internal_life_value_v2(PROVENANCE, proof_write.value))
     for event in primary.outbox:
+        if (operation.operation_kind in _GENERAL_GROWTH_COMMIT_KINDS_V1
+                and event.event_kind in {'general_growth_intent_available_for_future_trial',
+                    'general_growth_trial_start_available_for_observation','general_growth_trial_completed_for_adoption'}):
+            output_kind={'freeze_general_growth_intent_v1':'d01.general_growth_intent_v1',
+                'register_general_growth_trial_start_v1':'d01.general_growth_trial_start_v1',
+                'derive_general_growth_trial_v1':'d01.general_growth_trial_v1'}[operation.operation_kind]
+            matches=tuple(value for value in general_produced if value.kind==output_kind)
+            if len(matches)!=1:raise ValueError('General lifecycle requires its actual same-CAS signed produced input')
+            event=replace(event,trigger_original=matches[0])
+        if (general_growth_attention_original is not None and event.receiver_domain == "d07"
+                and event.event_kind == "general_growth_attention_available_for_service"):
+            event = replace(event, trigger_original=general_growth_attention_original)
+        if (general_growth_trigger_original is not None and event.receiver_domain == 'd01'
+                and event.event_kind == 'actual_life_outcome_available_for_growth'):
+            event = replace(event, trigger_original=general_growth_trigger_original)
         if type(stage) is ArtifactTaskSettlementStageV1:
             event=replace(event,trigger_original=original)
         if root_original is not None:
@@ -977,9 +1391,11 @@ def commit_d07_preparation_v1(runtime, db, *, operation, request, preparation, r
         receipt = runtime.graph._commit_domain_bundle_fenced(bundle, process_lease, in_transaction=True,
             v2_write=(metadata, epoch, 'finish:'+scope.operation_id, finish_digest, canonical_json(to_wire(scope.permit))),
             now_utc=preparation.frame.now_utc, domain_production_issuance_v1=witness)
+        from .d07_source_preparation_members_v3 import bind_d07_source_postcas_v3
+        with bind_d07_source_postcas_v3(witness,receipt):
+            original_digest = record_d07_preparation_after_cas_v1(db, service.d11_issuer, preparation, receipt)
     finally:
         _ACTIVE.pop(id(witness), None)
-    original_digest = record_d07_preparation_after_cas_v1(db, service.d11_issuer, preparation, receipt)
     return {'schema':'sylanne.domain-production-receipt.v1','domain':'d07',
         'operation_kind':operation.operation_kind,'operation_id':base,
         'prepare_operation_id':preparation.prepared.prepare_operation_id,

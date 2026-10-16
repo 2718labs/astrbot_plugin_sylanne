@@ -3,6 +3,7 @@
 The request is only a locator. No supplied content, approval, check, quote,
 continuation or executable callback becomes permission. No sender is installed.
 """
+from ..runtime_storage_v3 import read_graph_row_v3,read_graph_rows_v3
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import json
@@ -75,6 +76,10 @@ class _ContactFinalMaterialV3:
     stage_call: object
     provisional_writes: tuple = ()
     final_bundle: object = None
+    prospective_birth: object = None
+    prospective_joint_gate: object = None
+    prospective_successor: object = None
+    continuation_observation: object = None
 
 
 
@@ -85,25 +90,31 @@ class PrepareCurrentContactDispatchRequestV3:
 
     def __post_init__(self):
         if (type(self.contact_id) is not str or not self.contact_id.startswith('contact:')
-                or len(self.contact_id) > 128 or type(self.segment_index) is not int or self.segment_index != 0):
-            raise ValueError('Contact final command only accepts its fixed first segment locator')
+                or len(self.contact_id) > 128 or type(self.segment_index) is not int or not 0<=self.segment_index<3):
+            raise ValueError('Contact final command requires its exact finite segment locator')
 
 
-def contact_final_runtime_ids_v3(namespace, contact_id, activity_id):
+def contact_final_runtime_ids_v3(namespace, contact_id, activity_id, segment_index=0):
     from .d11_types import runtime_job_key, runtime_outbox_key
-    digest = canonical_digest(('d11.contact-first-runtime.v1', namespace, contact_id))
+    digest = canonical_digest(('d11.contact-first-runtime.v1', namespace, contact_id)if segment_index==0 else
+        ('d11.contact-segment-runtime.v1',namespace,contact_id,segment_index))
     job, outbox = 'contact-message-job:' + digest[:48], 'contact-message-outbox:' + digest[:48]
     return runtime_job_key(*namespace.as_tuple, activity_id, job), runtime_outbox_key(*namespace.as_tuple, activity_id, outbox)
 
 
-def _raw_plan(db, namespace, contact_id):
-    from .contact_plan_adoption_v2 import TABLE
+def _raw_plan(db,namespace,contact_id):
+    from .domain_background_read_v3 import read_background_contact_plan_metadata_v3
+    actual,plan = read_background_contact_plan_metadata_v3(db,namespace,contact_id)
+    if actual:
+        return plan
+    from .contact_host_source_v3 import contact_host_work_for_db_v3
+    from ..authority_service.contact_background_graph_v3 import contact_authority_work_v3
+    work = contact_host_work_for_db_v3(db) or contact_authority_work_v3(db)
+    if work is None or work.contact_selector.contact_id!=contact_id or work.namespace!=namespace:
+        raise MissingProductionOriginalV1('actual_contact_plan_metadata_read_work')
+    work.contact_locator.require_v3(work)
     from ..domains.d08.contact_plan_v2 import decode_contact_plan_v2
-    row = db.execute(f'SELECT payload_json FROM {TABLE} WHERE bot=? AND persona=? AND contact_id=?',
-        (*namespace.as_tuple,contact_id)).fetchone()
-    if row is None:
-        raise MissingProductionOriginalV1('actual_adopted_contact_plan_v2')
-    return decode_contact_plan_v2(json.loads(row[0])['plan'])
+    return decode_contact_plan_v2(work.contact_locator.plan_metadata)
 
 
 def read_plan_contact_final_v3(db, *, namespace, activity_id, operation_kind, request):
@@ -117,12 +128,18 @@ def read_plan_contact_final_v3(db, *, namespace, activity_id, operation_kind, re
     from .d11_types import runtime_job_key
     if type(request) is not PrepareCurrentContactDispatchRequestV3:
         raise TypeError('closed Contact final locator request required')
-    plan = _raw_plan(db, namespace, request.contact_id)
+    if request.segment_index>0:
+        from .contact_continuation_stage_v1 import read_plan_contact_continuation_v1
+        return read_plan_contact_continuation_v1(db,namespace=namespace,activity_id=activity_id,request=request)
+    from .domain_background_read_v3 import require_background_contact_source_component_v3
+    require_background_contact_source_component_v3(db,namespace,request.contact_id,'contact_final')
+    plan = _raw_plan(db,namespace,request.contact_id)
     if (plan.namespace, plan.activity_id) != (namespace, activity_id):
         raise ValueError('Contact final command crossed its actual namespace/activity')
     ids = contact_final_action_ids_v1(plan.contact_id, 0)
+    from ..domains.d08.contact_plan_v3 import contact_plan_keys_v3
     owner = Owner('activity', *namespace.as_tuple, plan.activity_id)
-    keys = [owner_grant_key(*namespace.as_tuple), *contact_plan_keys_v2(plan),
+    keys = [owner_grant_key(*namespace.as_tuple), *contact_plan_keys_v2(plan), *contact_plan_keys_v3(plan)[1:],
         *contact_batch_keys_v3(namespace, plan.activity_id, plan.contact_id), contact_claim_key_v2(namespace, plan.contact_id),
         AtomKey(owner, 'd08.goal.v1', ids['goal']), AtomKey(owner, 'd08.action_intent.v1', ids['action']),
         AtomKey(owner, 'd08.action_cancellation.v1', ids['action']), AtomKey(owner, 'd08.action_schema.v1', ids['schema']), *contact_final_runtime_ids_v3(namespace, plan.contact_id, plan.activity_id)]
@@ -135,8 +152,7 @@ def read_plan_contact_final_v3(db, *, namespace, activity_id, operation_kind, re
     from .contact_qualification_evidence_v3 import CONTACT_FINAL_QUERY_TYPES_V3
     types = CONTACT_FINAL_QUERY_TYPES_V3
     for kind in ('d03.role_binding', 'd05.boundary_rule'):
-        rows = db.execute('SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? AND valid=1 LIMIT 129',
-            (*namespace.as_tuple, kind)).fetchall()
+        rows = read_graph_rows_v3(db,columns=('value',),where='bot=? AND persona=? AND type_name=? AND valid=1',parameters=(*namespace.as_tuple, kind),history=False,limit=129)
         if len(rows) > 128:
             raise MissingProductionOriginalV1('complete_contact_structural_inventory:' + kind)
         for (wire,) in rows:
@@ -148,17 +164,39 @@ def read_plan_contact_final_v3(db, *, namespace, activity_id, operation_kind, re
             (*namespace.as_tuple, job)).fetchone()
         if paid:
             keys.append(AtomKey.from_token(json.loads(paid[0])['cost_ref']))
-    return production_read_plan_v1(types, keys, tuple(sorted(roots)), (plan.source_ref.ref,))
+    from .contact_prospective_v1 import read_contact_prospective_original_v1,contact_prospective_barrier_key_v1,contact_prospective_original_ref_v1
+    keys.append(contact_prospective_barrier_key_v1(namespace,activity_id,request.contact_id))
+    birth=read_contact_prospective_original_v1(db,current_read_issuer_v3(db),namespace,request.contact_id)
+    originals=(plan.source_ref.ref,)
+    if birth is not None:
+        raw=json.loads(birth.payload_json)
+        from .domain_background_read_v3 import _active_v3
+        parent=_active_v3(db)
+        component=require_background_contact_source_component_v3(db,namespace,request.contact_id,'contact_final')
+        roots=set(component.source_selection.roots)
+        originals=(*originals,raw['joint_preparation']['ref'],contact_prospective_original_ref_v1(namespace,request.contact_id,raw['birth_operation_id']))
+        from .joint_node_execution_v1 import read_joint_executor_index_v1,augment_joint_binding_read_plan_v1
+        binding=read_joint_executor_index_v1(db,namespace=namespace,selector_kind='contact',
+            selector_key=(raw['terms']['causal_operation_id'],raw['terms']['dedupe_key']),issuer=current_read_issuer_v3(db))
+        if binding is None:raise MissingProductionOriginalV1('matching_current_joint_binding_for_contact_prospective_birth')
+        base=production_read_plan_v1(types,keys,tuple(sorted(roots)),originals)
+        joined=augment_joint_binding_read_plan_v1(db,namespace=namespace,plan=base,binding=binding)
+        # Joint context qualification is independently materialized by its
+        # closed Source component; its heads remain in the complete CAS guard.
+        return replace(joined,source_roots=base.source_roots,required_original_refs=base.required_original_refs)
+    return production_read_plan_v1(types, keys, tuple(sorted(roots)), originals)
 
 
 def command_identity_contact_final_v3(db, *, namespace, request, operation_id, issuer):
     from .contact_reviewed_content_v2 import read_contact_reviewed_content_original_v2
     content = read_contact_reviewed_content_original_v2(db, namespace=namespace, contact_id=request.contact_id,
         issuer=issuer, resource_issuer=issuer._d02)
-    first = content.segments[0]
-    if operation_id != first.operation_id:
-        raise ValueError('Contact final command cannot mint a second first-segment operation')
-    return content.activity_id, first.segment.effect_id, content.audience_id
+    from .contact_final_action_v1 import require_contact_segment_index_v1
+    require_contact_segment_index_v1(content,request.segment_index)
+    selected=content.segments[request.segment_index]
+    if operation_id != selected.operation_id:
+        raise ValueError('Contact final command cannot select another original segment operation')
+    return content.activity_id,selected.segment.effect_id,content.audience_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +330,12 @@ def _qualification(material, db, read, action):
     from ..domains.d03.context import ContextProvider
     from .contact_route_binding_v1 import read_current_contact_route_binding_v1
     from .contact_qualification_v3 import issue_contact_checks_locked_v3
+    from .contact_prospective_v1 import require_contact_prospective_final_gate_v1
+    if material.request.segment_index:
+        from .contact_continuation_stage_v1 import require_current_contact_continuation_joint_gate_v1
+        require_current_contact_continuation_joint_gate_v1(db,material=material,read=read)
+    else:
+        require_contact_prospective_final_gate_v1(db,material=material,read=read)
     route = read_current_contact_route_binding_v1(db, read, account_ref=_raw_plan(db, material.scope.namespace, material.content.contact_id).route_account_ref.ref,
         target_entity_ref=action.intent.target_ref, audience=material.content.audience_id)
     return issue_contact_checks_locked_v3(db, read.frame.snapshot, route.query, material.scope,
@@ -314,7 +358,7 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
     from .contact_dispatch_candidate_v3 import contact_dispatch_segment_payload_ref_v3
     from ..domains.d09.contact_batch_v3 import contact_batch_keys_v3
     from .contact_batch_freezer_v3 import freeze_installed_contact_verified_batch_v3
-    from ..domains.d08.execution import GoalExecutionProvider, RequiredCheckRegistry
+    from ..domains.d08.execution import GoalExecutionProvider, RequiredCheckRegistry, _decode_goal
     from ..domains.d03.context import ContextProvider
     from ..domains.d01.production_operations_v1 import stage_result_v1, plain_v1
     from .contact_final_action_v3 import prepare_contact_action_stage_v3, contact_whole_grant_request_v1
@@ -324,6 +368,9 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
     from .d10_production_operations_v1 import InstalledD10ProductionReadersV1
     if type(request) is not PrepareCurrentContactDispatchRequestV3 or type(installed_readers) is not InstalledD10ProductionReadersV1:
         raise TypeError('Contact final command requires its concrete installed readers')
+    if request.segment_index>0:
+        from .contact_continuation_stage_v1 import stage_contact_continuation_in_transaction_v1
+        return stage_contact_continuation_in_transaction_v1(db,frame=frame,request=request,installed_readers=installed_readers)
     graph = installed_readers.role_clock_reader.graph
     runtime = graph._GraphCoordinator__domain_production_runtime_v1
     runtime._current()
@@ -341,14 +388,40 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
         raise ValueError('Contact final material identity differs from its paid original')
     frame = _contact_expression_frame_v3(frame, content)
     policy = assembly.admin_bundle.private_reply_dispatch
+    if assembly.admin_bundle.contact_effect_accounting is None:
+        raise MissingProductionOriginalV1("installed_contact_effect_pricing")
+    if set(dict(assembly.admin_bundle.contact_effect_accounting.unit_cost)) != set(policy.quote_ceiling):
+        raise MissingProductionOriginalV1("complete_original_contact_effect_price_dimensions")
     grant = issuer.current_budget_grant(db, frame.envelope.parent_budget_lease_ref)
     if grant != assembly.installation_policy.root_grant or any(len(item.segment.body) > policy.segment_max_chars for item in content.segments):
         raise ValueError('Contact message exceeds its actual installed private price/segment scope')
-    deadline = min(frame.envelope.deadline_utc, content.valid_until, frame.now_utc + policy.deadline_after_seconds, grant.valid_until_utc)
-    job_key, outbox_key = contact_final_runtime_ids_v3(scope.namespace, content.contact_id, content.activity_id)
-    quote = issuer.issue_private_reply_dispatch_quote_v2(db, policy=policy, namespace=scope.namespace,
-        identity=frame.envelope.identity, parent_grant=grant, deadline_utc=deadline,
-        graph_job_ref=job_key.token, outbox_refs=(outbox_key.token,), now_utc=frame.now_utc)
+    from .contact_prospective_v1 import read_contact_prospective_original_v1,contact_prospective_barrier_key_v1
+    birth=read_contact_prospective_original_v1(db,issuer,scope.namespace,content.contact_id)
+    born=None if birth is None else json.loads(birth.payload_json)
+    deadline=min(frame.envelope.deadline_utc,content.valid_until,frame.now_utc+policy.deadline_after_seconds,grant.valid_until_utc)
+    job_key,outbox_key=contact_final_runtime_ids_v3(scope.namespace,content.contact_id,content.activity_id)
+    if born is None:
+        barrier=read_graph_row_v3(db,columns=('revision','valid'),where='token=? AND bot=? AND persona=?',
+            parameters=(contact_prospective_barrier_key_v1(scope.namespace,content.activity_id,content.contact_id).token,*scope.namespace.as_tuple),history=False)
+        if barrier is not None:raise MissingProductionOriginalV1('actual_immutable_contact_prospective_birth_for_barrier')
+        quote=issuer.issue_private_reply_dispatch_quote_v2(db,policy=policy,namespace=scope.namespace,
+            identity=frame.envelope.identity,parent_grant=grant,deadline_utc=deadline,
+            graph_job_ref=job_key.token,outbox_refs=(outbox_key.token,),now_utc=frame.now_utc)
+    else:
+        quote=issuer._d02.original_signed_quote(db,born['quote']['id'],born['quote']['version'])
+        deadline=born['deadline_utc']
+        if (deadline>frame.envelope.deadline_utc or frame.now_utc>=deadline
+                or canonical_digest(quote)!=born['quote']['digest']
+                or (quote.operation_id,quote.effect_id,quote.parent_budget_lease_ref)!=(
+                    frame.envelope.identity.operation_id,frame.envelope.identity.effect_id,grant.lease_id)):
+            raise ValueError('Contact prospective final cannot change or extend its original quote/future/root/deadline')
+        from .contact_original_read_v3 import contact_original_point_v3
+        reservation=contact_original_point_v3(db,table='runtime_budget_reservations',
+            columns=('digest','ceiling_json','state'),key_columns=('lease_id','operation_id'),
+            key=(grant.lease_id,quote.operation_id),legacy_reader=lambda:None)
+        if (reservation is None or reservation[0]!=born['reservation']['digest']
+                or json.loads(reservation[1])!=born['reservation']['ceiling'] or reservation[2]!='reserved'):
+            raise ValueError('Contact prospective final lost its original once-held reservation')
     from .first_ingress_v2 import trusted_upper
     clock_upper = trusted_upper(runtime._active_contact_final_clock_v1)
     local_deadline = min(frame.envelope.monotonic_deadline, time.monotonic() + deadline - clock_upper)
@@ -360,8 +433,9 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
     job = replace(issuer.job_for(envelope, db, now_utc=frame.now_utc), phase='waiting',
         wake_condition={'kind':'contact_host_takeover', 'operation_id':envelope.identity.operation_id})
     create_job(db, job, 'contact-job-create:' + canonical_digest((scope.namespace, job.job_id))[:48], canonical_digest(job))
-    reserve_budget(db, grant.lease_id, envelope.identity.operation_id,
-        budget_operation_digest(envelope, grant.lease_id, dict(quote.ceiling)), dict(quote.ceiling))
+    if born is None:
+        reserve_budget(db, grant.lease_id, envelope.identity.operation_id,
+            budget_operation_digest(envelope, grant.lease_id, dict(quote.ceiling)), dict(quote.ceiling))
     batch_keys = contact_batch_keys_v3(scope.namespace, content.activity_id, content.contact_id)
     batch_key = batch_keys[0]
     outbox = RuntimeOutboxValue(*scope.namespace.as_tuple, content.activity_id, envelope.identity.operation_id,
@@ -373,8 +447,11 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
         content, installed_readers.current_contact_policy, runtime._active_contact_final_effect_v1,
         runtime._active_contact_final_effect_snapshot_v1, runtime._active_contact_final_clock_v1, quote, grant, job, outbox,
         runtime._active_contact_final_stage_call_v1)
+    if birth is not None:material=replace(material,prospective_birth=birth)
     material = _publish_material(material)
     with _contact_projection_read_v3(material, db, phase='pre_e') as read:
+        from .contact_prospective_v1 import require_contact_prospective_final_gate_v1
+        joint_gate=require_contact_prospective_final_gate_v1(db,material=material,read=read)
         route = read_current_contact_route_binding_v1(db, read, account_ref=plan.route_account_ref.ref,
             target_entity_ref=plan.target_entity_ref, audience=content.audience_id)
         claim_write = prepare_whole_contact_claim_v3(db, read, content=content, current_policy=material.current_policy, scope=scope, now_utc=frame.now_utc)
@@ -383,7 +460,9 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
             d02_issuer=graph._GraphCoordinator__d02_issuer, d11_issuer=issuer, quote=quote, grant=grant,
             current_policy=material.current_policy, now_utc=frame.now_utc)
         action = prepare_contact_action_stage_v3(envelope=read.frame.envelope, content=content, index=0,
-            current_checks=versions, route=route, quote=quote, grant=grant, now_utc=frame.now_utc)
+            current_checks=versions, route=route, quote=quote, grant=grant, now_utc=frame.now_utc,
+            fixed_birth_goal=None if born is None else _decode_goal(born['candidate']['goal']))
+    material=_publish_material(replace(material,prospective_joint_gate=joint_gate))
     runtime_writes = (job_graph_write(job), outbox_graph_write(outbox, job_key))
     for write in runtime_writes:
         reconcile_runtime_write(db, write)
@@ -444,6 +523,12 @@ def stage_prepare_current_contact_dispatch_in_transaction_v3(db, *, frame, reque
             qualification, _ = _qualification(material, db, read, action)
             if qualification.checks != first_qualification.checks:
                 raise ValueError('Contact whole-batch provisional providers changed')
+    if material.prospective_birth is not None:
+        from .contact_prospective_v1 import derive_contact_prospective_successor_v1
+        successor=derive_contact_prospective_successor_v1(material.prospective_birth,action=action,qualification=qualification,
+            quote=material.quote,reservation_digest=qualification.check_versions.reservation_digest,
+            joint_gate_digest=canonical_digest(material.prospective_joint_gate),deadline_utc=material.frame.envelope.deadline_utc)
+        material=_publish_material(replace(material,prospective_successor=successor))
     stage = stage_result_v1(material.frame, 'd08', 'prepare_contact_dispatch_v3', request,
         provenance={'reviewed_content_digest':content.digest, 'qualification_digest':qualification.digest,
             'job_ref':job_key.token, 'outbox_ref':outbox_key.token}, jobs=(job,))
@@ -478,6 +563,9 @@ def require_contact_final_commit_v3(witness, graph, db, bundle, v2_write):
             or not graph._anchor_matches(v2_write[0].requirements, m.scope.pinned_anchor)):
         raise ValueError('Contact final commit original R/E or actual SQL transaction changed')
     CurrentDomainReadV1(m.frame).check(db)
+    if m.request.segment_index>0:
+        from .contact_continuation_stage_v1 import require_contact_continuation_commit_v1
+        return require_contact_continuation_commit_v1(witness,graph,db,bundle,v2_write)
     from .contact_reviewed_content_v2 import read_contact_reviewed_content_original_v2
     from .contact_dispatch_candidate_v3 import validate_contact_dispatch_candidate_writes_v3
     if read_contact_reviewed_content_original_v2(db, namespace=m.scope.namespace, contact_id=m.content.contact_id,
@@ -537,6 +625,8 @@ def seal_contact_final_admission_v3(witness, graph, db, receipt, evidence):
                 clock_policy=graph._GraphCoordinator__scene_clock_policy, owner_guard=m.owner_guard,
                 provisional_qualification=stage.qualification, now_utc=m.frame.now_utc)
             insert_admission(db, admission, request)
+            from .contact_effect_accounting_v1 import record_contact_effect_budget_origin_v1
+            record_contact_effect_budget_origin_v1(graph, db, material=m, admission=admission, request=request)
             runtime = inspect_contact_final_d11_v3(db, bundle=stage.bundle, candidate=evidence,
                 qualification=qualification, d11_issuer=graph._GraphCoordinator__d11_issuer, now_utc=m.frame.now_utc)
             from .dispatch_action_job_binding import bind_action_job
@@ -559,7 +649,9 @@ def require_contact_action_job_v3(witness, db, action, admission):
         issued = load_request(db, m.scope.namespace, admission.admission_ref)
         if (issued is None or issued[0].admission != admission or issued[1].proactive_contact is not True
                 or issued[1].footprint.contact_id != m.content.contact_id
-                or not issued[1].footprint.quota_occupancies or not issued[1].footprint.object_gate_keys
+                or issued[1].segment_index!=m.request.segment_index
+                or bool(issued[1].footprint.quota_occupancies)!=(m.request.segment_index==0)
+                or not issued[1].footprint.object_gate_keys
                 or issued[1].contact_policy_check_ref is None
                 or m.job.phase != 'waiting' or m.job.work_kind != 'message'
                 or m.job.wake_condition != {'kind':'contact_host_takeover', 'operation_id':admission.operation_id}):
@@ -613,6 +705,10 @@ def commit_contact_final_stage_v3(runtime, db, *, operation, request, preparatio
             'write_commitments':commitments, 'job_ref':preparation.bundle.persistent_job_refs[0],
             'outbox_ref':preparation.bundle.outbox_refs[0]})
     original = record_adopted_domain_operation_v1(db, primary, receipt)
+    from .contact_prospective_v1 import record_contact_prospective_successor_after_commit_v1
+    record_contact_prospective_successor_after_commit_v1(db,material=m,receipt=receipt,final_original_digest=original.original_digest)
+    from .contact_continuation_v1 import record_contact_segment_original_after_commit_v1
+    record_contact_segment_original_after_commit_v1(db,material=m,receipt=receipt,admission=admission,request=command)
     return _contact_final_result_v3(receipt=receipt,original_digest=original.original_digest,
         job_id=m.job.job_id,admission_ref=admission.admission.admission_ref,dispatch_request_digest=canonical_digest(command))
 
@@ -732,6 +828,10 @@ def verify_contact_final_committed_v3(db, *, namespace, result, issuer, graph):
     if issued is None:
         raise ValueError('Contact COMMIT readback lost its durable admission/request')
     admission, request = issued
+    if request.segment_index>0:
+        from .contact_continuation_readback_v1 import verify_contact_continuation_committed_v1
+        return verify_contact_continuation_committed_v1(db,namespace=namespace,result=result,issuer=issuer,graph=graph,
+            original=original,proof=proof,qualified=qualified,admission=admission,request=request)
     if (request.proactive_contact is not True or request.segment_index != 0
             or not request.footprint.quota_occupancies or not request.footprint.object_gate_keys
             or admission.receipt_digest != proof['admission_receipt_digest']
@@ -745,72 +845,8 @@ def verify_contact_final_committed_v3(db, *, namespace, result, issuer, graph):
             or len(proof['write_commitments']) != len(original['receipt'].write_versions)
             or load_action_job_binding(db, namespace, proof['admission_ref']) is None):
         raise ValueError('Contact COMMIT readback identity/actual quota/admission differs')
-    metadata, epoch = graph._v2_graph_stamp(namespace)
-    fence = db.execute('SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,finish_request_id,finish_request_digest '
-        'FROM graph_bundle_fences_v2 WHERE bot=? AND persona=? AND operation_id=?', (*namespace.as_tuple,result['operation_id'])).fetchone()
-    attempt = db.execute('SELECT request_digest,attempt_id,permit_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',
-        (*namespace.as_tuple,result['operation_id'])).fetchone()
-    from ..authority_service.v2_contract import from_wire
-    from .budget import get_budget_lease
-    if fence is None or attempt is None:
-        raise ValueError('Contact COMMIT lacks its durable original fence/Owner attempt')
-    permit = from_wire(json.loads(fence[1]))
-    expected_finish = 'sha256:' + canonical_digest({'schema':'w01.owner-domain-write.v3',
-        'operation_id':result['operation_id'], 'request_digest':attempt[0], 'permit_token':permit.token})
-    if (fence[0] != original['receipt'].operation_digest or fence[1] != attempt[2]
-            or permit.operation != 'write' or permit.operation_id != attempt[1]
-            or permit.token != request.content_fence
-            or fence[4] != fence[2]+1 or fence[5] != fence[3]+1
-            or (metadata.graph_revision,epoch.revision) != (fence[4],fence[5])
-            or metadata.requirements.activation_generation != request.activation_generation
-            or metadata.requirements.graph_incarnation != admission.admission.graph_incarnation
-            or not graph._anchor_matches(metadata.requirements,permit.pinned_anchor)
-            or fence[6:] != ('finish:'+attempt[1],expected_finish)
-            or (admission.graph_revision,admission.graph_epoch) != (fence[4],fence[5])):
-        raise ValueError('Contact COMMIT actual root/generation/R-E/fence linkage differs')
-    if db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',namespace.as_tuple).fetchone() != (
-            admission.admission.access_epoch,admission.admission.delete_epoch):
-        raise ValueError('Contact COMMIT actual access/delete barrier differs')
-    for ref,revision in admission.admission.graph_reads:
-        actual = db.execute('SELECT revision FROM graph_atoms WHERE token=? AND bot=? AND persona=?',(ref,*namespace.as_tuple)).fetchone()
-        if actual != ((revision,) if revision else None):
-            raise ValueError('Contact COMMIT actual full admission read inventory differs')
-    events = db.execute('SELECT event_id FROM graph_events WHERE bot=? AND persona=? AND session=? AND epoch_revision=?',
-        (*namespace.as_tuple,request.activity_id,fence[5])).fetchall()
-    if events != [(request.operation_id,)]:
-        raise ValueError('Contact COMMIT actual post epoch event differs')
-    if {(x['ref'],x['revision']) for x in proof['write_commitments']} != {(v.key.token,v.revision) for v in original['receipt'].write_versions}:
-        raise ValueError('Contact COMMIT member commitments differ from its exact receipt')
-    parent = issuer.current_budget_grant(db,original['payload']['parent_budget'])
-    lease = get_budget_lease(db,parent.lease_id)
-    job_ref = AtomKey.from_token(proof['job_ref'])
-    job = get_job(db,job_ref.name)
-    resource_version = job.operator_versions.get('resource_quote')
-    if type(resource_version) is not str:
-        raise ValueError('Contact COMMIT waiting job lacks its actual quote version')
-    quote_id, quote_version = resource_version.rsplit(':',1)
-    quote = issuer._d02._load_quote(db,quote_id,int(quote_version))
-    from .domain_production_erasure_v1 import decode_typed_production_value_v1
-    from ..runtime_contracts import OperationIdentity, AuthorityContext
-    from types import SimpleNamespace
-    identity = decode_typed_production_value_v1(original['payload']['identity'],OperationIdentity)
-    authority = decode_typed_production_value_v1(original['payload']['authority'],AuthorityContext)
-    # Read-only identity view for the existing signed price-policy verifier;
-    # neither this value nor historical process capability grants new work.
-    issuer._qualified_private_reply_dispatch_policy(db,SimpleNamespace(identity=identity,authority=authority),quote,parent)
-    assembly = graph._GraphCoordinator__d04_installed_joint_assembly
-    if assembly is None or parent != assembly.installation_policy.root_grant:
-        raise ValueError('Contact COMMIT signed parent differs from its actual installed root')
-    reserved = db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
-        (parent.lease_id,request.operation_id)).fetchone()
-    if ((parent.bot_id,parent.persona_id,lease.bot_id,lease.persona_id) != (*namespace.as_tuple,*namespace.as_tuple)
-            or lease.state != 'active' or lease.version != admission.admission.budget_version
-            or quote.work_kind != 'message' or quote.graph_job_ref != proof['job_ref'] or quote.outbox_refs != (proof['outbox_ref'],)
-            or (quote.bot_id,quote.persona_id,quote.activity_id,quote.operation_id,quote.effect_id,quote.parent_budget_lease_ref) != (
-                *namespace.as_tuple,request.activity_id,request.operation_id,request.effect_id,parent.lease_id)
-            or reserved != (admission.admission.budget_reservation_digest,canonical_json(dict(quote.ceiling)),'reserved')
-            or canonical_serialize(admission.admission.budget_ceiling) != canonical_serialize(dict(quote.ceiling))):
-        raise ValueError('Contact COMMIT actual signed parent/message quote/reservation differs')
+    metadata,fence,parent,lease,job,quote,identity,authority=_verify_contact_committed_runtime_v3(db,namespace=namespace,
+        result=result,original=original,proof=proof,request=request,admission=admission,issuer=issuer,graph=graph)
     from .contact_reviewed_content_v2 import read_contact_reviewed_content_original_v2
     content = read_contact_reviewed_content_original_v2(db,namespace=namespace,contact_id=request.footprint.contact_id,
         issuer=issuer,resource_issuer=issuer._d02)
@@ -833,8 +869,7 @@ def verify_contact_final_committed_v3(db, *, namespace, result, issuer, graph):
     all_writes = []
     for member in proof['write_commitments']:
         key = AtomKey.from_token(member['ref'])
-        raw = db.execute('SELECT value FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
-            (key.token,*namespace.as_tuple)).fetchone()
+        raw = read_graph_row_v3(db,columns=('value',),where='token=? AND bot=? AND persona=?',parameters=(key.token,*namespace.as_tuple),history=False)
         if raw is None:
             raise ValueError('Contact COMMIT four-join member is absent')
         domain = 'd11' if key.type_name.startswith('runtime.') else key.type_name[:3]
@@ -901,10 +936,8 @@ def verify_contact_final_committed_v3(db, *, namespace, result, issuer, graph):
         key = AtomKey.from_token(row['ref'])
         if key.owner.bot != namespace.bot_id or key.owner.persona != namespace.persona_id or type(row['revision']) is not int:
             raise ValueError('Contact COMMIT member crossed its namespace/version')
-        history = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
-            (key.token, row['revision'])).fetchone()
-        current = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
-            (key.token, *namespace.as_tuple)).fetchone()
+        history = read_graph_row_v3(db,columns=('event_id', 'value', 'valid'),where='token=? AND revision=?',parameters=(key.token, row['revision']),history=True)
+        current = read_graph_row_v3(db,columns=('revision', 'value', 'valid'),where='token=? AND bot=? AND persona=?',parameters=(key.token, *namespace.as_tuple),history=False)
         if (history is None or history[0] != result['operation_id'] or history[2] != 1
                 or canonical_digest(json.loads(history[1])) != row['digest']
                 or current != (row['revision'], history[1], 1)):
@@ -914,9 +947,92 @@ def verify_contact_final_committed_v3(db, *, namespace, result, issuer, graph):
             or job.operation_id != request.operation_id or job.effect_id != request.effect_id
             or job.wake_condition != {'kind':'contact_host_takeover', 'operation_id':request.operation_id}):
         raise ValueError('Contact COMMIT waiting job identity differs')
-    actual_job = db.execute('SELECT value FROM graph_atoms WHERE token=?', (proof['job_ref'],)).fetchone()
+    actual_job = read_graph_row_v3(db,columns=('value',),where='token=?',parameters=(proof['job_ref'],),history=False)
     if actual_job is None or canonical_serialize(json.loads(actual_job[0])) != canonical_serialize(job_graph_write(job).value):
         raise ValueError('Contact COMMIT durable job and Graph projection differ')
     validate_contact_final_result_v3(result,original=original,job_id=job.job_id,
         admission_ref=admission.admission.admission_ref,dispatch_request_digest=canonical_digest(request))
     return issued
+
+
+def current_read_issuer_v3(db):
+    from .domain_background_read_v3 import _active_v3
+    from .contact_host_source_v3 import contact_host_work_for_db_v3
+    from ..authority_service.contact_background_graph_v3 import contact_authority_work_v3
+    parent=_active_v3(db)
+    if parent is not None:return parent.graph._GraphCoordinator__d11_issuer
+    work=contact_host_work_for_db_v3(db) or contact_authority_work_v3(db)
+    if work is None:raise MissingProductionOriginalV1('actual_installed_contact_original_reader')
+    return work.contact_issuer
+
+
+def _verify_contact_committed_runtime_v3(db,*,namespace,result,original,proof,request,admission,issuer,graph):
+    from .jobs import get_job
+    from ..runtime_contracts import canonical_serialize
+    metadata, epoch = graph._v2_graph_stamp(namespace)
+    fence = db.execute('SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,finish_request_id,finish_request_digest '
+        'FROM graph_bundle_fences_v2 WHERE bot=? AND persona=? AND operation_id=?', (*namespace.as_tuple,result['operation_id'])).fetchone()
+    attempt = db.execute('SELECT request_digest,attempt_id,permit_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',
+        (*namespace.as_tuple,result['operation_id'])).fetchone()
+    from ..authority_service.v2_contract import from_wire
+    from .budget import get_budget_lease
+    if fence is None or attempt is None:
+        raise ValueError('Contact COMMIT lacks its durable original fence/Owner attempt')
+    permit = from_wire(json.loads(fence[1]))
+    expected_finish = 'sha256:' + canonical_digest({'schema':'w01.owner-domain-write.v3',
+        'operation_id':result['operation_id'], 'request_digest':attempt[0], 'permit_token':permit.token})
+    if (fence[0] != original['receipt'].operation_digest or fence[1] != attempt[2]
+            or permit.operation != 'write' or permit.operation_id != attempt[1]
+            or permit.token != request.content_fence
+            or fence[4] != fence[2]+1 or fence[5] != fence[3]+1
+            or (metadata.graph_revision,epoch.revision) != (fence[4],fence[5])
+            or metadata.requirements.activation_generation != request.activation_generation
+            or metadata.requirements.graph_incarnation != admission.admission.graph_incarnation
+            or not graph._anchor_matches(metadata.requirements,permit.pinned_anchor)
+            or fence[6:] != ('finish:'+attempt[1],expected_finish)
+            or (admission.graph_revision,admission.graph_epoch) != (fence[4],fence[5])):
+        raise ValueError('Contact COMMIT actual root/generation/R-E/fence linkage differs')
+    if db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',namespace.as_tuple).fetchone() != (
+            admission.admission.access_epoch,admission.admission.delete_epoch):
+        raise ValueError('Contact COMMIT actual access/delete barrier differs')
+    for ref,revision in admission.admission.graph_reads:
+        actual = db.execute('SELECT revision FROM graph_atoms WHERE token=? AND bot=? AND persona=?',(ref,*namespace.as_tuple)).fetchone()
+        if actual != ((revision,) if revision else None):
+            raise ValueError('Contact COMMIT actual full admission read inventory differs')
+    events = db.execute('SELECT event_id FROM graph_events WHERE bot=? AND persona=? AND session=? AND epoch_revision=?',
+        (*namespace.as_tuple,request.activity_id,fence[5])).fetchall()
+    if events != [(request.operation_id,)]:
+        raise ValueError('Contact COMMIT actual post epoch event differs')
+    if {(x['ref'],x['revision']) for x in proof['write_commitments']} != {(v.key.token,v.revision) for v in original['receipt'].write_versions}:
+        raise ValueError('Contact COMMIT member commitments differ from its exact receipt')
+    parent = issuer.current_budget_grant(db,original['payload']['parent_budget'])
+    lease = get_budget_lease(db,parent.lease_id)
+    job_ref = AtomKey.from_token(proof['job_ref'])
+    job = get_job(db,job_ref.name)
+    resource_version = job.operator_versions.get('resource_quote')
+    if type(resource_version) is not str:
+        raise ValueError('Contact COMMIT waiting job lacks its actual quote version')
+    quote_id, quote_version = resource_version.rsplit(':',1)
+    quote = issuer._d02._load_quote(db,quote_id,int(quote_version))
+    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+    from ..runtime_contracts import OperationIdentity, AuthorityContext
+    from types import SimpleNamespace
+    identity = decode_typed_production_value_v1(original['payload']['identity'],OperationIdentity)
+    authority = decode_typed_production_value_v1(original['payload']['authority'],AuthorityContext)
+    # Read-only identity view for the existing signed price-policy verifier;
+    # neither this value nor historical process capability grants new work.
+    issuer._qualified_private_reply_dispatch_policy(db,SimpleNamespace(identity=identity,authority=authority),quote,parent)
+    assembly = graph._GraphCoordinator__d04_installed_joint_assembly
+    if assembly is None or parent != assembly.installation_policy.root_grant:
+        raise ValueError('Contact COMMIT signed parent differs from its actual installed root')
+    reserved = db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
+        (parent.lease_id,request.operation_id)).fetchone()
+    if ((parent.bot_id,parent.persona_id,lease.bot_id,lease.persona_id) != (*namespace.as_tuple,*namespace.as_tuple)
+            or lease.state != 'active' or lease.version != admission.admission.budget_version
+            or quote.work_kind != 'message' or quote.graph_job_ref != proof['job_ref'] or quote.outbox_refs != (proof['outbox_ref'],)
+            or (quote.bot_id,quote.persona_id,quote.activity_id,quote.operation_id,quote.effect_id,quote.parent_budget_lease_ref) != (
+                *namespace.as_tuple,request.activity_id,request.operation_id,request.effect_id,parent.lease_id)
+            or reserved != (admission.admission.budget_reservation_digest,canonical_json(dict(quote.ceiling)),'reserved')
+            or canonical_serialize(admission.admission.budget_ceiling) != canonical_serialize(dict(quote.ceiling))):
+        raise ValueError('Contact COMMIT actual signed parent/message quote/reservation differs')
+    return metadata,fence,parent,lease,job,quote,identity,authority

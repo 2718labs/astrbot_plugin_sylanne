@@ -23,8 +23,9 @@ from .v2_contract import FencePermitV2, from_wire as fence_from_wire, to_wire as
 
 
 def _canonical(raw: str):
-    value = json.loads(raw)
-    if canonical_json(value) != raw:
+    from .current_authority_graph_read_v3 import authority_current_json_v3, authority_current_json_matches_v3
+    value = authority_current_json_v3(raw)
+    if not authority_current_json_matches_v3(raw, value, legacy_serializer=canonical_json):
         raise ValueError("noncanonical graph value")
     return value
 
@@ -82,14 +83,19 @@ class PinnedCurrentSelfIdentityGraphVerifier:
     def _check(db, namespace, anchor, installation_id, guard, *,
                location_observation=None, storage_admission=None, holder=None):
         ns = namespace.as_tuple
-        meta = db.execute(
-            "SELECT schema,requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
-            "WHERE bot=? AND persona=?", ns).fetchone()
-        epoch = db.execute(
-            "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", ns).fetchone()
-        access = db.execute(
-            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
-            "WHERE bot=? AND persona=?", ns).fetchone()
+        from .current_authority_graph_read_v3 import authority_current_json_matches_v3
+        from .foreground_mesh_source_read_v3 import read_foreground_mesh_self_header_v3, read_foreground_mesh_point_v3
+        def legacy_header():
+            meta = db.execute(
+                "SELECT schema,requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
+                "WHERE bot=? AND persona=?", ns).fetchone()
+            epoch = db.execute(
+                "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", ns).fetchone()
+            access = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", ns).fetchone()
+            return meta, epoch, access
+        meta, epoch, access = read_foreground_mesh_self_header_v3(db,namespace=namespace,legacy_reader=legacy_header)
         if (meta is None or meta[0] != "sylanne3.authority.v2"
                 or epoch is None or access is None
                 or access[1] != 0 and location_observation is None):
@@ -115,12 +121,12 @@ class PinnedCurrentSelfIdentityGraphVerifier:
             return None
         activation_key = AtomKey(Owner("persona", *ns),
                                  "d01.persona_activation.v1", "current")
-        activation_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (activation_key.token,)).fetchone()
-        grant_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*ns).token,)).fetchone()
+        activation_row = read_foreground_mesh_point_v3(db,table="graph_atoms",columns=("revision","value","valid"),
+            key_columns=("token",),key=(activation_key.token,),legacy_reader=lambda: db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",(activation_key.token,)).fetchone())
+        grant_row = read_foreground_mesh_point_v3(db,table="graph_atoms",columns=("revision","value","valid"),
+            key_columns=("token",),key=(owner_grant_key(*ns).token,),legacy_reader=lambda: db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",(owner_grant_key(*ns).token,)).fetchone())
         if (activation_row is None or activation_row[2] != 1
                 or grant_row is None or grant_row[2] != 1):
             return None
@@ -154,20 +160,17 @@ class PinnedCurrentSelfIdentityGraphVerifier:
                 return None
         elif storage_admission is not None:
             return None
-        proof_row = db.execute(
-            "SELECT operation_id,request_digest,grant_id,grant_digest,"
-            "graph_incarnation,graph_access_epoch,graph_epoch,"
-            "graph_receipt_digest,proof_json "
-            "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=? "
-            "AND operation_id=?",
-            ns + (grant["issue_operation_id"],)).fetchone()
+        proof_row = read_foreground_mesh_point_v3(db,table="graph_owner_issue_operations_v1",
+            columns=("operation_id","request_digest","grant_id","grant_digest","graph_incarnation","graph_access_epoch","graph_epoch","graph_receipt_digest","proof_json"),
+            key_columns=("bot","persona","operation_id"),key=ns+(grant["issue_operation_id"],),
+            legacy_reader=lambda: db.execute("SELECT operation_id,request_digest,grant_id,grant_digest,graph_incarnation,graph_access_epoch,graph_epoch,graph_receipt_digest,proof_json FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=? AND operation_id=?",ns+(grant["issue_operation_id"],)).fetchone())
         if proof_row is None:
             return None
         proof = OwnerGraphCommitProofV1(
             namespace, proof_row[0], proof_row[1], proof_row[2], proof_row[3],
             proof_row[4], grant["grant_revision"], proof_row[5],
             proof_row[6], proof_row[7])
-        if (proof_row[8] != canonical_json(asdict(proof))
+        if (not authority_current_json_matches_v3(proof_row[8], asdict(proof), legacy_serializer=canonical_json)
                 or proof.grant_id != grant["grant_id"]
                 or proof.grant_digest != "sha256:" + canonical_digest(grant)
                 or proof.grant_revision != grant_row[0]
@@ -179,35 +182,32 @@ class PinnedCurrentSelfIdentityGraphVerifier:
             return None
         plan_key = AtomKey(Owner("persona", *ns),
                            "d01.persona_plan.v1", activation.plan_id)
-        plan = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (plan_key.token,)).fetchone()
+        plan = read_foreground_mesh_point_v3(db,table="graph_atoms",columns=("revision","value","valid"),
+            key_columns=("token",),key=(plan_key.token,),legacy_reader=lambda: db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",(plan_key.token,)).fetchone())
         if plan is None or plan[2] != 1:
             return None
         plan_value = _canonical(plan[1])
         _validate_persona_plan(plan_value)
         resource_key = role_resources_key(namespace, activation.plan_id)
-        resource_row = db.execute(
-            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (resource_key.token,)).fetchone()
+        resource_row = read_foreground_mesh_point_v3(db,table="graph_atoms",columns=("revision","value","valid"),
+            key_columns=("token",),key=(resource_key.token,),legacy_reader=lambda: db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",(resource_key.token,)).fetchone())
         if resource_row is None or resource_row[2] != 1 or resource_row[0] != 1:
             return None
         resource_value = _canonical(resource_row[1])
         resources = RoleRuntimeResourcesV1(**resource_value)
-        role_intent = db.execute(
-            "SELECT operation_id,input_digest,fence_attempt_id,requirements_json,"
-            "anchor_json,graph_revision,graph_epoch FROM graph_role_init_intents_v1 "
-            "WHERE bot=? AND persona=?", ns).fetchone()
-        role_request = db.execute(
-            "SELECT operation_id,request_digest,input_digest "
-            "FROM graph_role_init_request_proofs_v1 WHERE bot=? AND persona=?",
-            ns).fetchone()
-        role_row = db.execute(
-            "SELECT operation_id,input_digest,permit_json,receipt_json,"
-            "pre_graph_revision,pre_graph_epoch,post_graph_revision,"
-            "post_graph_epoch,finish_request_id,finish_request_digest "
-            "FROM graph_role_init_receipts_v1 WHERE bot=? AND persona=?",
-            ns).fetchone()
+        role_intent = read_foreground_mesh_point_v3(db,table="graph_role_init_intents_v1",
+            columns=("operation_id","input_digest","fence_attempt_id","requirements_json","anchor_json","graph_revision","graph_epoch"),
+            key_columns=("bot","persona"),key=ns,legacy_reader=lambda: db.execute(
+                "SELECT operation_id,input_digest,fence_attempt_id,requirements_json,anchor_json,graph_revision,graph_epoch FROM graph_role_init_intents_v1 WHERE bot=? AND persona=?",ns).fetchone())
+        role_request = read_foreground_mesh_point_v3(db,table="graph_role_init_request_proofs_v1",
+            columns=("operation_id","request_digest","input_digest"),key_columns=("bot","persona"),key=ns,
+            legacy_reader=lambda: db.execute("SELECT operation_id,request_digest,input_digest FROM graph_role_init_request_proofs_v1 WHERE bot=? AND persona=?",ns).fetchone())
+        role_row = read_foreground_mesh_point_v3(db,table="graph_role_init_receipts_v1",
+            columns=("operation_id","input_digest","permit_json","receipt_json","pre_graph_revision","pre_graph_epoch","post_graph_revision","post_graph_epoch","finish_request_id","finish_request_digest"),
+            key_columns=("bot","persona"),key=ns,legacy_reader=lambda: db.execute(
+                "SELECT operation_id,input_digest,permit_json,receipt_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,finish_request_id,finish_request_digest FROM graph_role_init_receipts_v1 WHERE bot=? AND persona=?",ns).fetchone())
         if role_intent is None or role_request is None or role_row is None:
             return None
         role_data = _canonical(role_row[3])
@@ -303,3 +303,4 @@ class PinnedCurrentSelfIdentityGraphVerifier:
 
 
 __all__ = ("PinnedCurrentSelfIdentityGraphVerifier",)
+

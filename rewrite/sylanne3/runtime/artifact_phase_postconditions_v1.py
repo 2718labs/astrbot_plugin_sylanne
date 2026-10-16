@@ -561,6 +561,7 @@ def stage_register_artifact_phase_postcondition_contract_v1(db,*,frame,request,i
 
 
 def _current_policy_sql_v1(db,*,policy,issuer,now_utc,owner_guard,installed_bundle):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     if type(policy) is ArtifactPhasePostconditionPolicyOriginalV2:
         return _current_policy_sql_v2(db,policy=policy,issuer=issuer,now_utc=now_utc,
             owner_guard=owner_guard,installed_bundle=installed_bundle)
@@ -572,11 +573,10 @@ def _current_policy_sql_v1(db,*,policy,issuer,now_utc,owner_guard,installed_bund
     if now_utc>=policy.original_deadline_utc:raise MissingProductionOriginalV1('current_original_postcondition_deadline')
     for head,digest in ((policy.goal_head,policy.goal_digest),(policy.plan_head,policy.plan_digest),
             (policy.source_head,policy.source_value_digest)):
-        row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-            (*policy.namespace.as_tuple,head.key.token)).fetchone()
+        row=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=head.key.token)
         if row is None or (row[0],canonical_digest(json.loads(row[1])),row[2])!=(head.revision,digest,1):
             raise MissingProductionOriginalV1('current_postcondition_Goal_Plan_Source_original')
-    owner=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(owner_guard.grant_ref,)).fetchone()
+    owner=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=owner_guard.grant_ref)
     if owner is None or (owner[0],canonical_digest(json.loads(owner[1])),owner[2])!=(owner_guard.grant_revision,owner_guard.grant_digest,1):
         raise MissingProductionOriginalV1('current_postcondition_upstream_Owner')
     from .artifact_task_text_extent_v1 import KIND as EXTENT_KIND,require_artifact_task_text_extent_history_v1
@@ -613,7 +613,7 @@ def _current_policy_sql_v1(db,*,policy,issuer,now_utc,owner_guard,installed_bund
     limit=min(objective[0]['valid_until_utc'],_utc(root.valid_until_utc).timestamp(),_utc(cycle.deadline_utc).timestamp(),*grant_deadlines)
     if lease.state!='active' or not now_utc<policy.original_deadline_utc<=limit:
         raise MissingProductionOriginalV1('current_fixed_registered_task_Root_budget_policy_deadline')
-    record=SourceRecord.from_dict(json.loads(db.execute('SELECT value FROM graph_atoms WHERE token=?',(policy.source_head.key.token,)).fetchone()[0]))
+    record=SourceRecord.from_dict(json.loads(artifact_model_graph_point_v3(db,('value',),token=policy.source_head.key.token)[0]))
     _source_family_current_sql_v1(db,namespace=policy.namespace,roots=(policy.source_head.key.token,),purpose='context',audiences=record.audiences)
     if policy.request.observer_policy_ref is not None:
         from ..host.authority_profile import readonly_artifact_phase_fixture_observer_v1
@@ -811,6 +811,7 @@ def decode_artifact_phase_postcondition_original_v1(kind,raw):
 
 
 def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original_ref,producing_operation_id,raw):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_life_payload_point_v3,artifact_model_task_preparation_operations_v3
     if kind == PREPARATION_PARENT_KIND_V1:
         return _preparation_parent_history_v1(db, namespace=namespace, original_ref=original_ref,
             producing_operation_id=producing_operation_id, raw=raw)
@@ -838,12 +839,8 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
         if not adopted['payload']['now_utc']<value.original_deadline_utc:
             raise ValueError('policy was not actually registered within its fixed original lifetime')
         from .d11_life_preparation_v1 import TABLE
-        root_row=db.execute("SELECT payload_json,payload_digest FROM "+TABLE+
-            " WHERE bot=? AND persona=? AND kind='draft_root_capability' AND original_ref=?",
-            (*namespace.as_tuple,value.request.task.root_registration_ref)).fetchone()
-        objective_row=db.execute("SELECT payload_json,payload_digest FROM "+TABLE+
-            " WHERE bot=? AND persona=? AND kind='artifact_task_objective' AND original_ref=?",
-            (*namespace.as_tuple,value.objective_ref)).fetchone()
+        root_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='draft_root_capability',ref=value.request.task.root_registration_ref,issuer=issuer)
+        objective_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='artifact_task_objective',ref=value.objective_ref,issuer=issuer)
         if root_row is None or objective_row is None or objective_row[1]!=value.objective_digest:
             raise ValueError('policy history lost fixed registered task/Root originals')
         from .d11_offline_originals_v1 import _utc
@@ -853,8 +850,7 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
         if adopted['payload']['request']!=plain_v1(RegisterArtifactPhasePostconditionContractRequestV1(value.selector,value.policy_ref)):
             raise ValueError('contract actual registration request differs')
         from .d11_life_preparation_v1 import TABLE
-        policy_raw=db.execute("SELECT payload_json,payload_digest,producing_operation_id FROM "+TABLE+
-            " WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*namespace.as_tuple,POLICY_KIND,value.policy_ref)).fetchone()
+        policy_raw=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=POLICY_KIND,ref=value.policy_ref,issuer=issuer)
         if policy_raw is None or policy_raw[1]!=value.policy_digest:raise ValueError('contract has no original preDecision policy')
         policy=decode_artifact_phase_postcondition_original_v1(POLICY_KIND,json.loads(policy_raw[0]))
         if ((value.conditions,value.owner_guard,value.goal_head,value.goal_digest,value.plan_head,value.plan_digest,value.source_head,value.source_value_digest)!=
@@ -879,8 +875,7 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
                     (value.selector.task,value.selector.method_ref,value.selector.phase_index,value.selector.phase_kind)
                 or value.selected_preparation_ref!='d08-current:'+value.selected_preparation_digest[:48]):
             raise ValueError('contract lost the policy committed by actual selected binding')
-        decision=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
-            (value.selector.decision_ref,value.selector.decision_revision)).fetchone()
+        decision=artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=value.selector.decision_ref,revision=value.selector.decision_revision)
         if decision is None or decision[2]!=1 or canonical_digest(json.loads(decision[1]))!=value.selector.decision_digest:
             raise ValueError('contract actual adopted Decision history differs')
         selection=read_adopted_domain_operation_v1(db,namespace,decision[0])
@@ -892,22 +887,20 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
             (*namespace.as_tuple,policy_raw[2])).fetchone()
         if policy_seq is None or not policy_seq[0]<candidate['receipt'].commit_seq<selection['receipt'].commit_seq<adopted['receipt'].commit_seq:
             raise ValueError('contract was not actually registered after preDecision policy and adopted Decision')
-        model_rows=db.execute("SELECT producing_operation_id FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_phase_prepared' "
-            "AND json_extract(payload_json,'$.selector.task.c02_operation_id')=?",(*namespace.as_tuple,value.selector.task.c02_operation_id)).fetchall()
+        model_rows=artifact_model_task_preparation_operations_v3(db,namespace,value.selector.task.c02_operation_id,legacy_reader=lambda:db.execute("SELECT producing_operation_id FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_phase_prepared' "
+            "AND json_extract(payload_json,'$.selector.task.c02_operation_id')=?",(*namespace.as_tuple,value.selector.task.c02_operation_id)).fetchall())
         for (op,) in model_rows:
             seq=db.execute('SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,op)).fetchone()
             if seq is None or seq[0]<=adopted['receipt'].commit_seq:raise ValueError('contract was registered after generation preparation')
     if kind==ASSESSMENT_KIND:
         if adopted['payload']['request']!=plain_v1(value.request):raise ValueError('assessment actual selectors differ')
         from .d11_life_preparation_v1 import TABLE
-        contract_row=db.execute("SELECT payload_json,payload_digest,producing_operation_id FROM "+TABLE+
-            " WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*namespace.as_tuple,CONTRACT_KIND,value.request.contract_ref)).fetchone()
+        contract_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=CONTRACT_KIND,ref=value.request.contract_ref,issuer=issuer)
         if contract_row is None or contract_row[1]!=value.contract_digest:raise ValueError('assessment lost frozen contract original')
         contract=decode_artifact_phase_postcondition_original_v1(CONTRACT_KIND,json.loads(contract_row[0]))
         require_artifact_phase_postcondition_history_v1(db,namespace=namespace,kind=CONTRACT_KIND,original_ref=contract.original_ref,
             producing_operation_id=contract_row[2],raw=json.loads(contract_row[0]))
-        policy_row=db.execute("SELECT payload_json FROM "+TABLE+" WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
-            (*namespace.as_tuple,POLICY_KIND,contract.policy_ref)).fetchone()
+        policy_row=artifact_model_life_payload_point_v3(db,('payload_json',),namespace=namespace,kind=POLICY_KIND,ref=contract.policy_ref,issuer=issuer)
         policy=decode_artifact_phase_postcondition_original_v1(POLICY_KIND,json.loads(policy_row[0]))
         from .foreground_call_plan_v1 import foreground_artifact_phase_group_identity_v2
         if (foreground_artifact_phase_group_identity_v2(value.content_selector)!=foreground_artifact_phase_group_identity_v2(value.request.selector)
@@ -920,8 +913,7 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
         from .d11_life_adoption_v1 import require_draft_terminal_readback_v1
         # This history seam verifies bytes and actual CAS joins. Installed
         # current readers and C09 authenticate the corresponding signatures.
-        file_row=db.execute("SELECT payload_json,payload_digest,producing_operation_id FROM "+TABLE+
-            " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",(*namespace.as_tuple,value.request.file_result_ref)).fetchone()
+        file_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind='adopted_life',ref=value.request.file_result_ref,issuer=issuer)
         if file_row is None:raise ValueError('assessment lost actual adopted file original')
         file_original=json.loads(file_row[0])
         if canonical_digest(file_original)!=file_row[1] or canonical_serialize(file_original)!=file_row[0]:raise ValueError('assessment file original bytes changed')
@@ -929,8 +921,7 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
         validate_adopted_life_member_history_v1(db,value=file_original,namespace=namespace,result_ref=value.request.file_result_ref,producing_operation_id=file_row[2])
         terminal=life_from_wire_v1(file_original['terminal'],D11LifeTerminalV1)
         from .d11_life_preparation_v1 import life_prepared_from_wire_v1
-        prepared_row=db.execute("SELECT payload_json,payload_digest FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
-            (*namespace.as_tuple,terminal.binding.prepared_original_ref)).fetchone()
+        prepared_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='prepared',ref=terminal.binding.prepared_original_ref,issuer=issuer)
         if prepared_row is None:raise ValueError('assessment lost actual file preparation')
         file_prepared=life_prepared_from_wire_v1(json.loads(prepared_row[0]))
         if file_prepared.digest!=prepared_row[1] or file_prepared.digest!=file_original['prepared_digest']:
@@ -942,15 +933,14 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
                 or (file_prepared.plan.operation_id,file_prepared.plan.attempt_id,file_prepared.plan.effect_id,file_prepared.plan.execution_call_id)!=
                     (ids['action_operation'],ids['attempt'],ids['effect'],ids['execution_call'])):
             raise ValueError('assessment changed independently adopted actual file readback/phase once IDs')
-        source=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(value.source_head.key.token,value.source_head.revision)).fetchone()
+        source=artifact_model_graph_point_v3(db,('value', 'valid'),token=value.source_head.key.token,revision=value.source_head.revision)
         from ..memory_types import SourceRecord
         if source is None or source[1]!=1 or canonical_digest(json.loads(source[0]))!=value.source_value_digest:
             raise ValueError('assessment actual content Source historical bytes differ')
         text=SourceRecord.from_dict(json.loads(source[0])).text
         from ..model_broker.artifact_draft_v1 import artifact_draft_model_ids_v2,artifact_draft_input_from_wire_v2,ArtifactDraftInputV3
         model_ids=artifact_draft_model_ids_v2(value.content_selector)
-        frozen_row=db.execute("SELECT payload_json,payload_digest FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_phase_frozen' AND original_ref=?",
-            (*namespace.as_tuple,model_ids['frozen'])).fetchone()
+        frozen_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='c4_phase_frozen',ref=model_ids['frozen'],issuer=issuer)
         if frozen_row is None:raise ValueError('assessment has no actual frozen generation contract commitment')
         frozen=artifact_draft_input_from_wire_v2(json.loads(frozen_row[0]))
         if (type(frozen) is not ArtifactDraftInputV3 or frozen.digest!=frozen_row[1]
@@ -1082,11 +1072,11 @@ def read_current_artifact_phase_postcondition_original_ref_v1(db,*,namespace,ori
 
 
 def _task_text_digest_v1(db,policy):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     # Text hash chooses only finite fixture applicability. The policy/contract
     # retain complete actual Source value/revision and independent current rights.
     from ..memory_types import SourceRecord
-    row=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
-        (policy.source_head.key.token,policy.source_head.revision)).fetchone()
+    row=artifact_model_graph_point_v3(db,('value', 'valid'),token=policy.source_head.key.token,revision=policy.source_head.revision)
     if row is None or row[1]!=1 or canonical_digest(json.loads(row[0]))!=policy.source_value_digest:
         raise ValueError('finite observer task text lost actual authorized Source original')
     return hashlib.sha256(SourceRecord.from_dict(json.loads(row[0])).text.encode()).hexdigest()
@@ -1441,6 +1431,7 @@ def _standing_profile_material_v2(bundle):
 
 
 def _standing_current_basis_v2(db, *, namespace, bundle, issuer, owner_guard, now_utc):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     from ..domains.d03.self_perspective import self_mapping_key, SelfIdentityMapping
     from ..graph_types import validate_owner_grant_v1
     from .budget import get_budget_lease, require_budget_family_admissible
@@ -1449,8 +1440,7 @@ def _standing_current_basis_v2(db, *, namespace, bundle, issuer, owner_guard, no
     if namespace != installation.namespace:
         raise ValueError("standing approval crossed installed namespace")
     def current(key):
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-            (key.token, *namespace.as_tuple)).fetchone()
+        row = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=key.token)
         if row is None or row[2] != 1:
             raise MissingProductionOriginalV1("actual_current_standing_" + key.type_name)
         return GraphVersion(key, row[0]), json.loads(row[1])
@@ -1557,6 +1547,7 @@ def stage_approve_artifact_standing_predecision_v2(db, *, frame, request, instal
 
 
 def _standing_approval_history_v2(db, *, namespace, original_ref, producing_operation_id, raw):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     value = _standing_approval_from_wire_v2(raw)
     adopted = read_adopted_domain_operation_v1(db, namespace, producing_operation_id)
     if (value.namespace != namespace or value.original_ref != original_ref
@@ -1571,8 +1562,7 @@ def _standing_approval_history_v2(db, *, namespace, original_ref, producing_oper
             or adopted["payload"]["now_utc"] != value.approved_at_utc
             or GraphVersion(value.self_mapping_head.key, value.self_mapping_head.revision) not in adopted["read_versions"]):
         raise ValueError("standing approval has no exact actual Owner W01 producer")
-    history = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
-        (value.self_mapping_head.key.token, value.self_mapping_head.revision)).fetchone()
+    history = artifact_model_graph_point_v3(db,('value', 'valid'),token=value.self_mapping_head.key.token,revision=value.self_mapping_head.revision)
     if history is None or history[1] != 1 or canonical_digest(json.loads(history[0])) != value.self_mapping_digest:
         raise ValueError("standing approval lost actual certified mapping historical bytes")
     return value
@@ -1638,6 +1628,7 @@ def authorize_current_task_predecision_v2(db, *, frame, task, operation, method_
 
 
 def _standing_source_family_sql_v2(db, *, namespace, source_ref, purpose, audiences, access_epoch, delete_epoch):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     from ..runtime_contracts import NamespaceId
     from ..memory_types import SourceRecord, source_key, access_key, validate_access
     from ..domains.d06 import source_correction_head_key
@@ -1648,8 +1639,7 @@ def _standing_source_family_sql_v2(db, *, namespace, source_ref, purpose, audien
         raise ValueError("predecision facts changed actual Source rights barriers")
     active, records = set(), {}
     def current(key):
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-            (key.token, *namespace.as_tuple)).fetchone()
+        row = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=key.token)
         if row is None or row[2] != 1:
             raise MissingProductionOriginalV1("actual_current_predecision_" + key.type_name)
         return GraphVersion(key, row[0]), json.loads(row[1])
@@ -1663,8 +1653,7 @@ def _standing_source_family_sql_v2(db, *, namespace, source_ref, purpose, audien
         head, value = current(key)
         _, access = current(access_key(*namespace.as_tuple, key.owner.subject))
         correction_key = source_correction_head_key(namespace, key.owner.subject)
-        correction = db.execute("SELECT revision,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-            (correction_key.token, *namespace.as_tuple)).fetchone()
+        correction = artifact_model_graph_point_v3(db,('revision', 'valid'),token=correction_key.token)
         record = SourceRecord.from_dict(value);validate_access(access)
         if (record.source_id != key.owner.subject or access["source_id"] != record.source_id
                 or access["status"] != "active" or purpose not in record.purposes or purpose not in access["purposes"]
@@ -1680,6 +1669,7 @@ def _standing_source_family_sql_v2(db, *, namespace, source_ref, purpose, audien
 
 def readonly_current_task_predecision_facts_v2(db, *, namespace, task, operation, method_ref, actor_ref,
         bundle, issuer, owner_guard, now_utc, purpose, audiences, access_epoch, delete_epoch):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     from .ingress_artifact_task_scope_v1 import (IngressArtifactTaskScopeOriginalV2,
         task_scope_ref_v1, SCOPE_KIND, OPERATION as TASK_SCOPE_OPERATION,
         _decode as task_decode, require_task_scope_archive_v1)
@@ -1737,8 +1727,7 @@ def readonly_current_task_predecision_facts_v2(db, *, namespace, task, operation
             or scope.c02_operation_id != task.c02_operation_id):
         raise MissingProductionOriginalV1("actual_current_approved_private_task_source_sender")
     approval_producer = read_adopted_domain_operation_v1(db, namespace, approval.registration_operation_id)
-    source_event = db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=1",
-        (scope.source_ref,)).fetchone()
+    source_event = artifact_model_graph_point_v3(db,('event_id',),token=scope.source_ref,revision=1)
     source_operation = None if source_event is None else db.execute(
         "SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, source_event[0])).fetchone()
@@ -2398,12 +2387,11 @@ def _current_policy_sql_v2(db,*,policy,issuer,now_utc,owner_guard,installed_bund
 
 
 def _require_amended_policy_history_v2(db,*,namespace,value,adopted):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_life_payload_point_v3
     from .d11_life_preparation_v1 import TABLE
     from .artifact_task_text_extent_v1 import (KIND as EXTENT_KIND,ArtifactTaskTextExtentOriginalV2,
         require_artifact_task_text_extent_history_v1)
-    row=db.execute('SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
-        ' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
-        (*namespace.as_tuple,EXTENT_KIND,value.request.extent_original_ref)).fetchone()
+    row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=EXTENT_KIND,ref=value.request.extent_original_ref,issuer=issuer)
     if row is None or row[1]!=value.extent_original_digest:
         raise ValueError('amended policy history lost its actual signed new extent')
     extent=require_artifact_task_text_extent_history_v1(db,namespace=namespace,original_ref=value.request.extent_original_ref,
@@ -2425,12 +2413,11 @@ def _require_amended_policy_history_v2(db,*,namespace,value,adopted):
             or extent_original is None or not extent_original['receipt'].commit_seq<adopted['receipt'].commit_seq):
         raise ValueError('amended policy history changed fixed basis/operative/rule Source or actual predecessor')
     for head,digest in ((value.source_head,value.source_value_digest),(value.rule_source_head,value.rule_source_digest)):
-        source=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(head.key.token,head.revision)).fetchone()
+        source=artifact_model_graph_point_v3(db,('value', 'valid'),token=head.key.token,revision=head.revision)
         if source is None or source[1]!=1 or canonical_digest(json.loads(source[0]))!=digest:
             raise ValueError('amended policy history lost exact Source bytes')
     from ..memory_types import SourceRecord
-    rule=SourceRecord.from_dict(json.loads(db.execute('SELECT value FROM graph_history WHERE token=? AND revision=?',
-        (value.rule_source_head.key.token,value.rule_source_head.revision)).fetchone()[0])).text
+    rule=SourceRecord.from_dict(json.loads(artifact_model_graph_point_v3(db,('value',),token=value.rule_source_head.key.token,revision=value.rule_source_head.revision)[0])).text
     if rule[extent.evidence_start:extent.evidence_end]!=extent.evidence_text:
         raise ValueError('amended policy evidence span belongs to another actual rule Source')
     semantic=[c for c in value.conditions if c.kind in {'tone','task_semantics'}]

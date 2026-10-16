@@ -28,6 +28,10 @@ def _task(graph,bundle,authorization_original_ref):
                 original_ref=authorization_original_ref,issuer=graph._GraphCoordinator__d11_issuer)
             if saved is None:raise ValueError('actual signed Owner task authorization missing')
             auth=saved[0];ids=owner_source_note_task_ids_v1(auth.cause.namespace,auth.cause.owner_operation_id)
+            from .owner_source_note_life_v1 import owner_source_note_life_ids_v1
+            from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
+            require_joint_bound_action_gate_v1(db, namespace=auth.cause.namespace,
+                action_ref=owner_source_note_life_ids_v1(auth)['action_ref'], issuer=graph._GraphCoordinator__d11_issuer)
             job=get_job(db,ids['job_id'])
             cont=None if job is None else decode_typed_production_value_v1(dict(job.continuation),OwnerSourceNoteTaskContinuationV2)
             return auth,ids,job,cont
@@ -78,130 +82,12 @@ def discover_owner_source_note_tasks_v1(graph,bootstrap,bundle):
         finally:db.rollback()
 
 
-def prepare_owner_source_note_task_values_v1(graph,bootstrap,bundle,*,authorization_original_ref,need_original_ref):
-    from .owner_source_note_values_v1 import (FreezeOwnerSourceNoteValuesParentRequestV1,
-        owner_source_note_values_ids_v1,read_owner_task_values_parent_v1)
-    from .domain_production_inputs_v1 import FreezeCurrentValuesInputRequestV1
-    from ..domains.d01.production_operations_v1 import EvaluateCurrentValuesRequestV1
-    from ..authority_service.current_owner_source_note_task_v1 import (
-        OwnerTaskActivityValuesChildRequestV1,owner_task_typed_command_digest_v1)
-    from .domain_production_registry_v1 import installed_operation_v1
-    auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    key=runtime_job_key(*auth.cause.namespace.as_tuple,ids['activity_id'],job.job_id)
-    parent_request=FreezeOwnerSourceNoteValuesParentRequestV1(authorization_original_ref,key.token,need_original_ref)
-    values_ids=owner_source_note_values_ids_v1(auth.cause.namespace,parent_request)
-    parent_result=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,
-        authorization_original_ref=authorization_original_ref,operation_kind='input:freeze_owner_source_note_values_parent_v1',
-        request=parent_request,operation_id=values_ids['parent_operation_id'])
-    if parent_result['coverage']!='complete':return parent_result
-    store=graph._GraphCoordinator__store
-    with store._lock:
-        db=store._db;db.execute('BEGIN')
-        try:
-            saved=read_owner_task_values_parent_v1(db,namespace=auth.cause.namespace,
-                original_ref=values_ids['parent_ref'],issuer=graph._GraphCoordinator__d11_issuer)
-            if saved is None:raise ValueError('Owner Values parent has no actual same-W01 signed original')
-            parent=saved[0]
-        finally:db.rollback()
-    outputs=[]
-    for slot,kind,command in (
-            ('freeze','input:freeze_values',FreezeCurrentValuesInputRequestV1(values_ids['candidate_set_ref'],values_ids['context_ref'])),
-            ('evaluate','evaluate_values',EvaluateCurrentValuesRequestV1(values_ids['candidate_set_ref'],values_ids['context_ref']))):
-        operation_id=values_ids[slot+'_operation_id']
-        with store._lock:
-            row=store._db.execute('SELECT revision FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
-            current_job=get_job(store._db,job.job_id)
-        selector=OwnerTaskActivityValuesChildRequestV1(auth.cause.namespace,auth.cause.installation_id,
-            auth.original_ref,auth.digest,operation_id,kind,owner_task_typed_command_digest_v1(installed_operation_v1(kind),command),
-            key.token,row[0],current_job.cancel_epoch,values_parent_original_ref=parent.original_ref,
-            values_parent_original_digest=parent.digest,child_slot=slot)
-        result=graph._GraphCoordinator__domain_production_runtime_v1.run_owner_source_note_task_current_v1(
-            selector=selector,operation_kind=kind,request=command)
-        if result['coverage']!='complete':return result
-        outputs.append(result)
-    checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,
-        authorization_original_ref=auth.original_ref,next_step='select',
-        completed_operation_ids=(values_ids['parent_operation_id'],values_ids['freeze_operation_id'],values_ids['evaluate_operation_id']))
-    return {'parent':parent_result,'children':tuple(outputs),'checkpoint':checkpoint,
-        'value_evaluation_operation_id':values_ids['evaluate_operation_id']}
 
 
-def qualify_owner_source_note_task_v1(graph,bootstrap,bundle,*,authorization_original_ref):
-    from .owner_source_note_need_v1 import PrepareOwnerSourceNoteNeedRequestV1
-    auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    key=runtime_job_key(*auth.cause.namespace.as_tuple,ids['activity_id'],ids['job_id'])
-    operation_id='owner-note-need:'+canonical_digest((auth.cause.namespace,auth.original_ref))[:40]
-    request=PrepareOwnerSourceNoteNeedRequestV1(auth.original_ref,key.token)
-    result=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='prepare_owner_source_note_need_v1',request=request,operation_id=operation_id)
-    if result['coverage']!='complete':return result
-    checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,
-        authorization_original_ref=auth.original_ref,next_step='values',completed_operation_ids=(operation_id,))
-    return {'need':result,'checkpoint':checkpoint,'need_original_ref':result['original_ref']}
 
 
-def select_owner_source_note_task_v1(graph,bootstrap,bundle,*,authorization_original_ref,
-        need_original_ref,value_evaluation_operation_id):
-    from ..domains.d08.personal_candidate_v1 import (SourceNoteCandidateBindingV1,
-        PrepareCurrentPersonalCandidatesRequestV1,SelectCurrentPersonalStepRequestV2)
-    auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    binding=SourceNoteCandidateBindingV1(ids['candidate_ref'],ids['node_id'],auth.request.project_ref,
-        auth.request.recipe_ref,auth.request.body_source_ref,ids['goal_key'].token,
-        auth.request.target_entity_ref,auth.request.role_binding_ref)
-    prep_id='owner-note-candidates:'+canonical_digest((auth.cause.namespace,auth.original_ref))[:40]
-    request=PrepareCurrentPersonalCandidatesRequestV1(ids['plan_key'].token,ids['goal_key'].token,1,1,
-        ids['selection_operation_id'],value_evaluation_operation_id,need_original_ref,(binding,))
-    prepared=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='prepare_personal_candidates_v1',request=request,operation_id=prep_id)
-    if prepared['coverage']!='complete':return prepared
-    selected=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='select_personal_step_v2',request=SelectCurrentPersonalStepRequestV2(ids['plan_key'].token,
-            ids['goal_key'].token,prep_id),operation_id=ids['selection_operation_id'])
-    if selected['coverage']!='complete':return selected
-    checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,
-        authorization_original_ref=auth.original_ref,next_step='prepare_action',
-        completed_operation_ids=(prep_id,ids['selection_operation_id']))
-    return {'prepared':prepared,'selected':selected,'checkpoint':checkpoint}
 
 
-def prepare_owner_source_note_task_action_body_v1(graph,bootstrap,bundle,*,authorization_original_ref):
-    from .d08_personal_candidate_v1 import ConsumePersonalDecisionRequestV1,prospective_personal_decision_key_v1
-    from ..domains.d08.personal_candidate_v1 import SourceNoteCandidateBindingV1
-    from .d02_life_body_preparation_v1 import PrepareSourceNoteBodyRequestV1
-    auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    prep_id='owner-note-candidates:'+canonical_digest((auth.cause.namespace,auth.original_ref))[:40]
-    decision=prospective_personal_decision_key_v1(auth.cause.namespace,ids['activity_id'],ids['selection_operation_id'],ids['plan_key'].token)
-    binding=SourceNoteCandidateBindingV1(ids['candidate_ref'],ids['node_id'],auth.request.project_ref,
-        auth.request.recipe_ref,auth.request.body_source_ref,ids['goal_key'].token,auth.request.target_entity_ref,auth.request.role_binding_ref)
-    action_id='personal-source-note-action:'+canonical_digest((auth.cause.namespace,ids['selection_operation_id'],binding))[:48]
-    if cont.step=='prepare_action':
-        action=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-            operation_kind='prepare_selected_source_note_action_v2',request=ConsumePersonalDecisionRequestV1(decision.token,prep_id),
-            operation_id=action_id)
-        if action['coverage']!='complete':return action
-        checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-            next_step='prepare_body',completed_operation_ids=(action_id,))
-    auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    store=graph._GraphCoordinator__store
-    with store._lock:
-        db=store._db;db.execute('BEGIN')
-        try:
-            from .d11_life_preparation_v1 import _read
-            from .d08_source_note_action_v1 import source_note_action_original_from_wire_v1
-            saved=_read(db,issuer=graph._GraphCoordinator__d11_issuer,namespace=auth.cause.namespace,
-                kind='source_note_action',ref='life-root:'+action_id)
-            if saved is None:raise ValueError('Owner task selected Action has no actual signed original')
-            root=source_note_action_original_from_wire_v1(saved[0])
-        finally:db.rollback()
-    body_id='d02-life-body:'+action_id
-    request=PrepareSourceNoteBodyRequestV1(root.action_intent_ref,auth.body_policy.body_policy_id,
-        auth.body_policy.body_policy_version,auth.body_policy.effect_policy_ref,auth.body_policy.cpu_ceiling_ms)
-    body=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='prepare_source_note_body',request=request,operation_id=body_id)
-    if body['coverage']!='complete':return body
-    checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        next_step='register_life_plan',completed_operation_ids=(body_id,))
-    return {'body':body,'checkpoint':checkpoint}
 
 
 def prepare_owner_source_note_task_life_v1(graph,bootstrap,bundle,*,authorization_original_ref):
@@ -260,115 +146,326 @@ def prepare_owner_source_note_task_life_v1(graph,bootstrap,bundle,*,authorizatio
     return {'status':'native_completed','native':native,'checkpoint':checkpoint}
 
 
-def adopt_owner_source_note_task_outcome_v1(graph,bootstrap,bundle,*,authorization_original_ref):
-    from .owner_source_note_life_v1 import RegisterOwnerSourceNoteLifeOutcomeRequestV1,owner_source_note_life_ids_v1
-    from .d11_life_preparation_v1 import read_registered_life_plan_v2,life_ids_v1,read_prepared_life_by_ref_v1
-    from .d11_life_contract_v1 import life_adoption_operation_id_v1
+async def drive_owner_source_note_task_v1(runtime, installation, *, authorization_original_ref):
+    """Finite actual Owner task phases; each Work reaches terminal before its consumer."""
+    from .personal_candidate_eligibility_v1 import actual_owner_personal_candidates_v1
+    worker, bootstrap, bundle = runtime._worker, runtime._v2_bootstrap, installation.admin_bundle
+    async def graph_call(function):
+        raw = await worker.call(function)
+        return runtime._consume_background_graph_result_v3(raw)
+    async def state():
+        return await worker.call(lambda graph: _task(graph, bundle, authorization_original_ref))
+    async def command(kind, request, operation_id):
+        result = await graph_call(lambda graph: run_owner_source_note_task_command_v1(graph, bootstrap, bundle,
+            authorization_original_ref=authorization_original_ref, operation_kind=kind,
+            request=request, operation_id=operation_id))
+        if result.get("coverage") != "complete":
+            raise ValueError("Owner task waits for actual current producer: " + kind)
+        return result
+    async def checkpoint(step, completed=(), result_ref=None, wait_reason=None):
+        return await graph_call(lambda graph: checkpoint_owner_source_note_task_step_v1(graph, bootstrap, bundle,
+            authorization_original_ref=authorization_original_ref, next_step=step,
+            completed_operation_ids=completed, completion_result_ref=result_ref, wait_reason=wait_reason))
+    auth, ids, job, continuation = await state()
+    if job is None:
+        await graph_call(lambda graph: graph.create_owner_source_note_task_v1(bootstrap, bundle,
+            authorization_original_ref=authorization_original_ref))
+        auth, ids, job, continuation = await state()
+    await graph_call(lambda graph: acknowledge_owner_task_submission_v1(graph,bootstrap,bundle,authorization_original_ref=authorization_original_ref))
+    if job.phase == "queued":
+        await graph_call(lambda graph: graph.acquire_owner_source_note_task_v1(bootstrap, bundle,
+            authorization_original_ref=authorization_original_ref))
+    for _ in range(16):
+        auth, ids, job, continuation = await state()
+        if job.phase != "running":
+            return {"status": job.phase, "job_id": job.job_id, "step": continuation.step,
+                "pending_effect_refs": continuation.pending_effect_refs}
+        step = continuation.step
+        key = runtime_job_key(*auth.cause.namespace.as_tuple, ids["activity_id"], job.job_id)
+        if step == "qualify":
+            from .d07_life_project_focus_v1 import FocusOwnerSourceNoteTaskRequestV1, owner_task_focus_operation_id_v1
+            focus_operation = owner_task_focus_operation_id_v1(auth.cause.namespace,auth)
+            await command("focus_owner_source_note_task_v1", FocusOwnerSourceNoteTaskRequestV1(auth.original_ref,key.token),
+                focus_operation)
+            from .owner_source_note_need_v1 import PrepareOwnerSourceNoteNeedRequestV1
+            operation = "owner-note-need:" + canonical_digest((auth.cause.namespace, auth.original_ref))[:40]
+            await command("prepare_owner_source_note_need_v1", PrepareOwnerSourceNoteNeedRequestV1(auth.original_ref, key.token), operation)
+            await checkpoint("values", (operation,))
+        elif step == "values":
+            await run_owner_source_note_values_async_v1(runtime, installation, authorization_original_ref=auth.original_ref)
+        elif step == "select":
+            def candidates(graph):
+                store = graph._GraphCoordinator__store
+                with store._lock:
+                    db = store._db; db.execute("BEGIN")
+                    try:
+                        return actual_owner_personal_candidates_v1(db, namespace=auth.cause.namespace,
+                            authorization=auth, job=job, issuer=graph._GraphCoordinator__d11_issuer)
+                    finally: db.rollback()
+            base = await worker.call(candidates)
+            await runtime.run_personal_candidate_eligibility_wave_v1(installation, candidates=base,
+                authorization_original_ref=auth.original_ref)
+            preparation = "owner-note-candidates:" + canonical_digest((auth.cause.namespace, auth.original_ref))[:40]
+            await command("prepare_personal_candidates_v1", base, preparation)
+            from ..domains.d08.personal_candidate_v1 import SelectCurrentPersonalStepRequestV2
+            await command("select_personal_step_v2", SelectCurrentPersonalStepRequestV2(
+                base.plan_ref, base.goal_ref, preparation), ids["selection_operation_id"])
+            chosen = await worker.call(lambda graph: read_owner_source_note_selected_decision_v1(graph, bundle, auth))
+            if chosen is None:
+                await checkpoint("select", (preparation, ids["selection_operation_id"]), wait_reason="actual_candidate_check_or_resource_wait")
+                return {"status": "waiting", "job_id": job.job_id, "step": "select"}
+            await checkpoint("prepare_action", (preparation, ids["selection_operation_id"]))
+        elif step == "prepare_action":
+            from .d08_personal_candidate_v1 import ConsumePersonalDecisionRequestV1, prospective_personal_decision_key_v1
+            from ..domains.d08.personal_candidate_v1 import SourceNoteCandidateBindingV1
+            binding = SourceNoteCandidateBindingV1(ids["candidate_ref"], ids["node_id"], auth.request.project_ref,
+                auth.request.recipe_ref, auth.request.body_source_ref, ids["goal_key"].token,
+                auth.request.target_entity_ref, auth.request.role_binding_ref)
+            action = "personal-source-note-action:" + canonical_digest((auth.cause.namespace, ids["selection_operation_id"], binding))[:48]
+            preparation = "owner-note-candidates:" + canonical_digest((auth.cause.namespace, auth.original_ref))[:40]
+            decision = prospective_personal_decision_key_v1(auth.cause.namespace, ids["activity_id"],
+                ids["selection_operation_id"], ids["plan_key"].token)
+            await command("prepare_selected_source_note_action_v2", ConsumePersonalDecisionRequestV1(decision.token, preparation), action)
+            await checkpoint("prepare_body", (action,))
+        elif step == "prepare_body":
+            from .d02_life_body_preparation_v1 import PrepareSourceNoteBodyRequestV1
+            root = await worker.call(lambda graph: read_owner_source_note_action_root_v1(graph, bundle, auth))
+            operation = "d02-life-body:" + root.action_operation_id
+            await command("prepare_source_note_body", PrepareSourceNoteBodyRequestV1(root.action_intent_ref,
+                auth.body_policy.body_policy_id, auth.body_policy.body_policy_version,
+                auth.body_policy.effect_policy_ref, auth.body_policy.cpu_ceiling_ms), operation)
+            await checkpoint("register_life_plan", (operation,))
+        elif step == "register_life_plan":
+            from .owner_source_note_life_v1 import RegisterOwnerSourceNoteLifePlanRequestV1, owner_source_note_life_ids_v1
+            life = owner_source_note_life_ids_v1(auth)
+            await command("register_owner_source_note_life_plan_v1", RegisterOwnerSourceNoteLifePlanRequestV1(auth.original_ref), life["plan_operation_id"])
+            await checkpoint("prepare_life", (life["plan_operation_id"],))
+        elif step == "prepare_life":
+            # This existing exact producer retains the once claim boundary with
+            # no parent checkpoint between preparation and original Native claim.
+            result = await graph_call(lambda graph: prepare_owner_source_note_task_life_v1(
+                graph, bootstrap, bundle, authorization_original_ref=auth.original_ref))
+            if result.get("status") != "native_completed":
+                return result
+        elif step in {"execute_life", "observe_life"}:
+            await checkpoint("observe_life" if step == "execute_life" else "adopt_outcome")
+        elif step == "adopt_outcome":
+            await run_owner_source_note_outcome_async_v1(runtime, installation, authorization_original_ref=auth.original_ref)
+        elif step == "completed":
+            return {"status": "completed", "job_id": job.job_id, "result_ref": job.result_ref}
+        else:
+            raise ValueError("Owner task has an unregistered actual continuation step")
+        _, _, current_job, current = await state()
+        if current_job.phase == "completed":
+            return {"status": "completed", "job_id": current_job.job_id, "result_ref": current_job.result_ref}
+        if current.step == step:
+            return {"status": "held", "job_id": current_job.job_id, "step": current.step}
+    raise ValueError("Owner task exhausted its actual finite phase recipe without progress")
+
+
+def read_owner_source_note_selected_decision_v1(graph, bundle, authorization):
+    from .d08_personal_candidate_v1 import prospective_personal_decision_key_v1
+    auth = authorization
+    ids = owner_source_note_task_ids_v1(auth.cause.namespace, auth.cause.owner_operation_id)
+    key = prospective_personal_decision_key_v1(auth.cause.namespace, ids["activity_id"],
+        ids["selection_operation_id"], ids["plan_key"].token)
+    with graph._GraphCoordinator__store._lock:
+        row = graph._GraphCoordinator__store._db.execute(
+            "SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+            (*auth.cause.namespace.as_tuple, key.token)).fetchone()
+    if row is None or row[1] != 1: raise ValueError("Owner task has no actual adopted Decision")
+    import json
+    return json.loads(row[0])["chosen_action_ref"]
+
+
+def read_owner_source_note_action_root_v1(graph, bundle, authorization):
+    from ..domains.d08.personal_candidate_v1 import SourceNoteCandidateBindingV1
+    from .d08_source_note_action_v1 import source_note_action_original_from_wire_v1
+    from .d11_life_preparation_v1 import _read
+    auth = authorization
+    ids = owner_source_note_task_ids_v1(auth.cause.namespace, auth.cause.owner_operation_id)
+    binding = SourceNoteCandidateBindingV1(ids["candidate_ref"], ids["node_id"], auth.request.project_ref,
+        auth.request.recipe_ref, auth.request.body_source_ref, ids["goal_key"].token,
+        auth.request.target_entity_ref, auth.request.role_binding_ref)
+    action = "personal-source-note-action:" + canonical_digest((auth.cause.namespace, ids["selection_operation_id"], binding))[:48]
+    with graph._GraphCoordinator__store._lock:
+        db = graph._GraphCoordinator__store._db; db.execute("BEGIN")
+        try:
+            saved = _read(db, issuer=graph._GraphCoordinator__d11_issuer,
+                namespace=auth.cause.namespace, kind="source_note_action", ref="life-root:" + action)
+            if saved is None: raise ValueError("Owner task has no actual signed selected Action")
+            return source_note_action_original_from_wire_v1(saved[0])
+        finally: db.rollback()
+
+
+async def run_owner_source_note_values_async_v1(runtime, installation, *, authorization_original_ref):
+    from .owner_source_note_values_v1 import FreezeOwnerSourceNoteValuesParentRequestV1, owner_source_note_values_ids_v1, read_owner_task_values_parent_v1
+    from .domain_production_inputs_v1 import FreezeCurrentValuesInputRequestV1
+    from ..domains.d01.production_operations_v1 import EvaluateCurrentValuesRequestV1
+    from ..authority_service.current_owner_source_note_task_v1 import OwnerTaskActivityValuesChildRequestV1, owner_task_typed_command_digest_v1
+    from .domain_production_registry_v1 import installed_operation_v1
+    worker, bootstrap, bundle = runtime._worker, runtime._v2_bootstrap, installation.admin_bundle
+    auth, ids, job, _ = await worker.call(lambda graph: _task(graph, bundle, authorization_original_ref))
+    key = runtime_job_key(*auth.cause.namespace.as_tuple, ids["activity_id"], job.job_id)
+    need_op = "owner-note-need:" + canonical_digest((auth.cause.namespace, auth.original_ref))[:40]
+    def need_ref(graph):
+        from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+        with graph._GraphCoordinator__store._lock:
+            db = graph._GraphCoordinator__store._db; db.execute("BEGIN")
+            try:
+                original = read_adopted_domain_operation_v1(db, auth.cause.namespace, need_op)
+                if original is None: raise ValueError("Owner values need has no actual adopted predecessor")
+                return "d07-current:" + original["original_digest"][:48]
+            finally: db.rollback()
+    ref = await worker.call(need_ref)
+    parent_request = FreezeOwnerSourceNoteValuesParentRequestV1(auth.original_ref, key.token, ref)
+    values = owner_source_note_values_ids_v1(auth.cause.namespace, parent_request)
+    raw = await worker.call(lambda graph: run_owner_source_note_task_command_v1(graph, bootstrap, bundle,
+        authorization_original_ref=auth.original_ref, operation_kind="input:freeze_owner_source_note_values_parent_v1",
+        request=parent_request, operation_id=values["parent_operation_id"]))
+    parent_result = runtime._consume_background_graph_result_v3(raw)
+    if parent_result.get("coverage") != "complete": return parent_result
+    for slot, kind, request in (
+            ("freeze", "input:freeze_values", FreezeCurrentValuesInputRequestV1(values["candidate_set_ref"], values["context_ref"])),
+            ("evaluate", "evaluate_values", EvaluateCurrentValuesRequestV1(values["candidate_set_ref"], values["context_ref"]))):
+        def child(graph):
+            with graph._GraphCoordinator__store._lock:
+                db = graph._GraphCoordinator__store._db; db.execute("BEGIN")
+                try:
+                    saved = read_owner_task_values_parent_v1(db, namespace=auth.cause.namespace,
+                        original_ref=values["parent_ref"], issuer=graph._GraphCoordinator__d11_issuer)
+                    if saved is None: raise ValueError("Owner Values child has no signed parent")
+                    row = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
+                    current_job = get_job(db, job.job_id)
+                finally: db.rollback()
+            parent = saved[0]
+            selector = OwnerTaskActivityValuesChildRequestV1(auth.cause.namespace, auth.cause.installation_id,
+                auth.original_ref, auth.digest, values[slot + "_operation_id"], kind,
+                owner_task_typed_command_digest_v1(installed_operation_v1(kind), request), key.token,
+                row[0], current_job.cancel_epoch, values_parent_original_ref=parent.original_ref,
+                values_parent_original_digest=parent.digest, child_slot=slot)
+            return graph._GraphCoordinator__domain_production_runtime_v1.run_owner_source_note_task_current_v1(
+                selector=selector, operation_kind=kind, request=request)
+        raw = await worker.call(child)
+        result = runtime._consume_background_graph_result_v3(raw)
+        if result.get("coverage") != "complete": return result
+    raw = await worker.call(lambda graph: checkpoint_owner_source_note_task_step_v1(graph, bootstrap, bundle,
+        authorization_original_ref=auth.original_ref, next_step="select", completed_operation_ids=(
+            values["parent_operation_id"], values["freeze_operation_id"], values["evaluate_operation_id"])))
+    return runtime._consume_background_graph_result_v3(raw)
+
+
+async def run_owner_source_note_outcome_async_v1(runtime, installation, *, authorization_original_ref):
+    from .owner_source_note_life_v1 import RegisterOwnerSourceNoteLifeOutcomeRequestV1, owner_source_note_life_ids_v1
     from ..domains.d10.production_operations_v1 import AdvanceCurrentLifeRequestV1
     from .d08_personal_plan_v1 import SettleCurrentPersonalGoalRequestV1
-    auth,_,job,cont=_task(graph,bundle,authorization_original_ref);ids=owner_source_note_life_ids_v1(auth)
-    store=graph._GraphCoordinator__store
-    with store._lock:
-        db=store._db;db.execute('BEGIN')
-        try:
-            plan=read_registered_life_plan_v2(db,namespace=auth.cause.namespace,issuer=graph._GraphCoordinator__d11_issuer,
-                original_ref=ids['plan_ref'])
-            prepared=read_prepared_life_by_ref_v1(db,namespace=auth.cause.namespace,issuer=graph._GraphCoordinator__d11_issuer,
-                prepared_original_ref=life_ids_v1(plan)['prepared'])
-            adoption_id=life_adoption_operation_id_v1(prepared.binding)
-        finally:db.rollback()
-    if cont.step=='observe_life':
-        checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-            next_step='adopt_outcome',completed_operation_ids=(adoption_id,))
-    outcome=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='register_owner_source_note_life_outcome_v1',request=RegisterOwnerSourceNoteLifeOutcomeRequestV1(auth.original_ref),
-        operation_id=ids['outcome_operation_id'])
-    if outcome['coverage']!='complete':return outcome
-    progress=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='advance_life',request=AdvanceCurrentLifeRequestV1(auth.request.project_ref,ids['outcome_ref']),
-        operation_id=ids['advance_operation_id'])
-    if progress['coverage']!='complete':return progress
-    settled=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='settle_personal_goal',request=SettleCurrentPersonalGoalRequestV1(ids['goal_key'].token,
-            ids['plan_key'].token,ids['progress_ref'],1,1),operation_id=ids['settle_operation_id'])
-    if settled['coverage']!='complete':return settled
-    from ..authority_service.current_owner_source_note_task_v1 import read_completed_owner_source_note_task_v1
-    with store._lock:
-        db=store._db;db.execute('BEGIN')
-        try:
-            proof=read_completed_owner_source_note_task_v1(db,namespace=auth.cause.namespace,authorization=auth,
-                issuer=graph._GraphCoordinator__d11_issuer)
-            if proof is None:raise ValueError('Owner task settlement has no actual completed artifact proof')
-            artifact_ref=proof.artifact_ref
-        finally:db.rollback()
-    checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        next_step='completed',completed_operation_ids=(ids['outcome_operation_id'],ids['advance_operation_id'],
-            ids['settle_operation_id']),completion_result_ref=artifact_ref)
-    return {'status':'completed','outcome':outcome,'progress':progress,'settlement':settled,'checkpoint':checkpoint}
+    worker, bootstrap, bundle = runtime._worker, runtime._v2_bootstrap, installation.admin_bundle
+    auth, _, _, _ = await worker.call(lambda graph: _task(graph, bundle, authorization_original_ref))
+    life = owner_source_note_life_ids_v1(auth)
+    ids = owner_source_note_task_ids_v1(auth.cause.namespace, auth.cause.owner_operation_id)
+    for kind, request, operation in (
+        ("register_owner_source_note_life_outcome_v1", RegisterOwnerSourceNoteLifeOutcomeRequestV1(auth.original_ref), life["outcome_operation_id"]),
+        ("advance_life", AdvanceCurrentLifeRequestV1(auth.request.project_ref, life["outcome_ref"]), life["advance_operation_id"]),
+        ("settle_personal_goal", SettleCurrentPersonalGoalRequestV1(ids["goal_key"].token, ids["plan_key"].token, life["progress_ref"], 1, 1), life["settle_operation_id"])):
+        raw = await worker.call(lambda graph: run_owner_source_note_task_command_v1(graph, bootstrap, bundle,
+            authorization_original_ref=auth.original_ref, operation_kind=kind, request=request, operation_id=operation))
+        result = runtime._consume_background_graph_result_v3(raw)
+        if result.get("coverage") != "complete": return result
+    def completion(graph):
+        from ..authority_service.current_owner_source_note_task_v1 import read_completed_owner_source_note_task_v1
+        with graph._GraphCoordinator__store._lock:
+            db = graph._GraphCoordinator__store._db; db.execute("BEGIN")
+            try:
+                proof = read_completed_owner_source_note_task_v1(db, namespace=auth.cause.namespace,
+                    authorization=auth, issuer=graph._GraphCoordinator__d11_issuer)
+                if proof is None: raise ValueError("Owner task completion lacks its real Native/Goal/Plan proof")
+                return proof.artifact_ref
+            finally: db.rollback()
+    result_ref = await worker.call(completion)
+    raw = await worker.call(lambda graph: checkpoint_owner_source_note_task_step_v1(graph, bootstrap, bundle,
+        authorization_original_ref=auth.original_ref, next_step="completed", completed_operation_ids=(
+            life["outcome_operation_id"], life["advance_operation_id"], life["settle_operation_id"]),
+        completion_result_ref=result_ref))
+    return runtime._consume_background_graph_result_v3(raw)
 
 
-def drive_owner_source_note_task_v1(graph,bootstrap,bundle,*,authorization_original_ref):
-    """Advance one actual task once; uncertainty returns without a second execution."""
-    graph._admin(bootstrap)
+def acknowledge_owner_task_submission_v1(graph, bootstrap, bundle, *, authorization_original_ref):
+    """Acknowledge actual task-carrier creation, never native work completion."""
+    import json
+    from ..runtime_contracts import canonical_serialize
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
-    from .owner_source_note_values_v1 import FreezeOwnerSourceNoteValuesParentRequestV1,owner_source_note_values_ids_v1
-    auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    if job is None:
-        created=graph.create_owner_source_note_task_v1(bootstrap,bundle,authorization_original_ref=auth.original_ref)
-        if created['coverage']!='complete':return created
-        auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    if job.phase=='queued':
-        acquired=graph.acquire_owner_source_note_task_v1(bootstrap,bundle,authorization_original_ref=auth.original_ref)
-        if acquired['coverage']!='complete':return acquired
-        auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-    if job.phase!='running':
-        return {'status':job.phase,'job_id':job.job_id,'step':cont.step,
-            'pending_effect_refs':cont.pending_effect_refs,'original_deadline_utc':auth.cause.original_deadline_utc}
-    results=[]
-    for _ in range(8):
-        auth,ids,job,cont=_task(graph,bundle,authorization_original_ref)
-        before_step=cont.step
-        if cont.step=='qualify':
-            result=qualify_owner_source_note_task_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref)
-        elif cont.step in {'values','select'}:
-            need_op='owner-note-need:'+canonical_digest((auth.cause.namespace,auth.original_ref))[:40]
-            store=graph._GraphCoordinator__store
-            with store._lock:
-                db=store._db;db.execute('BEGIN')
-                try:
-                    need=read_adopted_domain_operation_v1(db,auth.cause.namespace,need_op)
-                    if need is None:raise ValueError('Owner task lacks its actual prior Need producer')
-                    need_ref='d07-current:'+need['original_digest'][:48]
-                finally:db.rollback()
-            if cont.step=='values':
-                result=prepare_owner_source_note_task_values_v1(graph,bootstrap,bundle,
-                    authorization_original_ref=auth.original_ref,need_original_ref=need_ref)
-            else:
-                key=runtime_job_key(*auth.cause.namespace.as_tuple,ids['activity_id'],job.job_id)
-                values_ids=owner_source_note_values_ids_v1(auth.cause.namespace,
-                    FreezeOwnerSourceNoteValuesParentRequestV1(auth.original_ref,key.token,need_ref))
-                result=select_owner_source_note_task_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-                    need_original_ref=need_ref,value_evaluation_operation_id=values_ids['evaluate_operation_id'])
-        elif cont.step in {'prepare_action','prepare_body'}:
-            result=prepare_owner_source_note_task_action_body_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref)
-        elif cont.step in {'register_life_plan','prepare_life'}:
-            result=prepare_owner_source_note_task_life_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref)
-        elif cont.step in {'observe_life','adopt_outcome'}:
-            result=adopt_owner_source_note_task_outcome_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref)
-        elif cont.step=='execute_life':
-            # Only an already adopted actual Native effect can have reached this
-            # phase. The checkpoint itself re-reads those same formal originals.
-            result=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,
-                authorization_original_ref=auth.original_ref,next_step='observe_life')
-        elif cont.step=='completed':
-            return {'status':'completed','job_id':job.job_id,'result_ref':job.result_ref,'operations':tuple(results)}
-        else:raise ValueError('Owner task has an unregistered closed phase')
-        results.append(result)
-        _,_,current,current_cont=_task(graph,bundle,authorization_original_ref)
-        if current.phase=='completed':
-            return {'status':'completed','job_id':current.job_id,'result_ref':current.result_ref,'operations':tuple(results)}
-        if current_cont.step==before_step or current.phase!='running':
-            return {'status':result.get('status','held'),'job_id':current.job_id,'step':current_cont.step,
-                'pending_effect_refs':result.get('pending_effect_refs',current_cont.pending_effect_refs),
-                'operations':tuple(results)}
-    raise ValueError('Owner task exceeded its finite phase walk without completion')
+    from .owner_source_note_task_contract_v1 import SUBMITTED_EVENT, CreateOwnerSourceNoteTaskRequestV1
+    graph._admin(bootstrap)
+    auth, ids, job, continuation = _task(graph,bundle,authorization_original_ref)
+    if job is None: raise ValueError("Owner submit consumer requires its actual created task carrier")
+    ns = auth.cause.namespace
+    dedupe = canonical_digest((ns,auth.cause.owner_operation_id,"d11",SUBMITTED_EVENT))
+    store = graph._GraphCoordinator__store
+    with store._lock:
+        db=store._db; db.execute("BEGIN IMMEDIATE")
+        try:
+            causal=read_adopted_domain_operation_v1(db,ns,auth.cause.owner_operation_id)
+            created=read_adopted_domain_operation_v1(db,ns,ids["create_operation_id"])
+            if causal is None or created is None or created["operation_kind"] != "create_owner_source_note_task_v1":
+                raise ValueError("Owner submit consumer lost its actual original W01 create receipt")
+            body=decode_typed_production_value_v1(created["payload"]["request"],CreateOwnerSourceNoteTaskRequestV1)
+            if body.authorization_original_ref != auth.original_ref or continuation.authorization_original_digest != auth.digest:
+                raise ValueError("Owner submit consumer changed its signed task carrier")
+            row=db.execute("SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state,consumer_operation_id,receipt_json "
+                "FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?",(*ns.as_tuple,dedupe)).fetchone()
+            if row is None: raise ValueError("Owner task has no actual same-submit outbox")
+            expected=(auth.cause.owner_operation_id,"d11",SUBMITTED_EVENT,"d08-current:" + causal["original_digest"][:48],causal["original_digest"])
+            if row[:5] != expected: raise ValueError("Owner submit event differs from the signed authorization")
+            value={"schema":"d11.owner-source-note-submit-consumed.v1","dedupe_key":dedupe,
+                "causal_operation_id":auth.cause.owner_operation_id,"authorization_original_ref":auth.original_ref,
+                "authorization_original_digest":auth.digest,"consumer_operation_id":ids["create_operation_id"],
+                "create_original_digest":created["original_digest"],"create_receipt_digest":canonical_digest(created["receipt"])}
+            wire=canonical_serialize(value)
+            if row[5] == "completed":
+                if row[6:] != (ids["create_operation_id"],wire):
+                    raise ValueError("Owner submit stored consumer acknowledgement changed")
+            elif row[5] in {"pending","waiting"}:
+                db.execute("UPDATE graph_domain_production_outbox_v1 SET state='completed',consumer_operation_id=?,receipt_json=? "
+                    "WHERE bot=? AND persona=? AND dedupe_key=? AND state=?",
+                    (ids["create_operation_id"],wire,*ns.as_tuple,dedupe,row[5]))
+            else: raise ValueError("Owner submit was retired before task acknowledgement")
+            db.commit()
+            return value
+        except BaseException:
+            if db.in_transaction:db.rollback()
+            raise
+
+
+def validate_owner_task_submit_disposition_v1(db, *, namespace, row_data, value):
+    """C09 closes the actual submission-to-create receipt join."""
+    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from .owner_source_note_task_contract_v1 import SUBMITTED_EVENT, owner_source_note_task_ids_v1, CreateOwnerSourceNoteTaskRequestV1
+    expected={"schema","dedupe_key","causal_operation_id","authorization_original_ref","authorization_original_digest",
+        "consumer_operation_id","create_original_digest","create_receipt_digest"}
+    if (db is None or type(value) is not dict or set(value) != expected
+            or value["schema"] != "d11.owner-source-note-submit-consumed.v1"
+            or row_data["state"] != "completed" or row_data["event_kind"] != SUBMITTED_EVENT
+            or row_data["receiver_domain"] != "d11"
+            or any(value[name] != row_data[name] for name in ("dedupe_key","causal_operation_id","consumer_operation_id"))
+            ):
+        raise ValueError("Owner submit disposition has another exact outbox/carrier schema")
+    ids=owner_source_note_task_ids_v1(namespace,value["causal_operation_id"])
+    if value["consumer_operation_id"] != ids["create_operation_id"]:
+        raise ValueError("Owner submit consumer changed its deterministic task-create identity")
+    causal=read_adopted_domain_operation_v1(db,namespace,value["causal_operation_id"])
+    created=read_adopted_domain_operation_v1(db,namespace,value["consumer_operation_id"])
+    if (causal is None or causal["operation_kind"] != "submit_owner_source_note_task_v1"
+            or created is None or created["operation_kind"] != "create_owner_source_note_task_v1"
+            or created["original_digest"] != value["create_original_digest"]
+            or canonical_digest(created["receipt"]) != value["create_receipt_digest"]):
+        raise ValueError("Owner submit consumer lost its actual committed task receipt")
+    request=decode_typed_production_value_v1(created["payload"]["request"],CreateOwnerSourceNoteTaskRequestV1)
+    if request.authorization_original_ref != value["authorization_original_ref"]:
+        raise ValueError("Owner submit acknowledgement consumed another signed task")
+    from .owner_source_note_task_contract_v1 import OwnerSourceNoteTaskAuthorizationV2
+    auth=decode_typed_production_value_v1(causal["payload"]["provenance"]["owner_task_authorization"],OwnerSourceNoteTaskAuthorizationV2)
+    if (row_data["original_ref"],row_data["original_digest"]) != ("d08-current:" + causal["original_digest"][:48],causal["original_digest"]):
+        raise ValueError("Owner submit trigger changed its actual causal stage original")
+    if auth.original_ref != value["authorization_original_ref"] or auth.digest != value["authorization_original_digest"]:
+        raise ValueError("Owner submit causal authorization bytes differ")
+    return True

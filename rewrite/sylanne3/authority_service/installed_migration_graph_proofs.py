@@ -19,6 +19,8 @@ from ..runtime.graph_migration_snapshot_v1 import (
     _schema_digest,
 )
 from ..runtime_contracts import NamespaceId
+from .migration_snapshot_certificate_members_v1 import VerifiedMigrationSnapshotCertificateMembersV1
+from .contract import AuthorityUnavailable
 from .v2_migration_contract import (
     MigrationPermitV2, MigrationPlanV2, SourceSnapshotReceiptV2,
     TargetRecoveryReceiptV2,
@@ -41,8 +43,8 @@ class InstalledSourceGraphProofV1:
         self._namespace_id = namespace_id
         self._installation_id = installation_id
 
-    def __call__(self, receipt: SourceSnapshotReceiptV2,
-                 plan: MigrationPlanV2, permit: MigrationPermitV2) -> bool:
+    def verify_snapshot_certificate_members_v1(self, receipt: SourceSnapshotReceiptV2,
+                 plan: MigrationPlanV2, permit: MigrationPermitV2) -> VerifiedMigrationSnapshotCertificateMembersV1 | None:
         if (type(receipt) is not SourceSnapshotReceiptV2
                 or type(plan) is not MigrationPlanV2
                 or type(permit) is not MigrationPermitV2
@@ -59,12 +61,14 @@ class InstalledSourceGraphProofV1:
                     receipt.snapshot_format)
                    != (plan.transfer_id, plan.namespace, self._installation_id,
                        permit.token, FORMAT)):
-            return False
+            return None
         # mode=ro cannot create a missing database. A SQLite read transaction
         # gives the inventory, schema, catalogue and graph stamp one view.
         if not self._path.is_file():
-            return False
+            return None
         try:
+            source_stat = self._path.stat()
+            source_file_identity = (source_stat.st_dev, source_stat.st_ino)
             db = sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True,
                                  isolation_level=None)
             try:
@@ -75,7 +79,7 @@ class InstalledSourceGraphProofV1:
                     self._namespace_id.as_tuple).fetchone()
                 metadata = GraphStore._decode_recovery(row, self._namespace_id)
                 if metadata is None or metadata.requirements != receipt.requirements:
-                    return False
+                    return None
                 epoch_row = db.execute(
                     "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
                     self._namespace_id.as_tuple).fetchone()
@@ -90,7 +94,7 @@ class InstalledSourceGraphProofV1:
                 )
                 digest = _hash(payload)
                 closure = _hash((schema, catalogue, tables))
-                return (
+                verified = (
                     receipt.requirements.namespace == self._namespace_id
                     and receipt.requirements.authority_namespace == plan.namespace
                     and receipt.requirements.graph_incarnation
@@ -100,10 +104,21 @@ class InstalledSourceGraphProofV1:
                     and receipt.snapshot_digest == digest
                     and receipt.closure_digest == closure
                 )
+                if not verified:
+                    return None
+                from .migration_snapshot_certificate_members_v1 import _issue_verified_snapshot_certificate_members_v1
+                return _issue_verified_snapshot_certificate_members_v1(
+                    self, receipt, plan, permit, schema, catalogue, tables,
+                    str(self._path), source_file_identity)
             finally:
                 db.close()
-        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
-            return False
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, IndexError, AuthorityUnavailable):
+            return None
+
+
+    def __call__(self, receipt: SourceSnapshotReceiptV2,
+                 plan: MigrationPlanV2, permit: MigrationPermitV2) -> bool:
+        return self.verify_snapshot_certificate_members_v1(receipt, plan, permit) is not None
 
 
 class InstalledTargetGraphProofHoldV1:

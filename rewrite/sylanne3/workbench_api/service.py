@@ -114,6 +114,31 @@ _INPUT_FIELDS.update({action: spec[2] for action, spec in _D04_INITIALIZATION_AC
 _INPUT_FIELDS["read_d04_initialization_profile"] = frozenset()
 _MUTATION_CAPABILITIES.update({action: spec[1] for action, spec in _D04_INITIALIZATION_ACTIONS.items()})
 
+from .conditioned_self_view_v4 import ACTION as _SELF_VIEW_ACTION, INPUT_FIELDS as _SELF_VIEW_INPUT_FIELDS
+_ACTIONS |= {_SELF_VIEW_ACTION}
+_READ_ACTIONS |= {_SELF_VIEW_ACTION}
+_INPUT_FIELDS[_SELF_VIEW_ACTION] = _SELF_VIEW_INPUT_FIELDS
+
+from .named_joint_node_v1 import ACTION as _NAMED_NODE_ACTION, INPUT_FIELDS as _NAMED_NODE_FIELDS,FREEZE_ACTION as _FREEZE_NODE_ACTION,FREEZE_FIELDS as _FREEZE_NODE_FIELDS,PREPARE_ACTION as _PREPARE_NODE_ACTION,PREPARE_FIELDS as _PREPARE_NODE_FIELDS
+_ACTIONS|={_NAMED_NODE_ACTION}
+_WIRED_COMMANDS|={_NAMED_NODE_ACTION}
+_MUTATION_CAPABILITIES[_NAMED_NODE_ACTION]='workbench.create'
+_INPUT_FIELDS[_NAMED_NODE_ACTION]=_NAMED_NODE_FIELDS
+_ACTIONS|={_FREEZE_NODE_ACTION}
+_WIRED_COMMANDS|={_FREEZE_NODE_ACTION}
+_MUTATION_CAPABILITIES[_FREEZE_NODE_ACTION]='workbench.create'
+_INPUT_FIELDS[_FREEZE_NODE_ACTION]=_FREEZE_NODE_FIELDS
+_ACTIONS|={_PREPARE_NODE_ACTION}
+_READ_ACTIONS|={_PREPARE_NODE_ACTION}
+_WIRED_COMMANDS|={_PREPARE_NODE_ACTION}
+_INPUT_FIELDS[_PREPARE_NODE_ACTION]=_PREPARE_NODE_FIELDS
+
+from .beta1_owner_state_v1 import ACTION as _OWNER_STATE_ACTION, INPUT_FIELDS as _OWNER_STATE_INPUT_FIELDS
+_ACTIONS |= {_OWNER_STATE_ACTION}
+_READ_ACTIONS |= {_OWNER_STATE_ACTION}
+_WIRED_COMMANDS |= {_OWNER_STATE_ACTION}
+_INPUT_FIELDS[_OWNER_STATE_ACTION] = _OWNER_STATE_INPUT_FIELDS
+
 from .domain_operations_v1 import ACTIONS as _DOMAIN_OPERATION_ACTIONS, INPUT_FIELDS as _DOMAIN_OPERATION_FIELDS
 _ACTIONS |= frozenset(_DOMAIN_OPERATION_ACTIONS)
 _WIRED_COMMANDS |= frozenset(_DOMAIN_OPERATION_ACTIONS)
@@ -250,6 +275,45 @@ class WorkbenchService:
                                      "C09 删除权威尚未接入；未准备删除。", False)
             return self._problem("unavailable", "provider_unavailable", "工作台协调器尚未接入；未执行任何领域写入。", True)
         try:
+            if command['action']in {_NAMED_NODE_ACTION,_FREEZE_NODE_ACTION,_PREPARE_NODE_ACTION}:
+                from .named_joint_node_v1 import execute_named_joint_node_v1,execute_frozen_joint_command_v1,execute_prepared_joint_command_v1,named_node_service_terminal_v1,named_node_error_v1
+                execute_named={_NAMED_NODE_ACTION:execute_named_joint_node_v1,_FREEZE_NODE_ACTION:execute_frozen_joint_command_v1,_PREPARE_NODE_ACTION:execute_prepared_joint_command_v1}[command['action']]
+                from ..graph_worker import GraphStorageWorkV3
+                try:
+                    returned=execute_named(self._issuer,session=session,scope=command['scope'],
+                        purpose=command['purpose'],audience=command['audience'],operation_id=command['operation_id'],input_data=command['input'])
+                except Exception as error:return named_node_error_v1(error)
+                if type(returned)is not GraphStorageWorkV3:raise TypeError('Named node requires its actual Source READ Work')
+                terminal=named_node_service_terminal_v1 if command['action']==_NAMED_NODE_ACTION else self._projection_response
+                return returned.map_terminal_v3('service',terminal,named_node_error_v1)
+            if command['action'] == _OWNER_STATE_ACTION:
+                from .issuer import GraphWorkbenchIssuer
+                from .beta1_owner_state_v1 import execute_owner_state_read_v1, require_owner_state_command_work_v1
+                from ..graph_worker import GraphStorageWorkV3
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem('unavailable', 'owner_state_issuer_unavailable', '当前 Owner 状态读取未接入。', False)
+                returned = execute_owner_state_read_v1(self._issuer, session=session,
+                    scope=command['scope'], purpose=command['purpose'], audience=command['audience'],
+                    operation_id=command['operation_id'], input_data=command['input'])
+                if type(returned) is GraphStorageWorkV3:
+                    require_owner_state_command_work_v1(self._issuer, returned,
+                        scope=command['scope'], input_data=command['input'])
+                    return returned.map_terminal_v3('service', self._projection_response, self._projection_error_v3)
+                return self._projection_response(returned)
+            if command['action'] == _SELF_VIEW_ACTION:
+                from .issuer import GraphWorkbenchIssuer
+                from .conditioned_self_view_v4 import execute_self_view_read_v4, require_self_view_command_work_v4
+                from ..graph_worker import GraphStorageWorkV3
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem('unavailable', 'self_view_issuer_unavailable', '当前自我视图读取尚未接入。', False)
+                returned = execute_self_view_read_v4(self._issuer, session=session,
+                    scope=command['scope'], purpose=command['purpose'], audience=command['audience'],
+                    operation_id=command['operation_id'], input_data=command['input'])
+                if type(returned) is GraphStorageWorkV3:
+                    require_self_view_command_work_v4(self._issuer, returned,
+                        scope=command['scope'], input_data=command['input'])
+                    return returned.map_terminal_v3('service', self._projection_response, self._projection_error_v3)
+                return self._projection_response(returned)
             if command["action"] in _PACKAGE_ACTIONS:
                 from .issuer import GraphWorkbenchIssuer
                 from .package_maintenance_v2 import VIEW_SCHEMA,decode_package_profile_v2,decode_package_status_v2
@@ -480,6 +544,23 @@ class WorkbenchService:
             from ..graph_worker import GraphStorageWorkV3
             if type(returned) is GraphStorageWorkV3:
                 action, operation_id, input_data = command["action"], command["operation_id"], command["input"]
+                if returned.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_d07_dispatch_read_v3"}:
+                    from .domain_operations_v1 import ACTIONS,decode_request_v1
+                    from ..runtime.current_beta1_source_read_v3 import require_beta1_source_w09_command_v3
+                    if action not in ACTIONS:raise ValueError("unregistered World continuation action")
+                    state=returned.state
+                    require_beta1_source_w09_command_v3(returned,graph=self._issuer._coordinator,
+                        operation_kind=ACTIONS[action].operation_kind,
+                        request=decode_request_v1(ACTIONS[action].operation_kind,input_data["request"]),
+                        authority=state.authority,lease=state.lease,operation_id=operation_id,
+                        activity_id=input_data["activity_id"],audience_ref=input_data["audience_ref"],
+                        parent_budget_lease_ref=input_data["parent_budget_lease_ref"])
+                    if(state.owner_binding.scope!=command["scope"]
+                            or state.authority.purpose!=command["purpose"]
+                            or state.authority.audience!=(command["audience"],)):
+                        raise ValueError("World continuation changed its actual Owner scope/purpose/audience")
+                    return returned.map_terminal_v3("service",lambda value:self._command_response(
+                        action,operation_id,input_data,value),self._projection_error_v3)
                 if returned.kind == "current_method_learning_read_v3":
                     from .domain_operations_v1 import ACTIONS
                     from ..runtime.current_method_learning_read_v3 import (
@@ -589,6 +670,25 @@ class WorkbenchService:
             if audience != "owner" or len(scope.split("/")) != 2:
                 raise ValueError("Context catalogue requires the exact signed Owner scope")
             validate_context_catalogue_input_v1(input_data)
+        if action in {_PREPARE_NODE_ACTION,_FREEZE_NODE_ACTION}:
+            from .named_joint_node_v1 import validate_joint_command_selection_input_v1,validate_frozen_joint_command_input_v1
+            if purpose!='context'or audience!='owner'or len(scope.split('/'))!=2:raise ValueError('Prospective selection requires actual signed Owner scope')
+            if action==_PREPARE_NODE_ACTION:validate_joint_command_selection_input_v1(input_data)
+            else:validate_frozen_joint_command_input_v1(input_data,NamespaceId(*scope.split('/')))
+        if action==_NAMED_NODE_ACTION:
+            from .named_joint_node_v1 import validate_named_joint_node_input_v1
+            if purpose!='context'or audience!='owner'or len(scope.split('/'))!=2:raise ValueError('Named node requires current signed Owner scope')
+            validate_named_joint_node_input_v1(input_data)
+        if action == _OWNER_STATE_ACTION:
+            from .beta1_owner_state_v1 import validate_owner_state_input_v1
+            if purpose != 'context' or audience != 'owner' or len(scope.split('/')) != 2:
+                raise ValueError('Owner state requires its exact signed current Owner context scope')
+            validate_owner_state_input_v1(input_data)
+        if action == _SELF_VIEW_ACTION:
+            from .conditioned_self_view_v4 import validate_self_view_input_v4
+            if purpose != 'consolidation' or audience != 'owner' or len(scope.split('/')) != 2:
+                raise ValueError('SelfView requires its exact current Owner consolidation scope')
+            validate_self_view_input_v4(input_data)
         if action in _DOMAIN_OPERATION_ACTIONS:
             from .domain_operations_v1 import validate_input_v1
             if audience != "owner" or len(scope.split("/")) != 2:

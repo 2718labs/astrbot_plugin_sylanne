@@ -5,6 +5,8 @@ provider call, native work, BEGIN or COMMIT occurs in this module. Immutable
 signed originals are in the shared business database, never a parallel graph.
 """
 from __future__ import annotations
+from .natural_producer_qualification_v1 import _producer_original_point_v3
+from .domain_background_read_v3 import background_json_loads_v3,background_inventory_v3
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -43,7 +45,8 @@ from .model_cost_settlement import (OriginalModelCostFactV1, prepare_original_mo
 TABLE = "graph_d07_execution_originals_v1"
 SIGN_KIND = "d07.execution-original.v1"
 KINDS = frozenset({"prepared", "prepare_commit", "request", "call", "result_attempt", "result", "paid_cost",
-    "partial_cost", "body_cost", "execution", "adopted", "simulation_request", "simulation_budget", "reflection_request", "accounting_prepared", "semantic_question", "budget_allocation", "budget_closed"})
+    "partial_cost", "body_cost", "execution", "adopted", "simulation_request", "simulation_budget", "reflection_request", "reflection_continuation", "general_growth_attention_v1", "accounting_prepared", "semantic_question", "budget_allocation", "budget_closed"})
+KINDS = KINDS | frozenset({'joint_external_semantic_basis_v1'})
 
 
 def install_d07_execution_schema_v1(db):
@@ -61,20 +64,33 @@ def record_d07_original_in_transaction_v1(db, issuer, namespace, kind, ref, payl
     if not db.in_transaction or kind not in KINDS:
         raise ValueError("D07 registered original requires W01 transaction")
     wire = canonical_serialize(_json(payload))
-    digest = canonical_digest(json.loads(wire))
+    digest = canonical_digest(background_json_loads_v3(wire))
     signature = issuer._signer.sign(SIGN_KIND, canonical_serialize((namespace, kind, ref, digest)))
-    prior = read_d07_original_v1(db, issuer, namespace, kind, ref)
+    from .d07_graph_stages_v1 import read_d07_actual_writer_prior_v3
+    actual_writer,prior=read_d07_actual_writer_prior_v3(db,namespace,kind,ref,issuer)
+    if not actual_writer:
+        prior = read_d07_original_v1(db, issuer, namespace, kind, ref)
     if prior is not None:
-        if prior != (json.loads(wire), digest):
+        if prior != (background_json_loads_v3(wire), digest):
             raise ValueError("D07 original identity reused with different bytes")
         return digest
     db.execute(f"INSERT INTO {TABLE} VALUES(?,?,?,?,?,?,?)", (*namespace.as_tuple, kind, ref, wire, digest, signature))
+    from .d07_graph_stages_v1 import _record_d07_actual_written_original_v3
+    _record_d07_actual_written_original_v3(db,namespace,kind,ref,wire,digest,signature)
+    from .d07_source_preparation_members_v3 import register_d07_source_preparation_original_v3
+    register_d07_source_preparation_original_v3(db,issuer,namespace,kind,ref,wire,digest,signature)
     return digest
 
 
 def read_d07_original_v1(db, issuer, namespace, kind, ref):
+    from .d07_source_preparation_members_v3 import read_bound_d07_source_preparation_original_v3
+    handled,original=read_bound_d07_source_preparation_original_v3(db,issuer,namespace,kind,ref)
+    if handled:return original
+    from ..authority_service.d07_authority_model_source_read_v3 import read_bound_current_d07_authority_original_v3
+    authority,original=read_bound_current_d07_authority_original_v3(db,issuer,namespace,kind,ref)
+    if authority:return original
     from .natural_producer_qualification_v1 import _producer_original_point_v3
-    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3,background_json_digest_v3
+    from .domain_background_read_v3 import background_json_matches_v3,background_json_digest_v3
     exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone()
     if exists is None:
         return None
@@ -101,7 +117,7 @@ class D07ExecutionReadV1:
     def __post_init__(self):
         AtomKey.from_token(self.ref)
         if (type(self.revision) is not int or self.revision < 0 or type(self.valid) is not bool
-                or canonical_serialize(json.loads(self.value_json)) != self.value_json):
+                or canonical_serialize(background_json_loads_v3(self.value_json)) != self.value_json):
             raise ValueError("D07 exact graph read original required")
 
 
@@ -179,6 +195,74 @@ class D07RelationshipPreparedV2(D07PreparedExecutionV1):
                 raise ValueError("Relationship C3 lost its exact original commitment")
 
 
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class D07ReflectionPreparedV3(D07PreparedExecutionV1):
+    reflection_request_ref: str
+    reflection_request_digest: str
+    reflection_continuation_ref: str
+    reflection_continuation_digest: str
+    parent_prepared_ref: str
+    parent_prepared_digest: str
+    parent_execution_ref: str
+    parent_execution_digest: str
+    checkpoint_ref: GraphVersion
+    checkpoint_digest: str
+    ticket_id: str
+    source_refs: tuple[str, ...]
+    parent_budget_lease_ref: str
+    parent_grant_digest: str
+    original_deadline_utc: float
+    cycle_ref: GraphVersion | None = None
+    cycle_digest: str | None = None
+    call_plan_digest: str | None = None
+    c02_operation_id: str | None = None
+    cancel_generation: int | None = None
+    schema: str = "d07.reflection-prepared.v3"
+
+    def __post_init__(self):
+        import math
+        if (self.schema != "d07.reflection-prepared.v3" or self.work_kind != "reflection"
+                or type(self.checkpoint_ref) is not GraphVersion or self.checkpoint_ref.revision < 1
+                or self.checkpoint_ref.key.type_name != "d07.reflection_checkpoint.v1"
+                or NamespaceId.from_key(self.checkpoint_ref.key) != self.namespace
+                or type(self.source_refs) is not tuple or not 1 <= len(self.source_refs) <= 16
+                or len(set(self.source_refs)) != len(self.source_refs)
+                or type(self.original_deadline_utc) not in (int, float)
+                or not math.isfinite(self.original_deadline_utc)):
+            raise ValueError("reflection preparation lost its exact original checkpoint/source/deadline")
+        for name in ("reflection_request_ref", "reflection_continuation_ref", "parent_prepared_ref",
+                "parent_execution_ref", "ticket_id", "parent_budget_lease_ref"):
+            value = getattr(self, name)
+            if type(value) is not str or not 1 <= len(value) <= 4096:
+                raise ValueError("reflection preparation lost its actual original locator")
+        for name in ("reflection_request_digest", "reflection_continuation_digest", "parent_prepared_digest",
+                "parent_execution_digest", "checkpoint_digest", "parent_grant_digest"):
+            value = getattr(self, name)
+            if type(value) is not str or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+                raise ValueError("reflection preparation lost its exact signed commitment")
+        for ref in self.source_refs:
+            key = AtomKey.from_token(ref)
+            if key.type_name != "memory.source" or NamespaceId.from_key(key) != self.namespace:
+                raise ValueError("reflection preparation crossed its exact source namespace")
+        group = (self.cycle_ref, self.cycle_digest, self.call_plan_digest, self.c02_operation_id, self.cancel_generation)
+        if any(value is not None for value in group):
+            if (any(value is None for value in group) or type(self.cycle_ref) is not GraphVersion
+                    or self.cycle_ref.revision < 1 or self.cycle_ref.key.type_name != "runtime.job"
+                    or NamespaceId.from_key(self.cycle_ref.key) != self.namespace
+                    or type(self.cancel_generation) is not int or self.cancel_generation < 0
+                    or type(self.c02_operation_id) is not str or not self.c02_operation_id):
+                raise ValueError("Self reflection requires its whole exact parentage group")
+            for value in (self.cycle_digest, self.call_plan_digest):
+                if type(value) is not str or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+                    raise ValueError("Self reflection lost its original cycle/call-plan commitment")
+
+    @property
+    def digest(self):
+        from ..domains.d01.production_operations_v1 import plain_v1
+        return canonical_digest(plain_v1(self))
+
+
 @dataclass(frozen=True, slots=True)
 class D07IngressRecallPreparedV1:
     """Exact Self C3 original; the upstream Owner guard is a separate constraint."""
@@ -249,7 +333,7 @@ class D07IngressRecallPreparedV1:
                 raise ValueError("Self recall original commitment differs")
         for name in ("self_authority_json", "owner_guard_json"):
             value = getattr(self, name)
-            if type(value) is not str or canonical_serialize(json.loads(value)) != value:
+            if type(value) is not str or canonical_serialize(background_json_loads_v3(value)) != value:
                 raise ValueError("Self and upstream Owner provenance must remain exact and separate")
 
     @property
@@ -441,7 +525,7 @@ def _require_relationship_c3_trigger_parent_v2(db, frame, question, cycle):
         _committed(db, question.scope.namespace, arrival_operation)
         row = db.execute('SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',
             (*question.scope.namespace.as_tuple,arrival_operation)).fetchone()
-        arrival = _receipt(json.loads(row[0]))
+        arrival = _receipt(background_json_loads_v3(row[0]))
         issuance = db.execute('SELECT source_ref,bundle_digest FROM graph_d03_arrival_issuance_v2 WHERE bot=? AND persona=? AND operation_id=?',
             (*question.scope.namespace.as_tuple,arrival_operation)).fetchone()
         history = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',(key.token,atom.revision)).fetchone()
@@ -449,14 +533,14 @@ def _require_relationship_c3_trigger_parent_v2(db, frame, question, cycle):
         identity = read_committed_ingress_identity(db,question.scope.namespace,source.source_id)
         if identity is None:
             raise MissingProductionOriginalV1('actual_relationship_message_arrival_ingress_identity')
-        ingress = json.loads(identity.identity_json)
+        ingress = background_json_loads_v3(identity.identity_json)
         event_id = 'world:message-arrival-v1:' + canonical_digest({'namespace':question.scope.namespace.as_tuple,
             'platform_ref':ingress['platform_ref'],'conversation_ref':ingress['conversation_ref'],
             'message_id':ingress['message_id'],'source_id':source.source_id})
         if (arrival.operation_id != arrival_operation or arrival.commit_seq < 1 or arrival.commit_seq >= c02.commit_seq
                 or issuance != (source.source_id,arrival.operation_digest)
                 or GraphVersion(key,atom.revision) not in arrival.write_versions
-                or history is None or history[0] != arrival_operation or history[2] != 1 or json.loads(history[1]) != atom.value
+                or history is None or history[0] != arrival_operation or history[2] != 1 or background_json_loads_v3(history[1]) != atom.value
                 or atom.value['kind'] != 'message_received' or atom.value['event_id'] != event_id
                 or tuple(atom.value['source_refs']) != (cycle.source_ref,)):
             raise ValueError('Relationship event must be the actual independent D03 arrival preceding this C02 Source consumption')
@@ -484,7 +568,7 @@ def _require_relationship_semantic_question_v2(db, issuer, frame, question):
     if row is None or (row[1], row[3]) != (question.policy_digest, question.policy_revision):
         raise ValueError("Relationship C3 question policy is not the exact current installed revision")
     issuer._signer.verify("d11.d05-production-policy.v2", row[0], row[2])
-    policy = decode_typed_production_value_v1(json.loads(row[0]), InstalledRelationshipPolicyV2)
+    policy = decode_typed_production_value_v1(background_json_loads_v3(row[0]), InstalledRelationshipPolicyV2)
     if policy.namespace != question.scope.namespace or canonical_digest(asdict(policy)) != question.policy_digest:
         raise ValueError("Relationship C3 question lost its signed installed policy")
     policy.rule(question.scope)
@@ -520,8 +604,8 @@ class D07SemanticTargetOriginalV1:
     def __post_init__(self):
         if (self.kind not in {"graph_head", "d08_joint_plan_intent"} or type(self.original_ref) is not str
                 or not self.original_ref or type(self.revision) is not int or self.revision < 1
-                or canonical_digest(json.loads(self.value_json)) != self.original_digest
-                or canonical_serialize(json.loads(self.value_json)) != self.value_json
+                or canonical_digest(background_json_loads_v3(self.value_json)) != self.original_digest
+                or canonical_serialize(background_json_loads_v3(self.value_json)) != self.value_json
                 or type(self.source_refs) is not tuple or type(self.read_versions) is not tuple):
             raise ValueError("D07 exact bounded semantic target original differs")
         if len(self.value_json.encode()) > 8192 or len(self.source_refs) > 16 or len(set(self.source_refs)) != len(self.source_refs):
@@ -545,21 +629,21 @@ def read_d07_joint_plan_semantic_target_v1(db, issuer, namespace, target_ref):
     if row is None:
         raise ValueError("D07 semantic locator is not an installed target original")
     issuer._signer.verify("d11.d08-joint-plan-intent.v1", row[1], row[3])
-    raw = json.loads(row[1])
+    raw = background_json_loads_v3(row[1])
     intent = decode_typed_production_value_v1(raw, JointPlanIntentOriginalV1)
     if (canonical_serialize(raw) != row[1] or canonical_digest(raw) != row[2] or intent.revision != target_ref.version
-            or tuple(json.loads(row[4])) != intent.source_refs):
+            or tuple(background_json_loads_v3(row[4])) != intent.source_refs):
         raise ValueError("D07 signed D08 exact target revision/content commitment differs")
     original = db.execute("SELECT receipt_json,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, row[0])).fetchone()
-    if original is None or original[1] < 1 or json.loads(original[0]).get("commit_seq") != original[1]:
+    if original is None or original[1] < 1 or background_json_loads_v3(original[0]).get("commit_seq") != original[1]:
         raise ValueError("D07 signed semantic target lost its actual producing Graph operation")
     versions = []
     for ref in intent.current_goal_refs:
         key = AtomKey.from_token(ref)
-        goal = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (ref,)).fetchone()
+        goal = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(ref,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (ref,)).fetchone())
         if (NamespaceId.from_key(key) != namespace or key.type_name != "d08.goal.v1" or goal is None
-                or goal[2] != 1 or goal[0] < 1 or json.loads(goal[1]).get("state") != "active"):
+                or goal[2] != 1 or goal[0] < 1 or background_json_loads_v3(goal[1]).get("state") != "active"):
             raise ValueError("D07 signed plan target requires its actual current active goals")
         versions.append(GraphVersion(key, goal[0]))
     return D07SemanticTargetOriginalV1("d08_joint_plan_intent", target_ref.ref, target_ref.version, row[2], row[1], intent.source_refs, tuple(versions))
@@ -581,6 +665,10 @@ def resolve_current_d07_semantic_target_v1(db, issuer, frame, question):
     atom = frame.snapshot.get(key)
     if atom is None or not atom.valid or atom.revision != question.target_ref.version:
         raise ValueError("D07 semantic current Graph target is not in authorized frame")
+    from ..domains.d03.world_history_v1 import VIEW_TYPE
+    if key.type_name==VIEW_TYPE:
+        from .d03_world_history_v1 import world_semantic_target_v1
+        return world_semantic_target_v1(db,issuer=issuer,frame=frame,question=question,atom=atom)
     return D07SemanticTargetOriginalV1("graph_head", key.token, atom.revision, canonical_digest(atom.value),
         canonical_serialize(atom.value), (), (GraphVersion(key, atom.revision),))
 
@@ -594,12 +682,14 @@ def read_current_d07_semantic_question_v1(db, issuer, namespace, ref):
     if raw.get("schema") == "d07.relationship-semantic-question.v2":
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
         from ..domains.d05.relationship_revision_v2 import RelationshipScopeV2
-        raw["scope"] = decode_typed_production_value_v1(raw["scope"], RelationshipScopeV2)
-        raw["cycle_ref"] = decode_typed_production_value_v1(raw["cycle_ref"], GraphVersion)
-        return D07RelationshipSemanticQuestionV2(**raw)
+        return decode_native_named_d07_value_v2(row[0], D07RelationshipSemanticQuestionV2)
     if raw.get("schema") == "d07.method-growth-semantic-question.v2":
         from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2, method_growth_value_from_wire_v2
         return method_growth_value_from_wire_v2(row[0], D07MethodGrowthSemanticQuestionV2)
+    if raw.get("schema")=="d07.general-growth-semantic-question.v1":
+        from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        return decode_typed_production_value_v1(row[0],D07GeneralGrowthQuestionV1)
     return D07SemanticQuestionV1(**raw)
 
 
@@ -620,19 +710,29 @@ def read_prepared_d07_execution_v1(db, issuer, namespace, job_id):
     raw["audience"] = tuple(raw["audience"])
     if raw.get("schema") == "d07.ingress-recall-prepared.v1":
         value = D07IngressRecallPreparedV1(**raw)
-        thaw_d07_ingress_recall_request_v1(json.loads(value.frozen_json))
+        thaw_d07_ingress_recall_request_v1(background_json_loads_v3(value.frozen_json))
     elif raw.get("schema") in {"d07.prepared-execution.v1", "d07.relationship-prepared.v2"}:
         if raw["schema"] == "d07.relationship-prepared.v2":
             from .domain_production_erasure_v1 import decode_typed_production_value_v1
-            raw["cycle_ref"] = decode_typed_production_value_v1(raw["cycle_ref"], GraphVersion)
-            value = D07RelationshipPreparedV2(**raw)
+            value = decode_native_named_d07_value_v2(row[0], D07RelationshipPreparedV2)
         else:
             value = D07PreparedExecutionV1(**raw)
-        thaw_d07_cognition_request_v1(json.loads(value.frozen_json))
+        thaw_d07_cognition_request_v1(background_json_loads_v3(value.frozen_json))
+    elif raw.get("schema") == "d07.reflection-prepared.v3":
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        value = decode_typed_production_value_v1(row[0], D07ReflectionPreparedV3)
+        thaw_d07_cognition_request_v1(background_json_loads_v3(value.frozen_json))
+    elif raw.get("schema") == "d07.general-growth-prepared.v1":
+        from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from ..model_broker.general_growth_cognition_v1 import thaw_general_growth_cognition_request_v1
+        raw["context_source_refs"]=tuple(raw["context_source_refs"])
+        raw["support_source_refs"]=tuple(raw["support_source_refs"])
+        value=D07GeneralGrowthPreparedV1(**raw)
+        thaw_general_growth_cognition_request_v1(background_json_loads_v3(value.frozen_json))
     elif raw.get("schema") == "d07.method-growth-prepared.v2":
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2, method_growth_value_from_wire_v2
         value = method_growth_value_from_wire_v2(row[0], D07MethodGrowthPreparedV2)
-        thaw_d07_cognition_request_v1(json.loads(value.frozen_json))
+        thaw_d07_cognition_request_v1(background_json_loads_v3(value.frozen_json))
     else:
         raise ValueError("unregistered actual D07 prepared schema")
     if value.namespace != namespace or value.job_id != job_id or value.digest != row[1]:
@@ -661,34 +761,56 @@ def require_current_d07_content_reads_v1(db, prepared, *, issuer=None):
             raise ValueError("D07 actual prepared Graph commit original missing")
         rows = tuple(D07ExecutionReadV1(**r) for r in committed[0]["post_read_rows"])
         inventory = committed[0]["post_query_inventory_json"]
-        for external in json.loads(prepared.external_content_originals_json):
+        for external in background_json_loads_v3(prepared.external_content_originals_json):
             if set(external) != {"kind", "ref", "revision", "digest"} or external["kind"] != "d08_joint_plan_intent":
                 raise ValueError("D07 unregistered external content original kind")
             actual = read_d07_joint_plan_semantic_target_v1(db, issuer, prepared.namespace, VersionedRef(external["ref"], external["revision"]))
             if actual.original_digest != external["digest"]:
                 raise ValueError("D07 exact signed semantic target changed")
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-    if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2} and issuer is not None:
+    named = type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2} or (
+        type(prepared) is D07ReflectionPreparedV3 and prepared.cycle_ref is not None)
+    if named and issuer is not None:
         from .foreground_call_plan_v1 import require_current_named_c3_cycle_v2
         require_current_named_c3_cycle_v2(db, namespace=prepared.namespace, prepared=prepared, issuer=issuer)
+    reflection_lineage=None
+    if type(prepared) is D07ReflectionPreparedV3 and issuer is not None:
+        from .d07_reflection_execution_v1 import verify_reflection_checkpoint_member_v3
+        reflection_lineage=verify_reflection_checkpoint_member_v3(db,prepared=prepared,issuer=issuer)
     for row in rows:
-        if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2} and row.ref == prepared.cycle_ref.key.token:
+        if (reflection_lineage is not None and reflection_lineage[0]=="adopted_child"
+                and row.ref==prepared.checkpoint_ref.key.token):
+            if (row.revision!=prepared.checkpoint_ref.revision or not row.valid
+                    or canonical_digest(background_json_loads_v3(row.value_json))!=prepared.checkpoint_digest):
+                raise ValueError("reflection frozen checkpoint differs from authenticated parent birth")
+            continue
+        if named and row.ref == prepared.cycle_ref.key.token:
             continue
         if NamespaceId.from_key(AtomKey.from_token(row.ref)) != prepared.namespace:
             raise ValueError("D07 frozen read crosses namespace")
-        current = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (row.ref,)).fetchone()
+        current = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(row.ref,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (row.ref,)).fetchone())
         if row.revision == 0:
             if row.valid or current is not None:
                 raise ValueError("D07 exact negative content read now exists")
         elif (current is None or (current[0], bool(current[2])) != (row.revision, row.valid)
-                or canonical_serialize(json.loads(current[1])) != row.value_json):
+                or canonical_serialize(background_json_loads_v3(current[1])) != row.value_json):
             raise ValueError("D07 actual cognition content became stale")
-    for page in json.loads(inventory):
+    for page in background_json_loads_v3(inventory):
         if not page["complete"]:
             raise ValueError("D07 incomplete query cannot prove exact current selection")
-        rows = db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
-            (*prepared.namespace.as_tuple, page["type_id"])).fetchall()
-        if len(rows) > 128 or rows != [tuple(r) for r in page["rows"]]:
+        from .domain_background_read_v3 import read_bound_d07_model_seal_query_rows_v3
+        handled,current_rows=read_bound_d07_model_seal_query_rows_v3(db,prepared.namespace,page["type_id"])
+        if not handled:
+            from ..authority_service.d07_authority_model_source_read_v3 import read_bound_current_d07_authority_query_rows_v3
+            handled,current_rows=read_bound_current_d07_authority_query_rows_v3(db,prepared.namespace,page["type_id"])
+        rows=(list(current_rows) if handled else db.execute(
+            "SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
+            (*prepared.namespace.as_tuple,page["type_id"])).fetchall())
+        expected=[tuple(item) for item in page["rows"]]
+        if reflection_lineage is not None and reflection_lineage[0]=="adopted_child":
+            expected=[(ref,reflection_lineage[1].revision) if ref==prepared.checkpoint_ref.key.token
+                and revision==prepared.checkpoint_ref.revision else (ref,revision) for ref,revision in expected]
+        if len(rows) > 128 or rows != expected:
             raise ValueError("D07 actual negative/query selection scope changed")
 
 
@@ -745,6 +867,11 @@ def freeze_current_d07_stage_v1(frame, stage, workflow, installation_id):
             "simulation:" + frame.envelope.identity.operation_id, "Compare the supplied hypothetical assumptions",
             stage.request.simulation_request_ref, _source_input(frame, registered.snapshot_refs),
             baseline=registered.baseline, alternatives=registered.alternatives, unknowns=registered.unknowns)
+        if stage.provenance.get('forecast_mode')=='declared_forecast':
+            from .conditioned_self_operations_v1 import build_current_simulation_forecast_context_v1
+            context,digest=build_current_simulation_forecast_context_v1(frame,stage)
+            input=replace(input,target_original_json=context,target_original_kind='simulation_forecast_context_v1',
+                target_original_digest=digest)
     elif stage.work_kind == "reflection":
         request = stage.provenance["reflection_request"]
         checkpoint = frame.snapshot.get(AtomKey.from_token(request["reflection_ref"]))
@@ -763,13 +890,16 @@ def freeze_current_d07_stage_v1(frame, stage, workflow, installation_id):
 
 def _clock_original(db, issuer, namespace, mapping):
     from .d11_role_clock_installation_v1 import TABLE as CLOCK_TABLE, SIGN_KIND as CLOCK_SIGN_KIND
-    rows = db.execute(f"SELECT original_json,original_digest,signature FROM {CLOCK_TABLE} WHERE bot=? AND persona=? AND revision=?",
-        (*namespace.as_tuple, mapping.version)).fetchall()
-    if len(rows) != 1:
+    row=_producer_original_point_v3(db,table=CLOCK_TABLE,columns=("original_json","original_digest","signature"),
+        key_columns=("bot","persona","revision"),key=(*namespace.as_tuple,mapping.version),
+        legacy_reader=lambda:db.execute(f"SELECT original_json,original_digest,signature FROM {CLOCK_TABLE} "
+            "WHERE bot=? AND persona=? AND revision=?",(*namespace.as_tuple,mapping.version)).fetchone())
+    if row is None:
         raise ValueError("D07 role time requires its actual signed Owner clock original")
-    wire, digest, signature = rows[0]
-    issuer._signer.verify(CLOCK_SIGN_KIND, wire, signature)
-    raw = json.loads(wire)
+    wire,digest,signature=row
+    from .domain_background_read_v3 import background_verify_signature_v3
+    background_verify_signature_v3(issuer._signer,CLOCK_SIGN_KIND,wire,signature)
+    raw = background_json_loads_v3(wire)
     if (canonical_digest(raw) != digest or raw["mapping"] != _mapping_dict(mapping)
             or get_clock_mapping(db, mapping.mapping_id, mapping.version) != mapping):
         raise ValueError("D07 actual role clock original differs")
@@ -814,8 +944,8 @@ def _prepare_d07_resources_in_transaction_v1(db, *, frame, ids, work_kind, froze
             or state_atom is None or not state_atom.valid):
         raise ValueError("D07 actual current BodyProfile/BodyState absent")
     state = BodyState(**state_atom.value)
-    inventory = db.execute("SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
-        "AND type_name='d02.reservation.v1' ORDER BY token LIMIT 129", ns.as_tuple).fetchall()
+    inventory=tuple((atom.key.token,atom.revision,atom.value,atom.valid)
+        for atom in background_inventory_v3(db,ns,"d02.reservation.v1",valid_only=False))
     if len(inventory) > 128:
         raise ValueError("D07 body reservation inventory requires bounded continuation")
     reservations = []
@@ -823,7 +953,7 @@ def _prepare_d07_resources_in_transaction_v1(db, *, frame, ids, work_kind, froze
     for ref, revision, value, valid in inventory:
         key = AtomKey.from_token(ref)
         atom = frame.snapshot.get(key)
-        if valid != 1 or atom is None or atom.revision != revision or atom.value != json.loads(value):
+        if valid != 1 or atom is None or atom.revision != revision or atom.value != value:
             raise ValueError("D07 full current body reservation inventory must be in Owner frame")
         reservations.append(BodyReservation(**{**atom.value, "settled_components": tuple(atom.value["settled_components"])}))
     job = PersistentJob(ids["job"], identity.operation_id, identity.activity_id, identity.effect_id,
@@ -944,7 +1074,7 @@ def prepare_d07_execution_in_transaction_v1(db, *, frame, stage, workflow, insta
     if type(semantic) is D07RelationshipSemanticQuestionV2:
         _, cycle = _require_relationship_semantic_question_v2(db, d11_issuer, frame, semantic)
         semantic_original = read_d07_original_v1(db, d11_issuer, ns, "semantic_question", stage.request.trigger_original_ref)
-        if semantic_original is None or semantic_original[0] != json.loads(canonical_serialize(asdict(semantic))):
+        if semantic_original is None or semantic_original[0] != background_json_loads_v3(canonical_serialize(asdict(semantic))):
             raise ValueError("Relationship C3 cannot use an unregistered semantic question")
         from .foreground_call_plan_v1 import ForegroundModelAttemptV1
         # Enforce the same finite whole plan before any actual call can be acquired.
@@ -960,7 +1090,7 @@ def prepare_d07_execution_in_transaction_v1(db, *, frame, stage, workflow, insta
     if type(semantic) is D07MethodGrowthSemanticQuestionV2:
         _, cycle = _require_method_growth_semantic_question_v2(db, d11_issuer, frame, semantic)
         semantic_original = read_d07_original_v1(db, d11_issuer, ns, "semantic_question", stage.request.trigger_original_ref)
-        if semantic_original is None or semantic_original[0] != json.loads(canonical_serialize(asdict(semantic))):
+        if semantic_original is None or semantic_original[0] != background_json_loads_v3(canonical_serialize(asdict(semantic))):
             raise ValueError("growth C3 cannot use an unregistered or changed signed semantic question")
         from .foreground_call_plan_v1 import ForegroundModelAttemptV1
         replace(cycle.call_plan, attempts=(*cycle.call_plan.attempts, ForegroundModelAttemptV1(
@@ -974,17 +1104,34 @@ def prepare_d07_execution_in_transaction_v1(db, *, frame, stage, workflow, insta
             "c02_operation_id": semantic.c02_operation_id, "source_head": semantic.source_head, "source_digest": semantic.source_digest,
             "parent_budget_lease_ref": semantic.parent_budget_lease_ref, "original_deadline_utc": semantic.original_deadline_utc,
             "cancel_generation": cycle.cancel_generation})
+    if stage.work_kind == "reflection" and "reflection_continuation" in stage.provenance:
+        from .d07_reflection_execution_v1 import reflection_preparation_fields_v3
+        fields = reflection_preparation_fields_v3(db, issuer=d11_issuer,
+            continuation=stage.provenance["reflection_continuation"],
+            continuation_digest=stage.provenance["reflection_continuation_digest"],now_utc=frame.now_utc)
+        prepared = D07ReflectionPreparedV3(**{**{name:getattr(prepared,name) for name in prepared.__dataclass_fields__},**fields})
+        if prepared.cycle_ref is not None:
+            from .foreground_call_plan_v1 import ForegroundModelAttemptV1
+            from .foreground_cycle_v1 import foreground_cycle_from_wire_v1
+            cycle = foreground_cycle_from_wire_v1(get_job(db,prepared.cycle_ref.key.name).continuation)
+            replace(cycle.call_plan,attempts=(*cycle.call_plan.attempts,ForegroundModelAttemptV1(
+                "C3",prepared.call_id,None,prepared.operation_id,prepared.reservation_digest,lease.lease_id,
+                quote.ceiling["input_tokens"],quote.ceiling["output_tokens"],"reserved")))
     require_current_d07_content_reads_v1(db, prepared)
     updated_frame = resources.frame
     updated_envelope = updated_frame.envelope
     updated_stage = replace(stage, envelope=updated_envelope,
         proposal=replace(stage.proposal, envelope=updated_envelope, required_bundle_parts=("persistent_job",)),
         read_versions=resources.read_versions)
-    record_d07_original_in_transaction_v1(db, d11_issuer, ns, "prepared", job.job_id, asdict(prepared))
+    from ..domains.d01.production_operations_v1 import plain_v1
+    payload = plain_v1(prepared) if type(prepared) is D07ReflectionPreparedV3 else asdict(prepared)
+    record_d07_original_in_transaction_v1(db, d11_issuer, ns, "prepared", job.job_id, payload)
     record_d07_original_in_transaction_v1(db, d11_issuer, ns, "accounting_prepared", job.job_id,
         {"schema": "d07.accounting-prepared.v1", "prepared_digest": prepared.digest,
          **{name: _json(getattr(prepared, name)) for name in D07_ACCOUNTING_FIELDS}})
     create_job(db, job, job.operation_id, reservation_digest)
+    from .d07_source_preparation_members_v3 import register_d07_source_preparation_job_v3
+    register_d07_source_preparation_job_v3(db,job)
     return D07PreparationStageV1(updated_frame, updated_stage, prepared, job,
         resources.writes, resources.read_versions)
 
@@ -1046,29 +1193,32 @@ def verify_current_d07_preparation_stage_v1(db, preparation, service):
             D07ConcernInputsV1(frame.snapshot, provenance["tickets"], provenance["policy"],
                 provenance["issuance_originals"], provenance["trigger"], frame.now_utc, provenance["focus_epoch"]))
         if (checked.proposal.typed_writes != stage.proposal.typed_writes or checked.input_digest != stage.input_digest
-                or checked.provenance != {k: v for k, v in provenance.items() if k != "reflection_request"}
+                or checked.provenance != {k: v for k, v in provenance.items() if k not in {"reflection_request","reflection_continuation","reflection_continuation_digest"}}
                 or checked.status != "queued"):
             raise ValueError("D07 reflection fair preparation choice changed")
 
 
 def record_d07_preparation_after_cas_v1(db, issuer, preparation, graph_receipt):
     """Seal actual post-prepare content heads after all exact member CAS writes."""
+    from .d07_source_preparation_members_v3 import record_bound_d07_source_postcas_v3
+    handled,digest=record_bound_d07_source_postcas_v3(db,issuer,preparation,graph_receipt)
+    if handled:return digest
     if not db.in_transaction or type(preparation) is not D07PreparationStageV1:
         raise ValueError("D07 prepared closure requires actual same-transaction Graph CAS")
     prepared = preparation.prepared
     if getattr(graph_receipt, "status", None) != "committed":
         raise ValueError("D07 preparation graph receipt did not commit")
     for write in (*preparation.stage.proposal.typed_writes, *preparation.writes):
-        row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
-        if row is None or row[1] != 1 or json.loads(row[0]) != write.value:
+        row = _producer_original_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(write.key.token,),legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone())
+        if row is None or row[1] != 1 or background_json_loads_v3(row[0]) != write.value:
             raise ValueError("D07 fixed preparation member was not adopted")
     rows = []
     for observed in prepared.read_rows:
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (observed.ref,)).fetchone()
-        rows.append(D07ExecutionReadV1(observed.ref, row[0], bool(row[2]), canonical_serialize(json.loads(row[1])))
+        row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(observed.ref,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (observed.ref,)).fetchone())
+        rows.append(D07ExecutionReadV1(observed.ref, row[0], bool(row[2]), canonical_serialize(background_json_loads_v3(row[1])))
             if row else observed)
     query = []
-    for page in json.loads(prepared.query_inventory_json):
+    for page in background_json_loads_v3(prepared.query_inventory_json):
         values = db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
             (*prepared.namespace.as_tuple, page["type_id"])).fetchall()
         if len(values) > 128:
@@ -1118,17 +1268,22 @@ def read_registered_simulation_request_v1(db, issuer, namespace, ref):
 
 
 def seal_d07_request_in_transaction_v1(db, issuer, prepared, request):
-    if type(prepared) is D07IngressRecallPreparedV1:
+    from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,thaw_current_general_growth_prepared_request_v1
+    if type(prepared)is D07GeneralGrowthPreparedV1:
+        from ..model_broker.general_growth_cognition_v1 import TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST
+        frozen=thaw_current_general_growth_prepared_request_v1(prepared)
+        template_digest=GENERAL_TEMPLATE_DIGEST
+    elif type(prepared) is D07IngressRecallPreparedV1:
         from ..model_broker.d07_cognition_v1 import RECALL_TEMPLATE_DIGEST_V1
-        frozen = thaw_d07_ingress_recall_request_v1(json.loads(prepared.frozen_json))
+        frozen = thaw_d07_ingress_recall_request_v1(background_json_loads_v3(prepared.frozen_json))
         template_digest = RECALL_TEMPLATE_DIGEST_V1
     else:
-        frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
+        frozen = thaw_d07_cognition_request_v1(background_json_loads_v3(prepared.frozen_json))
         template_digest = TEMPLATE_DIGEST
     job = get_job(db, prepared.job_id)
     if (not db.in_transaction or type(request) is not ModelCallRequest or request.call_id != prepared.call_id
             or request.prompt_template_digest != template_digest or request.identity.phase != WORK_KIND
-            or dict(request.payload) != json.loads(frozen.canonical_wire)
+            or dict(request.payload) != background_json_loads_v3(frozen.canonical_wire)
             or request.envelope.authority.namespace != prepared.namespace
             or request.envelope.authority.worker_fence != job.fence
             or request.envelope.authority.actor != job.lease_holder or job.phase != "running"):
@@ -1190,9 +1345,9 @@ def read_current_original_ref_v1(db, namespace, ref, *, issuer):
     elif kind == "adopted":
         raw = actual[0]
         key = AtomKey.from_token(raw["interpretation_ref"])
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
+        row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(key.token,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone())
         if (row is None or row[2] != 1 or row[0] != raw["interpretation_revision"]
-                or canonical_digest(json.loads(row[1])) != raw["interpretation_value_digest"]):
+                or canonical_digest(background_json_loads_v3(row[1])) != raw["interpretation_value_digest"]):
             raise ValueError("D07 adopted interpretation current original differs")
         return ProductionOriginalRefV1("d07.actual-adopted-interpretation", ref, raw["interpretation_value_digest"],
             (GraphVersion(key, row[0]),))
@@ -1204,7 +1359,11 @@ def stage_actual_d07_interpretation_writes_v1(db, *, prepared, issuer, envelope)
     from ..domains.d07 import CurrentInterpretationCandidate, D07DomainProvider, Stance, EvidenceStatus
     from ..authority_service.d07_current_execution_v1 import D07CognitionResultReadV1, from_wire
     require_current_d07_content_reads_v1(db, prepared, issuer=issuer)
-    frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
+    from .d07_general_growth_execution_v1 import (D07GeneralGrowthPreparedV1,
+        thaw_current_general_growth_prepared_request_v1,parse_current_general_growth_output_v1)
+    general=type(prepared)is D07GeneralGrowthPreparedV1
+    frozen=(thaw_current_general_growth_prepared_request_v1(prepared)if general
+        else thaw_d07_cognition_request_v1(background_json_loads_v3(prepared.frozen_json)))
     if frozen.input.work_kind == "simulation":
         return (), ()  # Branches already preserve hypothetical eligibility.
     paid = read_d07_original_v1(db, issuer, prepared.namespace, "paid_cost", prepared.job_id)
@@ -1213,11 +1372,13 @@ def stage_actual_d07_interpretation_writes_v1(db, *, prepared, issuer, envelope)
     if paid is None or body is None or actual is None or not paid[0]["paid"] or body[0]["unpaid_cost"]:
         raise ValueError("D07 semantic candidates need actual paid scoped model/body originals")
     result = from_wire(actual[0], D07CognitionResultReadV1)
-    text = json.loads(result.observation.result_json)
+    text = background_json_loads_v3(result.observation.result_json)
     if set(text) != {"text"}:
         raise ValueError("D07 semantic candidate result is not original model text")
-    suggestion = parse_d07_cognition_output_v1(text["text"], frozen)
-    sources = {s.source_ref.ref: s.record for s in frozen.input.sources}
+    suggestion=(parse_current_general_growth_output_v1(prepared,text["text"],frozen)if general
+        else parse_d07_cognition_output_v1(text["text"], frozen))
+    source_inputs=(*frozen.input.context_sources,*frozen.input.support_sources)if general else frozen.input.sources
+    sources={source.source_ref.ref:source.record for source in source_inputs}
     writes, reads = [], []
     for index, finding in enumerate(suggestion.findings):
         candidate = CurrentInterpretationCandidate("d07-interpretation:" + canonical_digest(
@@ -1227,9 +1388,9 @@ def stage_actual_d07_interpretation_writes_v1(db, *, prepared, issuer, envelope)
             tuple(sorted({sources[ref].provenance_root for ref in finding.source_refs})), suggestion.unknowns)
         write = D07DomainProvider.current_interpretation_write(envelope, candidate,
             source_dependencies=tuple(AtomKey.from_token(ref) for ref in finding.source_refs))
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
+        row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(write.key.token,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone())
         if row is not None:
-            if row[2] != 1 or json.loads(row[1]) != write.value:
+            if row[2] != 1 or background_json_loads_v3(row[1]) != write.value:
                 raise ValueError("D07 model interpretation key conflicts with existing graph")
             continue
         writes.append(write)
@@ -1245,11 +1406,11 @@ def record_d07_adopted_interpretations_after_cas_v1(db, issuer, prepared, writes
     for write in writes:
         if write.key.type_name != "d07.current_interpretation.v1":
             continue
-        current = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
+        current = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(write.key.token,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone())
         history = None if current is None else db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
             (write.key.token, current[0])).fetchone()
-        if (current is None or current[2] != 1 or json.loads(current[1]) != write.value
-                or history is None or history[0] != operation_id or history[2] != 1 or json.loads(history[1]) != write.value):
+        if (current is None or current[2] != 1 or background_json_loads_v3(current[1]) != write.value
+                or history is None or history[0] != operation_id or history[2] != 1 or background_json_loads_v3(history[1]) != write.value):
             raise ValueError("D07 interpretation was not adopted by its actual graph event")
         original = {"schema": "d07.actual-cognition-adoption.v1", "interpretation_ref": write.key.token,
             "interpretation_revision": current[0], "interpretation_value_digest": canonical_digest(write.value),
@@ -1260,7 +1421,7 @@ def record_d07_adopted_interpretations_after_cas_v1(db, issuer, prepared, writes
 
 
 def _clock_from_json(value):
-    raw = json.loads(value)
+    raw = background_json_loads_v3(value)
     return CharacterClockMapping(**{**raw, "character_origin": Decimal(raw["character_origin"]), "rate": Decimal(raw["rate"])})
 
 
@@ -1325,7 +1486,7 @@ def settle_d07_original_model_cost_in_transaction_v1(db, *, prepared, fact, issu
     if (canonical_digest(quote) != prepared.quote_digest or graph_preparation != (prepared.activity_id,)
             or reserved is None or reserved[0] != prepared.reservation_digest
             or reserved[2] not in {"reserved", "unknown", "partial_unknown", "partial_overrun", "settled", "overrun"}
-            or json.loads(reserved[1]) != dict(quote.ceiling) or reserve_original != (prepared.reservation_digest,)
+            or background_json_loads_v3(reserved[1]) != dict(quote.ceiling) or reserve_original != (prepared.reservation_digest,)
             or quote.graph_job_ref != job_graph_write(get_job(db, prepared.job_id)).key.token
             or (quote.operation_id, quote.work_kind, quote.effect_id, quote.parent_budget_lease_ref) !=
                (prepared.operation_id, WORK_KIND, prepared.effect_id, fact.intent.budget_lease_id)
@@ -1395,7 +1556,7 @@ def stage_d07_body_cost_in_transaction_v1(db, *, prepared, issuer, resource_issu
     reads = []
     values = []
     for key in keys:
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
+        row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(key.token,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone())
         if key == keys[2]:
             if row is not None:
                 raise ValueError("D07 body settlement target exists without original")
@@ -1404,7 +1565,7 @@ def stage_d07_body_cost_in_transaction_v1(db, *, prepared, issuer, resource_issu
             if row is None or row[2] != 1:
                 raise ValueError("D07 current same body ledger unavailable")
             reads.append(GraphVersion(key, row[0]))
-            values.append(json.loads(row[1]))
+            values.append(background_json_loads_v3(row[1]))
     state = BodyState(**values[0])
     reservation = BodyReservation(**{**values[1], "settled_components": tuple(values[1]["settled_components"])})
     if (state.profile_id != body_quote.profile_id or state.version < body_quote.state_version
@@ -1432,8 +1593,8 @@ def record_d07_body_cost_after_cas_v1(db, *, prepared, issuer, writes, original)
     if not db.in_transaction or len(writes) != 3:
         raise ValueError("D07 body original requires actual three-write CAS")
     for write in writes:
-        row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
-        if row is None or row[1] != 1 or json.loads(row[0]) != write.value:
+        row = _producer_original_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(write.key.token,),legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone())
+        if row is None or row[1] != 1 or background_json_loads_v3(row[0]) != write.value:
             raise ValueError("D07 body cost graph CAS did not happen")
     if original["writes_digest"] != canonical_digest(writes):
         raise ValueError("D07 body original differs from actual CAS")
@@ -1445,8 +1606,8 @@ def build_actual_ingress_recall_execution_v1(db, *, prepared, result_read, paid,
     from ..model_broker.d07_cognition_v1 import parse_d07_ingress_recall_output_v1
     if type(prepared) is not D07IngressRecallPreparedV1 or not db.in_transaction:
         raise ValueError("Self C3 terminal projection requires its current exact prepared original")
-    frozen = thaw_d07_ingress_recall_request_v1(json.loads(prepared.frozen_json))
-    response = json.loads(result_read.observation.result_json)
+    frozen = thaw_d07_ingress_recall_request_v1(background_json_loads_v3(prepared.frozen_json))
+    response = background_json_loads_v3(result_read.observation.result_json)
     if set(response) != {"text"} or type(response["text"]) is not str:
         raise ValueError("Self C3 requires the exact observed provider text")
     suggestion = parse_d07_ingress_recall_output_v1(response["text"], frozen)
@@ -1486,11 +1647,18 @@ def stage_d07_execution_original_in_transaction_v1(db, *, prepared, issuer, hold
         execution, _ = build_actual_ingress_recall_execution_v1(db, prepared=prepared,
             result_read=read, paid=paid[0], issuer=issuer)
     else:
-        frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
-        response = json.loads(read.observation.result_json)
+        from .d07_general_growth_execution_v1 import (D07GeneralGrowthPreparedV1,
+            thaw_current_general_growth_prepared_request_v1,parse_current_general_growth_output_v1)
+        general=type(prepared)is D07GeneralGrowthPreparedV1
+        frozen=(thaw_current_general_growth_prepared_request_v1(prepared)if general
+            else thaw_d07_cognition_request_v1(background_json_loads_v3(prepared.frozen_json)))
+        response = background_json_loads_v3(read.observation.result_json)
         if set(response) != {"text"} or type(response["text"]) is not str:
             raise ValueError("D07 provider exact text response required")
-        suggestion = parse_d07_cognition_output_v1(response["text"], frozen)
+        suggestion=(parse_current_general_growth_output_v1(prepared,response["text"],frozen)if general
+            else parse_d07_cognition_output_v1(response["text"], frozen))
+        source_inputs=(*frozen.input.context_sources,*frozen.input.support_sources)if general else frozen.input.sources
+        causal_depth=prepared.stage_causal_depth if general else frozen.input.causal_depth
         mapping = _clock_from_json(prepared.clock_mapping_json)
         if _clock_original(db, issuer, prepared.namespace, mapping) != prepared.clock_original_digest:
             raise ValueError("D07 actual original role mapping changed")
@@ -1501,8 +1669,8 @@ def stage_d07_execution_original_in_transaction_v1(db, *, prepared, issuer, hold
             prepared.effect_id, prepared.attempt_id, prepared.execution_id, prepared.stage_input_digest,
             suggestion.output_digest, prepared.work_kind, start, end, mapping.mapping_id, str(mapping.version),
             get_job(db, prepared.job_id).budget_ref, (paid[0]["cost_ref"],),
-            tuple(s.source_ref.ref for s in frozen.input.sources), prepared.activation_generation,
-            suggestion.resolved_slots, suggestion.discriminating_refs, suggestion.predictions, frozen.input.causal_depth)
+            tuple(s.source_ref.ref for s in source_inputs), prepared.activation_generation,
+            suggestion.resolved_slots, suggestion.discriminating_refs, suggestion.predictions, causal_depth)
     record_d07_original_in_transaction_v1(db, issuer, prepared.namespace, "execution", terminal_ref, asdict(execution))
     job = transition_job(db, prepared.job_id, holder, fence, target_phase="completed", result_ref=terminal_ref)
     return execution, (job_graph_write(job),)
@@ -1547,21 +1715,20 @@ def require_current_method_growth_question_v2(db, *, namespace, question, issuer
             if commitment is None or commitment!=(version.revision,1,digest):
                 raise ValueError("growth question lost its actual current proposal/cue Source head")
         else:
-            row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (version.key.token,)).fetchone()
-            if row is None or row[2] != 1 or row[0] != version.revision or canonical_digest(json.loads(row[1])) != digest:
+            row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(version.key.token,),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (version.key.token,)).fetchone())
+            if row is None or row[2] != 1 or row[0] != version.revision or canonical_digest(background_json_loads_v3(row[1])) != digest:
                 raise ValueError("growth question lost its actual current proposal/cue Source head")
     from ..authority_service.model_reply_scope_observation_v3 import read_model_reply_growth_proposal_v3
     handled,raw_value=read_model_reply_growth_proposal_v3(db,namespace=namespace,version=question.proposal_head)
     if not handled:
-        raw = db.execute("SELECT value FROM graph_atoms WHERE token=?", (question.proposal_head.key.token,)).fetchone()[0]
-        raw_value=json.loads(raw)
+        raw = _producer_original_point_v3(db,table='graph_atoms',columns=('value',),key_columns=('token',),key=(question.proposal_head.key.token,),legacy_reader=lambda:db.execute("SELECT value FROM graph_atoms WHERE token=?", (question.proposal_head.key.token,)).fetchone())[0]
+        raw_value=background_json_loads_v3(raw)
     proposal = decode_typed_production_value_v1(raw_value, MethodTrialProposalV2)
     if (question.question_key != trial_question_v2(question.proposal_head.key.token, question.proposal_digest)
             or (question.target_ref.ref, question.target_ref.version) != (question.proposal_head.key.token, question.proposal_head.revision)
             or set(question.source_refs) != set(proposal.source_refs)):
         raise ValueError("growth semantic question must evaluate its exact already registered trial proposal and Source material")
-    from .natural_producer_qualification_v1 import _producer_original_point_v3
-    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3
+    from .domain_background_read_v3 import background_json_matches_v3
     history = _producer_original_point_v3(db,table='graph_history',columns=('event_id',),
         key_columns=('token','revision'),key=(question.proposal_head.key.token,question.proposal_head.revision),
         legacy_reader=lambda:db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=?",
@@ -1610,3 +1777,92 @@ def _require_method_growth_semantic_question_v2(db, issuer, frame, question):
     read.original(question.proposal_head.key.token)
     read.source_family(db, question.source_refs)
     return proposal, cycle
+
+def decode_native_named_d07_value_v2(raw, expected):
+    """Exact asdict writer ABI for the four installed named D07 V2 schemas."""
+    from dataclasses import fields
+    from typing import get_type_hints
+    from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2, D07MethodGrowthPreparedV2
+    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+    from .foreground_cycle_v1 import foreground_cycle_ids_v1
+    from .d11_types import runtime_job_key
+    variants={D07RelationshipPreparedV2:("d07.relationship-prepared.v2",("cycle_ref",)),
+        D07RelationshipSemanticQuestionV2:("d07.relationship-semantic-question.v2",("cycle_ref",)),
+        D07MethodGrowthPreparedV2:("d07.method-growth-prepared.v2",("cycle_ref","proposal_head","source_head")),
+        D07MethodGrowthSemanticQuestionV2:("d07.method-growth-semantic-question.v2",("cycle_ref","proposal_head","source_head"))}
+    if expected not in variants:
+        raise TypeError("only exact named D07 V2 writer schemas use the native GraphVersion ABI")
+    schema,heads=variants[expected]
+    if type(raw) is not dict or set(raw)!={field.name for field in fields(expected)} or raw.get("schema")!=schema:
+        raise ValueError("named D07 native original fields/schema differ")
+    namespace=(NamespaceId(**raw["namespace"]) if "namespace" in raw else
+        NamespaceId(raw["cycle_ref"]["key"]["owner"]["bot"],raw["cycle_ref"]["key"]["owner"]["persona"]))
+    hints=get_type_hints(expected)
+    decoded={}
+    for field in fields(expected):
+        value=raw[field.name]
+        if field.name in heads:
+            decoded[field.name]=decode_native_named_d07_head_v2(value,namespace=namespace,
+                c02_operation_id=raw.get("c02_operation_id"),head_kind=field.name)
+        elif expected is D07RelationshipSemanticQuestionV2 and field.name=="scope":
+            from ..domains.d05.relationship_revision_v2 import RelationshipScopeV2
+            if type(value) is not dict or set(value)!={part.name for part in fields(RelationshipScopeV2)}:
+                raise ValueError("Relationship native question scope fields differ")
+            scope=dict(value)
+            scope["namespace"]=NamespaceId(**scope["namespace"])
+            scope["subject_head"]=decode_native_named_d07_head_v2(value["subject_head"],
+                namespace=scope["namespace"],c02_operation_id=None,head_kind="subject_head")
+            scope["context_head"]=(None if value["context_head"] is None else
+                decode_native_named_d07_head_v2(value["context_head"],namespace=scope["namespace"],
+                    c02_operation_id=None,head_kind="context_head"))
+            decoded[field.name]=RelationshipScopeV2(**scope)
+        else:
+            decoded[field.name]=decode_typed_production_value_v1(value,hints[field.name])
+    result=expected(**decoded)
+    if canonical_serialize(asdict(result))!=canonical_serialize(raw):
+        raise ValueError("named D07 signed native bytes do not roundtrip through their exact writer")
+    return result
+
+
+def decode_native_named_d07_head_v2(raw, *, namespace, c02_operation_id, head_kind):
+    from .foreground_cycle_v1 import foreground_cycle_ids_v1
+    from .d11_types import runtime_job_key
+    from ..domains.d01.method_learning_v1 import TRIAL_PROPOSAL_TYPE_V2
+    if (type(raw) is not dict or set(raw)!={"key","revision"} or type(raw["key"]) is not dict
+            or set(raw["key"])!={"owner","type_name","name"} or type(raw["key"]["owner"]) is not dict
+            or set(raw["key"]["owner"])!={"kind","bot","persona","subject"}
+            or type(raw["revision"]) is not int or raw["revision"]<1):
+        raise ValueError("named D07 native GraphVersion exact field group differs")
+    key=AtomKey(Owner(**raw["key"]["owner"]),raw["key"]["type_name"],raw["key"]["name"])
+    if NamespaceId.from_key(key)!=namespace or AtomKey.from_token(key.token)!=key:
+        raise ValueError("named D07 native head namespace/token roundtrip differs")
+    if head_kind=="cycle_ref":
+        if c02_operation_id is None:
+            tag=key.name.removeprefix("foreground-job:")
+            if (key.owner.kind!="activity" or len(tag)!=40 or any(ch not in "0123456789abcdef" for ch in tag)
+                    or key.name!="foreground-job:"+tag or key.owner.subject!="foreground-activity:"+tag):
+                raise ValueError("named D07 question lost its native stable cycle grouping")
+        else:
+            activity,job=foreground_cycle_ids_v1(namespace,c02_operation_id)
+            if key!=runtime_job_key(*namespace.as_tuple,activity,job):
+                raise ValueError("named D07 native cycle owner/subject/name is not its stable C02 job")
+    elif head_kind=="proposal_head":
+        tag=key.name.removeprefix("method-learning:")
+        if (key.type_name!=TRIAL_PROPOSAL_TYPE_V2 or key.owner.kind!="persona" or key.owner.subject is not None
+                or len(tag)!=64 or any(ch not in "0123456789abcdef" for ch in tag)
+                or key.name!="method-learning:"+tag):
+            raise ValueError("growth native proposal has another actual type/owner/subject/key group")
+    elif head_kind=="source_head":
+        if key!=source_key(*namespace.as_tuple,key.owner.subject or ""):
+            raise ValueError("growth native Source head is not its canonical D06 record")
+    elif head_kind in {"subject_head","context_head"}:
+        owners={"d03.entity_anchor":("persona",),"d03.role_binding":("persona","scene"),
+            "d03.world_event":("event",),"memory.source":("event",)}
+        allowed={"d03.entity_anchor"} if head_kind=="subject_head" else {"d03.role_binding","d03.world_event","memory.source"}
+        if key.type_name not in allowed or key.owner.kind not in owners[key.type_name]:
+            raise ValueError("Relationship native scoped head type/owner differs")
+        if key.type_name=="memory.source" and key!=source_key(*namespace.as_tuple,key.owner.subject or ""):
+            raise ValueError("Relationship native scope Source key is not canonical")
+    else:
+        raise ValueError("unregistered named D07 native head field")
+    return GraphVersion(key,raw["revision"])

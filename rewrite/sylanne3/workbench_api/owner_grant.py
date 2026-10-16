@@ -79,6 +79,34 @@ class CurrentOwnerGrantPort(Protocol):
                               ) -> CurrentOwnerGrant | None: ...
 
 
+
+class _DetachedCurrentOwnerRequestLifetimeV3:
+    def __init__(self,port,leases):
+        self.port,self.leases=port,leases
+    def close(self):
+        leases,self.leases=self.leases,()
+        failure=None
+        for lease in reversed(leases):
+            try:self.port._coordinator.release_current_owner_lease(self.port._bootstrap,lease)
+            except BaseException as error:
+                if failure is None:failure=error
+        if failure is not None:raise failure
+
+class _CurrentOwnerRequestScopeV3:
+    def __init__(self,port,leases):
+        self.port,self.leases,self.detached=port,leases,False
+
+def detach_current_owner_request_lifetime_v3(scope):
+    from contextlib import ExitStack
+    if(type(scope)is not _CurrentOwnerRequestScopeV3 or scope.detached
+            or scope.port._request_leases.get()is not scope.leases):
+        raise ValueError("D07 classification requires its exact actual Owner request scope")
+    retained=ExitStack()
+    lifetime=_DetachedCurrentOwnerRequestLifetimeV3(scope.port,scope.leases)
+    retained.callback(lifetime.close)
+    scope.detached=True
+    return retained
+
 class GraphCurrentOwnerGrantPort:
     """Resolve D12 reads through the installed W01 graph and Authority heads."""
 
@@ -105,22 +133,13 @@ class GraphCurrentOwnerGrantPort:
     @contextmanager
     def request_scope(self) -> Iterator[None]:
         leases: list[object] = []
-        token = self._request_leases.set(leases)
-        try:
-            yield
+        token=self._request_leases.set(leases)
+        scope=_CurrentOwnerRequestScopeV3(self,leases)
+        try:yield scope
         finally:
             try:
-                release_error: BaseException | None = None
-                for lease in reversed(leases):
-                    try:
-                        self._coordinator.release_current_owner_lease(self._bootstrap, lease)
-                    except BaseException as exc:
-                        if release_error is None:
-                            release_error = exc
-                if release_error is not None:
-                    raise release_error
-            finally:
-                self._request_leases.reset(token)
+                if not scope.detached:_DetachedCurrentOwnerRequestLifetimeV3(self,leases).close()
+            finally:self._request_leases.reset(token)
 
     def resolve_current_owner(self, *, actor_id: str, scope: str,
                               purpose: str, audience: str,
@@ -175,8 +194,8 @@ class DurableOwnerGrantResolver:
     @contextmanager
     def request_scope(self) -> Iterator[None]:
         if isinstance(self._port, GraphCurrentOwnerGrantPort):
-            with self._port.request_scope():
-                yield
+            with self._port.request_scope()as scope:
+                yield scope
         else:
             yield
 

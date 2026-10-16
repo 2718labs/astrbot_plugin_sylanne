@@ -76,7 +76,7 @@ def validate_contact_payload_v2(kind, raw):
         from .restore_anchor import RestoreAnchor
         _fields(raw, ("schema", "job_id", "phase", "request_digest", "attempt_id", "anchor", "graph_revision", "graph_epoch", "prepared_digest"), "d10.contact-stage-attempt.v2")
         RestoreAnchor(**raw["anchor"])
-        if raw["phase"] not in {"acquire", "paid_cost", "result_read", "terminal"}:
+        if raw["phase"] not in {"acquire", "paid_cost", "result_read", "terminal", "seal"}:
             raise ValueError("contact retained stage has another operation")
         _digest(raw["request_digest"]); _digest(raw["prepared_digest"])
     elif kind == "stage_permit":
@@ -95,6 +95,8 @@ def validate_contact_payload_v2(kind, raw):
             validate_contact_payload_v2("paid_cost", result)
         elif result.get("status") == "acquired":
             _fields(result, ("status", "job_id", "request_digest")); _digest(result["request_digest"])
+        elif result.get('status') == 'sealed':
+            _fields(result,('status','job_id','intent_digest')); _digest(result['intent_digest'])
         elif result.get("status") == "completed":
             _fields(result, ("status", "job_id", "output_digest", "graph_receipt_digest"))
             _digest(result["output_digest"]); _digest(result["graph_receipt_digest"])

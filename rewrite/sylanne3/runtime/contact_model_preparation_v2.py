@@ -1,4 +1,5 @@
 """Contact acquire, exact call seal, actual result import and independent cost."""
+from .contact_original_read_v3 import contact_original_point_v3
 from dataclasses import replace, asdict
 from datetime import datetime, timezone
 import json
@@ -155,20 +156,20 @@ def read_paid_contact_result_v2(db, *, namespace, contact_id, phase, issuer, res
     result.require_original(intent, prepared)
     job = get_job(db, prepared.job_id)
     quote = resource_issuer.original_signed_quote(db, prepared.quote_id, prepared.quote_version)
-    reservation = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
-        (quote.parent_budget_lease_ref, prepared.prepare_operation_id)).fetchone()
-    cost = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (paid["cost_ref"],)).fetchone()
-    cost_operation = db.execute("SELECT receipt_json,activity_id,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, paid["cost_operation_id"])).fetchone()
+    reservation = contact_original_point_v3(db,table='runtime_budget_reservations',columns=('digest', 'ceiling_json', 'state'),key_columns=('lease_id', 'operation_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1]))((quote.parent_budget_lease_ref, prepared.prepare_operation_id)),legacy_reader=lambda: db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+        (quote.parent_budget_lease_ref, prepared.prepare_operation_id)).fetchone())
+    cost = contact_original_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((paid["cost_ref"],)),legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (paid["cost_ref"],)).fetchone())
+    cost_operation = contact_original_point_v3(db,table='graph_bundle_operations',columns=('receipt_json', 'activity_id', 'commit_seq'),key_columns=('bot', 'persona', 'operation_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))((*namespace.as_tuple, paid["cost_operation_id"])),legacy_reader=lambda: db.execute("SELECT receipt_json,activity_id,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, paid["cost_operation_id"])).fetchone())
     from .budget import _receipt_from_json
-    original_budget = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
-        (*namespace.as_tuple, prepared.prepare_operation_id)).fetchone()
+    original_budget = contact_original_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],'settle'))((*namespace.as_tuple, prepared.prepare_operation_id)),legacy_reader=lambda: db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
+        (*namespace.as_tuple, prepared.prepare_operation_id)).fetchone())
     actual_cost_commit = None if cost_operation is None else json.loads(cost_operation[0])
     stored_cost = None if actual_cost_commit is None else actual_cost_commit.get("original_model_cost")
     job_write = job_graph_write(job)
-    job_head = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_write.key.token,)).fetchone()
-    cost_event = None if cost_operation is None else db.execute("SELECT 1 FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
-        (*namespace.as_tuple, cost_operation[1], paid["cost_operation_id"])).fetchone()
+    job_head = contact_original_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((job_write.key.token,)),legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_write.key.token,)).fetchone())
+    cost_event = None if cost_operation is None else contact_original_point_v3(db,table='graph_events',columns=('1',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],_contact_values[3]))((*namespace.as_tuple, cost_operation[1], paid["cost_operation_id"])),legacy_reader=lambda: db.execute("SELECT 1 FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+        (*namespace.as_tuple, cost_operation[1], paid["cost_operation_id"])).fetchone())
     if (prepared.plan_original_digest != plan_digest or frozen.input.adopted_plan != plan or frozen.input.expression_plan != expression
             or prepare_commit != {"schema": "d10.contact-model-prepare-commit.v2", "prepared_digest": prepared.digest,
                 "receipt_digest": canonical_digest(prepare_receipt), "operation_id": prepared.prepare_operation_id}
@@ -210,10 +211,10 @@ def _require_contact_completion_graph_original_v2(db, namespace, prepared, candi
     from ..graph_store import GraphStore
     operation = "contact-terminal:" + canonical_digest((namespace, prepared.job_id, "terminal"))[:48]
     completed, _ = require_contact_original_v2(db, issuer, namespace, "stage_receipt", operation)
-    event = db.execute("SELECT revisions,invalidated,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
-        (*namespace.as_tuple, prepared.activity_id, operation)).fetchone()
-    bundle = db.execute("SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, operation)).fetchone()
+    event = contact_original_point_v3(db,table='graph_events',columns=('revisions', 'invalidated', 'epoch_revision'),key_columns=('bot', 'persona', 'session', 'event_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],_contact_values[3]))((*namespace.as_tuple, prepared.activity_id, operation)),legacy_reader=lambda: db.execute("SELECT revisions,invalidated,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+        (*namespace.as_tuple, prepared.activity_id, operation)).fetchone())
+    bundle = contact_original_point_v3(db,table='graph_bundle_operations',columns=('receipt_json',),key_columns=('bot', 'persona', 'operation_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))((*namespace.as_tuple, operation)),legacy_reader=lambda: db.execute("SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, operation)).fetchone())
     if event is None or bundle is None:
         raise ValueError("contact completed job lost its actual Graph operation")
     receipt = GraphReceipt("committed", GraphStore._version_rows(event[0]), GraphStore._version_rows(event[1]),
@@ -224,8 +225,8 @@ def _require_contact_completion_graph_original_v2(db, namespace, prepared, candi
             or json.loads(bundle[0])["graph_receipt_digest"] != canonical_digest(receipt)
             or len(receipt.revisions) != 1 or receipt.revisions[0].key != job_write.key):
         raise ValueError("contact completed signed output differs from its actual Graph receipt")
-    history = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=? AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-        (job_write.key.token, receipt.revisions[0].revision, *namespace.as_tuple, prepared.activity_id, operation)).fetchone()
+    history = contact_original_point_v3(db,table='graph_history',columns=('value', 'valid'),key_columns=('token', 'revision', 'event_bot', 'event_persona', 'event_session', 'event_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],_contact_values[3],_contact_values[4],_contact_values[5]))((job_write.key.token, receipt.revisions[0].revision, *namespace.as_tuple, prepared.activity_id, operation)),legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=? AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
+        (job_write.key.token, receipt.revisions[0].revision, *namespace.as_tuple, prepared.activity_id, operation)).fetchone())
     if history is None or history[1] != 1 or json.loads(history[0]) != job_write.value:
         raise ValueError("contact actual completed job history differs")
 

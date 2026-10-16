@@ -200,6 +200,7 @@ class AuthorityV2ModelEgressStore:
                 db.execute(_ORIGINAL_IDENTITY_DDL)
             elif original != (_ORIGINAL_IDENTITY_DDL,):
                 raise AuthorityUnavailable("unknown original model identity schema")
+            install_model_no_dispatch_witness_schema_v1(db)
 
     @contextmanager
     def _tx(self):
@@ -738,3 +739,55 @@ class AuthorityV2ModelEgressStore:
 
 
 __all__ = ["AuthorityV2ModelEgressStore"]
+
+MODEL_NO_DISPATCH_WITNESS_TABLE_V1 = "authority_model_no_dispatch_witnesses_v1"
+MODEL_NO_DISPATCH_WITNESS_COLUMNS_V1 = ("call_id", "authority_id", "namespace", "installation_id", "closure_operation_id", "request_digest", "witness_json", "witness_digest", "signature")
+MODEL_NO_DISPATCH_WITNESS_DDL_V1 = """CREATE TABLE authority_model_no_dispatch_witnesses_v1(
+    call_id TEXT PRIMARY KEY, authority_id TEXT NOT NULL, namespace TEXT NOT NULL,
+    installation_id TEXT NOT NULL, closure_operation_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL,
+    witness_json TEXT NOT NULL, witness_digest TEXT NOT NULL, signature TEXT NOT NULL,
+    FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id))"""
+
+
+def install_model_no_dispatch_witness_schema_v1(db):
+    if not db.in_transaction:
+        raise AuthorityUnavailable("Authority original witness schema requires its real store transaction")
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (MODEL_NO_DISPATCH_WITNESS_TABLE_V1,)).fetchone()
+    if row is None:
+        db.execute(MODEL_NO_DISPATCH_WITNESS_DDL_V1)
+    elif row != (MODEL_NO_DISPATCH_WITNESS_DDL_V1,):
+        raise AuthorityUnavailable("unregistered Authority no-dispatch witness schema")
+
+
+def read_model_no_dispatch_witness_locked_v1(store, db, *, request, signer):
+    from .v2_model_egress_contract import ModelNoDispatchWitnessV1
+    from .v2_model_egress_wire import from_wire
+    if db is not store._db or not db.in_transaction:
+        raise AuthorityUnavailable("actual Core model witness transaction required")
+    row = db.execute("SELECT request_digest,witness_json,witness_digest,signature FROM " +
+        MODEL_NO_DISPATCH_WITNESS_TABLE_V1 + " WHERE namespace=? AND call_id=? AND authority_id=? AND installation_id=?",
+        (request.intent.namespace, request.intent.call_id, request.intent.authority_id, request.installation_id)).fetchone()
+    if row is None:
+        return None
+    witness = from_wire(json.loads(row[1]), ModelNoDispatchWitnessV1)
+    witness.require_signature_v1(signer)
+    if (canonical_serialize(json.loads(row[1])) != row[1] or witness.digest != row[2]
+            or witness.signature != row[3] or row[0] != request.identity_digest
+            or witness.request.identity_digest != request.identity_digest):
+        raise AuthorityUnavailable("Authority witness repeated original identity differs")
+    return witness
+
+
+def record_model_no_dispatch_witness_locked_v1(store, db, *, witness):
+    from .v2_model_egress_contract import ModelNoDispatchWitnessV1
+    from .v2_model_egress_wire import to_wire
+    if db is not store._db or not db.in_transaction or type(witness) is not ModelNoDispatchWitnessV1:
+        raise AuthorityUnavailable("actual Core witness producer transaction required")
+    raw = canonical_serialize(to_wire(witness))
+    db.execute("INSERT INTO " + MODEL_NO_DISPATCH_WITNESS_TABLE_V1 +
+        " VALUES(?,?,?,?,?,?,?,?,?)", (witness.request.intent.call_id, witness.request.intent.authority_id,
+        witness.request.intent.namespace, witness.request.installation_id, witness.witness_operation_id,
+        witness.request.identity_digest, raw, witness.digest, witness.signature))
+    return witness
+

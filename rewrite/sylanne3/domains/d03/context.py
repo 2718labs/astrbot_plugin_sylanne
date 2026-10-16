@@ -354,7 +354,8 @@ class ContextProvider:
                 name, owners, storage, validator,
                 writer_domain="d03", schema_hash=digest,
             ))
-        return tuple(result)
+        from .world_history_v1 import world_type_specs_v1
+        return tuple(result) + world_type_specs_v1("d03")
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
@@ -373,10 +374,17 @@ class ContextProvider:
             return validate_life_numeric_context_proposal_v1(proposal, snapshot)
         if proposal.proposal_schema != "d03.proposal.v1":
             raise ValueError("unsupported D03 proposal schema")
+        from .world_history_v1 import INPUT_TYPE,VIEW_TYPE
+        if any(write.key.type_name in {INPUT_TYPE,VIEW_TYPE} for write in proposal.typed_writes):
+            from ...runtime.world_owner_read_v3 import require_world_staged_proposal_v3
+            require_world_staged_proposal_v3(proposal)
         allowed_types = frozenset(self.register_types())
         if any(write.key.type_name not in allowed_types for write in proposal.typed_writes):
             raise ValueError("D03 candidates may only contain D03 graph writes")
+        from .world_history_v1 import INPUT_TYPE,VIEW_TYPE,WorldAssertionInputV1,WorldViewResultV1,decode_world_value_v1
         decoders = {
+            INPUT_TYPE: lambda value: decode_world_value_v1(value,WorldAssertionInputV1),
+            VIEW_TYPE: lambda value: decode_world_value_v1(value,WorldViewResultV1),
             "d03.entity_anchor": lambda value: EntityAnchor(**_tuple_payload(value, "creation_evidence_refs")),
             "d03.account_binding": lambda value: AccountBinding(**_tuple_payload(value)),
             "d03.world_event": lambda value: WorldEvent(**_tuple_payload(value, "participant_roles", "source_refs")),

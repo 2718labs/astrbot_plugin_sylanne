@@ -161,8 +161,13 @@ def read_plan_life_encoding_baseline_v1(db, *, namespace, activity_id, operation
     # Discover all actual drive Sources for current qualification. These are
     # untrusted read-plan locators; the private stage authenticates each drive.
     from .d04_joint_advance_v2 import _decode_numeric_candidate
-    row = db.execute('SELECT numeric_receipt_json FROM graph_d04_joint_numeric_originals_v1 '
-        'WHERE bot=? AND persona=? AND operation_id=?', (*namespace.as_tuple, request.joint_operation_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db,table="graph_d04_joint_numeric_originals_v1",
+        columns=("numeric_receipt_json","numeric_receipt_digest","verification_json","verification_digest"),
+        key_columns=("bot","persona","operation_id"),key=(*namespace.as_tuple,request.joint_operation_id),
+        legacy_reader=lambda:db.execute("SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,verification_digest "
+            "FROM graph_d04_joint_numeric_originals_v1 WHERE bot=? AND persona=? AND operation_id=?",
+            (*namespace.as_tuple,request.joint_operation_id)).fetchone())
     if row is None:
         raise ValueError('Life baseline actual joint numeric original is unavailable; HOLD')
     numeric = _decode_numeric_candidate(row[0])
@@ -206,8 +211,11 @@ def _current_inputs(db, frame, request, installed_readers, environment):
     root_candidates = set()
     for member in output.members:
         predecessor = expected_pairs[member.checkpoint_ref]
-        historical_cp = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
-            (predecessor.checkpoint.ref, predecessor.checkpoint.revision)).fetchone()
+        from .natural_producer_qualification_v1 import _producer_original_point_v3
+        historical_cp=_producer_original_point_v3(db,table="graph_history",columns=("value","valid"),
+            key_columns=("token","revision"),key=(predecessor.checkpoint.ref,predecessor.checkpoint.revision),
+            legacy_reader=lambda:db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
+                (predecessor.checkpoint.ref,predecessor.checkpoint.revision)).fetchone())
         if historical_cp is None or historical_cp[1] != 1:
             raise ValueError('Life authenticated before checkpoint history disappeared')
         root_candidate_digest = json.loads(historical_cp[0])['root_candidate_digest']
@@ -230,13 +238,21 @@ def _current_inputs(db, frame, request, installed_readers, environment):
         or atom.value.get('root_candidate_digest') in root_candidates}
     if inventory != expected_refs:
         raise ValueError('Life encoding root component current inventory differs')
-    row = db.execute('SELECT numeric_receipt_json FROM graph_d04_joint_numeric_originals_v1 '
-        'WHERE bot=? AND persona=? AND operation_id=?', (*ns.as_tuple, request.joint_operation_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row=_producer_original_point_v3(db,table="graph_d04_joint_numeric_originals_v1",
+        columns=("numeric_receipt_json","numeric_receipt_digest","verification_json","verification_digest"),
+        key_columns=("bot","persona","operation_id"),key=(*ns.as_tuple,request.joint_operation_id),
+        legacy_reader=lambda:db.execute('SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,verification_digest '
+            'FROM graph_d04_joint_numeric_originals_v1 WHERE bot=? AND persona=? AND operation_id=?',
+            (*ns.as_tuple,request.joint_operation_id)).fetchone())
     if row is None: raise ValueError('Life actual numeric receipt is absent')
     candidate = _decode_numeric_candidate(row[0])
     appraisals = {}
     for ref, revision, *rest in candidate.source_versions:
-        history = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?', (ref, revision)).fetchone()
+        history=_producer_original_point_v3(db,table="graph_history",columns=("value","valid"),
+            key_columns=("token","revision"),key=(ref,revision),
+            legacy_reader=lambda:db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
+                (ref,revision)).fetchone())
         if history is None or history[1] != 1: raise ValueError('Life joint drive history is absent')
         drive = decode_sourced_numeric_drive(json.loads(history[0]))
         read.source_family(db, (drive.source_ref,), purpose='consolidation')
@@ -315,6 +331,11 @@ def stage_current_life_encoding_baseline_v1(db, *, frame, request, installed_rea
     result = LifeEncodingBaselineStageV1(frame, request, context, environment, accepted, output.original_digest, owner_guard.authorization_revision, fence_digest, primary)
     identity = id(result)
     _STAGES[identity] = (weakref.ref(result, lambda _: _STAGES.pop(identity, None)), db)
+    from .current_method_learning_read_v3 import _method_active
+    reader=_method_active(db)
+    if reader is not None:
+        from .c04_encoding_context_original_v3 import bind_prepared_life_encoding_stage_v3
+        bind_prepared_life_encoding_stage_v3(reader,db,result,scope,owner_guard)
     return result
 
 
@@ -328,6 +349,9 @@ def verify_life_encoding_baseline_stage_v1(db, stage, *, installed_readers):
             or canonical_digest(asdict(installed_readers.life_numeric_scope.permit)) != stage.owner_fence_digest
             or installed_readers.life_numeric_owner_guard.authorization_revision != stage.owner_epoch):
         raise ValueError('Life current interval-baseline premises changed')
+    from .current_method_learning_read_v3 import _method_active
+    reader=_method_active(db)
+    if reader is not None:reader.prepared_encoding_inputs_v3.require_stage_v3(db,stage)
     return stage
 
 
@@ -343,13 +367,14 @@ def _from_record(context, record, accepted):
         c.activation_generation, c.graph_incarnation, accepted)
 
 
-def record_life_encoding_baseline_after_cas_v1(db, *, stage, issuer, receipt):
+def record_life_encoding_baseline_after_cas_v1(db, *, stage, issuer, receipt, encoding_commit_witness_v3):
     issued = _STAGES.get(id(stage))
     if issued is None or issued[0]() is not stage or issued[1] is not db or not db.in_transaction:
         raise ValueError('Life baseline recording requires its issuing transaction')
     c = stage.context.original; frame = stage.frame; env = stage.environment
     ids = life_encoding_baseline_ids_v1(c.namespace, c.episode_ref, stage.request.joint_operation_id)
-    actual = _receipt(db, c.namespace, ids['operation'])
+    from .d06_life_numeric_commit_v1 import require_current_life_encoding_write_v3,record_current_life_encoding_original_v3
+    actual=require_current_life_encoding_write_v3(db,witness=encoding_commit_witness_v3,stage=stage,receipt=receipt)
     if actual != receipt or actual.write_versions or actual.read_versions != frame.envelope.version_guard.read_versions:
         raise ValueError('Life baseline requires its exact actual zero-write W01 read receipt')
     record = issue_and_record_c04_encoding_baseline_v3(db, namespace=c.namespace,
@@ -359,10 +384,8 @@ def record_life_encoding_baseline_after_cas_v1(db, *, stage, issuer, receipt):
         owner_epoch=stage.owner_epoch, access_epoch=frame.envelope.version_guard.access_epoch,
         delete_epoch=frame.envelope.version_guard.delete_epoch, asset=env.asset, policy=env.policy)
     original = _from_record(stage.context, record, stage.appraisal_acceptance_digests)
-    from .d11_life_preparation_v1 import _record
-    _record(db, issuer=issuer, namespace=c.namespace, kind=KIND, ref=original.original_ref,
-        operation_id=original.encoding_operation_id, value=original)
-    return original
+    return record_current_life_encoding_original_v3(db,witness=encoding_commit_witness_v3,
+        stage=stage,issuer=issuer,receipt=receipt,original=original)
 
 
 def read_current_life_encoding_baseline_v1(db, *, frame, request, installed_readers, environment):
@@ -402,8 +425,13 @@ def read_current_life_encoding_baseline_v1(db, *, frame, request, installed_read
     # Every historical contributing Source remains independently current for
     # this consumer; historical existence alone never restores revoked access.
     from .d04_joint_advance_v2 import _decode_numeric_candidate
-    raw = db.execute('SELECT numeric_receipt_json FROM graph_d04_joint_numeric_originals_v1 WHERE bot=? AND persona=? AND operation_id=?',
-        (*original.namespace.as_tuple, original.joint_operation_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    raw = _producer_original_point_v3(db,table='graph_d04_joint_numeric_originals_v1',
+        columns=('numeric_receipt_json','numeric_receipt_digest','verification_json','verification_digest'),
+        key_columns=('bot','persona','operation_id'),key=(*original.namespace.as_tuple,original.joint_operation_id),
+        legacy_reader=lambda:db.execute('SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,verification_digest '
+            'FROM graph_d04_joint_numeric_originals_v1 WHERE bot=? AND persona=? AND operation_id=?',
+            (*original.namespace.as_tuple,original.joint_operation_id)).fetchone())
     if raw is None: raise ValueError('Life baseline actual numeric source closure is absent')
     candidate = _decode_numeric_candidate(raw[0])
     read = CurrentDomainReadV1(frame)

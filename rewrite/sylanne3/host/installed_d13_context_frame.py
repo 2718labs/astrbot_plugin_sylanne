@@ -36,6 +36,22 @@ class InstalledD13ContextFrameReadV1:
     query: ShortContextProjectionQueryV1
     frame: D13ContextInputFrameV1
     context_slice: ShortContextSliceV1
+    _retention: object | None = None
+
+    def close(self):
+        retention = self._retention
+        object.__setattr__(self, "_retention", None)
+        object.__setattr__(self, "query", None)
+        object.__setattr__(self, "frame", None)
+        object.__setattr__(self, "context_slice", None)
+        if retention is not None:
+            retention.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()
 
 
 async def read_installed_d13_raw_context_frame_v1(
@@ -96,49 +112,67 @@ async def read_installed_d13_raw_context_frame_v1(
             activation_generation=anchor.activation_generation,
             operation_id=ingress_operation_id,
         )
+        from contextlib import ExitStack
+        from ..graph_worker import GraphStorageWorkV3
+        lifetime = ExitStack()
+        lifetime.callback(graph.release_authority_lease, bootstrap, lease)
         try:
             authority = AuthorityContext(
                 grant.subject, "d11", capability, policy.namespace,
                 ("persona",), "context", (envelope.conversation_ref,),
                 policy.root_grant.policy_ref, anchor.activation_generation,
             )
-            return graph.read_current_d13_conversation_window_v1(
+            result = graph.read_current_d13_conversation_window_v1(
                 authority, lease, scene_ref=scene_ref,
                 max_slots=bundle.d13_precompression.max_slots,
             )
+            if type(result) is GraphStorageWorkV3:
+                result.adopt_request_lifetime_v3(lifetime.pop_all())
+            return result
         finally:
-            graph.release_authority_lease(bootstrap, lease)
+            lifetime.close()
 
+    from ..graph_worker import OwnedGraphStorageResultV3
+    retention = None
     try:
-        window = await worker.call(read)
-    except Exception:
-        return None
-    if (type(window) is not ConversationWindowProjectionV1
-            or window.namespace != policy.namespace
-            or window.conversation_ref != envelope.conversation_ref):
-        return None
-    main = bundle.model_workflows.reply
-    request = ShortContextRequestV1(
-        "d09", "reply", window.conversation_ref, window.scene_ref,
-        window.audience_ref,
-        "d13:frame:" + canonical_digest({
-            "ingress_operation_id": ingress_operation_id,
-            "window_read_set": window.read_set,
-            "order_watermark": window.order_watermark,
-        }),
-        None, bundle.d13_precompression.history_token_budget,
-        selected.provider_id, selected.model_id, main.template_version,
-        "no-tools.v1", policy.root_lease.lease_id, True,
-    )
-    query = ShortContextProjectionQueryV1(window, request)
-    try:
-        frame, context_slice = build_d13_context_input_frame_v1(
-            query, current_window=window, selected_main_model=selected,
+        try:
+            result = await worker.call(read)
+            if type(result) is OwnedGraphStorageResultV3:
+                window, retention = result.take_value_v3()
+            else:
+                window = result
+        except Exception:
+            return None
+        if (type(window) is not ConversationWindowProjectionV1
+                or window.namespace != policy.namespace
+                or window.conversation_ref != envelope.conversation_ref):
+            return None
+        main = bundle.model_workflows.reply
+        request = ShortContextRequestV1(
+            "d09", "reply", window.conversation_ref, window.scene_ref,
+            window.audience_ref,
+            "d13:frame:" + canonical_digest({
+                "ingress_operation_id": ingress_operation_id,
+                "window_read_set": window.read_set,
+                "order_watermark": window.order_watermark,
+            }),
+            None, bundle.d13_precompression.history_token_budget,
+            selected.provider_id, selected.model_id, main.template_version,
+            "no-tools.v1", policy.root_lease.lease_id, True,
         )
-    except (TypeError, ValueError):
-        return None
-    return InstalledD13ContextFrameReadV1(query, frame, context_slice)
-
+        query = ShortContextProjectionQueryV1(window, request)
+        try:
+            frame, context_slice = build_d13_context_input_frame_v1(
+                query, current_window=window, selected_main_model=selected,
+            )
+        except (TypeError, ValueError):
+            return None
+        owned = InstalledD13ContextFrameReadV1(query, frame, context_slice, retention)
+        retention = None
+        return owned
+    finally:
+        if retention is not None:
+            retention.release()
 
 __all__ = [
     "InstalledD13ContextFrameReadV1",

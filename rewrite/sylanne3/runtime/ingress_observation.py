@@ -57,7 +57,11 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
     operation_id = ingress_ids(source_ref)[2]
     from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
     from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3
+    from .d13_paid_original_read_v3 import d13_paid_current_reader_v3
+    paid=d13_paid_current_reader_v3(db)
     def point(table,columns,legacy_reader):
+        if paid is not None:return paid.window_original_point_v3(table,columns,
+            ('bot','persona','operation_id'),namespace.as_tuple+(operation_id,))
         return model_reply_scope_point_v3(db,table=table,columns=columns,
             key_columns=('bot','persona','operation_id'),key=namespace.as_tuple+(operation_id,),legacy_reader=legacy_reader)
     from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_graph_attachment_v3

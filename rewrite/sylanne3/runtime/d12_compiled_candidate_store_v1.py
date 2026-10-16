@@ -95,12 +95,10 @@ def verify_d12_domain_candidate_v1(
     if receipt != expected:
         return False
     encoded = canonical_serialize(candidate)
-    row = db.execute(
-        "SELECT domain,field_input_digest,proposal_schema_hash,candidate_digest,"
-        "candidate_json,candidate_sha256 FROM graph_d12_domain_candidates_v1 "
-        "WHERE bot=? AND persona=? AND candidate_ref=?",
-        (*namespace.as_tuple, receipt.candidate_ref),
-    ).fetchone()
+    from .domain_background_read_v3 import background_point_v3
+    row=background_point_v3(db,table='graph_d12_domain_candidates_v1',columns=('domain','field_input_digest','proposal_schema_hash','candidate_digest','candidate_json','candidate_sha256'),
+        key_columns=('bot','persona','candidate_ref'),key=(*namespace.as_tuple,receipt.candidate_ref),
+        legacy_reader=lambda:db.execute('SELECT domain,field_input_digest,proposal_schema_hash,candidate_digest,candidate_json,candidate_sha256 FROM graph_d12_domain_candidates_v1 WHERE bot=? AND persona=? AND candidate_ref=?',(*namespace.as_tuple,receipt.candidate_ref)).fetchone())
     return row == (
         candidate.domain, candidate.field_input_digest,
         candidate.proposal_schema_hash, candidate.candidate_digest, encoded,

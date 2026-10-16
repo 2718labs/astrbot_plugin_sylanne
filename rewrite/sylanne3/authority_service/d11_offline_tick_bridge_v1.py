@@ -147,53 +147,11 @@ def _originals_locked(service, db, binding, execution):
     return before, source, terminal
 
 
-def _owner_observation(service, binding, permit, before):
-    """Read actual source/target Owner over this authenticated own interval."""
-    from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
-    owner_service = service.owner_service
-    with service._frozen() as (db, deletion, execution, _):
-        anchor, holder = service._current(db, deletion, execution)
-        service.bridge.fences.validate_fence_locked(db, permit, subject=service._subject, current_anchor=anchor)
-        actual_before, _, _ = _originals_locked(service, db, binding, execution)
-        if actual_before != before or not _same_location(before, anchor) or holder != owner_service.holder:
-            raise AuthorityUnavailable("offline current Owner location changed")
-        head = service.owner_tickets.current_migration_head_in_tx(db, authority_namespace=service.bridge.namespace)
-        if head is None or head.state != "active":
-            raise AuthorityUnavailable("offline current Owner head unavailable")
-        if type(owner_service) is InstalledD12OwnerStorageAdmissionServiceV1:
-            if owner_service._head_in_tx(db) != head:
-                raise AuthorityUnavailable("offline source Owner differs")
-            actor, _ = owner_service._background_identity_in_tx(db, head)
-            history = None
-        else:
-            history = owner_service._current_transfer(db, generation=anchor.activation_generation)
-            actor = None
-    if history is None:
-        _, _, admission = owner_service._read_graph(owner_head=head, anchor=before)
-        observed = D12CurrentOwnerAuthorityV1(head.guard, None, admission)
-    else:
-        location = owner_service._read_graph(history=history, owner_head=head, anchor=before)
-    with service._frozen() as (db, deletion, execution, _):
-        current, _ = service._current(db, deletion, execution)
-        service.bridge.fences.validate_fence_locked(db, permit, subject=service._subject, current_anchor=current)
-        if current != anchor or service.owner_tickets.current_migration_head_in_tx(db,
-                authority_namespace=service.bridge.namespace) != head:
-            raise AuthorityUnavailable("offline Owner changed during independent location read")
-        if history is None:
-            if owner_service._background_identity_in_tx(db, head)[0] != actor:
-                raise AuthorityUnavailable("offline source Owner actor changed")
-        else:
-            metadata, revision, grant_digest, imported, continuation = location
-            observed = owner_service._current_background_identity_for_verified_location_in_tx_v1(db,
-                head=head, history=history, metadata=metadata, revision=revision,
-                grant_digest=grant_digest, imported=imported, continuation=continuation, anchor=current)
-            actor = owner_service.sessions._current_pairing_source.current_principal_binding(
-                authority_namespace=service.bridge.namespace, installation_id=service.installation_id,
-                principal=head.issue_operation.principal)
-            if actor is None:
-                raise AuthorityUnavailable("offline target current Owner actor unavailable")
-    return observed, actor.actor_id
-
+def _owner_observation(service,binding,permit,before):
+    from .owner_location_read_v3 import _owner_location_service_invocation_v3
+    with _owner_location_service_invocation_v3(service):
+        from .owner_location_read_v3 import prepare_owner_location_for_offline_bridge_v3
+        return prepare_owner_location_for_offline_bridge_v3(service,binding=binding,permit=permit,before=before)
 
 def _observe_bridge(service, binding, permit):
     with service._frozen() as (db, deletion, execution, _):
@@ -221,67 +179,69 @@ def _observe_bridge(service, binding, permit):
 
 
 def operate_offline_adoption_bridge_v1(service, binding, action, gate=None, outcome=None):
-    from .d11_offline_tick_service_v1 import AuthorityD11OfflineTickServiceV1
-    if type(service) is not AuthorityD11OfflineTickServiceV1 or action not in {"begin", "validate", "finish", "status"}:
-        raise AuthorityUnavailable("actual installed offline bridge and closed operation required")
-    if action in {"finish", "status"}:
-        from .d11_offline_historical_accounting_v1 import _scope
-        _scope(service, binding)
-    else:
-        service._binding(binding)
-    service.bridge.core._require(service.credential, "current", service.bridge.namespace)
-    operation_id = service._gate_id(binding, "adoption")
-    if action != "begin" and (type(gate) is not D11OfflineTickAdoptionBridgeV1
-            or gate.binding != binding or gate.permit.operation_id != operation_id):
-        raise AuthorityUnavailable("offline exact original bridge required")
-    if action in {"finish", "status"}:
-        with service.bridge.core._tx() as db:
-            row = service.bridge.fences._row(db, operation_id)
-            if row is None or service.bridge.fences._permit(row) != gate.permit:
-                raise AuthorityUnavailable("offline actual bridge gate differs")
-            if action == "status":
-                if row[6] not in {"active", "finished"}:
-                    raise AuthorityUnavailable("offline gate has an unsupported state")
-                return row[6]
-            if outcome not in {"committed", "abandoned"}:
-                raise AuthorityUnavailable("offline finish requires an exact outcome")
-            finish = (operation_id + ":" + outcome, "sha256:" + canonical_digest((gate.qualification_digest, outcome)))
-            if row[6] == "finished":
-                if row[8:10] != finish:
-                    raise AuthorityUnavailable("offline finished bridge replay changed outcome")
-                return True
-        _verify_graph_finish(service, gate, outcome)
-        with service._frozen() as (db, deletion, execution, _):
-            current = service.fences._current_locked(db, deletion, execution, require_clear=False)
-            service.bridge.fences.validate_fence_locked(db, gate.permit, subject=service._subject, current_anchor=current)
-            service.bridge.fences.finish_fence_locked(db, gate.permit, subject=service._subject,
-                current_anchor=current, request_id=finish[0], request_digest=finish[1])
-        return True
-    if action == "begin":
-        service._recover_committed_append(binding)
-        with service._frozen() as (db, deletion, execution, _):
-            from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
-            after, holder = service._current(db, deletion, execution)
-            before, source, _ = _originals_locked(service, db, binding, execution)
-            if not _same_location(before, after) or source.holder != holder:
-                raise AuthorityUnavailable("offline own interval crossed its actual location")
-            require_lifecycle_admission_in_tx_v1(db, service.bridge.namespace, action="offline_tick_adoption")
-            permit = service.bridge.fences.begin_fence_locked(db, subject=service._subject,
-                holder=holder, operation="write", current_anchor=after, operation_id=operation_id)
-        try:
-            return _observe_bridge(service, binding, permit)
-        except BaseException:
-            # No content mutation occurs during observation. Close exactly
-            # this still-current unused permit; ambiguity remains recoverable.
+    from .owner_location_read_v3 import _owner_location_service_invocation_v3
+    with _owner_location_service_invocation_v3(service):
+        from .d11_offline_tick_service_v1 import AuthorityD11OfflineTickServiceV1
+        if type(service) is not AuthorityD11OfflineTickServiceV1 or action not in {"begin", "validate", "finish", "status"}:
+            raise AuthorityUnavailable("actual installed offline bridge and closed operation required")
+        if action in {"finish", "status"}:
+            from .d11_offline_historical_accounting_v1 import _scope
+            _scope(service, binding)
+        else:
+            service._binding(binding)
+        service.bridge.core._require(service.credential, "current", service.bridge.namespace)
+        operation_id = service._gate_id(binding, "adoption")
+        if action != "begin" and (type(gate) is not D11OfflineTickAdoptionBridgeV1
+                or gate.binding != binding or gate.permit.operation_id != operation_id):
+            raise AuthorityUnavailable("offline exact original bridge required")
+        if action in {"finish", "status"}:
+            with service.bridge.core._tx() as db:
+                row = service.bridge.fences._row(db, operation_id)
+                if row is None or service.bridge.fences._permit(row) != gate.permit:
+                    raise AuthorityUnavailable("offline actual bridge gate differs")
+                if action == "status":
+                    if row[6] not in {"active", "finished"}:
+                        raise AuthorityUnavailable("offline gate has an unsupported state")
+                    return row[6]
+                if outcome not in {"committed", "abandoned"}:
+                    raise AuthorityUnavailable("offline finish requires an exact outcome")
+                finish = (operation_id + ":" + outcome, "sha256:" + canonical_digest((gate.qualification_digest, outcome)))
+                if row[6] == "finished":
+                    if row[8:10] != finish:
+                        raise AuthorityUnavailable("offline finished bridge replay changed outcome")
+                    return True
+            _verify_graph_finish(service, gate, outcome)
             with service._frozen() as (db, deletion, execution, _):
-                current, _ = service._current(db, deletion, execution)
-                service.bridge.fences.finish_fence_locked(db, permit, subject=service._subject,
-                    current_anchor=current, request_id=operation_id + ":rejected",
-                    request_digest="sha256:" + canonical_digest((binding.digest, "adoption-rejected")))
-            raise
-    if _observe_bridge(service, binding, gate.permit) != gate:
-        raise AuthorityUnavailable("offline independently reread bridge changed")
-    return gate
+                current = service.fences._current_locked(db, deletion, execution, require_clear=False)
+                service.bridge.fences.validate_fence_locked(db, gate.permit, subject=service._subject, current_anchor=current)
+                service.bridge.fences.finish_fence_locked(db, gate.permit, subject=service._subject,
+                    current_anchor=current, request_id=finish[0], request_digest=finish[1])
+            return True
+        if action == "begin":
+            service._recover_committed_append(binding)
+            with service._frozen() as (db, deletion, execution, _):
+                from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                after, holder = service._current(db, deletion, execution)
+                before, source, _ = _originals_locked(service, db, binding, execution)
+                if not _same_location(before, after) or source.holder != holder:
+                    raise AuthorityUnavailable("offline own interval crossed its actual location")
+                require_lifecycle_admission_in_tx_v1(db, service.bridge.namespace, action="offline_tick_adoption")
+                permit = service.bridge.fences.begin_fence_locked(db, subject=service._subject,
+                    holder=holder, operation="write", current_anchor=after, operation_id=operation_id)
+            try:
+                return _observe_bridge(service, binding, permit)
+            except BaseException:
+                # No content mutation occurs during observation. Close exactly
+                # this still-current unused permit; ambiguity remains recoverable.
+                with service._frozen() as (db, deletion, execution, _):
+                    current, _ = service._current(db, deletion, execution)
+                    service.bridge.fences.finish_fence_locked(db, permit, subject=service._subject,
+                        current_anchor=current, request_id=operation_id + ":rejected",
+                        request_digest="sha256:" + canonical_digest((binding.digest, "adoption-rejected")))
+                raise
+        if _observe_bridge(service, binding, gate.permit) != gate:
+            raise AuthorityUnavailable("offline independently reread bridge changed")
+        return gate
 
 
 def _verify_graph_finish(service, gate, outcome):

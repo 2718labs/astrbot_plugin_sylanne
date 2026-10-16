@@ -42,6 +42,13 @@ def table_exists_v1(db, table):
 
 class CurrentDomainReadV1:
     """Common bounded reader, deliberately containing no write capability."""
+    def __new__(cls, frame):
+        if cls is CurrentDomainReadV1:
+            from ..authority_service.named_joint_binding_body_v1 import named_joint_core_read_for_frame_v1
+            actual = named_joint_core_read_for_frame_v1(frame)
+            if actual is not None:
+                return actual
+        return super().__new__(cls)
     def __init__(self, frame):
         from .domain_production_contracts_v1 import CurrentOwnerStopProjectionFrameV1, require_owner_stop_projection_frame_v1
         if type(frame) is CurrentOwnerStopProjectionFrameV1:
@@ -95,6 +102,9 @@ class CurrentDomainReadV1:
         return atom
 
     def original(self, ref, *, kind=None, digest=None):
+        from ..authority_service.artifact_model_original_family_v3 import artifact_model_frame_original_v3
+        artifact,value=artifact_model_frame_original_v3(self.frame,ref,kind=kind,digest=digest)
+        if artifact:return value
         matches = tuple(original for original in self.frame.observed_originals if original.original_ref == ref)
         if len(matches) != 1:
             raise MissingProductionOriginalV1("authenticated_original:" + ref)
@@ -105,6 +115,9 @@ class CurrentDomainReadV1:
         return found
 
     def complete_inventory(self, db, type_name):
+        from ..authority_service.artifact_model_graph_v3 import read_bound_artifact_model_frame_inventory_v3
+        artifact,values=read_bound_artifact_model_frame_inventory_v3(self.frame,db,type_name)
+        if artifact:return values
         frame, ns = self.frame, self.frame.envelope.authority.namespace
         rows = db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? "
             "ORDER BY token LIMIT ?", (*ns.as_tuple, type_name, frame.limits.max_query_rows + 1)).fetchall()
@@ -123,6 +136,10 @@ class CurrentDomainReadV1:
 
     def source_family(self, db, roots, *, purpose=None, audience=None, allow_corrected=False):
         """Read every parent plus its own access and correction head, bounded."""
+        from ..authority_service.artifact_model_graph_v3 import require_artifact_model_frame_source_family_v3
+        require_artifact_model_frame_source_family_v3(self.frame,db,roots,purpose=purpose,audience=audience)
+        from .artifact_frame_control_reads_v3 import require_artifact_borrowed_frame_source_family_v3
+        require_artifact_borrowed_frame_source_family_v3(self.frame,db,roots,purpose=purpose,audience=audience)
         frame, ns = self.frame, self.frame.envelope.authority.namespace
         if type(roots) is not tuple or not roots or len(roots) > frame.limits.max_source_roots:
             raise MissingProductionOriginalV1("bounded_source_roots")
@@ -165,6 +182,9 @@ class CurrentDomainReadV1:
         return records
 
     def committed_operation(self, db, operation_id):
+        from ..authority_service.artifact_model_graph_v3 import artifact_model_frame_committed_operation_v3
+        artifact,row=artifact_model_frame_committed_operation_v3(self.frame,db,operation_id)
+        if artifact:return row
         if not table_exists_v1(db, "graph_bundle_operations"):
             raise MissingProductionOriginalV1("committed_producing_operation")
         row = db.execute("SELECT digest,receipt_json,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? "
@@ -437,7 +457,30 @@ class InstalledD01ProductionReadersV1:
         self.issuer, self.owner_guard = issuer, owner_guard
         self.role_clock_reader = role_clock_reader
 
+    def freeze_current_general_growth_after_commit_v1(self,db,*,frame,producing_operation_id,request,witness,receipt):
+        from .d01_general_growth_v1 import freeze_current_general_growth_after_commit_v1
+        return freeze_current_general_growth_after_commit_v1(self,db,frame=frame,producing_operation_id=producing_operation_id,request=request,witness=witness,receipt=receipt)
+
+    def validate_current_general_growth_trial_start_v1(self,db,frame,request):
+        from .d01_general_growth_v1 import validate_current_general_growth_trial_start_v1
+        return validate_current_general_growth_trial_start_v1(self,db,frame,request)
+
+    def start_current_general_growth_trial_after_commit_v1(self,db,*,frame,producing_operation_id,request,witness,receipt):
+        from .d01_general_growth_v1 import start_current_general_growth_trial_after_commit_v1
+        return start_current_general_growth_trial_after_commit_v1(self,db,frame=frame,producing_operation_id=producing_operation_id,request=request,witness=witness,receipt=receipt)
+
+    def derive_current_general_growth_trial_from_adopted_progress_v1(self,db,*,frame,producing_operation_id,request,witness,receipt):
+        from .d01_general_growth_v1 import derive_current_general_growth_trial_from_adopted_progress_v1
+        return derive_current_general_growth_trial_from_adopted_progress_v1(self,db,frame=frame,producing_operation_id=producing_operation_id,request=request,witness=witness,receipt=receipt)
+
+    def read_current_general_growth_v1(self,db,frame,request):
+        from .d01_general_growth_v1 import read_current_general_growth_v1
+        return read_current_general_growth_v1(self,db,frame,request)
+
     def _read(self, db, read, ref, kind):
+        from .current_conditioned_self_read_v3 import read_bound_conditioned_d01_input_v3
+        handled,result=read_bound_conditioned_d01_input_v3(db,read=read,ref=ref,kind=kind,issuer=self.issuer)
+        if handled:return result
         if not table_exists_v1(db, TABLE):
             raise MissingProductionOriginalV1("d01_" + kind + "_original:" + ref)
         row = db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM "
@@ -595,13 +638,23 @@ class InstalledD01ProductionReadersV1:
                 raise ValueError("growth counterevidence belongs to another proposal")
             if counter["query_scope_ref"] != "d07.current_interpretation.v1":
                 raise ValueError("growth counterevidence scope is not its fixed D07 interpretation inventory")
-            pages = tuple(page for page in frame.query_coverage if page.type_id == counter["query_scope_ref"])
-            complete = (counter["coverage_complete"] is True and len(pages) == 1 and pages[0].complete
-                        and pages[0].epoch.revision == counter["query_epoch"])
-            counter_roots = tuple(counter["evidence_source_refs"]) + tuple(counter["counterevidence_source_refs"])
-            if counter_roots:
-                read.source_family(db, tuple(dict.fromkeys(counter_roots)), purpose="consolidation")
-            conflict = counter["conflict_found"] is True
+            active_counter_plan=PersonaDomain().resolve_active_role(frame.snapshot,
+                namespace=frame.envelope.authority.namespace,current_guard=self.owner_guard)
+            counter_target=next((block for block in active_counter_plan.plan.blocks if block.block_id==raw["target_block"]),None)
+            if original.kind=="d01.growth_proposal" and counter_target is not None and counter_target.kind!="semantic_identity":
+                if tuple(counter["evidence_source_refs"])!=roots:
+                    raise ValueError("ordinary growth counter birth support differs from its signed proposal")
+                current_complete,conflict,current_originals=self.current_general_growth_counter_scope_v3(db,read,raw)
+                complete=counter["coverage_complete"] is True and current_complete
+                originals.extend(current_originals)
+            else:
+                pages = tuple(page for page in frame.query_coverage if page.type_id == counter["query_scope_ref"])
+                complete = (counter["coverage_complete"] is True and len(pages) == 1 and pages[0].complete
+                            and pages[0].epoch.revision == counter["query_epoch"])
+                counter_roots = tuple(counter["evidence_source_refs"]) + tuple(counter["counterevidence_source_refs"])
+                if counter_roots:
+                    read.source_family(db, tuple(dict.fromkeys(counter_roots)), purpose="consolidation")
+                conflict = counter["conflict_found"] is True
             originals.append(counter_original)
         except MissingProductionOriginalV1:
             pass
@@ -622,6 +675,46 @@ class InstalledD01ProductionReadersV1:
             originals.extend(deep_originals)
         return CurrentGrowthInputsV1(proposal, tuple(source.source_id for source in sources), self.owner_guard,
             tuple(originals), trials_complete, complete, conflict, semantic_qualification=semantic)
+
+
+    def current_general_growth_counter_scope_v3(self, db, read, intent):
+        """Current ordinary-block counter facts; the signed counter remains its birth evidence."""
+        from ..domains.d07 import D07DomainProvider
+        active=PersonaDomain().resolve_active_role(read.frame.snapshot,
+            namespace=read.frame.envelope.authority.namespace,current_guard=self.owner_guard)
+        target=next((block for block in active.plan.blocks if block.block_id==intent["target_block"]),None)
+        if target is None or target.kind=="semantic_identity" or target.plasticity!="growth":
+            raise MissingProductionOriginalV1("actual_current_ordinary_growth_block")
+        scope="d01.growth:"+intent["target_block"]+":"+intent["change_kind"]
+        inventory=read.complete_inventory(db,"d07.current_interpretation.v1")
+        pages=tuple(page for page in read.frame.query_coverage if page.type_id=="d07.current_interpretation.v1")
+        if len(pages)!=1 or not pages[0].complete:
+            raise MissingProductionOriginalV1("complete_current_general_growth_counter_inventory")
+        originals=[];qualification="qualified";matched=False
+        spec=next(item for item in D07DomainProvider.type_specs() if item.name=="d07.current_interpretation.v1")
+        for atom in inventory:
+            if not atom.valid or atom.value.get("question_key")!=scope or atom.value.get("current") is not True:
+                continue
+            matched=True;spec.validator(atom.value)
+            history=read_graph_row_v3(db,("event_id","value","valid"),
+                where="token=? AND revision=?",parameters=(atom.key.token,atom.revision),history=True)
+            if history is None or history[2]!=1 or json.loads(history[1])!=atom.value:
+                raise MissingProductionOriginalV1("actual_current_general_growth_counter_adoption")
+            read.committed_operation(db,history[0])
+            originals.append(read.original(atom.key.token,digest=canonical_digest(atom.value)))
+            refs=tuple(atom.value["source_refs"])
+            if not refs:
+                if qualification!="opposition":qualification="unknown"
+                continue
+            read.source_family(db,refs,purpose="consolidation")
+            for ref in refs:read.head(db,ref,required=True)
+            if atom.value["stance"]=="oppose" and atom.value["evidence_status"]=="supported":
+                qualification="opposition"
+            elif qualification!="opposition" and (atom.value["stance"]!="support"
+                    or atom.value["meaningful_unknowns"] or atom.value["evidence_status"]!="supported"):
+                qualification="unknown"
+        if not matched:qualification="unknown"
+        return qualification=="qualified",qualification=="opposition",tuple(originals)
 
     def freeze_current_values_from_graph_v1(self, db, *, frame, producing_operation_id,
                                           candidate_set_ref, context_ref):
@@ -1415,8 +1508,30 @@ def read_plan_current_d01_operation_v1(db, *, namespace, activity_id, operation_
         originals.extend((request.growth_proposal_ref, request.trigger_original_ref, request.counterevidence_query_ref,
                           *request.trial_original_refs))
         raw = raw_registered_input_v1(db, TABLE, namespace, request.growth_proposal_ref)
+        ordinary_counter=False
+        if raw is not None and set(raw)==set(GrowthIntentOriginalV1.__dataclass_fields__):
+            activation_key=AtomKey(Owner("persona",*namespace.as_tuple),"d01.persona_activation.v1","current")
+            activation=raw_head_value_v1(db,namespace,activation_key)
+            if activation is not None:
+                plan_key=AtomKey(Owner("persona",*namespace.as_tuple),"d01.persona_plan.v1",activation["plan_id"])
+                current_plan=raw_head_value_v1(db,namespace,plan_key)
+                if (current_plan is not None and current_plan["version"]==activation["plan_version"]
+                        and str(current_plan["plan_id"])+"@"+str(current_plan["version"])==activation["head_id"]):
+                    current_target=next((block for block in current_plan["blocks"] if block["block_id"]==raw["target_block"]),None)
+                    ordinary_counter=current_target is not None and current_target["kind"]!="semantic_identity"
+                    keys.extend((activation_key,plan_key))
         if raw:
             roots.extend(raw["evidence_source_refs"])
+            if ordinary_counter:
+                types.append("d07.current_interpretation.v1")
+                question_scope="d01.growth:"+raw["target_block"]+":"+raw["change_kind"]
+                current=read_graph_rows_v3(db,("token","value"),where="bot=? AND persona=? AND type_name='d07.current_interpretation.v1' AND valid=1",
+                    parameters=namespace.as_tuple,history=False,order_by=("token",),limit=129)
+                if len(current)>128:raise MissingProductionOriginalV1("complete_current_general_growth_counter_inventory")
+                for ref,encoded in current:
+                    value=json.loads(encoded)
+                    if value.get("question_key")==question_scope and value.get("current") is True:
+                        keys.append(AtomKey.from_token(ref));originals.append(ref);roots.extend(value["source_refs"])
             keys.append(AtomKey(Owner("persona", *namespace.as_tuple), "d01.persona_revision.v1", raw["proposal_id"]))
             for ref in raw["evidence_source_refs"]:
                 source = raw_head_value_v1(db, namespace, AtomKey.from_token(ref))
@@ -1426,7 +1541,9 @@ def read_plan_current_d01_operation_v1(db, *, namespace, activity_id, operation_
         for ref in (*request.trial_original_refs, request.counterevidence_query_ref):
             raw = raw_registered_input_v1(db, TABLE, namespace, ref)
             if raw:
-                roots.extend((*raw.get("evidence_source_refs", ()), *raw.get("counterevidence_source_refs", ())))
+                roots.extend(raw.get("evidence_source_refs", ()))
+                if not (ordinary_counter and ref==request.counterevidence_query_ref):
+                    roots.extend(raw.get("counterevidence_source_refs", ()))
                 originals.extend(raw.get("settled_outcome_refs", ()))
     elif operation_kind == "migrate_semantic_identity_v3" and type(request) is MigrateSemanticIdentityRequestV3:
         keys.append(request.expected_plan_head.key)
@@ -1822,3 +1939,10 @@ def semantic_counter_binding_v3(counter):
         raise MissingProductionOriginalV1("complete_current_scoped_deep_counter_binding")
     return {"question_scope":counter.question_scope,"interpretation_versions":plain_v1(counter.interpretation_versions),
         "interpretation_digests":plain_v1(counter.interpretation_digests),"source_digests":plain_v1(counter.source_digests)}
+
+
+from .d01_general_growth_v1 import (GeneralGrowthIntentOriginalV1,GeneralGrowthTrialStartV1,GeneralGrowthTrialOriginalV1)
+_GENERAL_ORIGINAL_TYPES_V1={"general_growth_intent_v1":GeneralGrowthIntentOriginalV1,
+    "general_growth_trial_start_v1":GeneralGrowthTrialStartV1,"general_growth_trial_v1":GeneralGrowthTrialOriginalV1}
+KINDS=frozenset((*KINDS,*_GENERAL_ORIGINAL_TYPES_V1))
+_ORIGINAL_TYPES.update(_GENERAL_ORIGINAL_TYPES_V1)

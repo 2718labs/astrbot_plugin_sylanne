@@ -1,4 +1,5 @@
 """Read contact content from both real paid original calls, never caller text."""
+from .contact_original_read_v3 import contact_original_point_v3
 import json
 
 from ..domains.d09.contact_content_v2 import ContactPaidModelBindingV2, prepare_contact_reviewed_content_v2
@@ -23,8 +24,8 @@ def _read_contact_paid_cost_commit_v2(db, *, namespace, prepared, paid, issuer):
     operation=paid['cost_operation_id']
     if operation!=original_model_cost_operation_id_v1(namespace,prepared.call_id):
         raise ValueError('Contact2 cost operation differs from its sealed once call')
-    row=db.execute('SELECT digest,activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations '
-        'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation)).fetchone()
+    row=contact_original_point_v3(db,table='graph_bundle_operations',columns=('digest', 'activity_id', 'effect_id', 'commit_seq', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))((*namespace.as_tuple,operation)),legacy_reader=lambda: db.execute('SELECT digest,activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations '
+        'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation)).fetchone())
     if row is None:raise ValueError('Contact2 actual cost COMMIT is absent')
     raw=json.loads(row[4])
     fields={'original_model_cost','original_intent_digest','terminal_receipt_digest','quote_id','quote_version','work_kind','accounting_attempt_id'}
@@ -43,11 +44,11 @@ def _read_contact_paid_cost_commit_v2(db, *, namespace, prepared, paid, issuer):
     from ..authority_service.v2_model_egress_wire import from_wire
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
     intent=from_wire(intent_raw, ModelEgressIntentV1)
-    quote=issuer._d02._load_quote(db,prepared.quote_id,prepared.quote_version)
-    budget=db.execute('SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? '
-        "AND operation_id=? AND phase='settle'",(*namespace.as_tuple,prepared.prepare_operation_id)).fetchone()
-    attempt=db.execute('SELECT state,attempt_id FROM graph_original_model_cost_attempts_v1 '
-        'WHERE bot=? AND persona=? AND call_id=?',(*namespace.as_tuple,prepared.call_id)).fetchone()
+    quote=issuer._d02.original_signed_quote(db,prepared.quote_id,prepared.quote_version)
+    budget=contact_original_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],'settle'))((*namespace.as_tuple,prepared.prepare_operation_id)),legacy_reader=lambda: db.execute('SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? '
+        "AND operation_id=? AND phase='settle'",(*namespace.as_tuple,prepared.prepare_operation_id)).fetchone())
+    attempt=contact_original_point_v3(db,table='graph_original_model_cost_attempts_v1',columns=('state', 'attempt_id'),key_columns=('bot', 'persona', 'call_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))((*namespace.as_tuple,prepared.call_id)),legacy_reader=lambda: db.execute('SELECT state,attempt_id FROM graph_original_model_cost_attempts_v1 '
+        'WHERE bot=? AND persona=? AND call_id=?',(*namespace.as_tuple,prepared.call_id)).fetchone())
     if (budget is None or attempt!=('committed',raw['accounting_attempt_id'])
             or raw['original_intent_digest']!=canonical_digest(asdict(intent))
             or raw['terminal_receipt_digest']!=paid['terminal_digest']
@@ -60,12 +61,12 @@ def _read_contact_paid_cost_commit_v2(db, *, namespace, prepared, paid, issuer):
             or receipt.budget_receipt_digest!=canonical_digest(asdict(_receipt_from_json(budget[0])))
             or (row[1],row[2])!=(prepared.activity_id,quote.effect_id)):
         raise ValueError('Contact2 model cost original/call/budget/identity differs')
-    event=db.execute('SELECT reads,revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? '
-        'AND session=? AND event_id=?',(*namespace.as_tuple,prepared.activity_id,operation)).fetchone()
+    event=contact_original_point_v3(db,table='graph_events',columns=('reads', 'revisions', 'epoch_revision'),key_columns=('bot', 'persona', 'session', 'event_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],_contact_values[3]))((*namespace.as_tuple,prepared.activity_id,operation)),legacy_reader=lambda: db.execute('SELECT reads,revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? '
+        'AND session=? AND event_id=?',(*namespace.as_tuple,prepared.activity_id,operation)).fetchone())
     key=AtomKey.from_token(paid['cost_ref'])
     if key.type_name!='runtime.cost_settlement' or NamespaceId.from_key(key)!=namespace:
         raise ValueError('Contact2 cost reference type/namespace differs')
-    history=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(key.token,)).fetchone()
+    history=contact_original_point_v3(db,table='graph_history',columns=('event_id', 'value', 'valid'),key_columns=('token', 'revision'),key=(lambda _contact_values: (_contact_values[0],1))((key.token,)),legacy_reader=lambda: db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(key.token,)).fetchone())
     def exact_member(encoded,revision):
         raw=json.loads(encoded)
         return (type(raw) is list and len(raw)==1 and type(raw[0]) is list and len(raw[0])==2
@@ -84,7 +85,7 @@ def _read_model_binding_v2(db, *, namespace, issuer, paid_model):
         require_contact_original_v2(db, issuer, namespace, kind, prepared.job_id)[1])
         for kind in ("prepared", "prepare_commit", "request", "call", "result", "terminal", "paid_cost"))
     cost_key = AtomKey.from_token(paid["cost_ref"])
-    row = db.execute("SELECT revision,value,valid,bot,persona FROM graph_atoms WHERE token=?", (cost_key.token,)).fetchone()
+    row = contact_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid', 'bot', 'persona'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((cost_key.token,)),legacy_reader=lambda: db.execute("SELECT revision,value,valid,bot,persona FROM graph_atoms WHERE token=?", (cost_key.token,)).fetchone())
     if row is None or row[2:] != (1, *namespace.as_tuple) or row[1] != canonical_serialize(paid["cost_value"]):
         raise ValueError("contact reviewed content lost its actual immutable paid cost")
     receipt = _read_contact_paid_cost_commit_v2(db, namespace=namespace, prepared=prepared, paid=paid, issuer=issuer)

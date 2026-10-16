@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 import sqlite3
 from typing import Iterator
@@ -43,6 +43,7 @@ class TargetGraphHeldProofV1:
     target_generation: int
     new_graph_incarnation: str
     reconciliation_digest: str | None = None
+    certificate_member_set_digest: str | None = None
 
 
 class InstalledMigrationTargetVerifierV1:
@@ -133,6 +134,19 @@ class InstalledMigrationTargetVerifierV1:
         if self._target_lease_registry is not None:
             self._target_lease_registry.require_current_target_lease_in_tx_v1(
                 db, plan=plan, permit=permit, held=held)
+        from .migration_snapshot_certificate_members_v1 import (
+            read_snapshot_certificate_members_in_tx_v1,
+            find_snapshot_certificate_member_set_in_tx_v1,
+        )
+        status = self._authority.store.status_locked(db, held.transfer_id)
+        if held.certificate_member_set_digest is None:
+            if find_snapshot_certificate_member_set_in_tx_v1(
+                    self._authority.core, db, plan.namespace, plan.transfer_id) is not None:
+                raise AuthorityUnavailable("legacy empty migration member set changed before activation")
+        else:
+            source_set, _ = read_snapshot_certificate_members_in_tx_v1(self._authority.core, db, status)
+            if source_set.set_digest != held.certificate_member_set_digest:
+                raise AuthorityUnavailable("target held certificate membership changed before activation")
         current = self._reconciliation.read_constraints_in_authority_tx_v1(
             db=db, target_db=target_db, plan=plan, permit=permit,
             deletion_head=deletion_head, execution_head=execution_head)
@@ -152,7 +166,8 @@ class InstalledMigrationTargetVerifierV1:
         This context never mutates the graph; ROLLBACK releases the fence.
         """
         with self._target_writer_lock() as target_db:
-            if not self._verify_persisted_graph_and_heads(receipt, plan, permit):
+            member_set_digest = self._verify_persisted_graph_and_heads(receipt, plan, permit)
+            if not member_set_digest:
                 raise AuthorityUnavailable("target graph proof is unavailable; HOLD")
             # TargetRecoveryReceiptV2 carries only a claimed digest for the
             # deferred external effects and costs. This gate cannot be
@@ -164,7 +179,8 @@ class InstalledMigrationTargetVerifierV1:
                     receipt.transfer_id, receipt.target_installation_id,
                     receipt.permit_token, receipt.snapshot_digest,
                     receipt.graph_commit_digest, receipt.target_generation,
-                    receipt.new_graph_incarnation, reconciliation.original_digest)
+                    receipt.new_graph_incarnation, reconciliation.original_digest,
+                    None if member_set_digest is True else member_set_digest)
             finally:
                 self._held_reconciliation.reset(token)
 
@@ -178,7 +194,7 @@ class InstalledMigrationTargetVerifierV1:
 
     def _verify_persisted_graph_and_heads(
             self, receipt: TargetRecoveryReceiptV2,
-            plan: MigrationPlanV2, permit: MigrationPermitV2) -> bool:
+            plan: MigrationPlanV2, permit: MigrationPermitV2) -> str | bool:
         if (type(receipt) is not TargetRecoveryReceiptV2
                 or type(plan) is not MigrationPlanV2
                 or type(permit) is not MigrationPermitV2
@@ -326,7 +342,40 @@ class InstalledMigrationTargetVerifierV1:
                         != tuple(item for item in source_tables
                                  if item[0] not in excluded):
                     return False
-            return True
+                from .migration_snapshot_certificate_members_v1 import (
+                    certificate_cells_from_verified_inventory_v1,
+                    read_snapshot_certificate_members_in_tx_v1,
+                    find_snapshot_certificate_member_set_in_tx_v1,
+                    MigrationSnapshotCertificateCellV1,
+                )
+                source_cells = certificate_cells_from_verified_inventory_v1(source_tables, namespace, plan.namespace)
+                target_cells = certificate_cells_from_verified_inventory_v1(target_tables, namespace, plan.namespace)
+                with self._authority.fences._frozen() as (core_db, deletion_head, execution_head, _):
+                    member_status = self._authority._status_locked(
+                        core_db, deletion_head, execution_head, plan.transfer_id)
+                    if member_status != status:
+                        return False
+                    source_set = find_snapshot_certificate_member_set_in_tx_v1(
+                        self._authority.core, core_db, plan.namespace, plan.transfer_id)
+                    if source_set is None:
+                        if source_cells or target_cells:
+                            raise AuthorityUnavailable("missing_authenticated_import_root_membership")
+                        return True
+                    source_set, certificate_members = read_snapshot_certificate_members_in_tx_v1(
+                        self._authority.core, core_db, member_status)
+                if (source_set.schema_digest != source_schema or source_set.catalogue_digest != source_catalogue):
+                    return False
+                signed_cells = tuple(sorted((MigrationSnapshotCertificateCellV1(**{
+                    field.name: getattr(member, field.name)
+                    for field in fields(MigrationSnapshotCertificateCellV1)})
+                    for member in certificate_members), key=lambda cell: (cell.certificate_table, cell.certificate_key)))
+                if source_cells != signed_cells or target_cells != signed_cells:
+                    return False
+            return source_set.set_digest
+        except AuthorityUnavailable as exc:
+            if str(exc) == "missing_authenticated_import_root_membership":
+                raise
+            return False
         except Exception:
             return False
 

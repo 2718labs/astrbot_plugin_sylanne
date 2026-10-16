@@ -192,6 +192,16 @@ def derive_current_domain_reads(
                 or atom.revision != revision or atom.value != (json.loads(encoded) if fixed is None else encoded)):
             raise ValueError("current domain projection row changed")
 
+    return _derive_verified_current_domain_reads_v1(db,projection,request,context)
+
+
+def _derive_verified_current_domain_reads_v1(db,projection,request,context):
+    """Pure typed D03/D05 decode after the actual caller verifies all atoms.
+
+    This helper neither reads another row nor issues graph/Source permission.
+    The existing public reader retains its full current census verification.
+    """
+    namespace = projection.namespace
     role_spec = next(spec for spec in context.type_specs()
                      if spec.name == "d03.role_binding")
     boundary_spec = next(spec for spec in RelationshipProvider().type_specs()

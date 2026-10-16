@@ -184,6 +184,7 @@ class LifePreparationStageV1:
     read_versions: tuple[GraphVersion, ...]
     admission_reader: object
     before_capture_stage: object | None = None
+    habit_occurrence_transition: "HabitLifeOccurrenceTransitionV1 | None" = None
 
 
 def life_ids_v1(plan):
@@ -220,8 +221,18 @@ def _record(db, *, issuer, namespace, kind, ref, operation_id, value):
     wire, digest = canonical_serialize(plain_v1(value)), canonical_digest(plain_v1(value))
     signature = issuer._signer.sign(SIGN_KIND, canonical_serialize((namespace, kind, ref, digest)))
     expected = (operation_id, wire, digest, signature)
-    old = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone()
+    from .artifact_host_result_archive_source_v3 import read_bound_artifact_archive_record_v3
+    archive,old=read_bound_artifact_archive_record_v3(db,issuer=issuer,namespace=namespace,kind=kind,ref=ref,
+        operation_id=operation_id,value=value)
+    from .current_life_numeric_paid_write_v3 import read_bound_numeric_paid_point_v3,read_bound_numeric_seal_point_v3
+    handled=archive
+    if not handled:handled,old=read_bound_numeric_seal_point_v3(db,table=TABLE,columns=("producing_operation_id","payload_json","payload_digest","signature"),
+        key_columns=("bot","persona","kind","original_ref"),key=(*namespace.as_tuple,kind,ref))
+    if not handled:handled,old=read_bound_numeric_paid_point_v3(db,table=TABLE,columns=("producing_operation_id","payload_json","payload_digest","signature"),
+        key_columns=("bot","persona","kind","original_ref"),key=(*namespace.as_tuple,kind,ref))
+    if not handled:
+        old = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+            " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone()
     if old is not None and old != expected:
         raise ValueError("Life immutable original replay differs")
     if old is None:
@@ -243,6 +254,8 @@ def _read_signed_life_payload_v1(db, *, issuer, namespace, kind, ref):
             or background_json_digest_v3(row[1], raw) != row[2]):
         raise ValueError("Life signed original bytes changed")
     issuer._signer.verify(SIGN_KIND, canonical_serialize((namespace, kind, ref, row[2])), row[3])
+    from ..authority_service.life_model_original_family_read_v3 import register_life_model_signed_body_v3
+    register_life_model_signed_body_v3(db, kind, ref, raw, row[0])
     return raw, row[0]
 
 
@@ -251,7 +264,10 @@ def _read(db, *, issuer, namespace, kind, ref):
     if saved is None:
         return None
     raw, operation_id = saved
-    if kind in {"c4_paid", "c4_result", "c4_phase_paid", "c4_phase_result"}:
+    if kind in {"c4_no_dispatch", "c4_phase_no_dispatch"}:
+        from .c09_life_originals_v1 import require_c4_no_dispatch_cost_original_commit_v1
+        require_c4_no_dispatch_cost_original_commit_v1(db, namespace=namespace, operation_id=operation_id)
+    elif kind in {"c4_paid", "c4_result", "c4_phase_paid", "c4_phase_result"}:
         from .c09_life_originals_v1 import require_c4_model_cost_original_commit_v1
         require_c4_model_cost_original_commit_v1(db, namespace=namespace, operation_id=operation_id)
     elif kind == "numeric_paid_v1":
@@ -399,6 +415,15 @@ def draft_predecessor_original_refs_v1(db, *, namespace, target):
     """Select the one original marker; this does not authenticate its body."""
     if target.mode == "create":
         return ()
+    from .artifact_borrowed_source_v3 import artifact_borrowed_recipe_index_v3
+    artifact,index=artifact_borrowed_recipe_index_v3(db,namespace=namespace,family="life_index",
+        kind="adopted_by_marker",ref=target.expected_prior_effect_marker)
+    if artifact:
+        if len(index)!=1:raise MissingProductionOriginalV1("unique_actual_adopted_draft_predecessor")
+        ref,original=index[0]
+        if original["terminal"]["binding"]["schema"]!="d11.draft-execution-binding.v1":
+            raise ValueError("predecessor marker selects another Life recipe")
+        return ref,original["terminal"]["binding"]["prepared_original_ref"]
     rows = db.execute("SELECT original_ref,payload_json FROM " + TABLE +
         " WHERE bot=? AND persona=? AND kind='adopted_life' "
         "AND json_extract(payload_json,'$.terminal.payload.readback.effect_marker')=? LIMIT 2",
@@ -542,6 +567,8 @@ def read_prepared_life_v1(db, *, binding, issuer):
     value = life_prepared_from_wire_v1(original[0])
     if value.binding != binding or value.prepare_operation_id != original[1] or value.requirements_json is None:
         raise ValueError("Life signed preparation lacks its exact actual CAS")
+    from ..authority_service.life_model_original_family_read_v3 import register_life_model_prepared_body_v3
+    register_life_model_prepared_body_v3(db, value)
     return value
 
 
@@ -570,10 +597,16 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
     if plan is None:
         raise MissingProductionOriginalV1("actual_registered_life_plan_v2")
     action, source = _plan_current(db, read, plan)
+    from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
+    require_joint_bound_action_gate_v1(db, namespace=ns, action_ref=plan.action_intent.ref, issuer=issuer, frame=frame)
+    expected_prepare_operation='d11-life-prepare:'+plan.operation_id
+    if type(plan)is RegisteredDraftFilePlanV3 and request.prepare_operation_id!=expected_prepare_operation:
+        from .d11_life_product_adapter_v1 import registered_phase_draft_prepare_operation_id_v2
+        expected_prepare_operation=registered_phase_draft_prepare_operation_id_v2(db,frame=frame,request=request,plan=plan,issuer=issuer)
     if ((frame.envelope.identity.operation_id, frame.envelope.identity.phase, frame.envelope.identity.attempt_id,
                 frame.envelope.identity.activity_id, frame.envelope.identity.effect_id) !=
                 (request.prepare_operation_id, "prepare_life", request.prepare_operation_id, plan.activity_id, plan.effect_id)
-            or request.prepare_operation_id != "d11-life-prepare:" + plan.operation_id
+            or request.prepare_operation_id != expected_prepare_operation
             or frame.envelope.parent_budget_lease_ref != plan.parent_budget_lease_ref
             or tuple(frame.envelope.authority.audience) != plan.audiences
             or any(getattr(plan, n) != installed_build[n] for n in ("algorithm_build_digest", "postcondition_build_digest"))):
@@ -661,7 +694,9 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
     evaluate_life_admission_v1(db, frame=frame, prepared=prepared, reader=admission_reader, new_work=True)
     stage = stage_result_v1(frame, "d10", "prepare_life", request, provenance={"prepared_binding": binding,
         "execution": "requires_actual_d11_once_claim_and_durable_artifact_postcondition"})
-    return LifePreparationStageV1(frame, stage, prepared, job, (job_graph_write(job),), frame.snapshot.versions, admission_reader, before_stage)
+    preparation=LifePreparationStageV1(frame, stage, prepared, job, (job_graph_write(job),), frame.snapshot.versions, admission_reader, before_stage)
+    from .d10_habit_v1 import attach_habit_life_occurrence_transition_v1
+    return attach_habit_life_occurrence_transition_v1(db,preparation=preparation,issuer=issuer)
 
 
 def record_life_preparation_after_cas_v1(db, *, issuer, preparation, graph_receipt):
@@ -702,6 +737,8 @@ def read_current_prepared_life_v1(db, *, binding, issuer, resource_issuer, now_u
     if p is None:
         raise ValueError("Life signed preparation is absent")
     if for_execution:
+        from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
+        require_joint_bound_action_gate_v1(db, namespace=binding.namespace, action_ref=p.plan.action_intent.ref, issuer=issuer)
         metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
         epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
         if metadata != (p.requirements_json, p.graph_revision) or epoch != (p.graph_epoch,):
@@ -709,7 +746,9 @@ def read_current_prepared_life_v1(db, *, binding, issuer, resource_issuer, now_u
     for frozen in p.read_rows:
         row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (frozen.ref,)).fetchone()
         if not life_read_matches_v1(frozen, row):
-            raise ValueError("Life current source/access/Owner/action closure changed")
+            from .d10_habit_v1 import require_habit_life_input_own_delta_v1
+            if not require_habit_life_input_own_delta_v1(db,prepared=p,frozen=frozen,actual=row,issuer=issuer):
+                raise ValueError("Life current source/access/Owner/action closure changed")
     from .d11_life_accounting_v1 import read_life_accounting_prepared_v1
     accounting = read_life_accounting_prepared_v1(db, binding=binding, issuer=issuer, resource_issuer=resource_issuer)
     if accounting is None or accounting.prepared_digest != p.digest:
@@ -794,4 +833,6 @@ def verify_life_preparation_in_transaction_v1(db, preparation, issuer, resource_
     key=job_graph_write(preparation.job).key
     if frame.snapshot.get(key).revision != 0 or db.execute("SELECT 1 FROM graph_atoms WHERE token=?",(key.token,)).fetchone():
         raise ValueError("Life first job projection lacks actual pre-CAS absence")
+    from .d10_habit_v1 import verify_habit_life_occurrence_transition_v1
+    verify_habit_life_occurrence_transition_v1(db,preparation=preparation,issuer=issuer)
     return preparation

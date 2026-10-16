@@ -58,6 +58,51 @@ class InstalledC09GraphApplicationV1:
         path = db.execute("PRAGMA database_list").fetchone()
         if path is None or str(Path(path[2]).resolve()) != member["resolved_path"]:
             raise AuthorityUnavailable("C09 Graph application outside current manifest")
+        if context.manifest['schema']=='sylanne3.c09.storage_manifest.v2':
+            from .c09_graph_rebase_issue_v2 import _read_issue,_verify_signature
+            from .c09_paged_recovery_facts_v2 import _BoundedReadConnectionV2
+            from ..runtime.c09_paged_sql_v2 import peek_current_c09_sql_meter_v3,require_c09_reserved_meter_v3
+            from ..runtime.c09_paged_capture_contract_v2 import (
+                GraphErasureRebaseCertificateV2,c09_paged_value_from_wire_v2,c09_paged_value_to_wire_v2)
+            from ..runtime_contracts import canonical_serialize
+            from contextlib import nullcontext
+            active=peek_current_c09_sql_meter_v3()
+            manager=self.control.reserve_control_read_v3()if active is None else nullcontext(active.budget)
+            with manager as budget:
+                meter=require_c09_reserved_meter_v3(budget)
+                # Immutable issue reads use the actual selected Core member independently
+                # of caller-owned Core/Graph transactions; no V3 basis or lock inversion.
+                core_member=next(item for item in context.manifest['members']if item['role']=='core')
+                self.control.verify_member_v1(core_member,prepared=False)
+                with closing(sqlite3.connect(Path(core_member['resolved_path']).as_uri()+'?mode=ro',
+                        uri=True,isolation_level=None))as source:
+                    source.execute('PRAGMA query_only=ON');source.execute('BEGIN')
+                    try:issue=_read_issue(_BoundedReadConnectionV2(source,meter),self.scoped.namespace,operation_id)
+                    finally:source.rollback()
+                self.control.verify_member_v1(core_member,prepared=False)
+                if issue is None:raise AuthorityUnavailable('actual current V2 Core signed Graph issue absent')
+                _verify_signature(issue,self.control._key)
+                row=meter.read_fixed_row(db,'graph_c09_rebase_certificates_v2',
+                    ('certificate_json','issue_digest'),'bot=? AND persona=? AND operation_id=?',
+                    (*self.namespace.as_tuple,operation_id))
+                if row is None:raise AuthorityUnavailable('actual current V2 Graph certificate mirror absent')
+                certificate=c09_paged_value_from_wire_v2(json.loads(row[0]),GraphErasureRebaseCertificateV2)
+                candidate=certificate.candidate;scope=candidate.scope
+                if (issue.certificate!=certificate or row[1]!=issue.issue_digest
+                        or canonical_serialize(c09_paged_value_to_wire_v2(certificate))!=row[0]
+                        or (scope.authority_id,scope.installation_id,scope.authority_namespace,
+                            scope.operation_id,scope.maintenance_generation)!=
+                           (self.control.authority_id,self.control.installation_id,self.scoped.namespace,
+                            operation_id,context.storage_generation)
+                        or scope.graph_namespace!=json.dumps(list(self.namespace.as_tuple),separators=(',',':'))
+                        or scope.old_manifest_digest!=context.manifest['prior_manifest_digest']
+                        or certificate.certificate_digest!=context.manifest['certificate_digest']
+                        or issue.issue_digest!=context.manifest['graph_issue_digest']
+                        or certificate.facts_pin_digest!=context.manifest['recovery_pin_digest']
+                        or candidate.new_incarnation!=member['incarnation_or_journal_id']
+                        or canonical_digest(candidate.tombstones)!=context.manifest['cumulative_tombstone_root']):
+                    raise AuthorityUnavailable('actual current V2 Core issue/Graph mirror/manifest original differs')
+                return certificate
         if context.manifest['schema'] == 'sylanne3.c09.storage_manifest.v3':
             from .c09_selected_history_v3 import _bounded
             from .c09_graph_rebase_issue_v2 import _read_issue, _verify_signature
@@ -144,12 +189,18 @@ class InstalledC09GraphApplicationV1:
                     db.execute("BEGIN IMMEDIATE")
                     try:
                         certificate = self._certificate_locked(db, context, operation_id)
+                        from ..runtime.c09_paged_capture_contract_v2 import GraphErasureRebaseCertificateV2
+                        if type(certificate)is GraphErasureRebaseCertificateV2:
+                            new_incarnation=certificate.candidate.new_incarnation
+                            tombstone_root=canonical_digest(certificate.candidate.tombstones)
+                        else:
+                            new_incarnation=certificate.new_incarnation;tombstone_root=certificate.tombstone_root
                         prior = self._read_ack_locked(db, operation_id)
                         if prior is not None:
                             db.rollback()
                             return prior
                         metadata, epoch = self.coordinator._v2_graph_stamp(self.namespace)
-                        if metadata.requirements.graph_incarnation != certificate.new_incarnation:
+                        if metadata.requirements.graph_incarnation != new_incarnation:
                             raise AuthorityUnavailable("C09 current Graph incarnation differs")
                         tail = tuple(self.scoped.deletion._db.execute(
                             "SELECT seq,operation_id,phase,chain_digest FROM authority_deletion_v2_tail "
@@ -159,6 +210,11 @@ class InstalledC09GraphApplicationV1:
                         certificate_operations = {row[0] for row in db.execute(
                             "SELECT operation_id FROM graph_c09_rebase_certificates_v1 WHERE bot=? AND persona=?",
                             self.namespace.as_tuple)}
+                        present_v2=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_c09_rebase_certificates_v2'").fetchone()
+                        if present_v2 is not None:
+                            certificate_operations.update(row[0]for row in db.execute(
+                                'SELECT operation_id FROM graph_c09_rebase_certificates_v2 WHERE bot=? AND persona=?',
+                                self.namespace.as_tuple))
                         if any(op not in certificate_operations for _, op, _, _ in tail):
                             raise AuthorityUnavailable("C09 cumulative operation lacks erasure certificate")
                         candidate = GraphCandidate(Event(Scope(*self.namespace.as_tuple, "c09-maintenance"),
@@ -181,8 +237,8 @@ class InstalledC09GraphApplicationV1:
                                 "namespace": list(self.namespace.as_tuple), "operation_id": operation_id,
                                 "manifest_digest": context.manifest_digest, "storage_generation": context.storage_generation,
                                 "certificate_digest": certificate.certificate_digest,
-                                "cumulative_tombstone_root": certificate.tombstone_root,
-                                "new_incarnation": certificate.new_incarnation, "deletion_seq": deletion.seq,
+                                "cumulative_tombstone_root": tombstone_root,
+                                "new_incarnation": new_incarnation, "deletion_seq": deletion.seq,
                                 "deletion_digest": deletion.digest, "deletion_epoch": closed_receipt.pending.deletion_epoch,
                                 "closed_digest": canonical_digest(closed_receipt), "cumulative_suffix_digest": canonical_digest(tail),
                                 "prior_applied_seq": state.applied_seq, "graph_receipt_digest": canonical_digest(receipt),

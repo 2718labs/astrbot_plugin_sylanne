@@ -13,6 +13,7 @@ from ..host.model_workflows_v4 import AdminModelWorkflowsV4
 from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -106,19 +107,19 @@ class InstalledNaturalModelAuthorityV2:
     """Administrator-installed model signing authority and exact mTLS reader."""
 
     d11_issuer: D11BudgetJobIssuer
-    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6
+    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8
     observer_peer: tuple[str, str]
     installation_bundle: object | None = None
 
     def __post_init__(self) -> None:
         if (type(self.d11_issuer) is not D11BudgetJobIssuer
-                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or self.workflows.natural_generation is None
                 or self.workflows.natural_review is None
                 or type(self.observer_peer) is not tuple
                 or len(self.observer_peer) != 2):
             raise AuthorityUnavailable("installed natural model authority is incomplete")
-        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
             from ..host.authority_profile import AdminInstallationBundle
             if (type(self.installation_bundle) is not AdminInstallationBundle
                     or self.installation_bundle.model_workflows is not self.workflows):

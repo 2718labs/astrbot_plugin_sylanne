@@ -24,8 +24,11 @@ def raw_life_original_v1(db, namespace, kind, ref):
     """Locate frozen read inputs; the installed stage separately authenticates them."""
     if not table_exists_v1(db, TABLE):
         return None
-    row = db.execute("SELECT payload_json FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db,table=TABLE,columns=('payload_json','payload_digest','producing_operation_id'),
+        key_columns=('bot','persona','kind','original_ref'),key=(*namespace.as_tuple,kind,ref),
+        legacy_reader=lambda:db.execute("SELECT payload_json,payload_digest,producing_operation_id FROM " + TABLE +
+            " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple,kind,ref)).fetchone())
     return None if row is None else json.loads(row[0])
 
 
@@ -35,8 +38,11 @@ def life_inventory_read_inputs_v1(db, *, namespace, scope):
     keys.extend(life_activation_read_keys_v1(db, namespace))
     inventory = {}
     for type_name in LIFE_CURRENT_TYPES:
-        rows = db.execute("SELECT token,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
-            (*namespace.as_tuple, type_name)).fetchall()
+        from .borrowed_habit_classification_v3 import read_bound_borrowed_habit_inventory_v3
+        handled,atoms=read_bound_borrowed_habit_inventory_v3(db,namespace,type_name)
+        rows=tuple((atom.key.token,canonical_serialize(atom.value),int(atom.valid))for atom in atoms)if handled else db.execute(
+            "SELECT token,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
+            (*namespace.as_tuple,type_name)).fetchall()
         if len(rows) > 128:
             raise MissingProductionOriginalV1("complete_life_input_inventory:" + type_name)
         inventory[type_name] = tuple((AtomKey.from_token(token), json.loads(encoded))
@@ -284,6 +290,8 @@ def derive_current_phase_draft_file_plan_v2(db, *, frame, request, installed_rea
         raise ValueError("phase file Body B changed its protected effect policy revision")
     quote = graph._GraphCoordinator__d02_issuer.original_signed_quote(db, body.resource_quote_ref, body.resource_quote_version)
     deadline = adoption.original_deadline_utc
+    from .d10_habit_v1 import current_habit_draft_plan_deadline_v1
+    deadline=current_habit_draft_plan_deadline_v1(db,frame=frame,selector=selector,deadline_utc=deadline,issuer=installed_readers.issuer)
     if (not frame.now_utc < _utc(deadline).timestamp() <= min(frame.envelope.deadline_utc,
             quote.valid_until_utc, _utc(scope.valid_until_utc).timestamp(), _utc(root.valid_until_utc).timestamp())
             or body_request.cpu_ceiling_ms > quote.ceiling.get("cpu_ms", 0)):
@@ -302,6 +310,28 @@ def derive_current_phase_draft_file_plan_v2(db, *, frame, request, installed_rea
     require_draft_authority_inputs_v1(db, frame=frame, plan=plan, issuer=installed_readers.issuer)
     return plan
 
+
+
+def registered_phase_draft_prepare_operation_id_v2(db,*,frame,request,plan,issuer):
+    """Recover the original phase operation from its real signed registered-plan producer."""
+    from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
+    from .d11_life_preparation_v1 import _read
+    from .domain_production_inputs_v1 import RegisterCurrentPhaseDraftFilePlanInputRequestV2
+    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from ..model_broker.artifact_draft_v1 import artifact_draft_file_ids_v2,artifact_draft_phase_original_ref_v2
+    from .d01_production_operations_v1 import CurrentDomainReadV1,MissingProductionOriginalV1
+    if type(plan)is not RegisteredDraftFilePlanV3:raise TypeError('only the actual registered phase Draft plan has this prepare operation')
+    raw=_read(db,issuer=issuer,namespace=frame.envelope.authority.namespace,kind='plan',ref=request.plan_original_ref)
+    if raw is None or canonical_digest(raw[0])!=canonical_digest(plain_v1(plan)):raise MissingProductionOriginalV1('actual_signed_registered_phase_Draft_plan')
+    original=read_adopted_domain_operation_v1(db,frame.envelope.authority.namespace,raw[1])
+    if original is None or(original['domain'],original['operation_kind'])!=('d10','input:register_artifact_phase_draft_plan_v2')or original['receipt'].status!='committed':raise MissingProductionOriginalV1('actual_phase_Draft_plan_registration_COMMIT')
+    read=CurrentDomainReadV1(frame);read.check(db);read.committed_operation(db,raw[1])
+    command=decode_typed_production_value_v1(original['payload']['request'],RegisterCurrentPhaseDraftFilePlanInputRequestV2);selector=command.selector
+    ids=artifact_draft_file_ids_v2(selector)
+    if request.plan_original_ref!=artifact_phase_draft_plan_ref_v2(selector)or raw[1]!=artifact_phase_draft_plan_registration_operation_id_v2(selector)or(plan.activity_id,plan.operation_id,plan.effect_id,plan.attempt_id,plan.execution_call_id)!=(ids['activity_id'],ids['action_operation'],ids['effect'],ids['attempt'],ids['execution_call']):raise ValueError('phase Draft preparation changed its actual registered selector, plan or original execution identity')
+    return artifact_draft_phase_original_ref_v2(selector)+':file-prepare'
 
 def read_plan_current_life_preparation_v1(db, *, namespace, activity_id, operation_kind, request, now_utc, before_capture_policy=None):
     if operation_kind != "prepare_life" or type(request) is not PrepareCurrentLifeRequestV1:

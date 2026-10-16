@@ -4,16 +4,15 @@ This is independent of C02, foreground replies and model CallPlans. Its audit
 DTO is not a capability; the paired Host must retain the issued handle and
 recheck its exact command, Graph snapshot and write fence at W01.
 """
-from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import json
-import sqlite3
 
 from .contract import AuthorityUnavailable
+from .current_authority_graph_read_v3 import authority_current_json_v3
 from .v2_contract import FencePermitV2
-from .v2_self_identity_contract import SelfIdentityCurrentRequestV1, AuthorityCurrentSelfIdentityV1
+from .v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
 from .v2_self_identity_service import AuthorityV2SelfIdentityService
 from .linux_clock_v1 import LinuxKernelClockProviderV1
 from .current_foreground_activity_v1 import _source_family_current_sql_v1
@@ -41,6 +40,8 @@ ACQUIRE_OPERATION = 'acquire_owner_source_note_task_v1'
 _VALUES_CHILD_DOMAINS = {'input:freeze_values':'d01','evaluate_values':'d01'}
 VALUES_PARENT_OPERATION = 'input:freeze_owner_source_note_values_parent_v1'
 _DOMAINS = {
+    'focus_owner_source_note_task_v1':'d07',
+    'prepare_personal_candidate_eligibility_v1':'d08', 'adopt_personal_candidate_eligibility_v1':'d08',
     CREATE_OPERATION:'d11', ACQUIRE_OPERATION:'d11', CHECKPOINT_OPERATION:'d11',
     'prepare_owner_source_note_need_v1':'d07', VALUES_PARENT_OPERATION:'d08',
     'prepare_personal_candidates_v1':'d08', 'select_personal_step_v2':'d08',
@@ -49,6 +50,8 @@ _DOMAINS = {
     'register_owner_source_note_life_outcome_v1':'d10', 'advance_life':'d10', 'settle_personal_goal':'d08',
 }
 _STEPS = {
+    'focus_owner_source_note_task_v1':('qualify',),
+    'prepare_personal_candidate_eligibility_v1':('select',), 'adopt_personal_candidate_eligibility_v1':('select',),
     'prepare_owner_source_note_need_v1':('qualify',), VALUES_PARENT_OPERATION:('values',),
     'prepare_personal_candidates_v1':('select',), 'select_personal_step_v2':('select',),
     'prepare_selected_source_note_action_v2':('prepare_action',),
@@ -151,6 +154,7 @@ def read_completed_owner_source_note_task_v1(db, *, namespace, authorization, is
     This proves historical completion plus current Life eligibility. It grants
     no new task authority and does not weaken any other authorized head.
     """
+    from .foreground_mesh_source_read_v3 import read_foreground_mesh_point_v3 as _original_graph_point_v3
     from ..runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
     from ..domains.d08.execution import _decode_goal, _decode_intent
     from ..domains.d08.personal_plan_v1 import PersonalPlanV1
@@ -173,11 +177,11 @@ def read_completed_owner_source_note_task_v1(db, *, namespace, authorization, is
         if type(key) is str: key = AtomKey.from_token(key)
         if NamespaceId.from_key(key) != namespace:
             raise AuthorityUnavailable('completed Owner task member crossed namespace')
-        row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
+        row = _original_graph_point_v3(db,table='graph_atoms',columns=('revision','value','valid'),key_columns=('token','bot','persona'),key=(key.token,*namespace.as_tuple),legacy_reader=lambda:db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone())
         if row is None or row[2] != 1:
             raise AuthorityUnavailable('completed Owner task actual member is absent or invalidated')
         versions[key] = row[0]
-        return row, json.loads(row[1])
+        return row, authority_current_json_v3(row[1])
     goal_version, goal_digest = heads['goal']; plan_version, plan_digest = heads['plan']
     goal_row, goal_raw = current(goal_version.key); plan_row, plan_raw = current(plan_version.key)
     if ((goal_row[0],canonical_digest(goal_raw),plan_row[0],canonical_digest(plan_raw)) ==
@@ -187,15 +191,13 @@ def read_completed_owner_source_note_task_v1(db, *, namespace, authorization, is
         raise AuthorityUnavailable('completed Owner task permits only its exact first settlement')
     historical = []
     for version,digest in (heads['goal'],heads['plan']):
-        old = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
-            (version.key.token,version.revision)).fetchone()
-        if old is None or old[1] != 1 or canonical_digest(json.loads(old[0])) != digest:
+        old = _original_graph_point_v3(db,table='graph_history',columns=('value','valid'),key_columns=('token','revision'),key=(version.key.token,version.revision),legacy_reader=lambda:db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(version.key.token,version.revision)).fetchone())
+        if old is None or old[1] != 1 or canonical_digest(authority_current_json_v3(old[0])) != digest:
             raise AuthorityUnavailable('completed Owner task lost its authorized original Goal/Plan')
-        historical.append(json.loads(old[0]))
-    latest = tuple(db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=2',
-        (version.key.token,)).fetchone() for version in (goal_version,plan_version))
+        historical.append(authority_current_json_v3(old[0]))
+    latest = tuple(_original_graph_point_v3(db,table='graph_history',columns=('event_id','value','valid'),key_columns=('token','revision'),key=(version.key.token,2),legacy_reader=lambda version=version:db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=2',(version.key.token,)).fetchone())for version in(goal_version,plan_version))
     if (any(row is None for row in latest) or latest[0][0] != latest[1][0]
-            or latest[0][1:] != goal_row[1:] or latest[1][1:] != plan_row[1:]):
+            or (authority_current_json_v3(latest[0][1]),latest[0][2])!=(goal_raw,goal_row[2])or(authority_current_json_v3(latest[1][1]),latest[1][2])!=(plan_raw,plan_row[2])):
         raise AuthorityUnavailable('completed Owner task Goal/Plan were not one actual settlement')
     original = read_adopted_domain_operation_v1(db,namespace,latest[0][0])
     if (original is None or (original['domain'],original['operation_kind']) != ('d08','settle_personal_goal')
@@ -338,6 +340,12 @@ class InstalledCurrentOwnerSourceNoteTaskV1:
             raise TypeError('Owner task requires the actual shared Self/C09/Owner/clock/Root composition')
         self.self_identity = self_identity_service
         self.issuer, self.clock, self.installed_bundle = budget_issuer, clock_provider, installed_bundle
+        from .current_authority_graph_read_v3 import install_authority_graph_read_controller_v3
+        install_authority_graph_read_controller_v3(self,service=self,source_location=self_identity_service._source_location)
+
+    def current_mesh_v1(self, *, credential, subject, permit, request):
+        from .current_foreground_mesh_v1 import observe_current_personal_mesh_v1
+        return observe_current_personal_mesh_v1(self,credential=credential,subject=subject,permit=permit,request=request)
 
     def current(self, *, credential, subject, permit, request):
         service = self.self_identity
@@ -351,171 +359,184 @@ class InstalledCurrentOwnerSourceNoteTaskV1:
         if operation.domain != {**_DOMAINS,**_VALUES_CHILD_DOMAINS}[request.operation_kind]:
             raise AuthorityUnavailable('Owner task operation no longer has its registered domain')
         service._fences.validate_fence(credential=credential,subject=subject,permit=permit)
-        identity_request = SelfIdentityCurrentRequestV1(permit.authority_id,service._fences.namespace,
-            request.namespace,service._installation_id,service._manifest_digest,request.operation_id,permit)
-        current_self = service.current(credential=credential,subject=subject,request=identity_request)
-        if current_self is None:
-            raise AuthorityUnavailable('Owner task independently registered Self is absent')
-        location = service._source_location.observe_business_for_fence_v1(credential=credential,subject=subject,permit=permit)
-        current_owner, observed = service._owner_storage.get_current_background_owner_authority_for_fence_v1(
-            credential=credential,subject=subject,permit=permit)
-        if observed != permit or current_owner.guard.authorization_head != current_self.owner_authorization_head:
-            raise AuthorityUnavailable('Owner task upstream Owner changed')
-        reading = self.clock()
-        now = reading.utc_seconds + reading.utc_error_seconds
-        path = Path(location.graph_db_path)
-        with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)) as db:
-            db.execute('PRAGMA query_only=ON'); db.execute('BEGIN')
-            service._source_location.require_graph_snapshot_v1(db,location,graph_db_path=path)
-            ns = request.namespace
-            if db.execute('SELECT revision FROM graph_epochs WHERE bot=? AND persona=?',ns.as_tuple).fetchone() != (current_self.graph_epoch,):
-                raise AuthorityUnavailable('Owner task Graph changed after its independent Self read')
-            versions = {}
-            def atom(ref, required=True):
-                key = AtomKey.from_token(ref) if type(ref) is str else ref
-                if NamespaceId.from_key(key) != ns:
-                    raise AuthorityUnavailable('Owner task read crossed namespace')
-                row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-                    (*ns.as_tuple,key.token)).fetchone()
-                versions[key] = 0 if row is None else row[0]
-                if required and (row is None or row[2] != 1):
-                    raise AuthorityUnavailable('Owner task current required head is absent')
-                return None if row is None else json.loads(row[1])
-            owner_key = owner_grant_key(*ns.as_tuple)
-            owner = atom(owner_key)
-            guard = ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
-                current_owner.guard.authorization_head.removeprefix('sha256:'))
-            mapping_key = self_mapping_key(ns)
-            mapping = atom(mapping_key)
-            if mapping != plain_v1(self_identity_mapping_from_current(current_self)):
-                raise AuthorityUnavailable('Owner task Graph mapping differs from current Authority Self')
-            saved = read_owner_source_note_task_authorization_v2(db,namespace=ns,
-                original_ref=request.authorization_original_ref,issuer=self.issuer)
-            if saved is None:
-                raise AuthorityUnavailable('actual signed Owner task authorization is absent')
-            auth, original = saved
-            cause = auth.cause
-            if (auth.digest != request.authorization_original_digest or cause.owner_guard != guard
-                    or cause.installation_id != service._installation_id or cause.manifest_digest != service._manifest_digest
-                    or 'workbench.create' not in owner['capabilities'] or 'consolidation' not in owner['purposes']
-                    or not set(cause.audiences) <= set(owner['audiences'])):
-                raise AuthorityUnavailable('Owner task original identity or current upstream scope changed')
-            completion = (read_completed_owner_source_note_task_v1(db,namespace=ns,authorization=auth,issuer=self.issuer)
-                if request.operation_kind == CHECKPOINT_OPERATION else None)
-            if completion is not None:
-                versions.update((version.key,version.revision) for version in completion.read_versions)
-            values = {}
-            for name, head, digest in auth.heads:
-                values[name] = atom(head.key)
-                expected_head, expected_digest = head, digest
-                if completion is not None and name in {'goal','plan'}:
-                    expected_head = completion.goal_head if name == 'goal' else completion.plan_head
-                    expected_digest = completion.goal_digest if name == 'goal' else completion.plan_digest
-                if versions[head.key] != expected_head.revision or canonical_digest(values[name]) != expected_digest:
-                    raise AuthorityUnavailable('Owner task authorized current head changed: '+name)
-            role = values['role']
-            if (role['status'] != 'active' or now < role['effective_from']
-                    or role['effective_until'] is not None and now >= role['effective_until']
-                    or values['target']['status'] != 'active'
-                    or values['goal']['state'] != ('satisfied' if completion is not None else 'active')
-                    or values['plan']['state'] != ('satisfied' if completion is not None else 'active')):
-                raise AuthorityUnavailable('Owner task current role/target/Goal/Plan is not active')
-            for purpose in ('context','consolidation'):
-                for version in _source_family_current_sql_v1(db,namespace=ns,roots=auth.source_refs,
-                        purpose=purpose,audiences=cause.audiences):
-                    versions[version.key] = version.revision
-            parent = get_budget_lease(db,cause.parent_budget_lease_ref)
-            require_budget_family_admissible(db,parent.lease_id)
-            grant = self.issuer.current_budget_grant(db,parent.lease_id)
-            policy = self.installed_bundle.installation_policy
-            if (parent.lease_id != policy.root_lease.lease_id or grant != policy.root_grant
-                    or (grant.grant_id,grant.version,canonical_digest(grant)) !=
-                        (cause.parent_grant_id,cause.parent_grant_version,cause.parent_grant_digest)
-                    or not {TASK_WORK_KIND,NOTE_WORK_KIND} <= set(grant.allowed_work_kinds)):
-                raise AuthorityUnavailable('Owner task original Root or signed grant changed')
-            self._require_body_policy(db,auth,now)
-            deadline = min(cause.original_deadline_utc,grant.valid_until_utc)
-            if not now < deadline:
-                raise AuthorityUnavailable('Owner task original absolute deadline expired')
-            ids = owner_source_note_task_ids_v1(ns,cause.owner_operation_id)
-            job_key = runtime_job_key(*ns.as_tuple,ids['activity_id'],ids['job_id'])
-            if request.task_job_ref != job_key.token or request.expected_cancel_generation != 0:
-                raise AuthorityUnavailable('Owner task selected another job or a cancelled generation')
-            job_value = atom(job_key,required=request.expected_job_revision>0)
-            if versions[job_key] != request.expected_job_revision:
-                raise AuthorityUnavailable('Owner task expected current job revision changed')
-            responsibility_ref = responsibility_digest = current_job_digest = None
-            if request.operation_kind == CREATE_OPERATION:
-                body = CreateOwnerSourceNoteTaskRequestV1(auth.original_ref)
-                if (job_value is not None or request.expected_job_revision != 0
-                        or request.operation_id != ids['create_operation_id']
-                        or request.request_digest != owner_task_typed_command_digest_v1(operation,body)):
-                    raise AuthorityUnavailable('Owner task creation differs from its one actual authorized cause')
-            else:
-                if job_value is None:
-                    raise AuthorityUnavailable('Owner task continuation has no actual current job')
-                job = get_job(db,job_key.name)
-                cont = decode_typed_production_value_v1(job.continuation,OwnerSourceNoteTaskContinuationV2)
-                if (job_graph_write(job).value != job_value or job.work_kind != TASK_WORK_KIND
-                        or job.operation_id != ids['create_operation_id'] or job.activity_id != ids['activity_id']
-                        or job.effect_id is not None or job.budget_ref != parent.lease_id or job.cancel_epoch
-                        or cont.cancel_generation or cont.authorization_original_ref != auth.original_ref
-                        or cont.authorization_original_digest != auth.digest
-                        or cont.cause_original_ref != cause.original_ref or cont.cause_original_digest != cause.digest
-                        or cont.source_refs != auth.source_refs
-                        or job.phase in {'completed','cancelled','failed','draining','pending_confirmation'}
-                        or now >= datetime.fromisoformat(job.deadline_utc.replace('Z','+00:00')).timestamp()):
-                    raise AuthorityUnavailable('Owner task SQL/Graph job or immutable original scope changed')
-                responsibility_ref = ids['responsibility_ref']
-                saved_responsibility = _read(db,issuer=self.issuer,namespace=ns,kind=RESPONSIBILITY_KIND,ref=responsibility_ref)
-                if saved_responsibility is None:
-                    raise AuthorityUnavailable('Owner task actual signed Self responsibility is absent')
-                responsibility = decode_typed_production_value_v1(saved_responsibility[0],OwnerSourceNoteTaskResponsibilityV2)
-                expected = OwnerSourceNoteTaskResponsibilityV2(ns,service._installation_id,cause.owner_operation_id,
-                    cause.original_ref,cause.digest,auth.original_ref,auth.digest,guard,GraphVersion(mapping_key,versions[mapping_key]),
-                    canonical_digest(mapping),current_self.self_entity_ref,parent.lease_id,cause.original_deadline_utc,auth.source_refs)
-                responsibility_digest = responsibility.digest
-                if (responsibility != expected or saved_responsibility[1] != job.operation_id
-                        or (cont.responsibility_ref,cont.responsibility_digest) != (responsibility_ref,responsibility_digest)):
-                    raise AuthorityUnavailable('Owner task responsibility is not its actual fixed Self and Owner cause')
-                if request.operation_kind == ACQUIRE_OPERATION:
-                    if job.phase != 'queued' or job.lease_holder is not None:
-                        raise AuthorityUnavailable('Owner task acquire requires its actual queued unleased job')
-                else:
-                    if (job.phase != 'running' or job.lease_holder != current_self.self_entity_ref
-                            or job.lease_expires_utc is None
-                            or now >= datetime.fromisoformat(job.lease_expires_utc.replace('Z','+00:00')).timestamp()):
-                        raise AuthorityUnavailable('Owner task step requires its actual live Self worker')
-                    if request.operation_kind != CHECKPOINT_OPERATION and (cont.pending_effect_refs
-                            or cont.step not in _STEPS[request.operation_kind]):
-                        raise AuthorityUnavailable('Owner task step cannot bypass an unresolved original effect or task phase')
-                current_job_digest = canonical_digest(job)
-                if type(request) is OwnerTaskActivityValuesChildRequestV1:
-                    from ..runtime.owner_source_note_values_v1 import qualify_owner_task_values_child_in_core_v1
-                    parent, _ = qualify_owner_task_values_child_in_core_v1(db,request=request,authorization=auth,
-                        job=job,current_self=current_self,owner_guard=guard,now_utc=now,issuer=self.issuer)
-                    versions.update((head.key,head.revision) for head,_,_ in parent.hard_heads)
-                    deadline=min(deadline,parent.original_deadline_utc)
-                if request.operation_kind in {'prepare_source_note_body','register_owner_source_note_life_plan_v1',
-                        'prepare_life','register_owner_source_note_life_outcome_v1','advance_life','settle_personal_goal'}:
-                    from ..runtime.owner_source_note_life_v1 import qualify_owner_source_note_life_command_v1
-                    command_heads=qualify_owner_source_note_life_command_v1(db,authorization=auth,request=request,
-                        issuer=self.issuer,now_utc=now,actor_ref=current_self.self_entity_ref)
-                    versions.update((head.key,head.revision) for head in command_heads)
-            epochs = db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',ns.as_tuple).fetchone()
-            result = OwnerTaskActivityEvidenceV1(request,current_self,guard,auth,
-                tuple(GraphVersion(key,revision) for key,revision in sorted(versions.items(),key=lambda row:row[0].token)),
-                QueryEpoch(ns,'namespace',current_self.graph_epoch),owner_task_allowed_write_domains_v1(request.operation_kind),
-                datetime.fromtimestamp(deadline,timezone.utc).isoformat().replace('+00:00','Z'),
-                *epochs,now,current_job_digest,responsibility_ref,responsibility_digest,completion)
-        after = service.current(credential=credential,subject=subject,request=identity_request)
-        if after != current_self:
-            raise AuthorityUnavailable('Owner task independent Self/Owner/C09/Graph observation changed')
+        from .original_foreground_source_read_v3 import observe_original_activity_current_v3
+        result=observe_original_activity_current_v3(self,credential=credential,subject=subject,permit=permit,request=request)
         service._fences.validate_fence(credential=credential,subject=subject,permit=permit)
         final_clock = self.clock()
+        deadline = datetime.fromisoformat(result.valid_until_utc.replace('Z', '+00:00')).timestamp()
         if final_clock.utc_seconds + final_clock.utc_error_seconds >= deadline:
             raise AuthorityUnavailable('Owner task expired during its actual current qualification')
         return result, permit
+
+    def _read_current_graph_v3(self, db, *, credential, subject, permit, request, current_self, current_owner, location, now):
+        service = self.self_identity
+        from ..runtime.domain_production_registry_v1 import installed_operation_v1
+        operation = installed_operation_v1(request.operation_kind)
+        path = Path(location.graph_db_path)
+        from .current_authority_graph_read_v3 import authority_current_json_v3
+        from .foreground_mesh_source_read_v3 import read_foreground_mesh_point_v3 as read_authority_current_point_v3
+        ns = request.namespace
+        if db.execute('SELECT revision FROM graph_epochs WHERE bot=? AND persona=?',ns.as_tuple).fetchone() != (current_self.graph_epoch,):
+            raise AuthorityUnavailable('Owner task Graph changed after its independent Self read')
+        versions = {}
+        def atom(ref, required=True):
+            key = AtomKey.from_token(ref) if type(ref) is str else ref
+            if NamespaceId.from_key(key) != ns:
+                raise AuthorityUnavailable('Owner task read crossed namespace')
+            row = read_authority_current_point_v3(db, table="graph_atoms", columns=("revision","value","valid"),
+                key_columns=("token","bot","persona"), key=(key.token,*ns.as_tuple),
+                legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+                    (*ns.as_tuple,key.token)).fetchone())
+            versions[key] = 0 if row is None else row[0]
+            if required and (row is None or row[2] != 1):
+                raise AuthorityUnavailable('Owner task current required head is absent')
+            return None if row is None else authority_current_json_v3(row[1])
+        owner_key = owner_grant_key(*ns.as_tuple)
+        owner = atom(owner_key)
+        guard = ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
+            current_owner.guard.authorization_head.removeprefix('sha256:'))
+        mapping_key = self_mapping_key(ns)
+        mapping = atom(mapping_key)
+        if mapping != plain_v1(self_identity_mapping_from_current(current_self)):
+            raise AuthorityUnavailable('Owner task Graph mapping differs from current Authority Self')
+        saved = read_owner_source_note_task_authorization_v2(db,namespace=ns,
+            original_ref=request.authorization_original_ref,issuer=self.issuer)
+        if saved is None:
+            raise AuthorityUnavailable('actual signed Owner task authorization is absent')
+        auth, original = saved
+        cause = auth.cause
+        if (auth.digest != request.authorization_original_digest or cause.owner_guard != guard
+                or cause.installation_id != service._installation_id or cause.manifest_digest != service._manifest_digest
+                or 'workbench.create' not in owner['capabilities'] or 'consolidation' not in owner['purposes']
+                or not set(cause.audiences) <= set(owner['audiences'])):
+            raise AuthorityUnavailable('Owner task original identity or current upstream scope changed')
+        completion = (read_completed_owner_source_note_task_v1(db,namespace=ns,authorization=auth,issuer=self.issuer)
+            if request.operation_kind == CHECKPOINT_OPERATION else None)
+        if completion is not None:
+            versions.update((version.key,version.revision) for version in completion.read_versions)
+        values = {}
+        for name, head, digest in auth.heads:
+            values[name] = atom(head.key)
+            expected_head, expected_digest = head, digest
+            if completion is not None and name in {'goal','plan'}:
+                expected_head = completion.goal_head if name == 'goal' else completion.plan_head
+                expected_digest = completion.goal_digest if name == 'goal' else completion.plan_digest
+            if versions[head.key] != expected_head.revision or canonical_digest(values[name]) != expected_digest:
+                raise AuthorityUnavailable('Owner task authorized current head changed: '+name)
+        role = values['role']
+        if (role['status'] != 'active' or now < role['effective_from']
+                or role['effective_until'] is not None and now >= role['effective_until']
+                or values['target']['status'] != 'active'
+                or values['goal']['state'] != ('satisfied' if completion is not None else 'active')
+                or values['plan']['state'] != ('satisfied' if completion is not None else 'active')):
+            raise AuthorityUnavailable('Owner task current role/target/Goal/Plan is not active')
+        for purpose in ('context','consolidation'):
+            for version in _source_family_current_sql_v1(db,namespace=ns,roots=auth.source_refs,
+                    purpose=purpose,audiences=cause.audiences):
+                versions[version.key] = version.revision
+        parent = get_budget_lease(db,cause.parent_budget_lease_ref)
+        require_budget_family_admissible(db,parent.lease_id)
+        grant = self.issuer.current_budget_grant(db,parent.lease_id)
+        policy = self.installed_bundle.installation_policy
+        if (parent.lease_id != policy.root_lease.lease_id or grant != policy.root_grant
+                or (grant.grant_id,grant.version,canonical_digest(grant)) !=
+                    (cause.parent_grant_id,cause.parent_grant_version,cause.parent_grant_digest)
+                or not {TASK_WORK_KIND,NOTE_WORK_KIND} <= set(grant.allowed_work_kinds)):
+            raise AuthorityUnavailable('Owner task original Root or signed grant changed')
+        self._require_body_policy(db,auth,now)
+        deadline = min(cause.original_deadline_utc,grant.valid_until_utc)
+        if not now < deadline:
+            raise AuthorityUnavailable('Owner task original absolute deadline expired')
+        ids = owner_source_note_task_ids_v1(ns,cause.owner_operation_id)
+        job_key = runtime_job_key(*ns.as_tuple,ids['activity_id'],ids['job_id'])
+        if request.task_job_ref != job_key.token or request.expected_cancel_generation != 0:
+            raise AuthorityUnavailable('Owner task selected another job or a cancelled generation')
+        job_value = atom(job_key,required=request.expected_job_revision>0)
+        if versions[job_key] != request.expected_job_revision:
+            raise AuthorityUnavailable('Owner task expected current job revision changed')
+        responsibility_ref = responsibility_digest = current_job_digest = None
+        if request.operation_kind == CREATE_OPERATION:
+            body = CreateOwnerSourceNoteTaskRequestV1(auth.original_ref)
+            if (job_value is not None or request.expected_job_revision != 0
+                    or request.operation_id != ids['create_operation_id']
+                    or request.request_digest != owner_task_typed_command_digest_v1(operation,body)):
+                raise AuthorityUnavailable('Owner task creation differs from its one actual authorized cause')
+        else:
+            if job_value is None:
+                raise AuthorityUnavailable('Owner task continuation has no actual current job')
+            job = get_job(db,job_key.name)
+            cont = decode_typed_production_value_v1(job.continuation,OwnerSourceNoteTaskContinuationV2)
+            if (job_graph_write(job).value != job_value or job.work_kind != TASK_WORK_KIND
+                    or job.operation_id != ids['create_operation_id'] or job.activity_id != ids['activity_id']
+                    or job.effect_id is not None or job.budget_ref != parent.lease_id or job.cancel_epoch
+                    or cont.cancel_generation or cont.authorization_original_ref != auth.original_ref
+                    or cont.authorization_original_digest != auth.digest
+                    or cont.cause_original_ref != cause.original_ref or cont.cause_original_digest != cause.digest
+                    or cont.source_refs != auth.source_refs
+                    or job.phase in {'completed','cancelled','failed','draining','pending_confirmation'}
+                    or now >= datetime.fromisoformat(job.deadline_utc.replace('Z','+00:00')).timestamp()):
+                raise AuthorityUnavailable('Owner task SQL/Graph job or immutable original scope changed')
+            responsibility_ref = ids['responsibility_ref']
+            saved_responsibility = _read(db,issuer=self.issuer,namespace=ns,kind=RESPONSIBILITY_KIND,ref=responsibility_ref)
+            if saved_responsibility is None:
+                raise AuthorityUnavailable('Owner task actual signed Self responsibility is absent')
+            responsibility = decode_typed_production_value_v1(saved_responsibility[0],OwnerSourceNoteTaskResponsibilityV2)
+            expected = OwnerSourceNoteTaskResponsibilityV2(ns,service._installation_id,cause.owner_operation_id,
+                cause.original_ref,cause.digest,auth.original_ref,auth.digest,guard,GraphVersion(mapping_key,versions[mapping_key]),
+                canonical_digest(mapping),current_self.self_entity_ref,parent.lease_id,cause.original_deadline_utc,auth.source_refs)
+            responsibility_digest = responsibility.digest
+            if (responsibility != expected or saved_responsibility[1] != job.operation_id
+                    or (cont.responsibility_ref,cont.responsibility_digest) != (responsibility_ref,responsibility_digest)):
+                raise AuthorityUnavailable('Owner task responsibility is not its actual fixed Self and Owner cause')
+            if request.operation_kind == ACQUIRE_OPERATION:
+                if job.phase != 'queued' or job.lease_holder is not None:
+                    raise AuthorityUnavailable('Owner task acquire requires its actual queued unleased job')
+            else:
+                if (job.phase != 'running' or job.lease_holder != current_self.self_entity_ref
+                        or job.lease_expires_utc is None
+                        or now >= datetime.fromisoformat(job.lease_expires_utc.replace('Z','+00:00')).timestamp()):
+                    raise AuthorityUnavailable('Owner task step requires its actual live Self worker')
+                if request.operation_kind != CHECKPOINT_OPERATION and (cont.pending_effect_refs
+                        or cont.step not in _STEPS[request.operation_kind]):
+                    raise AuthorityUnavailable('Owner task step cannot bypass an unresolved original effect or task phase')
+            current_job_digest = canonical_digest(job)
+            if type(request) is OwnerTaskActivityValuesChildRequestV1:
+                from ..runtime.owner_source_note_values_v1 import qualify_owner_task_values_child_in_core_v1
+                parent, _ = qualify_owner_task_values_child_in_core_v1(db,request=request,authorization=auth,
+                    job=job,current_self=current_self,owner_guard=guard,now_utc=now,issuer=self.issuer)
+                versions.update((head.key,head.revision) for head,_,_ in parent.hard_heads)
+                deadline=min(deadline,parent.original_deadline_utc)
+            if request.operation_kind == 'focus_owner_source_note_task_v1':
+                from ..runtime.d07_life_project_focus_v1 import FocusOwnerSourceNoteTaskRequestV1, owner_task_focus_operation_id_v1
+                command = FocusOwnerSourceNoteTaskRequestV1(auth.original_ref,job_key.token)
+                if (request.operation_id != owner_task_focus_operation_id_v1(ns,auth)
+                        or request.request_digest != owner_task_typed_command_digest_v1(operation,command)):
+                    raise AuthorityUnavailable('Owner Focus changed its actual signed task and finite recipe')
+            if request.operation_kind in {'prepare_personal_candidate_eligibility_v1','adopt_personal_candidate_eligibility_v1'}:
+                from ..runtime.personal_candidate_eligibility_v1 import actual_owner_personal_candidates_v1, PersonalEligibilityRequestV1, personal_eligibility_request_id_v1
+                base = actual_owner_personal_candidates_v1(db, namespace=ns, authorization=auth, job=job, issuer=self.issuer)
+                body = PersonalEligibilityRequestV1(base)
+                expected_id = personal_eligibility_request_id_v1(db, ns, base,
+                    prepare=request.operation_kind=='prepare_personal_candidate_eligibility_v1')
+                if request.operation_id != expected_id or request.request_digest != owner_task_typed_command_digest_v1(operation, body):
+                    raise AuthorityUnavailable('Owner eligibility changed its exact signed task/Need/candidates recipe')
+            if request.operation_kind in {'prepare_source_note_body','register_owner_source_note_life_plan_v1',
+                    'prepare_life','register_owner_source_note_life_outcome_v1','advance_life','settle_personal_goal'}:
+                from ..runtime.owner_source_note_life_v1 import qualify_owner_source_note_life_command_v1
+                command_heads=qualify_owner_source_note_life_command_v1(db,authorization=auth,request=request,
+                    issuer=self.issuer,now_utc=now,actor_ref=current_self.self_entity_ref)
+                versions.update((head.key,head.revision) for head in command_heads)
+        epochs = db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',ns.as_tuple).fetchone()
+        result = OwnerTaskActivityEvidenceV1(request,current_self,guard,auth,
+            tuple(GraphVersion(key,revision) for key,revision in sorted(versions.items(),key=lambda row:row[0].token)),
+            QueryEpoch(ns,'namespace',current_self.graph_epoch),owner_task_allowed_write_domains_v1(request.operation_kind),
+            datetime.fromtimestamp(deadline,timezone.utc).isoformat().replace('+00:00','Z'),
+            *epochs,now,current_job_digest,responsibility_ref,responsibility_digest,completion)
+        return result
+
+    def current_mesh_v1(self, *, credential, subject, permit, request):
+        from .current_foreground_mesh_v1 import observe_current_personal_mesh_v1
+        return observe_current_personal_mesh_v1(self, credential=credential, subject=subject, permit=permit, request=request)
 
     def _require_body_policy(self, db, auth, now):
         # The signed Owner W01 original committed the verified Body policy; this

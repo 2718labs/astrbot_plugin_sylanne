@@ -313,55 +313,66 @@ class InstalledD12TargetOwnerAdmissionServiceV1:
 
     def get_current_owner_authority_for_fence_v1(self, *, credential, subject, permit,
             actor, session_token, session_request):
-        if (type(permit) is not FencePermitV2 or permit.operation not in {"read", "write"}
-                or permit.holder != self.holder or permit.namespace != self.namespace
-                or permit.subject != subject):
-            raise AuthorityUnavailable("current target content fence required")
-        self.fences._require_permit(credential=credential, subject=subject, permit=permit)
-        with self.fences._frozen() as (db, deletion, execution, _):
-            anchor = self.fences._current_locked(db, deletion, execution,
-                holder=self.holder, generation=permit.generation)
-            if anchor != permit.pinned_anchor:
-                raise AuthorityUnavailable("target Owner fence anchor changed")
-            self.fences.fences.validate_fence_locked(db, permit=permit, subject=subject, current_anchor=anchor)
-            actor_binding = self._current_session(db, actor=actor, token=session_token, request=session_request)
-            owner_head = self.tickets.current_migration_head_in_tx(db, authority_namespace=self.namespace)
-            if (owner_head is None or owner_head.state != "active"
-                    or owner_head.issue_operation.principal != session_request.principal):
-                raise AuthorityUnavailable("target session is not the original migration Owner")
-            history = self._current_transfer(db, generation=permit.generation)
-            metadata, grant_revision, grant_digest, imported, continuation = self._read_graph(
-                history=history, owner_head=owner_head, anchor=anchor)
-            lifecycle_head, lifecycle_material = self._lifecycle_relocation_material(db, history)
-            material = dict(namespace=self.namespace_id, authority_namespace=self.namespace,
-                transfer_id=history.plan.transfer_id, source_installation_id=history.plan.source_installation_id,
-                target_installation_id=self.installation_id, target_holder=self.holder,
-                source_grant_ref=owner_grant_key(*self.namespace_id.as_tuple).token,
-                source_grant_revision=grant_revision, source_grant_digest=grant_digest,
-                source_owner_guard=owner_head.guard, principal=session_request.principal,
-                target_actor_id=actor, target_actor_revision=actor_binding.revision,
-                target_credential_id=session_request.credential_id,
-                target_credential_epoch=session_request.credential_epoch,
-                activation_generation=anchor.activation_generation, revocation_epoch=anchor.revocation_epoch,
-                graph_incarnation=metadata.requirements.graph_incarnation,
-                source_snapshot_digest=history.source_snapshot.snapshot_digest,
-                target_import_digest=imported.graph_commit_digest,
-                activation_receipt_digest=digest(history.receipts[-1]),
-                policy_ref=self.policy_ref, policy_digest=self.policy_digest,
-                storage_continuation_ref=None if continuation is None else continuation.original_ref,
-                storage_continuation_digest=None if continuation is None else continuation.original_digest,
-                schema=SCHEMA, **lifecycle_material)
-            material["original_ref"] = "d12targetowner:" + digest(material)[7:]
-            material["original_digest"] = digest(material)
-            original = D12TargetOwnerAdmissionV1(**material)
-            values = (self.namespace, self.installation_id, original.original_ref,
-                      original.original_digest, canonical_serialize(asdict(original)))
-            db.execute("INSERT OR IGNORE INTO authority_d12_target_owner_admissions_v1 VALUES(?,?,?,?,?)", values)
-            if db.execute("SELECT * FROM authority_d12_target_owner_admissions_v1 WHERE original_ref=?",
-                          (original.original_ref,)).fetchone() != values:
-                raise AuthorityUnavailable("target Owner admission original identity conflict")
-            self._commit_lifecycle_relocation(db, lifecycle_head, original)
-            return D12CurrentOwnerAuthorityV1(owner_head.guard, original), permit
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            if (type(permit) is not FencePermitV2 or permit.operation not in {"read", "write"}
+                    or permit.holder != self.holder or permit.namespace != self.namespace
+                    or permit.subject != subject):
+                raise AuthorityUnavailable("current target content fence required")
+            self.fences._require_permit(credential=credential, subject=subject, permit=permit)
+            with self.fences._frozen() as (db, deletion, execution, _):
+                anchor = self.fences._current_locked(db, deletion, execution,
+                    holder=self.holder, generation=permit.generation)
+                if anchor != permit.pinned_anchor:
+                    raise AuthorityUnavailable("target Owner fence anchor changed")
+                self.fences.fences.validate_fence_locked(db, permit=permit, subject=subject, current_anchor=anchor)
+                actor_binding = self._current_session(db, actor=actor, token=session_token, request=session_request)
+                owner_head = self.tickets.current_migration_head_in_tx(db, authority_namespace=self.namespace)
+                if (owner_head is None or owner_head.state != "active"
+                        or owner_head.issue_operation.principal != session_request.principal):
+                    raise AuthorityUnavailable("target session is not the original migration Owner")
+                history = self._current_transfer(db, generation=permit.generation)
+            from .owner_location_read_v3 import prepare_current_owner_location_for_target_public_fence_v3
+            metadata,grant_revision,grant_digest,imported,continuation=prepare_current_owner_location_for_target_public_fence_v3(
+                self,credential=credential,subject=subject,permit=permit,head=owner_head,history=history,
+                actor=actor,session_token=session_token,session_request=session_request)
+            with self.fences._frozen() as (db,deletion,execution,_):
+                current=self.fences._current_locked(db,deletion,execution,holder=self.holder,generation=permit.generation)
+                self.fences.fences.validate_fence_locked(db,permit=permit,subject=subject,current_anchor=current)
+                if (current!=anchor or self.tickets.current_migration_head_in_tx(db,authority_namespace=self.namespace)!=owner_head
+                        or self._current_transfer(db,generation=permit.generation)!=history
+                        or self._current_session(db,actor=actor,token=session_token,request=session_request)!=actor_binding):
+                    raise AuthorityUnavailable('Target public Owner changed after complete metadata location read')
+                lifecycle_head, lifecycle_material = self._lifecycle_relocation_material(db, history)
+                material = dict(namespace=self.namespace_id, authority_namespace=self.namespace,
+                    transfer_id=history.plan.transfer_id, source_installation_id=history.plan.source_installation_id,
+                    target_installation_id=self.installation_id, target_holder=self.holder,
+                    source_grant_ref=owner_grant_key(*self.namespace_id.as_tuple).token,
+                    source_grant_revision=grant_revision, source_grant_digest=grant_digest,
+                    source_owner_guard=owner_head.guard, principal=session_request.principal,
+                    target_actor_id=actor, target_actor_revision=actor_binding.revision,
+                    target_credential_id=session_request.credential_id,
+                    target_credential_epoch=session_request.credential_epoch,
+                    activation_generation=anchor.activation_generation, revocation_epoch=anchor.revocation_epoch,
+                    graph_incarnation=metadata.requirements.graph_incarnation,
+                    source_snapshot_digest=history.source_snapshot.snapshot_digest,
+                    target_import_digest=imported.graph_commit_digest,
+                    activation_receipt_digest=digest(history.receipts[-1]),
+                    policy_ref=self.policy_ref, policy_digest=self.policy_digest,
+                    storage_continuation_ref=None if continuation is None else continuation.original_ref,
+                    storage_continuation_digest=None if continuation is None else continuation.original_digest,
+                    schema=SCHEMA, **lifecycle_material)
+                material["original_ref"] = "d12targetowner:" + digest(material)[7:]
+                material["original_digest"] = digest(material)
+                original = D12TargetOwnerAdmissionV1(**material)
+                values = (self.namespace, self.installation_id, original.original_ref,
+                          original.original_digest, canonical_serialize(asdict(original)))
+                db.execute("INSERT OR IGNORE INTO authority_d12_target_owner_admissions_v1 VALUES(?,?,?,?,?)", values)
+                if db.execute("SELECT * FROM authority_d12_target_owner_admissions_v1 WHERE original_ref=?",
+                              (original.original_ref,)).fetchone() != values:
+                    raise AuthorityUnavailable("target Owner admission original identity conflict")
+                self._commit_lifecycle_relocation(db, lifecycle_head, original)
+                return D12CurrentOwnerAuthorityV1(owner_head.guard, original), permit
 
     def get_current_background_owner_authority_for_fence_v1(self, *, credential, subject, permit):
         """Read installed background authority after a genuine target admission.
@@ -370,26 +381,36 @@ class InstalledD12TargetOwnerAdmissionServiceV1:
         actor, key pairing, credential epoch or target namespace invalidates it.
         Missing a prior freshly signed target admission is an explicit HOLD.
         """
-        if (type(permit) is not FencePermitV2 or permit.operation not in {"read", "write"}
-                or permit.holder != self.holder or permit.namespace != self.namespace
-                or permit.subject != subject):
-            raise AuthorityUnavailable("current installed target background fence required")
-        self.fences._require_permit(credential=credential, subject=subject, permit=permit)
-        with self.fences._frozen() as (db, deletion, execution, _):
-            anchor = self.fences._current_locked(db, deletion, execution,
-                holder=self.holder, generation=permit.generation)
-            if anchor != permit.pinned_anchor:
-                raise AuthorityUnavailable("target background fence anchor changed")
-            self.fences.fences.validate_fence_locked(db, permit=permit, subject=subject, current_anchor=anchor)
-            head = self.tickets.current_migration_head_in_tx(db, authority_namespace=self.namespace)
-            if head is None or head.state != "active":
-                raise AuthorityUnavailable("original background Owner head is not active")
-            history = self._current_transfer(db, generation=permit.generation)
-            metadata, revision, grant_digest, imported, continuation = self._read_graph(history=history, owner_head=head, anchor=anchor)
-            current = self._current_background_identity_for_verified_location_in_tx_v1(
-                db, head=head, history=history, metadata=metadata, revision=revision,
-                grant_digest=grant_digest, imported=imported, continuation=continuation, anchor=anchor)
-            return current, permit
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            if (type(permit) is not FencePermitV2 or permit.operation not in {"read", "write"}
+                    or permit.holder != self.holder or permit.namespace != self.namespace
+                    or permit.subject != subject):
+                raise AuthorityUnavailable("current installed target background fence required")
+            self.fences._require_permit(credential=credential, subject=subject, permit=permit)
+            with self.fences._frozen() as (db, deletion, execution, _):
+                anchor = self.fences._current_locked(db, deletion, execution,
+                    holder=self.holder, generation=permit.generation)
+                if anchor != permit.pinned_anchor:
+                    raise AuthorityUnavailable("target background fence anchor changed")
+                self.fences.fences.validate_fence_locked(db, permit=permit, subject=subject, current_anchor=anchor)
+                head = self.tickets.current_migration_head_in_tx(db, authority_namespace=self.namespace)
+                if head is None or head.state != "active":
+                    raise AuthorityUnavailable("original background Owner head is not active")
+                history = self._current_transfer(db, generation=permit.generation)
+            from .owner_location_read_v3 import prepare_current_owner_location_for_target_background_fence_v3
+            metadata,revision,grant_digest,imported,continuation=prepare_current_owner_location_for_target_background_fence_v3(
+                self,credential=credential,subject=subject,permit=permit,head=head,history=history)
+            with self.fences._frozen() as (db,deletion,execution,_):
+                current_anchor=self.fences._current_locked(db,deletion,execution,holder=self.holder,generation=permit.generation)
+                self.fences.fences.validate_fence_locked(db,permit=permit,subject=subject,current_anchor=current_anchor)
+                if (current_anchor!=anchor or self.tickets.current_migration_head_in_tx(db,authority_namespace=self.namespace)!=head
+                        or self._current_transfer(db,generation=permit.generation)!=history):
+                    raise AuthorityUnavailable('Target background Owner changed after complete metadata location read')
+                current = self._current_background_identity_for_verified_location_in_tx_v1(
+                    db, head=head, history=history, metadata=metadata, revision=revision,
+                    grant_digest=grant_digest, imported=imported, continuation=continuation, anchor=anchor)
+                return current, permit
 
     def _current_background_identity_for_verified_location_in_tx_v1(self, db, *, head,
             history, metadata, revision, grant_digest, imported, continuation, anchor):

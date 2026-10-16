@@ -47,34 +47,41 @@ def artifact_task_observer_read_inputs_v1(db,namespace,goal_ref):
     """Finite selectors only; the stage reconstructs every original independently."""
     from .d11_life_preparation_v1 import TABLE
     from .d10_project_checkpoint_v1 import project_effect_read_inputs_v1
-    row=db.execute("SELECT value FROM graph_atoms WHERE token=? AND bot=? AND persona=?",(goal_ref,*namespace.as_tuple)).fetchone()
+    from .domain_background_read_v3 import background_graph_head_v3,background_json_loads_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    def original(kind,ref):
+        return _producer_original_point_v3(db,table=TABLE,columns=("payload_json",),
+            key_columns=("bot","persona","kind","original_ref"),key=(*namespace.as_tuple,kind,ref),
+            legacy_reader=lambda:db.execute("SELECT payload_json FROM "+TABLE+
+                " WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*namespace.as_tuple,kind,ref)).fetchone())
+    row=background_graph_head_v3(db,namespace,goal_ref)
     if row is None:return (),(),()
-    predicate=json.loads(row[0])["satisfaction_predicate"]
+    predicate=background_json_loads_v3(row[1])["satisfaction_predicate"]
     if (predicate["kind"],predicate["observation_provider"])!=("domain_state","d08.artifact_task_objective.v1"):
         return (),(),()
     ref=dict(predicate["parameters"])["objective_ref"]
-    objective=db.execute("SELECT payload_json FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='artifact_task_objective' AND original_ref=?",(*namespace.as_tuple,ref)).fetchone()
+    objective=original("artifact_task_objective",ref)
     if objective is None:return (),(),(ref,)
-    obj=json.loads(objective[0]);key=project_checkpoint_key_v1(namespace,obj["project_ref"])
+    obj=background_json_loads_v3(objective[0]);key=project_checkpoint_key_v1(namespace,obj["project_ref"])
     keys=[key];roots=[];originals=[ref]
-    cp=db.execute("SELECT value FROM graph_atoms WHERE token=? AND bot=? AND persona=?",(key.token,*namespace.as_tuple)).fetchone()
+    cp=background_graph_head_v3(db,namespace,key)
     if cp is not None:
-        for work_ref in json.loads(cp[0])["work_version_refs"]:
+        for work_ref in background_json_loads_v3(cp[1])["work_version_refs"]:
             keys.append(AtomKey.from_token(work_ref))
-            row=db.execute("SELECT value FROM graph_atoms WHERE token=? AND bot=? AND persona=?",(work_ref,*namespace.as_tuple)).fetchone()
+            row=background_graph_head_v3(db,namespace,work_ref)
             if row is None:continue
-            work=json.loads(row[0]);k,s,o=project_effect_read_inputs_v1(db,namespace,work["progress_ref"])
+            work=background_json_loads_v3(row[1]);k,s,o=project_effect_read_inputs_v1(db,namespace,work["progress_ref"])
             keys.extend(k);roots.extend(s);originals.extend(o)
-            terminal=db.execute("SELECT payload_json FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",(*namespace.as_tuple,work["artifact_ref"])).fetchone()
+            terminal=original("adopted_life",work["artifact_ref"])
             if terminal is None:continue
-            binding=json.loads(terminal[0])["terminal"]["binding"]
-            prepared=db.execute("SELECT payload_json FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",(*namespace.as_tuple,binding["prepared_original_ref"])).fetchone()
+            binding=background_json_loads_v3(terminal[0])["terminal"]["binding"]
+            prepared=original("prepared",binding["prepared_original_ref"])
             if prepared is None:continue
-            target=json.loads(prepared[0])["plan"]["target"]
+            target=background_json_loads_v3(prepared[0])["plan"]["target"]
             from .artifact_task_amendment_v1 import amendment_key_v1,amendment_original_ref_v1,decode_amendment_v1
             amendment_key=amendment_key_v1(namespace,target["root_registration_ref"]);keys.append(amendment_key)
-            amendment=db.execute("SELECT value FROM graph_atoms WHERE token=? AND bot=? AND persona=?",(amendment_key.token,*namespace.as_tuple)).fetchone()
-            if amendment is not None:originals.append(amendment_original_ref_v1(decode_amendment_v1(json.loads(amendment[0]))))
+            amendment=background_graph_head_v3(db,namespace,amendment_key)
+            if amendment is not None:originals.append(amendment_original_ref_v1(decode_amendment_v1(background_json_loads_v3(amendment[1]))))
     return tuple(dict.fromkeys(keys)),tuple(dict.fromkeys(roots)),tuple(dict.fromkeys(originals))
 
 
@@ -408,7 +415,9 @@ def stage_register_current_artifact_task_milestone_in_transaction_v2(db, *, fram
         value = _derive_current_artifact_task_milestone_v2(db, frame=frame, request=request, installed_readers=readers)
     except MissingProductionOriginalV1 as missing:
         return stage_result_v1(frame,'d08',ARTIFACT_TASK_MILESTONE_OPERATION_V2,request,coverage='waiting_for_original',missing=missing.missing_inputs)
-    stage = stage_result_v1(frame,'d08',ARTIFACT_TASK_MILESTONE_OPERATION_V2,request,provenance={'artifact_task_milestone':value})
+    stage = stage_result_v1(frame,'d08',ARTIFACT_TASK_MILESTONE_OPERATION_V2,request,
+        provenance={'artifact_task_milestone':value,'conditioned_source_roots':frame.envelope.source_qualification.source_refs,'conditioned_original_deadline_utc':frame.envelope.deadline_utc},
+        receiver_events=(('d07','conditioned_observed_outcome_committed_v1'),))
     return _empty_postcondition_stage_v1(stage,frame,readers)
 
 
@@ -418,11 +427,23 @@ def require_artifact_task_milestone_history_v2(db, *, namespace, original_ref, p
     from .d11_artifact_draft_content_v1 import require_artifact_draft_phase_verified_history_v2
     value=decode_artifact_task_milestone_v2(raw)
     producer=read_adopted_domain_operation_v1(db,namespace,producing_operation_id)
+    provenance=None if producer is None else producer['payload']['provenance']
+    exact_provenance=provenance=={'artifact_task_milestone':raw}
+    if type(provenance)is dict and set(provenance)=={'artifact_task_milestone','conditioned_source_roots','conditioned_original_deadline_utc'}:
+        import math
+        roots=provenance['conditioned_source_roots'];deadline=provenance['conditioned_original_deadline_utc']
+        source_reads={row['key']for row in producer['payload']['read_versions']
+            if row['revision']>0 and AtomKey.from_token(row['key']).type_name=='memory.source'}
+        exact_provenance=(provenance['artifact_task_milestone']==raw and type(roots)is list
+            and all(type(ref)is str for ref in roots)and len(set(roots))==len(roots)
+            and value.source_head.key.token in roots and set(roots)<=source_reads
+            and all(AtomKey.from_token(ref).token==ref and NamespaceId.from_key(AtomKey.from_token(ref))==namespace for ref in roots)
+            and type(deadline)in {int,float}and math.isfinite(deadline)and deadline>producer['payload']['now_utc'])
     if (value.namespace!=namespace or value.original_ref!=original_ref or value.registration_operation_id!=producing_operation_id
             or producer is None or (producer['domain'],producer['operation_kind'])!=('d08',ARTIFACT_TASK_MILESTONE_OPERATION_V2)
             or producer['payload']['coverage']!='complete' or producer['receipt'].write_versions
             or producer['payload']['request']!=plain_v1(RegisterCurrentArtifactTaskMilestoneRequestV2(value.selector))
-            or producer['payload']['provenance']!={'artifact_task_milestone':raw}
+            or not exact_provenance
             or producer['payload']['now_utc']!=value.registered_at_utc):
         raise ValueError('task milestone has no exact empty-write actual signed W01 producer')
     def original(kind,ref,digest):

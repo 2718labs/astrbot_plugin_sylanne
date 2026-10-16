@@ -239,6 +239,7 @@ def prepare_original_model_cost_plan(
             or type(fact) is not OriginalModelCostFactV1
             or not callable(getattr(issuer, "original_signed_quote", None))):
         raise ModelCostUnavailable("typed original accounting inputs are required")
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
     quote = issuer.original_signed_quote(db, quote_id, quote_version)
     intent = fact.intent
     job_ref = runtime_job_key(*namespace.as_tuple, quote.activity_id,
@@ -251,26 +252,29 @@ def prepare_original_model_cost_plan(
             or quote.work_kind != work_kind
             or work_kind not in _MODEL_WORK_KINDS):
         raise ModelCostUnavailable("original signed quote differs from model call")
-    original = db.execute(
+    original = _producer_original_point_v3(db,table='graph_bundle_operations',columns=('activity_id',),key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,quote.operation_id),
+        legacy_reader=lambda:db.execute(
         "SELECT activity_id FROM graph_bundle_operations WHERE bot=? "
         "AND persona=? AND operation_id=?",
         namespace.as_tuple + (quote.operation_id,),
-    ).fetchone()
+    ).fetchone())
     if original != (quote.activity_id,):
         raise ModelCostUnavailable("original ingress business receipt is absent")
     lease = get_budget_lease(db, quote.parent_budget_lease_ref)
     if (lease.bot_id, lease.persona_id) != namespace.as_tuple:
         raise ModelCostUnavailable("original budget lease crosses namespace")
-    reservation = db.execute(
+    reservation = _producer_original_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json','state'),key_columns=('lease_id','operation_id'),key=(lease.lease_id,quote.operation_id),
+        legacy_reader=lambda:db.execute(
         "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
         "WHERE lease_id=? AND operation_id=?",
         (lease.lease_id, quote.operation_id),
-    ).fetchone()
-    original_reserve = db.execute(
+    ).fetchone())
+    original_reserve = _producer_original_point_v3(db,table='runtime_budget_operations',columns=('digest',),key_columns=('bot_id','persona_id','operation_id','phase'),key=(*namespace.as_tuple,quote.operation_id,'reserve'),
+        legacy_reader=lambda:db.execute(
         "SELECT digest FROM runtime_budget_operations WHERE bot_id=? "
         "AND persona_id=? AND operation_id=? AND phase='reserve'",
         namespace.as_tuple + (quote.operation_id,),
-    ).fetchone()
+    ).fetchone())
     if (reservation is None or original_reserve is None
             or reservation[0] != intent.budget_reservation_digest
             or original_reserve[0] != intent.budget_reservation_digest
@@ -363,3 +367,87 @@ __all__ = (
     "read_original_model_cost",
     "original_model_cost_operation_id_v1",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class OriginalModelNoDispatchCostPlanV1:
+    namespace: NamespaceId
+    bundle_operation_id: str
+    original_operation_id: str
+    call_id: str
+    quote: ResourceQuote
+    original_reservation_digest: str
+    witness_digest: str
+    predicted_budget: BudgetPrediction
+    actual: dict[str, int]
+    schema: str = "sylanne.d11.original-model-no-dispatch-cost-plan.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class OriginalModelNoDispatchCostCommitV1:
+    status: str
+    operation_id: str
+    call_id: str
+    quote_id: str
+    quote_version: int
+    witness_digest: str
+    cost_ref: str
+    budget_receipt_digest: str
+    commit_seq: int
+    graph_revision: int
+    graph_epoch: int
+    schema: str = "sylanne.d11.original-model-no-dispatch-cost-commit.v1"
+
+
+def prepare_original_model_no_dispatch_cost_plan_v1(db, issuer, namespace, witness, *, quote_id, quote_version):
+    from ..authority_service.v2_model_egress_contract import ModelNoDispatchWitnessV1
+    if type(namespace) is not NamespaceId or type(witness) is not ModelNoDispatchWitnessV1:
+        raise ModelCostUnavailable("actual authenticated original no-dispatch witness required")
+    from .d11_offline_originals_v1 import _utc
+    from datetime import datetime, timezone
+    intent = witness.request.intent
+    quote = issuer.original_signed_quote(db, quote_id, quote_version)
+    if (quote.work_kind != "artifact_draft_v1" or datetime.fromtimestamp(quote.deadline_utc, timezone.utc) != _utc(witness.request.requested_deadline_utc)
+            or (quote.bot_id, quote.persona_id) != namespace.as_tuple
+            or quote.operation_id != intent.budget_reservation_operation_id
+            or quote.parent_budget_lease_ref != intent.budget_lease_id or dict(quote.ceiling) != dict(intent.budget_ceiling)
+            or quote.graph_job_ref != runtime_job_key(*namespace.as_tuple, quote.activity_id, intent.job_id).token
+            or not set(quote.ceiling) <= {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}):
+        raise ModelCostUnavailable("no-dispatch settlement crossed the original model-only quote/reservation")
+    original = db.execute("SELECT activity_id FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, quote.operation_id)).fetchone()
+    lease = get_budget_lease(db, quote.parent_budget_lease_ref)
+    reservation = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+        (lease.lease_id, quote.operation_id)).fetchone()
+    reserve = db.execute("SELECT digest FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+        (*namespace.as_tuple, quote.operation_id)).fetchone()
+    if (original != (quote.activity_id,) or (lease.bot_id, lease.persona_id) != namespace.as_tuple
+            or reservation is None or reservation[0] != intent.budget_reservation_digest
+            or reservation[2] != "reserved" or json.loads(reservation[1]) != dict(quote.ceiling)
+            or reserve != (intent.budget_reservation_digest,)):
+        raise ModelCostUnavailable("no-dispatch original reserve is absent, changed or already settled")
+    actual = {unit: 0 for unit in quote.ceiling}
+    prediction = predict_budget_settlement(lease, quote.operation_id, intent.budget_reservation_digest,
+        quote.ceiling, actual, reservation=BudgetReservation(lease.lease_id, quote.operation_id,
+            intent.budget_reservation_digest, quote.ceiling), execution_revoked=True)
+    return OriginalModelNoDispatchCostPlanV1(namespace, original_model_cost_operation_id_v1(namespace, intent.call_id),
+        quote.operation_id, intent.call_id, quote, intent.budget_reservation_digest, witness.digest, prediction, actual)
+
+
+def apply_original_model_no_dispatch_budget_in_transaction_v1(db, issuer, plan, witness):
+    if not db.in_transaction or type(plan) is not OriginalModelNoDispatchCostPlanV1:
+        raise ModelCostUnavailable("actual caller-owned no-dispatch accounting transaction required")
+    current = prepare_original_model_no_dispatch_cost_plan_v1(db, issuer, plan.namespace, witness,
+        quote_id=plan.quote.quote_id, quote_version=plan.quote.version)
+    if current != plan: raise ModelCostUnavailable("original no-dispatch cost snapshot changed")
+    receipt = settle_budget(db, plan.quote.parent_budget_lease_ref, plan.original_operation_id,
+        plan.original_reservation_digest, plan.actual, execution_revoked=True)
+    if receipt != plan.predicted_budget.receipt:
+        raise ModelCostUnavailable("no-dispatch zero settlement differs from its original exact prediction")
+    value = cost_settlement_from_runtime(db, bot_id=plan.namespace.bot_id, persona_id=plan.namespace.persona_id,
+        activity_id=plan.quote.activity_id, bundle_operation_id=plan.bundle_operation_id, effect_id=plan.quote.effect_id,
+        settlement_id=plan.bundle_operation_id, lease_id=plan.quote.parent_budget_lease_ref,
+        cost_operation_id=plan.original_operation_id, budget_operation_id=plan.original_operation_id,
+        budget_phase="settle", prior_unknown_ref=None, execution_revoked=True)
+    return OriginalModelCostApplicationV1(receipt, cost_settlement_graph_write(value))
+

@@ -19,6 +19,8 @@ def install_schema(db) -> None:
     _install_job_schema(db)
     _install_encoding_call_schema(db)
     _install_clock_schema(db)
+    from .owner_goal_projection_v1 import install_owner_goal_projection_schema_v1
+    install_owner_goal_projection_schema_v1(db)
 
 __all__ = [
     "BudgetLease", "BudgetReceipt", "CharacterClockMapping",

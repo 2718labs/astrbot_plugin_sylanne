@@ -102,6 +102,7 @@ def _cold_verify_package(package: Path, expected_manifest_sha256: str, *, expect
                 "status": ("formal_package_mechanics_only" if expected_mode == "formal-alpha1"
                            else "snapshot_alpha1_test_package_mechanics_only" if expected_mode == "snapshot-alpha1-test"
                            else "alpha2_local_candidate_package_mechanics_only" if expected_mode == "alpha2-candidate"
+                           else "beta1_server_test_package_mechanics_only" if expected_mode == "beta1-candidate"
                            else "backend_candidate_package_mechanics_only"),
                 "package_bytes": package.stat().st_size,
                 "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
@@ -122,6 +123,10 @@ def cold_verify_alpha2_candidate_package(package: Path, expected_manifest_sha256
     return _cold_verify_package(package, expected_manifest_sha256, expected_mode="alpha2-candidate")
 
 
+def cold_verify_beta1_candidate_package(package: Path, expected_manifest_sha256: str) -> dict:
+    return _cold_verify_package(package, expected_manifest_sha256, expected_mode="beta1-candidate")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cold-verify a pinned formal alpha1 ZIP")
     parser.add_argument("--package", type=Path, required=True)
@@ -130,8 +135,10 @@ def main() -> None:
     modes.add_argument("--backend-alpha1-candidate", action="store_true")
     modes.add_argument("--snapshot-alpha1-test", action="store_true")
     modes.add_argument("--alpha2-candidate", action="store_true")
+    modes.add_argument("--beta1-candidate", action="store_true")
     args = parser.parse_args()
-    verifier = (cold_verify_alpha2_candidate_package if args.alpha2_candidate else
+    verifier = (cold_verify_beta1_candidate_package if args.beta1_candidate else
+                cold_verify_alpha2_candidate_package if args.alpha2_candidate else
                 (lambda package, pin: _cold_verify_package(package, pin, expected_mode="snapshot-alpha1-test"))
                 if args.snapshot_alpha1_test else cold_verify_backend_candidate_package if args.backend_alpha1_candidate
                 else cold_verify_formal_package)

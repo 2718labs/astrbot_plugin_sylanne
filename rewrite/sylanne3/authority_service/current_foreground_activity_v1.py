@@ -13,8 +13,9 @@ import json
 import sqlite3
 
 from .contract import AuthorityUnavailable
+from .current_authority_graph_read_v3 import authority_current_json_v3
 from .v2_self_identity_service import AuthorityV2SelfIdentityService
-from .v2_self_identity_contract import SelfIdentityCurrentRequestV1, AuthorityCurrentSelfIdentityV1
+from .v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
 from .v2_contract import FencePermitV2
 from .linux_clock_v1 import LinuxKernelClockProviderV1
 from ..domains.d03.self_identity_qualification import self_identity_mapping_from_current
@@ -36,6 +37,7 @@ from ..runtime.d11_types import job_graph_write
 from ..runtime.c09_installation_inventory_v2 import InstallationFilesystemManifestV2
 
 _DOMAINS = {
+    "prepare_personal_candidate_eligibility_v1": "d08", "adopt_personal_candidate_eligibility_v1": "d08",
     "derive_ingress_artifact_task_scope_v1": "d10",
     "await_existing_artifact_revision_v1": "d10",
     "select_existing_artifact_continuation_v1": "d08", "revise_existing_artifact_v1": "d08",
@@ -365,6 +367,13 @@ def _source_family_current_sql_v1(db, *, namespace, roots, purpose, audiences,
                                   streaming_qualified=None, streaming_scope=None,
                                   streaming_graph_stamp=None):
     """Shared exact source/access/correction closure for activity and Owner setup."""
+    from .artifact_model_source_read_v3 import artifact_model_source_family_v3
+    model_sources=artifact_model_source_family_v3(db,namespace=namespace,roots=roots,purpose=purpose,audiences=audiences)
+    if model_sources is not None:return model_sources
+    from .foreground_mesh_source_read_v3 import foreground_mesh_source_family_v3
+    mesh_sources = foreground_mesh_source_family_v3(db,namespace=namespace,roots=roots,purpose=purpose,audiences=audiences)
+    if mesh_sources is not None:
+        return mesh_sources
     if streaming_qualified is not None:
         from ..runtime.source_correction_read_v3 import _SourceFamilyQualificationV3
         if type(streaming_qualified) is not _SourceFamilyQualificationV3:
@@ -430,6 +439,9 @@ class InstalledCurrentForegroundActivityV1:
                 raise TypeError("foreground draft requires its actual installed typed bundle")
         self.installed_bundle = installed_bundle
         self._owner_stop_reply_service_v1 = None
+        from .current_authority_graph_read_v3 import install_authority_graph_read_controller_v3
+        install_authority_graph_read_controller_v3(self,service=self,source_location=self_identity_service._source_location)
+
 
     def install_owner_stop_reply_service_v1(self, service):
         from .owner_stop_reply_v1 import InstalledOwnerStopReplyServiceV1
@@ -604,429 +616,8 @@ class InstalledCurrentForegroundActivityV1:
             raise AuthorityUnavailable("foreground admission lacks its actual installed Core reply barrier")
         stop_service.require_reply_cycle_not_retired_v1(c02_operation_id=request.c02_operation_id)
         service._fences.validate_fence(credential=credential, subject=subject, permit=permit)
-        identity_request = SelfIdentityCurrentRequestV1(permit.authority_id, service._fences.namespace,
-            request.namespace, service._installation_id, service._manifest_digest, request.operation_id, permit)
-        current_self = service.current(credential=credential, subject=subject, request=identity_request)
-        if current_self is None:
-            raise AuthorityUnavailable("foreground current independently registered self is absent")
-        location = service._source_location.observe_business_for_fence_v1(credential=credential, subject=subject, permit=permit)
-        current_owner, observed = service._owner_storage.get_current_background_owner_authority_for_fence_v1(
-            credential=credential, subject=subject, permit=permit)
-        if observed != permit or current_owner.guard.authorization_head != current_self.owner_authorization_head:
-            raise AuthorityUnavailable("foreground upstream Owner constraint changed")
-        reading = self.clock()
-        now = reading.utc_seconds + reading.utc_error_seconds
-        path = Path(location.graph_db_path)
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA query_only=ON")
-            db.execute("BEGIN")
-            service._source_location.require_graph_snapshot_v1(db, location, graph_db_path=path)
-            if db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", request.namespace.as_tuple).fetchone() != (current_self.graph_epoch,):
-                raise AuthorityUnavailable("foreground actual Graph query epoch differs from the independent self read")
-            versions = {}
-            def atom(ref, required=True):
-                key = AtomKey.from_token(ref) if type(ref) is str else ref
-                if NamespaceId.from_key(key) != request.namespace:
-                    raise AuthorityUnavailable("foreground read crossed its actual namespace")
-                row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
-                    (*request.namespace.as_tuple, key.token)).fetchone()
-                revision = 0 if row is None else row[0]
-                versions[key] = revision
-                if required and (row is None or not row[2]):
-                    raise AuthorityUnavailable("foreground current required head is absent")
-                return None if row is None else json.loads(row[1])
-            owner_key = owner_grant_key(*request.namespace.as_tuple)
-            owner = atom(owner_key)
-            if (request.purpose not in owner["purposes"] or not set(request.audiences) <= set(owner["audiences"])
-                    or "workbench.create" not in owner["capabilities"]):
-                raise AuthorityUnavailable("foreground purpose/audience exceeds the real upstream grant")
-            mapping = atom(self_mapping_key(request.namespace))
-            from ..domains.d01.production_operations_v1 import plain_v1
-            if mapping != plain_v1(self_identity_mapping_from_current(current_self)):
-                raise AuthorityUnavailable("foreground actual Graph self mapping differs from independent Authority")
-            cue = atom(request.cue_source_ref)
-            ingress = read_committed_ingress_identity(db, request.namespace, SourceRecord.from_dict(cue).source_id)
-            if ingress is None or json.loads(ingress.identity_json)["operation_id"] != request.ingress_operation_id:
-                raise AuthorityUnavailable("foreground cue lacks its original four-ledger ingress witness")
-            c02 = db.execute("SELECT digest,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-                (*request.namespace.as_tuple, request.c02_operation_id)).fetchone()
-            if c02 is None or "first_ingress_c02" not in json.loads(c02[1]):
-                raise AuthorityUnavailable("foreground requires an actual adopted C02 original")
-            episode_refs = set()
-            for token, revision, encoded in db.execute("SELECT token,revision,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=? AND valid=1",
-                    (*request.namespace.as_tuple, request.c02_operation_id)):
-                key = AtomKey.from_token(token)
-                if key.type_name == "memory.episode.v1" and request.cue_source_ref in json.loads(encoded)["source_refs"]:
-                    current = atom(key)
-                    if current != json.loads(encoded) or versions[key] != revision:
-                        raise AuthorityUnavailable("foreground C02 cue episode changed")
-                    episode_refs.add(key.token)
-            trace_refs = []
-            for token, revision, encoded in db.execute("SELECT token,revision,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=? AND valid=1",
-                    (*request.namespace.as_tuple, request.c02_operation_id)):
-                key = AtomKey.from_token(token)
-                if key.type_name == "memory.subjective_trace.v2" and json.loads(encoded)["episode_ref"] in episode_refs:
-                    current = atom(key)
-                    if current != json.loads(encoded) or versions[key] != revision:
-                        raise AuthorityUnavailable("foreground C02 subjective trace changed")
-                    trace_refs.append(key.token)
-            if len(episode_refs) != 1 or len(trace_refs) != 1:
-                raise AuthorityUnavailable("foreground C02 episode does not belong to the actual cue")
-            job_value = atom(request.cycle_job_ref, required=request.expected_cycle_revision > 0)
-            job_key = AtomKey.from_token(request.cycle_job_ref)
-            activity_id, job_id = foreground_cycle_ids_v1(request.namespace, request.c02_operation_id)
-            c04_selection = None
-            if request.operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"}:
-                from ..runtime.c04_foreground_selection_v4 import qualify_self_c04_foreground_v4
-                c04_selection, c04_ids, c04_versions = qualify_self_c04_foreground_v4(
-                    db, request=request, bundle=self.installed_bundle, issuer=self.issuer)
-                versions.update(c04_versions)
-            expected_activity = activity_id if c04_selection is None else c04_selection.child_activity_id
-            if request.activity_id != expected_activity or job_key != runtime_job_key(*request.namespace.as_tuple, activity_id, job_id):
-                raise AuthorityUnavailable("foreground cycle must retain its stable adopted C02 identity")
-            if versions[job_key] != request.expected_cycle_revision:
-                raise AuthorityUnavailable("foreground cycle CAS revision changed")
-            deadline = request.requested_deadline_utc
-            from ..runtime.source_note_foreground_v1 import (OPERATION as NOTE_CREATE_OPERATION,
-                ForegroundSourceNoteContinuationV1, qualify_source_note_foreground_v1)
-            note_job = None if job_value is None else get_job(db, job_key.name)
-            note_mode = (request.operation_kind == NOTE_CREATE_OPERATION or note_job is not None
-                and type(foreground_cycle_from_wire_v1(note_job.continuation)) is ForegroundSourceNoteContinuationV1)
-            note_authorization = None
-            if request.operation_kind in {"prepare_selected_source_note_action_v2", "prepare_source_note_body",
-                    "input:register_life_plan_v2", "checkpoint_source_note_foreground_cycle_v1"} and not note_mode:
-                raise AuthorityUnavailable("SourceNote named Self operation requires its actual SourceNote responsibility")
-            if note_mode:
-                note_guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
-                    current_owner.guard.authorization_head.removeprefix("sha256:"))
-                note_authorization = qualify_source_note_foreground_v1(db, request=request, job=note_job,
-                    issuer=self.issuer, installed_bundle=self.installed_bundle, owner_guard=note_guard,
-                    now_utc=now, atom=atom)
-                deadline = min(deadline, note_authorization.original_deadline_utc)
-            if request.operation_kind == "prepare_ingress_recall_model_v1":
-                from ..runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
-                if (request.operation_id != ingress_recall_model_ids_v1(
-                        request.namespace, request.c02_operation_id)["prepare"]
-                        or request.purpose != ("consolidation" if note_mode or request.draft_root_registration_ref is not None else "context")):
-                    raise AuthorityUnavailable("Self C3 changed its fixed identity/purpose")
-            if job_value is not None:
-                if request.operation_kind in {"create_foreground_cycle", "create_foreground_cycle_v2", "derive_ingress_artifact_task_scope_v1", "create_source_note_foreground_cycle_v1"}:
-                    raise AuthorityUnavailable("foreground create requires its observed absent cycle target")
-                job = get_job(db, job_key.name)
-                continuation = foreground_cycle_from_wire_v1(job.continuation)
-                if (job.work_kind != WORK_KIND or job.activity_id != activity_id or job.budget_ref != request.parent_budget_lease_ref
-                        or job.cancel_epoch != request.expected_cancel_generation or job.cancel_epoch
-                        or continuation.c02_operation_id != request.c02_operation_id
-                        or continuation.source_ref != request.cue_source_ref):
-                    raise AuthorityUnavailable("foreground cycle origin/control generation differs")
-                if job_graph_write(job).value != job_value or job.phase in {"completed", "failed", "cancelled", "draining"}:
-                    raise AuthorityUnavailable("foreground actual SQL/Graph job is terminal, draining or inconsistent")
-                if request.operation_kind in {"wake_foreground_cycle", "wake_artifact_draft_cycle_v1", "wake_artifact_draft_cycle_v2"}:
-                    if job.phase not in {"waiting", "deferred"}:
-                        raise AuthorityUnavailable("foreground wake requires its original waiting/deferred job")
-                elif request.operation_kind == "acquire_foreground_cycle":
-                    if job.phase != "queued" or job.lease_holder is not None:
-                        raise AuthorityUnavailable("foreground acquire requires its actual queued unleased job")
-                elif request.operation_kind in {"prepare_ingress_recall_result_read_v1", "finish_ingress_recall_model_v1", "adopt_ingress_recall_model_v1"}:
-                    from ..runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
-                    from ..runtime.d07_ingress_recall_result_v1 import ingress_recall_result_operation_id_v1, ADOPT_OPERATION
-                    from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1, read_prepared_d07_execution_v1
-                    original = read_prepared_d07_execution_v1(db, self.issuer, request.namespace,
-                        ingress_recall_model_ids_v1(request.namespace, request.c02_operation_id)["job"])
-                    if (type(original) is not D07IngressRecallPreparedV1
-                            or job.phase not in {"waiting", "deferred"}
-                            or original.cycle_job_ref != request.cycle_job_ref
-                            or request.operation_id != ingress_recall_result_operation_id_v1(
-                                request.namespace, request.c02_operation_id, request.operation_kind)):
-                        raise AuthorityUnavailable("Self C3 result needs its exact unretired parent/preparation")
-                    child = get_job(db, original.job_id)
-                    required_phase = "completed" if request.operation_kind == ADOPT_OPERATION else "running"
-                    if (child.phase != required_phase or child.fence != 1 or child.cancel_epoch
-                            or atom(job_graph_write(child).key) != job_graph_write(child).value
-                            or required_phase == "running" and (child.lease_expires_utc is None
-                                or now >= datetime.fromisoformat(child.lease_expires_utc.replace("Z", "+00:00")).timestamp())):
-                        raise AuthorityUnavailable("Self C3 result has no current actual worker/terminal")
-                elif request.operation_kind == "adopt_ingress_c04_v1":
-                    from ..runtime.c04_internal_work_original_v1 import read_c04_internal_work_prepared_v1
-                    from ..runtime.c04_frozen_association_original_v3 import read_c04_frozen_association_original_v4
-                    from ..runtime.c04_ingress_preparation_v4 import require_current_self_c04_parent_v4
-                    prepared = read_c04_internal_work_prepared_v1(db, request.namespace, c04_ids["prepare"])
-                    work = read_c04_frozen_association_original_v4(db, request.namespace, prepared.binding)
-                    require_current_self_c04_parent_v4(db, namespace=request.namespace,
-                        binding=prepared.binding, work=work, prepared=prepared, installed_bundle=self.installed_bundle,
-                        issuer=self.issuer, current_self=current_self, now_utc=now)
-                elif request.operation_kind == "acquire_ingress_recall_model_v1":
-                    from ..runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
-                    from ..runtime.d07_ingress_recall_acquisition_v1 import ingress_recall_acquire_operation_id_v1
-                    from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1, read_prepared_d07_execution_v1
-                    original = read_prepared_d07_execution_v1(db, self.issuer, request.namespace,
-                        ingress_recall_model_ids_v1(request.namespace, request.c02_operation_id)["job"])
-                    if (type(original) is not D07IngressRecallPreparedV1
-                            or job.phase not in {"waiting", "deferred"}
-                            or request.operation_id != ingress_recall_acquire_operation_id_v1(request.namespace, request.c02_operation_id)
-                            or original.cycle_job_ref != request.cycle_job_ref):
-                        raise AuthorityUnavailable("Self C3 acquire needs its original waiting cycle/preparation")
-                    child = get_job(db, original.job_id)
-                    if (child.phase != "queued" or child.fence or child.cancel_epoch
-                            or child.lease_holder is not None or child.result_ref is not None
-                            or atom(job_graph_write(child).key) != job_graph_write(child).value):
-                        raise AuthorityUnavailable("Self C3 acquire changed its actual once queued job")
-                elif request.operation_kind == 'acquire_artifact_draft_model_v2':
-                    from ..runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
-                    if (type(continuation.call_plan) is not ForegroundCallPlanV2 or job.phase != 'waiting'
-                            or job.lease_holder is not None or job.lease_expires_utc is not None):
-                        raise AuthorityUnavailable('phase acquisition requires its actual released waiting current group')
-                elif request.operation_kind == "acquire_artifact_draft_model":
-                    if job.phase not in {"waiting", "deferred"}:
-                        raise AuthorityUnavailable("C4 acquire requires the original released waiting cycle")
-                    from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1, artifact_draft_model_ids_v1
-                    from ..runtime.d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1
-                    selector = artifact_draft_task_selector_v1(request.namespace, c02_operation_id=request.c02_operation_id,
-                        root_registration_ref=request.draft_root_registration_ref)
-                    prepared = read_artifact_draft_prepared_v1(db, namespace=request.namespace, issuer=self.issuer, selector=selector)
-                    if prepared is None:
-                        raise AuthorityUnavailable("C4 acquire has no actual committed prepared original")
-                    model_job = get_job(db, prepared.job_id)
-                    if (model_job.phase != "queued" or model_job.fence or model_job.cancel_epoch
-                            or model_job.lease_holder is not None or model_job.result_ref is not None
-                            or request.operation_id != artifact_draft_model_ids_v1(selector)["acquire"]):
-                        raise AuthorityUnavailable("C4 acquire changed its actual once queued job")
-                    if atom(job_graph_write(model_job).key) != job_graph_write(model_job).value:
-                        raise AuthorityUnavailable("C4 acquire actual SQL/Graph worker job differs")
-                elif (job.phase != "running" or (job.lease_holder, job.fence, job.lease_expires_utc) !=
-                        (request.worker_holder, request.worker_fence, request.worker_lease_expires_utc)
-                        or job.lease_expires_utc is None or now >= datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp()):
-                    raise AuthorityUnavailable("foreground work needs its actual unexpired worker holder/fence/lease")
-                deadline = min(deadline, datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp())
-            elif request.operation_kind not in {"create_foreground_cycle", "create_foreground_cycle_v2", "derive_ingress_artifact_task_scope_v1", "create_source_note_foreground_cycle_v1"} or request.expected_cancel_generation:
-                raise AuthorityUnavailable("only explicit cycle creation may use its observed absent target")
-            permitted_sources = {request.cue_source_ref}
-            artifact_operations = {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1", "revise_existing_artifact_v1", "wake_artifact_draft_cycle_v1", "prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content",
-                "compose_artifact_goal_plan", "create_artifact_project", "prepare_artifact_draft_project_context",
-                "propose_artifact_draft_action", "prepare_artifact_draft_body", "input:register_artifact_draft_plan_v3", "prepare_life"}
-            artifact_operations.update(_ARTIFACT_PHASE_OPERATIONS_V2 | _ARTIFACT_PHASE_FILE_OPERATIONS_V2 | _ARTIFACT_INITIAL_TASK_OPERATIONS_V1 | _ARTIFACT_PREDECISION_OPERATIONS_V2 | _ARTIFACT_AMENDMENT_PLAN_OPERATIONS_V2 | _METHOD_FACT_OPERATIONS_V1)
-            if request.draft_root_registration_ref is not None:
-                artifact_operations.update(("initialize_project_checkpoint", "refresh_project_checkpoint", "settle_project_checkpoint",
-                    "input:register_life_outcome_v2", "advance_life", "settle_personal_goal"))
-            if note_mode:
-                permitted_sources.update(note_authorization.source_refs)
-            elif type(request) in {ForegroundActivityRequestV2,ForegroundActivityPreparationParentRequestV2}:
-                guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
-                    current_owner.guard.authorization_head.removeprefix('sha256:'))
-                sources,preparation_deadline=_qualify_artifact_preparation_foreground_v2(db,request=request,job=job,
-                    continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
-                    current_self=current_self,owner_guard=guard,now=now,atom=atom)
-                permitted_sources.update(sources);deadline=min(deadline,preparation_deadline)
-            elif request.operation_kind in artifact_operations:
-                if request.draft_root_registration_ref is None or self.installed_bundle is None:
-                    raise AuthorityUnavailable("artifact stage needs actual installed task policy and registered root")
-                from ..runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
-                phase_file = (job_value is not None and type(continuation.call_plan) is ForegroundCallPlanV2
-                    and request.operation_kind in _ARTIFACT_PHASE_FILE_OPERATIONS_V2)
-                if request.operation_kind in _METHOD_FACT_OPERATIONS_V1:
-                    from ..runtime.d02_method_readiness_v1 import qualify_current_method_foreground_v1
-                    guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
-                        current_owner.guard.authorization_head.removeprefix('sha256:'))
-                    sources,method_deadline=qualify_current_method_foreground_v1(db,request=request,job=job,
-                        continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
-                        current_self=current_self,owner_guard=guard,now=now,atom=atom)
-                    permitted_sources.update(sources);deadline=min(deadline,method_deadline)
-                elif (job_value is not None and type(continuation.call_plan) is ForegroundCallPlanV2
-                        and request.operation_kind in _ARTIFACT_PHASE_FINAL_OPERATIONS_V2):
-                    guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
-                        current_owner.guard.authorization_head.removeprefix('sha256:'))
-                    sources,final_deadline=_qualify_artifact_method_final_foreground_v2(db,request=request,
-                        continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
-                        owner_guard=guard,now=now,atom=atom)
-                    permitted_sources.update(sources);deadline=min(deadline,final_deadline)
-                elif request.operation_kind in _ARTIFACT_AMENDMENT_PLAN_OPERATIONS_V2:
-                    guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
-                        current_owner.guard.authorization_head.removeprefix('sha256:'))
-                    sources,task_deadline=_qualify_artifact_task_plan_revision_foreground_v2(db,request=request,job=job,
-                        continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
-                        current_self=current_self,owner_guard=guard,now=now,atom=atom)
-                    permitted_sources.update(sources);deadline=min(deadline,task_deadline)
-                elif request.operation_kind in _ARTIFACT_PREDECISION_OPERATIONS_V2:
-                    guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
-                        current_owner.guard.authorization_head.removeprefix('sha256:'))
-                    sources,task_deadline=_qualify_artifact_task_predecision_foreground_v2(db,request=request,job=job,
-                        continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
-                        current_self=current_self,owner_guard=guard,now=now,atom=atom)
-                    permitted_sources.update(sources);deadline=min(deadline,task_deadline)
-                elif request.operation_kind in _ARTIFACT_INITIAL_TASK_OPERATIONS_V1:
-                    guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
-                        current_owner.guard.authorization_head.removeprefix('sha256:'))
-                    sources, task_deadline = _qualify_artifact_initial_task_foreground_v1(db, request=request, job=job,
-                        continuation=continuation, issuer=self.issuer, installed_bundle=self.installed_bundle,
-                        owner_guard=guard, now=now, atom=atom)
-                    permitted_sources.update(sources)
-                    deadline = min(deadline, task_deadline)
-                elif request.operation_kind in _ARTIFACT_PHASE_OPERATIONS_V2 or phase_file:
-                    guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
-                        current_owner.guard.authorization_head.removeprefix('sha256:'))
-                    sources, phase_deadline = _qualify_artifact_phase_foreground_v2(db, request=request, job=job,
-                        continuation=continuation, issuer=self.issuer, installed_bundle=self.installed_bundle,
-                        current_self=current_self, owner_guard=guard, now=now, atom=atom)
-                    permitted_sources.update(sources)
-                    deadline = min(deadline, phase_deadline)
-                else:
-                    from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1, artifact_draft_model_ids_v1
-                    selector = artifact_draft_task_selector_v1(request.namespace, c02_operation_id=request.c02_operation_id,
-                        root_registration_ref=request.draft_root_registration_ref)
-                    ids = artifact_draft_model_ids_v1(selector)
-                    if request.operation_kind in {"prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content"}:
-                        expected = ids[{"prepare_artifact_draft_model": "prepare", "acquire_artifact_draft_model": "acquire", "adopt_artifact_draft_content": "adopt"}[request.operation_kind]]
-                        if request.operation_id != expected:
-                            raise AuthorityUnavailable("artifact stage changed its original fixed operation identity")
-                    if request.operation_kind in {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1", "revise_existing_artifact_v1"}:
-                        from ..runtime.artifact_continuation_originals_v1 import (
-                            discover_existing_artifact_continuation_request_v1, artifact_continuation_operation_id_v1)
-                        from ..runtime.domain_production_registry_v1 import installed_operation_v1
-                        actual = discover_existing_artifact_continuation_request_v1(db, namespace=request.namespace,
-                            selector=selector, issuer=self.issuer)
-                        from ..runtime.artifact_wait_checkpoint_v1 import artifact_wait_operation_id_v1
-                        expected = (artifact_wait_operation_id_v1(selector)
-                            if request.operation_kind == "await_existing_artifact_revision_v1"
-                            else artifact_continuation_operation_id_v1(selector,
-                                revision=request.operation_kind == "revise_existing_artifact_v1"))
-                        if (actual is None or request.operation_id != expected
-                                or request.request_digest != foreground_typed_command_digest_v1(
-                                    installed_operation_v1(request.operation_kind), actual)):
-                            raise AuthorityUnavailable("artifact continuation differs from actual unique project/file selection")
-                    if request.operation_kind not in {"prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content", "wake_artifact_draft_cycle_v1", "await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1"}:
-                        from ..runtime.d11_artifact_draft_content_v1 import artifact_draft_content_from_wire_v1, ArtifactDraftContentAdoptionV1
-                        adopted = _read(db, issuer=self.issuer, namespace=request.namespace, kind="c4_adopted", ref=ids["adopt"])
-                        if adopted is None:
-                            raise AuthorityUnavailable("artifact continuation has no actual adopted paid content")
-                        content = artifact_draft_content_from_wire_v1(adopted[0], ArtifactDraftContentAdoptionV1)
-                        if content.selector != selector or content.task_source.ref != request.cue_source_ref:
-                            raise AuthorityUnavailable("artifact adopted content belongs to another actual task")
-                        permitted_sources.update(content.content.source_refs)
-            if request.operation_kind=="prepare_artifact_draft_project_context":
-                from ..host.authority_profile import AdminArtifactDraftPolicyV2
-                if type(self.installed_bundle.artifact_draft) is AdminArtifactDraftPolicyV2:
-                    from ..runtime.artifact_continuation_originals_v1 import artifact_control_keys_for_task_v1
-                    from ..runtime.d03_life_project_context_v1 import PrepareArtifactDraftProjectContextRequestV1
-                    from ..runtime.domain_production_registry_v1 import installed_operation_v1
-                    standing=self.installed_bundle.artifact_draft.standing_scope
-                    keys=artifact_control_keys_for_task_v1(db,namespace=request.namespace,c02_operation_id=request.c02_operation_id,
-                        root_registration_ref=request.draft_root_registration_ref)
-                    atom(keys[2]);atom(keys[3])
-                    body=PrepareArtifactDraftProjectContextRequestV1(keys[2].token,keys[3].token,
-                        request.cue_source_ref,standing.social_role,standing.norm_refs)
-                    if request.request_digest!=foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind),body):
-                        raise AuthorityUnavailable("Self project role differs from initial installed standing selection")
-            if request.plan_ref is not None:
-                plan = atom(request.plan_ref)
-                if AtomKey.from_token(request.plan_ref).type_name != "d08.personal_plan.v1":
-                    raise AuthorityUnavailable("foreground current task source expansion needs its adopted personal plan")
-                permitted_sources.update(plan["source_refs"])
-            if request.plan_source_ref not in permitted_sources:
-                raise AuthorityUnavailable("foreground source is outside the already adopted task closure")
-            source_versions = _source_family_current_sql_v1(db, namespace=request.namespace,
-                roots=tuple(sorted(permitted_sources)),
-                purpose=request.purpose, audiences=request.audiences)
-            for version in source_versions:
-                versions[version.key] = version.revision
-            grant = self.issuer.current_budget_grant(db, request.parent_budget_lease_ref)
-            lease = get_budget_lease(db, grant.lease_id)
-            require_budget_family_admissible(db, grant.lease_id)
-            if (lease.state != "active" or (grant.bot_id, grant.persona_id) != request.namespace.as_tuple
-                    or WORK_KIND not in grant.allowed_work_kinds):
-                raise AuthorityUnavailable("foreground original signed root budget does not cover internal cycle work")
-            if not note_mode and request.operation_kind in artifact_operations | {"derive_ingress_artifact_task_scope_v1"} and not {"artifact_draft_v1", "d10.life.artifact_draft.v1"} <= set(grant.allowed_work_kinds):
-                raise AuthorityUnavailable("artifact stages exceed the actual current signed model/file grant")
-            current_guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
-                current_owner.guard.authorization_head.removeprefix("sha256:"))
-            from ..runtime.foreground_cycle_v1 import (CreateForegroundCycleRequestV2, derive_current_foreground_responsibility_v1,
-                foreground_post_c02_cause_ref_v1, require_current_foreground_responsibility_v1)
-            if request.operation_kind == "create_source_note_foreground_cycle_v1":
-                from ..runtime.source_note_foreground_v1 import (CreateSourceNoteForegroundCycleRequestV1,
-                    derive_source_note_foreground_responsibility_v1)
-                from ..runtime.foreground_cycle_v1 import InstalledForegroundCycleReadersV1
-                responsibility, authorization = derive_source_note_foreground_responsibility_v1(db, namespace=request.namespace,
-                    request=CreateSourceNoteForegroundCycleRequestV1(note_authorization.original_ref),
-                    installed_readers=InstalledForegroundCycleReadersV1(self.issuer, self.installed_bundle),
-                    owner_guard=current_guard, parent_budget_lease_ref=request.parent_budget_lease_ref,
-                    purpose=request.purpose, audiences=request.audiences, now_utc=now)
-                if request.requested_deadline_utc != responsibility.deadline_utc:
-                    raise AuthorityUnavailable("SourceNote initial request changed its immutable authorized causal deadline")
-                deadline = responsibility.deadline_utc
-            elif request.operation_kind == "create_foreground_cycle_v2":
-                from ..runtime.foreground_call_plan_v1 import foreground_reply_budget_ids_v1
-                from ..runtime.domain_production_registry_v1 import installed_operation_v1
-                cause_ref = request.draft_root_registration_ref or foreground_post_c02_cause_ref_v1(request.namespace, request.c02_operation_id)
-                body = CreateForegroundCycleRequestV2(request.c02_operation_id, request.cue_source_ref,
-                    foreground_reply_budget_ids_v1(request.namespace, request.c02_operation_id)[0],
-                    cause_original_ref=cause_ref, draft_root_registration_ref=request.draft_root_registration_ref)
-                if request.request_digest != foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind), body):
-                    raise AuthorityUnavailable("new cycle request differs from its fixed actual cause/root body")
-                responsibility = derive_current_foreground_responsibility_v1(db, namespace=request.namespace, request=body,
-                    installed_bundle=self.installed_bundle, issuer=self.issuer, owner_guard=current_guard,
-                    parent_budget_lease_ref=request.parent_budget_lease_ref, purpose=request.purpose, audiences=request.audiences, now_utc=now)
-                if request.requested_deadline_utc != responsibility.deadline_utc:
-                    raise AuthorityUnavailable("new cycle requested window differs from its actual immutable responsibility")
-                deadline = responsibility.deadline_utc
-            elif job_value is not None:
-                require_current_foreground_responsibility_v1(db, namespace=request.namespace, job=job,
-                    installed_bundle=self.installed_bundle, issuer=self.issuer, owner_guard=current_guard,
-                    purpose=request.purpose, audiences=request.audiences, now_utc=now)
-            deadline = min(deadline, grant.valid_until_utc)
-            root = None
-            if request.operation_kind == "derive_ingress_artifact_task_scope_v1":
-                from ..runtime.ingress_artifact_task_scope_v1 import (DeriveIngressArtifactTaskScopeRequestV1,
-                    derive_task_scope_candidate_v1,active_task_objectives_v1)
-                from ..runtime.domain_production_registry_v1 import installed_operation_v1
-                from .c09_storage_control_v1 import _directory_path
-                from .d11_artifact_draft_executor_v1 import _pinned_root
-                body=DeriveIngressArtifactTaskScopeRequestV1(request.c02_operation_id,request.cue_source_ref)
-                if (request.draft_root_registration_ref is not None or request.purpose!="consolidation"
-                        or request.plan_source_ref!=request.cue_source_ref
-                        or request.request_digest!=foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind),body)):
-                    raise AuthorityUnavailable("Self task derivation changed its exact C02/Source body")
-                resources=tuple(r for r in self.filesystem_manifest.resources
-                    if r.resource_id==self.installed_bundle.artifact_draft.tool_scope.resource_id)
-                if (self.filesystem_manifest.authority_id!=permit.authority_id
-                        or location.context.manifest["inventory_manifest_digest"]!=self.filesystem_manifest.manifest_digest
-                        or len(resources)!=1 or resources[0].kind!="export"
-                        or not {"jobs_drafts","imports_exports"}<=set(resources[0].content_coverage)):
-                    raise AuthorityUnavailable("Self task scope lacks its actual signed C09 draft/export resource")
-                directory=_directory_path(Path(resources[0].path));stat=directory.stat(follow_symlinks=False)
-                identity=DraftFileIdentityV1(stat.st_dev,stat.st_ino)
-                with _pinned_root(directory,identity):
-                    task,objective=derive_task_scope_candidate_v1(db,bundle=self.installed_bundle,issuer=self.issuer,
-                        request=body,owner_guard=current_guard,root_identity=identity,now_utc=now)
-                for obj in active_task_objectives_v1(db,request.namespace,self.issuer):atom(obj.goal_ref)
-                if objective is not None:
-                    atom(objective.goal_ref,required=task.task_kind=="continue")
-                    atom(objective.plan_ref,required=task.task_kind=="continue")
-                root=task.root
-                root_deadline=datetime.fromisoformat(root.valid_until_utc.replace("Z","+00:00")).timestamp()
-                if request.requested_deadline_utc!=root_deadline:
-                    raise AuthorityUnavailable("Self task root deadline differs from original installed intersection")
-                deadline=min(deadline,root_deadline)
-            elif request.draft_root_registration_ref is not None:
-                original = _read(db, issuer=self.issuer, namespace=request.namespace,
-                    kind="draft_root_capability", ref=request.draft_root_registration_ref)
-                if original is None:
-                    raise AuthorityUnavailable("foreground root requires its actual prior authorized registration")
-                root = draft_from_wire_v1(original[0], DraftRootCapabilityV1)
-                if (root.source_ref != (request.cue_source_ref if type(request) in {ForegroundActivityRequestV2,ForegroundActivityPreparationParentRequestV2} or request.operation_kind in _ARTIFACT_PHASE_OPERATIONS_V2 | _ARTIFACT_INITIAL_TASK_OPERATIONS_V1 | _ARTIFACT_PREDECISION_OPERATIONS_V2 | _ARTIFACT_AMENDMENT_PLAN_OPERATIONS_V2 or (job_value is not None and type(continuation.call_plan) is ForegroundCallPlanV2 and request.operation_kind in _ARTIFACT_PHASE_FILE_OPERATIONS_V2 | _ARTIFACT_PHASE_FINAL_OPERATIONS_V2) else request.plan_source_ref) or root.installation_id != service._installation_id
-                        or root.manifest_digest != service._manifest_digest or root.owner_grant_ref != owner_key.token
-                        or root.owner_grant_revision != versions[owner_key] or root.owner_grant_digest != canonical_digest(owner)):
-                    raise AuthorityUnavailable("foreground draft root belongs to another original scope")
-                deadline = min(deadline, datetime.fromisoformat(root.valid_until_utc.replace("Z", "+00:00")).timestamp())
-            if not now < deadline:
-                raise AuthorityUnavailable("foreground original deadline is expired or unverifiable")
-            evidence_type=ForegroundActivityEvidenceV1 if type(request) is ForegroundActivityRequestV1 else ForegroundActivityEvidenceV2
-            result = evidence_type(request, current_self,
-                ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
-                    current_owner.guard.authorization_head.removeprefix("sha256:")),
-                tuple(GraphVersion(key, revision) for key, revision in sorted(versions.items(), key=lambda row: row[0].token)),
-                QueryEpoch(request.namespace, "namespace", current_self.graph_epoch), foreground_allowed_write_domains_v1(request.operation_kind),
-                datetime.fromtimestamp(deadline, timezone.utc).isoformat().replace("+00:00", "Z"), root,
-                *db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
-                    request.namespace.as_tuple).fetchone())
+        from .original_foreground_source_read_v3 import observe_original_activity_current_v3
+        result,job_value=observe_original_activity_current_v3(self,credential=credential,subject=subject,permit=permit,request=request)
         if job_value is None:
             context, _, _ = stop_service._storage()
             with stop_service.core._tx() as core_db:
@@ -1039,11 +630,433 @@ class InstalledCurrentForegroundActivityV1:
                 require_reply_scope_not_stopped_in_tx_v1(core_db, authority_namespace=service._fences.namespace,
                     installation_id=service._installation_id, activation_generation=permit.generation,
                     actual_cycle_identity=actual_scope, action="foreground")
-        after = service.current(credential=credential, subject=subject, request=identity_request)
-        if after != current_self:
-            raise AuthorityUnavailable("foreground independent self/Owner/C09/Graph observation changed")
         service._fences.validate_fence(credential=credential, subject=subject, permit=permit)
         return result, permit
+
+    def _read_current_graph_v3(self, db, *, credential, subject, permit, request, current_self, current_owner, location, now):
+        service = self.self_identity
+        path = Path(location.graph_db_path)
+        from .current_authority_graph_read_v3 import authority_current_json_v3
+        from .foreground_mesh_source_read_v3 import read_foreground_mesh_point_v3 as read_authority_current_point_v3
+        from .foreground_mesh_source_read_v3 import read_foreground_mesh_c02_history_v3
+        if db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", request.namespace.as_tuple).fetchone() != (current_self.graph_epoch,):
+            raise AuthorityUnavailable("foreground actual Graph query epoch differs from the independent self read")
+        versions = {}
+        def atom(ref, required=True):
+            key = AtomKey.from_token(ref) if type(ref) is str else ref
+            if NamespaceId.from_key(key) != request.namespace:
+                raise AuthorityUnavailable("foreground read crossed its actual namespace")
+            row = read_authority_current_point_v3(db, table="graph_atoms", columns=("revision","value","valid"),
+                key_columns=("token","bot","persona"), key=(key.token,*request.namespace.as_tuple),
+                legacy_reader=lambda: db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+                    (*request.namespace.as_tuple,key.token)).fetchone())
+            revision = 0 if row is None else row[0]
+            versions[key] = revision
+            if required and (row is None or not row[2]):
+                raise AuthorityUnavailable("foreground current required head is absent")
+            return None if row is None else authority_current_json_v3(row[1])
+        owner_key = owner_grant_key(*request.namespace.as_tuple)
+        owner = atom(owner_key)
+        if (request.purpose not in owner["purposes"] or not set(request.audiences) <= set(owner["audiences"])
+                or "workbench.create" not in owner["capabilities"]):
+            raise AuthorityUnavailable("foreground purpose/audience exceeds the real upstream grant")
+        mapping = atom(self_mapping_key(request.namespace))
+        from ..domains.d01.production_operations_v1 import plain_v1
+        if mapping != plain_v1(self_identity_mapping_from_current(current_self)):
+            raise AuthorityUnavailable("foreground actual Graph self mapping differs from independent Authority")
+        cue = atom(request.cue_source_ref)
+        ingress = read_committed_ingress_identity(db, request.namespace, SourceRecord.from_dict(cue).source_id)
+        if ingress is None or json.loads(ingress.identity_json)["operation_id"] != request.ingress_operation_id:
+            raise AuthorityUnavailable("foreground cue lacks its original four-ledger ingress witness")
+        c02 = read_authority_current_point_v3(db, table="graph_bundle_operations", columns=("digest","receipt_json"),
+            key_columns=("bot","persona","operation_id"), key=(*request.namespace.as_tuple,request.c02_operation_id),
+            legacy_reader=lambda: db.execute("SELECT digest,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+                (*request.namespace.as_tuple,request.c02_operation_id)).fetchone())
+        if c02 is None or "first_ingress_c02" not in authority_current_json_v3(c02[1]):
+            raise AuthorityUnavailable("foreground requires an actual adopted C02 original")
+        episode_refs = set()
+        for token, revision, encoded in read_foreground_mesh_c02_history_v3(db, namespace=request.namespace, operation_id=request.c02_operation_id,
+                legacy_reader=lambda: tuple(db.execute("SELECT token,revision,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=? AND valid=1",
+                    (*request.namespace.as_tuple,request.c02_operation_id)))):
+            key = AtomKey.from_token(token)
+            if key.type_name == "memory.episode.v1" and request.cue_source_ref in authority_current_json_v3(encoded)["source_refs"]:
+                current = atom(key)
+                if current != authority_current_json_v3(encoded) or versions[key] != revision:
+                    raise AuthorityUnavailable("foreground C02 cue episode changed")
+                episode_refs.add(key.token)
+        trace_refs = []
+        for token, revision, encoded in read_foreground_mesh_c02_history_v3(db, namespace=request.namespace, operation_id=request.c02_operation_id,
+                legacy_reader=lambda: tuple(db.execute("SELECT token,revision,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=? AND valid=1",
+                    (*request.namespace.as_tuple,request.c02_operation_id)))):
+            key = AtomKey.from_token(token)
+            if key.type_name == "memory.subjective_trace.v2" and authority_current_json_v3(encoded)["episode_ref"] in episode_refs:
+                current = atom(key)
+                if current != authority_current_json_v3(encoded) or versions[key] != revision:
+                    raise AuthorityUnavailable("foreground C02 subjective trace changed")
+                trace_refs.append(key.token)
+        if len(episode_refs) != 1 or len(trace_refs) != 1:
+            raise AuthorityUnavailable("foreground C02 episode does not belong to the actual cue")
+        job_value = atom(request.cycle_job_ref, required=request.expected_cycle_revision > 0)
+        job_key = AtomKey.from_token(request.cycle_job_ref)
+        activity_id, job_id = foreground_cycle_ids_v1(request.namespace, request.c02_operation_id)
+        c04_selection = None
+        if request.operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"}:
+            from ..runtime.c04_foreground_selection_v4 import qualify_self_c04_foreground_v4
+            c04_selection, c04_ids, c04_versions = qualify_self_c04_foreground_v4(
+                db, request=request, bundle=self.installed_bundle, issuer=self.issuer)
+            versions.update(c04_versions)
+        expected_activity = activity_id if c04_selection is None else c04_selection.child_activity_id
+        if request.activity_id != expected_activity or job_key != runtime_job_key(*request.namespace.as_tuple, activity_id, job_id):
+            raise AuthorityUnavailable("foreground cycle must retain its stable adopted C02 identity")
+        if versions[job_key] != request.expected_cycle_revision:
+            raise AuthorityUnavailable("foreground cycle CAS revision changed")
+        deadline = request.requested_deadline_utc
+        from ..runtime.source_note_foreground_v1 import (OPERATION as NOTE_CREATE_OPERATION,
+            ForegroundSourceNoteContinuationV1, qualify_source_note_foreground_v1)
+        note_job = None if job_value is None else get_job(db, job_key.name)
+        note_mode = (request.operation_kind == NOTE_CREATE_OPERATION or note_job is not None
+            and type(foreground_cycle_from_wire_v1(note_job.continuation)) is ForegroundSourceNoteContinuationV1)
+        note_authorization = None
+        if request.operation_kind in {"prepare_selected_source_note_action_v2", "prepare_source_note_body",
+                "input:register_life_plan_v2", "checkpoint_source_note_foreground_cycle_v1"} and not note_mode:
+            raise AuthorityUnavailable("SourceNote named Self operation requires its actual SourceNote responsibility")
+        if note_mode:
+            note_guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
+                current_owner.guard.authorization_head.removeprefix("sha256:"))
+            note_authorization = qualify_source_note_foreground_v1(db, request=request, job=note_job,
+                issuer=self.issuer, installed_bundle=self.installed_bundle, owner_guard=note_guard,
+                now_utc=now, atom=atom)
+            deadline = min(deadline, note_authorization.original_deadline_utc)
+        if request.operation_kind == "prepare_ingress_recall_model_v1":
+            from ..runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
+            if (request.operation_id != ingress_recall_model_ids_v1(
+                    request.namespace, request.c02_operation_id)["prepare"]
+                    or request.purpose != ("consolidation" if note_mode or request.draft_root_registration_ref is not None else "context")):
+                raise AuthorityUnavailable("Self C3 changed its fixed identity/purpose")
+        if job_value is not None:
+            if request.operation_kind in {"create_foreground_cycle", "create_foreground_cycle_v2", "derive_ingress_artifact_task_scope_v1", "create_source_note_foreground_cycle_v1"}:
+                raise AuthorityUnavailable("foreground create requires its observed absent cycle target")
+            job = get_job(db, job_key.name)
+            continuation = foreground_cycle_from_wire_v1(job.continuation)
+            if (job.work_kind != WORK_KIND or job.activity_id != activity_id or job.budget_ref != request.parent_budget_lease_ref
+                    or job.cancel_epoch != request.expected_cancel_generation or job.cancel_epoch
+                    or continuation.c02_operation_id != request.c02_operation_id
+                    or continuation.source_ref != request.cue_source_ref):
+                raise AuthorityUnavailable("foreground cycle origin/control generation differs")
+            if job_graph_write(job).value != job_value or job.phase in {"completed", "failed", "cancelled", "draining"}:
+                raise AuthorityUnavailable("foreground actual SQL/Graph job is terminal, draining or inconsistent")
+            if request.operation_kind in {"wake_foreground_cycle", "wake_artifact_draft_cycle_v1", "wake_artifact_draft_cycle_v2"}:
+                if job.phase not in {"waiting", "deferred"}:
+                    raise AuthorityUnavailable("foreground wake requires its original waiting/deferred job")
+            elif request.operation_kind == "acquire_foreground_cycle":
+                if job.phase != "queued" or job.lease_holder is not None:
+                    raise AuthorityUnavailable("foreground acquire requires its actual queued unleased job")
+            elif request.operation_kind in {"prepare_ingress_recall_result_read_v1", "finish_ingress_recall_model_v1", "adopt_ingress_recall_model_v1"}:
+                from ..runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
+                from ..runtime.d07_ingress_recall_result_v1 import ingress_recall_result_operation_id_v1, ADOPT_OPERATION
+                from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1, read_prepared_d07_execution_v1
+                original = read_prepared_d07_execution_v1(db, self.issuer, request.namespace,
+                    ingress_recall_model_ids_v1(request.namespace, request.c02_operation_id)["job"])
+                if (type(original) is not D07IngressRecallPreparedV1
+                        or job.phase not in {"waiting", "deferred"}
+                        or original.cycle_job_ref != request.cycle_job_ref
+                        or request.operation_id != ingress_recall_result_operation_id_v1(
+                            request.namespace, request.c02_operation_id, request.operation_kind)):
+                    raise AuthorityUnavailable("Self C3 result needs its exact unretired parent/preparation")
+                child = get_job(db, original.job_id)
+                required_phase = "completed" if request.operation_kind == ADOPT_OPERATION else "running"
+                if (child.phase != required_phase or child.fence != 1 or child.cancel_epoch
+                        or atom(job_graph_write(child).key) != job_graph_write(child).value
+                        or required_phase == "running" and (child.lease_expires_utc is None
+                            or now >= datetime.fromisoformat(child.lease_expires_utc.replace("Z", "+00:00")).timestamp())):
+                    raise AuthorityUnavailable("Self C3 result has no current actual worker/terminal")
+            elif request.operation_kind == "adopt_ingress_c04_v1":
+                from ..runtime.c04_internal_work_original_v1 import read_c04_internal_work_prepared_v1
+                from ..runtime.c04_frozen_association_original_v3 import read_c04_frozen_association_original_v4
+                from ..runtime.c04_ingress_preparation_v4 import require_current_self_c04_parent_v4
+                prepared = read_c04_internal_work_prepared_v1(db, request.namespace, c04_ids["prepare"])
+                work = read_c04_frozen_association_original_v4(db, request.namespace, prepared.binding)
+                require_current_self_c04_parent_v4(db, namespace=request.namespace,
+                    binding=prepared.binding, work=work, prepared=prepared, installed_bundle=self.installed_bundle,
+                    issuer=self.issuer, current_self=current_self, now_utc=now)
+            elif request.operation_kind == "acquire_ingress_recall_model_v1":
+                from ..runtime.d07_ingress_recall_preparation_v1 import ingress_recall_model_ids_v1
+                from ..runtime.d07_ingress_recall_acquisition_v1 import ingress_recall_acquire_operation_id_v1
+                from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1, read_prepared_d07_execution_v1
+                original = read_prepared_d07_execution_v1(db, self.issuer, request.namespace,
+                    ingress_recall_model_ids_v1(request.namespace, request.c02_operation_id)["job"])
+                if (type(original) is not D07IngressRecallPreparedV1
+                        or job.phase not in {"waiting", "deferred"}
+                        or request.operation_id != ingress_recall_acquire_operation_id_v1(request.namespace, request.c02_operation_id)
+                        or original.cycle_job_ref != request.cycle_job_ref):
+                    raise AuthorityUnavailable("Self C3 acquire needs its original waiting cycle/preparation")
+                child = get_job(db, original.job_id)
+                if (child.phase != "queued" or child.fence or child.cancel_epoch
+                        or child.lease_holder is not None or child.result_ref is not None
+                        or atom(job_graph_write(child).key) != job_graph_write(child).value):
+                    raise AuthorityUnavailable("Self C3 acquire changed its actual once queued job")
+            elif request.operation_kind == 'acquire_artifact_draft_model_v2':
+                from ..runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+                if (type(continuation.call_plan) is not ForegroundCallPlanV2 or job.phase != 'waiting'
+                        or job.lease_holder is not None or job.lease_expires_utc is not None):
+                    raise AuthorityUnavailable('phase acquisition requires its actual released waiting current group')
+            elif request.operation_kind == "acquire_artifact_draft_model":
+                if job.phase not in {"waiting", "deferred"}:
+                    raise AuthorityUnavailable("C4 acquire requires the original released waiting cycle")
+                from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1, artifact_draft_model_ids_v1
+                from ..runtime.d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1
+                selector = artifact_draft_task_selector_v1(request.namespace, c02_operation_id=request.c02_operation_id,
+                    root_registration_ref=request.draft_root_registration_ref)
+                prepared = read_artifact_draft_prepared_v1(db, namespace=request.namespace, issuer=self.issuer, selector=selector)
+                if prepared is None:
+                    raise AuthorityUnavailable("C4 acquire has no actual committed prepared original")
+                model_job = get_job(db, prepared.job_id)
+                if (model_job.phase != "queued" or model_job.fence or model_job.cancel_epoch
+                        or model_job.lease_holder is not None or model_job.result_ref is not None
+                        or request.operation_id != artifact_draft_model_ids_v1(selector)["acquire"]):
+                    raise AuthorityUnavailable("C4 acquire changed its actual once queued job")
+                if atom(job_graph_write(model_job).key) != job_graph_write(model_job).value:
+                    raise AuthorityUnavailable("C4 acquire actual SQL/Graph worker job differs")
+            elif (job.phase != "running" or (job.lease_holder, job.fence, job.lease_expires_utc) !=
+                    (request.worker_holder, request.worker_fence, request.worker_lease_expires_utc)
+                    or job.lease_expires_utc is None or now >= datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp()):
+                raise AuthorityUnavailable("foreground work needs its actual unexpired worker holder/fence/lease")
+            deadline = min(deadline, datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp())
+        elif request.operation_kind not in {"create_foreground_cycle", "create_foreground_cycle_v2", "derive_ingress_artifact_task_scope_v1", "create_source_note_foreground_cycle_v1"} or request.expected_cancel_generation:
+            raise AuthorityUnavailable("only explicit cycle creation may use its observed absent target")
+        permitted_sources = {request.cue_source_ref}
+        artifact_operations = {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1", "revise_existing_artifact_v1", "wake_artifact_draft_cycle_v1", "prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content",
+            "compose_artifact_goal_plan", "create_artifact_project", "prepare_artifact_draft_project_context",
+            "propose_artifact_draft_action", "prepare_artifact_draft_body", "input:register_artifact_draft_plan_v3", "prepare_life"}
+        artifact_operations.update(_ARTIFACT_PHASE_OPERATIONS_V2 | _ARTIFACT_PHASE_FILE_OPERATIONS_V2 | _ARTIFACT_INITIAL_TASK_OPERATIONS_V1 | _ARTIFACT_PREDECISION_OPERATIONS_V2 | _ARTIFACT_AMENDMENT_PLAN_OPERATIONS_V2 | _METHOD_FACT_OPERATIONS_V1)
+        if request.draft_root_registration_ref is not None:
+            artifact_operations.update(("initialize_project_checkpoint", "refresh_project_checkpoint", "settle_project_checkpoint",
+                "input:register_life_outcome_v2", "advance_life", "settle_personal_goal"))
+        if note_mode:
+            permitted_sources.update(note_authorization.source_refs)
+        elif type(request) in {ForegroundActivityRequestV2,ForegroundActivityPreparationParentRequestV2}:
+            guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
+                current_owner.guard.authorization_head.removeprefix('sha256:'))
+            sources,preparation_deadline=_qualify_artifact_preparation_foreground_v2(db,request=request,job=job,
+                continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
+                current_self=current_self,owner_guard=guard,now=now,atom=atom)
+            permitted_sources.update(sources);deadline=min(deadline,preparation_deadline)
+        elif request.operation_kind in artifact_operations:
+            if request.draft_root_registration_ref is None or self.installed_bundle is None:
+                raise AuthorityUnavailable("artifact stage needs actual installed task policy and registered root")
+            from ..runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+            phase_file = (job_value is not None and type(continuation.call_plan) is ForegroundCallPlanV2
+                and request.operation_kind in _ARTIFACT_PHASE_FILE_OPERATIONS_V2)
+            if request.operation_kind in _METHOD_FACT_OPERATIONS_V1:
+                from ..runtime.d02_method_readiness_v1 import qualify_current_method_foreground_v1
+                guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
+                    current_owner.guard.authorization_head.removeprefix('sha256:'))
+                sources,method_deadline=qualify_current_method_foreground_v1(db,request=request,job=job,
+                    continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
+                    current_self=current_self,owner_guard=guard,now=now,atom=atom)
+                permitted_sources.update(sources);deadline=min(deadline,method_deadline)
+            elif (job_value is not None and type(continuation.call_plan) is ForegroundCallPlanV2
+                    and request.operation_kind in _ARTIFACT_PHASE_FINAL_OPERATIONS_V2):
+                guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
+                    current_owner.guard.authorization_head.removeprefix('sha256:'))
+                sources,final_deadline=_qualify_artifact_method_final_foreground_v2(db,request=request,
+                    continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
+                    owner_guard=guard,now=now,atom=atom)
+                permitted_sources.update(sources);deadline=min(deadline,final_deadline)
+            elif request.operation_kind in _ARTIFACT_AMENDMENT_PLAN_OPERATIONS_V2:
+                guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
+                    current_owner.guard.authorization_head.removeprefix('sha256:'))
+                sources,task_deadline=_qualify_artifact_task_plan_revision_foreground_v2(db,request=request,job=job,
+                    continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
+                    current_self=current_self,owner_guard=guard,now=now,atom=atom)
+                permitted_sources.update(sources);deadline=min(deadline,task_deadline)
+            elif request.operation_kind in _ARTIFACT_PREDECISION_OPERATIONS_V2:
+                guard=ProductionOwnerGuardV1(owner_key.token,versions[owner_key],canonical_digest(owner),
+                    current_owner.guard.authorization_head.removeprefix('sha256:'))
+                sources,task_deadline=_qualify_artifact_task_predecision_foreground_v2(db,request=request,job=job,
+                    continuation=continuation,issuer=self.issuer,installed_bundle=self.installed_bundle,
+                    current_self=current_self,owner_guard=guard,now=now,atom=atom)
+                permitted_sources.update(sources);deadline=min(deadline,task_deadline)
+            elif request.operation_kind in _ARTIFACT_INITIAL_TASK_OPERATIONS_V1:
+                guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
+                    current_owner.guard.authorization_head.removeprefix('sha256:'))
+                sources, task_deadline = _qualify_artifact_initial_task_foreground_v1(db, request=request, job=job,
+                    continuation=continuation, issuer=self.issuer, installed_bundle=self.installed_bundle,
+                    owner_guard=guard, now=now, atom=atom)
+                permitted_sources.update(sources)
+                deadline = min(deadline, task_deadline)
+            elif request.operation_kind in _ARTIFACT_PHASE_OPERATIONS_V2 or phase_file:
+                guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
+                    current_owner.guard.authorization_head.removeprefix('sha256:'))
+                sources, phase_deadline = _qualify_artifact_phase_foreground_v2(db, request=request, job=job,
+                    continuation=continuation, issuer=self.issuer, installed_bundle=self.installed_bundle,
+                    current_self=current_self, owner_guard=guard, now=now, atom=atom)
+                permitted_sources.update(sources)
+                deadline = min(deadline, phase_deadline)
+            else:
+                from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1, artifact_draft_model_ids_v1
+                selector = artifact_draft_task_selector_v1(request.namespace, c02_operation_id=request.c02_operation_id,
+                    root_registration_ref=request.draft_root_registration_ref)
+                ids = artifact_draft_model_ids_v1(selector)
+                if request.operation_kind in {"prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content"}:
+                    expected = ids[{"prepare_artifact_draft_model": "prepare", "acquire_artifact_draft_model": "acquire", "adopt_artifact_draft_content": "adopt"}[request.operation_kind]]
+                    if request.operation_id != expected:
+                        raise AuthorityUnavailable("artifact stage changed its original fixed operation identity")
+                if request.operation_kind in {"await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1", "revise_existing_artifact_v1"}:
+                    from ..runtime.artifact_continuation_originals_v1 import (
+                        discover_existing_artifact_continuation_request_v1, artifact_continuation_operation_id_v1)
+                    from ..runtime.domain_production_registry_v1 import installed_operation_v1
+                    actual = discover_existing_artifact_continuation_request_v1(db, namespace=request.namespace,
+                        selector=selector, issuer=self.issuer)
+                    from ..runtime.artifact_wait_checkpoint_v1 import artifact_wait_operation_id_v1
+                    expected = (artifact_wait_operation_id_v1(selector)
+                        if request.operation_kind == "await_existing_artifact_revision_v1"
+                        else artifact_continuation_operation_id_v1(selector,
+                            revision=request.operation_kind == "revise_existing_artifact_v1"))
+                    if (actual is None or request.operation_id != expected
+                            or request.request_digest != foreground_typed_command_digest_v1(
+                                installed_operation_v1(request.operation_kind), actual)):
+                        raise AuthorityUnavailable("artifact continuation differs from actual unique project/file selection")
+                if request.operation_kind not in {"prepare_artifact_draft_model", "acquire_artifact_draft_model", "adopt_artifact_draft_content", "wake_artifact_draft_cycle_v1", "await_existing_artifact_revision_v1", "select_existing_artifact_continuation_v1"}:
+                    from ..runtime.d11_artifact_draft_content_v1 import artifact_draft_content_from_wire_v1, ArtifactDraftContentAdoptionV1
+                    adopted = _read(db, issuer=self.issuer, namespace=request.namespace, kind="c4_adopted", ref=ids["adopt"])
+                    if adopted is None:
+                        raise AuthorityUnavailable("artifact continuation has no actual adopted paid content")
+                    content = artifact_draft_content_from_wire_v1(adopted[0], ArtifactDraftContentAdoptionV1)
+                    if content.selector != selector or content.task_source.ref != request.cue_source_ref:
+                        raise AuthorityUnavailable("artifact adopted content belongs to another actual task")
+                    permitted_sources.update(content.content.source_refs)
+        if request.operation_kind=="prepare_artifact_draft_project_context":
+            from ..host.authority_profile import AdminArtifactDraftPolicyV2
+            if type(self.installed_bundle.artifact_draft) is AdminArtifactDraftPolicyV2:
+                from ..runtime.artifact_continuation_originals_v1 import artifact_control_keys_for_task_v1
+                from ..runtime.d03_life_project_context_v1 import PrepareArtifactDraftProjectContextRequestV1
+                from ..runtime.domain_production_registry_v1 import installed_operation_v1
+                standing=self.installed_bundle.artifact_draft.standing_scope
+                keys=artifact_control_keys_for_task_v1(db,namespace=request.namespace,c02_operation_id=request.c02_operation_id,
+                    root_registration_ref=request.draft_root_registration_ref)
+                atom(keys[2]);atom(keys[3])
+                body=PrepareArtifactDraftProjectContextRequestV1(keys[2].token,keys[3].token,
+                    request.cue_source_ref,standing.social_role,standing.norm_refs)
+                if request.request_digest!=foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind),body):
+                    raise AuthorityUnavailable("Self project role differs from initial installed standing selection")
+        if request.plan_ref is not None:
+            plan = atom(request.plan_ref)
+            if AtomKey.from_token(request.plan_ref).type_name != "d08.personal_plan.v1":
+                raise AuthorityUnavailable("foreground current task source expansion needs its adopted personal plan")
+            permitted_sources.update(plan["source_refs"])
+        if request.plan_source_ref not in permitted_sources:
+            raise AuthorityUnavailable("foreground source is outside the already adopted task closure")
+        source_versions = _source_family_current_sql_v1(db, namespace=request.namespace,
+            roots=tuple(sorted(permitted_sources)),
+            purpose=request.purpose, audiences=request.audiences)
+        for version in source_versions:
+            versions[version.key] = version.revision
+        grant = self.issuer.current_budget_grant(db, request.parent_budget_lease_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        require_budget_family_admissible(db, grant.lease_id)
+        if (lease.state != "active" or (grant.bot_id, grant.persona_id) != request.namespace.as_tuple
+                or WORK_KIND not in grant.allowed_work_kinds):
+            raise AuthorityUnavailable("foreground original signed root budget does not cover internal cycle work")
+        if not note_mode and request.operation_kind in artifact_operations | {"derive_ingress_artifact_task_scope_v1"} and not {"artifact_draft_v1", "d10.life.artifact_draft.v1"} <= set(grant.allowed_work_kinds):
+            raise AuthorityUnavailable("artifact stages exceed the actual current signed model/file grant")
+        current_guard = ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
+            current_owner.guard.authorization_head.removeprefix("sha256:"))
+        from ..runtime.foreground_cycle_v1 import (CreateForegroundCycleRequestV2, derive_current_foreground_responsibility_v1,
+            foreground_post_c02_cause_ref_v1, require_current_foreground_responsibility_v1)
+        if request.operation_kind == "create_source_note_foreground_cycle_v1":
+            from ..runtime.source_note_foreground_v1 import (CreateSourceNoteForegroundCycleRequestV1,
+                derive_source_note_foreground_responsibility_v1)
+            from ..runtime.foreground_cycle_v1 import InstalledForegroundCycleReadersV1
+            responsibility, authorization = derive_source_note_foreground_responsibility_v1(db, namespace=request.namespace,
+                request=CreateSourceNoteForegroundCycleRequestV1(note_authorization.original_ref),
+                installed_readers=InstalledForegroundCycleReadersV1(self.issuer, self.installed_bundle),
+                owner_guard=current_guard, parent_budget_lease_ref=request.parent_budget_lease_ref,
+                purpose=request.purpose, audiences=request.audiences, now_utc=now)
+            if request.requested_deadline_utc != responsibility.deadline_utc:
+                raise AuthorityUnavailable("SourceNote initial request changed its immutable authorized causal deadline")
+            deadline = responsibility.deadline_utc
+        elif request.operation_kind == "create_foreground_cycle_v2":
+            from ..runtime.foreground_call_plan_v1 import foreground_reply_budget_ids_v1
+            from ..runtime.domain_production_registry_v1 import installed_operation_v1
+            cause_ref = request.draft_root_registration_ref or foreground_post_c02_cause_ref_v1(request.namespace, request.c02_operation_id)
+            body = CreateForegroundCycleRequestV2(request.c02_operation_id, request.cue_source_ref,
+                foreground_reply_budget_ids_v1(request.namespace, request.c02_operation_id)[0],
+                cause_original_ref=cause_ref, draft_root_registration_ref=request.draft_root_registration_ref)
+            if request.request_digest != foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind), body):
+                raise AuthorityUnavailable("new cycle request differs from its fixed actual cause/root body")
+            responsibility = derive_current_foreground_responsibility_v1(db, namespace=request.namespace, request=body,
+                installed_bundle=self.installed_bundle, issuer=self.issuer, owner_guard=current_guard,
+                parent_budget_lease_ref=request.parent_budget_lease_ref, purpose=request.purpose, audiences=request.audiences, now_utc=now)
+            if request.requested_deadline_utc != responsibility.deadline_utc:
+                raise AuthorityUnavailable("new cycle requested window differs from its actual immutable responsibility")
+            deadline = responsibility.deadline_utc
+        elif job_value is not None:
+            require_current_foreground_responsibility_v1(db, namespace=request.namespace, job=job,
+                installed_bundle=self.installed_bundle, issuer=self.issuer, owner_guard=current_guard,
+                purpose=request.purpose, audiences=request.audiences, now_utc=now)
+        deadline = min(deadline, grant.valid_until_utc)
+        root = None
+        if request.operation_kind == "derive_ingress_artifact_task_scope_v1":
+            from ..runtime.ingress_artifact_task_scope_v1 import (DeriveIngressArtifactTaskScopeRequestV1,
+                derive_task_scope_candidate_v1,active_task_objectives_v1)
+            from ..runtime.domain_production_registry_v1 import installed_operation_v1
+            from .c09_storage_control_v1 import _directory_path
+            from .d11_artifact_draft_executor_v1 import _pinned_root
+            body=DeriveIngressArtifactTaskScopeRequestV1(request.c02_operation_id,request.cue_source_ref)
+            if (request.draft_root_registration_ref is not None or request.purpose!="consolidation"
+                    or request.plan_source_ref!=request.cue_source_ref
+                    or request.request_digest!=foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind),body)):
+                raise AuthorityUnavailable("Self task derivation changed its exact C02/Source body")
+            resources=tuple(r for r in self.filesystem_manifest.resources
+                if r.resource_id==self.installed_bundle.artifact_draft.tool_scope.resource_id)
+            if (self.filesystem_manifest.authority_id!=permit.authority_id
+                    or location.context.manifest["inventory_manifest_digest"]!=self.filesystem_manifest.manifest_digest
+                    or len(resources)!=1 or resources[0].kind!="export"
+                    or not {"jobs_drafts","imports_exports"}<=set(resources[0].content_coverage)):
+                raise AuthorityUnavailable("Self task scope lacks its actual signed C09 draft/export resource")
+            directory=_directory_path(Path(resources[0].path));stat=directory.stat(follow_symlinks=False)
+            identity=DraftFileIdentityV1(stat.st_dev,stat.st_ino)
+            with _pinned_root(directory,identity):
+                task,objective=derive_task_scope_candidate_v1(db,bundle=self.installed_bundle,issuer=self.issuer,
+                    request=body,owner_guard=current_guard,root_identity=identity,now_utc=now)
+            for obj in active_task_objectives_v1(db,request.namespace,self.issuer):atom(obj.goal_ref)
+            if objective is not None:
+                atom(objective.goal_ref,required=task.task_kind=="continue")
+                atom(objective.plan_ref,required=task.task_kind=="continue")
+            root=task.root
+            root_deadline=datetime.fromisoformat(root.valid_until_utc.replace("Z","+00:00")).timestamp()
+            if request.requested_deadline_utc!=root_deadline:
+                raise AuthorityUnavailable("Self task root deadline differs from original installed intersection")
+            deadline=min(deadline,root_deadline)
+        elif request.draft_root_registration_ref is not None:
+            original = _read(db, issuer=self.issuer, namespace=request.namespace,
+                kind="draft_root_capability", ref=request.draft_root_registration_ref)
+            if original is None:
+                raise AuthorityUnavailable("foreground root requires its actual prior authorized registration")
+            root = draft_from_wire_v1(original[0], DraftRootCapabilityV1)
+            if (root.source_ref != (request.cue_source_ref if type(request) in {ForegroundActivityRequestV2,ForegroundActivityPreparationParentRequestV2} or request.operation_kind in _ARTIFACT_PHASE_OPERATIONS_V2 | _ARTIFACT_INITIAL_TASK_OPERATIONS_V1 | _ARTIFACT_PREDECISION_OPERATIONS_V2 | _ARTIFACT_AMENDMENT_PLAN_OPERATIONS_V2 or (job_value is not None and type(continuation.call_plan) is ForegroundCallPlanV2 and request.operation_kind in _ARTIFACT_PHASE_FILE_OPERATIONS_V2 | _ARTIFACT_PHASE_FINAL_OPERATIONS_V2) else request.plan_source_ref) or root.installation_id != service._installation_id
+                    or root.manifest_digest != service._manifest_digest or root.owner_grant_ref != owner_key.token
+                    or root.owner_grant_revision != versions[owner_key] or root.owner_grant_digest != canonical_digest(owner)):
+                raise AuthorityUnavailable("foreground draft root belongs to another original scope")
+            deadline = min(deadline, datetime.fromisoformat(root.valid_until_utc.replace("Z", "+00:00")).timestamp())
+        if not now < deadline:
+            raise AuthorityUnavailable("foreground original deadline is expired or unverifiable")
+        evidence_type=ForegroundActivityEvidenceV1 if type(request) is ForegroundActivityRequestV1 else ForegroundActivityEvidenceV2
+        result = evidence_type(request, current_self,
+            ProductionOwnerGuardV1(owner_key.token, versions[owner_key], canonical_digest(owner),
+                current_owner.guard.authorization_head.removeprefix("sha256:")),
+            tuple(GraphVersion(key, revision) for key, revision in sorted(versions.items(), key=lambda row: row[0].token)),
+            QueryEpoch(request.namespace, "namespace", current_self.graph_epoch), foreground_allowed_write_domains_v1(request.operation_kind),
+            datetime.fromtimestamp(deadline, timezone.utc).isoformat().replace("+00:00", "Z"), root,
+            *db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
+                request.namespace.as_tuple).fetchone())
+        return result, job_value
+
+    def current_mesh_v1(self, *, credential, subject, permit, request):
+        from .current_foreground_mesh_v1 import observe_current_personal_mesh_v1
+        return observe_current_personal_mesh_v1(self, credential=credential, subject=subject, permit=permit, request=request)
+
 
 
 _WIRE_TYPES = {"foreground_request": ForegroundActivityRequestV1, "foreground_evidence": ForegroundActivityEvidenceV1,
@@ -1146,6 +1159,7 @@ _ARTIFACT_PHASE_OPERATIONS_V2 = frozenset({'prepare_artifact_draft_model_v2', 'a
 
 def _qualify_artifact_phase_foreground_v2(db, *, request, job, continuation, issuer, installed_bundle, current_self, owner_guard, now, atom):
     """Rebuild exact phase commands from actual signed current task originals."""
+    from .foreground_mesh_source_read_v3 import read_foreground_mesh_point_v3 as _original_graph_point_v3
     from ..model_broker.artifact_draft_v1 import (ArtifactDraftPhaseSelectorV2, artifact_draft_model_ids_v2,
         artifact_draft_file_ids_v2, artifact_draft_phase_original_ref_v2)
     from ..runtime.foreground_call_plan_v1 import ForegroundCallPlanV2, require_protected_reply_budget_v1
@@ -1219,9 +1233,8 @@ def _qualify_artifact_phase_foreground_v2(db, *, request, job, continuation, iss
         for before,after,digest in changes:
             if before.key != after.key or NamespaceId.from_key(before.key) != request.namespace:
                 raise AuthorityUnavailable('actual completed phase delta crossed namespace/key')
-            historical = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
-                (after.key.token,after.revision)).fetchone()
-            if historical is None or historical[1] != 1 or canonical_digest(json.loads(historical[0])) != digest:
+            historical = _original_graph_point_v3(db,table='graph_history',columns=('value','valid'),key_columns=('token','revision'),key=(after.key.token,after.revision),legacy_reader=lambda:db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(after.key.token,after.revision)).fetchone())
+            if historical is None or historical[1] != 1 or canonical_digest(authority_current_json_v3(historical[0])) != digest:
                 raise AuthorityUnavailable('actual completed phase delta lost receipt historical bytes')
             completed_changes.setdefault(before.key.token, []).append((before.revision,after.revision))
     def admitted_frozen_revision(ref, before, current):
@@ -1398,10 +1411,10 @@ def _qualify_artifact_phase_foreground_v2(db, *, request, job, continuation, iss
                 file_ids = artifact_draft_file_ids_v2(selector)
                 action_key = artifact_phase_action_keys_v2(selector)[0]
                 action = atom(action_key)
-                action_history = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? ORDER BY revision DESC LIMIT 1',
-                    (action_key.token,)).fetchone()
+                actual_revision=_original_graph_point_v3(db,table='graph_atoms',columns=('revision',),key_columns=('token','bot','persona'),key=(action_key.token,*request.namespace.as_tuple),legacy_reader=lambda:db.execute('SELECT revision FROM graph_atoms WHERE token=?',(action_key.token,)).fetchone())[0]
+                action_history = _original_graph_point_v3(db,table='graph_history',columns=('event_id','value','valid'),key_columns=('token','revision'),key=(action_key.token,actual_revision),legacy_reader=lambda:db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',(action_key.token,actual_revision)).fetchone())
                 producer = None if action_history is None else read_adopted_domain_operation_v1(db, request.namespace, action_history[0])
-                if (action_history is None or action_history[2] != 1 or json.loads(action_history[1]) != action
+                if (action_history is None or action_history[2] != 1 or authority_current_json_v3(action_history[1]) != action
                         or producer is None or (producer['domain'],producer['operation_kind']) != ('d08','propose_artifact_draft_phase_action_v2')
                         or producer['payload']['request'] != plain_v1(ProposeCurrentArtifactPhaseActionRequestV2(selector))
                         or producer['payload']['provenance']['artifact_phase_content_adoption'] != plain_v1(content)
@@ -1544,8 +1557,8 @@ def _qualify_artifact_method_final_foreground_v2(db, *, request, continuation, i
             raise AuthorityUnavailable('method progress substituted another paid full-file terminal outcome')
         body=AdvanceCurrentLifeRequestV1(project_ref,ids['outcome_ref']);expected=ids['advance']
     else:
-        rows=db.execute("SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d10.life_progress.v1' AND valid=1 "
-            "AND json_extract(value,'$.effect_id')=?",(*request.namespace.as_tuple,terminal.binding.effect_id)).fetchall()
+        from ..runtime.domain_background_read_v3 import background_inventory_v3
+        rows=tuple((item.key.token,item.revision,item.value)for item in background_inventory_v3(db,request.namespace,'d10.life_progress.v1',valid_only=True)if item.value['effect_id']==terminal.binding.effect_id)
         if len(rows)!=1:raise AuthorityUnavailable('method final operation requires its unique actual same-effect D10 progress')
         progress_ref=rows[0][0];progress=atom(progress_ref)
         if (progress['project_ref'],progress['artifact_ref'])!=(project_ref,terminal.binding.artifact_ref):
@@ -1564,7 +1577,7 @@ def _qualify_artifact_method_final_foreground_v2(db, *, request, continuation, i
     return set(adoption.content.source_refs),milestone.original_deadline_utc
 
 
-_ARTIFACT_PREDECISION_OPERATIONS_V2=frozenset({'input:register_artifact_task_text_extent',
+_ARTIFACT_PREDECISION_OPERATIONS_V2=frozenset({'prepare_personal_candidate_eligibility_v1', 'adopt_personal_candidate_eligibility_v1', 'input:register_artifact_task_text_extent',
     'input:register_artifact_phase_postcondition_policy_v1','prepare_personal_candidates_v1','select_personal_step_v2'})
 
 
@@ -1602,6 +1615,13 @@ def _qualify_artifact_task_predecision_foreground_v2(db, *, request, job, contin
             parent_budget_lease_ref=request.parent_budget_lease_ref,actor_ref=current_self.self_entity_ref,
             purpose=request.purpose,audiences=request.audiences,access_epoch=access_epoch,delete_epoch=delete_epoch)
         expected=artifact_phase_policy_registration_operation_id_v1(policy)
+    elif request.operation_kind in {'prepare_personal_candidate_eligibility_v1','adopt_personal_candidate_eligibility_v1'}:
+        from ..runtime.personal_candidate_eligibility_v1 import PersonalEligibilityRequestV1, personal_eligibility_request_id_v1
+        material=readonly_current_artifact_task_choice_material_v2(db,namespace=request.namespace,
+            request=CurrentArtifactTaskChoiceRequestV2(task),issuer=issuer)
+        body=PersonalEligibilityRequestV1(material.prepare_request)
+        expected=personal_eligibility_request_id_v1(db,request.namespace,material.prepare_request,
+            prepare=request.operation_kind=='prepare_personal_candidate_eligibility_v1')
     elif request.operation_kind=='prepare_personal_candidates_v1':
         material=readonly_current_artifact_task_choice_material_v2(db,namespace=request.namespace,
             request=CurrentArtifactTaskChoiceRequestV2(task),issuer=issuer)
@@ -1631,7 +1651,7 @@ def _qualify_artifact_task_predecision_foreground_v2(db, *, request, job, contin
             or request.request_digest!=foreground_typed_command_digest_v1(installed_operation_v1(request.operation_kind),body)):
         raise AuthorityUnavailable('Self preDecision command changed its actual factory request/fixed identity/task cycle')
     approval=readonly_current_task_predecision_facts_v2(db,namespace=request.namespace,task=task,
-        operation=request.operation_kind,method_ref=method,actor_ref=current_self.self_entity_ref,bundle=installed_bundle,
+        operation='prepare_personal_candidates_v1' if request.operation_kind in {'prepare_personal_candidate_eligibility_v1','adopt_personal_candidate_eligibility_v1'} else request.operation_kind,method_ref=method,actor_ref=current_self.self_entity_ref,bundle=installed_bundle,
         issuer=issuer,owner_guard=owner_guard,now_utc=now,purpose=request.purpose,audiences=request.audiences,
         access_epoch=access_epoch,delete_epoch=delete_epoch)
     if request.operation_kind=='prepare_personal_candidates_v1':

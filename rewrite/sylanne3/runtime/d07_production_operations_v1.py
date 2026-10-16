@@ -5,6 +5,8 @@ work. This adapter independently reads current D12 policy and original DB
 tickets, sources, rounds and jobs. It never constructs a successful terminal.
 """
 from __future__ import annotations
+from .natural_producer_qualification_v1 import _producer_original_point_v3
+from .domain_background_read_v3 import background_json_loads_v3,background_inventory_v3
 
 from dataclasses import replace
 import json
@@ -72,17 +74,23 @@ def _stage_current(db, frame, request, readers, kind, compiler, reader_name):
                 raise ValueError("D07 queued work has another registered resource quote")
             reservation = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
                 "WHERE lease_id=? AND operation_id=?", (lease.lease_id, frame.envelope.identity.operation_id)).fetchone()
-            if reservation is None or reservation[2] != "reserved" or json.loads(reservation[1]) != dict(quote.ceiling):
+            if reservation is None or reservation[2] != "reserved" or background_json_loads_v3(reservation[1]) != dict(quote.ceiling):
                 raise MissingProductionOriginalV1("actual_d07_signed_quote_and_parent_reservation")
             if reservation[0] != preparation.prepared.reservation_digest:
                 raise ValueError("D07 reservation differs from the actual immutable preparation")
-            return preparation
+            from .d07_source_owner_read_v3 import register_d07_source_stage_v3
+            from .current_d07_simulation_source_read_v3 import register_current_d07_simulation_stage_v3
+            return register_current_d07_simulation_stage_v3(db,register_d07_source_stage_v3(db,preparation,request=request),request=request)
         original_ref = "d07-current:" + canonical_digest((frame.envelope.authority.namespace,
             frame.envelope.identity.operation_id))[:48]
         result = port.as_staged_domain_operation(stage, original_ref)
-        return verify_d07_production_stage_v1(result)
+        from .d07_source_owner_read_v3 import register_d07_source_stage_v3
+        from .current_d07_simulation_source_read_v3 import register_current_d07_simulation_stage_v3
+        return register_current_d07_simulation_stage_v3(db,register_d07_source_stage_v3(db,verify_d07_production_stage_v1(result),request=request),request=request)
     except MissingProductionOriginalV1 as missing:
-        return waiting_stage_v1(frame, "d07", kind, request, missing)
+        from .d07_source_owner_read_v3 import register_d07_source_stage_v3
+        from .current_d07_simulation_source_read_v3 import register_current_d07_simulation_stage_v3
+        return register_current_d07_simulation_stage_v3(db,register_d07_source_stage_v3(db,waiting_stage_v1(frame, "d07", kind, request, missing),request=request),request=request)
 
 
 def stage_serve_current_concern_in_transaction_v1(db, *, frame, request, installed_readers):
@@ -121,6 +129,12 @@ def verify_d07_production_stage_v1(stage):
 
 
 def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_kind, request):
+    from .current_d07_simulation_source_read_v3 import read_bound_current_d07_simulation_plan_v3
+    handled,plan=read_bound_current_d07_simulation_plan_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
+    if handled:return plan
+    from .d07_source_owner_read_v3 import read_bound_d07_source_plan_v3
+    handled,plan=read_bound_d07_source_plan_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
+    if handled:return plan
     types = ["d07.attention_ticket.v1", "d07.focus.v1", "d07.concern_round.v1",
              "d07.reflection_checkpoint.v1", "d07.working_set.v1", "d02.body_profile.v1",
              "d02.body_state.v1", "d02.reservation.v1"]
@@ -133,12 +147,13 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
             row = db.execute("SELECT payload_json FROM graph_d07_execution_originals_v1 WHERE bot=? AND persona=? "
                 "AND kind='semantic_question' AND original_ref=?", (*namespace.as_tuple, request.trigger_original_ref)).fetchone()
             if row:
-                question = json.loads(row[0])
+                question = background_json_loads_v3(row[0])
                 roots.extend(question["source_refs"])
                 if question.get("schema") == "d07.relationship-semantic-question.v2":
                     from .domain_production_erasure_v1 import decode_typed_production_value_v1
                     from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
-                    typed = decode_typed_production_value_v1(question, D07RelationshipSemanticQuestionV2)
+                    from .d07_execution_v1 import decode_native_named_d07_value_v2
+                    typed=decode_native_named_d07_value_v2((question,canonical_digest(question)),D07RelationshipSemanticQuestionV2)
                     keys.append(typed.cycle_ref.key)
                     keys.append(AtomKey.from_token(typed.trigger_original_ref))
                     from .foreground_cycle_v1 import foreground_cycle_from_wire_v1
@@ -148,7 +163,7 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
                     policy = db.execute("SELECT payload_json FROM graph_d05_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? AND revision=?",
                         (*namespace.as_tuple, typed.policy_ref, typed.policy_revision)).fetchone()
                     if policy:
-                        roots.extend(json.loads(policy[0])["policy_source_refs"])
+                        roots.extend(background_json_loads_v3(policy[0])["policy_source_refs"])
                 try:
                     keys.append(AtomKey.from_token(question["target_ref"]["ref"]))
                 except (ValueError, TypeError):
@@ -163,16 +178,15 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
                 row = db.execute("SELECT payload_json FROM graph_d07_execution_originals_v1 WHERE bot=? AND persona=? "
                     "AND kind='reflection_request' AND original_ref=?", (*namespace.as_tuple, request.trigger_original_ref)).fetchone()
                 if row:
-                    reflected = json.loads(row[0])
+                    reflected = background_json_loads_v3(row[0])
                     roots.extend(reflected["source_refs"])
                     keys.append(AtomKey.from_token(reflected["reflection_ref"]))
                     originals.extend(reflected[name] for name in ("cognition_adoption_receipt_ref",
                         "causal_root_ref", "causal_depth_original_ref"))
-        rows = db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d07.attention_ticket.v1' "
-                          "AND valid=1 ORDER BY token LIMIT 129", namespace.as_tuple).fetchall()
+        rows=tuple((atom.value,) for atom in background_inventory_v3(db,namespace,"d07.attention_ticket.v1",valid_only=True))
         if len(rows) <= 128:
             for (encoded,) in rows:
-                roots.extend(json.loads(encoded)["source_refs"])
+                roots.extend(encoded["source_refs"])
     elif operation_kind == "advance_reflection" and type(request) is AdvanceCurrentReflectionRequestV1:
         keys.append(AtomKey.from_token(request.reflection_ref))
         originals.append(request.cognitive_terminal_ref)
@@ -183,7 +197,7 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
                 "AND kind='simulation_request' AND original_ref=?",
                              (*namespace.as_tuple, request.simulation_request_ref)).fetchone()
             if row:
-                original = json.loads(row[0])
+                original = background_json_loads_v3(row[0])
                 registered = original["request"]
                 roots.extend(registered["snapshot_refs"])
                 originals.append(original["dedicated_budget_ref"])
@@ -208,7 +222,7 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
         if len(jobs) > 16:
             raise MissingProductionOriginalV1("bounded_current_d07_job_inventory")
         for continuation_json, result_ref, budget_ref in jobs:
-            continuation = json.loads(continuation_json)
+            continuation = background_json_loads_v3(continuation_json)
             if result_ref:
                 originals.append(result_ref)
             for name in ("cognition_adoption_receipt_ref", "causal_root_ref", "causal_depth_original_ref", "dedicated_budget_original_ref"):

@@ -129,9 +129,13 @@ class D07CognitionInputV1:
             if (type(self.target_original_json) is not str or len(self.target_original_json.encode()) > 8192
                     or canonical_serialize(json.loads(self.target_original_json)) != self.target_original_json):
                 raise ValueError("D07 target must be the exact bounded current original")
-            if (self.target_original_kind not in {"graph_head", "d08_joint_plan_intent"}
+            if (self.target_original_kind not in {"graph_head", "d08_joint_plan_intent", "simulation_forecast_context_v1"}
                     or self.target_original_digest != canonical_digest(json.loads(self.target_original_json))):
                 raise ValueError("D07 target original kind/commitment differs")
+            if self.target_original_kind=='simulation_forecast_context_v1':
+                raw=json.loads(self.target_original_json)
+                if self.work_kind!='simulation'or raw.get('schema')!='d07.simulation-forecast-context.v1' or raw.get('forecast_mode')!='declared_forecast':
+                    raise ValueError('typed forecast context cannot describe another model work kind')
         elif self.target_original_kind is not None or self.target_original_digest is not None:
             raise ValueError("D07 target commitment requires actual target bytes")
 

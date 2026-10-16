@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import hmac
 import json
+from ...runtime.domain_background_read_v3 import background_json_loads_v3,background_point_v3
 import sqlite3
 
 from ...graph_types import GraphWrite
@@ -104,6 +105,12 @@ class D02BodyQuoteAuthority:
                         hashlib.sha256).hexdigest()
 
     def _verify(self, kind: str, payload: str, signature: str) -> None:
+        from ...runtime.domain_background_read_v3 import BackgroundJSONColumnV3
+        if type(payload) is BackgroundJSONColumnV3:
+            raw=payload.json_v3()
+            if not payload.matches_v3(raw):
+                raise BodyQuoteUnavailable("D02 fixed original changed its actual canonical EOF")
+            payload=canonical_serialize(raw)
         if not hmac.compare_digest(self._sign(kind, payload), signature):
             raise BodyQuoteUnavailable("D02 body original signature differs")
 
@@ -136,18 +143,17 @@ class D02BodyQuoteAuthority:
         if type(namespace) is not NamespaceId:
             raise BodyQuoteUnavailable("body policy namespace is required")
         try:
-            row = db.execute(
-                "SELECT policy_json,signature,status FROM d02_fixed_body_policies_v1 "
-                "WHERE bot=? AND persona=? AND policy_id=? AND version=?",
-                namespace.as_tuple + (policy_id, version),
-            ).fetchone()
+            row=background_point_v3(db,table="d02_fixed_body_policies_v1",columns=("policy_json","signature","status"),
+                key_columns=("bot","persona","policy_id","version"),key=namespace.as_tuple+(policy_id,version),
+                legacy_reader=lambda:db.execute("SELECT policy_json,signature,status FROM d02_fixed_body_policies_v1 "
+                    "WHERE bot=? AND persona=? AND policy_id=? AND version=?",namespace.as_tuple+(policy_id,version)).fetchone())
         except sqlite3.Error as exc:
             raise BodyQuoteUnavailable("installed body policy is unavailable") from exc
         if row is None or row[2] != "active":
             raise BodyQuoteUnavailable("active body policy is absent")
         self._verify("d02-fixed-body-policy.v1", row[0], row[1])
         try:
-            raw = json.loads(row[0])
+            raw = background_json_loads_v3(row[0])
             raw["profile"]["namespace"] = NamespaceId(**raw["profile"]["namespace"])
             raw["profile"]["applicable_axes"] = tuple(raw["profile"]["applicable_axes"])
             raw["profile"]["work_kinds"] = tuple(raw["profile"]["work_kinds"])
@@ -259,26 +265,19 @@ class D02BodyQuoteAuthority:
         resource_quote: ResourceQuote, operation_id: str,
     ) -> BodyQuote:
         try:
-            row = db.execute(
-                "SELECT quote_version,policy_id,policy_version,operation_id,"
-                "resource_quote_digest,body_quote_json,signature "
-                "FROM d02_body_quotes_v1 WHERE bot=? AND persona=? "
-                "AND quote_id=? AND operation_id=?",
-                (resource_quote.bot_id, resource_quote.persona_id,
-                 quote_id, operation_id),
-            ).fetchone()
+            row=_read_fixed_body_quote_original_v3(db,resource_quote,quote_id,operation_id)
         except sqlite3.Error as exc:
             raise BodyQuoteUnavailable("original body quote is unavailable") from exc
         if (row is None or row[0] != quote_version or row[3] != operation_id
                 or row[4] != canonical_digest(resource_quote)):
             raise BodyQuoteUnavailable("original body quote binding differs")
         self._verify("d02-body-quote.v1", canonical_serialize({
-            "quote": json.loads(row[5]), "quote_version": row[0],
+            "quote": background_json_loads_v3(row[5]), "quote_version": row[0],
             "policy_id": row[1], "policy_version": row[2],
             "operation_id": row[3], "resource_quote_digest": row[4],
         }), row[6])
         try:
-            raw = json.loads(row[5])
+            raw = background_json_loads_v3(row[5])
             raw["components"] = tuple(WorkComponent(**part)
                                       for part in raw["components"])
             quote = BodyQuote(**raw)
@@ -287,3 +286,36 @@ class D02BodyQuoteAuthority:
         if quote.quote_id != quote_id:
             raise BodyQuoteUnavailable("original body quote identity differs")
         return quote
+
+def _read_fixed_body_quote_original_v3(db,resource_quote,quote_id,operation_id):
+    from ...runtime.domain_background_read_v3 import _active_v3,require_bound_d07_write_data_v3
+    columns=("quote_version","policy_id","policy_version","operation_id","resource_quote_digest","body_quote_json","signature")
+    from ...runtime.current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,row=read_bound_native_numeric_point_v3(db,table='d02_body_quotes_v1',columns=columns,
+        key_columns=('bot','persona','quote_id'),key=(resource_quote.bot_id,resource_quote.persona_id,quote_id))
+    if not handled:
+        from ...authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,row=read_bound_life_model_body_point_v3(db,table='d02_body_quotes_v1',columns=columns,
+        key_columns=('bot','persona','quote_id'),key=(resource_quote.bot_id,resource_quote.persona_id,quote_id))
+    if handled:return row
+    owner=_active_v3(db)
+    if owner is not None and owner.kind=="d07_stage" and owner.sealed and owner.d07_selector.stage!="egress_seal":
+        proof=getattr(owner,"d07_authored_successor",None)
+        if proof is None:
+            binding=require_bound_d07_write_data_v3(db)
+        else:
+            proof.require_current()
+            binding=proof.binding
+        if (binding[0] is not owner or (resource_quote.bot_id,resource_quote.persona_id)!=owner.namespace.as_tuple
+                or not db.in_transaction or not owner.store._lock._is_owned()):
+            raise BodyQuoteUnavailable("D02 original lost its real same-writer D07 transaction")
+        from ...runtime_storage_v3 import runtime_storage_quantum_v3,_runtime_bounded_fixed_row_v3
+        with runtime_storage_quantum_v3(db) as meter:
+            return _runtime_bounded_fixed_row_v3(db,meter,"d02_body_quotes_v1",columns,
+                "bot=? AND persona=? AND quote_id=? AND operation_id=?",
+                (*owner.namespace.as_tuple,quote_id,operation_id))
+    return background_point_v3(db,table="d02_body_quotes_v1",columns=columns,
+        key_columns=("bot","persona","quote_id"),key=(resource_quote.bot_id,resource_quote.persona_id,quote_id),
+        legacy_reader=lambda:db.execute("SELECT "+",".join(columns)+" FROM d02_body_quotes_v1 "
+            "WHERE bot=? AND persona=? AND quote_id=? AND operation_id=?",
+            (resource_quote.bot_id,resource_quote.persona_id,quote_id,operation_id)).fetchone())

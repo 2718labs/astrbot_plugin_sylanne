@@ -7,7 +7,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..authority_service.contract import AuthorityUnavailable
 from ..domains.d01.method_learning_v1 import VALUE_TYPES
 from ..graph_types import AtomKey, owner_grant_key
-from ..runtime_contracts import NamespaceId
+from ..runtime_contracts import NamespaceId, canonical_digest
 from ..runtime_storage_v3 import (RuntimeStorageOperationV3, bind_runtime_storage_operation_v3,
     finish_runtime_storage_operation_v3, runtime_storage_quantum_v3, runtime_storage_v3)
 from ..graph_worker import GraphStorageWorkV3, GraphStorageStepV3
@@ -21,7 +21,22 @@ _HISTORY_COLUMNS = ("event_id", "value", "valid")
 _DOMAIN_COLUMNS = ("domain", "operation_kind", "request_digest", "original_digest",
     "original_payload_json", "read_versions_json", "bundle_digest", "receipt_json", "receipt_digest")
 _BUNDLE_COLUMNS = ("digest", "activity_id", "effect_id", "commit_seq")
-METHOD_INPUT_OPERATIONS_V3 = frozenset({
+_NUMERIC_OWNER_OPERATIONS_V1=frozenset({
+    "prepare_internal_life_numeric_context","prepare_internal_life_numeric",
+    "acquire_internal_life_numeric","adopt_internal_life_numeric",
+    "prepare_internal_life_numeric_drive","prepare_internal_life_numeric_joint",
+    "prepare_internal_life_interval_baseline","adopt_internal_life_numeric_trace"})
+_NUMERIC_NATIVE_READ_OPERATIONS_V3=frozenset({"read_current_life_numeric_joint_prepared_v3","read_current_life_numeric_trace_v3"})
+_NUMERIC_READ_ONLY_OPERATIONS_V3=frozenset({
+    "read_current_life_numeric_identity_v3","read_current_life_numeric_model_draft_v3",
+    "qualify_current_life_numeric_candidate_v3","read_current_life_numeric_joint_prepared_v3","read_current_life_numeric_trace_v3"})
+_NUMERIC_METADATA_OPERATIONS_V3=_NUMERIC_OWNER_OPERATIONS_V1 | _NUMERIC_READ_ONLY_OPERATIONS_V3
+_OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3=frozenset({"cancel_current_owner_job_v3"})
+_NUMERIC_PAID_WRITE_OPERATIONS_V3=frozenset({"prepare_current_life_numeric_result_read_v3","record_current_life_numeric_paid_result_v3"})
+METHOD_INPUT_OPERATIONS_V3 = _NUMERIC_OWNER_OPERATIONS_V1 | frozenset({
+    "freeze_general_growth_intent_v1","register_general_growth_trial_start_v1",
+    "derive_general_growth_trial_v1","adopt_general_growth_v1",
+    'prepare_personal_candidate_eligibility_v1', 'adopt_personal_candidate_eligibility_v1',
     "register_method_evaluation_protocol_v1", "register_scoped_method_trial_v1", "register_method_experiment_v1",
     "register_method_trial_proposal_v2", "register_scoped_method_trial_v2", "register_method_experiment_v2",
     "register_method_blind_review_request_v2", "evaluate_current_method_outcome_v1",
@@ -34,6 +49,8 @@ METHOD_INPUT_OPERATIONS_V3 = frozenset({
     "register_artifact_phase_postcondition_contract_v1", "quote_current_method_choices_v1",
     "observe_method_comparison_v1", "adopt_current_c1_method_conditions_v1",
 })
+from .borrowed_habit_classification_v3 import BORROWED_HABIT_METADATA_OPERATIONS_V3
+METHOD_INPUT_OPERATIONS_V3 = METHOD_INPUT_OPERATIONS_V3 | BORROWED_HABIT_METADATA_OPERATIONS_V3
 _METHOD_LEARNING_OPERATIONS_V3 = frozenset({
     "register_method_evaluation_protocol_v1", "register_scoped_method_trial_v1", "register_method_experiment_v1",
     "register_method_trial_proposal_v2", "register_scoped_method_trial_v2", "register_method_experiment_v2",
@@ -49,7 +66,15 @@ _CANDIDATE_CONSUMERS_V3 = METHOD_INPUT_OPERATIONS_V3 - _METHOD_LEARNING_OPERATIO
 
 def _method_preplan_families_v3(kind):
     """Only the actual registered recipe's fixed families may precede its plan."""
+    if kind in (_NUMERIC_READ_ONLY_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3):return frozenset()
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3
+    if beta1_source_operation_v3(kind):return frozenset()
+    from .borrowed_habit_classification_v3 import BORROWED_HABIT_METADATA_OPERATIONS_V3
+    if kind in BORROWED_HABIT_METADATA_OPERATIONS_V3:
+        from .d11_life_product_adapter_v1 import LIFE_CURRENT_TYPES
+        return frozenset(LIFE_CURRENT_TYPES)
     if kind not in METHOD_INPUT_OPERATIONS_V3: raise AuthorityUnavailable("unregistered method input operation")
+    if kind in _GENERAL_OWNER_OPERATIONS_V1 or kind in _NUMERIC_OWNER_OPERATIONS_V1:return frozenset()
     families = set(METHOD_LEARNING_TYPES_V3)
     if kind in _METHOD_LEARNING_OPERATIONS_V3:
         families.update(("d01.persona_activation.v1", "d01.persona_plan.v1", "d03.account_binding", "d03.entity_anchor"))
@@ -74,7 +99,7 @@ _BOUND = ContextVar("sylanne_current_method_learning_read_v3", default=None)
 class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
     def __init__(self, issuer, graph, operation, fence, *, runtime, authority, lease, operation_kind,
             request, operation_id, activity_id, audience_ref, parent_budget_lease_ref, request_digest,
-            owner_binding, owner_guard, session_proof, initial_now_utc):
+            owner_binding, owner_guard, session_proof, initial_now_utc, source_pending_owner=None):
         if issuer is not _ISSUER or type(operation) is not RuntimeStorageOperationV3:
             raise AuthorityUnavailable("actual method Work retention issuer required")
         if operation.closed or runtime_storage_v3(graph._GraphCoordinator__store._db) is not operation.handle:
@@ -84,18 +109,28 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
         self.operation_id, self.activity_id, self.audience_ref = operation_id, activity_id, audience_ref
         self.parent_budget_lease_ref, self.request_digest = parent_budget_lease_ref, request_digest
         self.owner_binding, self.owner_guard, self.session_proof = owner_binding, owner_guard, session_proof
-        from .domain_production_contracts_v1 import ProductionOwnerGuardV1
-        self.material_owner_guard = ProductionOwnerGuardV1(owner_grant_key(*authority.namespace.as_tuple).token,
-            owner_binding.grant_revision, owner_binding.grant_digest.removeprefix("sha256:"),
-            owner_binding.authorization_head.removeprefix("sha256:"))
+        self.source_pending_owner=source_pending_owner
+        if source_pending_owner is not None:
+            from .current_beta1_source_read_v3 import require_pending_beta1_owner_factory_v3
+            require_pending_beta1_owner_factory_v3(source_pending_owner,graph,operation,fence,authority,operation_kind,request)
+            if owner_binding is not None or owner_guard is not None or session_proof is not None:
+                raise AuthorityUnavailable('pending Source Owner factory cannot carry a placeholder/current Owner proof')
+            self.material_owner_guard=None
+        else:
+            from .domain_production_contracts_v1 import ProductionOwnerGuardV1
+            self.material_owner_guard = ProductionOwnerGuardV1(owner_grant_key(*authority.namespace.as_tuple).token,
+                owner_binding.grant_revision, owner_binding.grant_digest.removeprefix("sha256:"),
+                owner_binding.authorization_head.removeprefix("sha256:"))
         self.initial_now_utc, self.deadline_utc = initial_now_utc, operation.deadline_utc
         if (runtime.graph is not graph or authority.namespace != fence.scope.namespace
-                or owner_binding.namespace != authority.namespace or operation.operation_id != operation_id):
+                or owner_binding is not None and owner_binding.namespace != authority.namespace or operation.operation_id != operation_id):
             raise AuthorityUnavailable("method command crossed its actual runtime/Owner/business operation")
         self.work, self.owner_head = None, None
         self.inventory_sealed = self.inputs_sealed = False
         self.read_finished = self.business_started = self.business_completed = False
         self.inventory = self.selected_plan = self.selected_envelope = self.frame_fields = None
+        self.prepared_encoding_inputs_v3=None
+        self.prepared_numeric_drive_inputs_v3=None
         self.points, self.inventories, self.input_heads = {}, {}, {}
         self.census_columns, self.census_versions = {}, {}
         self.atom_column = self.pending_input = None
@@ -103,7 +138,7 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
         self.observed_originals, self.installed_policy_refs = (), ()
         self.installed_readers = None
         self.budget_task, self.policy_tasks = None, {}
-        self.preplan_families = _method_preplan_families_v3(operation_kind)
+        self.preplan_families = frozenset()if source_pending_owner is not None else _method_preplan_families_v3(operation_kind)
         self.preference_type = None
         self.preference_origin = self.preference_inventory = None
         self.preferences_from_census = False
@@ -114,22 +149,48 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
             self.preference_type = ESTIMATE_TYPE
             self.preferences_from_census = True
             self.preference_origin = ("actual_prepare_request", operation_id, request_digest, request.bindings)
+        from .current_beta1_source_read_v3 import beta1_source_operation_v3
+        own_source=source_pending_owner is not None or beta1_source_operation_v3(operation_kind)
+        self.numeric_source_permission=None
+        self.general_metadata_issuing_task=None
+        self.general_metadata_reserved=0;self.general_source_reserved=0
+        self.general_owner_entry=self.general_source_permission=None
         self.attachments, self.pending_attachments = {}, []
         self.wires = {}
         self.attachment = None
         self.prefinal = self
-        super().__init__(graph, operation, fence, projection_types=METHOD_LEARNING_TYPES_V3 | (frozenset({self.preference_type}) if self.preference_type else frozenset()),
+        super().__init__(graph, operation, fence, projection_types=(frozenset() if own_source or operation_kind in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3) else METHOD_LEARNING_TYPES_V3 | (frozenset({self.preference_type}) if self.preference_type else frozenset())),
             selected_tokens=frozenset(), census_schema="sylanne.method-learning-census.v3",
             leaf_schema="sylanne.method-learning-census-leaf.v3")
+        if type(self)is _MethodLearningReadV3 and operation_kind in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3):
+            self.census_schema="numeric-owner-header-census.v1" if operation_kind in _NUMERIC_METADATA_OPERATIONS_V3 else "general-owner-header-census.v1"
+            self.leaf_schema="numeric-owner-header-census-leaf.v1" if operation_kind in _NUMERIC_METADATA_OPERATIONS_V3 else "general-owner-header-census-leaf.v1"
+            self.root=canonical_digest((self.census_schema,self.namespace,self.query,self.selection_digest))
+        if own_source:
+            self.census_schema="world-owner-header-census.v3"
+            self.leaf_schema="world-owner-header-census-leaf.v3"
+            self.root=canonical_digest((self.census_schema,self.namespace,self.query,self.selection_digest))
         _READERS.add(self)
 
     def require_current(self, *, meter=None):
         if self not in _READERS or self.operation.closed or self.work is None:
             raise AuthorityUnavailable("actual originating method Work reader required")
+        if self.operation_kind in _NUMERIC_READ_ONLY_OPERATIONS_V3:
+            from .current_life_numeric_read_v3 import require_numeric_read_work_v3
+            require_numeric_read_work_v3(self)
+        if self.operation_kind in _NUMERIC_PAID_WRITE_OPERATIONS_V3:
+            from .current_life_numeric_paid_write_v3 import require_numeric_paid_write_work_v3
+            require_numeric_paid_write_work_v3(self)
+        from .current_beta1_source_read_v3 import beta1_source_operation_v3,beta1_source_work_kind_v3,beta1_source_reader_work_kind_v3,require_current_beta1_source_work_v3
+        own_source=self.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(self.operation_kind)
+        if own_source:require_current_beta1_source_work_v3(self)
+        if self.source_pending_owner is not None and self.owner_binding is None:
+            from .current_beta1_source_read_v3 import require_pending_beta1_owner_reader_current_v3
+            return require_pending_beta1_owner_reader_current_v3(self,meter=meter)
         store = self.store
         if (not store._lock._is_owned() or self.work.state is not self
                 or self.work.operation is not self.operation or self.work.coordinator is not self.graph
-                or self.work.kind != METHOD_LEARNING_WORK_KIND_V3
+                or self.work.kind != (beta1_source_reader_work_kind_v3(self)if own_source else "current_life_numeric_paid_write_v3" if self.operation_kind in _NUMERIC_PAID_WRITE_OPERATIONS_V3 else "current_owner_job_cancel_v3" if self.operation_kind in _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 else "current_life_numeric_read_v3" if self.operation_kind in _NUMERIC_READ_ONLY_OPERATIONS_V3 else METHOD_LEARNING_WORK_KIND_V3)
                 or self.work.operation_id != self.operation.operation_id
                 or self.work.deadline_utc != self.operation.deadline_utc
                 or self.work.selection_digest != self.selection_digest
@@ -149,7 +210,17 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
         return self
 
     def _next(self, meter):
+        if self.work.kind=='current_conditioned_self_source_read_v3':
+            from .current_conditioned_self_read_v3 import require_conditioned_owner_ready_v3
+            require_conditioned_owner_ready_v3(self)
+        from .current_beta1_source_read_v3 import beta1_source_operation_v3
+        if type(self)is _MethodLearningReadV3 and (self.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(self.operation_kind)):
+            return _advance_general_method_header_census_v1(self,meter)
+        if type(self)is _MethodLearningReadV3 and self.operation_kind in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3):
+            return _advance_general_method_header_census_v1(self,meter)
         super()._next(meter)
+        from .artifact_borrowed_source_v3 import record_artifact_borrowed_header_v3
+        record_artifact_borrowed_header_v3(self)
         if self.cell is not None and self.body is not None:
             key, revision, valid, _, _ = self.pending
             self.atom_column = MethodJSONColumnV3(_ISSUER, self, table="graph_atoms", column="value",
@@ -243,7 +314,7 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
                 self.require_current(meter=meter)
                 self._reserve(65536)
                 self.inventory_sealed = True
-                self.inventory = PreparedCurrentMethodLearningReadV3(_ISSUER, self)
+                self.inventory = _method_inventory_result_v3(self)
                 if self.preferences_from_census:
                     self.preference_inventory = PreparedMethodRelationshipPreferencesV3(_ISSUER, self,
                         tuple(atom for atom in self.atoms if atom.key.type_name == self.preference_type))
@@ -253,18 +324,20 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
 
 def begin_current_method_learning_read_v3(graph, operation, fence, *, runtime, authority, lease,
         operation_kind, request, operation_id, activity_id, audience_ref, parent_budget_lease_ref,
-        request_digest, owner_binding, owner_guard, session_proof, initial_now_utc):
+        request_digest, owner_binding, owner_guard, session_proof, initial_now_utc, source_pending_owner=None):
     """Root supplies its actual existing command, fence and original retention."""
     return _MethodLearningReadV3(_ISSUER, graph, operation, fence, runtime=runtime, authority=authority,
         lease=lease, operation_kind=operation_kind, request=request, operation_id=operation_id,
         activity_id=activity_id, audience_ref=audience_ref, parent_budget_lease_ref=parent_budget_lease_ref,
         request_digest=request_digest, owner_binding=owner_binding, owner_guard=owner_guard,
-        session_proof=session_proof, initial_now_utc=initial_now_utc)
+        session_proof=session_proof, initial_now_utc=initial_now_utc, source_pending_owner=source_pending_owner)
 
 
 def attach_current_method_learning_work_v3(reader, work):
-    if (type(reader) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3) or reader not in _READERS or reader.work is not None
-            or type(work) is not GraphStorageWorkV3 or work.kind != METHOD_LEARNING_WORK_KIND_V3
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3,beta1_source_work_kind_v3,beta1_source_reader_work_kind_v3,register_current_beta1_source_work_v3
+    own_source=type(reader)is _MethodLearningReadV3 and beta1_source_operation_v3(reader.operation_kind)
+    if (type(reader) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3, PreparedPersonalEligibilityRecoveryReadV1) or reader not in _READERS or reader.work is not None
+            or type(work) is not GraphStorageWorkV3 or work.kind != (beta1_source_reader_work_kind_v3(reader)if own_source else METHOD_LEARNING_WORK_KIND_V3)
             or work.state is not reader or work.operation is not reader.operation
             or work.coordinator is not reader.graph or work.operation_id != reader.operation.operation_id
             or work.deadline_utc != reader.operation.deadline_utc or work.selection_digest != reader.selection_digest):
@@ -272,13 +345,14 @@ def attach_current_method_learning_work_v3(reader, work):
     work._require_invocation(reader.graph, initial=True)
     reader.work = work
     work.phase = "method_census"
+    if own_source:register_current_beta1_source_work_v3(reader,work)
     return work
 
 
 def queue_current_method_learning_attachment_v3(reader, *, read_plan, table, columns, key_columns, key):
     """Add only an actual selected Source history from this Work's read recipe."""
     from .domain_production_contracts_v1 import ProductionReadPlanV1
-    if (type(reader) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3) or reader not in _READERS or reader.complete
+    if (type(reader) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3, PreparedPersonalEligibilityRecoveryReadV1) or reader not in _READERS or reader.complete
             or not reader.graph_eof or type(read_plan) is not ProductionReadPlanV1):
         raise AuthorityUnavailable("unfinished actual method Work/read recipe required")
     reader.work._require_invocation(reader.graph)
@@ -295,13 +369,17 @@ def queue_current_method_learning_attachment_v3(reader, *, read_plan, table, col
 
 def advance_current_method_learning_read_v3(graph, work):
     reader = work.state
+    if type(reader) is PreparedPersonalEligibilityRecoveryReadV1:
+        return _advance_personal_eligibility_recovery_v1(graph,work)
     if type(reader) is BorrowedMethodLearningReadV3:
         return _advance_borrowed_method_learning_read_v3(graph, work)
-    if (type(reader) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3) or reader not in _READERS or reader.work is not work
+    if (type(reader) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3, PreparedPersonalEligibilityRecoveryReadV1) or reader not in _READERS or reader.work is not work
             or graph is not reader.graph or work.operation is not reader.operation):
         raise AuthorityUnavailable("actual same-operation method Work required")
     with bind_runtime_storage_operation_v3(work.operation, reader.db):
-        if not reader.read_finished: graph._validate_read_fence_v3(reader.fence)
+        if not reader.read_finished:
+            _prepare_current_general_method_owner_entry_v1(reader)
+            graph._validate_read_fence_v3(reader.fence)
         if reader.inputs_sealed:
             if not reader.read_finished:
                 graph._finish_read_fence_v3(reader.fence)
@@ -344,6 +422,8 @@ def advance_current_method_learning_read_v3(graph, work):
                             if reader.db.in_transaction: raise AuthorityUnavailable("method selected-input step inherited a transaction")
                             reader.db.execute("BEGIN")
                             try:
+                                from .d07_source_preparation_members_v3 import prepare_current_d07_source_read_dependencies_v3
+                                prepare_current_d07_source_read_dependencies_v3(reader)
                                 reader.frame_fields = _materialize_current_domain_frame_fields_v1(graph, reader.db,
                                     envelope=reader.selected_envelope, scope=reader.fence.scope, plan=reader.selected_plan,
                                     now_utc=reader.initial_now_utc, expected_owner_guard=reader.material_owner_guard,
@@ -351,6 +431,16 @@ def advance_current_method_learning_read_v3(graph, work):
                                     observed_originals=reader.observed_originals, installed_policy_refs=reader.installed_policy_refs,
                                     limits=ProductionOperationLimitsV1(), prepared_inputs=PreparedMethodDomainInputsV3(
                                         _ISSUER, reader, reader.selected_plan, reader.selected_envelope))
+                                if reader.work.kind=='current_conditioned_self_source_read_v3':
+                                    from .current_conditioned_self_read_v3 import augment_current_conditioned_output_plan_v3,finalize_current_conditioned_source_inputs_v3
+                                    if augment_current_conditioned_output_plan_v3(reader):return GraphStorageStepV3('progress')
+                                    finalize_current_conditioned_source_inputs_v3(reader)
+                                if reader.operation_kind=="prepare_internal_life_numeric_drive":
+                                    from .d06_life_numeric_drive_v1 import capture_prepared_numeric_drive_inputs_v3
+                                    capture_prepared_numeric_drive_inputs_v3(reader)
+                                if reader.operation_kind=="prepare_internal_life_interval_baseline":
+                                    from .c04_encoding_context_original_v3 import capture_prepared_w01_life_encoding_inputs_v3
+                                    capture_prepared_w01_life_encoding_inputs_v3(reader)
                             finally: reader.db.rollback()
                         reader.inputs_sealed = reader.complete = True
                         work.phase = "inputs_sealed"
@@ -369,6 +459,81 @@ def advance_current_method_learning_read_v3(graph, work):
                         raise AuthorityUnavailable("method inventory has no actual fixed recipe or adopted selected dependency")
                     task = reader.inventories.get(actual)
                     if task is None: task = _MethodInventoryReadV3(reader, actual); reader.inventories[actual] = task
+                elif kind=='frozen_joint_d12':
+                    from .frozen_joint_command_source_v3 import create_frozen_joint_d12_task_v3
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        task=create_frozen_joint_d12_task_v3(reader,actual)
+                elif kind=='frozen_joint_metadata':
+                    from .frozen_joint_command_source_v3 import create_frozen_joint_metadata_task_v3
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        task=create_frozen_joint_metadata_task_v3(reader,actual)
+                elif kind=='conditioned_owner_metadata':
+                    from .current_conditioned_self_read_v3 import create_current_conditioned_metadata_task_v3
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        task=create_current_conditioned_metadata_task_v3(reader,actual)
+                elif kind=="world_metadata":
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        if reader.operation_kind=="run_simulation":
+                            from .current_d07_simulation_source_read_v3 import create_current_d07_simulation_metadata_task_v3
+                            task=create_current_d07_simulation_metadata_task_v3(reader,actual)
+                        else:
+                            from .world_owner_read_v3 import create_world_metadata_task_v3
+                            task=create_world_metadata_task_v3(reader,actual)
+                elif kind=="beta1_source_metadata":
+                    from .current_beta1_source_read_v3 import create_current_beta1_source_metadata_task_v3
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        task=create_current_beta1_source_metadata_task_v3(reader,actual)
+                elif kind == "general_method_source_metadata":
+                    with reader.store._lock:
+                        require_actual_source_owner_metadata_work_v1(reader)
+                        tasks=_GENERAL_METHOD_SOURCE_TASKS_V1.setdefault(reader,{})
+                        task=tasks.get(actual)
+                        if task is None:
+                            task=_GeneralMethodSourceMetadataEOFV1(_GENERAL_METHOD_SOURCE_ISSUER_V1,reader,actual)
+                            tasks[actual]=task
+                elif kind=="drive_dose_grant":
+                    from .d06_life_numeric_drive_v1 import DriveDoseGrantTaskV3
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        identity=(kind,actual);task=reader.attachments.get(identity)
+                        if task is None:task=DriveDoseGrantTaskV3(reader,actual);reader.attachments[identity]=task
+                elif kind=="math_nonseries_metadata":
+                    from .c04_encoding_context_original_v3 import MathNonSeriesMetadataTaskV3
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        identity=(kind,actual);task=reader.attachments.get(identity)
+                        if task is None:task=MathNonSeriesMetadataTaskV3(reader,actual);reader.attachments[identity]=task
+                elif kind=="numeric_c04_selection":
+                    from .current_life_numeric_metadata_v1 import NumericC04SelectorTaskV1
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        identity=("numeric_c04_selection",actual)
+                        task=reader.attachments.get(identity)
+                        if task is None:
+                            task=NumericC04SelectorTaskV1(reader,actual)
+                            reader.attachments[identity]=task
+                elif kind=="numeric_owner_metadata":
+                    from .current_life_numeric_metadata_v1 import NumericMetadataTaskV1
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        identity=("numeric_owner_metadata",actual)
+                        task=reader.attachments.get(identity)
+                        if task is None:
+                            task=NumericMetadataTaskV1(reader,actual)
+                            reader.attachments[identity]=task
+                elif kind=="general_owner_metadata":
+                    from .d01_general_growth_v1 import create_current_general_owner_metadata_task_v1
+                    with reader.store._lock,runtime_storage_quantum_v3(reader.db):
+                        require_actual_general_owner_metadata_work_v1(reader,operation_kind=reader.operation_kind,namespace=reader.namespace)
+                        identity=("general_owner_metadata",actual)
+                        task=reader.attachments.get(identity)
+                        if task is None:
+                            task=create_current_general_owner_metadata_task_v1(reader,actual)
+                            reader.attachments[identity]=task
+                elif kind == "joint_original_keys":
+                    table, namespace, original_kind = actual
+                    if table != "graph_d08_joint_node_originals_v1" or namespace != reader.namespace:
+                        raise AuthorityUnavailable("Joint original key recipe crossed namespace or family")
+                    tasks = _JOINT_KEY_SCANS_V3.setdefault(reader, {})
+                    task = tasks.get(actual)
+                    if task is None:
+                        task = _JointOriginalKeysReadV3(reader, actual); tasks[actual] = task
                 elif kind == "budget_grant":
                     if actual != reader.parent_budget_lease_ref: raise AuthorityUnavailable("method budget locator differs from its actual parent")
                     if reader.budget_task is None: reader.budget_task = _MethodBudgetGrantReadV3(reader, actual)
@@ -380,7 +545,9 @@ def advance_current_method_learning_read_v3(graph, work):
                 else: raise AuthorityUnavailable("unregistered method selected-input request")
                 reader.pending_input = task
             finally: _READING.reset(token)
-        if not reader.read_finished: graph._validate_read_fence_v3(reader.fence)
+        if not reader.read_finished:
+            _prepare_current_general_method_owner_entry_v1(reader)
+            graph._validate_read_fence_v3(reader.fence)
     return GraphStorageStepV3("complete", reader.result) if reader.business_completed else GraphStorageStepV3("progress")
 
 
@@ -388,7 +555,12 @@ def finish_current_method_learning_read_v3(graph, work, error):
     reader = work.state
     payload = reader.result
     try:
-        if type(reader) is _MethodLearningReadV3 and not reader.read_finished:
+        if type(reader) is PreparedPersonalEligibilityRecoveryReadV1:
+            if reader.owner_read_entry is not None:
+                reader.owner_read_entry.release_v3(); reader.owner_read_entry=None
+            if reader.read_issuance_lifetime is not None:
+                reader.read_issuance_lifetime.close(); reader.read_issuance_lifetime=None
+        if type(reader) in (_MethodLearningReadV3,PreparedPersonalEligibilityRecoveryReadV1) and not reader.read_finished:
             graph._finish_read_fence_v3(reader.fence)
             reader.read_finished = True
         if error is None: work.result_lease = work.operation
@@ -474,7 +646,7 @@ def bind_prepared_method_learning_read_v3(proof, graph, db):
     if type(proof) in (PreparedMethodDomainInputsV3, PreparedBorrowedMethodDomainInputsV3):
         proof._actual_v3()
         proof = proof.owner.inventory
-    if type(proof) is not PreparedCurrentMethodLearningReadV3:
+    if type(proof) not in (PreparedCurrentMethodLearningReadV3,PreparedPersonalEligibilityRecoveryInventoryV1):
         raise AuthorityUnavailable("actual private method Binder required")
     proof._actual()
     if proof.graph is not graph or proof.db is not db:
@@ -486,7 +658,7 @@ def bind_prepared_method_learning_read_v3(proof, graph, db):
 
 
 def require_actual_method_learning_attachment_owner_v3(owner, *, db=None):
-    if (type(owner) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3) or owner not in _READERS
+    if (type(owner) not in (_MethodLearningReadV3, BorrowedMethodLearningReadV3, PreparedPersonalEligibilityRecoveryReadV1) or owner not in _READERS
             or owner.work is None or owner.work.state is not owner or owner.work.operation is not owner.operation
             or owner.work.coordinator is not owner.graph or not owner.graph_eof or owner.operation.closed
             or db is not None and db is not owner.db):
@@ -544,6 +716,9 @@ def require_bound_method_learning_history_v3(db, namespace, key, revision):
 
 
 def read_bound_method_learning_attachment_v3(db, *, table, columns, key_columns, key):
+    from .world_owner_read_v3 import read_bound_world_attachment_v3
+    handled,row=read_bound_world_attachment_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if handled:return True,row
     post = _method_post_commit_active_v3(db)
     if post is not None:
         return True, post.attachment_v3(table, tuple(columns), tuple(key_columns), tuple(key))
@@ -608,13 +783,58 @@ class MethodInputNeededV3(Exception):
     def __init__(self, request): self.request = request
 
 
+class _MethodJSONStreamV3:
+    def __new__(cls,column,*,ensure_ascii,wire_metadata=None):
+        from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
+        class Stream(C09CanonicalJSONStreamV2):
+            def _append_decoded_codepoint(self,codepoint):
+                state=self._string
+                if state is None or state["mode"]!="value":
+                    return super()._append_decoded_codepoint(codepoint)
+                column._actual()
+                if wire_metadata is not None and wire_metadata.consume_codepoint_v3(state["path"],codepoint):return
+                if not column.retain_path_v3(state["path"]):return
+                high=column.text_high
+                if high is not None:
+                    column.text_high=None
+                    if 0xdc00<=codepoint<=0xdfff:
+                        column.text_chars.append(chr(0x10000+((high-0xd800)<<10)+codepoint-0xdc00));return
+                    column.text_chars.append(chr(high))
+                if 0xd800<=codepoint<=0xdbff:column.text_high=codepoint
+                else:column.text_chars.append(chr(codepoint))
+        return Stream(ensure_ascii=ensure_ascii)
+
+
 class MethodJSONColumnV3:
     def __init__(self, issuer, owner, *, table, column, key_columns, key, cell=None,
-            signer=None, signature_kind=None, signature=None):
+            signer=None, signature_kind=None, signature=None,
+            general_metadata_issuer=None,general_metadata_profile=None,beta1_metadata_task=None,beta1_metadata_issuer=None):
         if issuer is not _ISSUER or owner not in _READERS:
             raise AuthorityUnavailable("actual method JSON-column issuer required")
-        from .domain_background_read_v3 import _BackgroundJSONStreamV3
+        self.beta1_metadata_task=beta1_metadata_task
+        self.beta1_metadata_fields_seen=set()
+        if beta1_metadata_task is not None:
+            from .current_beta1_source_read_v3 import require_beta1_metadata_column_task_v3
+            if general_metadata_profile is not None:raise AuthorityUnavailable("distinct metadata issuers cannot be combined")
+            require_beta1_metadata_column_task_v3(beta1_metadata_task,owner,issuer=beta1_metadata_issuer,
+                table=table,column=column,key_columns=key_columns,key=key)
+        elif general_metadata_profile is None:_require_current_general_method_body_v1(owner,table,key)
         self.owner, self.db, self.operation = owner, owner.db, owner.operation
+        self.general_metadata_profile=general_metadata_profile
+        self.general_metadata_fields_seen=set()
+        self.general_metadata_task=None
+        self.semantic_decoder=self.semantic_hash=None
+        if general_metadata_profile is not None:
+            if general_metadata_issuer is not _GENERAL_METADATA_COLUMN_ISSUER_V1:
+                raise AuthorityUnavailable("private actual General metadata column issuer required")
+            require_actual_general_owner_metadata_work_v1(owner,operation_kind=owner.operation_kind,namespace=owner.namespace)
+            self.general_metadata_task=owner.general_metadata_issuing_task
+            if self.general_metadata_task is None or self.general_metadata_task.reader is not owner:
+                raise AuthorityUnavailable("actual General issuing attachment task required")
+            _GENERAL_METADATA_COLUMNS_V1[self]=(owner,general_metadata_profile,self.general_metadata_task)
+            if cell is not None and cell.header[0]=="canonical-json.utf8.v1":
+                import codecs,hashlib
+                self.semantic_decoder=codecs.getincrementaldecoder("utf8")("strict");self.semantic_hash=hashlib.sha256()
         self.table, self.column, self.key_columns, self.key = table, column, tuple(key_columns), tuple(key)
         self.cell = cell
         self.signer, self.signature_kind, self.signature = signer, signature_kind, signature
@@ -626,7 +846,11 @@ class MethodJSONColumnV3:
         self.reserved = 0
         self.wire_parts, self.wire = [], None
         self.canonical_digest = None; self.canonical_stream = None
-        self.parser = _BackgroundJSONStreamV3(self, ensure_ascii=cell is None or cell.header[0] != "canonical-json.utf8.v1")
+        wire_metadata=None
+        if beta1_metadata_task is not None and owner.work.kind=='current_conditioned_self_source_read_v3':
+            from .current_conditioned_self_read_v3 import conditioned_metadata_wire_capture_v3
+            wire_metadata=conditioned_metadata_wire_capture_v3(beta1_metadata_task)
+        self.parser = _MethodJSONStreamV3(self, ensure_ascii=cell is None or cell.header[0] != "canonical-json.utf8.v1",wire_metadata=wire_metadata)
         _JSON_COLUMNS[self] = (owner, self.db, table, column, self.key_columns, self.key, cell, signer, signature_kind, signature)
         if signer is not None: self.signature_state = signer.begin_original_stream_verification_v3(signature_kind, self)
 
@@ -638,10 +862,20 @@ class MethodJSONColumnV3:
         return self
 
     def _reserve_v3(self, extra=0):
-        size = _heap((self.nodes, self.value, self.scalar, self.text_parts, self.text_chars, self.fragment, self.wire_parts)) + extra + 65536
+        if self.general_metadata_profile is not None:
+            return reserve_current_general_owner_metadata_peak_v1(self.owner,extra=extra)
+        size = _heap((self.nodes, self.value, self.scalar, self.text_parts, self.text_chars, self.fragment, self.wire_parts,
+            self.general_metadata_fields_seen)) + extra + 65536
         if size > self.reserved:
             self.operation.retain(size - self.reserved); self.reserved = size
-    def retain_path_v3(self, path): return True
+    def retain_path_v3(self,path):
+        if self.beta1_metadata_task is not None:
+            from .current_beta1_source_read_v3 import retain_beta1_metadata_path_v3
+            return retain_beta1_metadata_path_v3(self,path)
+        if self.general_metadata_profile is None:return True
+        _require_general_owner_metadata_column_v1(self)
+        from .d01_general_growth_v1 import retain_current_general_owner_metadata_path_v1
+        return retain_current_general_owner_metadata_path_v1(self.general_metadata_profile,path)
     def _put_v3(self, path, value):
         if not path: self.value = value
         else:
@@ -651,7 +885,13 @@ class MethodJSONColumnV3:
     def _flush_text_v3(self):
         if self.text_chars:
             self.text_parts.append("".join(self.text_chars)); self.text_chars = []
-    def _emit_v3(self, event):
+    def _emit_v3(self,event):
+        if self.beta1_metadata_task is not None:
+            if event.kind=="key"and len(event.path)==1:self.beta1_metadata_fields_seen.add(event.key)
+            if not self.retain_path_v3(event.path):return
+        if self.general_metadata_profile is not None:
+            if event.kind=="key" and len(event.path)==1:self.general_metadata_fields_seen.add(event.key)
+            if not self.retain_path_v3(event.path):return
         import json
         if event.kind in ("object_start", "array_start"):
             self._reserve_v3(1024)
@@ -672,6 +912,10 @@ class MethodJSONColumnV3:
     def advance(self, meter):
         from .c09_paged_sql_v2 import legacy_cell_read_transaction_v2, read_legacy_sql_cell_fragment_v2, _quote
         self._actual(); self.owner.require_current(meter=meter)
+        if self.beta1_metadata_task is not None:
+            from .current_beta1_source_read_v3 import advance_beta1_metadata_column_v3
+            return advance_beta1_metadata_column_v3(self,meter)
+        if self.general_metadata_profile is not None:return _advance_general_owner_metadata_column_v1(self,meter)
         if self.complete: return True
         if self.canonical_stream is not None:
             self.canonical_stream.read_fragment(meter)
@@ -729,6 +973,8 @@ class MethodJSONColumnV3:
 
     def json_v3(self):
         self._actual()
+        if self.general_metadata_profile is not None or self.beta1_metadata_task is not None:
+            raise AuthorityUnavailable("locator metadata is not a protected whole-body original")
         if not self.complete: raise AuthorityUnavailable("method JSON must reach actual EOF")
         self.operation.retain(_heap(self.frozen) + 1024)
         return _detach_value_v3(self.frozen)
@@ -777,7 +1023,11 @@ class _MethodPointReadV3:
         from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
         where = " AND ".join(n + "=?" for n in self.key_columns)
         if not self.complete: raise AuthorityUnavailable("method point lacks actual EOF")
-        actual = _runtime_bounded_fixed_row_v3(self.owner.db, meter, self.table, self.metadata_columns, where, self.key)
+        if self.owner.operation_kind=="prepare_internal_life_numeric_drive":
+            from .d06_life_numeric_drive_v1 import recheck_drive_numeric_point_header_v3
+            actual=recheck_drive_numeric_point_header_v3(self,meter)
+        else:
+            actual = _runtime_bounded_fixed_row_v3(self.owner.db, meter, self.table, self.metadata_columns, where, self.key)
         if actual != self.metadata: raise AuthorityUnavailable("method point full key/current row changed after EOF")
         return self.row
 
@@ -846,11 +1096,41 @@ def _method_active(db):
 
 
 def _require_input_request(owner, request):
+    from .artifact_borrowed_source_v3 import require_artifact_borrowed_point_v3
+    if require_artifact_borrowed_point_v3(owner,request):return
     from .natural_producer_qualification_v1 import _HOST_ATTACHMENT_SHAPES_V3
     table, columns, key_columns, key = request
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3
+    if owner.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(owner.operation_kind):
+        from .current_beta1_source_read_v3 import require_beta1_source_point_v3
+        return require_beta1_source_point_v3(owner,request)
+    if owner.operation_kind in _NUMERIC_PAID_WRITE_OPERATIONS_V3:
+        from .current_life_numeric_paid_write_v3 import require_numeric_paid_point_v3
+        require_numeric_paid_point_v3(owner,request)
+        return
+    if owner.operation_kind in _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3:
+        from .current_owner_job_cancel_v3 import require_cancel_job_point_v3
+        require_cancel_job_point_v3(owner,request)
+        return
+    if owner.operation_kind in _NUMERIC_READ_ONLY_OPERATIONS_V3:
+        from .current_life_numeric_read_v3 import require_numeric_read_point_v3
+        require_numeric_read_point_v3(owner,request)
+        return
+    if owner.operation_kind=="prepare_internal_life_interval_baseline" and table in {"graph_c04_encoding_baselines_v3","graph_d11_life_originals_v1"}:
+        from .c04_encoding_context_original_v3 import require_life_encoding_prior_selector_v3
+        if require_life_encoding_prior_selector_v3(owner,request):return
+    if owner.operation_kind=="prepare_internal_life_numeric_drive" and table in {"graph_d04_originals_v3","graph_d11_life_originals_v1","graph_dependency_edges"}:
+        from .d06_life_numeric_drive_v1 import require_drive_input_selector_v3
+        if require_drive_input_selector_v3(owner,request):return
+    numeric_c04=False
+    if (owner.operation_kind in _NUMERIC_OWNER_OPERATIONS_V1 and request[:3] in {
+            ("graph_c04_internal_work_prepared_v1",("binding_digest","prepared_digest","prepared_json"),("bot","persona","operation_id")),
+            ("d11_c04_cpu_cost_originals_v1",("original_json","original_digest"),("bot","persona","operation_id"))}):
+        from .current_life_numeric_metadata_v1 import require_numeric_c04_original_selector_v1
+        require_numeric_c04_original_selector_v1(owner,request);numeric_c04=True
     if request[:3] not in _HOST_ATTACHMENT_SHAPES_V3 and request[:3] not in {
             ("graph_atoms", ("revision", "value", "valid"), ("token", "bot", "persona")),
-            ("graph_d05_production_policies_v1", ("payload_json",), ("bot", "persona", "policy_ref", "revision"))}:
+            ("graph_d05_production_policies_v1", ("payload_json",), ("bot", "persona", "policy_ref", "revision"))} and not numeric_c04:
         raise AuthorityUnavailable("unregistered fixed method selected point")
     if table in {"graph_atoms", "graph_history", "graph_dependencies"}:
         if NamespaceId.from_key(AtomKey.from_token(key[0])) != owner.namespace:
@@ -871,6 +1151,7 @@ def method_graph_head_v3(db, namespace, key):
         if namespace != post.namespace: raise AuthorityUnavailable("successor head crossed namespace")
         return post.head_v3(key)
     from ..graph_types import GraphAtom
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3
     owner = _method_active(db)
     if owner is None: raise AuthorityUnavailable("actual method selected-input family is unavailable")
     if NamespaceId.from_key(key) != namespace or namespace != owner.namespace:
@@ -882,7 +1163,11 @@ def method_graph_head_v3(db, namespace, key):
     if inventory is not None and inventory.complete and not any(atom.key == key for atom in inventory.rows):
         owner.require_current()
         return GraphAtom(key, 0, {}, False)
-    if key.type_name in METHOD_LEARNING_TYPES_V3 and owner.inventory_sealed and key.token not in owner.census_columns:
+    if (key.type_name in METHOD_LEARNING_TYPES_V3 and owner.inventory_sealed
+            and owner.operation_kind not in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3)
+            and owner.work.kind!='current_habit_source_read_v3' and not beta1_source_operation_v3(owner.operation_kind)
+            and not _artifact_borrowed_reader_v3(owner)
+            and key.token not in owner.census_columns):
         owner.require_current()
         return GraphAtom(key, 0, {}, False)
     request = ("graph_atoms", ("revision", "value", "valid"), ("token", "bot", "persona"), (key.token, *namespace.as_tuple))
@@ -919,12 +1204,14 @@ def method_domain_inventory_v3(db, namespace, type_id):
         return tuple(post.head_v3(version.key) for version in pages[0].row_versions)
     owner = _method_active(db)
     if owner is None or namespace != owner.namespace: raise AuthorityUnavailable("actual method inventory Binder required")
-    if type_id in METHOD_LEARNING_TYPES_V3:
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3
+    if type_id in METHOD_LEARNING_TYPES_V3 and owner.operation_kind not in _NUMERIC_METADATA_OPERATIONS_V3 and owner.work.kind!='current_habit_source_read_v3' and not beta1_source_operation_v3(owner.operation_kind) and not _artifact_borrowed_reader_v3(owner):
         return tuple(method_graph_head_v3(db, namespace, atom.key) for atom in owner.inventory.atoms if atom.key.type_name == type_id)
     if type_id == owner.preference_type and owner.preferences_from_census:
         owner.preference_inventory.require_current_v3()
         return tuple(method_graph_head_v3(db, namespace, atom.key) for atom in owner.preference_inventory.atoms)
-    allowed = set(owner.preplan_families)
+    from .artifact_borrowed_source_v3 import artifact_borrowed_inventory_types_v3
+    allowed = set(owner.preplan_families)|set(artifact_borrowed_inventory_types_v3(owner))
     if owner.selected_plan is not None: allowed.update(owner.selected_plan.fixed_type_ids)
     if owner.preference_origin is not None: allowed.add(owner.preference_type)
     if type_id not in allowed:
@@ -980,6 +1267,7 @@ class PreparedMethodDomainInputsV3:
             raise AuthorityUnavailable("method data evidence changed before actual WRITE qualification")
         if not o.inputs_sealed and (scope is not o.fence.scope or current_owner is not o.owner_binding):
             raise AuthorityUnavailable("unfinished method READ inputs require their actual READ scope/Owner")
+        _register_current_general_method_source_write_phase_v1(self,scope,current_owner)
         return self
     def release_payload_v3(self):
         _release_method_registered_payloads_v3(self.owner)
@@ -995,12 +1283,13 @@ class PreparedMethodDomainInputsV3:
         if self.owner.action_schema_locator is not None: _ACTION_LOCATORS.pop(self.owner.action_schema_locator, None)
         self.owner.action_schema_locator = None
         self.owner.pending_input = self.owner.result = None
+        self.owner.personal_eligibility_wave_v1 = None
 
 
 def read_bound_method_frame_inputs_v3(db, *, graph, scope, plan, envelope, current_owner):
     owner = _method_active(db)
     if owner is None: return False, None
-    if type(owner) is not _MethodLearningReadV3:
+    if type(owner) not in (_MethodLearningReadV3,PreparedPersonalEligibilityRecoveryReadV1):
         raise AuthorityUnavailable("Owner frame getter cannot consume borrowed issuance")
     if (owner.graph is not graph or envelope.authority.namespace != owner.namespace
             or envelope.identity.operation_id != owner.operation_id
@@ -1014,7 +1303,13 @@ def read_bound_method_frame_inputs_v3(db, *, graph, scope, plan, envelope, curre
         if owner.selected_plan is None: owner.selected_plan = plan
         elif plan != owner.selected_plan: raise AuthorityUnavailable("pure method read plan changed during preparation")
         owner.selected_envelope = envelope
-    proof = PreparedMethodDomainInputsV3(_ISSUER, owner, plan, envelope)
+    if owner.inputs_sealed and owner.work.kind == 'current_habit_source_read_v3':
+        proof = owner.result
+        if type(proof) is not PreparedMethodDomainInputsV3 or proof.owner is not owner:
+            raise AuthorityUnavailable('Habit WRITE lost its actual once-sealed same-Work inputs')
+        proof._actual_v3()
+    else:
+        proof = PreparedMethodDomainInputsV3(_ISSUER, owner, plan, envelope)
     proof.require_current_v3(db, scope, current_owner)
     return True, proof
 
@@ -1094,7 +1389,22 @@ class _MethodBudgetGrantReadV3:
 def require_method_signature_column_v3(original, *, signer, kind, signature=None, verifier=None, complete=False):
     if type(original) is not MethodJSONColumnV3:
         raise AuthorityUnavailable("actual method signed-column original required")
-    original._actual(); o = original.owner; task = o.budget_task
+    original._actual(); o = original.owner
+    if original.beta1_metadata_task is not None:
+        from .current_beta1_source_read_v3 import require_beta1_metadata_signature_v3
+        return require_beta1_metadata_signature_v3(original,signer=signer,kind=kind,signature=signature,
+            verifier=verifier,complete=complete)[1]
+    if original.general_metadata_profile is not None:
+        _require_general_owner_metadata_column_v1(original)
+        original.general_metadata_task.require_signature_v1(original,signer,kind)
+        if complete and (not original.complete or signature!=original.signature or verifier is not original.signature_state
+                or original.signature_bytes!=original.byte_count):
+            raise AuthorityUnavailable("General signed metadata lacks actual whole HMAC EOF")
+        return original
+    if o.operation_kind=="prepare_internal_life_numeric_drive" and original.table=="runtime_budget_grants" and original.key[0]!=o.parent_budget_lease_ref:
+        from .d06_life_numeric_drive_v1 import require_drive_dose_signature_v3
+        return require_drive_dose_signature_v3(original,signer=signer,kind=kind,signature=signature,verifier=verifier,complete=complete)
+    task = o.budget_task
     if (task is None or original.table != "runtime_budget_grants" or original.column != "grant_json"
             or original.key_columns != ("lease_id", "version") or original.key != task.metadata[:2]
             or original.key[0] != o.parent_budget_lease_ref or kind != "budget-grant.v1"
@@ -1115,6 +1425,9 @@ def read_bound_method_budget_grant_v3(db, lease_id):
         raise AuthorityUnavailable("model foreground scope successor grants no budget/price read")
     owner = _method_active(db)
     if owner is None: return False, None
+    if lease_id!=owner.parent_budget_lease_ref and owner.operation_kind=="prepare_internal_life_numeric_drive":
+        from .d06_life_numeric_drive_v1 import read_bound_drive_dose_grant_v3
+        return read_bound_drive_dose_grant_v3(owner,lease_id)
     if lease_id != owner.parent_budget_lease_ref:
         raise AuthorityUnavailable("method budget grant is not its actual parent lease")
     task = owner.budget_task
@@ -1269,6 +1582,7 @@ class BorrowedMethodLearningReadV3(_MethodLearningReadV3):
             raise AuthorityUnavailable("borrowed method original Graph/Self/query stamp changed")
         self.runtime, self.issued, self.selector, self.evidence = runtime, issued, selector, evidence
         self.authority = self.lease = self.owner_binding = self.session_proof = None
+        self.source_pending_owner = None
         self.operation_kind, self.request, self.operation_id = operation_kind, request, selector.operation_id
         self.request_digest, self.activity_id, self.audience_ref = digest, activity, audiences[0]
         self.purpose, self.audiences, self.parent_budget_lease_ref = purpose, tuple(audiences), parent
@@ -1302,6 +1616,8 @@ class BorrowedMethodLearningReadV3(_MethodLearningReadV3):
             selected_tokens=frozenset(), census_schema="sylanne.method-learning-census.v3",
             leaf_schema="sylanne.method-learning-census-leaf.v3")
         _READERS.add(self)
+        from .artifact_borrowed_source_v3 import register_artifact_borrowed_constructor_v3
+        register_artifact_borrowed_constructor_v3(self)
 
     def seal_plan_v3(self, plan, *, installed_readers=None, observed_originals=(), installed_policy_refs=()):
         from .domain_production_contracts_v1 import ProductionReadPlanV1
@@ -1310,9 +1626,14 @@ class BorrowedMethodLearningReadV3(_MethodLearningReadV3):
         roots = {v.key.token for v in self.evidence.read_versions if v.key.type_name == "memory.source"}
         if not set(plan.source_roots) <= roots:
             raise AuthorityUnavailable("borrowed plan added Source outside its actual qualified issuance")
-        combined = ProductionReadPlanV1(plan.fixed_type_ids,
-            tuple(sorted(set((*plan.exact_keys, *(v.key for v in self.evidence.read_versions))), key=lambda k:k.token)),
-            plan.source_roots, plan.required_original_refs)
+        from .artifact_borrowed_source_v3 import require_artifact_borrowed_seal_plan_v3
+        if _artifact_borrowed_reader_v3(self):
+            require_artifact_borrowed_seal_plan_v3(self,plan)
+            combined=plan
+        else:
+            combined = ProductionReadPlanV1(plan.fixed_type_ids,
+                tuple(sorted(set((*plan.exact_keys, *(v.key for v in self.evidence.read_versions))), key=lambda k:k.token)),
+                plan.source_roots, plan.required_original_refs)
         if self.selected_plan is not None and combined != self.selected_plan:
             raise AuthorityUnavailable("pure borrowed method plan changed during preparation")
         self.selected_plan, self.installed_readers = combined, installed_readers
@@ -1368,6 +1689,7 @@ class PreparedBorrowedMethodDomainInputsV3:
         if o.action_schema_locator is not None: _ACTION_LOCATORS.pop(o.action_schema_locator, None)
         o.action_schema_locator = None
         o.preference_origin = o.selected_plan = o.frame_fields = o.pending_input = o.result = None
+        o.personal_eligibility_wave_v1 = None
 
 
 def read_bound_method_issued_frame_inputs_v3(db, *, graph, scope, plan, issued):
@@ -1388,12 +1710,16 @@ def _start_borrowed_method_input_v3(reader, needed):
         task = reader.points.get(actual)
         if task is None: task = _MethodPointReadV3(reader, actual); reader.points[actual] = task
     elif kind == "inventory":
-        allowed = set(reader.preplan_families)
+        from .artifact_borrowed_source_v3 import artifact_borrowed_inventory_types_v3
+        allowed = set(reader.preplan_families)|set(artifact_borrowed_inventory_types_v3(reader))
         if reader.selected_plan is not None: allowed.update(reader.selected_plan.fixed_type_ids)
         if reader.preference_origin is not None: allowed.add(reader.preference_type)
         if actual not in allowed: raise AuthorityUnavailable("borrowed inventory has no actual fixed recipe/dependency")
         task = reader.inventories.get(actual)
         if task is None: task = _MethodInventoryReadV3(reader, actual); reader.inventories[actual] = task
+    elif kind == "artifact_body_dependencies":
+        from .artifact_borrowed_source_v3 import start_artifact_borrowed_dependencies_v3
+        task=start_artifact_borrowed_dependencies_v3(reader,actual)
     elif kind == "budget_grant":
         if actual != reader.parent_budget_lease_ref: raise AuthorityUnavailable("borrowed budget locator changed original parent")
         if reader.budget_task is None: reader.budget_task = _MethodBudgetGrantReadV3(reader, actual)
@@ -1404,6 +1730,17 @@ def _start_borrowed_method_input_v3(reader, needed):
         if task is None: task = _MethodRelationshipPolicyReadV3(reader, actual); reader.policy_tasks[actual] = task
     else: raise AuthorityUnavailable("unregistered borrowed method selected dependency")
     reader.pending_input = task
+
+
+def _artifact_borrowed_reader_v3(reader):
+    from .artifact_borrowed_source_v3 import is_artifact_borrowed_source_reader_v3
+    return is_artifact_borrowed_source_reader_v3(reader)
+
+
+def _advance_artifact_borrowed_classification_v3(reader):
+    from .artifact_borrowed_source_v3 import advance_artifact_borrowed_classification_v3
+    with runtime_storage_quantum_v3(reader.db)as meter:
+        return advance_artifact_borrowed_classification_v3(reader,meter)
 
 
 def _advance_borrowed_method_learning_read_v3(graph, work):
@@ -1426,8 +1763,14 @@ def _advance_borrowed_method_learning_read_v3(graph, work):
         elif not r.inventory_sealed:
             with r.store._lock:
                 if r.db.in_transaction: raise AuthorityUnavailable("borrowed census inherited a transaction")
-                if r.authority_epochs is not None: r.require_current()
-                r.advance()
+                from .borrowed_habit_classification_v3 import (BORROWED_HABIT_METADATA_OPERATIONS_V3,
+                    advance_borrowed_habit_metadata_eof_v3)
+                if r.authority_epochs is None:r.advance()
+                elif _advance_artifact_borrowed_classification_v3(r):pass
+                elif r.operation_kind in BORROWED_HABIT_METADATA_OPERATIONS_V3:
+                    with runtime_storage_quantum_v3(r.db)as meter:
+                        if advance_borrowed_habit_metadata_eof_v3(r,meter):r.advance()
+                else:r.require_current();r.advance()
         elif r.pending_input is not None:
             with r.store._lock, runtime_storage_quantum_v3(r.db) as meter:
                 if r.db.in_transaction: raise AuthorityUnavailable("borrowed selected step inherited a transaction")
@@ -1447,6 +1790,8 @@ def _advance_borrowed_method_learning_read_v3(graph, work):
                             from dataclasses import replace
                             r.selected_plan = replace(r.selected_plan, exact_keys=tuple(sorted(
                                 set((*r.selected_plan.exact_keys, r.action_schema_locator.key)), key=lambda k:k.token)))
+                            from .artifact_borrowed_source_v3 import artifact_borrowed_action_schema_complete_v3
+                            artifact_borrowed_action_schema_complete_v3(r)
                             work.phase = "selected_inputs_final"
                         return GraphStorageStepV3("progress")
                     if r.selected_plan is None:
@@ -1463,6 +1808,8 @@ def _advance_borrowed_method_learning_read_v3(graph, work):
                                     expected_rights=r.expected_rights, observed_originals=r.observed_originals,
                                     limits=ProductionOperationLimitsV1(), prepared_inputs=PreparedBorrowedMethodDomainInputsV3(
                                         _ISSUER, r, r.selected_plan))
+                                from .ordinary_source_note_habit_classification_v3 import prepare_current_ordinary_source_note_habit_classification_v3
+                                prepare_current_ordinary_source_note_habit_classification_v3(r)
                             finally: r.db.rollback()
                         if r.operation_kind in ACTION_SCHEMA_LOCATOR_OPERATIONS_V3 and r.action_schema_locator is None:
                             r.action_schema_locator = begin_current_borrowed_action_schema_locator_v3(r, r.frame_fields, r.selected_plan)
@@ -1681,9 +2028,11 @@ def read_bound_method_borrowed_plan_v3(db, *, graph, issued, plan):
     if _require_borrowed_issuance_v3(issued, graph) != owner.evidence:
         raise AuthorityUnavailable("borrowed base plan lost its original issued evidence")
     owner.require_current()
-    combined = ProductionReadPlanV1(plan.fixed_type_ids,
-        tuple(sorted(set((*plan.exact_keys, *(v.key for v in owner.evidence.read_versions))), key=lambda key:key.token)),
-        plan.source_roots, plan.required_original_refs)
+    if _artifact_borrowed_reader_v3(owner):combined=plan
+    else:
+        combined = ProductionReadPlanV1(plan.fixed_type_ids,
+            tuple(sorted(set((*plan.exact_keys, *(v.key for v in owner.evidence.read_versions))), key=lambda key:key.token)),
+            plan.source_roots, plan.required_original_refs)
     sealed = owner.selected_plan
     if ((combined.fixed_type_ids, combined.source_roots, combined.required_original_refs) !=
             (sealed.fixed_type_ids, sealed.source_roots, sealed.required_original_refs)):
@@ -1706,9 +2055,40 @@ def read_bound_method_borrowed_plan_v3(db, *, graph, issued, plan):
 
 def _release_method_registered_payloads_v3(owner):
     """Invalidate this Work's actual partial/final registrations without scope reads."""
+    if type(owner)is BorrowedMethodLearningReadV3:
+        from .borrowed_habit_classification_v3 import release_borrowed_habit_metadata_v3
+        from .ordinary_source_note_habit_classification_v3 import release_ordinary_source_note_habit_classification_v3
+        from .artifact_frame_control_reads_v3 import release_artifact_model_source_frames_v3
+        release_artifact_model_source_frames_v3(owner)
+        release_ordinary_source_note_habit_classification_v3(owner)
+        release_borrowed_habit_metadata_v3(owner)
+        from .artifact_borrowed_source_v3 import release_artifact_borrowed_source_v3
+        release_artifact_borrowed_source_v3(owner)
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3,release_current_beta1_source_work_v3
+    if owner.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(owner.operation_kind):release_current_beta1_source_work_v3(owner)
+    if owner.operation_kind=="prepare_internal_life_interval_baseline":
+        from .c04_encoding_context_original_v3 import release_prepared_life_encoding_inputs_v3
+        release_prepared_life_encoding_inputs_v3(owner)
+    if owner.operation_kind=="prepare_internal_life_numeric_drive":
+        from .d06_life_numeric_drive_v1 import release_prepared_numeric_drive_inputs_v3
+        release_prepared_numeric_drive_inputs_v3(owner)
+    _GENERAL_METHOD_SOURCE_WRITE_PHASES_V1.pop(owner,None)
+    source_tasks=_GENERAL_METHOD_SOURCE_TASKS_V1.pop(owner,{})
+    for task in source_tasks.values():
+        task.parser=task.cell=task.metadata=None;task.fragment=b""
+    if type(owner)is _MethodLearningReadV3 and owner.operation_kind in (_NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3):
+        from .current_life_numeric_metadata_v1 import release_numeric_metadata_payloads_v1
+        release_numeric_metadata_payloads_v1(owner)
+    if type(owner)is _MethodLearningReadV3 and owner.operation_kind in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3):
+        if owner.general_source_permission is not None:
+            _GENERAL_METHOD_SOURCE_PROOFS_V1.pop(owner.general_source_permission,None)
+            owner.general_source_permission=None
+        if owner.general_owner_entry is not None:
+            owner.general_owner_entry.release_v3();owner.general_owner_entry=None
     for column, record in tuple(_JSON_COLUMNS.items()):
         if record[0] is owner:
             _JSON_COLUMNS.pop(column, None)
+            _GENERAL_METADATA_COLUMNS_V1.pop(column,None)
             column.nodes.clear(); column.scalar.clear(); column.text_parts.clear(); column.text_chars.clear()
             column.wire_parts.clear()
             column.value = column.frozen = column.wire = column.parser = column.cell = column.signature_state = column.canonical_stream = None
@@ -2221,13 +2601,15 @@ class PreparedMethodForegroundScopePostCommitV3:
         primary, proposals, experiences, settlements, paid_costs = _members(stage)
         identity = prior_frame.envelope.identity
         evidence = _require_borrowed_issuance_v3(issued, graph)
+        from .artifact_frame_control_reads_v3 import require_artifact_model_post_commit_readsets_v3
+        require_artifact_model_post_commit_readsets_v3(owner,prior_frame,primary,actual_receipt)
         if (primary is not stage.stage or primary.domain != "d11" or primary.coverage != "complete"
                 or primary.operation_kind != owner.operation_kind or primary.operation_id != owner.operation_id
                 or primary.namespace != owner.namespace or primary.activity_id != identity.activity_id
                 or identity.operation_id != owner.operation_id or actual_receipt.status != "committed"
                 or (actual_receipt.operation_id, actual_receipt.activity_id, actual_receipt.effect_id)
                     != (identity.operation_id, identity.activity_id, identity.effect_id)
-                or primary.read_versions != prior_frame.snapshot.versions
+                or primary.read_versions != prior_frame.envelope.version_guard.read_versions
                 or actual_receipt.read_versions != prior_frame.envelope.version_guard.read_versions
                 or prior_frame.owner_guard != owner.material_owner_guard or evidence != owner.evidence
                 or (prior_frame.envelope.version_guard.access_epoch, prior_frame.envelope.version_guard.delete_epoch) != owner.expected_rights
@@ -2426,3 +2808,726 @@ def bind_method_foreground_scope_post_commit_v3(db, graph, prior_frame, stage, a
         yield proof
     finally:
         _POST_COMMIT.reset(token); proof.release_payload_v3()
+
+
+class PreparedPersonalEligibilityRecoveryReadV1(_MethodLearningReadV3):
+    """Exact private READ continuation; this class never invokes a write compiler."""
+    def __init__(self, issuer, graph, operation, fence, *, runtime, authority, owner_binding, owner_guard,
+            issued, selector, request, initial_now_utc, saved_wave, saved_original, saved_receipt):
+        if issuer is not _ISSUER or fence.scope.operation != "read" or selector.operation_kind != "prepare_personal_candidate_eligibility_v1":
+            raise AuthorityUnavailable("actual exact saved-eligibility READ issuer required")
+        self.issued, self.selector = issued, selector
+        self.business_operation_id=selector.operation_id
+        self.saved_wave, self.saved_original, self.saved_receipt = saved_wave, saved_original, saved_receipt
+        self.personal_eligibility_wave_v1 = None
+        self.selection_source_refs = frozenset(version.key.token for version in saved_original["read_versions"]
+            if version.key.type_name == "memory.source")
+        self.recovery_source_ref = issued.source_ref
+        super().__init__(_ISSUER,graph,operation,fence,runtime=runtime,authority=authority,lease=None,
+            operation_kind=selector.operation_kind,request=request,operation_id=operation.operation_id,
+            activity_id=saved_original["payload"]["identity"]["activity_id"],audience_ref=issued.audiences[0],
+            parent_budget_lease_ref=saved_wave.parent_budget_lease_ref,request_digest=canonical_digest(request),
+            owner_binding=owner_binding,owner_guard=owner_guard,session_proof=None,initial_now_utc=initial_now_utc)
+        self.selected_tokens = frozenset(version.key.token for version in saved_original["read_versions"])
+        self.census_schema = "d08.personal-eligibility-recovery-metadata-census.v1"
+        self.leaf_schema = "d08.personal-eligibility-recovery-selected-leaf.v1"
+        self.root = canonical_digest((self.census_schema,self.namespace,self.query,self.selection_digest))
+        self.recovery_versions = {version.key.token:version.revision for version in saved_wave.read_versions}
+        self.recovery_families = frozenset(page.type_id for page in saved_wave.query_coverage)
+
+    def _graph_eof_v3(self):
+        self.work.phase = "eligibility_recovery_originals"
+
+    def _next(self,meter):
+        # Closed metadata census includes every negative-query member. Source
+        # bytes are restricted to the actual saved preparation's Source closure.
+        row=meter.read_fixed_row(self.db,"graph_atoms",("token","revision","type_name"),
+            "bot=? AND persona=? AND token>? ORDER BY token",(*self.namespace.as_tuple,self.cursor))
+        if row is not None and row[0] in self.recovery_versions and row[1] != self.recovery_versions[row[0]]:
+            raise AuthorityUnavailable("saved eligibility semantic head changed before recovery material disclosure")
+        if row is not None and row[2] in METHOD_LEARNING_TYPES_V3 and row[0] not in self.selected_tokens:
+            if row[2] in self.recovery_families:
+                raise AuthorityUnavailable("saved eligibility complete negative metadata scope changed")
+            self.cursor=row[0]; return
+        if row is not None and row[2] == "memory.source" and row[0] not in self.selection_source_refs:
+            self.cursor=row[0]; return
+        return super()._next(meter)
+
+    def require_current(self, *, meter=None):
+        super().require_current(meter=meter)
+        if self.issued.graph is not self.graph or self.issued.scope is not self.fence.scope or self.issued.operation_id != self.business_operation_id:
+            raise AuthorityUnavailable("eligibility recovery changed its actual fresh READ issuance")
+        if not self.read_finished: self.graph._validate_read_fence_v3(self.fence)
+
+
+class PreparedPersonalEligibilityRecoveryInventoryV1(PreparedCurrentMethodLearningReadV3):
+    def __init__(self,issuer,reader):
+        if type(reader) is not PreparedPersonalEligibilityRecoveryReadV1:
+            raise AuthorityUnavailable("exact selected-Source recovery census required")
+        self.recovery_selection = (reader.census_schema,reader.leaf_schema,reader.selection_source_refs)
+        super().__init__(issuer,reader)
+
+    def _identity(self):
+        return (*super()._identity(), self.recovery_selection)
+
+
+def _method_inventory_result_v3(reader):
+    if type(reader) is PreparedPersonalEligibilityRecoveryReadV1:
+        return PreparedPersonalEligibilityRecoveryInventoryV1(_ISSUER,reader)
+    return PreparedCurrentMethodLearningReadV3(_ISSUER,reader)
+
+
+def _advance_personal_eligibility_recovery_v1(graph,work):
+    reader=work.state
+    if type(reader) is not PreparedPersonalEligibilityRecoveryReadV1 or reader not in _READERS or reader.work is not work:
+        raise AuthorityUnavailable("actual private same-Work eligibility READ required")
+    with bind_runtime_storage_operation_v3(work.operation,reader.db):
+        graph._validate_read_fence_v3(reader.fence)
+        if reader.authority_epochs is not None:
+            with reader.store._lock:
+                reader.require_current()
+        if reader.inputs_sealed:
+            if reader.business_started: raise AuthorityUnavailable("saved eligibility READ completes exactly once")
+            reader.business_started=True
+            proof=reader.result
+            with bind_prepared_method_learning_read_v3(proof,graph,reader.db):
+                from .personal_candidate_eligibility_v1 import complete_personal_eligibility_recovery_read_v1
+                result=complete_personal_eligibility_recovery_read_v1(reader)
+            proof.business_result=result; _BUSINESS_RESULTS[proof]=(work,result)
+            reader.business_completed=True
+            reader.read_issuance_lifetime.close()
+            graph._finish_read_fence_v3(reader.fence); reader.read_finished=True
+            return GraphStorageStepV3("complete",proof)
+        if not reader.inventory_sealed:
+            with reader.store._lock:
+                if reader.db.in_transaction: raise AuthorityUnavailable("eligibility recovery retained a transaction")
+                reader.advance()
+            return GraphStorageStepV3("progress")
+        if reader.pending_input is not None:
+            with reader.store._lock,runtime_storage_quantum_v3(reader.db) as meter:
+                reader.require_current(meter=meter); reader.pending_input.advance(meter)
+                if reader.pending_input.complete:reader.pending_input=None
+            return GraphStorageStepV3("progress")
+        token=_READING.set(reader)
+        try:
+            with bind_prepared_method_learning_read_v3(reader.inventory,graph,reader.db):
+                from .personal_candidate_eligibility_v1 import prepare_personal_eligibility_recovery_inputs_v1
+                prepare_personal_eligibility_recovery_inputs_v1(reader)
+        except MethodInputNeededV3 as needed:
+            kind,actual=needed.request
+            if kind=="point":
+                _require_input_request(reader,actual)
+                task=reader.points.get(actual)
+                if task is None:task=_MethodPointReadV3(reader,actual);reader.points[actual]=task
+            elif kind=="inventory":
+                allowed=set(reader.preplan_families)
+                if reader.selected_plan is not None:allowed.update(reader.selected_plan.fixed_type_ids)
+                if actual not in allowed:raise AuthorityUnavailable("recovery requested an unregistered fixed family")
+                task=reader.inventories.get(actual)
+                if task is None:task=_MethodInventoryReadV3(reader,actual);reader.inventories[actual]=task
+            elif kind=="budget_grant":
+                if actual!=reader.parent_budget_lease_ref:raise AuthorityUnavailable("recovery changed its original parent budget")
+                if reader.budget_task is None:reader.budget_task=_MethodBudgetGrantReadV3(reader,actual)
+                task=reader.budget_task
+            else:raise AuthorityUnavailable("unregistered saved eligibility READ dependency")
+            reader.pending_input=task
+        finally:_READING.reset(token)
+        with reader.store._lock:
+            reader.require_current()
+        return GraphStorageStepV3("progress")
+
+
+
+# Private, less-than-body metadata mode uses the exact existing signer-recognized Method column.
+_GENERAL_OWNER_OPERATIONS_V1=frozenset({
+    "freeze_general_growth_intent_v1","register_general_growth_trial_start_v1",
+    "derive_general_growth_trial_v1","adopt_general_growth_v1"})
+_GENERAL_OWNER_METADATA_TYPES_V1=frozenset(('d07.current_interpretation.v1', 'd08.action_outcome.v1', 'd10.life_progress.v1', 'runtime.job', 'runtime.cost_settlement'))
+_GENERAL_METADATA_COLUMN_ISSUER_V1=object()
+_GENERAL_METADATA_COLUMNS_V1=WeakKeyDictionary()
+
+def require_actual_general_owner_metadata_work_v1(owner,*,operation_kind,namespace):
+    require_actual_method_learning_attachment_owner_v3(owner,db=owner.db)
+    if (type(owner)is not _MethodLearningReadV3 or owner.operation_kind not in _GENERAL_OWNER_OPERATIONS_V1
+            or owner.operation_kind!=operation_kind or owner.namespace!=namespace
+            or owner.fence.scope.operation!="read"):
+        raise AuthorityUnavailable("actual same Owner General READ input Work required")
+    return owner
+
+def prepare_current_general_owner_metadata_column_v1(owner,*,table,column,key_columns,key,profile,
+        signer=None,signature_kind=None,signature=None,cell=None):
+    require_actual_general_owner_metadata_work_v1(owner,operation_kind=owner.operation_kind,namespace=owner.namespace)
+    from .d01_general_growth_v1 import validate_current_general_owner_metadata_profile_v1
+    validate_current_general_owner_metadata_profile_v1(table,column,tuple(key_columns),tuple(key),profile,owner.namespace)
+    return MethodJSONColumnV3(_ISSUER,owner,table=table,column=column,key_columns=key_columns,key=key,cell=cell,
+        signer=signer,signature_kind=signature_kind,signature=signature,
+        general_metadata_issuer=_GENERAL_METADATA_COLUMN_ISSUER_V1,general_metadata_profile=profile)
+
+def _require_general_owner_metadata_column_v1(column):
+    state=_GENERAL_METADATA_COLUMNS_V1.get(column)
+    if state is None or state!=(column.owner,column.general_metadata_profile,column.general_metadata_task):
+        raise AuthorityUnavailable("actual issued fixed General metadata column required")
+    column._actual()
+    return state
+
+def _advance_general_owner_metadata_column_v1(column,meter):
+    from .c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2,_quote
+    c=column;_require_general_owner_metadata_column_v1(c);c.owner.require_current(meter=meter)
+    if c.complete:return True
+    if c.fragment_offset<len(c.fragment):
+        end=min(c.fragment_offset+1024,len(c.fragment));chunk=c.fragment[c.fragment_offset:end]
+        c._reserve_v3(131072);c.parser.feed(chunk,c._emit_v3)
+        if c.semantic_decoder is not None:
+            from ..authority_service.d07_authority_model_source_read_v3 import _D07AuthorityGraphMetadataColumnV3
+            _D07AuthorityGraphMetadataColumnV3._semantic_v3(c,chunk,meter)
+        c.fragment_offset=end;c._flush_text_v3();return False
+    if c.cell is not None:chunk=c.cell.read_fragment(meter=meter)
+    else:
+        where=" AND ".join(_quote(name)+"=?"for name in c.key_columns)
+        with legacy_cell_read_transaction_v2(c.db):
+            if c.total is None:
+                row=c.db.execute("SELECT typeof("+_quote(c.column)+"),length(CAST("+_quote(c.column)+" AS BLOB)) FROM "+
+                    _quote(c.table)+" WHERE "+where,c.key).fetchone();meter.charge_read(16)
+                if row is None or row[0]!="text":raise AuthorityUnavailable("actual General metadata column absent")
+                c.total=row[1]
+            if c.offset<c.total:
+                chunk,total,kind=read_legacy_sql_cell_fragment_v2(c.db,table=c.table,column=c.column,
+                    where=where,parameters=c.key,start=c.offset,length=min(16384,c.total-c.offset),meter=meter)
+                if (total,kind)!=(c.total,"text"):raise AuthorityUnavailable("General metadata original changed")
+                c.offset+=len(chunk)
+            else:chunk=None
+    if chunk is not None:
+        if c.signature_state is not None:c.signature_state.update(chunk);c.signature_bytes+=len(chunk)
+        c.fragment,c.fragment_offset=chunk,0;return False
+    parsed=c.parser.finish()
+    if c.cell is not None:
+        digest=c.cell.finish(meter=meter)
+        if (parsed.sha256,parsed.byte_count)!=(digest,c.cell.header[3]):
+            raise AuthorityUnavailable("General metadata canonical cell whole EOF differs")
+    elif parsed.byte_count!=c.total:raise AuthorityUnavailable("General metadata whole raw EOF differs")
+    if c.semantic_decoder is not None:
+        from ..authority_service.d07_authority_model_source_read_v3 import _D07AuthorityGraphMetadataColumnV3
+        _D07AuthorityGraphMetadataColumnV3._semantic_v3(c,b"",meter,final=True)
+        c.canonical_digest=c.semantic_hash.hexdigest()
+    else:c.canonical_digest=parsed.sha256
+    c._reserve_v3(_heap(c.value)*2+1024);c.frozen=_freeze_value_v3(c.value)
+    c.sha256,c.byte_count=parsed.sha256,parsed.byte_count
+    c.value=None;c.nodes={};c.scalar=bytearray();c.fragment=b"";c.parser=None
+    c.semantic_decoder=c.semantic_hash=None
+    c.complete=True
+    if c.signature_state is not None:
+        c.signer.finish_original_stream_verification_v3(c.signature_kind,c.signature,c,c.signature_state)
+        c.signature_verified=True
+    return True
+
+def current_general_owner_metadata_column_value_v1(column):
+    _require_general_owner_metadata_column_v1(column)
+    if not column.complete:raise AuthorityUnavailable("General metadata getter requires complete actual EOF")
+    reserve_current_general_owner_metadata_peak_v1(column.owner,extra=_general_method_metadata_heap_v1(column.frozen)+1024)
+    return _detach_value_v3(column.frozen)
+
+
+
+def _require_current_general_owner_metadata_reader_v1(db,namespace,issuer=None):
+    owner=_method_active(db)
+    if owner is None:raise AuthorityUnavailable("actual General Owner Method input Binder required")
+    require_actual_general_owner_metadata_work_v1(owner,operation_kind=owner.operation_kind,namespace=namespace)
+    if issuer is not None and issuer is not owner.graph._GraphCoordinator__d11_issuer:
+        raise AuthorityUnavailable("General metadata issuer differs from actual installed D11")
+    return owner
+
+def _read_current_general_owner_metadata_attachment_v1(owner,identity):
+    key=("general_owner_metadata",identity)
+    task=owner.attachments.get(key)
+    if task is None or not task.complete:_need_method_input(owner,key)
+    if task.reader is not owner or task.identity!=identity:
+        raise AuthorityUnavailable("General metadata attachment changed actual originating Work")
+    task.require_reader_v1()
+    return task.result
+
+def read_bound_current_general_owner_signed_metadata_v1(db,*,namespace,issuer,table,original_ref,kind):
+    from .current_conditioned_self_read_v3 import read_bound_conditioned_general_signed_metadata_v3
+    handled,result=read_bound_conditioned_general_signed_metadata_v3(db,namespace=namespace,issuer=issuer,table=table,original_ref=original_ref,kind=kind)
+    if handled:return result
+    owner=_require_current_general_owner_metadata_reader_v1(db,namespace,issuer)
+    return _read_current_general_owner_metadata_attachment_v1(owner,("signed",table,kind,original_ref))
+
+def read_bound_current_general_owner_graph_metadata_v1(db,*,namespace,key,kind):
+    from .current_conditioned_self_read_v3 import read_bound_conditioned_general_graph_metadata_v3
+    handled,result=read_bound_conditioned_general_graph_metadata_v3(db,namespace=namespace,key=key,kind=kind)
+    if handled:return result
+    owner=_require_current_general_owner_metadata_reader_v1(db,namespace)
+    if type(key)is not AtomKey or NamespaceId.from_key(key)!=namespace:
+        raise AuthorityUnavailable("General metadata head differs from actual namespace")
+    return _read_current_general_owner_metadata_attachment_v1(owner,("graph",kind,key.token))
+
+def read_bound_current_general_owner_type_metadata_v1(db,*,namespace,type_id,limit=129):
+    from .current_conditioned_self_read_v3 import read_bound_conditioned_general_type_metadata_v3
+    handled,result=read_bound_conditioned_general_type_metadata_v3(db,namespace=namespace,type_id=type_id,limit=limit)
+    if handled:return result
+    owner=_require_current_general_owner_metadata_reader_v1(db,namespace)
+    if limit!=129:raise AuthorityUnavailable("General metadata preserves actual complete 128-row bound")
+    rows,complete=_read_current_general_owner_metadata_attachment_v1(owner,("type",type_id,129))
+    if not complete or len(rows)>128:raise AuthorityUnavailable("General metadata type inventory incomplete")
+    return rows,complete
+
+def read_bound_current_general_owner_prepared_for_adoption_v1(db,*,namespace,issuer,prepared_digest):
+    owner=_require_current_general_owner_metadata_reader_v1(db,namespace,issuer)
+    return _read_current_general_owner_metadata_attachment_v1(owner,("prepared_for_adoption",prepared_digest))
+
+def read_bound_current_general_owner_start_metadata_inventory_v1(db,*,namespace,issuer,limit=129):
+    owner=_require_current_general_owner_metadata_reader_v1(db,namespace,issuer)
+    if limit!=129:raise AuthorityUnavailable("General start metadata preserves its actual complete bound")
+    rows,complete=_read_current_general_owner_metadata_attachment_v1(owner,("starts",129))
+    if not complete or len(rows)>128:raise AuthorityUnavailable("General immutable start inventory incomplete")
+    return rows,complete
+
+def require_current_general_owner_metadata_coverage_v1(inputs,type_id):
+    if type(inputs)is not PreparedMethodDomainInputsV3 or type_id not in _GENERAL_OWNER_METADATA_TYPES_V1:
+        raise AuthorityUnavailable("actual General selected Method frame counter metadata required")
+    if _INPUTS.get(inputs)!=(inputs.owner,inputs.plan,inputs.envelope,inputs.read_scope,inputs.graph_stamp,inputs.owner_rights):
+        raise AuthorityUnavailable("actual registered General Method frame inputs required")
+    owner=inputs.owner
+    owner.require_current()
+    if inputs.plan!=owner.selected_plan:
+        raise AuthorityUnavailable("General metadata coverage changed actual selected plan")
+    if owner.operation_kind not in _GENERAL_OWNER_OPERATIONS_V1 or type_id not in inputs.plan.fixed_type_ids:
+        raise AuthorityUnavailable("General counter coverage differs from actual selected recipe")
+    rows,complete=read_bound_current_general_owner_type_metadata_v1(owner.db,namespace=owner.namespace,type_id=type_id,limit=129)
+    for row in rows:row.require_for_v1(owner)
+    return rows
+
+def _general_method_metadata_heap_v1(value,seen=None):
+    import sys
+    if seen is None:seen=set()
+    if id(value)in seen:return 0
+    if type(value)is MappingProxyType:
+        seen.add(id(value))
+        return sys.getsizeof(value)+sum(_general_method_metadata_heap_v1(k,seen)+
+            _general_method_metadata_heap_v1(v,seen)for k,v in value.items())
+    if type(value)in(dict,list,tuple,set):
+        seen.add(id(value))
+        entries=value.items()if type(value)is dict else ((None,item)for item in value)
+        return sys.getsizeof(value)+sum((0 if k is None else _general_method_metadata_heap_v1(k,seen))+
+            _general_method_metadata_heap_v1(v,seen)for k,v in entries)
+    return _heap(value,seen)
+
+def reserve_current_general_owner_metadata_peak_v1(reader,extra=0):
+    require_actual_general_owner_metadata_work_v1(reader,operation_kind=reader.operation_kind,namespace=reader.namespace)
+    from .d01_general_growth_v1 import GeneralOwnerGraphMetadataV1
+    seen=set();size=extra+65536
+    for column,(owner,profile,task)in tuple(_GENERAL_METADATA_COLUMNS_V1.items()):
+        if owner is not reader:continue
+        size+=_general_method_metadata_heap_v1((column.nodes,column.value,column.frozen,column.scalar,
+            column.text_parts,column.text_chars,column.fragment,column.general_metadata_fields_seen),seen)
+        if column.parser is not None:
+            parser=column.parser
+            size+=_general_method_metadata_heap_v1((parser._stack,parser._string,parser._literal,parser._number,
+                parser._active_scalar),seen)
+    def result_heap(value):
+        if type(value)is GeneralOwnerGraphMetadataV1:
+            return _general_method_metadata_heap_v1((value.key,value._frozen_value,value.payload_digest),seen)
+        if type(value)is tuple or type(value)is list:
+            import sys
+            if id(value)in seen:return 0
+            seen.add(id(value))
+            return sys.getsizeof(value)+sum(result_heap(item)for item in value)
+        return _general_method_metadata_heap_v1(value,seen)
+    visited=set()
+    def task_heap(task):
+        if task is None or id(task)in visited:return 0
+        visited.add(id(task))
+        total=_general_method_metadata_heap_v1((task.identity,task.cursor),seen)+result_heap(task.rows)
+        total+=_general_method_metadata_heap_v1((task.metadata,task.value),seen)
+        total+=result_heap(task.result)
+        return total+task_heap(task.child)
+    for identity,task in reader.attachments.items():
+        if identity[0]=="general_owner_metadata":size+=task_heap(task)
+    size+=task_heap(reader.general_metadata_issuing_task)
+    if size>reader.general_metadata_reserved:
+        reader.operation.retain(size-reader.general_metadata_reserved);reader.general_metadata_reserved=size
+    return size
+
+
+_GENERAL_METHOD_SOURCE_ISSUER_V1=object()
+_GENERAL_METHOD_SOURCE_TASKS_V1=WeakKeyDictionary()
+_GENERAL_METHOD_SOURCE_PROOFS_V1=WeakKeyDictionary()
+
+def _general_method_source_heap_v1(reader,extra=0):
+    size=extra
+    for task in _GENERAL_METHOD_SOURCE_TASKS_V1.get(reader,{}).values():
+        size+=_general_method_metadata_heap_v1((task.key,task.header,task.fragment,task.metadata))
+        if task.parser is not None:
+            parser=task.parser
+            size+=parser._source_heap_bytes()+_heap((parser._stack,parser._string,parser._literal,parser._number,parser._active_scalar))
+    if size>reader.general_source_reserved:
+        reader.operation.retain(size-reader.general_source_reserved);reader.general_source_reserved=size
+    return size
+
+def _new_general_method_source_parser_v1(reader,*,ensure_ascii):
+    from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
+    from weakref import ref as weak_ref
+    reader_ref=weak_ref(reader)
+    class _ActualGeneralSourceParser(C09MemorySourceJSONStreamV3):
+        def _source_require_arena(self,extra=0):
+            _general_method_source_heap_v1(reader_ref(),extra)
+            return super()._source_require_arena(extra)
+    return _ActualGeneralSourceParser(ensure_ascii=ensure_ascii)
+
+def require_actual_source_owner_metadata_work_v1(reader):
+    if reader.operation_kind in _NUMERIC_PAID_WRITE_OPERATIONS_V3:
+        from .current_life_numeric_paid_write_v3 import require_numeric_paid_write_work_v3
+        return require_numeric_paid_write_work_v3(reader)
+    if reader.operation_kind in _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3:
+        from .current_owner_job_cancel_v3 import require_current_job_cancel_work_v3
+        return require_current_job_cancel_work_v3(reader)
+    if reader.operation_kind in _GENERAL_OWNER_OPERATIONS_V1:
+        return require_actual_general_owner_metadata_work_v1(reader,operation_kind=reader.operation_kind,namespace=reader.namespace)
+    from .current_life_numeric_metadata_v1 import require_numeric_owner_metadata_work_v1
+    return require_numeric_owner_metadata_work_v1(reader)
+
+
+class _GeneralMethodSourceMetadataEOFV1:
+    def __init__(self,issuer,reader,ref):
+        if issuer is not _GENERAL_METHOD_SOURCE_ISSUER_V1:raise TypeError("actual General Source metadata leaf issuer required")
+        require_actual_source_owner_metadata_work_v1(reader)
+        from weakref import ref as weak_ref
+        self.reader=weak_ref(reader);self.key=AtomKey.from_token(ref)
+        if self.key.type_name!="memory.source"or NamespaceId.from_key(self.key)!=reader.namespace:
+            raise ValueError("General Source metadata leaf crossed actual Source namespace")
+        self.header=None;self.cell=None;self.parser=None;self.fragment=b"";self.offset=0;self.total=None
+        self.phase="header";self.metadata=None;self.sha256=None;self.complete=False
+
+    def advance(self,meter):
+        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3,begin_runtime_cell_read_v3
+        from .c09_paged_sql_v2 import read_legacy_sql_cell_fragment_v2,legacy_cell_read_transaction_v2
+        reader=self.reader();reader.require_current(meter=meter)
+        if self.complete:self.require_v1(reader,meter);return True
+        if self.header is not None:
+            if reader.operation_kind in _NUMERIC_NATIVE_READ_OPERATIONS_V3:
+                from .current_life_numeric_native_read_v3 import recheck_native_numeric_source_header_v3
+                current=recheck_native_numeric_source_header_v3(reader,meter,self)
+            elif reader.operation_kind=="prepare_internal_life_numeric_drive":
+                from .d06_life_numeric_drive_v1 import recheck_drive_numeric_source_header_v3
+                current=recheck_drive_numeric_source_header_v3(reader,meter,self)
+            else:
+                current=_runtime_bounded_fixed_row_v3(reader.db,meter,"graph_atoms",("revision","valid","value_cell_id"),
+                    "token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple))
+            if current!=self.header:raise AuthorityUnavailable("General Method Source physical head changed")
+        if self.phase=="header":
+            self.header=_runtime_bounded_fixed_row_v3(reader.db,meter,"graph_atoms",
+                ("revision","valid","value_cell_id"),"token=? AND bot=? AND persona=?",
+                (self.key.token,*reader.namespace.as_tuple))
+            if self.header is None or self.header[0]<1 or self.header[1]!=1:
+                raise ValueError("General Source metadata lost its actual positive current head")
+            self.cell=begin_runtime_cell_read_v3(reader.db,self.header[2],erasure_owner_ref=self.key.token)if self.header[2]is not None else None
+            codec=None if self.cell is None else self.cell.header[0]
+            if codec not in(None,"canonical-json.ascii.v1","canonical-json.utf8.v1"):
+                raise ValueError("General Source metadata has another actual cell codec")
+            self.parser=_new_general_method_source_parser_v1(reader,ensure_ascii=codec!="canonical-json.utf8.v1")
+            self.phase="source";return False
+        if self.fragment:
+            part=self.fragment[:1024]
+            _general_method_source_heap_v1(reader,len(part)*4+65536)
+            self.parser.feed(part,lambda event:None)
+            self.fragment=self.fragment[len(part):]
+            return False
+        if self.cell is not None:chunk=self.cell.read_fragment(meter=meter)
+        else:
+            with legacy_cell_read_transaction_v2(reader.db):
+                if self.total is None:
+                    meter.require_available(1024)
+                    row=reader.db.execute("SELECT typeof(value),length(CAST(value AS BLOB)) FROM graph_atoms "
+                        "WHERE token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple)).fetchone()
+                    meter.charge_read(16)
+                    if row is None or row[0]!="text":raise ValueError("General Source original byte length/kind disappeared")
+                    self.total=row[1]
+                if self.offset<self.total:
+                    chunk,total,kind=read_legacy_sql_cell_fragment_v2(reader.db,table="graph_atoms",column="value",
+                        where="token=? AND bot=? AND persona=?",parameters=(self.key.token,*reader.namespace.as_tuple),
+                        start=self.offset,length=min(16384,self.total-self.offset),meter=meter)
+                    if(total,kind)!=(self.total,"text"):raise ValueError("General Source original byte count/kind changed")
+                    self.offset+=len(chunk)
+                else:chunk=None
+        if chunk is not None:
+            _general_method_source_heap_v1(reader,len(chunk)+65536);self.fragment=chunk;return False
+        result=self.parser.finish()
+        if self.cell is not None:
+            if(result.sha256,result.byte_count)!=(self.cell.finish(meter=meter),self.cell.header[3]):
+                raise ValueError("General Source actual raw EOF/cell digest differs")
+        elif result.byte_count!=self.total:raise ValueError("General Source legacy original EOF differs")
+        _general_method_source_heap_v1(reader,_heap(self.parser._source_metadata))
+        metadata=dict(self.parser._source_metadata)
+        for name in("audiences","purposes","parent_source_ids"):metadata[name]=tuple(metadata[name])
+        if metadata["source_id"]!=self.key.owner.subject:
+            raise ValueError("General Source metadata identity differs from actual key")
+        _general_method_source_heap_v1(reader,_heap(metadata))
+        self.metadata=MappingProxyType(metadata);self.sha256=result.sha256;self.complete=True
+        self.parser=None;self.cell=None;self.fragment=b""
+        return True
+
+    def require_v1(self,reader,meter):
+        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
+        if self.reader()is not reader or _GENERAL_METHOD_SOURCE_TASKS_V1.get(reader,{}).get(self.key.token)is not self or not self.complete:
+            raise ValueError("General Source metadata is not this actual Work's complete original leaf")
+        reader.require_current(meter=meter)
+        if reader.operation_kind in _NUMERIC_NATIVE_READ_OPERATIONS_V3:
+            from .current_life_numeric_native_read_v3 import recheck_native_numeric_source_header_v3
+            current=recheck_native_numeric_source_header_v3(reader,meter,self)
+        elif reader.operation_kind=="prepare_internal_life_numeric_drive":
+            from .d06_life_numeric_drive_v1 import recheck_drive_numeric_source_header_v3
+            current=recheck_drive_numeric_source_header_v3(reader,meter,self)
+        else:
+            current=_runtime_bounded_fixed_row_v3(reader.db,meter,"graph_atoms",
+                ("revision","valid","value_cell_id"),"token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple))
+        if current!=self.header:raise ValueError("General Source metadata changed its physical head after actual EOF")
+        return self
+
+
+    @property
+    def revision(self):return self.header[0]
+    @property
+    def valid(self):return bool(self.header[1])
+
+class _GeneralMethodSourcePermissionV1:
+    def __init__(self,issuer,reader,roots,records,versions):
+        if issuer is not _GENERAL_METHOD_SOURCE_ISSUER_V1:
+            raise AuthorityUnavailable("actual Method Source completion issuer required")
+        self.reader,self.roots=reader,roots
+        self.source_refs=tuple(sorted(records))
+        self.versions=tuple(versions)
+        self.authority,self.scope,self.owner_entry=reader.authority,reader.fence.scope,reader.general_owner_entry
+        _GENERAL_METHOD_SOURCE_PROOFS_V1[self]=(reader,reader.work,reader.operation,reader.selection_digest,
+            self.scope,self.authority,roots,self.source_refs,self.versions,self.owner_entry)
+    def require_for_v1(self,reader,roots):
+        expected=(reader,reader.work,reader.operation,reader.selection_digest,self.scope,
+            reader.authority,tuple(sorted(set(roots))),self.source_refs,self.versions,reader.general_owner_entry)
+        if (_GENERAL_METHOD_SOURCE_PROOFS_V1.get(self)!=expected or self.reader is not reader
+                or reader.general_source_permission is not self or reader.fence.scope is not self.scope
+                or self.scope.operation!="read"):
+            raise AuthorityUnavailable("General Method Source proof crossed actual Work/READ/selection")
+        reader.require_current()
+        if reader.read_finished:_require_current_general_method_source_write_phase_v1(reader)
+        else:self.owner_entry.require_for_v3(reader)
+        with runtime_storage_quantum_v3(reader.db)as meter:
+            for ref in self.source_refs:
+                _GENERAL_METHOD_SOURCE_TASKS_V1[reader][ref].require_v1(reader,meter)
+            for version in self.versions:
+                row=meter.read_fixed_row(reader.db,"graph_atoms",("revision",),
+                    "token=? AND bot=? AND persona=?",(version.key.token,*reader.namespace.as_tuple))
+                if (0 if row is None else row[0])!=version.revision:
+                    raise AuthorityUnavailable("General Method Source closure current revision changed")
+        return self
+
+def qualify_method_source_metadata_kernel_v1(reader,roots,*,purposes):
+    """Mechanical current Source/ancestor EOF traversal; grants no consumer permission."""
+    from ..memory_types import source_key,access_key
+    from ..domains.d06 import source_correction_head_key
+    from ..domains.d07.qualified_attention_read import _qualify_source_rights_values_v3
+    from ..graph_types import GraphVersion
+    require_actual_source_owner_metadata_work_v1(reader)
+    if reader.operation_kind in _NUMERIC_PAID_WRITE_OPERATIONS_V3:
+        from .current_life_numeric_paid_write_v3 import require_numeric_paid_source_purposes_v3
+        require_numeric_paid_source_purposes_v3(reader,purposes)
+    elif reader.operation_kind in _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3:
+        from .current_owner_job_cancel_v3 import require_cancel_source_purposes_v3
+        require_cancel_source_purposes_v3(reader,purposes)
+    elif tuple(purposes) not in ((reader.authority.purpose,),tuple(dict.fromkeys((reader.authority.purpose,"consolidation")))):
+        raise AuthorityUnavailable("Source traversal differs from the caller's actual fixed purposes")
+    records,versions,active={},{},set()
+    def visit(ref):
+        if ref in active:raise AuthorityUnavailable("General Method Source ancestry is cyclic")
+        if ref in records:return
+        if len(records)+len(active)>=256:raise AuthorityUnavailable("General Method Source family exceeds bounded original closure")
+        key=AtomKey.from_token(ref)
+        if key!=source_key(*reader.namespace.as_tuple,key.owner.subject or ""):
+            raise AuthorityUnavailable("General Method Source root is not actual canonical Source")
+        task=_GENERAL_METHOD_SOURCE_TASKS_V1.get(reader,{}).get(ref)
+        if task is None or not task.complete:
+            if reader.inputs_sealed:raise AuthorityUnavailable("General Method Source EOF was not actually prepared before WRITE")
+            _need_method_input(reader,("general_method_source_metadata",ref))
+        with runtime_storage_quantum_v3(reader.db)as meter:task.require_v1(reader,meter)
+        access=method_graph_head_v3(reader.db,reader.namespace,access_key(*reader.namespace.as_tuple,key.owner.subject))
+        correction=method_graph_head_v3(reader.db,reader.namespace,source_correction_head_key(reader.namespace,key.owner.subject))
+        record=None
+        for purpose in purposes:
+            for audience in reader.authority.audience:
+                record=_qualify_source_rights_values_v3(reader.namespace,ref,task,access,correction,
+                    audience=audience,purpose=purpose,metadata_only=True)
+                if record is None:
+                    raise AuthorityUnavailable("Method Source current assertion/access/correction/purpose/audience denied")
+        active.add(ref)
+        for parent in record.parent_source_ids:visit(source_key(*reader.namespace.as_tuple,parent).token)
+        active.remove(ref);records[ref]=record
+        for atom in (task,access,correction):
+            atom_key=task.key if atom is task else atom.key
+            versions[atom_key]=GraphVersion(atom_key,atom.revision)
+    for ref in roots:visit(ref)
+    return records,versions
+
+def require_current_general_method_sources_v1(reader,roots):
+    roots=tuple(sorted(set(roots)))
+    require_actual_general_owner_metadata_work_v1(reader,operation_kind=reader.operation_kind,namespace=reader.namespace)
+    if reader.selected_plan is None or roots!=tuple(sorted(set(reader.selected_plan.source_roots))):
+        raise AuthorityUnavailable("General Method Source roots differ from actual selected metadata plan")
+    if reader.authority.purpose!="consolidation"or not reader.authority.audience:
+        raise AuthorityUnavailable("General Method Source requires actual consolidation audience")
+    if reader.general_owner_entry is None:
+        raise AuthorityUnavailable("General Method Source requires completed independent MetaOwner entry")
+    if reader.read_finished:_require_current_general_method_source_write_phase_v1(reader)
+    else:reader.general_owner_entry.require_for_v3(reader)
+    proof=reader.general_source_permission
+    if proof is not None:return proof.require_for_v1(reader,roots)
+    records,versions=qualify_method_source_metadata_kernel_v1(reader,roots,purposes=(reader.authority.purpose,))
+    reader.operation.retain(_heap((tuple(records),tuple(versions.values())))+1024)
+    proof=_GeneralMethodSourcePermissionV1(_GENERAL_METHOD_SOURCE_ISSUER_V1,reader,roots,records,
+        tuple(sorted(versions.values(),key=lambda version:version.key.token)))
+    reader.general_source_permission=proof
+    return proof.require_for_v1(reader,roots)
+
+def _require_current_general_method_body_v1(reader,table,key):
+    from .artifact_borrowed_source_v3 import require_artifact_borrowed_body_column_v3
+    if require_artifact_borrowed_body_column_v3(reader,table,key):return
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3
+    if reader.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(reader.operation_kind):
+        from .current_beta1_source_read_v3 import require_beta1_source_body_v3
+        return require_beta1_source_body_v3(reader,table,key)
+    if reader.operation_kind in _NUMERIC_PAID_WRITE_OPERATIONS_V3:
+        from .current_life_numeric_paid_write_v3 import require_numeric_paid_body_v3
+        return require_numeric_paid_body_v3(reader,table,key)
+    if reader.operation_kind in _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3:
+        from .current_owner_job_cancel_v3 import require_cancel_job_body_v3
+        return require_cancel_job_body_v3(reader,table,key)
+    if reader.operation_kind in _NUMERIC_METADATA_OPERATIONS_V3:
+        from .current_life_numeric_metadata_v1 import require_numeric_method_body_v1
+        return require_numeric_method_body_v1(reader,table,key)
+    if reader.operation_kind not in _GENERAL_OWNER_OPERATIONS_V1:return
+    if reader.inputs_sealed:
+        raise AuthorityUnavailable("General WRITE cannot open an unprepared body column")
+    if table=="runtime_budget_grants":return
+    if table=="graph_atoms":
+        from ..memory_types import access_key
+        from ..domains.d06 import source_correction_head_key
+        atom_key=AtomKey.from_token(key[0])
+        if atom_key==owner_grant_key(*reader.namespace.as_tuple):return
+        subject=atom_key.owner.subject or ""
+        if atom_key in {access_key(*reader.namespace.as_tuple,subject),
+                source_correction_head_key(reader.namespace,subject)}:return
+    if reader.general_source_permission is None:
+        raise AuthorityUnavailable("General selected body requires all-parent Source metadata completion")
+    proof=reader.general_source_permission.require_for_v1(reader,reader.selected_plan.source_roots)
+    if table in {"graph_atoms","graph_history"}:
+        atom_key=AtomKey.from_token(key[0])
+        selected=atom_key in reader.selected_plan.exact_keys
+        if atom_key.type_name=="memory.source":selected=atom_key.token in proof.source_refs
+        elif atom_key.type_name not in _GENERAL_OWNER_METADATA_TYPES_V1:
+            selected=selected or atom_key.type_name in reader.selected_plan.fixed_type_ids
+        if not selected:
+            raise AuthorityUnavailable("General body escaped same qualified exact keys/Source closure")
+
+def _prepare_current_general_method_owner_entry_v1(reader):
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3,prepare_current_beta1_owner_entry_v3
+    if reader.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(reader.operation_kind):return prepare_current_beta1_owner_entry_v3(reader)
+    if reader.operation_kind not in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3):return
+    if reader.general_owner_entry is None:
+        from ..authority_service.owner_location_read_v3 import prepare_current_host_method_owner_read_entry_v3
+        reader.general_owner_entry=prepare_current_host_method_owner_read_entry_v3(reader)
+    reader.general_owner_entry.require_permission_v3(reader)
+    with reader.store._lock:reader.general_owner_entry.require_for_v3(reader)
+
+_GENERAL_METHOD_SOURCE_WRITE_PHASES_V1=WeakKeyDictionary()
+
+def _register_current_general_method_source_write_phase_v1(inputs,scope,current_owner):
+    reader=inputs.owner
+    from .current_beta1_source_read_v3 import beta1_source_operation_v3
+    if reader.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(reader.operation_kind):
+        from .current_beta1_source_read_v3 import register_beta1_source_write_phase_v3
+        return register_beta1_source_write_phase_v3(inputs,scope,current_owner)
+    if reader.operation_kind not in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_OWNER_OPERATIONS_V1):return
+    if not reader.inputs_sealed:return
+    if (not reader.read_finished or not reader.business_started or scope.operation!="write"
+            or scope is reader.fence.scope or _method_active(reader.db)is not reader
+            or inputs.plan!=reader.selected_plan or tuple(getattr(current_owner,name)for name in ("principal","actor","namespace","grant_id","scope","issuer_ref","capabilities","purposes","audiences","grant_digest","grant_revision","access_epoch","delete_epoch","graph_incarnation","authorization_head","authorization_revision","revocation_epoch"))!=tuple(getattr(reader.owner_binding,name)for name in ("principal","actor","namespace","grant_id","scope","issuer_ref","capabilities","purposes","audiences","grant_digest","grant_revision","access_epoch","delete_epoch","graph_incarnation","authorization_head","authorization_revision","revocation_epoch"))):
+        raise AuthorityUnavailable("General cached READ input requires actual current business WRITE")
+    reader.work._require_invocation(reader.graph)
+    _GENERAL_METHOD_SOURCE_WRITE_PHASES_V1[reader]=(inputs,scope,current_owner,reader.work,reader.operation,
+        reader.selection_digest,reader.graph_stamp,reader.selected_plan)
+
+def _require_current_general_method_source_write_phase_v1(reader):
+    record=_GENERAL_METHOD_SOURCE_WRITE_PHASES_V1.get(reader)
+    if record is None:raise AuthorityUnavailable("General Source cached input has no actual business WRITE phase")
+    inputs,scope,owner,work,operation,selection,stamp,plan=record
+    if (_INPUTS.get(inputs)!=(reader,inputs.plan,inputs.envelope,inputs.read_scope,inputs.graph_stamp,inputs.owner_rights)
+            or _method_active(reader.db)is not reader or inputs.owner is not reader
+            or not reader.read_finished or not reader.inputs_sealed or not reader.business_started
+            or scope.operation!="write" or scope is reader.fence.scope or tuple(getattr(owner,name)for name in ("principal","actor","namespace","grant_id","scope","issuer_ref","capabilities","purposes","audiences","grant_digest","grant_revision","access_epoch","delete_epoch","graph_incarnation","authorization_head","authorization_revision","revocation_epoch"))!=tuple(getattr(reader.owner_binding,name)for name in ("principal","actor","namespace","grant_id","scope","issuer_ref","capabilities","purposes","audiences","grant_digest","grant_revision","access_epoch","delete_epoch","graph_incarnation","authorization_head","authorization_revision","revocation_epoch"))
+            or (work,operation,selection,stamp,plan)!=(reader.work,reader.operation,reader.selection_digest,
+                reader.graph_stamp,reader.selected_plan)):
+        raise AuthorityUnavailable("General Source WRITE phase changed actual sealed input/Owner/selection")
+    reader.work._require_invocation(reader.graph)
+    reader.require_current()
+    return record
+
+def _advance_general_method_header_census_v1(reader,meter):
+    row=meter.read_fixed_row(reader.db,"graph_atoms",("token","revision","valid","type_name","value_cell_id"),
+        "bot=? AND persona=? AND token>? ORDER BY token",(*reader.namespace.as_tuple,reader.cursor))
+    if row is None:
+        if reader._epochs(meter)!=reader.authority_epochs:
+            raise AuthorityUnavailable("General Method metadata census Source epochs changed")
+        reader.graph_eof=True;reader._graph_eof_v3();return
+    token,revision,valid,type_id,cell_id=row
+    key=AtomKey.from_token(token)
+    if (NamespaceId.from_key(key)!=reader.namespace or key.type_name!=type_id
+            or type(revision)is not int or revision<1 or valid not in(0,1)):
+        raise AuthorityUnavailable("General Method metadata census graph header differs")
+    reader.store._validate_key(key)
+    reader.cursor=token
+    reader.heads[token]=(revision,valid,cell_id)
+    reader.root=canonical_digest((reader.leaf_schema,reader.root,token,revision,valid,type_id,cell_id))
+    reader.count+=1;reader._reserve()
+
+
+_JOINT_KEY_SCANS_V3 = WeakKeyDictionary()
+
+
+class _JointOriginalKeysReadV3:
+    """Bounded original-key EOF; signed bodies use ordinary exact point reads."""
+    def __init__(self, owner, request):
+        self.owner, self.request = owner, request
+        self.table, self.namespace, self.kind = request
+        self.rows, self.after, self.complete = [], None, False
+
+    def advance(self, meter):
+        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
+        self.owner.require_current(meter=meter)
+        where = "bot=? AND persona=? AND kind=?"
+        params = (*self.namespace.as_tuple, self.kind)
+        if self.after is not None:
+            where += " AND original_ref>?"; params = (*params, self.after)
+        row = _runtime_bounded_fixed_row_v3(self.owner.db, meter, self.table, ("original_ref",),
+            where + " ORDER BY original_ref", params)
+        if row is None:
+            self.complete = True; return
+        self.owner.operation.retain(len(row[0].encode("utf-8")) * 8 + 1024)
+        self.rows.append(row); self.after = row[0]
+        if len(self.rows) == 129:
+            self.complete = True
+
+
+def read_bound_method_joint_original_keys_v3(db, *, table, namespace, kind):
+    owner = _method_active(db)
+    if owner is None:
+        return False, None
+    from .artifact_borrowed_source_v3 import artifact_borrowed_joint_original_keys_v3
+    artifact,keys=artifact_borrowed_joint_original_keys_v3(owner,table=table,namespace=namespace,kind=kind)
+    if artifact:return True,keys
+    if (table != "graph_d08_joint_node_originals_v1" or namespace != owner.namespace
+            or kind not in {"external_node_contract_v1", "external_node_observation_v1", "compensation_authorization_v1"}):
+        raise AuthorityUnavailable("unregistered Joint original key family")
+    request = (table, namespace, kind)
+    tasks = _JOINT_KEY_SCANS_V3.setdefault(owner, {})
+    task = tasks.get(request)
+    if task is None or not task.complete:
+        _need_method_input(owner, ("joint_original_keys", request))
+    owner.require_current()
+    return True, tuple(task.rows)

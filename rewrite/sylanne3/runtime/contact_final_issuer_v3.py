@@ -55,12 +55,16 @@ def inspect_contact_final_d11_v3(db, *, bundle, candidate, qualification,
     if row is None:
         raise ValueError('Contact v2 admission lacks actual recovery metadata')
     metadata = GraphStore._decode_recovery(row, ns).requirements
+    producing_operation=identity.operation_id
+    if candidate.segment_index>0:
+        from .contact_continuation_stage_v1 import require_contact_continuation_runtime_candidate_v1
+        producing_operation=require_contact_continuation_runtime_candidate_v1(db,bundle=bundle,candidate=candidate,qualification=qualification).first_operation_id
     batch, proof, eligible = require_current_contact_batch_v3(db, namespace=ns,
-        batch_ref=candidate.batch_ref, operation_id=identity.operation_id,
+        batch_ref=candidate.batch_ref, operation_id=producing_operation,
         generation=envelope.authority.activation_generation, graph_incarnation=metadata.graph_incarnation)
     if metadata.namespace != ns or metadata.activation_generation != envelope.authority.activation_generation:
         raise ValueError('Contact v2 D11 current recovery generation differs')
-    if (proof.qualification.checks != qualification.checks
+    if candidate.segment_index==0 and (proof.qualification.checks != qualification.checks
             or proof.qualification.owner_policy_digest != qualification.owner_policy_digest
             or proof.qualification.route_semantic_digest != qualification.route_semantic_digest):
         raise ValueError('Contact v2 actual SQL proof differs from the freshly issued six providers')
@@ -73,8 +77,9 @@ def inspect_contact_final_d11_v3(db, *, bundle, candidate, qualification,
     registry.register(ActionSchema(schema.schema_id, schema.action_kind, True, schema.required_checks))
     decision = registry.qualify(intent, qualification.checks, now=now_utc)
     if (decision.status != 'qualified' or len(qualification.checks) != 6
-            or decision.receipt_digest != grant.qualification_receipt_digest
-            or decision.valid_until != grant.valid_until
+            or (candidate.segment_index==0 and (decision.receipt_digest != grant.qualification_receipt_digest
+                or decision.valid_until != grant.valid_until))
+            or not now_utc<envelope.deadline_utc<=min(decision.valid_until,grant.valid_until)
             or intent.identity != identity or candidate.operation_id != identity.operation_id
             or candidate.effect_id != identity.effect_id
             or canonical_digest(intent) != candidate.action_digest

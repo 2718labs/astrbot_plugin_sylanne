@@ -71,8 +71,9 @@ def _require_metadata_head(db, metadata):
     handled,row=read_bound_authority_graph_attachment_v3(db,table='graph_atoms',columns=('value','valid'),
         key_columns=('bot','persona','token'),key=(*metadata.namespace.as_tuple,key.token))
     if not handled:
-        row = db.execute('SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-            (*metadata.namespace.as_tuple, key.token)).fetchone()
+        from ..runtime_storage_v3 import read_graph_row_v3
+        row=read_graph_row_v3(db,columns=('value','valid'),where='bot=? AND persona=? AND token=?',
+            parameters=(*metadata.namespace.as_tuple,key.token))
     if row != (canonical_serialize(metadata), 1):
         raise ValueError('derived payload requires its exact currently adopted Graph metadata')
 

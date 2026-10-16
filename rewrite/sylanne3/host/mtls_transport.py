@@ -258,7 +258,8 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
         fields = {"status", "global_count", "namespace_count", "background_count",
                   "namespace_background_count", "capacity_available", "call_id",
                   "request_digest", "authority_id", "namespace", "subject",
-                  "installation_id", "current_anchor_digest", "draft_digest"}
+                  "installation_id", "current_anchor_digest", "draft_digest",
+                  "selected_admission_count", "selected_observation_count"}
         if (type(fact) is not dict or set(fact) != fields
                 or fact["status"] not in {"census", "absent", "prepared",
                     "not_dispatched", "unresolved", "terminal", "retained", "never_begun"}
@@ -274,6 +275,9 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
                     None if draft is None else runtime_canonical_digest(asdict(draft)),
                     None if draft is None else draft.call_id,
                     None if draft is None else draft.request_digest)
+                or any((fact[key] is not None if draft is None else
+                        type(fact[key]) is not int or not 0 <= fact[key] <= 1)
+                       for key in ("selected_admission_count", "selected_observation_count"))
                 or (draft is None) != (fact["status"] == "census")
                 ):
             raise RuntimeError("MODEL_CAPACITY_RESPONSE_BINDING")
@@ -447,6 +451,24 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
                 or receipt.observation_digest != record.observation_digest):
             raise RuntimeError("authority model terminal receipt binding is invalid")
         return record, permit, receipt
+
+    async def qualify_current_life_numeric_model_candidate_v3(
+        self,request,handshake,grant,*,namespace,holder,original_intent,original_permit,case,candidate_intent,
+    ):
+        from ..authority_service.life_numeric_model_qualification_v3 import (
+            require_numeric_model_candidate_case_v3,numeric_model_qualification_from_wire_v3)
+        self._model_identity(request,handshake,grant,namespace,holder,original_intent)
+        require_numeric_model_candidate_case_v3(original_intent,original_permit,case,candidate_intent)
+        response=await self._content_rpc(request,handshake,"qualify_current_life_numeric_model_candidate_v3",
+            {"namespace":namespace,"holder":holder,"original_intent":model_to_wire(original_intent),
+                "original_permit":to_wire(original_permit),"case":case,"candidate_intent":model_to_wire(candidate_intent)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response)!={"qualification","channel_binding_sha256"}:
+            raise RuntimeError("Numeric MODEL qualification response fields differ")
+        if response["channel_binding_sha256"]!=grant.channel_binding_sha256:
+            raise RuntimeError("Numeric MODEL qualification channel binding differs")
+        result=numeric_model_qualification_from_wire_v3(response["qualification"])
+        return result.require_for_v3(original_intent,original_permit,case,candidate_intent,grant.installation_id)
 
     async def model_terminal_fact_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
@@ -2395,14 +2417,20 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
     async def v2_accept_owner_session(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, challenge: OwnerSessionLoginChallengeV1, signature: bytes,
+        session_expires_no_later_than_utc: str | None = None,
     ) -> str:
         if (type(challenge) is not OwnerSessionLoginChallengeV1
                 or type(signature) is not bytes or len(signature) != 64):
             raise TypeError("Owner login challenge and Ed25519 signature are required")
+        command = {"namespace": namespace, "challenge": session_to_wire(challenge),
+                   "signature": signature.hex()}
+        if session_expires_no_later_than_utc is not None:
+            from ..authority_service.v2_owner_proof import _time
+            _time(session_expires_no_later_than_utc)
+            command["session_expires_no_later_than_utc"] = session_expires_no_later_than_utc
         response = await self._content_rpc(
-            request, handshake, "accept_owner_session_v1",
-            {"namespace": namespace, "challenge": session_to_wire(challenge),
-             "signature": signature.hex()}, protocol=AUTHORITY_V2_PROTOCOL)
+            request, handshake, "accept_owner_session_v1", command,
+            protocol=AUTHORITY_V2_PROTOCOL)
         token = self._owner_session_response(response, handshake, "token")
         if (type(token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None
                 or challenge.request.authority_id != handshake.installation_authority_id
@@ -3445,6 +3473,72 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
         if response != {"finished": True,
                         "channel_binding_sha256": handshake.channel_binding_sha256}:
             raise RuntimeError("authority v2 finish response is invalid")
+
+
+    async def model_no_dispatch_witness_v1(self, request, handshake, grant, *, namespace, holder, closure_request):
+        from ..authority_service.v2_model_egress_contract import ModelNoDispatchClosureRequestV1, ModelNoDispatchWitnessV1
+        if (type(closure_request) is not ModelNoDispatchClosureRequestV1
+                or (closure_request.installation_id, closure_request.holder) != (grant.installation_id, holder)):
+            raise RuntimeError("actual installed original no-dispatch closure request required")
+        self._model_identity(request, handshake, grant, namespace, holder, closure_request.intent)
+        response = await self._content_rpc(request, handshake, "model_no_dispatch_witness_v1",
+            {"namespace": namespace, "closure_request": model_to_wire(closure_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"witness", "channel_binding_sha256"}:
+            raise RuntimeError("no-dispatch witness exact response fields differ")
+        witness = model_from_wire(response["witness"], ModelNoDispatchWitnessV1)
+        if witness.request.identity_digest != closure_request.identity_digest:
+            raise RuntimeError("Authority no-dispatch witness crossed its original exact call")
+        return witness
+
+    async def _model_no_dispatch_accounting_rpc_v1(self, request, handshake, grant, *, namespace, holder,
+            method, accounting_request, accounting_grant=None):
+        from ..authority_service.v2_accounting_contract import ModelNoDispatchAccountingRequestV1, ModelNoDispatchAccountingGrantV1
+        from ..authority_service.v2_accounting_wire import to_wire, from_wire
+        methods = {"model_no_dispatch_accounting_begin_v1", "model_no_dispatch_accounting_validate_v1",
+            "model_no_dispatch_accounting_finish_v1", "model_no_dispatch_accounting_recover_finish_v1"}
+        if method not in methods or type(accounting_request) is not ModelNoDispatchAccountingRequestV1:
+            raise RuntimeError("closed actual no-dispatch accounting method/request required")
+        self._model_identity(request, handshake, grant, namespace, holder, accounting_request.intent)
+        if (accounting_request.witness.request.installation_id, accounting_request.witness.request.holder) != (grant.installation_id, holder):
+            raise RuntimeError("no-dispatch accounting installation differs")
+        command = {"namespace": namespace, "request": to_wire(accounting_request)}
+        if method in {"model_no_dispatch_accounting_validate_v1", "model_no_dispatch_accounting_finish_v1"}:
+            if type(accounting_grant) is not ModelNoDispatchAccountingGrantV1:
+                raise RuntimeError("actual original no-dispatch accounting grant required")
+            command["grant"] = to_wire(accounting_grant)
+        elif accounting_grant is not None:
+            raise RuntimeError("unexpected no-dispatch accounting grant")
+        response = await self._content_rpc(request, handshake, method, command, protocol=AUTHORITY_V2_PROTOCOL)
+        if method == "model_no_dispatch_accounting_begin_v1":
+            if set(response) != {"grant", "channel_binding_sha256"}: raise RuntimeError("no-dispatch grant fields differ")
+            result = from_wire(response["grant"], ModelNoDispatchAccountingGrantV1)
+            if (result.call_id, result.reservation_digest, result.witness_digest, result.permit.operation_id,
+                    result.permit.pinned_anchor, result.permit.subject) != (
+                    accounting_request.intent.call_id, accounting_request.intent.budget_reservation_digest,
+                    accounting_request.witness.digest, accounting_request.operation_id, accounting_request.expected_anchor, grant.subject):
+                raise RuntimeError("no-dispatch actual accounting grant original differs")
+            return result
+        field = "valid" if method == "model_no_dispatch_accounting_validate_v1" else "finished"
+        if set(response) != {field, "channel_binding_sha256"} or response[field] is not True:
+            raise RuntimeError("no-dispatch accounting response did not prove its exact stage")
+        return True
+
+    async def model_no_dispatch_accounting_begin_v1(self, request, handshake, grant, *, namespace, holder, accounting_request):
+        return await self._model_no_dispatch_accounting_rpc_v1(request, handshake, grant, namespace=namespace, holder=holder,
+            method="model_no_dispatch_accounting_begin_v1", accounting_request=accounting_request)
+
+    async def model_no_dispatch_accounting_validate_v1(self, request, handshake, grant, *, namespace, holder, accounting_request, accounting_grant):
+        return await self._model_no_dispatch_accounting_rpc_v1(request, handshake, grant, namespace=namespace, holder=holder,
+            method="model_no_dispatch_accounting_validate_v1", accounting_request=accounting_request, accounting_grant=accounting_grant)
+
+    async def model_no_dispatch_accounting_finish_v1(self, request, handshake, grant, *, namespace, holder, accounting_request, accounting_grant):
+        return await self._model_no_dispatch_accounting_rpc_v1(request, handshake, grant, namespace=namespace, holder=holder,
+            method="model_no_dispatch_accounting_finish_v1", accounting_request=accounting_request, accounting_grant=accounting_grant)
+
+    async def model_no_dispatch_accounting_recover_finish_v1(self, request, handshake, grant, *, namespace, holder, accounting_request):
+        return await self._model_no_dispatch_accounting_rpc_v1(request, handshake, grant, namespace=namespace, holder=holder,
+            method="model_no_dispatch_accounting_recover_finish_v1", accounting_request=accounting_request)
+
 
 
 __all__ = ("AuthorityTlsProfile", "MtlsAuthorityTransport",

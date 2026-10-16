@@ -28,7 +28,7 @@ else:
     from astrbot.api import logger, AstrBotConfig
     from astrbot.api.event import AstrMessageEvent, filter
     from astrbot.api.star import Context, Star, StarTools
-
+    
     from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
     from sylanne3.host import (
         AstrBotIngressError,
@@ -53,6 +53,8 @@ else:
     from sylanne3.host.model_workflows_v4 import AdminModelWorkflowsV4
     from sylanne3.host.model_workflows_v5 import AdminModelWorkflowsV5
     from sylanne3.host.model_workflows_v6 import AdminModelWorkflowsV6
+    from sylanne3.host.model_workflows_v7 import AdminModelWorkflowsV7
+    from sylanne3.host.model_workflows_v8 import AdminModelWorkflowsV8
     from sylanne3.host.model_selection import observe_host_model_selection_v1
     from sylanne3.host.webui_configuration_v1 import (
         WebuiConfigurationV1, configuration_values_v1, default_model_selection_v1,
@@ -103,12 +105,12 @@ else:
     from sylanne3.workbench_api.onboarding import OnboardingPolicyResolver
     from sylanne3.workbench_api.local_creation_catalogue import LocalCreationCatalogue
     from sylanne3.workbench_api.owner_grant import CurrentOwnerGrantPort
-
-
+    
+    
     PLUGIN_NAME = "astrbot_plugin_sylanne"
     PACKAGE_ROOT = Path(__file__).resolve().parent
-
-
+    
+    
     def _settings(config: object) -> tuple[bool, AuthoritySelection]:
         values = config if isinstance(config, dict) else {}
         enabled = values.get("enabled", False)
@@ -116,8 +118,8 @@ else:
             raise ValueError("enabled must be boolean")
         profile = values.get("authority_profile", "default")
         return enabled, AuthoritySelection(profile)
-
-
+    
+    
     def _installed_model_port(
         context: Context, host_loop: asyncio.AbstractEventLoop,
         installation: object,
@@ -128,7 +130,7 @@ else:
         bundle = installation.admin_bundle
         has_v2_workflows = (
             type(bundle) is AdminInstallationBundle
-            and type(bundle.model_workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6}
+            and type(bundle.model_workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
             and bundle.ingress_model is None
         )
         if (type(bundle) is not AdminInstallationBundle
@@ -144,11 +146,11 @@ else:
             installed_namespace=bundle.installation_policy.namespace,
             installation_bundle=bundle,
         )
-
-
+    
+    
     class Sylanne3Plugin(Star):
         """Full-runtime host. Incomplete authority or domain sets remain blocked."""
-
+    
         def __init__(self, context: Context, config: dict | None = None, *,
                      workbench_pairing: CurrentOwnerPairingPort | None = None,
                      workbench_owner_grants: CurrentOwnerGrantPort | None = None,
@@ -250,7 +252,7 @@ else:
             self._final_handoff_server: HostReverseGraphClaimServer | None = None
             self._final_handoff_listener: asyncio.AbstractServer | None = None
             self._final_claim_writer: Callable | None = None
-
+    
         def _installation_status(self) -> tuple[str, str]:
             health = self.runtime_health
             return health.status, (health.missing_capabilities[0]
@@ -271,14 +273,14 @@ else:
                 "business_enabled": self._enabled,
                 "required_origin": None if bundle is None else bundle.workbench_origin,
             }, headers={"Cache-Control": "no-store"})
-
+    
         def _model_observation(self):
             installation = self._setup_installation
             bundle = installation.admin_bundle if type(installation) is V2InstallationAssembly else None
             return observe_host_model_selection_v1(context=self.context,
                 authority_profile=self._authority_selection.profile_id, provider_id=self._llm_provider_id,
                 installation_bundle=bundle, authorized_baseline=self._model_baseline)
-
+    
         def _model_business_ready(self):
             observed = self._model_observation()
             if observed.state != "authorized":
@@ -299,18 +301,23 @@ else:
                     if requested != installed.provider_id:
                         self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                         return False
-            if type(workflows) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6} and workflows.d07_relationship_cognition is not None:
+            if type(workflows) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8} and workflows.d07_relationship_cognition is not None:
                 requested = selection["auxiliary_provider_id"]
                 if requested and requested != workflows.d07_relationship_cognition.provider_id:
                     self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                     return False
-            if type(workflows) is AdminModelWorkflowsV6 and workflows.growth_cognition is not None:
+            if type(workflows) in {AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8} and workflows.growth_cognition is not None:
                 requested = selection["auxiliary_provider_id"]
                 if requested and requested != workflows.growth_cognition.provider_id:
                     self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                     return False
+            if type(workflows) is AdminModelWorkflowsV8 and workflows.general_growth_cognition is not None:
+                requested = selection["auxiliary_provider_id"]
+                if requested and requested != workflows.general_growth_cognition.provider_id:
+                    self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
+                    return False
             return True
-
+    
         async def _setup_status(self):
             if not self._config_valid:
                 raise ValueError("setup configuration is invalid")
@@ -346,7 +353,7 @@ else:
                         and platform.libc_ver()[0] == "glibc",
                         "mode": "fresh_install_only", "requires_administrator": True},
                     "model_plan": None if observed.plan is None else observed.plan.to_dict()}
-
+    
         def observed_scene_candidates(self, namespace: NamespaceId) -> tuple[ObservedSceneCandidate, ...]:
             """Server-side observations only; an Owner route must still authenticate."""
             if (not self._enabled or self._runtime is None
@@ -354,7 +361,7 @@ else:
                     or self.runtime_health.status not in {"limited", "ready"}):
                 return ()
             return self._scene_candidates.for_namespace(namespace)
-
+    
         def lookup_observed_scene_candidate(
             self, *, namespace: NamespaceId, platform_ref: str,
             conversation_ref: str, visibility: str, scene_ref: str,
@@ -369,7 +376,7 @@ else:
                 conversation_ref=conversation_ref, visibility=visibility,
                 scene_ref=scene_ref,
             )
-
+    
         async def initialize(self) -> None:
             if self._webui is not None:
                 await self._webui.start()
@@ -575,6 +582,8 @@ else:
                     self._final_handoff_server = server
                     self._final_handoff_listener = listener
                     self._final_claim_writer = writer
+                    self._runtime.install_contact_background_host_v1(installation,context=self.context,
+                        server=server,listener=listener,candidates=self._scene_candidates)
                 except Exception:
                     await self._runtime.uninstall_final_handoff_pairing_v1()
                     logger.warning("Sylanne 3 final handoff pairing unavailable; dispatch HOLD")
@@ -634,7 +643,7 @@ else:
                     "blocked", health.missing_capabilities or ("runtime_bootstrap",),
                 )
                 logger.error("Sylanne 3 startup blocked: v2 graph unavailable")
-
+    
         async def terminate(self) -> None:
             self._enabled = False
             if self._webui is not None:
@@ -737,7 +746,7 @@ else:
                 self._runtime = None
             else:
                 self.runtime_health = RuntimeHealth("stopped")
-
+    
         def _natural_reply_ready_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
         ) -> bool:
@@ -752,7 +761,7 @@ else:
                     context=self.context) is True
             except Exception:
                 return False
-
+    
         async def _arm_registered_artifact_task_wait_v1(self,runtime,installation,initial_c02_operation_id,*,parent_task=None):
             if self._encoding_stopping or self._runtime is not runtime or self._v2_installation is not installation:return
             registered=await runtime._worker.call(lambda graph:graph.discover_registered_artifact_task_waits_v1(
@@ -861,6 +870,12 @@ else:
                             trusted_umo=trusted_umo, c02_operation_id=c02_operation_id, source_ref=source_ref)
                         if appraisal.get("status") not in {"adopted", "no_supported_meaning", "not_configured"}:
                             logger.info("Sylanne 3 D04 appraisal original status: %s", appraisal.get("status"))
+                        if appraisal.get("status") == "adopted":
+                            # This wave consumes only the actually adopted appraisal.
+                            # The installed numeric driver keeps its original claim,
+                            # heavy slot, Source guards, budget and serial adoption.
+                            runtime.queue_post_c02_numeric_v3(installation,
+                                c02_operation_id=c02_operation_id, source_ref=source_ref)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -928,7 +943,7 @@ else:
                 return
             self._schedule_post_c02_natural_v2(
                 runtime, installation, saved, audience[0])
-
+    
         def _schedule_post_c02_natural_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             saved: SavedNaturalPreparationV2, trusted_umo: str,
@@ -958,7 +973,7 @@ else:
                         runtime, installation, saved, trusted_umo)
                 return
             self._natural_backlog.pop(job_id, None)
-
+    
             async def continue_original() -> None:
                 try:
                     outcome = await runtime.run_installed_natural_reply_v2(
@@ -994,7 +1009,7 @@ else:
                         runtime.queue_post_c02_numeric_v3(installation,
                             c02_operation_id=saved.seal.c02_operation_id,
                             source_ref=saved.seal.source_ref)
-
+    
             task = asyncio.create_task(continue_original())
             self._reply_tasks[task] = "natural:" + job_id
             registered_wait=self._artifact_task_waiters_v1.get(saved.seal.c02_operation_id)
@@ -1004,9 +1019,9 @@ else:
                 self._reply_tasks.pop(finished, None)
                 if not self._encoding_stopping:
                     self._drain_natural_backlog_v2()
-
+    
             task.add_done_callback(finished_natural)
-
+    
         def _drain_natural_backlog_v2(self) -> None:
             while (self._natural_backlog and len(self._reply_tasks) < 8
                    and not self._encoding_stopping):
@@ -1020,7 +1035,7 @@ else:
                 installation = getattr(self, "_v2_installation", None)
                 if runtime is not None and installation is not None:
                     runtime.resume_pending_d04_numeric_v3(installation)
-
+    
         def _resume_natural_stage_scan_v2(self) -> None:
             runtime = getattr(self, "_runtime", None)
             installation = getattr(self, "_v2_installation", None)
@@ -1034,15 +1049,15 @@ else:
                 return
             task = asyncio.create_task(self._restore_pending_natural_stages_v2())
             self._natural_stage_scan_task = task
-
+    
             def finished_scan(finished: asyncio.Task) -> None:
                 if self._natural_stage_scan_task is finished:
                     self._natural_stage_scan_task = None
                 if not self._encoding_stopping:
                     self._resume_natural_stage_scan_v2()
-
+    
             task.add_done_callback(finished_scan)
-
+    
         def _resume_released_attention_scan_v2(self) -> None:
             runtime = getattr(self, "_runtime", None)
             installation = getattr(self, "_v2_installation", None)
@@ -1056,15 +1071,15 @@ else:
                 return
             task = asyncio.create_task(self._restore_released_attention_v2())
             self._released_attention_scan_task = task
-
+    
             def finished_scan(finished: asyncio.Task) -> None:
                 if self._released_attention_scan_task is finished:
                     self._released_attention_scan_task = None
                 if not self._encoding_stopping:
                     self._resume_released_attention_scan_v2()
-
+    
             task.add_done_callback(finished_scan)
-
+    
         async def _complete_accepted_natural_attention_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             final_operation_id: str,
@@ -1080,7 +1095,7 @@ else:
                 return
             self._released_attention_scan_pending = True
             self._resume_released_attention_scan_v2()
-
+    
         async def _run_first_ingress_c02(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             trusted_umo: str, envelope, receipt: IngressReceipt,
@@ -1134,7 +1149,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 first encoding C02 failed; original call HOLD")
-
+    
         async def _continue_post_c02_reply_model_v1(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             queued: ReplyModelQueuedPreparationV1, trusted_umo: str,
@@ -1162,7 +1177,7 @@ else:
                     logger.warning("Sylanne 3 post-C02 reply assembly remains HOLD")
                 else:
                     logger.info("Sylanne 3 reply admission sealed; awaiting original handler")
-
+    
         def _queue_d13_schedule_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             ingress_operation_id: str, envelope, *, trusted_umo: str,
@@ -1182,7 +1197,7 @@ else:
             self._d13_pending_schedules.setdefault(
                 ingress_operation_id, (envelope, trusted_umo))
             self._start_d13_drain_v2(runtime, installation)
-
+    
         def _queue_d13_precompression_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             job_id: str, conversation_ref: str, *, start_drain: bool = True,
@@ -1203,14 +1218,14 @@ else:
                 return
             if start_drain:
                 self._start_d13_drain_v2(runtime, installation)
-
+    
         def _start_d13_drain_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
         ) -> None:
             if self._d13_drain_task is None or self._d13_drain_task.done():
                 self._d13_drain_task = asyncio.create_task(
                     self._drain_d13_precompression_v2(runtime, installation))
-
+    
         def _wake_d13_expiry_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             job_id: str, conversation_ref: str,
@@ -1221,7 +1236,7 @@ else:
                 return
             self._d13_pending_expiries[job_id] = conversation_ref
             self._start_d13_drain_v2(runtime, installation)
-
+    
         async def _arm_d13_expiry_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             job_id: str, conversation_ref: str,
@@ -1252,7 +1267,7 @@ else:
             self._d13_deadline_wakes[job_id] = asyncio.get_running_loop().call_later(
                 delay, self._wake_d13_expiry_v2, runtime, installation,
                 job_id, conversation_ref)
-
+    
         async def _drain_d13_precompression_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
         ) -> None:
@@ -1340,7 +1355,7 @@ else:
                         and self._v2_installation is installation):
                     self._d13_drain_task = asyncio.create_task(
                         self._drain_d13_precompression_v2(runtime, installation))
-
+    
         def _schedule_post_c02_reply_model_v1(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             queued: ReplyModelQueuedPreparationV1, trusted_umo: str,
@@ -1362,7 +1377,7 @@ else:
                 self._reply_backlog_waiting = True
                 logger.warning("Sylanne 3 reply model worker busy; original job HOLD")
                 return
-
+    
             async def continue_original() -> None:
                 try:
                     handler_kwargs = (
@@ -1379,20 +1394,20 @@ else:
                     raise
                 except Exception:
                     logger.exception("Sylanne 3 reply model original job failed; HOLD")
-
+    
             task = asyncio.create_task(continue_original())
             self._reply_tasks[task] = queued.job.job_id
             self._reply_attempted_jobs.add(queued.job.job_id)
-
+    
             def finished_reply(finished: asyncio.Task) -> None:
                 self._reply_tasks.pop(finished, None)
                 if self._reply_backlog_waiting and not self._encoding_stopping:
                     self._start_reply_backlog_drain_v1()
                 if not self._encoding_stopping:
                     self._drain_natural_backlog_v2()
-
+    
             task.add_done_callback(finished_reply)
-
+    
         def _reserve_private_reply_dispatch_v1(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             ingress_operation_id: str, handler_invocation_id: str,
@@ -1409,7 +1424,7 @@ else:
                            for label in self._reply_tasks.values())):
                 return None
             decision = asyncio.get_running_loop().create_future()
-
+    
             async def continue_owned() -> None:
                 if not await decision:
                     return
@@ -1429,38 +1444,38 @@ else:
                     raise
                 except Exception:
                     logger.exception("Sylanne 3 original private reply dispatch failed; HOLD")
-
+    
             task = asyncio.create_task(continue_owned())
             self._reply_tasks[task] = "dispatch:" + ingress_operation_id
             def finished_dispatch(finished: asyncio.Task) -> None:
                 self._reply_tasks.pop(finished, None)
                 if not self._encoding_stopping:
                     self._drain_natural_backlog_v2()
-
+    
             task.add_done_callback(finished_dispatch)
             return decision
-
+    
         def _start_reply_backlog_drain_v1(self) -> None:
             """Re-read durable originals once a bounded live egress slot opens."""
             if (self._encoding_stopping or not self._reply_backlog_waiting
                     or self._reply_drain_task is not None
                     and not self._reply_drain_task.done()):
                 return
-
+    
             async def drain() -> None:
                 self._reply_backlog_waiting = False
                 await self._restore_pending_post_c02_reply_models_v1(
                     schedule_only=True)
-
+    
             task = asyncio.create_task(drain())
             self._reply_drain_task = task
-
+    
             def finished_drain(finished: asyncio.Task) -> None:
                 if self._reply_drain_task is finished:
                     self._reply_drain_task = None
-
+    
             task.add_done_callback(finished_drain)
-
+    
         async def _drive_first_ingress_c02_queue(self) -> None:
             try:
                 while not self._encoding_pending.empty() and not self._encoding_stopping:
@@ -1488,7 +1503,7 @@ else:
                 if not self._encoding_pending.empty() and not self._encoding_stopping:
                     self._encoding_tasks.add(asyncio.create_task(
                         self._drive_first_ingress_c02_queue()))
-
+    
         async def _restore_unacquired_first_ingress_c02_v1(self) -> None:
             runtime = self._runtime
             installation = self._v2_installation
@@ -1533,7 +1548,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 unacquired first encoding scan failed; HOLD")
-
+    
         async def _run_startup_c02_recovery_v1(self) -> None:
             # Reconcile any original D13 write fence before other graph reads.
             # Consumption remains queued until the reply recovery scan has ended.
@@ -1565,7 +1580,7 @@ else:
                 installation = self._v2_installation
                 if runtime is not None and installation is not None:
                     self._start_d13_drain_v2(runtime, installation)
-
+    
         def _start_owner_source_note_scan_v1(self) -> None:
             if self._encoding_stopping or self._runtime is None or self._v2_installation is None:return
             self._owner_source_note_scan_pending=True
@@ -1728,7 +1743,7 @@ else:
             finally:
                 self._natural_stage_scan_running = False
                 self._resume_natural_stage_scan_v2()
-
+    
         async def _restore_pending_natural_dispatch_v2(self) -> None:
             """Resume only committed natural effects discovered by W01's graph read."""
             runtime, installation = self._runtime, self._v2_installation
@@ -1791,7 +1806,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 natural dispatch recovery failed; HOLD")
-
+    
         async def _restore_released_attention_v2(self) -> None:
             """Resume accepted-focus releases by their original committed C02 IDs."""
             runtime, installation = self._runtime, self._v2_installation
@@ -1863,7 +1878,7 @@ else:
                 self._released_attention_scan_pending = False
             finally:
                 self._released_attention_scan_running = False
-
+    
         async def _restore_d13_original_schedules_v2(
             self, *, start_drain: bool = True,
         ) -> None:
@@ -1908,7 +1923,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 D13 original schedule recovery failed; HOLD")
-
+    
         async def _restore_pending_post_c02_reply_models_v1(
             self, *, schedule_only: bool = False,
         ) -> None:
@@ -2005,7 +2020,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 reply recovery scan failed; HOLD")
-
+    
         async def _restore_acquired_first_ingress_c02_v1(self) -> None:
             runtime = self._runtime
             installation = self._v2_installation
@@ -2105,7 +2120,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 acquired first encoding scan failed; HOLD")
-
+    
         async def _restore_committed_first_ingress_c02_cost_v1(self) -> None:
             runtime = self._runtime
             installation = self._v2_installation
@@ -2173,7 +2188,7 @@ else:
                 raise
             except Exception:
                 logger.exception("Sylanne 3 committed C02 cost scan failed; HOLD")
-
+    
         async def _schedule_first_ingress_c02(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             trusted_umo: str, envelope, receipt: IngressReceipt,
@@ -2190,7 +2205,7 @@ else:
                 runtime, installation, trusted_umo, envelope, receipt,
                 stages.job_id, handler_invocation_id=handler_invocation_id,
                 handler_deadline_utc=handler_deadline_utc)
-
+    
         async def _queue_first_ingress_c02(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             trusted_umo: str, envelope, receipt: IngressReceipt, job_id: str,
@@ -2227,7 +2242,7 @@ else:
                 self._encoding_tasks.add(asyncio.create_task(
                     self._drive_first_ingress_c02_queue()))
             return True
-
+    
         @filter.event_message_type(filter.EventMessageType.ALL)
         async def ingress(self, event: AstrMessageEvent) -> None:
             runtime = self._runtime
@@ -2313,7 +2328,7 @@ else:
                         takeover_port = None
                         handler_invocation_id = None
                         handler_deadline_utc = None
-
+    
                 async def continue_accepted() -> bool:
                     stages = await runtime.commit_first_ingress_pre_encoding_stages_v1(
                         envelope, receipt)
@@ -2328,7 +2343,7 @@ else:
                         envelope, receipt, stages,
                         handler_invocation_id=handler_invocation_id,
                         handler_deadline_utc=handler_deadline_utc)
-
+    
                 queued_for_handler = False
                 try:
                     if takeover_port is None:
@@ -2368,6 +2383,6 @@ else:
                     finally:
                         if dispatch_decision is not None and not dispatch_decision.done():
                             dispatch_decision.set_result(False)
-
-
+    
+    
     __all__ = ("Sylanne3Plugin",)

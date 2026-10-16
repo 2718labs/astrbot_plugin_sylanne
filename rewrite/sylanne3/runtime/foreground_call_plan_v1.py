@@ -679,27 +679,57 @@ class NamedC3ParentageDescriptorV3:
     source_digest: str | None = None
     parent_budget_lease_ref: str | None = None
     original_deadline_utc: float | None = None
+    reflection_request_ref: str | None = None
+    reflection_request_digest: str | None = None
+    reflection_continuation_ref: str | None = None
+    reflection_continuation_digest: str | None = None
+    parent_prepared_ref: str | None = None
+    parent_prepared_digest: str | None = None
+    parent_execution_ref: str | None = None
+    parent_execution_digest: str | None = None
+    checkpoint_ref: GraphVersion | None = None
+    checkpoint_digest: str | None = None
+    parent_grant_digest: str | None = None
 
     def __post_init__(self):
         from math import isfinite
-        if (type(self.namespace) is not NamespaceId or self.kind not in ('relationship', 'growth')
+        if (type(self.namespace) is not NamespaceId or self.kind not in ('relationship', 'growth', 'reflection')
                 or type(self.cycle_ref) is not GraphVersion or self.cycle_ref.revision < 1
                 or self.cycle_ref.key.type_name != 'runtime.job'
                 or NamespaceId.from_key(self.cycle_ref.key) != self.namespace
                 or type(self.cancel_generation) is not int or self.cancel_generation < 0):
             raise ValueError('named C3 relation requires its exact namespace/cycle/kind/cancel identity')
         for value in (self.operation_id, self.job_id, self.call_id,
-                self.semantic_question_ref, self.c02_operation_id):
+                self.c02_operation_id):
             if type(value) is not str or not value:
                 raise ValueError('named C3 relation lost an actual original identity')
+        if self.kind!="reflection" and (type(self.semantic_question_ref) is not str or not self.semantic_question_ref):
+            raise ValueError("named C3 retains its exact semantic original locator")
         digests = (self.semantic_question_digest, self.cycle_digest,
                    self.call_plan_digest, self.prepared_digest)
         extras = (self.proposal_head, self.proposal_digest, self.source_head,
                   self.source_digest, self.parent_budget_lease_ref, self.original_deadline_utc)
-        if self.kind == 'relationship':
-            if any(value is not None for value in extras):
+        reflection_fields=(self.reflection_request_ref,self.reflection_request_digest,self.reflection_continuation_ref,
+            self.reflection_continuation_digest,self.parent_prepared_ref,self.parent_prepared_digest,
+            self.parent_execution_ref,self.parent_execution_digest,self.checkpoint_ref,self.checkpoint_digest,self.parent_grant_digest)
+        if self.kind == "reflection":
+            if (any(value is None for value in reflection_fields) or self.semantic_question_ref is not None
+                    or self.semantic_question_digest is not None or any(value is not None for value in extras[:4])
+                    or type(self.checkpoint_ref) is not GraphVersion or self.checkpoint_ref.revision<1
+                    or self.checkpoint_ref.key.type_name!="d07.reflection_checkpoint.v1"
+                    or NamespaceId.from_key(self.checkpoint_ref.key)!=self.namespace
+                    or not self.parent_budget_lease_ref or type(self.original_deadline_utc) not in (int,float)
+                    or not isfinite(self.original_deadline_utc)):
+                raise ValueError("reflection C3 requires only its exact original parentage fields")
+            digests=(self.cycle_digest,self.call_plan_digest,self.prepared_digest,self.reflection_request_digest,
+                self.reflection_continuation_digest,self.parent_prepared_digest,self.parent_execution_digest,
+                self.checkpoint_digest,self.parent_grant_digest)
+        elif self.kind == 'relationship':
+            if any(value is not None for value in extras) or any(value is not None for value in reflection_fields):
                 raise ValueError('Relationship C3 cannot borrow Growth provenance')
         else:
+            if any(value is not None for value in reflection_fields):
+                raise ValueError("growth C3 cannot borrow reflection provenance")
             from ..domains.d01.method_learning_v1 import TRIAL_PROPOSAL_TYPE_V2
             for head, type_name in ((self.proposal_head, TRIAL_PROPOSAL_TYPE_V2),
                                     (self.source_head, 'memory.source')):
@@ -718,8 +748,20 @@ class NamedC3ParentageDescriptorV3:
 
 
 def _named_c3_descriptor_from_prepared_v3(prepared, namespace):
-    from .d07_execution_v1 import D07RelationshipPreparedV2
+    from .d07_execution_v1 import D07RelationshipPreparedV2, D07ReflectionPreparedV3
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
+    if type(prepared) is D07ReflectionPreparedV3:
+        if prepared.cycle_ref is None or prepared.namespace!=namespace:
+            raise TypeError("ordinary reflection is not a Self C3 parent")
+        names=("reflection_request_ref","reflection_request_digest","reflection_continuation_ref",
+            "reflection_continuation_digest","parent_prepared_ref","parent_prepared_digest","parent_execution_ref",
+            "parent_execution_digest","checkpoint_ref","checkpoint_digest","parent_grant_digest")
+        return NamedC3ParentageDescriptorV3(namespace=namespace,kind="reflection",operation_id=prepared.operation_id,
+            job_id=prepared.job_id,call_id=prepared.call_id,semantic_question_ref=None,semantic_question_digest=None,
+            cycle_ref=prepared.cycle_ref,cycle_digest=prepared.cycle_digest,call_plan_digest=prepared.call_plan_digest,
+            c02_operation_id=prepared.c02_operation_id,cancel_generation=prepared.cancel_generation,
+            prepared_digest=prepared.digest,parent_budget_lease_ref=prepared.parent_budget_lease_ref,
+            original_deadline_utc=prepared.original_deadline_utc,**{name:getattr(prepared,name) for name in names})
     if type(prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2} or prepared.namespace != namespace:
         raise TypeError('actual signed Relationship C3 preparation required')
     growth = type(prepared) is D07MethodGrowthPreparedV2
@@ -779,13 +821,22 @@ def _require_current_named_c3_descriptor_v3(db, *, namespace, descriptor, issuer
             or job.cancel_epoch or cycle.call_plan.parent_budget_lease_ref != get_job(db, descriptor.job_id).budget_ref):
         raise ValueError('Relationship C3 lost its actual current parent/cancel/budget binding')
     _adopted_c02_v1(db, namespace, descriptor.c02_operation_id)
-    question = read_d07_original_v1(db, issuer, namespace, 'semantic_question', descriptor.semantic_question_ref)
-    if question is None or question[1] != descriptor.semantic_question_digest:
-        raise ValueError('Relationship C3 lost its exact signed semantic question')
+    if descriptor.kind=="reflection":
+        from .d07_reflection_execution_v1 import require_reflection_c3_descriptor_v3
+        _,lineage=require_reflection_c3_descriptor_v3(db,namespace=namespace,descriptor=descriptor,issuer=issuer)
+        if lineage[0]=="birth" and (job.phase not in {"queued","running","waiting"} or cycle.stage=="completed"):
+            raise ValueError("reflection cannot revive its closed Self cycle")
+        if lineage[0]=="adopted_child" and not any(
+                member.call_id==descriptor.call_id for member in cycle.call_plan.attempts):
+            raise ValueError("completed reflection requires its original registered C3 member")
+    else:
+        question = read_d07_original_v1(db, issuer, namespace, 'semantic_question', descriptor.semantic_question_ref)
+        if question is None or question[1] != descriptor.semantic_question_digest:
+            raise ValueError('Relationship C3 lost its exact signed semantic question')
     from .d07_execution_v1 import read_current_d07_semantic_question_v1, D07RelationshipSemanticQuestionV2
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     from ..domains.d05.relationship_revision_v2 import InstalledRelationshipPolicyV2
-    semantic = read_current_d07_semantic_question_v1(db, issuer, namespace, descriptor.semantic_question_ref)
+    semantic = None if descriptor.kind=="reflection" else read_current_d07_semantic_question_v1(db, issuer, namespace, descriptor.semantic_question_ref)
     if descriptor.kind == 'relationship':
         if type(semantic) is not D07RelationshipSemanticQuestionV2:
             raise ValueError('Relationship C3 has another actual prepared semantic kind')
@@ -810,7 +861,7 @@ def _require_current_named_c3_descriptor_v3(db, *, namespace, descriptor, issuer
         if canonical_digest(asdict(typed_policy)) != semantic.policy_digest:
             raise ValueError('Relationship C3 policy lost its canonical signed commitment')
         typed_policy.rule(semantic.scope)
-    else:
+    elif descriptor.kind=="growth":
         from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
         from .d07_execution_v1 import require_current_method_growth_question_v2
         if type(semantic) is not D07MethodGrowthSemanticQuestionV2:
@@ -837,11 +888,13 @@ def _require_current_named_c3_descriptor_v3(db, *, namespace, descriptor, issuer
         if row is None:
             raise ValueError('Relationship C3 plan member lacks its actual pre-call Graph CAS')
         receipt = _producer_json_loads_v3(row[0])
-        binding = receipt.get('relationship_c3' if descriptor.kind == 'relationship' else 'method_growth_c3')
+        binding = receipt.get({'relationship':'relationship_c3','growth':'method_growth_c3','reflection':'reflection_c3'}[descriptor.kind])
         if (receipt.get('phase') != 'execution_acquired' or receipt.get('prepared_digest') != descriptor.prepared_digest
                 or binding is None or binding != {'cycle_ref': descriptor.cycle_ref.key.token,
                     'before_cycle_digest': descriptor.cycle_digest, 'before_call_plan_digest': descriptor.call_plan_digest,
-                    'call_id': descriptor.call_id, 'semantic_question_digest': descriptor.semantic_question_digest}):
+                    'call_id': descriptor.call_id,
+                    ('reflection_request_digest' if descriptor.kind=='reflection' else 'semantic_question_digest'):
+                        descriptor.reflection_request_digest if descriptor.kind=='reflection' else descriptor.semantic_question_digest}):
             raise ValueError('Relationship C3 pre-call checkpoint differs from its actual signed preparation')
     return job, cycle, head[0]
 
@@ -870,7 +923,7 @@ def register_current_named_c3_in_transaction_v2(db, *, prepared, issuer, now_utc
 def read_current_named_c3_attempt_v2(db, *, namespace, continuation, attempt, issuer):
     """Read the actual D07 typed producer; never substitute an IngressRecall original."""
     import json
-    from .d07_execution_v1 import (TABLE, D07RelationshipPreparedV2, read_prepared_d07_execution_v1,
+    from .d07_execution_v1 import (TABLE, D07RelationshipPreparedV2, D07ReflectionPreparedV3, read_prepared_d07_execution_v1,
         read_d07_original_v1, read_original_d07_request_v1, decode_d07_execution_original_v1)
     from .jobs import get_job
     rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared' "
@@ -879,7 +932,7 @@ def read_current_named_c3_attempt_v2(db, *, namespace, continuation, attempt, is
         raise ValueError("C3 attempt lacks one exact signed D07 preparation")
     prepared = read_prepared_d07_execution_v1(db, issuer, namespace, rows[0][0])
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-    if type(prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2}:
+    if type(prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2, D07ReflectionPreparedV3}:
         raise TypeError("C3 actual producer is not a registered named preparation")
     _, actual_cycle, _ = require_current_named_c3_cycle_v2(db, namespace=namespace, prepared=prepared, issuer=issuer)
     if actual_cycle.c02_operation_id != continuation.c02_operation_id:

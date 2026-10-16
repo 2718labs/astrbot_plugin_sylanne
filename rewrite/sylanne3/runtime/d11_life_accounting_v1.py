@@ -88,7 +88,15 @@ def record_life_accounting_prepared_after_cas_v1(db, *, issuer, prepared):
 
 def read_life_accounting_prepared_v1(db, *, binding, issuer, resource_issuer):
     ref = life_accounting_original_ref_v1(binding)
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,row=read_bound_native_numeric_point_v3(db,table='graph_d11_life_originals_v1',columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'),
+        key_columns=('bot', 'persona', 'kind', 'original_ref'),key=(*binding.namespace.as_tuple,'accounting_prepared',ref))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,row=read_bound_life_model_body_point_v3(db,table='graph_d11_life_originals_v1',columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'),
+        key_columns=('bot', 'persona', 'kind', 'original_ref'),key=(*binding.namespace.as_tuple,'accounting_prepared',ref))
+    if not handled:
+        row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
         " WHERE bot=? AND persona=? AND kind='accounting_prepared' AND original_ref=?", (*binding.namespace.as_tuple, ref)).fetchone()
     if row is None:
         return None
@@ -105,9 +113,25 @@ def read_life_accounting_prepared_v1(db, *, binding, issuer, resource_issuer):
     signed, signature = issuer.signed_budget_grant_at_version(db, grant.lease_id, grant.version)
     if signed != grant or signature != value.signed_grant_signature:
         raise ValueError("life accounting actual signed grant differs")
-    reserve = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,reserve=read_bound_native_numeric_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(*binding.namespace.as_tuple,binding.reservation_operation_id,'reserve'))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,reserve=read_bound_life_model_body_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(*binding.namespace.as_tuple,binding.reservation_operation_id,'reserve'))
+    if not handled:
+        reserve = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
         (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone()
-    reservation = db.execute("SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,reservation=read_bound_native_numeric_point_v3(db,table='runtime_budget_reservations',columns=('digest', 'ceiling_json'),
+        key_columns=('lease_id', 'operation_id'),key=(binding.parent_budget_lease_ref,binding.reservation_operation_id))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,reservation=read_bound_life_model_body_point_v3(db,table='runtime_budget_reservations',columns=('digest', 'ceiling_json'),
+        key_columns=('lease_id', 'operation_id'),key=(binding.parent_budget_lease_ref,binding.reservation_operation_id))
+    if not handled:
+        reservation = db.execute("SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
         (binding.parent_budget_lease_ref, binding.reservation_operation_id)).fetchone()
     if reserve != (value.reserve_receipt_json,) or reservation != (binding.reservation_digest, canonical_serialize({"thread_cpu_ms": binding.cpu_ceiling_ms})):
         raise ValueError("life accounting actual original reserve differs")

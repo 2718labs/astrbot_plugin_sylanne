@@ -988,6 +988,41 @@ class AuthorityV2OwnerTicketStore:
                 raise AuthorityUnavailable("owner current head genesis CAS failed")
             return receipt
 
+    def _current_guard_for_verified_permit_in_tx_v3(self, db, *, authority_namespace, installation_id, subject, permit):
+        """Mechanical current durable permit/head check; callers own purpose admission."""
+        self._require_mode(db)
+        AuthorityV2FenceStore._check_schema(db)
+        AuthorityV2FenceStore._require_no_migration(db)
+        namespace_row = self._core._row(db, authority_namespace)
+        if (namespace_row[0] != permit.holder
+                or namespace_row[1] != permit.generation
+                or namespace_row[2] != "active"
+                or namespace_row[3] is not None
+                or namespace_row[9] != "clear"
+                or self._core._anchor(db, authority_namespace, namespace_row)
+                != permit.pinned_anchor):
+            raise AuthorityUnavailable("owner guard Authority anchor is no longer current")
+        row = AuthorityV2FenceStore._row(db, permit.operation_id)
+        if (row is None or row[1] != authority_namespace
+                or row[2] != subject or row[3] != permit.token
+                or row[6] != "active" or row[7] != fence_canonical_bytes(permit)
+                or row[10] is not None
+                or AuthorityV2FenceStore._permit(row) != permit
+                or permit.authority_id != self._core._id(db)
+                or db.execute(
+                    "SELECT 1 FROM authority_v2_mutations "
+                    "WHERE namespace=? AND state='pending' LIMIT 1",
+                    (authority_namespace,),
+                ).fetchone() is not None):
+            raise AuthorityUnavailable("owner guard fence is no longer current")
+        guard = self._checked_current_head(db, authority_namespace)
+        if guard is not None and (
+                guard.authority_id != permit.authority_id
+                or guard.installation_id != installation_id
+                or namespace_ref(guard.namespace) != authority_namespace):
+            raise AuthorityUnavailable("owner guard installation identity differs")
+        return guard
+
     def get_current_guard(self, *, credential: object,
                           authority_namespace: str, installation_id: str,
                           subject: str, permit: FencePermitV2,
@@ -1019,37 +1054,8 @@ class AuthorityV2OwnerTicketStore:
         self._core._require(credential, "owner_guard_read", authority_namespace,
                             permit.holder)
         with self._core._tx() as db:
-            self._require_mode(db)
-            AuthorityV2FenceStore._check_schema(db)
-            AuthorityV2FenceStore._require_no_migration(db)
-            namespace_row = self._core._row(db, authority_namespace)
-            if (namespace_row[0] != permit.holder
-                    or namespace_row[1] != permit.generation
-                    or namespace_row[2] != "active"
-                    or namespace_row[3] is not None
-                    or namespace_row[9] != "clear"
-                    or self._core._anchor(db, authority_namespace, namespace_row)
-                    != permit.pinned_anchor):
-                raise AuthorityUnavailable("owner guard Authority anchor is no longer current")
-            row = AuthorityV2FenceStore._row(db, permit.operation_id)
-            if (row is None or row[1] != authority_namespace
-                    or row[2] != subject or row[3] != permit.token
-                    or row[6] != "active" or row[7] != fence_canonical_bytes(permit)
-                    or row[10] is not None
-                    or AuthorityV2FenceStore._permit(row) != permit
-                    or permit.authority_id != self._core._id(db)
-                    or db.execute(
-                        "SELECT 1 FROM authority_v2_mutations "
-                        "WHERE namespace=? AND state='pending' LIMIT 1",
-                        (authority_namespace,),
-                    ).fetchone() is not None):
-                raise AuthorityUnavailable("owner guard fence is no longer current")
-            guard = self._checked_current_head(db, authority_namespace)
-            if guard is not None and (
-                    guard.authority_id != permit.authority_id
-                    or guard.installation_id != installation_id
-                    or namespace_ref(guard.namespace) != authority_namespace):
-                raise AuthorityUnavailable("owner guard installation identity differs")
+            guard = self._current_guard_for_verified_permit_in_tx_v3(db,
+                authority_namespace=authority_namespace,installation_id=installation_id,subject=subject,permit=permit)
             if signed:
                 request = owner_session_request
                 sessions = self._owner_sessions

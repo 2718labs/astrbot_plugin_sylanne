@@ -1343,6 +1343,9 @@ def _decode(type_name: str, payload: dict) -> object:
     if type_name in {"d08.personal_plan.v1", "d08.decision_record.v2"}:
         from .personal_plan_v1 import decode_personal_plan_type_v1
         return decode_personal_plan_type_v1(type_name, payload)
+    if type_name=='d08.contact_prospective_barrier.v1':
+        from ...runtime.contact_prospective_v1 import validate_contact_prospective_barrier_v1
+        return validate_contact_prospective_barrier_v1(payload)
     if type_name == "d08.aspiration.v1":
         return Aspiration(**_tuple_fields(payload, "consideration_conditions", "source_refs"))
     if type_name == "d08.goal.v1":
@@ -1380,6 +1383,7 @@ class GoalExecutionProvider:
     _TYPE_OWNERS = {
         "d08.aspiration.v1": ("persona", "activity"),
         "d08.goal.v1": ("persona", "activity"),
+        "d08.contact_prospective_barrier.v1": ("activity",),
         "d08.commitment.v1": ("persona", "relation", "activity"),
         "d08.joint_plan.v1": ("activity",),
         "d08.action_intent.v1": ("activity",),
@@ -1422,6 +1426,7 @@ class GoalExecutionProvider:
                 validator,
                 immutable=type_name in {
                     "d08.action_outcome.v1", "d08.decision_record.v1",
+                    "d08.contact_prospective_barrier.v1",
                     "d08.communication_intent_grant.v1", "d08.action_schema.v1",
                     "d08.natural_expression_plan.v2",
                     "d08.contact_expression_plan.v1",
@@ -1436,8 +1441,10 @@ class GoalExecutionProvider:
                 }),
             ))
         from .contact_plan_v2 import contact_plan_type_specs_v2
+        from .contact_plan_v3 import contact_plan_type_specs_v3
         from .personal_plan_v1 import personal_plan_type_specs_v1
-        return (*specs, *contact_plan_type_specs_v2(), *personal_plan_type_specs_v1())
+        from .long_term_plan_v1 import long_term_type_specs_v1
+        return (*specs, *contact_plan_type_specs_v2(), *contact_plan_type_specs_v3(), *personal_plan_type_specs_v1(), *long_term_type_specs_v1())
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):

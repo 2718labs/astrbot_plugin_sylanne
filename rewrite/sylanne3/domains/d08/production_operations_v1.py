@@ -51,11 +51,13 @@ def compile_settle_current_observed_action_v1(frame, request, *, intent, outcome
     provider = GoalExecutionProvider()
     stage = stage_result_v1(frame, "d08", "settle_observed_action", request,
         writes=(GraphWrite(outcome_key, plain_v1(outcome), ()),),
-        provenance={"action_outcome": outcome, "outcome_settlement": settlement,
+        provenance={"conditioned_source_roots":frame.envelope.source_qualification.source_refs,"conditioned_original_deadline_utc":frame.envelope.deadline_utc,
+            "action_outcome": outcome, "outcome_settlement": settlement,
             "observation_original": observation_original, "cost_original": cost_original},
         contribution_keys=("d08-observed-outcome:" + canonical_digest((outcome.outcome_id,
             observation_original.original_digest, cost_original.original_digest)),),
-        receiver_events=(("d10", "action_outcome_observed_requires_current_life_qualification"),),
+        receiver_events=(("d10", "action_outcome_observed_requires_current_life_qualification"),
+            ("d01","general_growth_action_outcome_available"),("d07","conditioned_observed_outcome_committed_v1")),
         proposal_schema="d08.proposal.v1", proposal_hash=provider.descriptor.request_schema_hash)
     provider.validate(stage.proposals[0], frame.snapshot)
     return stage

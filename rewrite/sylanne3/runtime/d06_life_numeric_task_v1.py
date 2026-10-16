@@ -147,8 +147,13 @@ def read_life_numeric_prepared_v1(db, *, namespace, issuer, job_id):
     value = decode_life_numeric_prepared_v1(saved[0])
     if value.namespace != namespace or value.job_id != job_id or saved[1] != value.operation_id:
         raise ValueError('Life numeric prepared selector differs')
-    row = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',
-        (runtime_job_key(*namespace.as_tuple, value.activity_id, job_id).token,)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    history_key=runtime_job_key(*namespace.as_tuple,value.activity_id,job_id).token
+    history=_producer_original_point_v3(db,table="graph_history",columns=("event_id","value","valid"),
+        key_columns=("token","revision"),key=(history_key,1),
+        legacy_reader=lambda:db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1",
+            (history_key,)).fetchone())
+    row=None if history is None else(history[1],history[2],history[0])
     if row is None or row[1:] != (1, value.operation_id):
         raise ValueError('Life numeric signed preparation lacks its actual job history')
     actual = json.loads(row[0])
@@ -402,8 +407,14 @@ def read_life_numeric_appraisal_acceptance_v1(db, namespace, appraisal_ref, issu
             or p.digest != value.prepared_digest or p.frozen.identity.context_digest != value.context_digest
             or p.frozen.identity.before_digest != value.before_digest):
         raise ValueError('Life numeric acceptance lacks its actual composite adoption')
-    history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (appraisal_ref,)).fetchone()
-    completed = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=3', (job_key.token,)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+    handled,history=read_bound_native_numeric_history_v3(db,appraisal_ref,1,('value', 'valid', 'event_id'))
+    if not handled:
+        history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (appraisal_ref,)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+    handled,completed=read_bound_native_numeric_history_v3(db,job_key.token,3,('value', 'valid', 'event_id'))
+    if not handled:
+        completed = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=3', (job_key.token,)).fetchone()
     if (history != (value.appraisal_value_json, 1, value.operation_id)
             or completed is None or completed[1:] != (1, value.operation_id)
             or json.loads(completed[0]).get('phase') != 'completed'

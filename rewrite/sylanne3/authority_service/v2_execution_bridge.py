@@ -1800,10 +1800,21 @@ class AuthorityV2ExecutionBridge:
             raise AuthorityUnavailable("current Owner dispatch authorization is unavailable")
         contact_selector = None
         contact_capsule = None
+        contact_continuation = None
         if binding.origin.proactive_contact is True:
             if self._contact_p2_service_v1 is None:
                 raise AuthorityUnavailable("installed Contact P2 current policy service is absent")
-            contact_selector = self._contact_p2_service_v1.read_graph_selector_v1(binding)
+            if binding.origin.segment_index == 0:
+                contact_selector = self._contact_p2_service_v1.read_current_first_contact_p2_selector_v1(
+                    credential=credential,subject=subject,context=context,binding=binding,claimed_receipt=claimed_receipt)
+            elif 1 <= binding.origin.segment_index < binding.origin.segment_count <= 3:
+                contact_continuation = self._contact_p2_service_v1.continuation
+                if contact_continuation is None:
+                    raise AuthorityUnavailable('installed separate Contact continuation P2 service is absent')
+                contact_selector = contact_continuation.read_graph_selector_v1(credential=credential,subject=subject,
+                    context=context,binding=binding,claimed_receipt=claimed_receipt)
+            else:
+                raise AuthorityUnavailable('Contact P2 segment is outside its exact first/later protocols')
         # Check the P2 head, live fence, unresolved effect and exact claim
         # before leaving any durable graph reservation. Release all freezes
         # before the graph callback to avoid GraphWorker/Authority deadlock.
@@ -1829,9 +1840,14 @@ class AuthorityV2ExecutionBridge:
                         db, context=context, owner_witness=owner_witness,
                         execution_rows=execution_rows)
                     if contact_selector is not None:
-                        contact_capsule = self._contact_p2_service_v1.read_current_contact_policy_for_dispatch_in_tx_v1(
-                            db,context=context,binding=binding,claimed_receipt=claimed_receipt,
-                            owner_witness=owner_witness,authority_snapshot=admission_snapshot,selector=contact_selector)
+                        if contact_continuation is None:
+                            contact_capsule = self._contact_p2_service_v1.read_current_contact_policy_for_dispatch_in_tx_v1(
+                                db,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                                owner_witness=owner_witness,authority_snapshot=admission_snapshot,selector=contact_selector)
+                        else:
+                            contact_capsule = contact_continuation.read_current_contact_continuation_policy_for_dispatch_in_tx_v1(
+                                db,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                                owner_witness=owner_witness,authority_snapshot=admission_snapshot,selector=contact_selector)
         # External business graph transaction MUST be atomic and idempotent by
         # handoff_id. No Core, deletion, or execution journal lock is held here.
         try:
@@ -1859,8 +1875,14 @@ class AuthorityV2ExecutionBridge:
                 or graph_receipt.graph_deletion_epoch < binding.admission_deletion_epoch):
             raise AuthorityUnavailable("final graph claim receipt identity differs")
         if contact_capsule is not None:
-            contact_selector = self._contact_p2_service_v1.read_graph_selector_v1(binding,
-                claim_receipt=graph_receipt,expected_capsule=contact_capsule)
+            if contact_continuation is None:
+                contact_selector = self._contact_p2_service_v1.read_current_first_contact_p2_selector_v1(
+                    credential=credential,subject=subject,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                    claim_receipt=graph_receipt,expected_capsule=contact_capsule)
+            else:
+                contact_selector = contact_continuation.read_graph_selector_v1(credential=credential,subject=subject,
+                    context=context,binding=binding,claimed_receipt=claimed_receipt,
+                    claim_receipt=graph_receipt,expected_capsule=contact_capsule)
         with self.deletion.freeze_writes():
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
@@ -1887,9 +1909,14 @@ class AuthorityV2ExecutionBridge:
                     if current_snapshot != admission_snapshot:
                         raise AuthorityUnavailable("Authority admission changed during graph claim")
                     if contact_capsule is not None:
-                        self._contact_p2_service_v1.require_same_contact_policy_after_claim_in_tx_v1(
-                            db,capsule=contact_capsule,context=context,binding=binding,claimed_receipt=claimed_receipt,
-                            owner_witness=current_owner,authority_snapshot=current_snapshot,selector=contact_selector)
+                        if contact_continuation is None:
+                            self._contact_p2_service_v1.require_same_contact_policy_after_claim_in_tx_v1(
+                                db,capsule=contact_capsule,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                                owner_witness=current_owner,authority_snapshot=current_snapshot,selector=contact_selector)
+                        else:
+                            contact_continuation.require_same_contact_continuation_policy_after_claim_in_tx_v1(
+                                db,capsule=contact_capsule,context=context,binding=binding,claimed_receipt=claimed_receipt,
+                                owner_witness=current_owner,authority_snapshot=current_snapshot,selector=contact_selector)
                     if db.execute(
                         "SELECT 1 FROM authority_execution_handoff_starts_v1 "
                         "WHERE operation_id=? OR handoff_id=?",

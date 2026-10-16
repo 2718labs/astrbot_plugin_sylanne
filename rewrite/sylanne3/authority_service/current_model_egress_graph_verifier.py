@@ -109,6 +109,7 @@ class PinnedCurrentModelEgressGraphVerifier:
             if type(artifact_draft_bundle) is not AdminInstallationBundle:
                 raise TypeError("artifact draft verifier requires its actual installed bundle")
         self._artifact_draft_bundle = artifact_draft_bundle
+        self._artifact_model_reader_v3 = None
         self._owner_stop_reply_service_v1 = None
 
     def install_owner_stop_reply_service_v1(self, service):
@@ -147,41 +148,47 @@ class PinnedCurrentModelEgressGraphVerifier:
                 raise AuthorityUnavailable("named Relationship C3 differs from its actual signed prepared kind")
         return bundle.model_workflows.d07_relationship_cognition
 
-    def read_current_named_d07_model_workflow_v3(self, intent, request):
-        """Select only an actual signed prepared kind and installed named object."""
+    def read_current_named_d07_model_workflow_v3(self,intent,request,*,source_material):
+        """Consume the retained actual Source Work, never reopen protected Graph JSON."""
         from ..host.model_workflows_v5 import AdminModelWorkflowsV5
         from ..host.model_workflows_v6 import AdminModelWorkflowsV6
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-        from ..runtime.d07_execution_v1 import D07RelationshipPreparedV2
+        from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+        from ..runtime.d07_execution_v1 import (D07PreparedExecutionV1,D07RelationshipPreparedV2,
+            D07IngressRecallPreparedV1,D07ReflectionPreparedV3)
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-        from ..runtime.foreground_call_plan_v1 import require_current_named_c3_cycle_v2
+        from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
         from ..model_broker.broker import ModelCallRequest
-        from .d07_current_execution_v1 import read_current_d07_execution_graph_v1
+        from .d07_authority_model_source_read_v3 import PreparedD07AuthoritySourceMaterialV3
         from .contract import AuthorityUnavailable
-        bundle = self._artifact_draft_bundle
-        if bundle is None or type(bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7} or type(request) is not ModelCallRequest:
-            raise AuthorityUnavailable("actual installed named D07 workflow unavailable")
-        path = self._path
-        if self._owner_stop_reply_service_v1 is not None:
-            _, storage, _ = self._owner_stop_reply_service_v1._storage()
-            path = Path(storage["graph_path"])
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("BEGIN")
-            prepared, _, frozen = read_current_d07_execution_graph_v1(db, intent, self._issuer, self._clock(),
-                allow_unsealed_prepare=True, installed_bundle=bundle)
-            if type(prepared) is D07RelationshipPreparedV2:
-                workflow = bundle.model_workflows.d07_relationship_cognition
-            elif type(prepared) is D07MethodGrowthPreparedV2 and type(bundle.model_workflows) is AdminModelWorkflowsV6:
-                workflow = bundle.model_workflows.growth_cognition
-            else:
-                raise AuthorityUnavailable("ordinary/Recall D07 cannot borrow a named Relationship/Growth slot")
-            require_current_named_c3_cycle_v2(db, namespace=prepared.namespace, prepared=prepared, issuer=self._issuer)
-            if (workflow is None or prepared.digest != intent.binding_digest or request.digest != intent.request_digest
-                    or prepared.call_id != intent.call_id
-                    or (workflow.provider_id, workflow.model_id, workflow.provider_config_digest, workflow.max_output_tokens) != (
-                        frozen.installation.provider_id, frozen.installation.model_id, frozen.installation.provider_config_digest,
-                        frozen.installation.max_output_tokens)):
-                raise AuthorityUnavailable("named D07 differs from its actual signed kind/wholePlan/provider/root proof")
+        bundle=self._artifact_draft_bundle
+        if (bundle is None or type(bundle.model_workflows)not in {AdminModelWorkflowsV5,AdminModelWorkflowsV6,
+                AdminModelWorkflowsV7,AdminModelWorkflowsV8}or type(request)is not ModelCallRequest
+                or type(source_material)is not PreparedD07AuthoritySourceMaterialV3):
+            raise AuthorityUnavailable("named D07 workflow requires its actual retained qualified Source material")
+        work=source_material.work
+        if (work.controller.verifier is not self or work.request is not intent or source_material.reader.bundle is not bundle
+                or source_material.reader.model_source_phase!="model_policy"):
+            raise AuthorityUnavailable("named D07 policy crossed its actual verifier/intent/installed Source Work")
+        prepared,job,frozen,actual_request,basis=source_material.require_for_observer_v3(work)
+        if type(prepared)is D07RelationshipPreparedV2:
+            workflow=bundle.model_workflows.d07_relationship_cognition
+        elif type(prepared)is D07MethodGrowthPreparedV2 and type(bundle.model_workflows)in{
+                AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8}:
+            workflow=bundle.model_workflows.growth_cognition
+        elif type(prepared)is D07GeneralGrowthPreparedV1 and type(bundle.model_workflows)is AdminModelWorkflowsV8:
+            workflow=bundle.model_workflows.general_growth_cognition
+        elif type(prepared)in {D07PreparedExecutionV1,D07IngressRecallPreparedV1,D07ReflectionPreparedV3}:
+            workflow=bundle.model_workflows.d07_cognition
+        else:
+            raise AuthorityUnavailable("actual D07 prepared variant has no installed workflow slot")
+        if (workflow is None or prepared.digest!=intent.binding_digest or actual_request.digest!=request.digest
+                or request.digest!=intent.request_digest or prepared.call_id!=intent.call_id or job.job_id!=intent.job_id
+                or (workflow.provider_id,workflow.model_id,workflow.provider_config_ref,workflow.provider_config_digest,
+                    workflow.max_output_tokens)!=(frozen.installation.provider_id,frozen.installation.model_id,
+                    frozen.installation.provider_config_ref,frozen.installation.provider_config_digest,
+                    frozen.installation.max_output_tokens)or workflow.purpose!=prepared.purpose):
+            raise AuthorityUnavailable("named D07 policy differs from its actual signed kind/provider/source purpose")
         return workflow
 
     def observe_current_reply_scope_for_model_v1(self, intent, *, model_service=None,
@@ -225,17 +232,25 @@ class PinnedCurrentModelEgressGraphVerifier:
                 raise AuthorityUnavailable("foreground model admission lacks its actual Core reply barrier service/namespace")
             if kind == "artifact_draft_v1":
                 from ..runtime.d11_life_preparation_v1 import TABLE, _read
-                from ..runtime.d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1
+                from ..runtime.d11_artifact_draft_model_v1 import (
+                    decode_artifact_draft_original_v1, decode_artifact_draft_original_v2)
                 from .model_reply_scope_observation_v3 import model_reply_scope_rows_v3
-                refs = model_reply_scope_rows_v3(db, kind='life_c4_call', parameters=(intent.call_id,),
-                    legacy_reader=lambda: db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? "
-                        "AND kind='c4_prepared' AND json_extract(payload_json,'$.call_id')=? LIMIT 2",
+                refs = model_reply_scope_rows_v3(db, kind='life_c4_call_original', parameters=(intent.call_id,),
+                    legacy_reader=lambda: db.execute("SELECT kind,original_ref FROM " + TABLE +
+                        " WHERE bot=? AND persona=? AND kind IN ('c4_prepared','c4_phase_prepared') "
+                        "AND json_extract(payload_json,'$.call_id')=? LIMIT 2",
                         (*namespace.as_tuple, intent.call_id)).fetchall())
                 if len(refs) != 1:
                     raise AuthorityUnavailable("model barrier lacks its unique signed C4 parent")
-                row = _read(db, issuer=self._issuer, namespace=namespace, kind="c4_prepared", ref=refs[0][0])
-                prepared = decode_artifact_draft_original_v1("c4_prepared", row[0])
-                c02_operation_id = prepared.selector.c02_operation_id
+                original_kind, original_ref = refs[0]
+                row = _read(db, issuer=self._issuer, namespace=namespace, kind=original_kind, ref=original_ref)
+                if row is None: raise AuthorityUnavailable("actual signed C4 parent is absent")
+                prepared = (decode_artifact_draft_original_v2(original_kind, row[0])
+                    if original_kind == "c4_phase_prepared" else decode_artifact_draft_original_v1(original_kind, row[0]))
+                if (prepared.call_id, prepared.job_id, prepared.digest) != (intent.call_id,intent.job_id,intent.binding_digest):
+                    raise AuthorityUnavailable("actual signed C4 parent changed the model call identity")
+                task = prepared.selector.task if original_kind == "c4_phase_prepared" else prepared.selector
+                c02_operation_id = task.c02_operation_id
             elif kind == "d07.recall_need":
                 if observation is not None and not observation.legacy:
                     from .model_reply_parentage_v3 import require_d07_parentage_v3
@@ -348,6 +363,14 @@ class PinnedCurrentModelEgressGraphVerifier:
             raise ValueError("actual contact policy service must be installed exactly once")
         self._contact_policy_service = service
 
+    def install_artifact_model_reader_v3(self,reader):
+        from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
+        if(type(reader)is not InstalledArtifactDraftModelGraphReaderV3 or self._artifact_model_reader_v3 is not None
+                or reader.issuer is not self._issuer or reader.owner_storage.graph_path!=self._path
+                or reader.bundle is not self._artifact_draft_bundle or reader.model_service._graph_verifier is not self):
+            raise ValueError('Artifact model reader requires its actual installed same-Graph model service')
+        self._artifact_model_reader_v3=reader
+
     def install_internal_life_reader_v2(self, reader):
         from .internal_life_model_graph_v2 import InstalledInternalLifeModelGraphReaderV2
         if (type(reader) is not InstalledInternalLifeModelGraphReaderV2
@@ -376,7 +399,22 @@ class PinnedCurrentModelEgressGraphVerifier:
 
     def complete_graph_current(self, intent: ModelEgressIntentV1, *,
                                source_location=None, location_observation=None,
-                               model_service=None, credential=None, subject=None, permit=None) -> bool:
+                               model_service=None, credential=None, subject=None, permit=None,
+                               d07_source_material=None) -> bool:
+        if d07_source_material is not None:
+            from .d07_authority_model_source_read_v3 import PreparedD07AuthoritySourceMaterialV3
+            if type(d07_source_material) is not PreparedD07AuthoritySourceMaterialV3:
+                raise TypeError("D07 model policy requires its actual qualified Source material")
+            work=d07_source_material.work
+            reader=d07_source_material.reader
+            if (reader.model_source_phase!="model_policy" or work.controller.verifier is not self
+                    or work.controller.service is not model_service or work.request is not intent
+                    or work.credential is not credential or work.subject!=subject or work.permit is not permit
+                    or work.controller.location is not source_location
+                    or reader.location_observation is not location_observation):
+                raise AuthorityUnavailable("D07 policy Graph check crossed its actual retained model Source Work")
+            d07_source_material.require_for_observer_v3(work)
+            return True
         return self._current(intent, include_binding=True,
                              source_location=source_location, location_observation=location_observation,
                              model_service=model_service, credential=credential, subject=subject, permit=permit)
@@ -415,7 +453,8 @@ class PinnedCurrentModelEgressGraphVerifier:
                 work=begin_authority_model_graph_read_work_v3(self,model_service=model_service,credential=credential,
                     subject=subject,permit=permit,intent=intent,now_utc=now)
                 try:
-                    return read_authority_graph_current_v3(work,lambda db:self._current_graph_in_db_v3(db,intent,
+                    from .contact_model_work_v3 import read_contact_model_work_current_v3
+                    return read_contact_model_work_current_v3(work,lambda db:self._current_graph_in_db_v3(db,intent,
                         now,clock_epoch,include_binding=include_binding,source_location=source_location,
                         location_observation=location_observation))
                 finally:finish_authority_graph_read_work_v3(work)
@@ -451,6 +490,16 @@ class PinnedCurrentModelEgressGraphVerifier:
         if source_location is not None:
             source_location.require_graph_snapshot_v1(
                 db, location_observation, graph_db_path=self._path)
+        from .current_authority_graph_read_v3 import _authority_attachment_owner_v3
+        actual_work = _authority_attachment_owner_v3(db)
+        if actual_work is not None and actual_work.owner_model_work_kind == "d06.encode_internal_life_content":
+            from .internal_life_model_source_read_v3 import require_internal_life_model_body_v3
+            require_internal_life_model_body_v3(db, self._internal_life_reader_v2, intent)
+        if actual_work is not None and actual_work.owner_model_work_kind=="artifact_draft_v1":
+            if self._artifact_model_reader_v3 is None:return False
+            body=self._artifact_model_reader_v3.read(db,intent,now,allow_unsealed_prepare=not include_binding)
+            fresh_now,fresh_epoch=self._paired_clock() if include_binding else (self._clock(),clock_epoch)
+            return fresh_epoch==clock_epoch and now<=fresh_now<body.deadline_utc
         job = get_job(db, intent.job_id)
         if (location_observation is not None
                 and NamespaceId(job.bot_id, job.persona_id)

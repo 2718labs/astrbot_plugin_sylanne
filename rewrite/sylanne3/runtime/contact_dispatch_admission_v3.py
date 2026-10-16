@@ -103,13 +103,13 @@ def issue_contact_dispatch_admission_v3(*, db, bundle, evidence, graph_receipt,
     from .contact_claim_adoption_v3 import read_current_own_contact_continuation_v3
     from .contact_qualification_v3 import _plan_policy
     from ..domains.d10.contact_claim_v2 import decode_contact_claim_v2, contact_window_id_v2
-    read_current_own_contact_continuation_v3(db, current_read, content=content, segment_index=0,
+    read_current_own_contact_continuation_v3(db, current_read, content=content, segment_index=evidence.segment_index,
         current_policy=current_policy, scope=scope, now_utc=now_utc)
     claim_atom = current_read.head(db, contact_claim_key_v2(namespace, content.contact_id), required=True)
     own_claim = decode_contact_claim_v2(claim_atom.value)
     _, policy_atom, policy, _, _ = _plan_policy(db, current_read, content, current_policy, scope, now_utc)
     inventories = tuple(current_read.complete_inventory(db, kind) for kind in ('d10.contact_claim.v1', 'd10.contact_claim.v2'))
-    if (claim_atom.revision != 1 or own_claim.communication_action_id != parent.communication_action_id
+    if ((evidence.segment_index==0 and claim_atom.revision!=1) or own_claim.communication_action_id != parent.communication_action_id
             or own_claim.window_id != contact_window_id_v2(policy) or own_claim.policy_version != policy.version
             or own_claim.approval_ref != current_policy.original.original_ref
             or own_claim.approval_digest != current_policy.original.digest):
@@ -120,11 +120,19 @@ def issue_contact_dispatch_admission_v3(*, db, bundle, evidence, graph_receipt,
         'complete_claim_inventories':inventories})
     bucket = 'contact-quota:' + canonical_digest((namespace, own_claim.subject_ref, own_claim.channel, own_claim.category))
     gate = 'contact-object:' + canonical_digest((namespace, own_claim.subject_ref, own_claim.channel, own_claim.category))
+    occupancy=(QuotaOccupancy(bucket,own_claim.window_id,1),)
+    if evidence.segment_index>0:
+        from .contact_continuation_stage_v1 import _require_current_continuation_v1
+        material=current_read._witness.material
+        _require_current_continuation_v1(material,db)
+        if material.request.segment_index!=evidence.segment_index:
+            raise ValueError('Continuation admission cannot reuse another typed segment provider')
+        occupancy=()
     footprint = RecoveryConstraintFootprint('/'.join(namespace.as_tuple), identity.activity_id,
         identity.effect_id, external_idempotency_ref=outbox.idempotency_key,
         conflict_keys=('target:' + parent.target_ref,), communication_action=parent.communication_action_id,
         contact_id=content.contact_id, segment_id=evidence.segment_id,
-        object_gate_keys=(gate,), quota_occupancies=(QuotaOccupancy(bucket, own_claim.window_id, 1),),
+        object_gate_keys=(gate,), quota_occupancies=occupancy,
         budgets=(BudgetConstraint(lease.lease_id, str(lease.used.get(dimension, 0)),
             str(lease.reserved.get(dimension, 0) + lease.unconfirmed.get(dimension, 0)), str(limit)),))
     command_digest = canonical_digest({'operation_id': identity.operation_id,

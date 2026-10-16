@@ -391,6 +391,93 @@ class VerifiedSelectedHistoryReadV3:
         return result, last, eof
 
 
+
+
+
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _selected_history_dto_types_v3():
+    from dataclasses import is_dataclass
+    from types import MappingProxyType
+    from ..runtime.c09_paged_capture_contract_v2 import _WIRE_TYPES_V2
+    from ..runtime.c09_canonical_json_stream_v2 import _ContainerV2
+    from .c09_paged_recovery_facts_v2 import C09PagedFactsCompletionV2,C09VerifiedLegacyPreparedSummaryV2
+    from .c09_prepared_storage_v3 import C09VerifiedPagedPreparedSummaryV3
+    from ..runtime_contracts import NamespaceId,SnapshotRequirementsV2
+    from ..runtime.restore_anchor import RestoreAnchor
+    from ..runtime import c09_storage_rebase_contract_v1 as graph_dtos
+    from .erasure_recovery_pin_v4 import ExecutionRecoveryFactsPinV4
+    from ..runtime.c09_paged_sql_v2 import C09TableShapeV2
+    from ..runtime_journal import RecoveryConstraintFootprint
+    return frozenset((NamespaceId,SnapshotRequirementsV2,RestoreAnchor,RecoveryConstraintFootprint,
+        C09PagedFactsCompletionV2,_ContainerV2,ExecutionRecoveryFactsPinV4,C09TableShapeV2))|_WIRE_TYPES_V2|frozenset(
+            cls for cls in vars(graph_dtos).values()if type(cls)is type
+            and cls.__module__==graph_dtos.__name__ and is_dataclass(cls))
+
+
+def _selected_history_payload_heap_v3(value,seen):
+    from sys import getsizeof
+    from dataclasses import fields
+    from types import MappingProxyType
+    from .c09_paged_recovery_facts_v2 import C09VerifiedLegacyPreparedSummaryV2
+    from .c09_prepared_storage_v3 import C09VerifiedPagedPreparedSummaryV3
+    marker=id(value)
+    if marker in seen:return 0
+    seen.add(marker);amount=getsizeof(value);kind=type(value)
+    if kind in(dict,MappingProxyType):
+        return amount+sum(_selected_history_payload_heap_v3(key,seen)+_selected_history_payload_heap_v3(item,seen)
+            for key,item in value.items())
+    if kind in(tuple,list,set,frozenset):
+        return amount+sum(_selected_history_payload_heap_v3(item,seen)for item in value)
+    if kind in _selected_history_dto_types_v3():
+        return amount+sum(_selected_history_payload_heap_v3(getattr(value,field.name),seen)for field in fields(value))
+    if kind in(C09VerifiedLegacyPreparedSummaryV2,C09VerifiedPagedPreparedSummaryV2,C09VerifiedPagedPreparedSummaryV3):
+        return amount+_selected_history_payload_heap_v3((value._header,value._row,value._selection),seen)
+    # Installed control/SQL/permission/reader capabilities are never followed.
+    return amount
+
+
+def _selected_history_parser_heap_v3(parser,seen):
+    from sys import getsizeof
+    amount=getsizeof(parser)+getsizeof(parser._sha256)
+    amount+=_selected_history_payload_heap_v3((parser._stack,parser._string,parser._number,
+        parser._literal,parser._active_scalar),seen)
+    if parser._string is not None and parser._string['decoder']is not None:
+        amount+=_selected_history_payload_heap_v3(parser._string['decoder'].getstate(),seen)
+    return amount
+
+
+def _selected_history_natural_core_heap_v3(reader,seen):
+    from sys import getsizeof
+    from .c09_natural_final_history_v4 import (_SelectedNaturalCoreObligationsReadV4,
+        _SelectedNaturalCoreControlStreamReadV4,_SelectedNaturalCoreSealedMetadataReadV4,
+        _SelectedNaturalCoreRowReadV4)
+    if reader is None:return 0
+    amount=0
+    for state in reader.arena:
+        if id(state)in seen:continue
+        seen.add(id(state));amount+=getsizeof(state)+getsizeof(state.__dict__)
+        if type(state)is _SelectedNaturalCoreObligationsReadV4:
+            payload=(state.preparedref,state.phase,state.summary,state.scope,state.core_header,
+                state.source_digest,state.complete,state.last,state.row,state.checked_tables,state.count)
+        elif type(state)is _SelectedNaturalCoreControlStreamReadV4:
+            payload=(state.scope_digest,state.source_digest,state.cold_digest,state.summary,state.family,
+                state.stream,state.seal,state.cursor,state.page,state.records,state.index,state.last,
+                state.count,state.matching_root,state.complete)
+        elif type(state)is _SelectedNaturalCoreSealedMetadataReadV4:
+            payload=(state.scope_digest,state.locator,state.table,state.shape,state.last,state.count,
+                state.phase,state.complete,state.reader.locator,state.reader.page,state.reader.records,
+                state.reader.cursor)
+        elif type(state)is _SelectedNaturalCoreRowReadV4:
+            payload=(state.table,state.key,state.shape,state.column,state.kind,state.total,state.offset,
+                state.complete,state.commitment,None if state.decoder is None else state.decoder.getstate())
+            amount+=getsizeof(state.digest)
+        else:
+            raise AuthorityUnavailable('actual selected Core arena contains an unsupported private reader')
+        amount+=_selected_history_payload_heap_v3(payload,seen)
+    return amount
+
 class InstalledSelectedHistoryBuilderV3:
     def __init__(self, control):
         self.control = control
@@ -410,6 +497,72 @@ class InstalledSelectedHistoryBuilderV3:
         self.provider_scope_reader = self.provider_scope_proof = None
         self.result = None
         self.failed = False
+        control.register_c09_retained_state_v3(self)
+
+    def _c09_retained_heap_bytes_v3(self):
+        from sys import getsizeof
+        seen=set();amount=getsizeof(self)
+        amount+=_selected_history_payload_heap_v3((self.scope,self.completion,self.history_prior,
+            self.history_manifest,self.history_root,tuple(self.roles)),seen)
+        if self.basis is not None:
+            amount+=_selected_history_payload_heap_v3((self.basis.current,self.basis.manifest,self.basis.prepared),seen)
+        for role in self.roles.values():
+            amount+=getsizeof(role)+_selected_history_payload_heap_v3((role.details,role.base_header,role.selection,
+                role.child_original_digests,role.child_locators,role.target_stamp),seen)
+        amount+=sum(_selected_history_payload_heap_v3((reader.locator,reader.page,reader.records,
+            reader.cursor,reader.actual_after),seen)for reader in self.family_readers.values())
+        frame=self.history_frame
+        if frame is not None:
+            amount+=getsizeof(frame)
+            if type(frame)is _PriorPagedRecoveryFrameV2:
+                amount+=_selected_history_payload_heap_v3((frame.summary,frame.completion,frame.cursor,
+                    frame.page,frame.records,frame.inventory_digest,frame.core_header,frame.contact_locator),seen)
+            else:
+                amount+=_selected_history_payload_heap_v3((frame.summary,frame.scope,frame.starts,frame.last,
+                    frame.counts,frame.hashes,frame.header,frame.header_keys,frame.binding_header,frame.pin),seen)
+                for cell in(frame.facts,frame.bindings,frame.seal):
+                    if cell is not None:
+                        amount+=getsizeof(cell)+_selected_history_payload_heap_v3((cell.spans,cell.starts),seen)
+                        amount+=_selected_history_parser_heap_v3(cell.parser,seen)
+        scan=self.history_scan
+        if scan is not None:
+            amount+=getsizeof(scan)+_selected_history_payload_heap_v3((getattr(scan,'header',None),
+                getattr(scan,'row',None),getattr(scan,'result',None)),seen)
+            cell=getattr(scan,'cell',None)
+            if cell is not None:
+                amount+=getsizeof(cell)+_selected_history_payload_heap_v3((cell.spans,cell.starts),seen)
+                amount+=_selected_history_parser_heap_v3(cell.parser,seen)
+        role=self.role_reader
+        if role is not None:
+            amount+=getsizeof(role)+_selected_history_payload_heap_v3((role.scope,role.base,role.details,
+                role.base_digest,role.original_digest,role.target_path,role.target_stamp,role.child,role.counts,role.locators),seen)
+            if role.stream_reader is not None:
+                r=role.stream_reader
+                amount+=getsizeof(r)+_selected_history_payload_heap_v3((r.locator,r.page,r.records,r.cursor),seen)
+        amount+=_selected_history_natural_core_heap_v3(self.natural_core_reader,seen)
+        if self.core_source_reader is not None:
+            r=self.core_source_reader
+            amount+=_selected_history_payload_heap_v3((r.directory,r.last,r.stream_last,r.counts,r.root,r.shape),seen)
+        if self.runtime_physical_reader is not None:
+            r=self.runtime_physical_reader
+            amount+=_selected_history_payload_heap_v3((r.scope,r.source_scope,r.initial_source_anchor,r.after,
+                r.producer,r.cell_root,r.ref_shape,r.counts,r.root),seen)
+        if self.natural_core_proof is not None:
+            p=self.natural_core_proof
+            amount+=getsizeof(p)+_selected_history_payload_heap_v3((p.summary,p.preparedref,p.selection_digest,
+                p.target_path,p.target_inode,p.core_original_digest),seen)
+        if self.core_source_proof is not None:
+            p=self.core_source_proof;amount+=getsizeof(p)+_selected_history_payload_heap_v3((p.root,p.counts,p.directory),seen)
+        if self.runtime_physical_proof is not None:
+            p=self.runtime_physical_proof;amount+=getsizeof(p)+_selected_history_payload_heap_v3((p.root,p.counts,p.eof_digest),seen)
+        if self.provider_scope_proof is not None:
+            p=self.provider_scope_proof;amount+=getsizeof(p)+_selected_history_payload_heap_v3((p.original,p.details),seen)
+        if self.provider_scope_reader is not None:
+            r=self.provider_scope_reader
+            amount+=getsizeof(r)+_selected_history_payload_heap_v3((r.original,r.reader.scope,r.reader.model_complete_digest,r.reader.after,r.reader.count,r.reader.root),seen)
+        if self.result is not None:
+            p=self.result;amount+=getsizeof(p)+_selected_history_payload_heap_v3((p.history_count,p.history_root,p.family_eof),seen)
+        return amount
 
     def advance(self):
         if self.failed:
@@ -424,6 +577,25 @@ class InstalledSelectedHistoryBuilderV3:
             self.failed = True
             self.result = None
             raise
+
+    def advance_in_reserved_quantum_v3(self,*,meter):
+        """Borrow only this Control's actual admitted root; no new resource quantum."""
+        from .c09_storage_control_v1 import require_actual_c09_control_read_root_v3
+        if self.control._selected_history_builder_v3 is not self or self.failed:
+            raise AuthorityUnavailable('actual selected-history builder or first-failure cursor differs')
+        require_actual_c09_control_read_root_v3(self.control,meter)
+        self.control.require_c09_retained_arena_v3(meter=meter)
+        try:
+            result=self._advance(meter)
+            self.control.require_c09_retained_arena_v3(meter=meter)
+            return result
+        except BaseException:
+            self.failed=True;self.result=None
+            raise
+
+    def fail_reserved_quantum_v3(self,error):
+        # The fixed outer consumer calls this on its actual resource-boundary failure.
+        self.failed=True;self.result=None
 
     def _advance(self, meter):
         if self.result is not None:
@@ -633,6 +805,32 @@ def advance_selected_history_read_v3(control):
     return result
 
 
+
+def advance_selected_history_in_reserved_quantum_v3(control,*,meter):
+    from .c09_storage_control_v1 import (C09StorageControlV1,InstalledC09StorageReaderV1,
+        require_actual_c09_control_read_root_v3)
+    if type(control)not in(C09StorageControlV1,InstalledC09StorageReaderV1):
+        raise AuthorityUnavailable('actual installed selected-history Control required')
+    require_actual_c09_control_read_root_v3(control,meter)
+    reader=getattr(control,'_selected_history_builder_v3',None)
+    if reader is None:
+        reader=InstalledSelectedHistoryBuilderV3(control);control._selected_history_builder_v3=reader
+    return reader.advance_in_reserved_quantum_v3(meter=meter)
+
+
+def publish_selected_history_after_reserved_quantum_v3(control,result):
+    # Called only by the fixed consumer after its actual outer root succeeds.
+    from ..runtime.c09_paged_sql_v2 import peek_current_c09_sql_meter_v3
+    if peek_current_c09_sql_meter_v3()is not None:
+        raise AuthorityUnavailable('selected-history proof publication must follow actual root exit')
+    reader=getattr(control,'_selected_history_builder_v3',None)
+    if (type(result)is not VerifiedSelectedHistoryReadV3 or reader is None or reader.failed
+            or reader.result is not result or result.basis.control is not control):
+        raise AuthorityUnavailable('actual successfully completed selected-history builder proof required')
+    control.lease.require_held();control._selected_history_read_v3=result
+    return result
+
+
 _CHECKPOINT_TABLE = 'c09_selected_history_checkpoints_v3'
 _CHECKPOINT_DDL = """CREATE TABLE c09_selected_history_checkpoints_v3 (
  selection_digest TEXT NOT NULL,consumer TEXT NOT NULL,step_index INTEGER NOT NULL CHECK(step_index>0),
@@ -801,7 +999,9 @@ class InstalledSelectedCoverageV3:
                 read = view.read_sanitized_model_budget_v3(namespace=basis.prepared['namespace'], call_id=identity, meter=meter)
                 if read is None:
                     raise AuthorityUnavailable('actual selected model coverage disappeared')
-                unknown = (read.provider_state != 'observed' or read.reservation_state not in {'settled', 'overrun'}
+                from .c09_model_budget_original_v1 import C09ModelNoDispatchBudgetOriginalV2
+                unknown = (read.provider_state != 'observed' and type(read) is not C09ModelNoDispatchBudgetOriginalV2
+                    or read.reservation_state not in {'settled', 'overrun'}
                     or any(unit.actual_or_none is None or unit.pending_known or unit.unknown_upper_bound for unit in read.units))
                 with basis.read_database('graph', meter=meter) as graph:
                     reservation = _bounded(graph, meter).execute('SELECT digest,ceiling_json,state,actual_json '

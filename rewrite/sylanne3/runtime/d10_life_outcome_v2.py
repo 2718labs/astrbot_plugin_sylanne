@@ -26,8 +26,12 @@ from .d02_production_operations_v1 import stage_apply_current_body_effect_in_tra
 from .domain_production_contracts_v1 import ProductionOriginalRefV1, ProductionOutboxStageV1
 
 
+def life_experience_source_id_from_identity_v3(namespace,activity_id,effect_id):
+    return "d10-life-experience:" + canonical_digest((namespace,activity_id,effect_id))[:48]
+
+
 def life_experience_source_id_v1(binding):
-    return "d10-life-experience:" + canonical_digest((binding.namespace, binding.activity_id, binding.effect_id))[:48]
+    return life_experience_source_id_from_identity_v3(binding.namespace,binding.activity_id,binding.effect_id)
 
 
 def life_experience_provenance_ref_v1(binding):
@@ -174,7 +178,8 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
             "actual_cpu_ms": terminal.actual_cpu_ms, "started_at_utc": terminal.claim.payload.claimed_at_utc,
             "completed_at_utc": terminal.payload.completed_at_utc, "reality": "real_execution", "step": plan.step}
         record = SourceRecord(source_id, canonical_serialize(payload), "persona:" + b.namespace.persona_id, "internal", "confirmed",
-            _utc(terminal.payload.completed_at_utc).timestamp(), frame.now_utc, "life-terminal:" + terminal.terminal_digest,
+            _utc(terminal.payload.completed_at_utc).timestamp(), frame.now_utc,
+            SourceRecord.from_dict(json.loads(prepared.source_record_json)).provenance_root,
             plan.audiences, ("context", "consolidation"), (AtomKey.from_token(plan.input_source.ref).owner.subject,), "same_root")
         writes = (GraphWrite(source, record.to_dict()),
             GraphWrite(access, {"source_id": source_id, "audiences": list(plan.audiences), "purposes": ["context", "consolidation"],
@@ -188,11 +193,19 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
             operation_id=frame.envelope.identity.operation_id, value={"schema": "d11.actual-life-experience-provenance.v1",
                 "source_ref": source.token, "source_digest": canonical_digest(record.to_dict()), "binding": life_to_wire_v1(b),
                 "terminal": life_to_wire_v1(terminal), "adopted_operation_id": adopted_operation_id, "experience": payload})
+        from .habit_maintenance_followup_v3 import source_note_habit_outcome_events_v3
+        habit_events=source_note_habit_outcome_events_v3(db,frame=frame,prepared=prepared,terminal=terminal,issuer=installed_readers.issuer)
         life = replace(life, outbox=life.outbox + (ProductionOutboxStageV1(b.namespace, frame.envelope.identity.operation_id,
             "d06", "actual_internal_experience_requires_encoding", ProductionOriginalRefV1("d10.actual_life_experience",
-                source.token, canonical_digest(record.to_dict()), frame.snapshot.versions)),))
+                source.token, canonical_digest(record.to_dict()), frame.snapshot.versions)),)+habit_events)
         settlements = tuple(w.key.token for p in body.proposals for w in p.typed_writes if w.key.type_name == "d02.settlement.v1")
-        return CurrentLifeEffectExperienceBundleV1(frame.envelope, life, body, memory, (source.token,), settlements,
+        bundle = CurrentLifeEffectExperienceBundleV1(frame.envelope, life, body, memory, (source.token,), settlements,
             tuple(cost.original_ref for cost in costs))
+        from .d07_general_growth_attention_v1 import actual_general_growth_outcome_parent_metadata_v1
+        metadata = actual_general_growth_outcome_parent_metadata_v1(db, frame=frame, plan=plan,
+            prepared=prepared, terminal=terminal, context_source_refs=bundle.experience_refs,
+            outcome_original_ref=request.activity_outcome_ref, outcome_original_digest=canonical_digest(plain_v1(outcome)),
+            issuer=installed_readers.issuer)
+        return replace(bundle, general_growth_parent_metadata=metadata)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d10", "advance_life", request, missing)

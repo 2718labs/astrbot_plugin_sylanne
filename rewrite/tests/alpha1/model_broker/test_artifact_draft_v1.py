@@ -128,7 +128,7 @@ def test_phase_rejects_unregistered_or_out_of_order_selector(changed):
 def test_phase_rejects_other_plan_scope_and_stale_plan_source_or_prior_version():
     input = frozen(phase(index=2))
     assert codec.artifact_draft_from_wire_v2(plain_v1(input), codec.ArtifactDraftInputV2) == input
-    other = AtomKey(Owner("activity", "bot", "persona", "activity:other"), "d08.personal_plan.v1", "plan:other")
+    other = AtomKey(Owner("activity", "bot", "other-persona", "activity:other"), "d08.personal_plan.v1", "plan:other")
     with pytest.raises(ValueError, match="task scope"):
         replace(input.selector, plan_ref=other.token)
     with pytest.raises(ValueError, match="versions"):
@@ -144,6 +144,27 @@ def test_phase_rejects_other_plan_scope_and_stale_plan_source_or_prior_version()
         replace(input, prior_content=None)
     with pytest.raises(ValueError):
         codec.artifact_draft_from_wire_v2({**plain_v1(input), "execution_grant": True}, codec.ArtifactDraftInputV2)
+
+
+def test_cross_activity_plan_requires_actual_registered_amendment_binding():
+    from sylanne3.runtime.d01_production_operations_v1 import MissingProductionOriginalV1
+    from sylanne3.runtime.d11_artifact_draft_model_v1 import require_artifact_phase_plan_control_qualification_v2
+
+    original = phase(index=2)
+    # An actual same-task amendment can reuse its predecessor activity Plan.
+    # The wire locator is not the signed amendment or execution permission.
+    other = AtomKey(Owner("activity", "bot", "persona", "activity:previous"),
+        "d08.personal_plan.v1", "plan:previous")
+    selector = replace(original, plan_ref=other.token)
+    assert codec.artifact_draft_from_wire_v2(plain_v1(selector), codec.ArtifactDraftPhaseSelectorV2) == selector
+    for binding in (None, object()):
+        with pytest.raises(MissingProductionOriginalV1,
+                match="actual_registered_amendment_binding_for_cross_activity_Plan"):
+            require_artifact_phase_plan_control_qualification_v2(None,
+                selector=selector, binding=binding, issuer=None)
+    # A Decision must still belong to the actual current task activity.
+    with pytest.raises(ValueError, match="task scope"):
+        replace(original, decision_ref=AtomKey(other.owner, "d08.decision_record.v2", "decision:other").token)
 
 
 def test_phase_parser_counts_registered_characters_and_preserves_original_full_extent():

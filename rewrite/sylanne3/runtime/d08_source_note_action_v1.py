@@ -66,6 +66,9 @@ class SourceNoteActionOriginalV1:
 
 
 def source_note_action_original_from_wire_v1(raw):
+    if type(raw) is dict and raw.get("schema")=="d08.habit-source-note-action-original.v1":
+        from .d10_habit_v1 import habit_source_note_original_from_wire_v1
+        return habit_source_note_original_from_wire_v1(raw)
     if type(raw) is dict and raw.get("schema") == "d08.selected-source-note-action-original.v2":
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
         return decode_typed_production_value_v1(raw, SelectedSourceNoteActionOriginalV2)
@@ -136,9 +139,13 @@ def _intent(db, frame, request, installed_readers):
     goal = _decode("d08.goal.v1", goal_atom.value)
     build = read_installed_d11_life_build_v1(installed_readers.package_root, installed_readers.manifest_digest)
     artifact_ref = life_artifact_ref_v1(ns, identity.effect_id)
-    from .current_method_learning_read_v3 import current_action_parameter_digest_v3
-    parameter_digest = current_action_parameter_digest_v3(db, ns, identity.operation_id,
-        (project.value, recipe.value, source.value, artifact_ref, build))
+    values=(project.value,recipe.value,source.value,artifact_ref,build)
+    if identity.phase=='prepare_current_habit_source_note_action_v1':
+        from .current_habit_source_read_v3 import current_habit_source_note_action_parameter_digest_v3
+        parameter_digest=current_habit_source_note_action_parameter_digest_v3(db,ns,identity.operation_id,values)
+    else:
+        from .current_method_learning_read_v3 import current_action_parameter_digest_v3
+        parameter_digest=current_action_parameter_digest_v3(db,ns,identity.operation_id,values)
     return source_note_action_parts_v1(namespace=ns, identity=identity, request=request,
         goal=goal, parameter_digest=parameter_digest)[0]
 
@@ -146,6 +153,9 @@ def _intent(db, frame, request, installed_readers):
 def source_note_schema_key_v1(db, *, frame, request, installed_readers):
     action = _intent(db, frame, request, installed_readers)
     key = source_note_schema_key_from_action_v1(frame.envelope.authority.namespace, action)
+    if frame.envelope.identity.phase=='prepare_current_habit_source_note_action_v1':
+        from .current_habit_source_read_v3 import verify_prepared_habit_source_note_schema_key_v3
+        return verify_prepared_habit_source_note_schema_key_v3(db,frame.envelope.authority.namespace,frame.envelope.identity.operation_id,key)
     from .current_method_learning_read_v3 import verify_prepared_action_schema_key_v3
     return verify_prepared_action_schema_key_v3(db, frame.envelope.authority.namespace, frame.envelope.identity.operation_id, key)
 
@@ -277,6 +287,9 @@ def _build_source_note_action_in_transaction_v1(db, *, frame, request, installed
 def record_source_note_action_after_cas_v1(db, *, frame, staged, receipt, issuer):
     from .d11_life_preparation_v1 import _record
     primary = staged.stage
+    if primary.operation_kind=="prepare_current_habit_source_note_action_v1":
+        from .d10_habit_v1 import record_habit_source_note_action_after_cas_v1
+        return record_habit_source_note_action_after_cas_v1(db,frame=frame,staged=staged,receipt=receipt,issuer=issuer)
     payload = json.loads(primary.original_payload_json)
     selected = primary.operation_kind == "prepare_selected_source_note_action_v2"
     request = PrepareSourceNoteActionRequestV1(**(payload["provenance"]["derived_request"] if selected else payload["request"]))
@@ -315,11 +328,23 @@ def record_source_note_action_after_cas_v1(db, *, frame, staged, receipt, issuer
 def require_source_note_action_original_v1(db, *, namespace, action_intent_ref, issuer,
         frame=None, installed_bundle=None, body_quote_authority=None):
     from .d11_life_preparation_v1 import TABLE, _read
-    rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='source_note_action' "
-        "AND json_extract(payload_json,'$.action_intent_ref')=?", (*namespace.as_tuple, action_intent_ref)).fetchall()
+    from .current_life_numeric_native_read_v3 import read_bound_native_life_action_refs_v3
+    handled,rows=read_bound_native_life_action_refs_v3(db,namespace,action_intent_ref)
+    if not handled:
+        from .ordinary_source_note_habit_classification_v3 import read_bound_ordinary_source_note_action_refs_v3
+        handled,rows=read_bound_ordinary_source_note_action_refs_v3(db,namespace,action_intent_ref)
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_action_refs_v3
+        handled,rows=read_bound_life_model_action_refs_v3(db,namespace,action_intent_ref)
+    if not handled:
+        rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='source_note_action' "
+            "AND json_extract(payload_json,'$.action_intent_ref')=?", (*namespace.as_tuple,action_intent_ref)).fetchall()
     if len(rows) != 1:
         raise MissingProductionOriginalV1("actual_source_note_root_original")
     raw, operation = _read(db, issuer=issuer, namespace=namespace, kind="source_note_action", ref=rows[0][0])
+    if raw.get("schema")=="d08.habit-source-note-action-original.v1":
+        from .d10_habit_v1 import require_habit_source_note_original_v1
+        return require_habit_source_note_original_v1(db,namespace=namespace,raw=raw,operation=operation,issuer=issuer,frame=frame)
     original = source_note_action_original_from_wire_v1(raw)
     from .d04_root_original_store_v1 import _receipt
     receipt = _receipt(db, namespace, operation)
@@ -327,15 +352,35 @@ def require_source_note_action_original_v1(db, *, namespace, action_intent_ref, 
             or {(v.key.token, v.revision) for v in receipt.write_versions} != {(r, v) for r, v, _ in original.write_commitments}):
         raise ValueError("source-note root signature loses its real atomic Graph receipt")
     for ref, revision, digest in original.write_commitments:
-        history = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
-            (ref, revision)).fetchone()
+        from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+        handled,history=read_bound_native_numeric_history_v3(db,ref,revision,('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'))
+        if not handled:
+            from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_history_v3
+            handled,history=read_bound_life_model_history_v3(db,ref,revision,('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'))
+        if not handled:
+            from .natural_producer_qualification_v1 import _producer_original_point_v3
+            history = _producer_original_point_v3(db,table="graph_history",
+                columns=("value","valid","event_bot","event_persona","event_session","event_id"),
+                key_columns=("token","revision"),key=(ref,revision),legacy_reader=lambda:db.execute(
+                    "SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
+                    (ref,revision)).fetchone())
         if (history is None or history[1:] != (1, *namespace.as_tuple, original.activity_id, operation)
                 or canonical_digest(json.loads(history[0])) != digest):
             raise ValueError("source-note root loses one actual producing-event member")
     for ref, revision, digest, producing_operation, receipt_digest in original.context_commitments:
         producing_receipt = _receipt(db, namespace, producing_operation)
-        row = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
-            (ref, revision)).fetchone()
+        from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+        handled,row=read_bound_native_numeric_history_v3(db,ref,revision,('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'))
+        if not handled:
+            from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_history_v3
+            handled,row=read_bound_life_model_history_v3(db,ref,revision,('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'))
+        if not handled:
+            from .natural_producer_qualification_v1 import _producer_original_point_v3
+            row = _producer_original_point_v3(db,table="graph_history",
+                columns=("value","valid","event_bot","event_persona","event_session","event_id"),
+                key_columns=("token","revision"),key=(ref,revision),legacy_reader=lambda:db.execute(
+                    "SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
+                    (ref,revision)).fetchone())
         if (canonical_digest(producing_receipt) != receipt_digest
                 or (ref, revision) not in {(v.key.token, v.revision) for v in producing_receipt.write_versions}
                 or row is None or row[1:] != (1, *namespace.as_tuple, producing_receipt.activity_id, producing_operation)
@@ -405,6 +450,8 @@ def stage_prepare_selected_source_note_action_v2(db, *, frame, request, installe
     from ..domains.d08.personal_candidate_v1 import SourceNoteCandidateBindingV1
     if type(request) is not ConsumePersonalDecisionRequestV1 or type(installed_readers) is not InstalledSelectedSourceNoteActionReadersV2:
         raise TypeError("selected SourceNote consumes only actual Decision/preparation locators")
+    from .joint_window_management_v1 import require_managed_joint_preparation_v1,attach_managed_joint_preparation_v1
+    managed=require_managed_joint_preparation_v1(db,frame=frame,operation_kind='prepare_selected_source_note_action_v2',request=request)
     prepared, chosen, original = read_selected_personal_adapter_v1(db, frame=frame, request=request,
         installed_readers=installed_readers.personal_readers)
     if type(chosen.binding) is not SourceNoteCandidateBindingV1:
@@ -431,7 +478,7 @@ def stage_prepare_selected_source_note_action_v2(db, *, frame, request, installe
         writes=legacy.stage.proposals[0].typed_writes, provenance=proof,
         proposal_schema="d08.proposal.v1", proposal_hash=provider.descriptor.request_schema_hash)
     provider.validate(stage.proposals[0], frame.snapshot)
-    return SourceNoteActionStageV1(stage)
+    return attach_managed_joint_preparation_v1(SourceNoteActionStageV1(stage),managed)
 
 
 def selected_source_note_binding_from_originals_v2(db, *, namespace, request):
@@ -449,12 +496,11 @@ def selected_source_note_binding_from_originals_v2(db, *, namespace, request):
     prepared = decode_typed_production_value_v1(actual["payload"]["provenance"]["prepared_candidates"], PreparedPersonalCandidateSetV1)
     if request.decision_ref != prepared.future_decision_ref:
         raise ValueError("selected SourceNote decision differs from its actual preparation")
-    from ..runtime_storage_v3 import read_graph_head_v3, read_graph_history_v3
-    row = read_graph_head_v3(db, request.decision_ref, namespace=namespace.as_tuple)
+    from .domain_background_read_v3 import background_graph_head_v3,background_history_v3
+    row = background_graph_head_v3(db,namespace,request.decision_ref)
     if row is None or row[2] != 1:
         raise MissingProductionOriginalV1("actual_selected_SourceNote_Decision")
-    history = read_graph_history_v3(db, request.decision_ref, row[0],
-        columns=("event_id", "value", "valid"), namespace=namespace.as_tuple)
+    history = background_history_v3(db,request.decision_ref,row[0],columns=("event_id","value","valid"))
     if history != (prepared.selection_operation_id, row[1], 1):
         raise ValueError("selected SourceNote Decision has another actual adoption occurrence")
     decision = decode_personal_plan_type_v1(DECISION_TYPE, json.loads(row[1]))

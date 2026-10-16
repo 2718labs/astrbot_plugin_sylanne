@@ -26,9 +26,14 @@ def _collection(raw, name, cap=16):
 
 
 def validate_d07_behavior_provenance_v1(kind, raw):
-    if type(raw) is not dict or set(raw) != {"schema", "work_kind", "input_digest", "behavior", "execution", "status", "stop_reason"}:
+    expected={"schema", "work_kind", "input_digest", "behavior", "execution", "status", "stop_reason"}
+    if type(raw) is not dict or set(raw) not in(expected,expected|{'conditioned_source_roots','conditioned_original_deadline_utc'}):
         raise ValueError("D07 fixed behavior provenance fields differ")
     work_kind = raw["work_kind"]
+    if 'conditioned_source_roots'in raw:
+        if work_kind!='simulation'or raw['behavior'].get('forecast_mode')!='declared_forecast':
+            raise ValueError('conditional Source metadata belongs only to its registered typed simulation')
+        _collection(raw,'conditioned_source_roots',cap=32)
     if (raw["schema"] != "d07.actual-behavior-provenance.v1" or KINDS.get(work_kind) != kind
             or raw["status"] not in {"queued", "staged", "already_recorded", "deferred"}
             or type(raw["input_digest"]) is not str or len(raw["input_digest"]) != 64
@@ -106,8 +111,14 @@ def validate_d07_behavior_provenance_v1(kind, raw):
     elif work_kind == "simulation":
         expected = {"registered_request_ref", "request", "trigger", "dedicated_budget", "dedicated_budget_original", "content_reality",
             "external_evidence_eligibility", "current_admission_digest"}
-        if set(behavior) not in (expected, expected | {"simulation_result"}):
+        forecast_fields={'forecast_plan_ref','forecast_plan_digest','forecast_mode'}
+        if set(behavior)not in(expected,expected|{'simulation_result'},expected|forecast_fields,expected|forecast_fields|{'simulation_result'}):
             raise ValueError("D07 simulation stage original fields differ")
+        if forecast_fields<=set(behavior):
+            key=AtomKey.from_token(behavior['forecast_plan_ref'])
+            if key.type_name!='d07.simulation_forecast_plan.v1'or behavior['forecast_mode']!='declared_forecast':
+                raise ValueError('D07 simulation forecast provenance has another exact typed plan/mode')
+            refs.add(key.token)
         q = behavior["request"]
         _fields(q, SimulationRequest)
         request = SimulationRequest(**{**q, "snapshot_refs": tuple(q["snapshot_refs"]), "alternatives": tuple(q["alternatives"]),
@@ -149,11 +160,16 @@ def build_d07_staged_behavior_operation_v1(frame, behavior_stage, *, additional_
         "input_digest": behavior_stage.input_digest, "behavior": _json(behavior_stage.provenance),
         "execution": _json(behavior_stage.execution), "status": behavior_stage.status, "stop_reason": behavior_stage.stop_reason}
     kind = KINDS[behavior_stage.work_kind]
+    forecast=(behavior_stage.work_kind=='simulation'and behavior_stage.provenance.get('forecast_mode')=='declared_forecast')
+    if forecast:
+        provenance['conditioned_source_roots']=list(frame.envelope.source_qualification.source_refs)
+        provenance['conditioned_original_deadline_utc']=frame.envelope.deadline_utc
     validate_d07_behavior_provenance_v1(kind, provenance)
     costs = tuple(original for original in frame.observed_originals if behavior_stage.execution is not None
         and original.original_ref in behavior_stage.execution.cost_receipt_refs)
     return stage_result_v1(frame, "d07", kind, behavior_stage.request,
         writes=(*behavior_stage.proposal.typed_writes, *additional_writes), provenance=provenance,
+        receiver_events=(('d07','conditioned_simulation_committed_v1'),)if forecast and behavior_stage.status=='staged'else(),
         costs=costs, coverage="complete" if behavior_stage.status in {"staged", "already_recorded"} else "deferred",
         missing=() if behavior_stage.status in {"staged", "already_recorded"} else (behavior_stage.stop_reason,),
         continuation=None if behavior_stage.status in {"staged", "already_recorded"} else "d07-prepared:" + frame.envelope.identity.operation_id,

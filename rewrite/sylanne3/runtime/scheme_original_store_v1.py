@@ -226,6 +226,12 @@ def read_compilation_original_for_operation_v1(
         db: sqlite3.Connection, namespace: NamespaceId, *,
         compiled_digest: str) -> CompilationOriginalV1 | None:
     """Exact read for W01's authenticated original callback."""
+    from ..authority_service.named_joint_binding_body_v1 import named_joint_compilation_original_v1
+    named,value=named_joint_compilation_original_v1(db,namespace,compiled_digest)
+    if named:return value
+    from .frozen_joint_command_source_v3 import read_frozen_joint_compilation_v3
+    frozen,value=read_frozen_joint_compilation_v3(db,namespace,compiled_digest)
+    if frozen:return value
     _transaction(db)
     _digest(compiled_digest, "compiled_digest")
     row = db.execute(

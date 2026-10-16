@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import get_type_hints
 from weakref import WeakKeyDictionary, WeakSet, ref
 
-from ..contracts import AuthorityUnavailable
+from ..authority_service.contract import AuthorityUnavailable
 from ..graph_types import AtomKey
 from ..runtime_storage_v3 import begin_runtime_cell_read_v3, runtime_storage_v3
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
@@ -215,7 +215,7 @@ class PreparedContactEvidenceV3:
     def __init__(self,issuer,raw,sources,expected_digest):
         from .contact_qualification_evidence_v3 import ContactQualificationEvidenceV3
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
-        from ..domains.d10.offline_interval import OfflineTickGraphReadV1
+        from .d10_offline_tick_execution_v1 import OfflineTickGraphReadV1
         if issuer is not _ISSUER or type(sources)is not PreparedContactSourcesV3:raise TypeError('actual Contact historical issuer required')
         annotations=get_type_hints(ContactQualificationEvidenceV3);names={field.name for field in fields(ContactQualificationEvidenceV3)}
         if type(raw)is not dict or set(raw)!=names:raise ValueError('Contact historical metadata exact fieldset differs')

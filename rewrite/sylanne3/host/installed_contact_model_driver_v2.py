@@ -58,6 +58,15 @@ async def run_installed_contact_model_v2(runtime, installation, *, context, trus
         raise ValueError("contact fixed workflow is not installed")
     transport = MtlsAuthorityTransport({bundle.tls_profile.profile_id: bundle.tls_profile})
     adapter = None
+    source_retentions = []
+    async def contact_call(callback):
+        from ..graph_worker import OwnedGraphStorageResultV3
+        result = await worker.call(callback)
+        if type(result) is OwnedGraphStorageResultV3:
+            value,retained = result.take_value_v3()
+            source_retentions.append(retained)
+            return value
+        return result
     try:
         client = AuthorityClient(AuthoritySelection(bundle.tls_profile.profile_id), package_root=installation.package_root,
             data_dir=installation.data_dir, transport=transport)
@@ -66,27 +75,27 @@ async def run_installed_contact_model_v2(runtime, installation, *, context, trus
         actual_grant = await client.installation_grant_v2()
         if not same_installed_grant_identity_v2(grant, actual_grant):
             raise ValueError("contact actual installation grant changed")
-        service = await worker.call(lambda graph: contact_model_runtime_v2(graph, bootstrap, bundle))
-        prepared, frozen, job = await worker.call(lambda graph: service.read_preparation(contact_id=contact_id, phase=phase))
+        service = await contact_call(lambda graph: contact_model_runtime_v2(graph, bootstrap, bundle))
+        prepared, frozen, job = await contact_call(lambda graph: service.read_preparation(contact_id=contact_id, phase=phase))
         audience = json.loads(frozen.input.adopted_plan.audience_id)
         if (type(audience) is not list or len(audience) != 2 or any(type(v) is not str or not v for v in audience)
                 or audience[0] != trusted_umo or frozen.input.adopted_plan.audience_id not in workflow.audiences):
             raise ValueError("contact provider session is outside its actual private route")
-        attempts = await worker.call(lambda graph: service.read_result_attempts(contact_id=contact_id, phase=phase))
+        attempts = await contact_call(lambda graph: service.read_result_attempts(contact_id=contact_id, phase=phase))
         if attempts:
             # Recover old delivery gates before any new read or cost fence.
-            previous = await worker.call(lambda graph: service.prepare_result_read(
+            previous = await contact_call(lambda graph: service.prepare_result_read(
                 contact_id=contact_id, phase=phase, attempt=len(attempts)))
             if previous != attempts[-1]:
                 raise ValueError("contact result recovery changed its actual saved selector")
             await client.contact_model_result_recover_finish_v2(bundle, actual_grant, read_request=previous)
         if job.phase == "completed":
-            await worker.call(lambda graph: service.finish(contact_id=contact_id, phase=phase))
-            actual, candidate, terminal, cost = await worker.call(lambda graph:
+            await contact_call(lambda graph: service.finish(contact_id=contact_id, phase=phase))
+            actual, candidate, terminal, cost = await contact_call(lambda graph:
                 service.read_paid_progress(contact_id=contact_id, phase=phase))
             return _paid_progress(actual, phase, candidate, terminal, cost)
-        await worker.call(lambda graph: service.acquire(contact_id=contact_id, phase=phase))
-        prepared, frozen, job, request, draft, intent, anchor = await worker.call(lambda graph:
+        await contact_call(lambda graph: service.acquire(contact_id=contact_id, phase=phase))
+        prepared, frozen, job, request, draft, intent, anchor = await contact_call(lambda graph:
             service.read_egress(contact_id=contact_id, phase=phase))
         contact_provider_messages_v2(request, frozen.installation)
         descriptor = ModelProviderDescriptor(workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
@@ -105,7 +114,7 @@ async def run_installed_contact_model_v2(runtime, installation, *, context, trus
                 raise ValueError("contact Authority changed its frozen actual model draft")
             if record.state != "prepared":
                 return InstalledContactModelProgressV2(prepared, "terminal_hold")
-            await worker.call(lambda graph: service.seal_egress(contact_id=contact_id, phase=phase, intent=intent, permit=permit))
+            await contact_call(lambda graph: service.seal_egress(contact_id=contact_id, phase=phase, intent=intent, permit=permit))
             terminal = await executor.execute_once(intent=intent, expected_anchor=anchor, request=request)
         else:
             # Reentry inspects the existing terminal. It never submits another
@@ -113,19 +122,23 @@ async def run_installed_contact_model_v2(runtime, installation, *, context, trus
             terminal = await executor.recover_original_terminal(intent)
         if terminal is None:
             return InstalledContactModelProgressV2(prepared, "terminal_hold")
-        cost = await worker.call(lambda graph: service.commit_cost(contact_id=contact_id, phase=phase, intent=intent))
+        cost = await contact_call(lambda graph: service.commit_cost(contact_id=contact_id, phase=phase, intent=intent))
         if (type(cost) is not OriginalModelCostCommitV1 or cost.call_id != prepared.call_id
                 or cost.terminal_receipt_digest != canonical_digest(asdict(terminal))):
             raise ValueError("contact independent actual cost differs from its terminal")
-        read_request = await worker.call(lambda graph: service.prepare_result_read(
+        read_request = await contact_call(lambda graph: service.prepare_result_read(
             contact_id=contact_id, phase=phase, attempt=len(attempts) + 1))
         await service.read_result_delivery(client=client, grant=actual_grant, request=read_request)
-        await worker.call(lambda graph: service.finish(contact_id=contact_id, phase=phase))
-        _, _, candidate, paid = await worker.call(lambda graph: service.read_paid_result(contact_id=contact_id, phase=phase))
+        await contact_call(lambda graph: service.finish(contact_id=contact_id, phase=phase))
+        _, _, candidate, paid = await contact_call(lambda graph: service.read_paid_result(contact_id=contact_id, phase=phase))
         return _paid_progress(prepared, phase, candidate, terminal, cost)
     except asyncio.CancelledError:
         if adapter is not None:
             await adapter.abort_local_dispatches()
         raise
     finally:
-        await transport.close()
+        try:
+            await transport.close()
+        finally:
+            for retained in reversed(source_retentions):
+                retained.release()

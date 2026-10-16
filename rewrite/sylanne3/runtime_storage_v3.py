@@ -78,28 +78,103 @@ class RuntimeStorageOperationV3:
         self.kind = "business"
         self.retained = 0
         self.closed = False
-        self._release_lock = threading.Lock()
+        self._release_lock = threading.RLock()
+        self._retained_states = {}
         self._payload_release = None
 
     def transfer_payload_release_v3(self, callback):
         """Move the actual result cleanup to this same retained operation."""
-        with self._release_lock:
+        with self.pool.lock, self._release_lock:
             if self.closed or self._payload_release is not None:
                 raise AuthorityUnavailable("runtime result cleanup ownership already ended or moved")
             self._payload_release = callback
 
     def retain(self, size):
-        if self.closed:
-            raise AuthorityUnavailable("ordinary runtime retention operation ended")
-        self.pool.reserve(size)
-        self.retained += size
+        with self.pool.lock, self._release_lock:
+            if self.closed:
+                raise AuthorityUnavailable("ordinary runtime retention operation ended")
+            self.pool.reserve(size)
+            self.retained += size
+
+
+    def register_retained_state_v3(self, provider):
+        """Account one actual retained payload in this operation's existing pool."""
+        with self.pool.lock, self._release_lock:
+            if self.closed or provider in self._retained_states:
+                raise AuthorityUnavailable("runtime retained payload is ended or already registered")
+            size = provider._runtime_retained_heap_bytes_v3()
+            self.pool.reserve(size)
+            self._retained_states[provider] = (size, 0)
+            self.retained += size
+
+    def refresh_retained_state_v3(self, provider):
+        with self.pool.lock, self._release_lock:
+            if self.closed or provider not in self._retained_states:
+                raise AuthorityUnavailable("actual live retained payload registration required")
+            old, floor = self._retained_states[provider]
+            size = max(provider._runtime_retained_heap_bytes_v3(), floor)
+            delta = size - old
+            if delta > 0:
+                self.pool.reserve(delta)
+            elif delta < 0:
+                self.pool.release(-delta)
+            self._retained_states[provider] = (size, floor)
+            self.retained += delta
+            return size
+
+    def reserve_retained_state_growth_v3(self, provider, growth_bound):
+        """Preallocate a known bounded payload growth before its actual allocation."""
+        with self.pool.lock, self._release_lock:
+            self.refresh_retained_state_v3(provider)
+            old, floor = self._retained_states[provider]
+            if floor:
+                raise AuthorityUnavailable("runtime payload already has a reserved growth boundary")
+            self.pool.reserve(growth_bound)
+            self._retained_states[provider] = (old + growth_bound, old + growth_bound)
+            self.retained += growth_bound
+
+    def finish_retained_state_growth_v3(self, provider):
+        with self.pool.lock, self._release_lock:
+            if self.closed:
+                return
+            old, _ = self._retained_states[provider]
+            self._retained_states[provider] = (old, 0)
+            self.refresh_retained_state_v3(provider)
+
+    def unregister_retained_state_v3(self, provider):
+        with self.pool.lock, self._release_lock:
+            entry = self._retained_states.pop(provider, None)
+            if entry is None or self.closed:
+                return
+            size, _ = entry
+            self.pool.release(size)
+            self.retained -= size
+
+    def transfer_retained_state_v3(self, prior, successor):
+        """Move one payload owner atomically without a gap or double accounting."""
+        with self.pool.lock, self._release_lock:
+            if self.closed or prior not in self._retained_states or successor in self._retained_states:
+                raise AuthorityUnavailable("runtime payload transfer requires its actual current owner")
+            old, floor = self._retained_states[prior]
+            if floor:
+                raise AuthorityUnavailable("runtime payload ownership cannot move inside a growth allocation")
+            size = successor._runtime_retained_heap_bytes_v3()
+            delta = size - old
+            if delta > 0:
+                self.pool.reserve(delta)
+            elif delta < 0:
+                self.pool.release(-delta)
+            del self._retained_states[prior]
+            self._retained_states[successor] = (size, 0)
+            self.retained += delta
 
     def release(self):
-        with self._release_lock:
+        with self.pool.lock, self._release_lock:
             if self.closed:
                 return
             self.closed = True
             size, self.retained = self.retained, 0
+            self._retained_states.clear()
             cleanup, self._payload_release = self._payload_release, None
         try:
             if cleanup is not None:
@@ -1178,6 +1253,10 @@ def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header
         instance=instance,origin_digest=row[0],locator=locator,payload_sha256=header[5]))
     if expected_cell != cell_id:
         raise AuthorityUnavailable('runtime cell is not bound to its actual producer and layout')
+    if role=='graph' and proof.get('schema')=='sylanne.contact-plan-stream-origin.v3':
+        from .runtime.contact_plan_adoption_v3 import verify_selected_contact_plan_cell_origin_v3
+        return verify_selected_contact_plan_cell_origin_v3(db,basis=basis,cell_id=cell_id,header=header,
+            original=original,meter=meter)
     if role == 'graph':
         from .graph_types import AtomKey
         from .runtime_contracts import canonical_serialize,NamespaceId,namespace_ref
@@ -1410,6 +1489,9 @@ def selected_runtime_catalogue_v3(role):
     if role=='graph':
         from .runtime.owner_material_source_storage_v3 import PREPARED_DDL,DISPOSITION_DDL,COMMAND_SEED_DDL
         from .runtime.domain_production_originals_v1 import PHYSICAL_DDL
+        from .runtime.contact_plan_adoption_v3 import TABLE as CONTACT_PLAN_TABLE,DDL as CONTACT_PLAN_DDL
+        from .runtime.contact_plan_physical_write_v3 import STREAM_TABLE,STREAM_DDL
+        definitions.update({CONTACT_PLAN_TABLE:CONTACT_PLAN_DDL,STREAM_TABLE:STREAM_DDL})
         definitions.update(graph_owner_source_command_seeds_v3=COMMAND_SEED_DDL,graph_owner_source_prepared_v3=PREPARED_DDL,
             graph_owner_source_dispositions_v3=DISPOSITION_DDL,graph_domain_production_originals_v3=PHYSICAL_DDL)
         immutable+=['graph_owner_source_command_seeds_v3','graph_owner_source_dispositions_v3','graph_domain_production_originals_v3']
@@ -1419,6 +1501,11 @@ def selected_runtime_catalogue_v3(role):
             runtime_d13_counter_index_cursor_v3=_CURSOR_DDL,runtime_d13_counter_index_seals_v3=_SEAL_DDL)
         immutable+=['runtime_d13_counter_calls_v3','runtime_d13_counter_index_seals_v3']
     for name,ddl in definitions.items():yield ('table',name,ddl.replace('IF NOT EXISTS ',''))
+    if role=='graph':
+        from .runtime.contact_plan_adoption_v3 import TABLE as CONTACT_PLAN_TABLE,DDL_MAP as CONTACT_PLAN_DDLS
+        for name,ddl in CONTACT_PLAN_DDLS.items():
+            if name!=CONTACT_PLAN_TABLE:
+                yield ('trigger',name,ddl)
     for table in immutable:
         for action in ('UPDATE','DELETE'):
             name=table+'_no_'+action.lower()+'_v3'

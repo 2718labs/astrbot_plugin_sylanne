@@ -183,7 +183,7 @@ class AstrBotV2TextSender:
                  record_observation: Callable[
                      [HandoffStartV2, PlatformObservationV2], Awaitable[object]],
                  send_timeout_seconds: float = 30.0,
-                 local_module_admission=None) -> None:
+                 local_module_admission=None, contact_measurement=None) -> None:
         if (not isinstance(context, Context)
                 or not isinstance(candidates, SceneCandidateCatalog)
                 or not callable(getattr(resolver, "resolve", None))
@@ -202,6 +202,10 @@ class AstrBotV2TextSender:
         self._clock_policy = clock_policy
         self._record_observation = record_observation
         self._send_timeout_seconds = float(send_timeout_seconds)
+        from .contact_sender_measurement_v1 import InstalledContactSenderMeasurementV1
+        if contact_measurement is not None and type(contact_measurement) is not InstalledContactSenderMeasurementV1:
+            raise TypeError("Contact Sender requires its actual private measurement component")
+        self._contact_measurement = contact_measurement
         from ..runtime.local_module_admission_v1 import LocalModuleAdmissionV1
         if local_module_admission is not None and type(local_module_admission) is not LocalModuleAdmissionV1:
             raise TypeError("sender requires the frozen native module admission")
@@ -358,7 +362,11 @@ class AstrBotV2TextSender:
         action = ("send_group_msg" if visibility == "group"
                   else "send_private_msg")
         destination = "group_id" if visibility == "group" else "user_id"
+        if request.proactive_contact and self._contact_measurement is None:
+            raise DispatchBlocked("installed Contact effect pricing/measurement unavailable")
         async def call_onebot():
+            if self._contact_measurement is not None:
+                self._contact_measurement.start_invocation(binding, start, claimed_receipt, trusted_upper(clock))
             return await adapter.bot.call_action(
                 action, self_id=resolved.self_id,
                 **{destination: int(session.session_id)},
@@ -391,6 +399,12 @@ class AstrBotV2TextSender:
                 trusted_upper(clock), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             time_source_ref=self._clock_policy.source_id,
         )
+        if self._contact_measurement is not None:
+            try:
+                await self._contact_measurement.complete_invocation(observation)
+            except (Exception, asyncio.CancelledError):
+                # Lost measurement acknowledgement is reconciled from Core; no SDK retry.
+                pass
         try:
             await self._record_observation(start, observation)
         except (Exception, asyncio.CancelledError) as exc:

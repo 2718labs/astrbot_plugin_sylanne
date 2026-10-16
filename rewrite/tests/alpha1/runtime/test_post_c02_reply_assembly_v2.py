@@ -277,7 +277,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         assert host_process_runner is None and c09_protected_root is None
         assert initial_phase_fixture_installation is not None
         assert enable_c09_maintenance and enable_d10_offline_ticks and enable_d04_root_cpu and enable_c04_body_work
-    if (host_process_runner is None) != (c09_protected_root is None):
+    if not complete_c09_current_v3 and (host_process_runner is None) != (c09_protected_root is None):
         raise ValueError("separate Life Host requires its original protected-root lifetime")
     if host_process_runner is not None and not (enable_c09_maintenance and enable_d10_offline_ticks
             and enable_d11_life_source_note and enable_d04_root_cpu and enable_c04_body_work):
@@ -825,7 +825,12 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                     grant.authority_id, grant.installation_id,
                     grant.manifest_digest)
         before_capture_policy = None
-        if life_before_root_operation_id is not None:
+        if phase_initial is not None:
+            before_capture_policy=phase_initial.initial_bundle.life_d04_before_capture_policy
+            if (life_before_root_operation_id is not None and (before_capture_policy is None
+                    or before_capture_policy.root_operation_id!=life_before_root_operation_id)):
+                raise ValueError("actual Owner Root request differs from its protected prospective selector")
+        elif life_before_root_operation_id is not None:
             from sylanne3.runtime.d04_life_before_original_v1 import D04LifeBeforeCapturePolicyV1
             before_capture_policy = D04LifeBeforeCapturePolicyV1(namespace,
                 policy.installation_id, policy.manifest_digest, life_before_root_operation_id)
@@ -1238,6 +1243,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 "c09_deployment_config":None if c09_daemon is None else c09_daemon.config,
                 "c09_maintenance_factory":None if c09_daemon is None else c09_daemon.config.c09_maintenance_factory,
                 "c09_phase_setup_file":c09_phase_setup_file,
+                "c09_provider_cache":None if initial_offline_storage is None else initial_offline_storage.provider_cache,
             }
             await after_role_initialization(m1_initialization_case)
             if not continue_to_ingress and after_initial_self_registration is None:
@@ -1510,7 +1516,9 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         graph._GraphCoordinator__self_identity_port = InstalledCurrentSelfIdentityPort(
             client=authority_client, bundle=installed_bundle, grant=client_grant,
             owner_loop=asyncio.get_running_loop())
+        latest_c02_execution_id=None
         async def _commit_c02_message(host, ingress):
+            nonlocal latest_c02_execution_id
             first_ingress = await asyncio.to_thread(
                 graph.commit_first_ingress_v2, bootstrap, host, policy,
                 ingress_clock, encoding,
@@ -1678,6 +1686,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                     30.0, {"cpu_ms": 2}, "snapshot:reply-c02",
                     "resource:reply-c02"), ingress_clock)
             assert c02.status == "committed"
+            latest_c02_execution_id=model_prepared.intent.call_id
             graph.release_authority_lease(bootstrap, worker_lease)
             return first_ingress, c02
 
@@ -1754,7 +1763,7 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
          attention_clock, attention_policy, attention_competitor) = attention_inputs
 
         async def commit_second_c02(message_id: str, text: str, *, commit_attention=False,
-                                    return_envelope=False):
+                                    return_envelope=False,return_execution_id=False):
             """Run a distinct observed ingress through the same paid C02 path."""
             nonlocal client_grant
             if message_id == ingress.message_id or not text:
@@ -1814,6 +1823,10 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             first, second = await _commit_c02_message(second_host, second_ingress)
             if commit_attention:
                 await commit_c02_attention(second)
+            if return_execution_id:
+                if not return_envelope or latest_c02_execution_id is None:
+                    raise ValueError("actual second C02 execution locator requires its committed envelope")
+                return first,second,second_ingress,latest_c02_execution_id
             return (first, second, second_ingress) if return_envelope else (first, second)
 
         if after_c02 is not None:

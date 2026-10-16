@@ -1,4 +1,4 @@
-"""Run one permanent alpha2 installed node once and retain its complete fixture.
+"""Run one permanent Alpha2 or Beta1 installed family once and retain its complete fixture.
 
 Use an isolated Linux x86_64/glibc server environment. Product imports come
 from the externally pinned extracted ZIP; tests come from its frozen source
@@ -17,6 +17,7 @@ import zipfile
 
 NUMERIC_FILE = "rewrite/tests/alpha1/integration/test_installed_life_numeric_fullchain_v1.py"
 NODES = {
+    "numeric-full": NUMERIC_FILE,
     "numeric-positive": NUMERIC_FILE + "::test_installed_life_numeric_original_paid_native_interval_and_trace",
     "numeric-authorization": NUMERIC_FILE + "::test_installed_life_numeric_egress_authorization_refusals",
     "numeric-registration": NUMERIC_FILE + "::test_installed_life_numeric_registration_replay_and_cancelled_job",
@@ -26,6 +27,7 @@ NODES = {
     "sdk-v7": "rewrite/host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_l03_actual_installed_sdk_d13_v7_256_current_core_count_paid_native_cold_replay",
 }
 FAMILIES = {
+    "numeric-full": "numeric",
     "numeric-positive": "numeric_positive",
     "numeric-authorization": "numeric_authorization_groups",
     "numeric-registration": "numeric_registration",
@@ -79,6 +81,37 @@ def write_json(path, value):
         stream.write("\n")
 
 
+def require_beta1_snapshot(manifest, source_rows, package_bytes):
+    """Check the exact new candidate pin before any application import."""
+    snapshot = manifest["test_snapshot"]
+    inventory = snapshot["engineering_source_inventory"]
+    evidence = snapshot["verification_evidence"]
+    qualification = manifest["backend_qualification"]
+    if (package_bytes > 16_000_000 or manifest["candidate_scope"] != "beta1-server-test"
+            or snapshot["schema"] != "sylanne.beta1-server-test-candidate.v1"
+            or snapshot["public_release"] is not False
+            or inventory["schema"] != "sylanne.engineering-source-inventory.v1"
+            or digest(json.dumps(inventory["files"], ensure_ascii=True, sort_keys=True,
+                separators=(",", ":")).encode()) != inventory["sha256"]
+            or any(source_rows.get(row["path"]) != row for row in inventory["files"])
+            or evidence["schema"] != "sylanne.beta1-source-evidence.v1"
+            or digest(json.dumps(evidence, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":")).encode()) != snapshot["verification_evidence_digest"]
+            or qualification["schema"] != "sylanne.beta1-server-test-qualification.v1"
+            or qualification["runtime_scope"] != "backend-beta1-server-test"
+            or snapshot["native_sha256"] != NATIVE_SHA256
+            or snapshot["source_inventory_sha256"] != manifest["source_inventory"]["sha256"]):
+        raise ValueError("Beta1 snapshot/source companion qualification differs")
+    checks = evidence["checks"]
+    by_name = {row["name"]: row for row in checks}
+    if (len(by_name) != len(checks) or any(row["source_pin"] != inventory["sha256"] for row in checks)
+            or any(name not in by_name or by_name[name]["status"] != "passed"
+                for name in ("beta1_source_closure", "beta1_python_compile"))
+            or "beta1_server_acceptance" not in by_name
+            or by_name["beta1_server_acceptance"]["status"] != "not_run"):
+        raise ValueError("Beta1 needs fresh pinned local receipts and server NOT_RUN")
+
+
 def run(args):
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "AMD64"} or platform.libc_ver()[0] != "glibc":
         raise RuntimeError("requires isolated Linux x86_64/glibc")
@@ -101,8 +134,16 @@ def run(args):
         if digest(manifest_raw) != args.manifest_sha256:
             raise ValueError("external release-manifest SHA256 differs")
         manifest = json.loads(manifest_raw)
-        if manifest["package_version"] != "3.0.0-alpha2" or manifest["platform"]["os"] != "linux" or manifest["platform"]["arch"] != "x86_64" or manifest["platform"]["libc"] != "glibc":
-            raise ValueError("requires the full alpha2 Linux x86_64/glibc package")
+        identity = (manifest["package_version"], manifest["build_mode"])
+        if identity not in {("3.0.0-alpha2", "alpha2-candidate"),
+                            ("3.0.0-beta1", "beta1-candidate")} or tuple(
+                manifest["platform"][name] for name in ("os", "arch", "libc", "abi_version")) != (
+                    "linux", "x86_64", "glibc", 2):
+            raise ValueError("requires an exact Alpha2 or Beta1 Linux x86_64/glibc ABI2 candidate")
+        if identity == ("3.0.0-beta1", "beta1-candidate"):
+            require_beta1_snapshot(manifest, source_rows, package.stat().st_size)
+        run_schema = ("sylanne.beta1-server-single-run.v1" if identity[0] == "3.0.0-beta1"
+                      else "sylanne.alpha2-server-single-run.v1")
         listed = verify_rows(installed, manifest["files"])
         members = archive.namelist()
         if len(members) != len(set(members)) or set(members) != listed | {"release-manifest.json"}:
@@ -134,11 +175,15 @@ def run(args):
         raise ValueError("explicit delivery/fixture roots and the real delegated cgroup parent are required")
     if args.node not in {"sdk-v7", "sdk-real-elapsed"} and args.installed_stage_root is None:
         raise ValueError("explicit separately verified installed-stage root is required")
+    beta1_suite=identity==("3.0.0-beta1","beta1-candidate") and args.node in {"numeric-full","d13"}
+    if identity==("3.0.0-beta1","beta1-candidate") and args.node in {
+            "numeric-positive","numeric-authorization","numeric-registration"}:
+        raise ValueError("Beta1 Numeric requires its complete ten-node protected phase suite; subset fallback HOLD")
     setup = setup_pin = None
     setup_values = (args.phase_fixture_setup, args.phase_fixture_setup_sha256, args.phase_setup_root, args.engineering_inventory_sha256)
-    if args.node == "c09-current":
+    if args.node == "c09-current" or beta1_suite:
         if any(value is None for value in setup_values):
-            raise ValueError("current C09 requires fresh protected setup and frozen engineering inventory pins")
+            raise ValueError("current C09/Beta1 full suite requires fresh protected setup and frozen engineering inventory pins")
         setup, setup_raw = pinned_file(args.phase_fixture_setup, args.phase_fixture_setup_sha256)
         setup_pin = digest(setup_raw)
         inventory = json.loads((source.parent / "frozen-engineering-inventory.json").read_bytes())
@@ -149,7 +194,7 @@ def run(args):
         if any(source_rows.get(row["path"]) != row for row in inventory["files"]):
             raise ValueError("engineering inventory differs from the frozen source companion")
     elif any(value is not None for value in setup_values):
-        raise ValueError("current C09 setup arguments apply only to c09-current")
+        raise ValueError("protected phase setup applies to current C09 or the full Beta1 Numeric/D13 suite")
     phase_root = phase_approval = phase_approval_pin = None
     phase_values = (args.phase, args.phase_root, args.phase_approval, args.phase_approval_sha256)
     if args.node == "sdk-real-elapsed":
@@ -168,7 +213,7 @@ def run(args):
     if phase_root is not None and (phase_root.is_relative_to(output) or output.is_relative_to(phase_root)):
         raise ValueError("real-elapsed persistent root and fresh run receipts must be separate")
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
-    packet = {"schema": "sylanne.alpha2-server-single-run.v1", "node": node,
+    packet = {"schema": run_schema, "node": node,
         "installed_root": str(installed), "source_root": str(source),
         "package": str(package), "package_sha256": args.package_sha256,
         "manifest_sha256": args.manifest_sha256, "source_manifest": str(source_manifest),
@@ -216,7 +261,25 @@ def run(args):
         real_elapsed_approval_sha256=phase_approval_pin)
     summary = run_owned_resource_profile_v1(spec,
         cgroup_parent=str(args.cgroup_parent.resolve(strict=True)), timeout_seconds=1000)
-    if family == "c09_current":
+    if beta1_suite:
+        outcomes_path=output/"resource/actualphase-outcomes.json"
+        outcomes=json.loads(outcomes_path.read_bytes())if outcomes_path.is_file()else None
+        scope_executed=(outcomes is not None and outcomes["schema"]=="sylanne.beta1.actualphase-outcomes.v3"
+            and outcomes["harness_kind"]=="root_controlled_beta1_suite"
+            and outcomes["fixture_kind"]==family and outcomes["suite_sha256"]==setup_pin
+            and outcomes["operation_id"]==spec.operation_id
+            and outcomes["package_sha256"]==spec.package_sha256 and outcomes["manifest_sha256"]==spec.manifest_sha256
+            and outcomes["full_manifest_node_count"]==len(outcomes["node_manifest"])==15
+            and outcomes["requested_node_count"]==len(selected)
+            and outcomes["observation_status"]=="CURRENT_FAMILY_OBSERVED_OTHER_FAMILY_NOT_RUN"
+            and outcomes["node_count"]==len(outcomes["node_outcomes"])==len(selected)
+            and tuple(item["node"]for item in outcomes["node_outcomes"])==selected
+            and outcomes["effective_exit_code"]==0
+            and all(len(item["outcomes"])==len(item["processes"])==5 and item["checks"]
+                and all(item["checks"].values())for item in outcomes["node_outcomes"])
+            and summary.get("actual_phase_outcomes_path")==str(outcomes_path)
+            and all(row["status"]==("OBSERVED_CURRENT_V3_EXIT"if row["fixture_kind"]==family else"NOT_RUN")for row in outcomes["node_manifest"]))
+    elif family == "c09_current":
         outcomes_path=output/"resource/actualphase-outcomes.json"
         outcomes=json.loads(outcomes_path.read_bytes())if outcomes_path.is_file()else None
         scope_executed=(outcomes is not None and outcomes["schema"]=="sylanne.actualphase-outcomes.v3"
@@ -244,9 +307,13 @@ def run(args):
         "package_sha256": args.package_sha256, "manifest_sha256": args.manifest_sha256,
         "source_manifest_sha256": args.source_manifest_sha256,
         "resource_original": str(output / "resource/resource-run-original.json"),
-        "harness_kind": "root_controlled_four_phase" if family == "c09_current" else "pytest",
-        "actual_phase_outcomes" if family == "c09_current" else "pytest_outcomes": str(outcomes_path),
-        "scope": "selected isolated fixture and owned resource subtree; no all39/production acceptance"}
+        "harness_kind": ("root_controlled_beta1_suite" if beta1_suite else
+            "root_controlled_four_phase" if family=="c09_current" else "pytest"),
+        "actual_phase_outcomes" if beta1_suite or family=="c09_current" else "pytest_outcomes": str(outcomes_path),
+        "scope": "selected isolated fixture and owned resource subtree; no all39/production acceptance",
+        **({"full_manifest_node_count":15,"node_manifest_observations":None if outcomes is None else outcomes["node_manifest"],
+            "unobserved_state":"UNKNOWN"if outcomes is None else outcomes["observation_status"],
+            "committed_active_core_finish_ack_loss":"NOT_RUN"}if beta1_suite else{})}
     write_json(output / "run-result.json", receipt)
     print(json.dumps(receipt, ensure_ascii=False))
     return receipt["exit_code"]

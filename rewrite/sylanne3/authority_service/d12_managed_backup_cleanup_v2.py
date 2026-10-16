@@ -830,7 +830,7 @@ class _RegisteredOfflineCancelledReservationReadV3:
             if self.point.proof[4]!=self.row_hash.commitment or self.point.proof[6]!=self.row_hash.commitment:raise AuthorityUnavailable('actual offline historical job source commitment is not retained')
             self.row_hash=self.point=None;self.source_index+=1;return False
         if self.phase=='core_retirement':
-            from .v2_contract import fence_from_wire,canonical_bytes
+            from .v2_contract import from_wire as fence_from_wire,canonical_bytes
             from . import c09_authority_storage_rebase as legacy
             raw=json.loads(self.gate.no_future_claim_original_json)
             def fence_row(permit,request,digest):return (permit.operation_id,permit.namespace,permit.subject,permit.token,permit.fence_epoch,permit.revision,'finished',canonical_bytes(permit),request,digest,None)

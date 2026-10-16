@@ -126,11 +126,11 @@ def install_project_control_readers_v1(graph, *, scope, owner_guard, owner_bindi
 
 
 def _head(db, namespace, ref):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     key = AtomKey.from_token(ref)
     if NamespaceId.from_key(key) != namespace:
         raise ValueError('project control crossed namespace')
-    row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-        (*namespace.as_tuple, ref)).fetchone()
+    row = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=ref)
     if row is None or row[2] != 1:
         raise MissingProductionOriginalV1('current_valid_project_control_head:' + key.type_name)
     return GraphAtom(key, row[0], json.loads(row[1]), True)

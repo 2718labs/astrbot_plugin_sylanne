@@ -9,6 +9,7 @@ from __future__ import annotations
 from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3
 
 from contextlib import contextmanager, closing
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -19,6 +20,20 @@ import sqlite3
 import threading
 
 from .contract import AuthorityUnavailable, identifier
+
+_C09_CONTROL_READ_ROOT_V3=ContextVar('sylanne_actual_c09_control_read_root_v3',default=None)
+
+
+def require_actual_c09_control_read_root_v3(control,meter):
+    from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+    binding=_C09_CONTROL_READ_ROOT_V3.get()
+    if (binding is None or binding[0]is not control or binding[1]is not meter
+            or binding[2]!=threading.get_ident() or current_c09_sql_meter_v2()is not meter
+            or meter is not require_c09_reserved_meter_v3(meter.budget)):
+        raise AuthorityUnavailable('actual same-Control reserved root and owning thread required')
+    control.lease.require_held()
+    return meter
+
 
 SURFACES = frozenset({"graph_current_history", "graph_dependency_history",
     "source_derived_caches", "retrieval_indexes", "process_local_caches",
@@ -490,10 +505,13 @@ class InstalledC09StorageReaderV1:
                 profile.read_transaction_ns, profile.arena_bytes)
             meter = C09SqlByteMeterV2(budget)
             with c09_sql_meter_quantum_v2(meter):
-                self.require_c09_retained_arena_v3(meter=meter)
-                yield budget
-                self.require_c09_retained_arena_v3(meter=meter)
-                self.lease.require_held()
+                root_token=_C09_CONTROL_READ_ROOT_V3.set((self,meter,threading.get_ident()))
+                try:
+                    self.require_c09_retained_arena_v3(meter=meter)
+                    yield budget
+                    self.require_c09_retained_arena_v3(meter=meter)
+                    self.lease.require_held()
+                finally:_C09_CONTROL_READ_ROOT_V3.reset(root_token)
             if monotonic_ns() - started > profile.batch_local_ns:
                 raise AuthorityUnavailable("actual installed C09 cold read exceeded its unchanged duration")
         except BaseException:

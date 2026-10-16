@@ -22,6 +22,22 @@ _PAYLOAD_FIELDS = {'schema','request','namespace','identity','authority','parent
     'policy_refs','read_versions','query_coverage','observed_originals','provenance','writes','coverage',
     'missing_inputs','continuation_ref'}
 _EVENTS = {
+ 'conditioned_simulation_committed_v1':'d07',
+ 'conditioned_observed_outcome_committed_v1':'d07',
+ 'conditioned_calibration_resolution_committed_v1':'d01',
+ 'conditioned_method_review_committed_v1':'d01',
+ 'conditioned_conditions_committed_v1':'d07',
+ 'conditioned_life_phase_committed_v1':'d10',
+ 'conditioned_self_candidate_available':'d01',
+ 'conditioned_self_adopted_requires_choice_recheck':'d08',
+ 'conditioned_self_adopted_requires_life_projection':'d10',
+ 'conditioned_life_strategy_projected':'d10',
+ 'prediction_registered':'d07',
+ 'general_growth_intent_available_for_future_trial':'d01',
+ 'general_growth_trial_start_available_for_observation':'d01',
+ 'general_growth_trial_completed_for_adoption':'d01',
+ 'general_growth_action_outcome_available':'d01',
+ 'owner_source_note_task_submitted_v1':'d11',
  'artifact_draft_phase_content_adopted':'d11',
  'artifact_draft_phase_model_queued':'d11',
  'artifact_phase_action_proposal_available':'d11',
@@ -43,6 +59,7 @@ _EVENTS = {
  'personal_step_wait_condition_required':'d11',
  'project_continuation_updated':'d08',
  'actual_project_result_available':'d07',
+ 'general_growth_attention_available_for_service':'d07',
  'project_checkpoint_wait_registered':'d11',
     'action_outcome_observed_requires_current_life_qualification':'d10',
  'values_evaluated':'d08', 'persona_growth_requires_commitment_reevaluation':'d08',
@@ -50,7 +67,7 @@ _EVENTS = {
  'relationship_changed_requires_action_recheck':'d08','boundary_changed_requires_action_recheck':'d08',
  'boundary_changed_requires_contact_recheck':'d10','source_correction_requires_boundary_recheck':'d08',
  'source_correction_requires_contact_recheck':'d10','bilateral_commitment_established':'d10',
- 'joint_plan_adopted_requires_activity_qualification':'d10','joint_plan_adopted_requires_next_node_action':'d08',
+ 'joint_plan_adopted_requires_activity_qualification':'d10','joint_plan_adopted_requires_next_node_action':'d08','joint_node_observation_requires_node_recheck':'d08','joint_external_semantic_question_requires_fair_cognition':'d07',
  'actual_life_outcome_available_for_growth':'d01','qualified_contact_opportunity_requires_action':'d08',
  'actual_internal_experience_requires_encoding':'d06','actual_offline_simulation_experiences_require_encoding':'d06',
  'cognitive_execution_requires_current_adoption':'d07',
@@ -97,7 +114,7 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
             or value['schema']!=domain+'.current-'+kind+'.v1' or value['namespace']!={'bot_id':namespace.bot_id,'persona_id':namespace.persona_id}):
         raise ValueError('domain stage original exact bytes/schema differ')
     from .domain_production_registry_v1 import _FOREGROUND_OPERATIONS, _PERSONAL_OPERATIONS, _ARTIFACT_OPERATIONS, _POSTCONDITION_OPERATIONS
-    if kind in _FOREGROUND_OPERATIONS or kind in _PERSONAL_OPERATIONS or kind in _ARTIFACT_OPERATIONS or kind in _POSTCONDITION_OPERATIONS or kind in {"register_artifact_draft_root", "owner_stop_reply_v1", "adopt_owner_artifact_project_context_v1"}:
+    if kind in _FOREGROUND_OPERATIONS or kind in _PERSONAL_OPERATIONS or kind in _ARTIFACT_OPERATIONS or kind in _POSTCONDITION_OPERATIONS or kind in {"register_artifact_draft_root", "owner_stop_reply_v1", "adopt_owner_artifact_project_context_v1", "register_general_growth_attention_v1"}:
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
         decode_typed_production_value_v1(value['request'], operation.request_type)
     else:
@@ -143,7 +160,9 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
     for write in value['writes']:
         if type(write) is not dict or set(write)!={'key','value','dependencies'}:raise ValueError('domain Graph write schema differs')
         key=_key(write['key'],namespace);spec=registry.spec(key.type_name)
-        if key not in keys or spec.writer_domain!=domain or key.owner.kind not in spec.owner_kinds:
+        from ..domains.d03.world_history_v1 import WORLD_OPERATIONS
+        mesh_companion = kind in WORLD_OPERATIONS and spec.writer_domain=="d11" and key.type_name=="d11.semantic_tick.v1"
+        if key not in keys or spec.writer_domain!=domain and not mesh_companion or key.owner.kind not in spec.owner_kinds:
             raise ValueError('domain output is outside exact writer/read closure')
         if key.type_name == 'd05.contribution':
             from ..domains.d05.relationship import decode_relationship_contribution_payload_v1
@@ -155,6 +174,10 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
             spec.validator(write['value'])
         for ref in write['dependencies']:
             if _key(ref,namespace) not in keys:raise ValueError('domain output dependency omitted')
+    if (kind in {'freeze_general_growth_intent_v1','register_general_growth_trial_start_v1',
+            'derive_general_growth_trial_v1','adopt_general_growth_v1'}
+            and value['coverage']=='complete' and value['provenance']=={}):
+        raise ValueError('complete General growth original lacks actual verified provenance')
     from .domain_production_erasure_v1 import validate_domain_stage_provenance_v1
     if kind in _POSTCONDITION_OPERATIONS:
         extra=validate_domain_stage_provenance_v1(domain,kind,value['provenance'])
@@ -178,11 +201,16 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
                 or provenance['input_request_digest']!=canonical_digest(value['request'])):
             raise ValueError('domain input producer provenance differs')
         extra=()
-    elif domain == 'd07':
+    elif domain == 'd07' and kind=='register_general_growth_attention_v1':
+        from .d07_general_growth_attention_v1 import validate_general_growth_registration_provenance_v1
+        extra=validate_general_growth_registration_provenance_v1(value['provenance']) if value['coverage']=='complete' else ()
+    elif domain == 'd07' and kind in {'serve_concern','advance_reflection','run_simulation'}:
         from .d07_behavior_stage_codec_v1 import validate_d07_behavior_provenance_v1
         extra=validate_d07_behavior_provenance_v1(kind,value['provenance'])
     else:
         extra=validate_domain_stage_provenance_v1(domain,kind,value['provenance'])
+    from .habit_census_provenance_v1 import validate_habit_census_payload_v1
+    validate_habit_census_payload_v1(value)
     for ref in extra:_key(ref,namespace)
     if value['coverage'] not in {'complete','partial','deferred','waiting_for_original'}:
         raise ValueError('domain stage coverage is invalid')
@@ -224,6 +252,13 @@ def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
             if canonical_serialize(value)!=data['receipt_json']:raise ValueError('task wait disposition bytes changed')
             from .artifact_task_wait_consumer_v1 import validate_task_wait_disposition_v1
             validate_task_wait_disposition_v1(db,namespace=namespace,row_data=data,value=value)
+            return {'content_bearing':False,'causal_operation_id':data['causal_operation_id'],
+                'original_ref':data['original_ref'],'original_digest':data['original_digest']}
+        if type(value) is dict and value.get('schema') == 'd11.owner-source-note-submit-consumed.v1':
+            if canonical_serialize(value) != data['receipt_json']:
+                raise ValueError('Owner task submit disposition bytes are noncanonical')
+            from .owner_source_note_task_driver_v1 import validate_owner_task_submit_disposition_v1
+            validate_owner_task_submit_disposition_v1(db,namespace=namespace,row_data=data,value=value)
             return {'content_bearing':False,'causal_operation_id':data['causal_operation_id'],
                 'original_ref':data['original_ref'],'original_digest':data['original_digest']}
         expected={'schema','resolver_version','dedupe_key','causal_operation_id','causal_original_digest','trigger_original_digest',

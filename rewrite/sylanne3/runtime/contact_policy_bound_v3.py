@@ -155,7 +155,7 @@ def validate_contact_policy_bound_members_v3(bound, *, members, namespace,
                 raise ValueError('Contact3 native legacy quota claim key differs')
         claims.append(claim)
     own = [claim for claim in claims if claim.contact_id == bound.continuation.contact_id]
-    if (len(own) != 1 or own[0].status != 'claimed' or own[0].observations
+    if (len(own) != 1 or own[0].status in {'released','pending_confirmation'}
             or own[0].communication_action_id != bound.continuation.communication_action_id
             or bound.continuation.segment_effect_id != action.identity.effect_id
             or bound.continuation.segment_effect_id not in own[0].segment_effects
@@ -163,6 +163,9 @@ def validate_contact_policy_bound_members_v3(bound, *, members, namespace,
             or getattr(own[0], 'approval_digest', None) != owner_policy.digest
             or getattr(own[0], 'window_id', None) != contact_window_id_v2(policy)):
         raise ValueError('Contact3 native qualification does not own its exact unconsumed quota')
+    position=own[0].segment_effects.index(bound.continuation.segment_effect_id)
+    if dict(own[0].observations)!={effect:'accepted'for effect in own[0].segment_effects[:position]}:
+        raise ValueError('Contact native bound has no exact earlier accepted own-claim rule input')
     actual = LifeDomain.contact_policy_check(policy, opportunity, tuple(claims),
         now=now_utc, continuation=bound.continuation)
     if canonical_serialize(actual) != canonical_serialize(bound.local_check):

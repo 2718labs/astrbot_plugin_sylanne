@@ -264,7 +264,7 @@ def _candidate(db, read, request, readers):
 
 
 def _validate_ancillary(db, read, candidate):
-    from ..domains.d08.execution import ActionIntent, ActionOutcome, Commitment, _tuple_payload as d08_tuple
+    from ..domains.d08.execution import ActionIntent, ActionOutcome, Commitment
     expectation, reciprocity, repair = candidate.expectation, candidate.reciprocity, candidate.repair
     if expectation is not None:
         accepted_sources = set()
@@ -275,7 +275,7 @@ def _validate_ancillary(db, read, candidate):
             accepted_sources.update(_counterparty_response_sources_v2(db, read, atom, candidate.scope.subject_entity_ref))
         if expectation.commitment_ref is not None:
             atom = read.head(db, expectation.commitment_ref, required=True)
-            commitment = Commitment(**d08_tuple(atom.value, "communicated_refs", "acknowledged_refs", "source_refs"))
+            commitment = decode_typed_production_value_v1(atom.value, Commitment)
             if (commitment.subject_ref != "persona:" + candidate.scope.namespace.persona_id
                     or commitment.counterparty_ref != candidate.scope.subject_entity_ref
                     or commitment.semantic_scope != expectation_acceptance_question_scope_v2(expectation)
@@ -307,7 +307,7 @@ def _validate_ancillary(db, read, candidate):
             atom = read.head(db, ref, required=True)
             if atom.key.type_name != "d08.action_outcome.v1":
                 raise ValueError("repair practice requires an actual D08 outcome")
-            outcome = ActionOutcome(**d08_tuple(atom.value, "observation_refs", "completed_effects", "unknown_effects"))
+            outcome = decode_typed_production_value_v1(atom.value, ActionOutcome)
             matches = tuple(item for item in intents if item.valid and item.value["action_id"] == outcome.action_id
                 and item.value["identity"]["effect_id"] == outcome.effect_id)
             if len(matches) != 1 or matches[0].value["target_ref"] != repair.scope.subject_entity_ref or repair.dispute_ref not in matches[0].value["effect_scope"]:

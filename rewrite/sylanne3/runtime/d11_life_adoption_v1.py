@@ -38,7 +38,15 @@ from .first_ingress_v2 import trusted_upper
 
 
 def _read_signed(db, namespace, kind, ref, issuer):
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,row=read_bound_native_numeric_point_v3(db,table='graph_d11_life_originals_v1',columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'),
+        key_columns=('bot', 'persona', 'kind', 'original_ref'),key=(*namespace.as_tuple,kind,ref))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,row=read_bound_life_model_body_point_v3(db,table='graph_d11_life_originals_v1',columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'),
+        key_columns=('bot', 'persona', 'kind', 'original_ref'),key=(*namespace.as_tuple,kind,ref))
+    if not handled:
+        row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
         " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone()
     if row is None:
         return None
@@ -674,10 +682,26 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
         result_ref=binding.artifact_ref, producing_operation_id=operation_id)
 
     receipt = _decode_json(adopted["graph_receipt_json"], CommitReceipt)
-    event = db.execute("SELECT reads,revisions,epoch_revision,invalidated FROM graph_events "
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,event=read_bound_native_numeric_point_v3(db,table='graph_events',columns=('reads', 'revisions', 'epoch_revision', 'invalidated'),
+        key_columns=('bot', 'persona', 'session', 'event_id'),key=(*namespace.as_tuple,binding.activity_id,operation_id))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,event=read_bound_life_model_body_point_v3(db,table='graph_events',columns=('reads', 'revisions', 'epoch_revision', 'invalidated'),
+        key_columns=('bot', 'persona', 'session', 'event_id'),key=(*namespace.as_tuple,binding.activity_id,operation_id))
+    if not handled:
+        event = db.execute("SELECT reads,revisions,epoch_revision,invalidated FROM graph_events "
         "WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*namespace.as_tuple, binding.activity_id, operation_id)).fetchone()
-    fence = db.execute("SELECT permit_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,fence=read_bound_native_numeric_point_v3(db,table='graph_bundle_fences_v2',columns=('permit_json', 'pre_graph_revision', 'pre_graph_epoch', 'post_graph_revision', 'post_graph_epoch', 'finish_request_id', 'finish_request_digest'),
+        key_columns=('bot', 'persona', 'operation_id'),key=(*namespace.as_tuple,operation_id))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,fence=read_bound_life_model_body_point_v3(db,table='graph_bundle_fences_v2',columns=('permit_json', 'pre_graph_revision', 'pre_graph_epoch', 'post_graph_revision', 'post_graph_epoch', 'finish_request_id', 'finish_request_digest'),
+        key_columns=('bot', 'persona', 'operation_id'),key=(*namespace.as_tuple,operation_id))
+    if not handled:
+        fence = db.execute("SELECT permit_json,pre_graph_revision,pre_graph_epoch,post_graph_revision,post_graph_epoch,"
         "finish_request_id,finish_request_digest FROM graph_bundle_fences_v2 WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, operation_id)).fetchone()
     if (event is None or receipt.read_versions != GraphStore._version_rows(event[0])
@@ -689,7 +713,15 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
                 "sha256:" + canonical_digest((gate.qualification_digest, "committed")))):
         raise ValueError("life final actual event/fence is not the exact atomic bridge")
     actual = None if terminal.actual_cpu_ms is None else {"thread_cpu_ms": terminal.actual_cpu_ms}
-    settle = db.execute("SELECT digest,lease_id,resolution_binding_json FROM runtime_budget_operations "
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,settle=read_bound_native_numeric_point_v3(db,table='runtime_budget_operations',columns=('digest', 'lease_id', 'resolution_binding_json'),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(*namespace.as_tuple,binding.reservation_operation_id,'settle'))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,settle=read_bound_life_model_body_point_v3(db,table='runtime_budget_operations',columns=('digest', 'lease_id', 'resolution_binding_json'),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(*namespace.as_tuple,binding.reservation_operation_id,'settle'))
+    if not handled:
+        settle = db.execute("SELECT digest,lease_id,resolution_binding_json FROM runtime_budget_operations "
         "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
         (*namespace.as_tuple, binding.reservation_operation_id)).fetchone()
     if settle != (binding.reservation_digest, binding.parent_budget_lease_ref, _settlement_binding(actual, True)):
@@ -701,7 +733,13 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
         budget_phase="settle", prior_unknown_ref=None, execution_revoked=True)
     cost_write = cost_settlement_graph_write(cost)
     revisions = {version.key.token: version.revision for version in receipt.write_versions}
-    row = db.execute("SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?",
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+    handled,row=read_bound_native_numeric_history_v3(db,cost_write.key.token,revisions.get(cost_write.key.token),('value', 'valid', 'event_id'))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_history_v3
+        handled,row=read_bound_life_model_history_v3(db,cost_write.key.token,revisions.get(cost_write.key.token),('value', 'valid', 'event_id'))
+    if not handled:
+        row = db.execute("SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?",
         (cost_write.key.token, revisions.get(cost_write.key.token))).fetchone()
     if row != (canonical_serialize(cost_write.value), 1, operation_id):
         raise ValueError("life actual full cost is absent from its composite event")
@@ -713,13 +751,26 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
     life_adoption_receipt_from_wire_v1(result)
     if canonical_serialize(result) != canonical_serialize(expected):
         raise ValueError("life actual composite receipt commitments differ")
-    metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    metadata = _producer_original_point_v3(db, table='graph_recovery_metadata_v2',
+        columns=('requirements_json','graph_revision'), key_columns=('bot','persona'), key=namespace.as_tuple,
+        legacy_reader=lambda: db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", namespace.as_tuple).fetchone())
     before = _decode_json(gate.before_requirements_json, SnapshotRequirementsV2)
     target = replace(before, execution_seq=gate.after_anchor.execution_seq, execution_digest=gate.after_anchor.execution_digest)
     if require_current_metadata and (metadata is None or _decode_json(metadata[0], SnapshotRequirementsV2) != target
             or metadata[1] != gate.before_graph_revision + 1):
         raise ValueError("life committed Graph has not reached its exact authenticated current head")
     return expected
+
+
+def _project_effect_life_row_v3(db,namespace,kind,ref):
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    if kind not in {"activity_scope","prepared","adopted_life"}:
+        raise ValueError("project effect has no such fixed original locator")
+    return _producer_original_point_v3(db,table=TABLE,columns=("payload_json",),
+        key_columns=("bot","persona","kind","original_ref"),key=(*namespace.as_tuple,kind,ref),
+        legacy_reader=lambda:db.execute("SELECT payload_json FROM "+TABLE+
+            " WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*namespace.as_tuple,kind,ref)).fetchone())
 
 
 def _selected_predecessor_work_locators_v1(db, *, namespace, prepared):
@@ -729,13 +780,12 @@ def _selected_predecessor_work_locators_v1(db, *, namespace, prepared):
     from ..domains.d10.project_checkpoint_v1 import project_work_version_key_v1
     if prepared.plan.target.mode != "replace":
         return None
-    row = db.execute("SELECT payload_json FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='activity_scope' AND original_ref=?",
-        (*namespace.as_tuple, prepared.plan.activity_scope_ref)).fetchone()
+    row = _project_effect_life_row_v3(db,namespace,"activity_scope",prepared.plan.activity_scope_ref)
     if row is None:
         from .d01_production_operations_v1 import MissingProductionOriginalV1
         raise MissingProductionOriginalV1("actual_replacement_activity_scope")
-    scope = json.loads(row[0])
+    from .domain_background_read_v3 import background_json_loads_v3
+    scope = background_json_loads_v3(row[0])
     selector = artifact_draft_task_selector_v1(namespace,
         c02_operation_id=scope["c02_original_ref"],
         root_registration_ref=prepared.plan.target.root_registration_ref)
@@ -797,30 +847,26 @@ def _inherited_artifact_work_ref_v1(db, *, frame, prepared, issuer):
 def artifact_draft_project_effect_read_inputs_v1(db, *, namespace, progress_ref):
     from ..graph_types import AtomKey
     from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
-    row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-        (progress_ref, *namespace.as_tuple)).fetchone()
-    if row is None or row[1] != 1:
+    from .domain_background_read_v3 import background_graph_head_v3,background_json_loads_v3
+    row = background_graph_head_v3(db,namespace,progress_ref)
+    if row is None or row[2] != 1:
         return (), (), ()
-    progress = json.loads(row[0])
+    progress = background_json_loads_v3(row[1])
     if progress.get("step") != "artifact_draft_v1":
         return (), (), ()
-    adopted_row = db.execute("SELECT payload_json FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",
-        (*namespace.as_tuple, progress["artifact_ref"])).fetchone()
+    adopted_row = _project_effect_life_row_v3(db,namespace,"adopted_life",progress["artifact_ref"])
     if adopted_row is None:
         return (), (), (progress["terminal_ref"],)
     from .d11_life_contract_v1 import life_from_wire_v1, D11LifeTerminalV1
-    terminal = life_from_wire_v1(json.loads(adopted_row[0])["terminal"], D11LifeTerminalV1)
+    terminal = life_from_wire_v1(background_json_loads_v3(adopted_row[0])["terminal"], D11LifeTerminalV1)
     if type(terminal) is not D11DraftTerminalV1 or terminal.binding.namespace != namespace:
         raise ValueError("draft project selector found another original kind or namespace")
     b = terminal.binding
-    prepared_row = db.execute("SELECT payload_json FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
-        (*namespace.as_tuple, b.prepared_original_ref)).fetchone()
+    prepared_row = _project_effect_life_row_v3(db,namespace,"prepared",b.prepared_original_ref)
     if prepared_row is None:
         return (), (), (b.prepared_original_ref, terminal.original_ref)
     from .d11_life_preparation_v1 import life_prepared_from_wire_v1
-    prepared = life_prepared_from_wire_v1(json.loads(prepared_row[0]))
+    prepared = life_prepared_from_wire_v1(background_json_loads_v3(prepared_row[0]))
     keys = [AtomKey.from_token(progress_ref), AtomKey.from_token(b.artifact_ref),
         AtomKey.from_token(prepared.plan.action_intent.ref), *life_outcome_read_keys_v1(b, prepared.plan.action_intent.ref)]
     keys.extend(AtomKey.from_token(row.ref) for row in prepared.read_rows)
@@ -833,11 +879,9 @@ def artifact_draft_project_effect_read_inputs_v1(db, *, namespace, progress_ref)
         keys.append(work_key)
         originals += (prepared.plan.activity_scope_ref, request.predecessor_result_ref,
             selection["receipt"].operation_id)
-        prior = db.execute("SELECT payload_json FROM " + TABLE +
-            " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",
-            (*namespace.as_tuple, request.predecessor_result_ref)).fetchone()
+        prior = _project_effect_life_row_v3(db,namespace,"adopted_life",request.predecessor_result_ref)
         if prior is not None:
-            prior_terminal = life_from_wire_v1(json.loads(prior[0])["terminal"], D11LifeTerminalV1)
+            prior_terminal = life_from_wire_v1(background_json_loads_v3(prior[0])["terminal"], D11LifeTerminalV1)
             originals += (prior_terminal.binding.prepared_original_ref, prior_terminal.original_ref)
     return tuple(dict.fromkeys(keys)), roots, tuple(dict.fromkeys(originals))
 

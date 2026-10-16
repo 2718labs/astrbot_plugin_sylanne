@@ -10,7 +10,8 @@ from ..runtime_contracts import NamespaceId
 from .service import AuthenticatedSession, D12_SCHEMA
 
 
-ACTIONS = frozenset({"read_reply_controls", "stop_reply", "read_reply_control_status"})
+ACTIONS = frozenset({"read_reply_controls", "stop_reply", "read_reply_control_status",
+    "cancel_artifact_goal", "read_artifact_goal_cancel_status"})
 
 
 def parse_owner_reply_control_command_v1(payload):
@@ -26,7 +27,14 @@ def parse_owner_reply_control_command_v1(payload):
     if operation.version != 4 or str(operation) != payload["operation_id"]:
         raise ValueError("canonical Owner reply control operation required")
     namespace = NamespaceId(*payload["scope"].split("/"))
-    if payload["action"] == "stop_reply":
+    if payload["action"] in {"cancel_artifact_goal","read_artifact_goal_cancel_status"}:
+        from ..authority_service.owner_goal_cancellation_contract_v1 import (
+            OwnerGoalCancellationRequestV1,owner_goal_cancellation_from_wire_v1)
+        request=owner_goal_cancellation_from_wire_v1(payload["input"],OwnerGoalCancellationRequestV1)
+        if (request.namespace!=namespace or payload["action"]=="cancel_artifact_goal"
+                and request.cancel_operation_id!=payload["operation_id"]):
+            raise ValueError("Goal management envelope/actual target operation differs")
+    elif payload["action"] == "stop_reply":
         request = owner_stop_reply_request_from_wire_v1(payload["input"])
         if request.namespace != namespace or request.operation_id != payload["operation_id"]:
             raise ValueError("Owner StopReply envelope and target identity differ")
@@ -43,11 +51,15 @@ def parse_owner_reply_control_command_v1(payload):
 
 
 class InstalledOwnerReplyControlTransportV1:
-    def __init__(self, port: InstalledOwnerStopReplyPortV1, *, project_stop=None) -> None:
+    def __init__(self, port: InstalledOwnerStopReplyPortV1, *, project_stop=None, goal_runtime=None) -> None:
         if type(port) is not InstalledOwnerStopReplyPortV1:
             raise TypeError("actual paired Owner reply control port required")
         self.port = port
         self._project_stop = project_stop
+        from ..runtime_context import RuntimeContext
+        if goal_runtime is not None and type(goal_runtime) is not RuntimeContext:
+            raise TypeError("actual installed Goal projection RuntimeContext required")
+        self._goal_runtime=goal_runtime
 
     async def handle(self, payload, *, session):
         command = parse_owner_reply_control_command_v1(payload)
@@ -59,6 +71,25 @@ class InstalledOwnerReplyControlTransportV1:
                 or scope != "/".join(self.port.namespace.as_tuple)):
             raise PermissionError("current scoped Owner reply control admission required")
         action = command["action"]
+        if action in {"cancel_artifact_goal","read_artifact_goal_cancel_status"}:
+            from ..authority_service.owner_goal_cancellation_contract_v1 import (
+                OwnerGoalCancellationRequestV1,owner_goal_cancellation_from_wire_v1)
+            request=owner_goal_cancellation_from_wire_v1(command["input"],OwnerGoalCancellationRequestV1)
+            original=(await self.port.submit_owner_goal_cancel_v1(session=session,request=request)
+                if action=="cancel_artifact_goal" else
+                await self.port.read_owner_goal_cancel_status_v1(session=session,request=request))
+            projection=(await self._goal_runtime.project_owner_goal_cancellation_v1(original=original)
+                if self._goal_runtime is not None else {"status":"held"})
+            # Only actual metadata W01 can add metadata_projected. It neither
+            # confirms job cancellation nor authorizes a zero cost.
+            return {"status":"ready","control":{"schema":"d08.owner-goal-cancellation-status.v1",
+                "namespace":asdict(original.request.namespace),"goal_ref":original.request.goal_ref,
+                "operation_id":original.request.cancel_operation_id,"original_ref":original.original_ref,
+                "original_digest":original.digest,"state":original.state,
+                "projection_state":projection["status"],
+                "observed_goal_atom_revision":original.metadata.goal_atom_revision,
+                "observed_goal_semantic_revision":original.metadata.goal_semantic_revision,
+                "cancellation_confirmed":False}}
         if action == "read_reply_controls":
             page = await self.port.list_owner_reply_controls_v1(session=session, cursor=command["input"].get("cursor"))
             return {"status": "ready", "items": [item.to_wire() for item in page.items], "next_cursor": page.next_cursor}

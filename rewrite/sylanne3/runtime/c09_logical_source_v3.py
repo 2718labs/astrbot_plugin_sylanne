@@ -111,6 +111,12 @@ def read_c09_logical_source_shape_v3(scope, table, *, meter):
         if physical.columns!=registered or physical.primary_key_columns!=('bot','persona','operation_id') or actual!=(PHYSICAL_DDL.replace(' IF NOT EXISTS',''),):
             raise C09PagedCaptureHold('registered actual13-column Domain Source schema differs')
         mapped={'original_payload_cell_id':'original_payload_json'}
+    elif scope.role=='graph' and table=='graph_contact_expression_plan_originals_v3':
+        from .contact_plan_adoption_v3 import TABLE,COLUMNS,DDL
+        actual=meter.read_fixed_row(scope.source,'sqlite_master',('sql',),'type=? AND name=?',('table',TABLE))
+        if physical.columns!=COLUMNS or physical.primary_key_columns!=('bot','persona','contact_id') or actual!=(DDL,):
+            raise C09PagedCaptureHold('registered Contact Plan3 actual physical Source schema differs')
+        mapped={'payload_cell_id':'payload_json','source_selection_cell_id':'source_selection_json'}
     else:
         mapped = {'value_cell_id': 'value'} if scope.role == 'graph' and table in ('graph_atoms', 'graph_history') else (
             {'payload_cell_id': 'payload_json'} if scope.role == 'core' and table in _CORE_PAYLOAD_TABLES else {})

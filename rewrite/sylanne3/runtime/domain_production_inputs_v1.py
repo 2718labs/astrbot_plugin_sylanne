@@ -200,7 +200,26 @@ class RegisterCurrentPhaseDraftFilePlanInputRequestV2:
             raise TypeError("phase file registration accepts only its exact generation selector")
 
 
+from .joint_node_execution_v1 import RegisterJointNodeExecutionBindingRequestV1, QualifyJointPlanNodesRequestV1
+
+
+from .joint_external_observation_v1 import (RegisterJointExternalNodeContractRequestV1, ObserveJointExternalNodeRequestV1,
+    PrepareJointExternalSemanticQuestionRequestV1)
+
+
+from .joint_compensation_v1 import RegisterJointCompensationRequestV1
+
+
+from .joint_window_command_v1 import FreezeJointWindowNodeCommandRequestV1
+
 _PRODUCERS = {
+    "freeze_joint_window_node_command_v1": ("d10", FreezeJointWindowNodeCommandRequestV1),
+    "register_joint_compensation_v1": ("d08", RegisterJointCompensationRequestV1),
+    "prepare_joint_external_semantic_question_v1": ("d07", PrepareJointExternalSemanticQuestionRequestV1),
+    "register_joint_external_contract_v1": ("d08", RegisterJointExternalNodeContractRequestV1),
+    "observe_joint_external_node_v1": ("d08", ObserveJointExternalNodeRequestV1),
+    "register_joint_node_execution_binding_v1": ("d10", RegisterJointNodeExecutionBindingRequestV1),
+    "qualify_joint_plan_nodes_v1": ("d10", QualifyJointPlanNodesRequestV1),
     "register_artifact_task_text_extent": ("d08", RegisterArtifactTaskTextExtentRequestV1),
     "register_artifact_phase_price_policy": ("d02", RegisterCurrentArtifactPhasePricePolicyRequestV1),
     "freeze_values": ("d01", FreezeCurrentValuesInputRequestV1),
@@ -278,6 +297,25 @@ def _checked_request(producer_kind, request):
 
 def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_kind, request, installed_readers=None):
     registration = _checked_request(producer_kind, request)
+    if producer_kind == "freeze_joint_window_node_command_v1":
+        from .joint_node_execution_v1 import JointContactProspectiveBindingV1,joint_input_read_plan_v1
+        if type(request.command.binding)is JointContactProspectiveBindingV1:
+            from .contact_owner_command_source_v3 import read_plan_joint_contact_owner_source_v3
+            return read_plan_joint_contact_owner_source_v3(db,namespace=namespace,request=request,activity_id=activity_id)
+        from .frozen_joint_command_source_v3 import frozen_joint_read_plan_v3
+        return frozen_joint_read_plan_v3(db,namespace=namespace,request=request)
+    if producer_kind == "register_joint_compensation_v1":
+        from .joint_compensation_v1 import joint_compensation_read_plan_v1
+        return joint_compensation_read_plan_v1(db, namespace=namespace, request=request)
+    if producer_kind == "prepare_joint_external_semantic_question_v1":
+        from .joint_external_observation_v1 import joint_semantic_input_read_plan_v1
+        return joint_semantic_input_read_plan_v1(db, namespace=namespace, request=request)
+    if producer_kind in {"register_joint_external_contract_v1", "observe_joint_external_node_v1"}:
+        from .joint_external_observation_v1 import external_joint_input_read_plan_v1
+        return external_joint_input_read_plan_v1(db, namespace=namespace, request=request)
+    if producer_kind in {"register_joint_node_execution_binding_v1", "qualify_joint_plan_nodes_v1"}:
+        from .joint_node_execution_v1 import joint_input_read_plan_v1
+        return joint_input_read_plan_v1(db, namespace=namespace, request=request)
     if producer_kind == "register_artifact_phase_draft_plan_v2":
         from .d11_life_product_adapter_v1 import read_plan_current_phase_draft_file_registration_v2
         return read_plan_current_phase_draft_file_registration_v2(db, namespace=namespace,
@@ -511,6 +549,30 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
 
 def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installed_readers):
     registration = _checked_request(producer_kind, request)
+    if producer_kind=="freeze_joint_window_node_command_v1":
+        from .joint_window_command_v1 import stage_freeze_joint_window_command_v1
+        return stage_freeze_joint_window_command_v1(db,frame=frame,request=request,registration=registration,readers=installed_readers)
+    managed=None
+    if producer_kind=='register_joint_node_execution_binding_v1':
+        from .joint_artifact_execution_v1 import JointArtifactProspectiveBindingV1
+        from .joint_node_execution_v1 import JointContactProspectiveBindingV1
+        if type(request.binding)in {JointArtifactProspectiveBindingV1,JointContactProspectiveBindingV1}:
+            from .joint_window_management_v1 import require_managed_joint_preparation_v1
+            managed=require_managed_joint_preparation_v1(db,frame=frame,operation_kind='input:'+producer_kind,request=request)
+    from .joint_prevalidated_input_v1 import JOINT_PREVALIDATED_PRODUCERS_V1
+    if producer_kind in JOINT_PREVALIDATED_PRODUCERS_V1:
+        from .joint_prevalidated_input_v1 import freeze_current_joint_input_v1
+        from ..domains.d07 import D07DomainProvider
+        frozen=freeze_current_joint_input_v1(db,frame=frame,producer_kind=producer_kind,request=request,readers=installed_readers)
+        provider={"d10":LifeDomain(),"d08":GoalExecutionProvider(),"d07":D07DomainProvider()}[registration.domain]
+        stage=stage_result_v1(frame,registration.domain,"input:"+producer_kind,request,
+            provenance={"producer_kind":producer_kind,"input_request_digest":canonical_digest(plain_v1(request)),
+                "joint_prevalidated":frozen,"joint_prevalidated_digest":canonical_digest(frozen)},
+            receiver_events=(("d08","joint_node_observation_requires_node_recheck"),) if producer_kind=="observe_joint_external_node_v1" else
+                (("d07","joint_external_semantic_question_requires_fair_cognition"),) if producer_kind=="prepare_joint_external_semantic_question_v1" else (),
+            proposal_schema=registration.domain+".proposal.v1",proposal_hash=provider.descriptor.request_schema_hash)
+        from .joint_window_management_v1 import attach_managed_joint_preparation_v1
+        return attach_managed_joint_preparation_v1(StagedDomainInputV1(registration,request,stage),managed)
     if producer_kind == "register_artifact_task_text_extent":
         from .artifact_task_text_extent_v1 import stage_register_artifact_task_text_extent_v1
         return StagedDomainInputV1(registration, request,
@@ -621,6 +683,7 @@ def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installe
         provenance["owner_contact_policy_original"] = plain_v1(policy_original)
     stage = stage_result_v1(frame, registration.domain, "input:" + producer_kind, request, writes=writes,
         provenance=provenance,
+        receiver_events=(),
         proposal_schema=schema, proposal_hash=provider.descriptor.request_schema_hash)
     for proposal in stage.proposals:
         specs = {spec.name: spec for spec in (provider.register_types() if registration.domain == "d08" else provider.type_specs())}
@@ -681,6 +744,14 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
         "WHERE bot=? AND persona=? AND operation_id=?", (*stage.namespace.as_tuple, stage.operation_id)).fetchone()
     if actual != (actual_receipt.operation_digest, actual_receipt.activity_id, actual_receipt.effect_id, actual_receipt.commit_seq):
         raise ValueError("Owner input receipt does not match its actual same-transaction bundle original")
+    if registration.producer_kind=="freeze_joint_window_node_command_v1":
+        from .joint_window_command_v1 import record_frozen_joint_window_command_v1
+        return record_frozen_joint_window_command_v1(db,frame=frame,staged_input=staged_input,actual_receipt=actual_receipt,readers=installed_readers)
+    from .joint_prevalidated_input_v1 import JOINT_PREVALIDATED_PRODUCERS_V1
+    if registration.producer_kind in JOINT_PREVALIDATED_PRODUCERS_V1:
+        from .joint_prevalidated_input_v1 import record_prevalidated_joint_input_after_commit_v1
+        return record_prevalidated_joint_input_after_commit_v1(db,frame=frame,staged_input=staged_input,
+            actual_receipt=actual_receipt,readers=installed_readers)
     CurrentDomainReadV1(frame).committed_operation(db, actual_receipt.operation_id)
     frame = _post_commit_frame(db, frame, request)
     kind, operation = registration.producer_kind, actual_receipt.operation_id

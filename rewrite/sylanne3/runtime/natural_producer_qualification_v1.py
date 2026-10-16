@@ -1319,8 +1319,22 @@ class _HostProducerAttachmentV3:
             if type(owner)is AuthorityGraphReadWorkV3:
                 require_actual_authority_graph_attachment_owner_v3(owner,db=owner.db)
             else:
-                from .current_method_learning_read_v3 import require_actual_method_learning_attachment_owner_v3
-                require_actual_method_learning_attachment_owner_v3(owner,db=owner.db)
+                from .contact_host_stage_work_v3 import ContactHostStageReadWorkV3
+                if type(owner) is ContactHostStageReadWorkV3:
+                    from .contact_host_source_v3 import require_contact_host_work_v3
+                    require_contact_host_work_v3(owner,db=owner.db)
+                else:
+                    from .contact_domain_source_work_v3 import ContactDomainSourceReadV3
+                    if type(owner) is ContactDomainSourceReadV3:
+                        from .contact_domain_source_v3 import require_contact_domain_work_v3
+                        require_contact_domain_work_v3(owner,db=owner.db)
+                    else:
+                        from .current_method_learning_read_v3 import require_actual_method_learning_attachment_owner_v3
+                        from .owner_goal_projection_receipt_read_v1 import GoalProjectionReceiptReadWorkV1,require_goal_projection_receipt_read_work_v1
+                        if type(owner) is GoalProjectionReceiptReadWorkV1:
+                            require_goal_projection_receipt_read_work_v1(owner,db=owner.db)
+                        else:
+                            require_actual_method_learning_attachment_owner_v3(owner,db=owner.db)
         self.owner,self.request=owner,request
         self.table,self.columns,self.key_columns,self.key=request
         self.where=' AND '.join(name+'=?' for name in self.key_columns)
@@ -1344,7 +1358,9 @@ class _HostProducerAttachmentV3:
             self.small=dict(zip(self.metadata_columns,self.metadata))
             if self.table=='runtime_jobs':
                 from ..authority_service.current_authority_graph_read_v3 import AuthorityGraphReadWorkV3
-                if type(owner)is not AuthorityGraphReadWorkV3 or (self.small.get('bot_id'),self.small.get('persona_id'))!=owner.namespace.as_tuple:
+                from .contact_host_stage_work_v3 import ContactHostStageReadWorkV3
+                from .contact_domain_source_work_v3 import ContactDomainSourceReadV3
+                if type(owner) not in {AuthorityGraphReadWorkV3,ContactHostStageReadWorkV3,ContactDomainSourceReadV3} or (self.small.get('bot_id'),self.small.get('persona_id'))!=owner.namespace.as_tuple:
                     raise ValueError('Authority job canonical body crossed its actual namespace')
             self.pending=list(json_names)
             self.phase='columns';return
@@ -1746,10 +1762,31 @@ def bind_prepared_host_natural_producer_context_v3(graph,*,scope,prepared):
         typed_binding.__exit__(None,None,None)
         if observed is not None:_LIVE.pop(id(observed),None)
 
-_HOST_ATTACHMENT_SHAPES_V3=frozenset((('graph_atoms', ('revision', 'valid'), ('token',)), ('graph_atoms', ('revision', 'value', 'valid'), ('token',)), ('graph_atoms', ('revision', 'value', 'valid'), ('token', 'bot', 'persona')), ('graph_atoms', ('value',), ('token',)), ('graph_bundle_operations', ('activity_id',), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest',), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest', 'activity_id', 'effect_id', 'commit_seq'), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest', 'activity_id', 'effect_id', 'commit_seq', 'receipt_json'), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest', 'commit_seq'), ('bot', 'persona', 'operation_id')), ('graph_c04_adoption_provenance_v3', ('original_json', 'original_digest'), ('bot', 'persona', 'operation_id')), ('graph_c04_adoptions_v3', ('bundle_digest', 'plan_json', 'receipt_json'), ('bot', 'persona', 'operation_id')), ('graph_c04_association_inputs_v3', ('binding_digest', 'input_digest', 'algorithm_build_digest', 'work_json'), ('bot', 'persona', 'operation_id')), ('graph_c04_encoding_baselines_v3', ('joint_operation_id', 'original_json', 'original_digest', 'proof_json', 'proof_digest', 'as_known_at_json', 'historical_closure_digest', 'read_versions_json', 'read_versions_digest', 'encoding_receipt_digest', 'joint_receipt_digest', 'numeric_original_ref', 'numeric_original_revision', 'record_digest'), ('bot', 'persona', 'encoding_operation_id', 'source_ref')), ('graph_c04_internal_work_prepared_v1', ('binding_digest', 'prepared_digest', 'prepared_json'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_advances_v2', ('evidence_digest',), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_advances_v2', ('evidence_json', 'evidence_digest', 'bundle_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_numeric_originals_v1', ('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_numeric_originals_v1', ('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest', 'evidence_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_output_originals_v1', ('evidence_digest', 'original_json', 'original_digest', 'write_set_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_originals_v3', ('payload_json', 'payload_digest'), ('bot', 'persona', 'kind', 'original_ref')), ('graph_d11_life_originals_v1', ('payload_json', 'payload_digest', 'producing_operation_id'), ('bot', 'persona', 'kind', 'original_ref')), ('graph_d11_life_originals_v1', ('producing_operation_id', 'payload_json', 'payload_digest', 'signature'), ('bot', 'persona', 'kind', 'original_ref')), ('graph_domain_production_originals_v1', ('domain', 'operation_kind', 'request_digest', 'original_digest', 'original_payload_json', 'read_versions_json', 'bundle_digest', 'receipt_json', 'receipt_digest'), ('bot', 'persona', 'operation_id')), ('graph_events', ('reads', 'revisions', 'epoch_revision'), ('bot', 'persona', 'session', 'event_id')), ('graph_events', ('reads', 'revisions', 'epoch_revision', 'invalidated'), ('bot', 'persona', 'session', 'event_id')), ('graph_events', ('revisions', 'invalidated', 'epoch_revision'), ('bot', 'persona', 'session', 'event_id')), ('graph_history', ('dependencies',), ('token', 'revision', 'event_id')), ('graph_history', ('event_id', 'value', 'valid'), ('token', 'revision')), ('graph_history', ('value', 'valid'), ('token', 'revision')), ('graph_history', ('value', 'valid'), ('token', 'revision', 'event_bot', 'event_persona', 'event_session', 'event_id')), ('graph_history', ('value', 'valid', 'event_bot', 'event_persona', 'event_id'), ('token', 'revision'))))
+_HOST_ATTACHMENT_SHAPES_V3=frozenset((('graph_contact_segment_originals_v1',('bot','persona','contact_id','segment_index','operation_id','effect_id','payload_json','payload_digest','signature'),('bot','persona','contact_id','segment_index')),('graph_contact_effect_originals_v1',('payload_json','payload_digest','signature'),('bot','persona','kind','original_ref')),('graph_contact_effect_accounting_attempts_v1',('origin_digest','fact_digest','request_json','state'),('bot','persona','operation_id')),('graph_owner_domain_attempts_v3',('request_digest','attempt_id','permit_json'),('bot','persona','operation_id')),('runtime_budget_reservations',('digest','ceiling_json','actual_json','state'),('lease_id','operation_id')),('graph_atoms', ('revision', 'valid'), ('token',)), ('graph_atoms', ('revision', 'value', 'valid'), ('token',)), ('graph_atoms', ('revision', 'value', 'valid'), ('token', 'bot', 'persona')), ('graph_atoms', ('value',), ('token',)), ('graph_bundle_operations', ('activity_id',), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest',), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest', 'activity_id', 'effect_id', 'commit_seq'), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest', 'activity_id', 'effect_id', 'commit_seq', 'receipt_json'), ('bot', 'persona', 'operation_id')), ('graph_bundle_operations', ('digest', 'commit_seq'), ('bot', 'persona', 'operation_id')), ('graph_c04_adoption_provenance_v3', ('original_json', 'original_digest'), ('bot', 'persona', 'operation_id')), ('graph_c04_adoptions_v3', ('bundle_digest', 'plan_json', 'receipt_json'), ('bot', 'persona', 'operation_id')), ('graph_c04_association_inputs_v3', ('binding_digest', 'input_digest', 'algorithm_build_digest', 'work_json'), ('bot', 'persona', 'operation_id')), ('graph_c04_encoding_baselines_v3', ('joint_operation_id', 'original_json', 'original_digest', 'proof_json', 'proof_digest', 'as_known_at_json', 'historical_closure_digest', 'read_versions_json', 'read_versions_digest', 'encoding_receipt_digest', 'joint_receipt_digest', 'numeric_original_ref', 'numeric_original_revision', 'record_digest'), ('bot', 'persona', 'encoding_operation_id', 'source_ref')), ('graph_c04_internal_work_prepared_v1', ('binding_digest', 'prepared_digest', 'prepared_json'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_advances_v2', ('evidence_digest',), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_advances_v2', ('evidence_json', 'evidence_digest', 'bundle_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_numeric_originals_v1', ('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_numeric_originals_v1', ('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest', 'evidence_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_joint_output_originals_v1', ('evidence_digest', 'original_json', 'original_digest', 'write_set_digest'), ('bot', 'persona', 'operation_id')), ('graph_d04_originals_v3', ('payload_json', 'payload_digest'), ('bot', 'persona', 'kind', 'original_ref')), ('graph_d11_life_originals_v1', ('payload_json', 'payload_digest', 'producing_operation_id'), ('bot', 'persona', 'kind', 'original_ref')), ('graph_d11_life_originals_v1', ('producing_operation_id', 'payload_json', 'payload_digest', 'signature'), ('bot', 'persona', 'kind', 'original_ref')), ('graph_domain_production_originals_v1', ('domain', 'operation_kind', 'request_digest', 'original_digest', 'original_payload_json', 'read_versions_json', 'bundle_digest', 'receipt_json', 'receipt_digest'), ('bot', 'persona', 'operation_id')), ('graph_events', ('reads', 'revisions', 'epoch_revision'), ('bot', 'persona', 'session', 'event_id')), ('graph_events', ('reads', 'revisions', 'epoch_revision', 'invalidated'), ('bot', 'persona', 'session', 'event_id')), ('graph_events', ('revisions', 'invalidated', 'epoch_revision'), ('bot', 'persona', 'session', 'event_id')), ('graph_history', ('dependencies',), ('token', 'revision', 'event_id')), ('graph_history', ('event_id', 'value', 'valid'), ('token', 'revision')), ('graph_history', ('value', 'valid'), ('token', 'revision')), ('graph_history', ('value', 'valid'), ('token', 'revision', 'event_bot', 'event_persona', 'event_session', 'event_id')), ('graph_history', ('value', 'valid', 'event_bot', 'event_persona', 'event_id'), ('token', 'revision'))))
+
+
+_HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset({
+    ('runtime_budget_leases',('lease_id','parent_id','bot_id','persona_id','currency','limits_json','used_json','reserved_json','unconfirmed_json','version','state'),('lease_id',)),
+    ('runtime_budget_grants',('grant_json','signature'),('lease_id','version')),
+    ('runtime_budget_operations',('receipt_json',),('bot_id','persona_id','operation_id','phase')),
+    ('runtime_budget_operations',('digest','lease_id','receipt_json'),('bot_id','persona_id','operation_id','phase')),
+    ('runtime_budget_reservations',('state','digest'),('lease_id','operation_id')),
+    ('runtime_budget_reservations',('ceiling_json','state','actual_json'),('lease_id','operation_id')),
+    ('graph_original_model_cost_attempts_v1',('state','attempt_id'),('bot','persona','call_id')),
+})
 
 
 def _producer_original_point_v3(db,*,table,columns,key_columns,key,legacy_reader):
+    from ..authority_service.named_joint_binding_body_v1 import named_joint_core_point_v1
+    named, row = named_joint_core_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if named:return row
+    from .current_life_numeric_accounting_v3 import numeric_accounting_current_point_v3
+    numeric,row=numeric_accounting_current_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if numeric:return row
+    from .contact_domain_source_work_v3 import contact_domain_original_point_v3
+    contact,row = contact_domain_original_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if contact:
+        return row
     from .current_method_learning_read_v3 import read_bound_method_learning_attachment_v3
     handled,row=read_bound_method_learning_attachment_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if handled:return row
@@ -1771,12 +1808,21 @@ def _producer_original_point_v3(db,*,table,columns,key_columns,key,legacy_reader
             if any(data.get(name)!=value for name,value in original_keys.items()):return None
             return tuple(data[name]for name in original_columns)
         return row
+    from .contact_host_stage_work_v3 import contact_host_original_point_v3
+    handled,row=contact_host_original_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if handled:return row
     from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_graph_attachment_v3
     handled,row=read_bound_authority_graph_attachment_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if handled:return row
     handled,row=_read_host_natural_attachment_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
     return row if handled else legacy_reader()
 
+
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
+    ("graph_owner_goal_cancellation_projections_v1",("bot","persona","operation_id","goal_ref","root_registration_ref","core_original_ref","core_original_digest","observation_json","observation_digest","receipt_json","receipt_digest","signature"),("bot","persona","goal_ref","root_registration_ref")),
+    ("graph_events",("digest",),("bot","persona","session","event_id")),
+    ("graph_owner_domain_attempts_v3",("request_digest","attempt_id","anchor_json","graph_revision","graph_epoch","permit_json","receipt_json"),("bot","persona","operation_id")),
+})
 
 _HOST_ATTACHMENT_SCANS_V3=frozenset({
     ('graph_d11_life_originals_v1',('original_ref',),('bot','persona','kind'),'original_ref'),
@@ -1816,6 +1862,14 @@ class _HostProducerMetadataScanV3:
 
 
 def _producer_original_many_v3(db,*,table,columns,key_columns,key,order_column,legacy_reader):
+    from .artifact_borrowed_source_v3 import read_bound_artifact_borrowed_dependencies_v3
+    artifact,rows=read_bound_artifact_borrowed_dependencies_v3(db,table=table,columns=columns,
+        key_columns=key_columns,key=key,order_column=order_column)
+    if artifact:return rows
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_dependencies_v3
+    native,rows=read_bound_native_numeric_dependencies_v3(db,table=table,columns=columns,
+        key_columns=key_columns,key=key,order_column=order_column)
+    if native:return rows
     from .domain_background_read_v3 import read_bound_background_graph_attachment_rows_v3
     background,rows=read_bound_background_graph_attachment_rows_v3(db,table=table,columns=columns,
         key_columns=key_columns,key=key,order_column=order_column)
@@ -1864,6 +1918,11 @@ def _series_adoption_refs_v3(db,namespace,operation_id):
     return result
 
 _HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset({
+    ("graph_d07_attention_issuance_v1", ("source_ref", "c02_operation_id", "bundle_digest"), ("bot", "persona", "operation_id")),
+    ("graph_d07_execution_originals_v1", ("payload_json", "payload_digest", "signature"), ("bot", "persona", "kind", "original_ref")),
+    ("graph_d10_production_inputs_v1", ("kind", "producing_operation_id", "payload_json", "payload_digest", "signature"), ("bot", "persona", "original_ref")),
+    ("graph_d08_joint_node_originals_v1", ("kind", "producing_operation_id", "payload_json", "payload_digest", "signature"), ("bot", "persona", "original_ref")),
+    ("graph_d08_joint_node_originals_v1", ("payload_json",), ("bot", "persona", "original_ref")),
     ('graph_atoms',('revision','value','valid'),('token','bot','persona')),
     ('graph_history',('event_id','value','valid','event_bot','event_persona','event_session','dependencies'),('token','revision')),
     ('graph_recovery_metadata_v2', ('schema', 'requirements_json', 'graph_revision'), ('bot', 'persona')),
@@ -1979,3 +2038,68 @@ _HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset((('graph_recover
 _HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset((('graph_context_reply_call_bindings_v2', ('acquire_operation_id', 'call_id', 'worker_fence', 'original_seal_digest', 'frozen_request_digest', 'model_call_request_digest', 'model_call_request_json'), ('bot', 'persona', 'original_operation_id')),))
 
 _HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset((('graph_events', ('digest', 'epoch_revision'), ('bot', 'persona', 'session', 'event_id')),))
+
+
+# Fixed Contact immutable-original families share the existing whole-column EOF reader.
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
+    ("graph_contact_expression_plan_originals_v2",("bot","persona","contact_id","payload_json","payload_digest","signature"),("bot","persona","contact_id")),
+    ("graph_contact_model_originals_v2",("payload_json","payload_digest","signature"),("bot","persona","kind","original_ref")),
+    ("runtime_budget_reservations",("digest","ceiling_json","state"),("lease_id","operation_id")),
+    ("graph_bundle_operations",("receipt_json","activity_id","commit_seq"),("bot","persona","operation_id")),
+    ("runtime_budget_operations",("receipt_json",),("bot_id","persona_id","operation_id","phase")),
+    ("graph_events",("revisions","invalidated","epoch_revision"),("bot","persona","session","event_id")),
+    ("graph_bundle_operations",("receipt_json",),("bot","persona","operation_id")),
+    ("graph_bundle_operations",("digest","activity_id","effect_id","commit_seq","receipt_json"),("bot","persona","operation_id")),
+    ("graph_original_model_cost_attempts_v1",("state","attempt_id"),("bot","persona","call_id")),
+    ("graph_events",("reads","revisions","epoch_revision"),("bot","persona","session","event_id")),
+    ("runtime_budget_operations",("digest",),("bot_id","persona_id","operation_id","phase")),
+})
+
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
+    ('graph_events',('epoch_revision',),('bot','persona','session','event_id')),
+    ('runtime_budget_grants',('grant_json','signature'),('lease_id','version')),
+    ('graph_d10_production_inputs_v1',('kind','producing_operation_id','payload_json','payload_digest','signature'),('bot','persona','original_ref')),
+    ('graph_contact_prospective_originals_v1',('bot','persona','contact_id','birth_operation_id','payload_json','payload_digest','signature','original_ref'),('bot','persona','original_ref')),
+    ('graph_contact_prospective_originals_v1',('bot','persona','contact_id','birth_operation_id','payload_json','payload_digest','signature','original_ref'),('bot','persona','contact_id')),
+    ('graph_owner_domain_attempts_v3',('request_digest','attempt_id','graph_revision','graph_epoch','permit_json','receipt_json'),('bot','persona','operation_id')),
+    ('runtime_resource_quotes',('status',),('quote_id','version')),
+    ('graph_domain_production_outbox_v1',('causal_operation_id','event_kind','original_ref','original_digest','state'),('bot','persona','dedupe_key')),
+    ('graph_recovery_metadata_v2',('requirements_json','graph_revision'),('bot','persona')),
+})
+
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
+    ("runtime_budget_reservations",("state",),("lease_id","operation_id")),
+    ("graph_atoms",("value","valid"),("token",)),
+})
+
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
+    ('graph_events',('reads','revisions','invalidated','epoch_revision'),('bot','persona','session','event_id')),
+})
+
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset((("graph_atoms",("revision","value","valid"),("token",)),("graph_atoms",("value","valid"),("token",)),("runtime_budget_operations",("receipt_json",),("bot_id","persona_id","operation_id","phase")),("graph_atoms",("revision",),("token",)),("graph_atoms",("revision",),("token",)),("graph_bundle_operations",("receipt_json","commit_seq"),("bot","persona","operation_id")),("graph_atoms",("value","valid"),("token",)),("runtime_budget_operations",("receipt_json",),("bot_id","persona_id","operation_id","phase"))))
+
+
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({('runtime_jobs',('job_id','operation_id','activity_id','bot_id','persona_id','work_kind','phase','deadline_utc','lease_expires_utc','budget_ref'),('job_id',))})
+
+# Exact InternalLife originals share the metered complete-column reader.
+_HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
+    ('graph_internal_life_content_originals_v1', ('payload_json','payload_digest','signature'),
+        ('bot','persona','kind','original_ref')),
+    ('graph_internal_life_worker_originals_v2', ('payload_json','payload_digest','signature'),
+        ('bot','persona','kind','job_id')),
+    ('runtime_budget_operations', ('digest',), ('bot_id','persona_id','operation_id','phase')),
+    ("graph_atoms", ("value",), ("token",)),
+    ("graph_d11_life_originals_v1", ("producing_operation_id", "payload_json", "payload_digest", "signature"), ("bot", "persona", "kind", "original_ref")),
+    ("graph_events", ("reads", "revisions", "epoch_revision", "invalidated"), ("bot", "persona", "session", "event_id")),
+    ("graph_bundle_fences_v2", ("permit_json", "pre_graph_revision", "pre_graph_epoch", "post_graph_revision", "post_graph_epoch", "finish_request_id", "finish_request_digest"), ("bot", "persona", "operation_id")),
+    ("runtime_budget_operations", ("digest", "lease_id", "resolution_binding_json"), ("bot_id", "persona_id", "operation_id", "phase")),
+    ("graph_d11_life_originals_v1", ("producing_operation_id", "payload_json", "payload_digest", "signature"), ("bot", "persona", "kind", "original_ref")),
+    ("runtime_budget_operations", ("receipt_json",), ("bot_id", "persona_id", "operation_id", "phase")),
+    ("runtime_budget_reservations", ("digest", "ceiling_json"), ("lease_id", "operation_id")),
+    ("runtime_budget_operations", ("digest", "lease_id", "receipt_json"), ("bot_id", "persona_id", "operation_id", "phase")),
+    ("runtime_budget_reservations", ("ceiling_json", "state", "actual_json"), ("lease_id", "operation_id")),
+    ("d02_body_quotes_v1", ("quote_version", "policy_id", "policy_version", "operation_id", "resource_quote_digest", "body_quote_json", "signature"), ("bot", "persona", "quote_id")),
+})
+_HOST_ATTACHMENT_SCANS_V3 = _HOST_ATTACHMENT_SCANS_V3 | frozenset({
+    ('graph_dependencies', ('dependency_token','dependency_revision'), ('dependent_token',), 'dependency_token'),
+})

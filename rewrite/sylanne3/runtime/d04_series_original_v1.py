@@ -15,6 +15,9 @@ from .d04_appraisal_driver_v3 import read_d04_original_v3
 
 def require_series_adopted_original_v1(db, namespace, operation_id):
     """Use one actual read snapshot, or the caller's existing transaction."""
+    from .current_life_numeric_native_read_v3 import read_bound_native_nonseries_original_v3
+    handled,value=read_bound_native_nonseries_original_v3(db,namespace,operation_id)
+    if handled:return value
     from .d04_series_initial_original_v1 import d04_series_original_read_scope_v1
     if db.in_transaction:
         with d04_series_original_read_scope_v1(db) as scope:

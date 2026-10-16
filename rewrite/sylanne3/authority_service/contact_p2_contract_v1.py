@@ -60,6 +60,8 @@ class ContactP2PolicyCapsuleV1:
 
 
 def contact_p2_policy_capsule_to_wire_v1(value):
+    from .contact_continuation_p2_contract_v1 import ContactContinuationP2PolicyCapsuleV1,contact_continuation_p2_capsule_to_wire_v1
+    if type(value)is ContactContinuationP2PolicyCapsuleV1:return contact_continuation_p2_capsule_to_wire_v1(value)
     if type(value) is not ContactP2PolicyCapsuleV1:
         raise TypeError("actual Contact P2 policy capsule required")
     raw=asdict(value)
@@ -68,6 +70,9 @@ def contact_p2_policy_capsule_to_wire_v1(value):
 
 
 def contact_p2_policy_capsule_from_wire_v1(raw):
+    if type(raw)is dict and raw.get('schema')=='sylanne.contact-continuation-p2-current-policy-capsule.v1':
+        from .contact_continuation_p2_contract_v1 import contact_continuation_p2_capsule_from_wire_v1
+        return contact_continuation_p2_capsule_from_wire_v1(raw)
     if type(raw) is not dict or set(raw)!=set(ContactP2PolicyCapsuleV1.__dataclass_fields__):
         raise ValueError("exact Contact P2 policy capsule wire required")
     data=dict(raw);data["namespace"]=NamespaceId(**data["namespace"])
@@ -79,8 +84,12 @@ def contact_p2_policy_capsule_from_wire_v1(raw):
 
 
 def require_exact_contact_p2_policy_capsule_v1(context,binding,claimed,witness,snapshot,capsule):
+    from .contact_continuation_p2_contract_v1 import ContactContinuationP2PolicyCapsuleV1,require_exact_contact_continuation_p2_capsule_v1
+    if type(capsule)is ContactContinuationP2PolicyCapsuleV1:
+        return require_exact_contact_continuation_p2_capsule_v1(context,binding,claimed,witness,snapshot,capsule)
     from .v2_contract import canonical_digest as authority_digest
     if (type(capsule) is not ContactP2PolicyCapsuleV1 or binding.origin.proactive_contact is not True
+            or binding.origin.segment_index != 0
             or capsule.installation_id!=witness.guard.installation_id
             or capsule.namespace!=witness.guard.namespace
             or capsule.graph_incarnation!=binding.graph_incarnation

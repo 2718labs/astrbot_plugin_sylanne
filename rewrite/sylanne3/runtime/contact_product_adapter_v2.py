@@ -87,17 +87,17 @@ def read_plan_contact_model_v2(db, *, namespace, activity_id, operation_kind, re
     from .d11_types import runtime_job_key
     if type(request) is not PrepareCurrentContactModelRequestV2:
         raise TypeError("Contact V2 exact paid locator request required")
-    saved = db.execute(f"SELECT payload_json FROM {PLAN_TABLE} WHERE bot=? AND persona=? AND contact_id=?",
-        (*namespace.as_tuple, request.contact_id)).fetchone()
-    if saved is None:
-        raise MissingProductionOriginalV1("actual_adopted_contact_plan_v2")
-    plan, expression, proof = validate_contact_plan_original_payload_v2(json.loads(saved[0]))
-    ids = contact_model_ids_v2(plan, request.phase)
-    keys = [owner_grant_key(*namespace.as_tuple), *contact_plan_keys_v2(plan),
-        runtime_job_key(*namespace.as_tuple, plan.activity_id, ids["job"])]
-    keys.extend(AtomKey.from_token(row.ref) for row in proof.historical_reads)
-    roots = tuple(row.ref for row in proof.historical_reads
-        if AtomKey.from_token(row.ref).type_name == "memory.source" and row.revision > 0)
+    from .domain_background_read_v3 import require_background_contact_source_component_v3
+    component = require_background_contact_source_component_v3(db,namespace,request.contact_id,
+        'contact_generation_preparation' if request.phase=='contact_generation' else 'contact_review_preparation')
+    from ..domains.d08.contact_plan_v2 import decode_contact_plan_v2
+    from ..domains.d08.contact_plan_v3 import contact_plan_keys_v3
+    plan = decode_contact_plan_v2(component.contact_locator.plan_metadata)
+    ids = contact_model_ids_v2(plan,request.phase)
+    keys = [owner_grant_key(*namespace.as_tuple),*contact_plan_keys_v2(plan),*contact_plan_keys_v3(plan)[1:],
+        runtime_job_key(*namespace.as_tuple,plan.activity_id,ids['job'])]
+    keys.extend(AtomKey.from_token(ref) for ref,_,_ in component.contact_locator.historical_read_metadata)
+    roots = component.source_selection.roots
     if request.phase == "contact_review":
         generation = contact_model_ids_v2(plan, "contact_generation")
         keys.append(runtime_job_key(*namespace.as_tuple, plan.activity_id, generation["job"]))

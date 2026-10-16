@@ -25,6 +25,7 @@ from .model_workflows_v4 import AdminModelWorkflowsV4
 from .model_workflows_v5 import AdminModelWorkflowsV5
 from .model_workflows_v6 import AdminModelWorkflowsV6
 from .model_workflows_v7 import AdminModelWorkflowsV7
+from .model_workflows_v8 import AdminModelWorkflowsV8
 from ..runtime_contracts import canonical_digest
 
 
@@ -170,6 +171,8 @@ class WebuiConfigurationV1:
 
     def _public_model_slots(self):
         workflows = None if self._bundle is None else self._bundle.model_workflows
+        if type(workflows) is AdminModelWorkflowsV8:
+            return (*SLOTS, "d07_relationship_cognition", "growth_cognition", "general_growth_cognition")
         if type(workflows) in {AdminModelWorkflowsV6,AdminModelWorkflowsV7}:
             return (*SLOTS, "d07_relationship_cognition", "growth_cognition")
         return (*SLOTS, "d07_relationship_cognition") if type(workflows) is AdminModelWorkflowsV5 else SLOTS
@@ -178,7 +181,7 @@ class WebuiConfigurationV1:
         if self._bundle is None:
             return {}
         workflows = self._bundle.model_workflows
-        if type(workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+        if type(workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
             return {slot: getattr(workflows, slot, None) for slot in self._public_model_slots()}
         return {"reply": self._bundle.ingress_model} if self._bundle.ingress_model is not None else {}
 
@@ -188,7 +191,7 @@ class WebuiConfigurationV1:
         for slot in self._public_model_slots():
             current = installed.get(slot)
             provider_id = values["llm_provider_id"] if slot == "reply" else (
-                ("" if slot in {"d07_relationship_cognition", "growth_cognition"} else selection["overrides"][slot]) or selection["auxiliary_provider_id"] or
+                ("" if slot in {"d07_relationship_cognition", "growth_cognition", "general_growth_cognition"} else selection["overrides"][slot]) or selection["auxiliary_provider_id"] or
                 (current.provider_id if current is not None else ""))
             observed = observe_host_model_selection_v1(
                 context=self._context, authority_profile=values["authority_profile"],

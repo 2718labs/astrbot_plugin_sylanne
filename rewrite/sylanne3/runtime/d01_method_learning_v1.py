@@ -201,9 +201,12 @@ def continuity_question_v1(trial, evaluations):
 
 def _stage(frame, kind, request, *, writes=(), provenance=None, missing=()):
     provider = PersonaDomain()
+    if kind==REVIEW:
+        provenance={**provenance,"conditioned_source_roots":frame.envelope.source_qualification.source_refs,"conditioned_original_deadline_utc":frame.envelope.deadline_utc}
     return stage_result_v1(frame, "d01", kind, request, writes=writes, provenance=provenance,
         coverage="complete" if not missing else "partial", missing=missing,
-        receiver_events=(("d08", "method_learning_changed_requires_choice_recheck"),) if writes else (),
+        receiver_events=(("d08", "method_learning_changed_requires_choice_recheck"),
+            *((("d01","conditioned_method_review_committed_v1"),)if kind==REVIEW and not missing else())) if writes else (),
         proposal_schema="d01.proposal.v1", proposal_hash=provider.descriptor.request_schema_hash)
 
 
@@ -629,6 +632,17 @@ def read_current_method_trial_projection_v1(db, read, *, persona_plan, goal_ref)
         raise MissingProductionOriginalV1("unique_current_scoped_method_trial")
     return choices[0] if choices else None
 
+def method_trial_locator_inputs_v3(trials):
+    """Compose exact trial locators from metadata; this grants no body access."""
+    keys, roots, originals = [], [], []
+    for ref, source_refs, protocol_ref, gp1_ref, proposal_ref, protocol_source_refs in trials:
+        keys.extend(AtomKey.from_token(value) for value in (ref, protocol_ref, gp1_ref))
+        roots.extend(source_refs); originals.append(gp1_ref)
+        if proposal_ref is not None:keys.append(AtomKey.from_token(proposal_ref))
+        roots.extend(protocol_source_refs)
+    return (TRIAL_TYPE,), keys, roots, originals
+
+
 def method_trial_read_inputs_v1(db, namespace):
     """Bounded locator expansion; the installed stage authenticates each candidate."""
     if runtime_storage_v3(db) is not None:
@@ -638,21 +652,19 @@ def method_trial_read_inputs_v1(db, namespace):
             (*namespace.as_tuple, TRIAL_TYPE)).fetchall()
     if len(rows) > 128:
         raise MissingProductionOriginalV1("complete_scoped_method_trial_inventory")
-    keys, roots, originals = [], [], []
+    locators = []
     for ref, revision, raw in rows:
-        value = json.loads(raw); keys.append(AtomKey.from_token(ref)); roots.extend(value["source_refs"])
-        keys.extend(AtomKey.from_token(value[name]) for name in ("protocol_ref", "gp1_interpretation_ref"))
-        originals.append(value["gp1_interpretation_ref"])
+        value = json.loads(raw)
         history = _method_history(db, namespace, AtomKey.from_token(ref), revision)
         if history is None or history[1:] != (raw, 1):
             raise MissingProductionOriginalV1("actual_scoped_method_trial_head_history")
         original = None if history is None else read_adopted_domain_operation_v1(db, namespace, history[0])
-        if original and original["operation_kind"] == REGISTER_TRIAL_V2:
-            proposal_ref = original["payload"]["provenance"]["proposal_ref"]
-            keys.append(AtomKey.from_token(proposal_ref))
+        proposal_ref = (original["payload"]["provenance"]["proposal_ref"]
+            if original and original["operation_kind"] == REGISTER_TRIAL_V2 else None)
         protocol = _method_value(db, namespace, AtomKey.from_token(value["protocol_ref"]))
-        if protocol: roots.extend(protocol["source_refs"])
-    return (TRIAL_TYPE,), keys, roots, originals
+        locators.append((ref, value["source_refs"], value["protocol_ref"], value["gp1_interpretation_ref"],
+            proposal_ref, protocol["source_refs"] if protocol else ()))
+    return method_trial_locator_inputs_v3(locators)
 
 
 def read_plan_current_method_learning_v1(db, *, namespace, activity_id, operation_kind, request, installed_readers):

@@ -3,6 +3,7 @@
 The original progress schema is unchanged. These finite companions bind the
 actual Life terminal proof; their decoding never grants current permission.
 """
+from .natural_producer_qualification_v1 import _producer_original_point_v3, _producer_original_many_v3
 from dataclasses import dataclass
 import json
 
@@ -145,8 +146,10 @@ def validate_life_progress_provenance_history_v1(db,*,prepared,terminal,progress
     versions={v.key:v.revision for v in production['receipt'].write_versions}
     proof=writes[1].value
     from .d11_life_contract_v1 import life_adoption_operation_id_v1
-    end=db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',
-        (proof['terminal_provenance_ref'],)).fetchone()
+    end = _producer_original_point_v3(db, table='graph_history', columns=('value','valid','event_id'),
+        key_columns=('token','revision'), key=(proof['terminal_provenance_ref'],1),
+        legacy_reader=lambda: db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',
+            (proof['terminal_provenance_ref'],)).fetchone())
     if end!=(canonical_serialize(proof['terminal_provenance']),1,life_adoption_operation_id_v1(prepared.binding)):
         raise ValueError('Life progress lost its actual historical terminal proof')
     current_reads=life_current_fact_reads_v1(prepared)
@@ -154,8 +157,11 @@ def validate_life_progress_provenance_history_v1(db,*,prepared,terminal,progress
     for write in writes:
         deps=tuple(sorted((key.token,1 if key in produced else next(row.revision for row in current_reads if row.ref==key.token))
             for key in write.dependencies))
-        historical=db.execute('SELECT value,valid,event_bot,event_persona,event_id,dependencies FROM graph_history '
-            'WHERE token=? AND revision=1',(write.key.token,)).fetchone()
+        historical = _producer_original_point_v3(db, table='graph_history',
+            columns=('value','valid','event_bot','event_persona','event_id','dependencies'),
+            key_columns=('token','revision'), key=(write.key.token,1),
+            legacy_reader=lambda: db.execute('SELECT value,valid,event_bot,event_persona,event_id,dependencies FROM graph_history '
+                'WHERE token=? AND revision=1',(write.key.token,)).fetchone())
         if (versions.get(write.key)!=1 or historical is None or historical[:5]!=
                 (canonical_serialize(write.value),1,*ns.as_tuple,operation)
                 or tuple(sorted(tuple(pair) for pair in json.loads(historical[5])))!=deps):
@@ -169,15 +175,23 @@ def life_progress_current_read_inputs_v1(db,namespace,progress_ref):
     if fact.type_name!='d10.life_progress.v1' or NamespaceId.from_key(fact)!=namespace:
         raise ValueError('Life current progress read scope differs')
     proof_key=life_progress_auxiliary_key_v1(fact,PROVENANCE_TYPE)
-    row=db.execute('SELECT value,valid FROM graph_atoms WHERE token=?',(proof_key.token,)).fetchone()
+    row = _producer_original_point_v3(db,table='graph_atoms',columns=('value','valid'),
+        key_columns=('token',),key=(proof_key.token,),
+        legacy_reader=lambda: db.execute('SELECT value,valid FROM graph_atoms WHERE token=?',(proof_key.token,)).fetchone())
     if row is None or row[1]!=1:raise ValueError('legacy Life progress lacks typed current provenance; HOLD')
     proof=decode_life_progress_auxiliary_v1(PROVENANCE_TYPE,json.loads(row[0]));b=proof.terminal_provenance.binding
     if proof.fact_ref!=progress_ref or b.namespace!=namespace:raise ValueError('Life progress actual proof scope differs')
     from .d11_life_preparation_v1 import TABLE,life_prepared_from_wire_v1
-    prepared_row=db.execute('SELECT payload_json FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
-        (*namespace.as_tuple,'prepared',b.prepared_original_ref)).fetchone()
+    prepared_row = _producer_original_point_v3(db,table=TABLE,
+        columns=('producing_operation_id','payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'),
+        key=(*namespace.as_tuple,'prepared',b.prepared_original_ref),
+        legacy_reader=lambda: db.execute(
+            'SELECT producing_operation_id,payload_json,payload_digest,signature FROM '+TABLE+
+            ' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
+            (*namespace.as_tuple,'prepared',b.prepared_original_ref)).fetchone())
     if prepared_row is None:raise ValueError('Life progress actual prepared read original is absent')
-    prepared=life_prepared_from_wire_v1(json.loads(prepared_row[0]))
+    prepared=life_prepared_from_wire_v1(json.loads(prepared_row[1]))
     if prepared.binding!=b or prepared.digest!=proof.terminal_provenance.prepared_digest:
         raise ValueError('Life progress typed prepared read scope differs')
     from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
@@ -210,7 +224,9 @@ def require_current_life_progress_v1(db,*,namespace,progress,issuer,read):
     for key in keys:read.head(db,key,required=False)
     for audience in prepared.plan.audiences:
         for purpose in ('context','consolidation'):read.source_family(db,roots,purpose=purpose,audience=audience)
-    row=db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(fact.token,)).fetchone()
+    row = _producer_original_point_v3(db, table='graph_history', columns=('value','valid','event_id'),
+        key_columns=('token','revision'), key=(fact.token,1),
+        legacy_reader=lambda: db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(fact.token,)).fetchone())
     if row is None:raise ValueError('Life progress has no actual committed historical fact')
     operation=row[2];production=read_adopted_domain_operation_v1(db,namespace,operation)
     if (production is None or production['domain']!='d10' or production['operation_kind']!='advance_life'
@@ -221,15 +237,22 @@ def require_current_life_progress_v1(db,*,namespace,progress,issuer,read):
     versions={v.key:v.revision for v in production['receipt'].write_versions}
     for write in writes:
         expected=(1,canonical_serialize(write.value),1)
-        if (versions.get(write.key)!=1 or db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',
-                (write.key.token,)).fetchone()!=expected or db.execute(
-                'SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(write.key.token,)).fetchone()!=
-                (expected[1],1,operation)):
+        actual = _producer_original_point_v3(db, table='graph_atoms', columns=('revision','value','valid'),
+            key_columns=('token',), key=(write.key.token,), legacy_reader=lambda: db.execute(
+                'SELECT revision,value,valid FROM graph_atoms WHERE token=?',(write.key.token,)).fetchone())
+        historical = _producer_original_point_v3(db, table='graph_history', columns=('value','valid','event_id'),
+            key_columns=('token','revision'), key=(write.key.token,1), legacy_reader=lambda: db.execute(
+                'SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(write.key.token,)).fetchone())
+        if (versions.get(write.key)!=1 or actual!=expected or historical!=(expected[1],1,operation)):
             raise ValueError('Life current progress/proof/eligibility differs from actual adopted members')
     expected=tuple(sorted((key.token,1 if key in {writes[0].key,writes[1].key,AtomKey.from_token(writes[2].value['terminal_eligibility_ref'])}
         else next(row.revision for row in life_current_fact_reads_v1(prepared) if row.ref==key.token)) for key in writes[2].dependencies))
-    if tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',
-            (writes[2].key.token,)))!=expected:raise ValueError('Life progress actual current invalidation edges differ')
+    dependencies = _producer_original_many_v3(db, table='graph_dependencies',
+        columns=('dependency_token','dependency_revision'), key_columns=('dependent_token',),
+        key=(writes[2].key.token,), order_column='dependency_token',
+        legacy_reader=lambda: tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',
+            (writes[2].key.token,))))
+    if tuple(dependencies)!=expected:raise ValueError('Life progress actual current invalidation edges differ')
     return prepared,terminal,production
 
 
@@ -240,9 +263,14 @@ def require_life_experience_access_edges_v1(db,*,prepared,source):
     expected=tuple(sorted((key.token,1 if key in {source,life_fact_auxiliary_key_v1(
         life_role_segment_key_v1(prepared.binding,'end'),END_ELIGIBILITY)} else
         next(row.revision for row in life_current_fact_reads_v1(prepared) if row.ref==key.token)) for key in deps))
-    row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(access.token,)).fetchone()
+    row = _producer_original_point_v3(db, table='graph_atoms', columns=('revision','value','valid'),
+        key_columns=('token',), key=(access.token,), legacy_reader=lambda: db.execute(
+            'SELECT revision,value,valid FROM graph_atoms WHERE token=?',(access.token,)).fetchone())
+    dependencies = _producer_original_many_v3(db, table='graph_dependencies',
+        columns=('dependency_token','dependency_revision'), key_columns=('dependent_token',),
+        key=(access.token,), order_column='dependency_token', legacy_reader=lambda: tuple(db.execute(
+            'SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',(access.token,))))
     if (row is None or row[0]!=1 or row[2]!=1 or json.loads(row[1])['status']!='active'
-            or tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',
-                (access.token,)))!=expected):
+            or tuple(dependencies)!=expected):
         raise ValueError('Life experience access/current invalidation edges differ')
     return access

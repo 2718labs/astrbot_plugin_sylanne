@@ -6,8 +6,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 
-from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec
-from ...runtime_contracts import CheckReceipt, DomainProposal, canonical_digest, schema_hash
+from ...graph_types import AtomKey, GraphWrite, GraphVersion, Owner, TypeSpec
+from ...runtime_contracts import NamespaceId, CheckReceipt, DomainProposal, canonical_digest, schema_hash
+from ..d07.prediction_v1 import ConditionMatchProjectionV1
 from ...runtime.domain_production_contracts_v1 import ProductionOriginalRefV1, StagedDomainOperationV1
 from ..d01.production_operations_v1 import plain_v1, require_locator_v1, stage_result_v1
 from . import ActivityOutcome, ActivityRecipe, LifeDomain, LifeProject
@@ -143,7 +144,7 @@ def d10_production_type_specs_v1():
             schema_hash=schema_hash({"d10.offline_checkpoint.v1": 1})),
         TypeSpec("d10.offline_simulated_occurrence.v1", ("activity",), "state", occurrence,
             immutable=True, writer_domain="d10", schema_hash=schema_hash({"d10.offline_simulated_occurrence.v1": 1})),
-    ) + life_progress_type_specs_v1()
+    ) + life_progress_type_specs_v1() + (conditioned_life_projection_type_spec_v1(),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,10 +202,12 @@ def compile_advance_current_life_v1(frame, request, inputs):
     writes = () if inputs.duplicate_progress else (GraphWrite(key, plain_v1(progress),
         tuple(AtomKey.from_token(ref) for ref in progress.source_refs)),)
     return stage_result_v1(frame, "d10", "advance_life", request, writes=writes,
-        provenance={"life_progress": result, "actual_progress": progress, "terminal": inputs.actual_terminal_original,
+        provenance={"conditioned_source_roots":frame.envelope.source_qualification.source_refs,"conditioned_original_deadline_utc":frame.envelope.deadline_utc,
+            "life_progress": result, "actual_progress": progress, "terminal": inputs.actual_terminal_original,
             "adopted_plan": inputs.adopted_plan_original, "duplicate": inputs.duplicate_progress},
         contribution_keys=() if inputs.duplicate_progress else ("d10-life-effect:" + progress.effect_id,),
-        receiver_events=() if inputs.duplicate_progress else (("d01", "actual_life_outcome_available_for_growth"),),
+        receiver_events=() if inputs.duplicate_progress else (("d01", "actual_life_outcome_available_for_growth"),
+            ("d07","conditioned_observed_outcome_committed_v1"),("d10","conditioned_life_phase_committed_v1")),
         costs=inputs.paid_cost_originals, proposal_schema="d10.proposal.v1",
         proposal_hash=LifeDomain().descriptor.request_schema_hash)
 
@@ -291,6 +294,7 @@ class CurrentLifeEffectExperienceBundleV1:
     d11_cost_settlement_refs: tuple[str, ...]
     bundle_kind: str = "d10.life_progress_effect_experience.v1"
     member_domains: tuple[str, ...] = ("d02", "d06", "d10")
+    general_growth_parent_metadata: object | None = None
 
     def __post_init__(self):
         if (self.bundle_kind not in {"d10.life_progress_effect_experience.v1", "d10.offline_tick_body_experience.v1"}
@@ -301,6 +305,47 @@ class CurrentLifeEffectExperienceBundleV1:
                        (*self.life_stage.proposals, *self.body_stage.proposals, self.memory_proposal))):
             raise ValueError("D10 effect/experience bundle requires exact separately issued domain members")
 
+
+
+@dataclass(frozen=True,slots=True)
+class ConditionedLifeStrategyProjectionV1:
+    namespace: NamespaceId
+    projection_id: str
+    project_head: GraphVersion
+    recipe_head: GraphVersion
+    plan_head: GraphVersion
+    goal_head: GraphVersion
+    strategy_ref: str
+    strategy_digest: str
+    condition_match: ConditionMatchProjectionV1
+    preferred_method: str
+    alternative_method: str
+    support_families: tuple[str,...]
+    exclusions: tuple[str,...]
+    counterexamples: tuple[str,...]
+    rollback_predicate_ref: str
+    source_refs: tuple[str,...]
+    schema: str='d10.conditioned-strategy-projection.v1'
+    def __post_init__(self):
+        from ..d07.prediction_v1 import ConditionMatchProjectionV1
+        from ..d01.conditioned_self_v1 import REGISTERED_METHODS
+        if (self.schema!='d10.conditioned-strategy-projection.v1' or type(self.namespace)is not NamespaceId
+                or type(self.condition_match)is not ConditionMatchProjectionV1 or self.condition_match.namespace!=self.namespace
+                or self.condition_match.strategy_ref!=self.strategy_ref or self.condition_match.strategy_digest!=self.strategy_digest
+                or self.preferred_method not in REGISTERED_METHODS or self.alternative_method not in REGISTERED_METHODS):
+            raise ValueError('D10 strategy projection preserves actual adopted D01 and current D07 membership')
+        for head,kind in ((self.project_head,'d10.life_project.v1'),(self.recipe_head,'d10.activity_recipe.v1'),
+                (self.plan_head,'d08.personal_plan.v1'),(self.goal_head,'d08.goal.v1')):
+            if type(head)is not GraphVersion or head.revision<1 or head.key.type_name!=kind or NamespaceId.from_key(head.key)!=self.namespace:
+                raise ValueError('D10 strategy projection crossed its exact project/recipe/plan/Goal')
+        require_locator_v1(self.projection_id,'projection');require_locator_v1(self.rollback_predicate_ref,'rollback predicate')
+
+
+def conditioned_life_projection_type_spec_v1():
+    from ...runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+    return TypeSpec('d10.conditioned_strategy_projection.v1',('persona',),'state',
+        lambda value:decode_typed_production_value_v1(value,ConditionedLifeStrategyProjectionV1),immutable=True,
+        writer_domain='d10',schema_hash=schema_hash({'d10.conditioned_strategy_projection.v1':tuple(field.name for field in fields(ConditionedLifeStrategyProjectionV1))}))
 
 def verify_d10_production_stage_v1(stage):
     if stage.domain != "d10" or stage.operation_kind not in {"advance_life", "advance_offline", "prepare_contact"}:

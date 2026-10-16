@@ -56,7 +56,10 @@ def issue_and_record_c04_encoding_baseline_v3(
             source_ref, perspective_ref, owner_fence_digest, as_known_at),
         facet_issuer_evidence=None,
     )
-    output = read_d04_joint_output_original_v1(db, namespace, joint_operation_id)
+    from .c04_encoding_context_original_v3 import active_w01_life_encoding_inputs_v3,_historical
+    prepared=active_w01_life_encoding_inputs_v3(db)
+    output=(prepared.output_v3(db,namespace,joint_operation_id) if prepared is not None
+        else read_d04_joint_output_original_v1(db,namespace,joint_operation_id))
     if output is None or output.original_digest != context.joint_output_original_digest:
         raise ValueError("encoding output original differs")
     numeric_ref = next((member.checkpoint_ref for member in output.members
@@ -72,13 +75,9 @@ def issue_and_record_c04_encoding_baseline_v3(
     )
     drives = []
     for ref, revision, *_ in numeric.receipt.source_versions:
-        row = db.execute(
-            "SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
-            (ref, revision),
-        ).fetchone()
-        if row is None or row[1] != 1:
-            raise ValueError("encoding joint drive historical original is absent")
-        drives.append(decode_sourced_numeric_drive(json.loads(row[0])))
+        from ..graph_types import AtomKey,GraphVersion
+        value,_=_historical(db,namespace,GraphVersion(AtomKey.from_token(ref),revision))
+        drives.append(decode_sourced_numeric_drive(value))
     proof = issue_encoding_baseline_proof_v3(
         joint_operation_id=joint_operation_id,
         baseline_id=baseline_id,

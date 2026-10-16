@@ -171,8 +171,62 @@ def freeze_owner_source_note_task_frame_v1(graph, db, *, envelope, issued, scope
         installed_policy_refs=installed_policy_refs, limits=limits)
 
 
+
+def freeze_conditioned_child_frame_v1(graph,db,*,envelope,issued,scope,plan,now_utc,
+        operation,request,process_lease,observed_originals=(),installed_policy_refs=(),
+        limits=ProductionOperationLimitsV1()):
+    from ..graph_coordinator import GraphCoordinator
+    from .conditioned_child_issuance_v1 import require_conditioned_child_process_v1
+    from ..authority_service.conditioned_child_contract_v1 import CHILD_DOMAINS
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from ..runtime_contracts import canonical_serialize,canonical_digest
+    if(type(graph)is not GraphCoordinator or db is not graph._GraphCoordinator__store._db
+            or not db.in_transaction or not graph._GraphCoordinator__store._lock._is_owned()
+            or type(envelope)is not CommandEnvelope or type(scope)is not FenceScope
+            or type(plan)is not ProductionReadPlanV1 or type(limits)is not ProductionOperationLimitsV1):
+        raise ValueError('conditioned child frame requires its actual installed W01 transaction')
+    evidence=require_conditioned_child_process_v1(issued,graph,scope,envelope.authority,process_lease)
+    selector=evidence.selector;current=evidence.current_self
+    metadata,epoch=graph._v2_graph_stamp(selector.namespace)
+    if(selector.operation_kind!=operation.operation_kind or operation.domain!=CHILD_DOMAINS[selector.operation_kind]
+            or selector.typed_request_json!=canonical_serialize(plain_v1(request))
+            or selector.typed_request_digest!=canonical_digest(request)
+            or envelope.identity.operation_id!=selector.operation_id or envelope.identity.activity_id!=selector.activity_id
+            or envelope.identity.phase!=selector.operation_kind or envelope.authority.issuer_domain!=operation.domain
+            or envelope.authority.actor!=current.self_entity_ref or envelope.authority.namespace!=selector.namespace
+            or envelope.authority.purpose!=selector.purpose or envelope.authority.audience!=selector.audiences
+            or envelope.parent_budget_lease_ref!=selector.parent_budget_lease_ref
+            or envelope.authority.activation_generation!=current.activation_generation
+            or scope.graph_epoch!=epoch or scope.graph_revision!=metadata.graph_revision
+            or current.graph_revision!=metadata.graph_revision or evidence.query_epoch.revision!=epoch.revision
+            or not graph._anchor_matches(metadata.requirements,scope.pinned_anchor)
+            or not now_utc<envelope.deadline_utc<=evidence.valid_until_utc):
+        raise ValueError('conditioned child frame changed its actual command, current Self, Root, stamp or original deadline')
+    if not set(plan.source_roots)<=set(selector.source_refs):
+        raise ValueError('conditioned child frame added Source outside its independently qualified scope')
+    from .current_conditioned_self_read_v3 import read_bound_conditioned_child_frame_inputs_v3
+    prepared=read_bound_conditioned_child_frame_inputs_v3(db,graph=graph,scope=scope,plan=plan,issued=issued)
+    prepared.require_issued_current_v3(db,scope,issued)
+    combined=ProductionReadPlanV1(plan.fixed_type_ids,
+        tuple(sorted(set((*plan.exact_keys,*(version.key for version in evidence.read_versions))),key=lambda key:key.token)),
+        plan.source_roots,plan.required_original_refs)
+    for version in evidence.read_versions:
+        atom=prepared.head_v3(version.key)
+        if atom is None or atom.revision!=version.revision:
+            raise ValueError('conditioned Core qualification head differs from the actual Host stage snapshot')
+    return _materialize_current_domain_frame_v1(graph,db,envelope=envelope,scope=scope,plan=combined,
+        prepared_inputs=prepared,now_utc=now_utc,expected_owner_guard=evidence.owner_guard,
+        expected_rights=(evidence.access_epoch,evidence.delete_epoch),observed_originals=observed_originals,
+        installed_policy_refs=installed_policy_refs,limits=limits)
+
 def _materialize_current_domain_frame_v1(graph, db, **kwargs):
-    return CurrentOperationFrameV1(*_materialize_current_domain_frame_fields_v1(graph, db, **kwargs))
+    frame=CurrentOperationFrameV1(*_materialize_current_domain_frame_fields_v1(graph, db, **kwargs))
+    from .current_d07_simulation_source_read_v3 import register_current_d07_simulation_source_frame_v3
+    frame=register_current_d07_simulation_source_frame_v3(db,frame,kwargs["scope"])
+    from .current_habit_source_read_v3 import register_current_habit_source_frame_v3
+    frame=register_current_habit_source_frame_v3(db,frame,kwargs["scope"])
+    from .artifact_frame_control_reads_v3 import register_artifact_model_source_frame_v3
+    return register_artifact_model_source_frame_v3(db,frame,kwargs["scope"],kwargs.get("prepared_inputs"))
 
 
 def freeze_owner_stop_projection_frame_v1(graph, db, *, envelope, issued, scope, plan, now_utc):
@@ -220,6 +274,27 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
         expected_owner_guard, expected_rights, observed_originals, limits, prepared_inputs=None):
     """The original read-set algorithm, without issuing a frame or authority."""
     ns = namespace
+    from .domain_background_read_v3 import PreparedBackgroundFrameInputsV3
+    if type(prepared_inputs)is PreparedBackgroundFrameInputsV3:
+        from .d07_general_growth_attention_v1 import (general_growth_background_parent_v1,
+            require_general_growth_background_sources_v1)
+        if general_growth_background_parent_v1(prepared_inputs.owner) is not None:
+            require_general_growth_background_sources_v1(prepared_inputs.owner,plan.source_roots,
+                prepared_inputs.envelope.authority)
+    from .current_method_learning_read_v3 import PreparedMethodDomainInputsV3,_GENERAL_OWNER_OPERATIONS_V1,_NUMERIC_OWNER_OPERATIONS_V1
+    if (type(prepared_inputs)is PreparedMethodDomainInputsV3
+            and prepared_inputs.owner.operation_kind in _GENERAL_OWNER_OPERATIONS_V1):
+        from .current_method_learning_read_v3 import require_current_general_method_sources_v1
+        require_current_general_method_sources_v1(prepared_inputs.owner,plan.source_roots)
+    if (type(prepared_inputs)is PreparedMethodDomainInputsV3
+            and prepared_inputs.owner.operation_kind in _NUMERIC_OWNER_OPERATIONS_V1):
+        from .current_life_numeric_metadata_v1 import require_numeric_method_sources_v1
+        require_numeric_method_sources_v1(prepared_inputs.owner)
+    if type(prepared_inputs)is PreparedMethodDomainInputsV3:
+        from .current_beta1_source_read_v3 import beta1_source_operation_v3
+        if beta1_source_operation_v3(prepared_inputs.owner.operation_kind):
+            from .current_beta1_source_read_v3 import require_beta1_source_groups_v3
+            require_beta1_source_groups_v3(prepared_inputs.owner,plan.source_roots)
     _, epoch = graph._v2_graph_stamp(ns)
     atoms = {}
     def load(key):
@@ -246,7 +321,37 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
     query_epoch = QueryEpoch(ns, "namespace", epoch.revision)
     for type_id in plan.fixed_type_ids:
         graph._GraphCoordinator__store._registry.spec(type_id)
-        if prepared_inputs is not None:
+        general_inventory_metadata=False
+        from .current_method_learning_read_v3 import PreparedMethodDomainInputsV3,_GENERAL_OWNER_OPERATIONS_V1,\
+            _GENERAL_OWNER_METADATA_TYPES_V1
+        from .current_d07_simulation_source_read_v3 import SIMULATION_METADATA_INVENTORY_TYPES_V3,current_d07_simulation_inventory_metadata_v3
+        from .current_habit_source_read_v3 import is_habit_prepared_inputs_v3,habit_metadata_inventory_v3
+        if is_habit_prepared_inputs_v3(prepared_inputs):
+            metadata_rows=habit_metadata_inventory_v3(prepared_inputs,type_id)
+            rows=tuple((item.key.token,item.revision)for item in metadata_rows)
+            general_inventory_metadata=True
+        elif (type(prepared_inputs)is PreparedMethodDomainInputsV3
+                and prepared_inputs.owner.operation_kind=="run_simulation"and type_id in SIMULATION_METADATA_INVENTORY_TYPES_V3):
+            metadata_rows=current_d07_simulation_inventory_metadata_v3(prepared_inputs,type_id)
+            rows=tuple((item.key.token,item.revision)for item in metadata_rows)
+            general_inventory_metadata=True
+        elif (type(prepared_inputs)is PreparedMethodDomainInputsV3
+                and prepared_inputs.owner.operation_kind in _GENERAL_OWNER_OPERATIONS_V1
+                and type_id in _GENERAL_OWNER_METADATA_TYPES_V1):
+            from .current_method_learning_read_v3 import require_current_general_owner_metadata_coverage_v1
+            metadata_rows=require_current_general_owner_metadata_coverage_v1(prepared_inputs,type_id)
+            rows=tuple((item.key.token,item.revision)for item in metadata_rows)
+            general_inventory_metadata=True
+        elif (type(prepared_inputs)is PreparedBackgroundFrameInputsV3
+                and prepared_inputs.owner.kind=="followup_child"
+                and prepared_inputs.envelope.identity.phase=="derive_general_growth_trial_v1"
+                and type_id=="runtime.cost_settlement"):
+            from .domain_background_read_v3 import require_current_general_growth_trial_metadata_coverage_v1
+            metadata_versions=require_current_general_growth_trial_metadata_coverage_v1(prepared_inputs,
+                db=db,graph=graph,namespace=ns,type_id=type_id)
+            rows=tuple((version.key.token,version.revision)for version in metadata_versions)
+            general_inventory_metadata=True
+        elif prepared_inputs is not None:
             rows = tuple((atom.key.token, atom.revision) for atom in prepared_inputs.inventory_v3(type_id))
         else:
             rows = db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? "
@@ -254,7 +359,8 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
         selected, complete = rows[:limits.max_query_rows], len(rows) <= limits.max_query_rows
         versions = tuple(GraphVersion(AtomKey.from_token(ref), revision) for ref, revision in selected)
         for version in versions:
-            load(version.key)
+            if not general_inventory_metadata or version.key in plan.exact_keys:
+                load(version.key)
         continuation = None if complete else "production-query:" + canonical_digest(
             (ns, type_id, epoch.revision, selected[-1][0]))[:48]
         pages.append(ProductionQueryCoverageV1(query_epoch, type_id, versions, complete, continuation))
@@ -304,12 +410,34 @@ def _materialize_current_domain_frame_fields_v1(graph, db, *, envelope, scope, p
         expected_rights=expected_rights, observed_originals=observed_originals,
         limits=limits, prepared_inputs=prepared_inputs)
     query_epoch = QueryEpoch(ns, "namespace", epoch.revision)
+    read_versions=snapshot.versions
+    from .current_habit_source_read_v3 import is_habit_prepared_inputs_v3,habit_selected_metadata_read_set_v3
+    if is_habit_prepared_inputs_v3(prepared_inputs):
+        metadata_versions,pages=habit_selected_metadata_read_set_v3(prepared_inputs)
+        full={version.key:version.revision for version in metadata_versions}
+        for version in snapshot.versions:
+            if version.key in full and full[version.key]!=version.revision:
+                raise ValueError('Habit actual body and metadata readsets disagree')
+            full[version.key]=version.revision
+        if len(full)>limits.max_graph_heads:
+            raise ValueError('Habit complete readset exceeds the original current-head bound')
+        read_versions=tuple(GraphVersion(key,revision)for key,revision in sorted(full.items(),key=lambda item:item[0].token))
+    from .artifact_frame_control_reads_v3 import compose_artifact_model_frame_fields_v3
+    snapshot,pages,artifact_read_versions=compose_artifact_model_frame_fields_v3(prepared_inputs,snapshot,pages)
+    if artifact_read_versions is not None:
+        read_versions=artifact_read_versions
     inputs = tuple(sorted(set(plan.source_roots + plan.required_original_refs)))
+    from .artifact_frame_control_reads_v3 import artifact_model_frame_deadline_v3,artifact_model_frame_monotonic_deadline_v3
+    actual_deadline=artifact_model_frame_deadline_v3(prepared_inputs,envelope.deadline_utc)
     actual_envelope = replace(envelope,
+        deadline_utc=actual_deadline,
+        monotonic_deadline=artifact_model_frame_monotonic_deadline_v3(prepared_inputs,envelope.monotonic_deadline),
         identity=replace(envelope.identity, canonical_input_digest=canonical_digest({"input_refs": list(inputs)})),
         input_refs=inputs, source_qualification=replace(envelope.source_qualification, source_refs=plan.source_roots),
         version_guard=replace(envelope.version_guard,
-        read_versions=snapshot.versions, query_epochs=(query_epoch,), access_epoch=rights[0], delete_epoch=rights[1],
+        read_versions=read_versions, query_epochs=(query_epoch,), access_epoch=rights[0], delete_epoch=rights[1],
         catalogue_version=graph._GraphCoordinator__store._registry.catalogue_hash))
+    from .artifact_frame_control_reads_v3 import append_artifact_model_control_originals_v3
+    observed_originals=append_artifact_model_control_originals_v3(prepared_inputs,observed_originals)
     return (actual_envelope, snapshot, now_utc, expected_owner_guard,
         scope.generation, tuple(pages), tuple(installed_policy_refs), tuple(observed_originals), limits)

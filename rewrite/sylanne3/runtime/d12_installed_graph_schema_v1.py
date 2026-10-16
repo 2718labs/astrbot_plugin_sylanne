@@ -57,6 +57,8 @@ def install_d12_installed_graph_schema_v1(db):
     from .domain_production_originals_v1 import install_domain_production_originals_v1
     from .domain_production_commit_v1 import install_domain_production_outbox_v1
     install_domain_production_originals_v1(db)
+    from .d03_world_history_v1 import install_world_history_schema_v1
+    install_world_history_schema_v1(db)
     install_domain_production_outbox_v1(db)
     from .d07_execution_v1 import install_d07_execution_schema_v1
     install_d07_execution_schema_v1(db)

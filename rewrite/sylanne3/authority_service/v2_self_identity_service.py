@@ -256,13 +256,23 @@ class AuthorityV2SelfIdentityService:
             return receipt
 
     def _read_locked(self, db, deletion_head, execution_head, history,
-                     credential, subject, request, location=None):
+                     credential, subject, request, location=None, *, _mesh_work=None, _original_work=None):
         self._check_schema(db)
         anchor = self._current_namespace(db, deletion_head, execution_head)
         permit = request.permit
         if history and (location is None or self._source_location is None):
             raise AuthorityUnavailable("self identity needs actual current storage continuation")
-        if location is not None:
+        if _original_work is not None:
+            from .original_foreground_source_read_v3 import require_original_foreground_source_anchor_in_tx_v3
+            if _mesh_work is not None or _original_work.service.self_identity is not self:
+                raise AuthorityUnavailable('Original current Self changed its actual installed service')
+            require_original_foreground_source_anchor_in_tx_v3(_original_work,db,location)
+        elif _mesh_work is not None:
+            from .foreground_mesh_source_read_v3 import require_foreground_mesh_source_anchor_in_tx_v3
+            if _mesh_work.service.self_identity is not self:
+                raise AuthorityUnavailable("Personal mesh current Self reader changed its actual installation")
+            require_foreground_mesh_source_anchor_in_tx_v3(_mesh_work,db,location)
+        elif location is not None:
             self._source_location.require_current_in_tx_v1(db, location)
         if (request.authority_id != anchor.authority_id
                 or permit.pinned_anchor != anchor or permit.subject != subject
@@ -315,61 +325,12 @@ class AuthorityV2SelfIdentityService:
         return self._current_for_installed_permit(
             credential=credential, subject=subject, request=request)
 
-    def current_for_c04_v4(self, *, credential, reader, binding, permit):
-        """Closed Authority-internal read for the installed C04 exclusive claim."""
-        from .c04_current_execution_v3 import InstalledC04CurrentReaderV3
-        from .internal_work_contract import InternalWorkBindingV1
-        from .c04_exclusive_execution_v3 import _operation
-        from ..host.installed_d06_build import ALGORITHM_ID_V4
-        if (type(reader) is not InstalledC04CurrentReaderV3
-                or reader.foreground_observer is None
-                or reader.foreground_observer.self_identity is not self
-                or reader.namespace != self._namespace_id
-                or reader.graph_path != self._graph._path
-                or type(binding) is not InternalWorkBindingV1
-                or binding.algorithm_ref != ALGORITHM_ID_V4
-                or binding.namespace != self._fences.namespace
-                or type(permit) is not FencePermitV2
-                or permit.subject != "c04-exclusive:" + binding.binding_digest
-                or permit.operation != "write"
-                or permit.operation_id != _operation(binding, "claim")
-                or permit.generation != binding.activation_generation):
-            raise AuthorityUnavailable("Self C04 identity read crossed its installed exclusive claim")
-        request = SelfIdentityCurrentRequestV1(
-            permit.authority_id, self._fences.namespace, self._namespace_id,
-            self._installation_id, self._manifest_digest, binding.operation_id, permit)
-        self._core._require(credential, "self_identity_read",
-                            request.authority_namespace, self._holder)
-        location_reader, owner_reader = self._source_location, self._owner_storage
-        if location_reader is None or owner_reader is None:
-            raise AuthorityUnavailable("Self C04 lacks its actual installed current storage readers")
-        # Read-only internal observation. The caller cannot open/finish a fence,
-        # mutate an Owner grant, or borrow the public Host read subject.
-        location = location_reader._observe(purpose="business", credential=credential,
-            subject=permit.subject, permit=permit)
-        with self._fences._frozen() as (db, deletion, execution, history):
-            before = self._read_locked(db, deletion, execution, history,
-                credential, permit.subject, request, location)
-            owner_head = owner_reader._head_in_tx(db)
-            owner_reader._background_identity_in_tx(db, owner_head)
-        if before is None:
-            return None
-        head, guard, anchor, epoch = before
-        if owner_head.guard != guard:
-            raise AuthorityUnavailable("Self C04 storage Owner head differs")
-        _, _, admission = owner_reader._read_graph(owner_head=owner_head, anchor=anchor)
-        current_graph = self._graph.current(request.namespace, anchor, request.installation_id, guard,
-            source_location=location_reader, location_observation=location,
-            storage_admission=admission, holder=self._holder)
-        if current_graph is None:
-            raise AuthorityUnavailable("Self C04 current D01 role/storage identity is unavailable")
-        with self._fences._frozen() as (db, deletion, execution, history):
-            after = self._read_locked(db, deletion, execution, history,
-                credential, permit.subject, request, location)
-            if after != before or owner_reader._head_in_tx(db) != owner_head:
-                raise AuthorityUnavailable("Self C04 mapping or Owner changed during actual graph read")
-            owner_reader._background_identity_in_tx(db, owner_head)
-        return self._current_value(request, head, guard, anchor, current_graph, admission)
+    def current_for_c04_v4(self,*,credential,reader,binding,permit):
+        from .owner_location_read_v3 import (prepare_owner_location_for_c04_self_v3,
+            _owner_location_service_invocation_v3)
+        with _owner_location_service_invocation_v3(self):
+            return prepare_owner_location_for_c04_self_v3(self,credential=credential,reader=reader,
+                binding=binding,permit=permit)
 
     def _current_for_installed_permit(self, *, credential, subject, request):
         self._core._require(credential, "self_identity_read",
@@ -435,3 +396,4 @@ class AuthorityV2SelfIdentityService:
 
 
 __all__ = ("AuthorityV2SelfIdentityService", "SelfIdentityMutationReceiptV1")
+

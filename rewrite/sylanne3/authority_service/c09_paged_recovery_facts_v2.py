@@ -294,7 +294,8 @@ def _fact_key(family, value):
 
 def _require_fact_type(family, value):
     expected = C09ExecutionBindingV1 if family == 'binding' else C09ModelBudgetOriginalV1 if family == 'model' else _FAMILIES[family][0]
-    if type(value) is not expected:
+    from .c09_model_budget_original_v1 import C09ModelNoDispatchBudgetOriginalV2
+    if type(value) is not expected and not (family == 'model' and type(value) is C09ModelNoDispatchBudgetOriginalV2):
         raise AuthorityUnavailable('recovery fact has another exact family type')
 
 
@@ -1662,6 +1663,7 @@ class InstalledC09AuthorityRoleBasisV2:
         from .deployment_config import AuthorityDeploymentConfig,InstalledNaturalModelAuthorityV2
         from ..host.authority_profile import AdminInstallationBundle
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+        from ..host.model_workflows_v8 import AdminModelWorkflowsV8
         self.require_current();maintenance=self.session._control.maintenance
         config=getattr(maintenance,'_installed_deployment_config_v2',None)
         if type(config) is not AuthorityDeploymentConfig:
@@ -1670,7 +1672,7 @@ class InstalledC09AuthorityRoleBasisV2:
         if type(model) is not InstalledNaturalModelAuthorityV2:
             raise AuthorityUnavailable('actual C09 natural authority namespace installation absent')
         bundle=model.installation_bundle
-        if (type(bundle) is not AdminInstallationBundle or type(model.workflows) is not AdminModelWorkflowsV7
+        if (type(bundle) is not AdminInstallationBundle or type(model.workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
                 or bundle.model_workflows is not model.workflows
                 or model.d11_issuer is not getattr(maintenance,'_installed_d11_budget_job_issuer_v2',None)
                 or model.d11_issuer.resource_issuer is not getattr(maintenance,'_installed_d02_resource_issuer_v2',None)):
@@ -2763,6 +2765,9 @@ def read_foreground_attempt_original_row_v2(db, row, *, meter):
         raise AuthorityUnavailable('foreground source row differs from the actual selected Graph')
     if tuple(item[1] for item in db.execute('PRAGMA table_info(' + TABLE + ')')) != COLUMNS:
         raise AuthorityUnavailable('actual foreground source schema differs')
+    if row[4] == row[2]:
+        from ..runtime.habit_activity_history_v1 import read_habit_attempt_original_row_v1
+        return read_habit_attempt_original_row_v1(db, row, meter=meter)
     namespace = NamespaceId(row[0], row[1])
     operation, request_digest, attempt = row[2:5]
     if (type(request_digest) is not str or re.fullmatch(r"[0-9a-f]{64}", request_digest) is None

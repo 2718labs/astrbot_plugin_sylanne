@@ -88,6 +88,7 @@ def artifact_draft_model_result_from_wire_v1(raw,kind):
 
 def _read_current_artifact_draft_model_graph(db,intent,issuer,now,*,installed_bundle,phase,
         allow_unsealed_prepare=False,allow_accounted_result=False):
+    from .artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_current_type_versions_v3
     """Read actual current originals; used by the existing Core model verifier."""
     from ..runtime.d11_artifact_draft_model_v1 import (read_artifact_draft_prepared_v1,
         read_artifact_draft_frozen_v1,read_artifact_draft_model_request_v1,installed_artifact_draft_workflow_v1)
@@ -202,13 +203,13 @@ def _read_current_artifact_draft_model_graph(db,intent,issuer,now,*,installed_bu
             raise AuthorityUnavailable('phase original physical reservation state changed')
     _source_family_current_sql_v1(db,namespace=p.namespace,roots=(frozen.task_source_ref,),purpose="consolidation",audiences=p.audiences)
     for version in frozen.source_read_versions:
-        row=db.execute("SELECT revision FROM graph_atoms WHERE bot=? AND persona=? AND token=?",(*p.namespace.as_tuple,version.key.token)).fetchone()
+        row=artifact_model_graph_point_v3(db,('revision',),token=version.key.token)
         if (0 if row is None else row[0])!=version.revision:raise AuthorityUnavailable("C4 exact input/negative read changed")
     for source in frozen.sources:
-        row=db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",(source.ref,)).fetchone()
+        row=artifact_model_graph_point_v3(db,('value', 'valid'),token=source.ref)
         if row is None or row[1]!=1 or canonical_digest(json.loads(row[0]))!=source.value_digest:
             raise AuthorityUnavailable("C4 actual Source bytes changed")
-    mapping=db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",(self_mapping_key(p.namespace).token,)).fetchone()
+    mapping=artifact_model_graph_point_v3(db,('value', 'valid'),token=self_mapping_key(p.namespace).token)
     if mapping is None or mapping[1]!=1 or canonical_digest(json.loads(mapping[0]))!=frozen.current_self_digest:
         raise AuthorityUnavailable("C4 actual registered self mapping changed")
     rights=db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",p.namespace.as_tuple).fetchone()
@@ -226,7 +227,7 @@ def _read_current_artifact_draft_model_graph(db,intent,issuer,now,*,installed_bu
         raise AuthorityUnavailable("C4 actual acquired Graph revision/negative epoch changed before admission")
     _require_current_model_project_capacity_v1(db,prepared=p,request=request,issuer=issuer,
         installed_bundle=installed_bundle,now=now,epoch=epoch[0],rights=rights)
-    atom=db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",(job_graph_write(job).key.token,)).fetchone()
+    atom=artifact_model_graph_point_v3(db,('value', 'valid'),token=job_graph_write(job).key.token)
     if atom is None or atom[1]!=1 or json.loads(atom[0])!=job_graph_write(job).value:raise AuthorityUnavailable("C4 acquired SQL/Graph job differs")
     quote=issuer.resource_issuer.original_signed_quote(db,p.quote_id,1)
     if (canonical_digest(quote)!=p.quote_digest or tuple(sorted(quote.ceiling.items()))!=intent.budget_ceiling
@@ -254,6 +255,7 @@ def read_current_artifact_draft_prepared_v2(db, intent, issuer, now, *, installe
 
 
 def _require_current_model_project_capacity_v1(db,*,prepared,request,issuer,installed_bundle,now,epoch,rights):
+    from .artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_current_type_versions_v3
     """Actual current namespace read, with full coverage and authenticated rows.
 
     This server-only frame is a read view for the same D10 invariant. It is
@@ -270,15 +272,14 @@ def _require_current_model_project_capacity_v1(db,*,prepared,request,issuer,inst
     keys=set(plan.exact_keys);keys.add(AtomKey.from_token(prepared.owner_guard.grant_ref))
     pages=[]
     for kind in plan.fixed_type_ids:
-        rows=db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
-            (*ns.as_tuple,kind)).fetchall()
+        rows=artifact_model_current_type_versions_v3(db,ns,kind,limit=129)
         if len(rows)>128:raise AuthorityUnavailable("complete current C4 project capacity inventory exceeds bound")
         versions=tuple(GraphVersion(AtomKey.from_token(token),revision) for token,revision in rows)
         keys.update(version.key for version in versions)
         pages.append(ProductionQueryCoverageV1(QueryEpoch(ns,"namespace",epoch),kind,versions,True,None))
     atoms=[]
     for key in sorted(keys,key=lambda value:value.token):
-        row=db.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",(*ns.as_tuple,key.token)).fetchone()
+        row=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=key.token)
         atoms.append(GraphAtom(key,row[0],json.loads(row[1]),bool(row[2])) if row else GraphAtom(key,0,{},False))
     snapshot=GraphSnapshot(tuple(atoms),(NamespaceEpoch(*ns.as_tuple,epoch),))
     originals=[]
@@ -307,7 +308,7 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
     """Existing same-Core terminal reader plus the shared once read-attempt row."""
     def __init__(self,*,store,fences,graph_db_path,d11_issuer,installed_bundle,
             installation_id,read_subject,holder,trusted_now_utc,read_attempts,
-            owner_stop_reply_service=None):
+            owner_stop_reply_service=None,graph_reader):
         from .v2_model_egress_store import AuthorityV2ModelEgressStore
         from .v2_fence_service import AuthorityV2FenceService
         from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
@@ -326,7 +327,15 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
         self._path=Path(graph_db_path).resolve(strict=True)
         self._installation_id,self._read_subject,self._holder=installation_id,read_subject,holder
         self._clock=trusted_now_utc;self._delivery_lock=threading.RLock();self._inflight_deliveries={}
+        from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
+        if(type(graph_reader)is not InstalledArtifactDraftModelGraphReaderV3 or graph_reader.bundle is not installed_bundle
+                or graph_reader.issuer is not d11_issuer or graph_reader.owner_storage.fences is not fences
+                or graph_reader.owner_storage.graph_path!=self._path):
+            raise AuthorityUnavailable('Artifact result requires actual installed independent model Source reader')
+        self._graph_reader=graph_reader;self._location=graph_reader.model_service._source_location
+        graph_reader.install_result_service_v3(self)
         self._owner_stop_reply_service_v1=None
+        self._owner_goal_cancellation_service_v1=None
         if owner_stop_reply_service is not None:
             self.install_owner_stop_reply_service_v1(owner_stop_reply_service)
 
@@ -340,6 +349,27 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
                 or self._owner_stop_reply_service_v1 is not None):
             raise AuthorityUnavailable("C4 result barrier requires the actual same installed Core/Graph service")
         self._owner_stop_reply_service_v1=service
+
+    def install_owner_goal_cancellation_service_v1(self, service):
+        from .owner_goal_cancellation_v1 import InstalledOwnerGoalCancellationServiceV1
+        if (type(service) is not InstalledOwnerGoalCancellationServiceV1
+                or service.core is not self._fences.core or service.fences is not self._fences
+                or service.issuer is not self._issuer or service.bundle is not self._bundle
+                or service.installation_id != self._installation_id
+                or self._owner_goal_cancellation_service_v1 is not None):
+            raise AuthorityUnavailable("C4 result Goal barrier needs its actual installed Core/Graph")
+        self._owner_goal_cancellation_service_v1=service
+
+    def _require_goal_scope_in_tx_v1(self, db, request):
+        from .artifact_goal_barrier_v1 import require_artifact_task_not_cancelled_in_tx_v1
+        if self._owner_goal_cancellation_service_v1 is None:
+            raise AuthorityUnavailable("C4 body delivery lacks its actual installed Goal barrier")
+        selector=request.selector
+        task=selector.task if type(selector) is ArtifactDraftPhaseSelectorV2 else selector
+        return require_artifact_task_not_cancelled_in_tx_v1(db,
+            service=self._owner_goal_cancellation_service_v1, namespace=request.namespace,
+            c02_operation_id=task.c02_operation_id, root_registration_ref=task.root_registration_ref,
+            action="model_result_body")
 
     def _require_reply_scope_in_tx_v1(self, db, scope, anchor):
         from .owner_stop_reply_v1 import require_reply_scope_not_stopped_in_tx_v1
@@ -356,6 +386,7 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
                 raise AuthorityUnavailable("C4 result read anchor changed")
             if content:
                 self._require_reply_scope_in_tx_v1(db,reply_scope,anchor)
+                self._require_goal_scope_in_tx_v1(db,request)
             return self._terminal_locked(db,request,anchor,content=content)
 
     def _scope(self,request):
@@ -363,18 +394,18 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
                 or request.installation_id!=self._installation_id or request.authority_namespace!=self._fences.namespace):
             raise AuthorityUnavailable("C4 result read crossed installed scope")
 
-    def _graph_read(self,request,intent):
-        import sqlite3
-        from contextlib import closing
-        with closing(sqlite3.connect(self._path.as_uri()+"?mode=ro",uri=True,isolation_level=None)) as db:
-            db.execute("PRAGMA query_only=ON");db.execute("BEGIN")
-            reader = (read_current_artifact_draft_prepared_v2 if type(request) is ArtifactDraftModelResultReadRequestV2
-                else read_current_artifact_draft_model_graph_v1)
-            p,job,frozen=reader(db,intent,self._issuer,self._clock(),
-                installed_bundle=self._bundle,allow_accounted_result=True)
-            if (request.selector,request.binding_digest,request.model_request_digest,request.original_operation_id)!=(
-                    p.selector,p.digest,intent.request_digest,p.operation_id):raise AuthorityUnavailable("C4 result selector differs from actual original")
-            return p,job,frozen
+    def _graph_read(self,request,intent,terminal,location):
+        from .owner_location_read_v3 import prepare_owner_location_for_life_model_result_v3
+        from .artifact_model_result_source_v3 import prepare_artifact_result_source_work_v3,read_artifact_result_material_v3
+        from .current_authority_graph_read_v3 import finish_authority_graph_read_work_v3
+        entry=prepare_owner_location_for_life_model_result_v3(self,intent=intent,read_attempt_id=request.read_attempt_id)
+        work=None
+        try:
+            work=prepare_artifact_result_source_work_v3(self,request=request,intent=intent,terminal=terminal,entry=entry)
+            return read_artifact_result_material_v3(work,location=location)
+        finally:
+            if work is not None:finish_authority_graph_read_work_v3(work)
+            entry.release_v3()
 
     def prepare(self,*,credential,request,now_utc=None):
         self._scope(request)
@@ -387,15 +418,19 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
             anchor=self._fences.current_anchor(credential=credential,subject=self._read_subject)
             if anchor.authority_id!=request.authority_id:raise AuthorityUnavailable("C4 result Authority identity differs")
             intent,terminal,_=self._read_original(request,anchor,content=False)
-            before=self._graph_read(request,intent)
+            permit=self._fences.begin_fence(credential=credential,subject=self._read_subject,holder=self._holder,
+                operation="read",operation_id=request.read_attempt_id,expected_anchor=anchor)
+            with self._delivery_lock:self._inflight_deliveries[request.read_attempt_id]=permit
+            from .owner_location_read_v3 import register_owner_location_for_life_model_result_v3
+            register_owner_location_for_life_model_result_v3(self,credential=credential,request=request,permit=permit)
+            location=self._location.observe_business_for_fence_v1(credential=credential,subject=self._read_subject,permit=permit)
+            before=self._graph_read(request,intent,terminal,location)
             service=self._owner_stop_reply_service_v1
             if service is None:
                 raise AuthorityUnavailable("C4 new result read lacks its actual installed reply barrier")
             selector = before[0].selector
             task = selector.task if type(selector) is ArtifactDraftPhaseSelectorV2 else selector
             reply_scope=service.observe_actual_reply_scope_v1(c02_operation_id=task.c02_operation_id)
-            permit=self._fences.begin_fence(credential=credential,subject=self._read_subject,holder=self._holder,
-                operation="read",operation_id=request.read_attempt_id,expected_anchor=anchor)
             with self._fences.core._tx() as db:
                 self._fences.fences.validate_fence_locked(db,permit,subject=self._read_subject,current_anchor=anchor)
                 if self._attempts._read_locked(db,request.read_attempt_id) is not None:
@@ -403,7 +438,7 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
                 self._require_reply_scope_in_tx_v1(db,reply_scope,anchor)
                 self._attempts.begin_locked(db,request,permit=permit)
             current,receipt,observation=self._read_original(request,anchor,content=True,reply_scope=reply_scope)
-            if current!=intent or receipt!=terminal or self._graph_read(request,intent)!=before:
+            if current!=intent or receipt!=terminal or self._graph_read(request,intent,terminal,location)!=before:
                 raise AuthorityUnavailable("C4 current input/terminal changed during result copy")
             if observation.result_json is None or len(observation.result_json.encode())>65536:
                 raise AuthorityUnavailable("C4 actual result exceeds encoded64KiB")
@@ -416,6 +451,8 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
             with self._delivery_lock:self._inflight_deliveries[request.read_attempt_id]=delivery
             return delivery
         except BaseException:
+            from .owner_location_read_v3 import release_owner_location_for_life_model_result_invocation_v3
+            release_owner_location_for_life_model_result_invocation_v3(self,request.read_attempt_id)
             with self._delivery_lock:self._inflight_deliveries.pop(request.read_attempt_id,None)
             # An attempted read remains UNKNOWN. No exception authorizes fresh
             # content I/O or reconstructs an acknowledgement/result body.
@@ -434,11 +471,15 @@ class AuthorityArtifactDraftModelResultServiceV1(AuthorityV2NaturalGenerationOut
                 self._fences.fences.finish_fence_locked(db,delivery.permit,subject=self._read_subject,
                     current_anchor=delivery.permit.pinned_anchor,request_id=key+":delivered",request_digest="sha256:"+digest)
             self._inflight_deliveries.pop(key,None)
+            from .owner_location_read_v3 import release_owner_location_for_life_model_result_invocation_v3
+            release_owner_location_for_life_model_result_invocation_v3(self,key)
 
     def abandon_delivery(self,*,delivery):
         if type(delivery) not in {ArtifactDraftModelResultDeliveryV1, ArtifactDraftModelResultDeliveryV2}:raise AuthorityUnavailable("actual C4 delivery required")
         with self._delivery_lock:
             self._inflight_deliveries.pop(delivery.result.request.read_attempt_id,None)
+            from .owner_location_read_v3 import release_owner_location_for_life_model_result_invocation_v3
+            release_owner_location_for_life_model_result_invocation_v3(self,delivery.result.request.read_attempt_id)
 
 
 from ..model_broker.artifact_draft_v1 import (ArtifactDraftPhaseSelectorV2, artifact_draft_from_wire_v2,

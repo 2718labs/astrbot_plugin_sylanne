@@ -85,13 +85,13 @@ class LocalCreationCatalogue:
                 return None
             manifest = _read_json(manifest_bytes)
             if (type(manifest) is not dict or manifest.get("schema_version") != 1
-                    or manifest.get("build_mode") not in {"formal-alpha1", "snapshot-alpha1-test", "alpha2-candidate"}
+                    or manifest.get("build_mode") not in {"formal-alpha1", "snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}
                     or type(manifest.get("files")) is not list):
                 return None
-            if manifest["build_mode"] in {"snapshot-alpha1-test", "alpha2-candidate"}:
+            if manifest["build_mode"] in {"snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}:
                 from ..host.installed_package import verify_installed_backend_runtime_v1
                 qualified = verify_installed_backend_runtime_v1(self._root, self._expected_manifest_digest)
-                if not qualified.verified or qualified.runtime_scope not in {"backend-production-acceptance", "backend-local-alpha2-acceptance"}:
+                if not qualified.verified or qualified.runtime_scope not in {"backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}:
                     return None
             entries = [entry for entry in manifest["files"]
                        if type(entry) is dict and entry.get("path") == _PRESET_PATH]

@@ -257,36 +257,38 @@ class AuthorityD04RootExecutionServiceV3:
                            core_row[1], (binding.digest, row[1], row[2], target.digest))
 
     def claim_d04_root_v3(self, binding, executor_incarnation):
-        self._binding(binding)
-        identifier(executor_incarnation,"executor_incarnation")
-        bridge=self.bridge
-        bridge.core._require(self.credential,"execution",bridge.namespace)
-        with self._frozen() as (db,deletion,before):
-            _,old,_,old_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding)
+            identifier(executor_incarnation,"executor_incarnation")
+            bridge=self.bridge
+            bridge.core._require(self.credential,"execution",bridge.namespace)
+            with self._frozen() as (db,deletion,before):
+                _,old,_,old_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
+                if old is not None:
+                    self._reconcile_locked(db,binding,terminal_row or old_row,before)
+                else:
+                    anchor,holder=self._current_anchor_locked(db,deletion,before)
+                    if anchor.activation_generation!=binding.activation_generation:
+                        raise AuthorityUnavailable("root source generation changed")
+                    permit=bridge.fences.begin_fence_locked(db,
+                        subject=self._subject+":claim:"+canonical_digest((binding.digest,executor_incarnation)),holder=holder,operation="write",
+                        current_anchor=anchor,operation_id=root_gate_operation_id_v3(binding,"claim"))
             if old is not None:
-                self._reconcile_locked(db,binding,terminal_row or old_row,before)
-            else:
-                anchor,holder=self._current_anchor_locked(db,deletion,before)
-                if anchor.activation_generation!=binding.activation_generation:
-                    raise AuthorityUnavailable("root source generation changed")
-                permit=bridge.fences.begin_fence_locked(db,
-                    subject=self._subject+":claim:"+canonical_digest((binding.digest,executor_incarnation)),holder=holder,operation="write",
-                    current_anchor=anchor,operation_id=root_gate_operation_id_v3(binding,"claim"))
-        if old is not None:
-            raise AuthorityUnavailable("D04 execution claim already consumed; inspect originals")
-        try:
-            # The exclusive durable permit now excludes cancellation/source
-            # writes. Graph reads and any target Owner RPC are outside Core SQL.
-            prepared=self._graph_read(binding)
-            owner=self._owner_observation(permit,binding)
-            claim=D04RootExecutionClaimV3(binding.digest,binding.execution_id,root_mutation_id_v3(binding,"claim"),
-                permit.pinned_anchor.execution_seq+1,self.installation_id,executor_incarnation,"pending")
-            claim=replace(claim,signature=self._sign(claim))
-            self._durable_append_v3(binding,permit,claim,None,prepared=prepared,owner=owner)
-            return claim
-        except BaseException:
-            self._abandon_unappended_gate(binding,"claim")
-            raise
+                raise AuthorityUnavailable("D04 execution claim already consumed; inspect originals")
+            try:
+                # The exclusive durable permit now excludes cancellation/source
+                # writes. Graph reads and any target Owner RPC are outside Core SQL.
+                prepared=self._graph_read(binding)
+                owner=self._owner_observation(permit,binding)
+                claim=D04RootExecutionClaimV3(binding.digest,binding.execution_id,root_mutation_id_v3(binding,"claim"),
+                    permit.pinned_anchor.execution_seq+1,self.installation_id,executor_incarnation,"pending")
+                claim=replace(claim,signature=self._sign(claim))
+                self._durable_append_v3(binding,permit,claim,None,prepared=prepared,owner=owner)
+                return claim
+            except BaseException:
+                self._abandon_unappended_gate(binding,"claim")
+                raise
 
     def read_d04_root_originals_v3(self, binding):
         """Content-free status; a claim-only result is unknown, never zero CPU."""
@@ -340,41 +342,43 @@ class AuthorityD04RootExecutionServiceV3:
         Content-free measurements remain recordable after cancellation; full
         artifact bytes additionally require current source/job/Owner closure.
         """
-        self._binding(binding);self._verify_claim(binding,claim)
-        bridge=self.bridge;bridge.core._require(self.credential,"execution",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,actual,measurement,claim_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
-            if actual!=claim:raise AuthorityUnavailable("technical original lacks its real consumed claim")
-            self._reconcile_locked(db,binding,terminal_row or claim_row,execution)
-            if terminal_row is not None:
-                raise AuthorityUnavailable("root terminal already durable; inspect this original")
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            source_permit,_=self._gate_locked(db,binding,"claim")
-            if not self._same_location_epoch(source_permit.pinned_anchor,anchor):
-                raise AuthorityUnavailable("root technical append cannot restore a retired location/deletion epoch")
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="accounting",
-                current_anchor=anchor,operation_id=root_gate_operation_id_v3(binding,"original"),
-                command_digest="sha256:"+canonical_digest((binding.digest,claim.signature,"technical-originals")))
-        prepared,metadata,revision,_,_=self._read_original_payloads(binding)
-        if not self._graph_location_matches(metadata,permit.pinned_anchor):
-            raise AuthorityUnavailable("technical original Graph storage/deletion location differs")
-        content=False;owner=None
-        try:
-            current_digest=self._content_retention_current(binding)
-            owner=self._owner_observation(permit,binding)
-            content=current_digest==prepared.digest
-        except (AuthorityUnavailable,ValueError):
-            # This gate has an explicitly narrower historical measurement lane.
-            # It never permits source-derived artifact bytes on stale rights.
-            content=False
-        with self._frozen() as (db,deletion,execution):
-            anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
-            if content:
-                try:self._require_owner_locked(db,binding,owner)
-                except AuthorityUnavailable:content=False
-        qualification=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,permit,content))
-        return D04RootOriginalAppendV3(binding,claim,prepared.digest,canonical_serialize(metadata),revision,source_permit.pinned_anchor,permit,content,qualification)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);self._verify_claim(binding,claim)
+            bridge=self.bridge;bridge.core._require(self.credential,"execution",bridge.namespace)
+            with self._frozen() as (db,deletion,execution):
+                _,actual,measurement,claim_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
+                if actual!=claim:raise AuthorityUnavailable("technical original lacks its real consumed claim")
+                self._reconcile_locked(db,binding,terminal_row or claim_row,execution)
+                if terminal_row is not None:
+                    raise AuthorityUnavailable("root terminal already durable; inspect this original")
+                anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                source_permit,_=self._gate_locked(db,binding,"claim")
+                if not self._same_location_epoch(source_permit.pinned_anchor,anchor):
+                    raise AuthorityUnavailable("root technical append cannot restore a retired location/deletion epoch")
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="accounting",
+                    current_anchor=anchor,operation_id=root_gate_operation_id_v3(binding,"original"),
+                    command_digest="sha256:"+canonical_digest((binding.digest,claim.signature,"technical-originals")))
+            prepared,metadata,revision,_,_=self._read_original_payloads(binding)
+            if not self._graph_location_matches(metadata,permit.pinned_anchor):
+                raise AuthorityUnavailable("technical original Graph storage/deletion location differs")
+            content=False;owner=None
+            try:
+                current_digest=self._content_retention_current(binding)
+                owner=self._owner_observation(permit,binding)
+                content=current_digest==prepared.digest
+            except (AuthorityUnavailable,ValueError):
+                # This gate has an explicitly narrower historical measurement lane.
+                # It never permits source-derived artifact bytes on stale rights.
+                content=False
+            with self._frozen() as (db,deletion,execution):
+                anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
+                if content:
+                    try:self._require_owner_locked(db,binding,owner)
+                    except AuthorityUnavailable:content=False
+            qualification=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,permit,content))
+            return D04RootOriginalAppendV3(binding,claim,prepared.digest,canonical_serialize(metadata),revision,source_permit.pinned_anchor,permit,content,qualification)
 
     def _cost_closure(self,binding,claim,measurement,row):
         basis=root_cost_closure_basis_v3(row)
@@ -440,97 +444,101 @@ class AuthorityD04RootExecutionServiceV3:
 
     def begin_d04_root_adoption_bridge_v3(self,binding):
         """Only this binding's consecutive claim+terminal may bridge old Graph."""
-        self._binding(binding);bridge=self.bridge
-        bridge.core._require(self.credential,"execution",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,claim,measurement,claim_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
-            if claim is None or terminal_row is None or measurement.status!="completed" or root_cost_closure_basis_v3(terminal_row) is not None:
-                raise AuthorityUnavailable("root adoption requires actual completed terminal")
-            if measurement.actual_cpu_ms>binding.cpu_ceiling_ms:
-                raise AuthorityUnavailable("root CPU overrun permits historical accounting only")
-            self._reconcile_locked(db,binding,terminal_row,execution)
-            source_permit,_=self._gate_locked(db,binding,"claim")
-            before=source_permit.pinned_anchor
-            after,holder=self._current_anchor_locked(db,deletion,execution)
-            if (not self._same_location_epoch(before,after) or source_permit.holder!=holder
-                    or claim.claim_sequence!=before.execution_seq+1 or terminal_row[0]!=claim.claim_sequence+1
-                    or terminal_row[5]!=claim_row[6] or after.execution_seq!=terminal_row[0] or after.execution_digest!=terminal_row[6]):
-                raise AuthorityUnavailable("root adoption cannot skip interleaved/later execution or changed storage/deletion")
-            from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
-            require_lifecycle_admission_in_tx_v1(db,bridge.namespace,action="root_adoption")
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="write",current_anchor=after,
-                operation_id=root_gate_operation_id_v3(binding,"adoption"))
-        try:
-            prepared=self._graph_read(binding)
-            owner=self._owner_observation(permit,binding)
-            old=json.loads(prepared.authority_anchor_json)
-            if (not self._graph_location_matches(old,before)
-                    or (old["execution_seq"],old["execution_digest"])!=(before.execution_seq,before.execution_digest)):
-                raise AuthorityUnavailable("root adoption Graph is not its exact prepared execution prefix")
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);bridge=self.bridge
+            bridge.core._require(self.credential,"execution",bridge.namespace)
             with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution)
-                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-                self._require_owner_locked(db,binding,owner)
-                self._require_root_accepting_owner_locked(db,binding,prepared,owner)
-            _,metadata,revision,_,_=self._read_original_payloads(binding)
-            terminal=self._terminal(binding,claim,measurement,terminal_row)
-            qualification=canonical_digest((binding.digest,prepared.prepared.digest,metadata,revision,before,after,claim_row[6],terminal_row[6],permit,current_owner_authority_material_v1(owner)))
-            return D04RootAdoptionBridgeV3(binding,terminal,owner,prepared.prepared.digest,canonical_serialize(metadata),revision,before,after,permit,qualification)
-        except BaseException:
-            # Exact unused adoption fences have no external effect. Release only
-            # if their actual unchanged anchor is still current.
-            with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
-                    request_id=permit.operation_id+":rejected",request_digest="sha256:"+canonical_digest((binding.digest,"adoption-rejected")))
-            raise
+                _,claim,measurement,claim_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
+                if claim is None or terminal_row is None or measurement.status!="completed" or root_cost_closure_basis_v3(terminal_row) is not None:
+                    raise AuthorityUnavailable("root adoption requires actual completed terminal")
+                if measurement.actual_cpu_ms>binding.cpu_ceiling_ms:
+                    raise AuthorityUnavailable("root CPU overrun permits historical accounting only")
+                self._reconcile_locked(db,binding,terminal_row,execution)
+                source_permit,_=self._gate_locked(db,binding,"claim")
+                before=source_permit.pinned_anchor
+                after,holder=self._current_anchor_locked(db,deletion,execution)
+                if (not self._same_location_epoch(before,after) or source_permit.holder!=holder
+                        or claim.claim_sequence!=before.execution_seq+1 or terminal_row[0]!=claim.claim_sequence+1
+                        or terminal_row[5]!=claim_row[6] or after.execution_seq!=terminal_row[0] or after.execution_digest!=terminal_row[6]):
+                    raise AuthorityUnavailable("root adoption cannot skip interleaved/later execution or changed storage/deletion")
+                from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                require_lifecycle_admission_in_tx_v1(db,bridge.namespace,action="root_adoption")
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="write",current_anchor=after,
+                    operation_id=root_gate_operation_id_v3(binding,"adoption"))
+            try:
+                prepared=self._graph_read(binding)
+                owner=self._owner_observation(permit,binding)
+                old=json.loads(prepared.authority_anchor_json)
+                if (not self._graph_location_matches(old,before)
+                        or (old["execution_seq"],old["execution_digest"])!=(before.execution_seq,before.execution_digest)):
+                    raise AuthorityUnavailable("root adoption Graph is not its exact prepared execution prefix")
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution)
+                    bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
+                    self._require_owner_locked(db,binding,owner)
+                    self._require_root_accepting_owner_locked(db,binding,prepared,owner)
+                _,metadata,revision,_,_=self._read_original_payloads(binding)
+                terminal=self._terminal(binding,claim,measurement,terminal_row)
+                qualification=canonical_digest((binding.digest,prepared.prepared.digest,metadata,revision,before,after,claim_row[6],terminal_row[6],permit,current_owner_authority_material_v1(owner)))
+                return D04RootAdoptionBridgeV3(binding,terminal,owner,prepared.prepared.digest,canonical_serialize(metadata),revision,before,after,permit,qualification)
+            except BaseException:
+                # Exact unused adoption fences have no external effect. Release only
+                # if their actual unchanged anchor is still current.
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
+                        request_id=permit.operation_id+":rejected",request_digest="sha256:"+canonical_digest((binding.digest,"adoption-rejected")))
+                raise
 
     def validate_d04_root_gate_v3(self,binding,gate):
         """Authenticate an exact issued bridge before the Host Graph SQL opens."""
-        if type(gate) not in {D04RootOriginalAppendV3,D04RootAdoptionBridgeV3} or gate.binding!=binding:
-            raise AuthorityUnavailable("typed exact root gate required")
-        self._binding(binding);bridge=self.bridge
-        bridge.core._require(self.credential,"current",bridge.namespace)
-        prepared,metadata,revision,_,_=self._read_original_payloads(binding)
-        if (prepared.digest!=gate.prepared_digest or canonical_serialize(metadata)!=gate.before_requirements_json
-                or revision!=gate.before_graph_revision):
-            raise AuthorityUnavailable("root gate old Graph requirements/revision changed")
-        owner=(self._owner_observation(gate.permit,binding) if type(gate) is D04RootAdoptionBridgeV3 or gate.content_artifact_permitted else None)
-        selectors=self._read_root_basis(binding) if owner is not None else None
-        with self._frozen() as (db,deletion,execution):
-            anchor,_=self._current_anchor_locked(db,deletion,execution,
-                action="accounting" if type(gate) is D04RootOriginalAppendV3 else "business")
-            bridge.fences.validate_fence_locked(db,gate.permit,subject=gate.permit.subject,current_anchor=anchor)
-            _,claim,measurement,claim_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
-            if claim is None:raise AuthorityUnavailable("root gate has no actual claim")
-            self._verify_claim(binding,claim)
-            source,_=self._gate_locked(db,binding,"claim")
-            if type(gate) is D04RootOriginalAppendV3:
-                if gate.claim!=claim or gate.source_anchor!=source.pinned_anchor or terminal_row is not None:
-                    raise AuthorityUnavailable("root technical gate original changed")
-                expected=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,gate.permit,gate.content_artifact_permitted))
-            else:
-                if (terminal_row is None or gate.terminal!=self._terminal(binding,claim,measurement,terminal_row)
-                        or gate.before_anchor!=source.pinned_anchor or gate.after_anchor!=anchor
-                        or not self._same_location_epoch(gate.before_anchor,anchor)
-                        or claim_row[0]!=gate.before_anchor.execution_seq+1 or terminal_row[0]!=claim_row[0]+1
-                        or execution.seq!=terminal_row[0] or terminal_row[5]!=claim_row[6]):
-                    raise AuthorityUnavailable("root adoption exact consecutive transition changed")
-                self._require_owner_locked(db,binding,owner)
-                self._require_root_accepting_owner_locked(db,binding,selectors,owner)
-                expected=canonical_digest((binding.digest,prepared.digest,metadata,revision,gate.before_anchor,anchor,claim_row[6],terminal_row[6],gate.permit,current_owner_authority_material_v1(owner)))
-            if type(gate) is D04RootAdoptionBridgeV3 and gate.owner_authority!=owner:
-                raise AuthorityUnavailable("root bridge current Owner identity changed")
-            if gate.qualification_digest!=expected:
-                raise AuthorityUnavailable("root gate observation commitment changed")
-        if type(gate) is D04RootOriginalAppendV3 and gate.content_artifact_permitted:
-            if self._content_retention_current(binding)!=prepared.digest:
-                raise AuthorityUnavailable("root content artifact no longer has exact source closure")
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            if type(gate) not in {D04RootOriginalAppendV3,D04RootAdoptionBridgeV3} or gate.binding!=binding:
+                raise AuthorityUnavailable("typed exact root gate required")
+            self._binding(binding);bridge=self.bridge
+            bridge.core._require(self.credential,"current",bridge.namespace)
+            prepared,metadata,revision,_,_=self._read_original_payloads(binding)
+            if (prepared.digest!=gate.prepared_digest or canonical_serialize(metadata)!=gate.before_requirements_json
+                    or revision!=gate.before_graph_revision):
+                raise AuthorityUnavailable("root gate old Graph requirements/revision changed")
+            owner=(self._owner_observation(gate.permit,binding) if type(gate) is D04RootAdoptionBridgeV3 or gate.content_artifact_permitted else None)
+            selectors=self._read_root_basis(binding) if owner is not None else None
             with self._frozen() as (db,deletion,execution):
-                anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                anchor,_=self._current_anchor_locked(db,deletion,execution,
+                    action="accounting" if type(gate) is D04RootOriginalAppendV3 else "business")
                 bridge.fences.validate_fence_locked(db,gate.permit,subject=gate.permit.subject,current_anchor=anchor)
-                self._require_owner_locked(db,binding,owner)
-        return gate
+                _,claim,measurement,claim_row,terminal_row=read_root_execution_rows_locked_v3(bridge.journal,binding)
+                if claim is None:raise AuthorityUnavailable("root gate has no actual claim")
+                self._verify_claim(binding,claim)
+                source,_=self._gate_locked(db,binding,"claim")
+                if type(gate) is D04RootOriginalAppendV3:
+                    if gate.claim!=claim or gate.source_anchor!=source.pinned_anchor or terminal_row is not None:
+                        raise AuthorityUnavailable("root technical gate original changed")
+                    expected=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,gate.permit,gate.content_artifact_permitted))
+                else:
+                    if (terminal_row is None or gate.terminal!=self._terminal(binding,claim,measurement,terminal_row)
+                            or gate.before_anchor!=source.pinned_anchor or gate.after_anchor!=anchor
+                            or not self._same_location_epoch(gate.before_anchor,anchor)
+                            or claim_row[0]!=gate.before_anchor.execution_seq+1 or terminal_row[0]!=claim_row[0]+1
+                            or execution.seq!=terminal_row[0] or terminal_row[5]!=claim_row[6]):
+                        raise AuthorityUnavailable("root adoption exact consecutive transition changed")
+                    self._require_owner_locked(db,binding,owner)
+                    self._require_root_accepting_owner_locked(db,binding,selectors,owner)
+                    expected=canonical_digest((binding.digest,prepared.digest,metadata,revision,gate.before_anchor,anchor,claim_row[6],terminal_row[6],gate.permit,current_owner_authority_material_v1(owner)))
+                if type(gate) is D04RootAdoptionBridgeV3 and gate.owner_authority!=owner:
+                    raise AuthorityUnavailable("root bridge current Owner identity changed")
+                if gate.qualification_digest!=expected:
+                    raise AuthorityUnavailable("root gate observation commitment changed")
+            if type(gate) is D04RootOriginalAppendV3 and gate.content_artifact_permitted:
+                if self._content_retention_current(binding)!=prepared.digest:
+                    raise AuthorityUnavailable("root content artifact no longer has exact source closure")
+                with self._frozen() as (db,deletion,execution):
+                    anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                    bridge.fences.validate_fence_locked(db,gate.permit,subject=gate.permit.subject,current_anchor=anchor)
+                    self._require_owner_locked(db,binding,owner)
+            return gate
 
     def read_d04_root_gate_state_v3(self,binding,gate):
         if type(gate) not in {D04RootOriginalAppendV3,D04RootAdoptionBridgeV3} or gate.binding!=binding:
@@ -716,34 +724,36 @@ class AuthorityD04RootExecutionServiceV3:
         return self._terminal(binding,claim,measurement,row)
 
     def read_d04_root_restore_original_v3(self,binding):
-        self._binding(binding);bridge=self.bridge;bridge.core._require(self.credential,"current",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,claim,measurement,claim_row,row=read_root_execution_rows_locked_v3(bridge.journal,binding)
-            if claim is None or row is None or measurement.status!="completed" or root_cost_closure_basis_v3(row) is not None:raise AuthorityUnavailable("root restore requires actual complete artifact terminal")
-            self._reconcile_locked(db,binding,row,execution)
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="recovery")
-            source,_=self._gate_locked(db,binding,"claim")
-            if not self._same_location_epoch(source.pinned_anchor,anchor):raise AuthorityUnavailable("root restore crossed deletion/storage lineage")
-            import secrets
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="read",current_anchor=anchor,operation_id=root_gate_operation_id_v3(binding,"restore")+":"+secrets.token_hex(8))
-        try:
-            prepared,metadata,revision,artifact,measured=self._read_original_payloads(binding)
-            if measured!=to_wire(measurement) or not self._graph_location_matches(metadata,anchor):raise AuthorityUnavailable("root restore actual measurement/location changed")
-            self._verify_artifact(prepared,claim,measurement,artifact)
-            self._require_current_artifact_source_rights(prepared)
-            owner=self._owner_observation(permit,binding);read=self._read_root_basis(binding)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);bridge=self.bridge;bridge.core._require(self.credential,"current",bridge.namespace)
             with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-                self._require_root_accepting_owner_locked(db,binding,read,owner)
-            terminal=self._terminal(binding,claim,measurement,row)
-            return D04RootRestoreOriginalV3(prepared,claim,measurement,artifact,terminal,
-                canonical_digest((binding.digest,terminal.digest,prepared.digest,artifact,metadata,revision,permit)))
-        finally:
-            with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
-                    request_id=permit.operation_id+":closed",request_digest="sha256:"+canonical_digest((binding.digest,"restore",permit.operation_id)))
+                _,claim,measurement,claim_row,row=read_root_execution_rows_locked_v3(bridge.journal,binding)
+                if claim is None or row is None or measurement.status!="completed" or root_cost_closure_basis_v3(row) is not None:raise AuthorityUnavailable("root restore requires actual complete artifact terminal")
+                self._reconcile_locked(db,binding,row,execution)
+                anchor,holder=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                source,_=self._gate_locked(db,binding,"claim")
+                if not self._same_location_epoch(source.pinned_anchor,anchor):raise AuthorityUnavailable("root restore crossed deletion/storage lineage")
+                import secrets
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="read",current_anchor=anchor,operation_id=root_gate_operation_id_v3(binding,"restore")+":"+secrets.token_hex(8))
+            try:
+                prepared,metadata,revision,artifact,measured=self._read_original_payloads(binding)
+                if measured!=to_wire(measurement) or not self._graph_location_matches(metadata,anchor):raise AuthorityUnavailable("root restore actual measurement/location changed")
+                self._verify_artifact(prepared,claim,measurement,artifact)
+                self._require_current_artifact_source_rights(prepared)
+                owner=self._owner_observation(permit,binding);read=self._read_root_basis(binding)
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
+                    self._require_root_accepting_owner_locked(db,binding,read,owner)
+                terminal=self._terminal(binding,claim,measurement,row)
+                return D04RootRestoreOriginalV3(prepared,claim,measurement,artifact,terminal,
+                    canonical_digest((binding.digest,terminal.digest,prepared.digest,artifact,metadata,revision,permit)))
+            finally:
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
+                        request_id=permit.operation_id+":closed",request_digest="sha256:"+canonical_digest((binding.digest,"restore",permit.operation_id)))
 
     def read_d04_root_terminal_v3(self,binding):return self.read_d04_root_originals_v3(binding)[1]
 
@@ -756,63 +766,11 @@ class AuthorityD04RootExecutionServiceV3:
         if self._graph_read(binding,claim)!=measurement:raise AuthorityUnavailable("root recovery durable measurement differs")
         return binding,claim,self._cost_closure(binding,claim,measurement,row) if root_cost_closure_basis_v3(row) is not None else self._terminal(binding,claim,measurement,row)
 
-    def _owner_observation(self, permit, binding=None):
-        from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        if self.target_owner_service is None and self.storage_owner_service is not None:
-            return self._storage_owner_observation(permit,binding)
-        if self.target_owner_service is None:
-            selectors=self._read_root_basis(binding) if binding is not None else None
-            with self.bridge.core._tx() as db:
-                head=self.owner_tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)
-                if head is None or head.state!="active":
-                    raise AuthorityUnavailable("root current Owner head unavailable")
-                if binding is not None:self._require_root_accepting_owner_locked(db,binding,selectors)
-                return D12CurrentOwnerAuthorityV1(head.guard,None)
-        target=self.target_owner_service
-        if binding is None:
-            return target.get_current_background_owner_authority_for_fence_v1(
-                credential=self.credential,subject=permit.subject,permit=permit)[0]
-        # A target Graph intentionally retains its before-head during its own
-        # root claim/terminal appends. Only this actual installed root
-        # service may prove that bounded interval; ordinary target reads remain
-        # exact-current and never fall back on a failed authorization.
-        with self._frozen() as (db,deletion,execution):
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
-            _,claim,_,claim_row,terminal_row=read_root_execution_rows_locked_v3(self.bridge.journal,binding)
-            head=self.owner_tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)
-            if head is None or head.state!="active" or holder!=target.holder:
-                raise AuthorityUnavailable("root target current holder/Owner changed")
-            history=target._current_transfer(db,generation=anchor.activation_generation)
-            if claim is not None:
-                self._verify_claim(binding,claim)
-                original,_=self._gate_locked(db,binding,"claim")
-                before=original.pinned_anchor
-            else:
-                before=anchor
-        metadata,_=self._read_graph_requirements_only()
-        graph_head=(metadata["execution_seq"],metadata["execution_digest"])
-        if graph_head==(anchor.execution_seq,anchor.execution_digest):
-            location_anchor=anchor
-        else:
-            last=terminal_row or claim_row
-            if (claim is None or last is None or not self._same_location_epoch(before,anchor)
-                    or graph_head!=(before.execution_seq,before.execution_digest)
-                    or claim_row[0]!=before.execution_seq+1
-                    or terminal_row is not None and (terminal_row[0]!=claim_row[0]+1 or terminal_row[5]!=claim_row[6])
-                    or (anchor.execution_seq,anchor.execution_digest)!=(last[0],last[6])):
-                raise AuthorityUnavailable("target root identity cannot bridge unrelated execution")
-            location_anchor=before
-        location=target._read_graph(history=history,owner_head=head,anchor=location_anchor)
-        graph_metadata,revision,grant_digest,imported,continuation=location
-        with self._frozen() as (db,deletion,execution):
-            current,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-            if current!=anchor or target.tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)!=head:
-                raise AuthorityUnavailable("target root identity changed after location read")
-            return target._current_background_identity_for_verified_location_in_tx_v1(db,head=head,history=history,
-                metadata=graph_metadata,revision=revision,grant_digest=grant_digest,imported=imported,
-                continuation=continuation,anchor=current)
+    def _owner_observation(self,permit,binding=None):
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            from .owner_location_read_v3 import prepare_owner_location_for_root_execution_v3
+            return prepare_owner_location_for_root_execution_v3(self,permit=permit,binding=binding)
 
     def _verify_adoption_commit(self,binding,gate):
         from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
@@ -866,38 +824,4 @@ class AuthorityD04RootExecutionServiceV3:
                 if (row is None or row[1:]!=(1,*binding.namespace.as_tuple,"d12.scheme_adoption.v1",binding.operation_id) or json.loads(row[0])!=want):raise AuthorityUnavailable("root head/cost actual history differs")
         finally:db.close()
 
-    def _storage_owner_observation(self,permit,binding):
-        """Actual source C09 identity over only this consumed execution prefix."""
-        from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        service=self.storage_owner_service
-        if binding is None:return service.get_current_background_owner_authority_for_fence_v1(credential=self.credential,subject=permit.subject,permit=permit)[0]
-        with self._frozen() as (db,deletion,execution):
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
-            _,claim,_,claim_row,terminal_row=read_root_execution_rows_locked_v3(self.bridge.journal,binding)
-            head=service._head_in_tx(db)
-            if holder!=service.holder:raise AuthorityUnavailable("source storage Owner holder changed")
-            service._background_identity_in_tx(db,head)
-            if claim is not None:
-                self._verify_claim(binding,claim);source,_=self._gate_locked(db,binding,"claim");before=source.pinned_anchor
-            else:before=anchor
-        metadata,_=self._read_graph_requirements_only()
-        if (metadata["execution_seq"],metadata["execution_digest"])==(anchor.execution_seq,anchor.execution_digest):location_anchor=anchor
-        else:
-            last=terminal_row or claim_row
-            if (claim is None or last is None or not self._same_location_epoch(before,anchor)
-                    or (metadata["execution_seq"],metadata["execution_digest"])!=(before.execution_seq,before.execution_digest)
-                    or claim_row[0]!=before.execution_seq+1
-                    or terminal_row is not None and (terminal_row[0]!=claim_row[0]+1 or terminal_row[5]!=claim_row[6])
-                    or (anchor.execution_seq,anchor.execution_digest)!=(last[0],last[6])):
-                raise AuthorityUnavailable("source storage Owner cannot skip unrelated execution")
-            location_anchor=before
-        _,grant,admission=service._read_graph(owner_head=head,anchor=location_anchor)
-        if head.grant_digest.removeprefix("sha256:")!=binding.owner_grant_digest:
-            raise AuthorityUnavailable("source storage original Owner grant changed")
-        with self._frozen() as (db,deletion,execution):
-            current,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-            if current!=anchor or service._head_in_tx(db)!=head:raise AuthorityUnavailable("source storage Owner changed after independent graph read")
-            service._background_identity_in_tx(db,head)
-        return D12CurrentOwnerAuthorityV1(head.guard,None,admission)
+

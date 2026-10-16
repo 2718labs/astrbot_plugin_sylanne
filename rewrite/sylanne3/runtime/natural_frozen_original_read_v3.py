@@ -4,7 +4,7 @@ from hashlib import sha256
 from weakref import WeakKeyDictionary
 from types import MappingProxyType
 
-from ..contracts import AuthorityUnavailable
+from ..authority_service.contract import AuthorityUnavailable
 from ..runtime_contracts import _canonical_value
 from .owner_material_source_storage_v3 import CanonicalValueStreamV3
 

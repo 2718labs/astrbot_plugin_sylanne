@@ -97,4 +97,5 @@ def method_growth_value_from_wire_v2(raw, cls):
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     if cls not in {D07MethodGrowthSemanticQuestionV2, D07MethodGrowthPreparedV2}:
         raise TypeError("only named growth question/prepared variants are decoded")
-    return decode_typed_production_value_v1(raw, cls)
+    from .d07_execution_v1 import decode_native_named_d07_value_v2
+    return decode_native_named_d07_value_v2(raw, cls)

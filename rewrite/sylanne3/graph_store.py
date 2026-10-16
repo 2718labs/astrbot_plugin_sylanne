@@ -347,6 +347,8 @@ class GraphStore(Store):
                         install_d05_production_schema_v1, install_d08_production_schema_v1,
                         install_d10_production_schema_v1, install_d11_offline_schema_v1, install_d11_life_schema_v1):
                     install(self._db)
+                from .runtime.b3_managed_metadata_v1 import install_b3_managed_metadata_for_registry_v1
+                install_b3_managed_metadata_for_registry_v1(self._db,self._registry)
                 self._db.execute("BEGIN IMMEDIATE")
                 install_runtime_schema(self._db)
                 from .runtime.d12_installed_graph_schema_v1 import install_d12_installed_graph_schema_v1
@@ -1864,7 +1866,8 @@ class GraphStore(Store):
                 raise ValueError("immutable graph atoms cannot have invalidating dependencies")
             validated = self._registry.validate(write.key, write.value)
             from .runtime.owner_material_source_storage_v3 import issued_sealed_source_graph_write_v3
-            if issued_sealed_source_graph_write_v3(write):
+            from .runtime.contact_plan_physical_write_v3 import issued_contact_plan_graph_write_v3
+            if issued_sealed_source_graph_write_v3(write) or issued_contact_plan_graph_write_v3(write):
                 if self._runtime_storage_v3 is None:
                     raise ValueError("sealed Source write requires its actual segmented role")
                 prepared.append((write, spec, None))
@@ -2101,9 +2104,14 @@ class GraphStore(Store):
             value_column = graph_value_column_v3(self._db)
             from .runtime.owner_material_source_storage_v3 import (
                 issued_sealed_source_graph_write_v3, source_graph_cell_ref_v3)
+            from .runtime.contact_plan_physical_write_v3 import issued_contact_plan_graph_write_v3
             if issued_sealed_source_graph_write_v3(write):
                 value_json = source_graph_cell_ref_v3(write,self._db,revision=revision,
                     event_digest=digest,scope_key=scope_key,read_versions=reads,epochs=epochs)
+            elif issued_contact_plan_graph_write_v3(write):
+                from .runtime.contact_plan_physical_write_v3 import contact_plan_graph_cell_ref_v3
+                value_json = contact_plan_graph_cell_ref_v3(write,self._db,revision=revision,event_digest=digest,
+                    scope_key=scope_key,read_versions=reads,epochs=epochs)
             elif self._runtime_storage_v3 is not None:
                 value_json = seal_runtime_cell_in_transaction_v3(self._db,
                     locator={'table':'graph_atoms','token':token,'revision':revision},

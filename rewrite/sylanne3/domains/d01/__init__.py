@@ -425,6 +425,7 @@ class PersonaDomain:
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
         from .method_learning_v1 import method_learning_type_specs_v1
+        from .conditioned_self_v1 import conditioned_self_type_specs_v1
         layouts = (
             ("d01.persona_plan.v1", _validate_persona_plan, PersonaPlan),
             ("d01.persona_activation.v1", _validate_persona_activation, PersonaActivation),
@@ -444,7 +445,7 @@ class PersonaDomain:
                 "storage_role": "state",
                 "fields": [field.name for field in fields(value_type)],
             }),
-        ) for name, validator, value_type in layouts) + method_learning_type_specs_v1()
+        ) for name, validator, value_type in layouts) + method_learning_type_specs_v1() + conditioned_self_type_specs_v1()
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
@@ -667,7 +668,10 @@ class PersonaDomain:
                 or semantic_projection.runtime_identity.namespace!=plan.namespace or semantic_projection.persona_head!=plan.head_id):
             raise ValueError("persona readout requires the exact current qualified self model")
         blocks=[]
+        from .conditioned_self_v1 import decode_conditioned_self_claim_v1
         for block in plan.blocks:
+            if block.kind in {'self_knowledge','strategy'} and decode_conditioned_self_claim_v1(block.claim)is not None:
+                continue
             if block.kind!="semantic_identity":blocks.append(block);continue
             semantic=decode_semantic_identity_v3(block.claim)
             if semantic is None:blocks.append(block);continue
@@ -713,6 +717,11 @@ class PersonaDomain:
         target = next((block for block in plan.blocks if block.block_id == proposal.target_block), None)
         if target is None:
             raise ValueError("growth target block is missing")
+        from .conditioned_self_v1 import decode_conditioned_self_claim_v1
+        conditional=decode_conditioned_self_claim_v1(proposal.replacement_claim)
+        if conditional is not None:
+            from ...runtime.conditioned_self_operations_v1 import require_conditioned_growth_qualification_v1
+            require_conditioned_growth_qualification_v1(semantic_qualification,plan=plan,proposal=proposal,candidate=conditional)
         if target.kind == "semantic_identity":
             from .identity_v3 import decode_semantic_identity_v3
             base = decode_semantic_identity_v3(target.claim)

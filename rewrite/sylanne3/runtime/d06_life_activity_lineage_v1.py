@@ -122,12 +122,26 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
     from .d10_life_progress_provenance_v1 import require_current_life_progress_v1,require_life_experience_access_edges_v1
     require_current_life_progress_v1(db,namespace=ns,progress=progress,issuer=issuer,read=read)
     access_key_actual=require_life_experience_access_edges_v1(db,prepared=prepared,source=source_atom.key)
-    access_history=db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(access_key_actual.token,)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+    handled,access_history=read_bound_native_numeric_history_v3(db,access_key_actual.token,1,('value', 'valid', 'event_id'))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_history_v3
+        handled,access_history=read_bound_life_model_history_v3(db,access_key_actual.token,1,('value', 'valid', 'event_id'))
+    if not handled:
+        access_history=db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(access_key_actual.token,)).fetchone()
     expected_access=canonical_serialize({'source_id':source.source_id,'audiences':list(source.audiences),
         'purposes':list(source.purposes),'status':'active','recorded_at':source.recorded_at})
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,actual_access=read_bound_native_numeric_point_v3(db,table='graph_atoms',columns=('value',),
+        key_columns=('token',),key=(access_key_actual.token,))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,actual_access=read_bound_life_model_body_point_v3(db,table='graph_atoms',columns=('value',),
+        key_columns=('token',),key=(access_key_actual.token,))
+    if not handled:actual_access=db.execute('SELECT value FROM graph_atoms WHERE token=?',(access_key_actual.token,)).fetchone()
     if (not any(v.key==access_key_actual and v.revision==1 for v in adopted['receipt'].write_versions)
             or access_history!=(expected_access,1,operation_id)
-            or db.execute('SELECT value FROM graph_atoms WHERE token=?',(access_key_actual.token,)).fetchone()!=(expected_access,)):
+            or actual_access!=(expected_access,)):
         raise ValueError('Life current experience access lacks its exact actual same-composite original')
     verify_durable_life_artifact_v1(db, prepared, digest=terminal.payload.artifact_digest,
         length=terminal.payload.artifact_length)
@@ -187,8 +201,16 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
             or reservation["remaining_cost"] != body_quote.max_energy_cost - component.fixed_cost):
         raise ValueError("Life activity Body component is not actually settled")
     version = next((v for v in adopted["receipt"].write_versions if v.key == settlement.key), None)
-    historical = None if version is None else db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
-        (version.key.token, version.revision)).fetchone()
+    historical = None
+    if version is not None:
+        from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+        handled,historical=read_bound_native_numeric_history_v3(db,version.key.token,version.revision,('event_id','value','valid'))
+        if not handled:
+            from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_history_v3
+            handled,historical=read_bound_life_model_history_v3(db,version.key.token,version.revision,('event_id','value','valid'))
+        if not handled:
+            historical=db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+                (version.key.token,version.revision)).fetchone()
     if historical != (operation_id, canonical_serialize(settlement.value), 1):
         raise ValueError("Life Body settlement is not a member of the actual D10 composite")
     if (progress.activity_id, progress.effect_id, progress.artifact_ref, progress.terminal_ref, progress.reality) != (

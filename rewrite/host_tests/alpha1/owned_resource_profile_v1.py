@@ -192,6 +192,7 @@ FIXTURE_NODES.update({
 PACKAGE_NAMES = frozenset({
     "astrbot_plugin_sylanne-3.0.0-alpha1-linux-x86_64-glibc-alpha1-test-snapshot.zip",
     "astrbot_plugin_sylanne-3.0.0-alpha2-linux-x86_64-glibc-alpha2-candidate.zip",
+    "astrbot_plugin_sylanne-3.0.0-beta1-linux-x86_64-glibc-beta1-candidate.zip",
 })
 LOG_LIMIT = 8 * 1024 * 1024
 PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
@@ -204,6 +205,14 @@ APP_CONTROLS = {"memory.max": "1342177280", "memory.high": "1073741824",
 METRICS = ("cgroup.events", "memory.current", "memory.peak", "memory.events",
            "memory.events.local", "memory.stat", "memory.swap.current", "memory.swap.events",
            "cpu.stat", "cpu.pressure", "memory.pressure")
+
+
+BETA1_CURRENT_SUITE_KINDS=frozenset({"numeric","d13_full"})
+BETA1_PACKAGE_NAME="astrbot_plugin_sylanne-3.0.0-beta1-linux-x86_64-glibc-beta1-candidate.zip"
+
+
+def _uses_beta1_current_suite_v3(spec):
+    return Path(spec.package_path).name==BETA1_PACKAGE_NAME and spec.fixture_kind in BETA1_CURRENT_SUITE_KINDS
 
 
 def _validate_phase_fixture_setup(path_value, expected_sha256, setup_root):
@@ -281,7 +290,7 @@ class OwnedResourceRunV1:
             required = name in {"delivery_root", "fixture_root"} or (
                 name == "installed_stage_root" and self.fixture_kind != "b04"
                 and self.fixture_kind not in SDK_M1_KINDS) or (
-                name == "phase_setup_root" and self.fixture_kind in PHASE_FIXTURE_KINDS)
+                name == "phase_setup_root" and (self.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(self)))
             if required and value is None:
                 raise ValueError("explicit server " + name + " required")
             if value is not None:
@@ -328,6 +337,9 @@ class OwnedResourceRunV1:
         if str(UUID(self.operation_id, version=4)) != self.operation_id or UUID(self.operation_id).version != 4:
             raise ValueError("fresh UUID4 resource operation required")
         package = Path(self.package_path)
+        if (package.name==BETA1_PACKAGE_NAME and self.fixture_kind.startswith(("numeric","d13"))
+                and self.fixture_kind not in BETA1_CURRENT_SUITE_KINDS):
+            raise ValueError("Beta1 Numeric/D13 require the full current protected suite; no legacy pytest fallback")
         root = Path(self.frozen_rewrite_root)
         if (package.resolve(strict=True) != package or root.resolve(strict=True) != root
                 or package.name not in PACKAGE_NAMES or package.parent.parent != Path(self.delivery_root)
@@ -344,7 +356,7 @@ class OwnedResourceRunV1:
             _validate_c09_engineering_inventory_v1(self)
         elif self.engineering_inventory_sha256 is not None:
             raise ValueError("engineering inventory pin is only valid for current C09")
-        if self.fixture_kind in PHASE_FIXTURE_KINDS:
+        if self.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(self):
             if self.phase_fixture_setup is None or self.phase_fixture_setup_sha256 is None:
                 raise ValueError("pinned protected phase fixture setup required")
             if (len(self.phase_fixture_setup_sha256) != 64
@@ -461,7 +473,7 @@ def _pin_inputs_in_child(spec):
                 digest.update(chunk)
         if digest.hexdigest() != pin:
             raise ValueError("selected fixture input bytes changed before exec")
-    if spec.fixture_kind in PHASE_FIXTURE_KINDS:
+    if spec.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(spec):
         _validate_phase_fixture_setup(spec.phase_fixture_setup, spec.phase_fixture_setup_sha256, spec.phase_setup_root)
 
 
@@ -565,7 +577,7 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
         raise ValueError("explicit fixed fixture and existing root resource authority required")
     if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 1000:
         raise ValueError("original bounded fixture deadline required")
-    if spec.fixture_kind in PHASE_FIXTURE_KINDS:
+    if spec.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(spec):
         _validate_phase_fixture_setup(spec.phase_fixture_setup, spec.phase_fixture_setup_sha256, spec.phase_setup_root)
     if (len(tuple(Path("/proc/self/task").iterdir())) != 1
             or any(name == "sylanne3" or name.startswith("sylanne3.") or name == "astrbot"
@@ -577,7 +589,7 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
         raise ValueError("root-private ext4 evidence directory required")
     if Path(spec.basetemp).exists():
         raise ValueError("fresh fixture basetemp required")
-    if spec.fixture_kind in PHASE_FIXTURE_KINDS:
+    if spec.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(spec):
         _prepare_phase_child_paths_v1(spec)
     command = [PYTHON, "-B", str(Path(__file__).resolve()), "--fixed-child", json.dumps(asdict(spec))]
     environment = dict(os.environ,
@@ -610,7 +622,7 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
     environment.pop("PYTEST_ADDOPTS", None)
     environment.pop("SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP", None)
     environment.pop("SYLANNE_L02_FIXTURE_SETUP", None)
-    if spec.fixture_kind in PHASE_FIXTURE_KINDS:
+    if spec.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(spec):
         environment["SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP"] = spec.phase_fixture_setup
         if spec.fixture_kind in L02_FIXTURE_KINDS:
             environment["SYLANNE_L02_FIXTURE_SETUP"] = spec.phase_fixture_setup
@@ -697,7 +709,12 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
         summary["effective_controls"] = {"run": {n: _read(run / n) for n in RUN_CONTROLS},
             "app": {n: _read(app / n) for n in (*APP_CONTROLS, "cpu.max")},
             "run_identity": run_id, "app_identity": app_id, "added_parent_tokens": sorted(added)}
-        if spec.fixture_kind == "c09_current":
+        if _uses_beta1_current_suite_v3(spec):
+            from rewrite.host_tests.alpha1.c09_root_phase_harness_v3 import run_root_controlled_beta1_suite_v3
+            summary.pop("pytest_outcomes_path")
+            summary.update(run_root_controlled_beta1_suite_v3(spec,app=app,run=run,environment=environment,
+                started=started,deadline=started+timeout_seconds,profile=globals()))
+        elif spec.fixture_kind == "c09_current":
             from rewrite.host_tests.alpha1.c09_root_phase_harness_v3 import run_root_controlled_four_phase_v3
             summary.pop("pytest_outcomes_path")
             summary.update(run_root_controlled_four_phase_v3(spec,app=app,run=run,environment=environment,
@@ -726,7 +743,7 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
                     if os.read(go_r, 2) != b"GO": os._exit(125)
                     for fd in (placement, ready_w, go_r, out_w, err_w): os.close(fd)
                     os.chdir(spec.frozen_rewrite_root)
-                    if spec.fixture_kind in PHASE_FIXTURE_KINDS:
+                    if spec.fixture_kind in PHASE_FIXTURE_KINDS or _uses_beta1_current_suite_v3(spec):
                         _enter_phase_child_identity_v1()
                     os.execve(PYTHON, command, environment)
                 except BaseException as error:

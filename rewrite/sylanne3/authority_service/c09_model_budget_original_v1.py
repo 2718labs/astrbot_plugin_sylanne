@@ -13,8 +13,10 @@ UNITS = frozenset({"input_tokens", "output_tokens", "model_tokens", "model_micro
 MODEL_TABLES = (
     "authority_model_egress_v1", "authority_model_egress_bindings_v1", "authority_model_egress_observations_v1",
     "authority_model_egress_observation_status_v1", "authority_model_admissions_v2", "authority_model_original_identity_v2",
+    "authority_model_no_dispatch_witnesses_v1",
 )
 MODEL_COLUMNS = {
+    "authority_model_no_dispatch_witnesses_v1": ("call_id", "authority_id", "namespace", "installation_id", "closure_operation_id", "request_digest", "witness_json", "witness_digest", "signature"),
     "authority_model_egress_v1": ("call_id", "operation_id", "namespace", "subject", "identity_json", "state", "observation_digest"),
     "authority_model_egress_bindings_v1": ("call_id", "operation_id", "token"),
     "authority_model_egress_observations_v1": ("call_id", "observation_json", "observation_digest"),
@@ -143,6 +145,13 @@ class C09ModelBudgetOriginalV1:
 
 
 def model_budget_original_from_wire_v1(raw):
+    if type(raw) is dict and raw.get("schema") == "sylanne3.c09.model-no-dispatch-budget-original.v2":
+        if set(raw) != {f.name for f in fields(C09ModelNoDispatchBudgetOriginalV2)}:
+            raise AuthorityUnavailable("C09 no-dispatch original fields differ")
+        data = dict(raw)
+        data["source_row_commitments"] = tuple(data["source_row_commitments"])
+        data["units"] = tuple(C09ModelUnitObligationV1(**unit) for unit in data["units"])
+        return C09ModelNoDispatchBudgetOriginalV2(**data)
     if type(raw) is not dict or set(raw) != {f.name for f in fields(C09ModelBudgetOriginalV1)}:
         raise AuthorityUnavailable("C09 model original fields differ")
     value = dict(raw)
@@ -217,6 +226,16 @@ def validate_model_core_row_v1(table, columns, row):
                     terminal.installation_id, terminal.host_incarnation) != (
                     row[0], row[1], row[3], admission.request_digest, admission.installation_id, admission.host_incarnation):
                 raise AuthorityUnavailable("C09 model terminal/admission row differs")
+
+    elif table == "authority_model_no_dispatch_witnesses_v1":
+        from .v2_model_egress_contract import ModelNoDispatchWitnessV1
+        from .v2_model_egress_wire import from_wire
+        witness = from_wire(_json(row[6]), ModelNoDispatchWitnessV1)
+        if ((row[0], row[1], row[2], row[3], row[4], row[5], row[7], row[8]) !=
+                (witness.request.intent.call_id, witness.request.intent.authority_id, witness.request.intent.namespace,
+                 witness.request.installation_id, witness.witness_operation_id, witness.request.identity_digest,
+                 witness.digest, witness.signature)):
+            raise AuthorityUnavailable("C09 no-dispatch Core witness exact source row differs")
     elif table == "authority_model_original_identity_v2":
         if any(type(value) is not str or not value for value in row) or not all(_digest(value) for value in row[-2:]):
             raise AuthorityUnavailable("C09 model original identity row differs")
@@ -396,7 +415,7 @@ def require_model_budget_release_safe_v1(db, *, namespace, meter):
             row = reader.execute(f"SELECT * FROM {TABLE} WHERE namespace=? AND operation_id=? AND call_id=?",
                 (namespace, operation, call)).fetchone()
             original = validate_c09_model_budget_row_v1(columns, row)
-            if (original.provider_state != "observed" or original.reservation_state not in {"settled", "overrun"}
+            if (original.provider_state != "observed" and type(original) is not C09ModelNoDispatchBudgetOriginalV2 or original.reservation_state not in {"settled", "overrun"}
                     or any(unit.actual_or_none is None or unit.pending_known or unit.unknown_upper_bound for unit in original.units)):
                 raise AuthorityUnavailable("C09 model pending/unknown budget has no installed sanitized settlement consumer")
 
@@ -434,6 +453,12 @@ def read_frozen_model_budget_original_v2(*, core_db, business, namespace_id, sea
     present = core_db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='authority_model_egress_v1'").fetchone()
     if present is None:
         return None
+    if core_db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='authority_model_no_dispatch_witnesses_v1'").fetchone():
+        witness_row = core_db.execute("SELECT * FROM authority_model_no_dispatch_witnesses_v1 WHERE namespace=? AND call_id=?", (seal.namespace, call_id)).fetchone()
+        if witness_row is not None:
+            if core_db.execute("SELECT 1 FROM sqlite_master WHERE name='authority_c09_consumed_execution_v1'").fetchone() and core_db.execute("SELECT 1 FROM authority_c09_consumed_execution_v1 WHERE namespace=? AND kind='model_call' AND item_id=?", (seal.namespace, call_id)).fetchone():
+                return None
+            return _read_frozen_artifact_no_dispatch_budget_original_v2(core_db=core_db, business=business, namespace_id=namespace_id, seal=seal, resource_issuer=resource_issuer, budget_job_issuer=budget_job_issuer, call_id=call_id, witness_row=witness_row, provider_scope_sink=_provider_scope_sink)
     def commitment(db, table, row):
         columns = tuple(item[1] for item in db.execute(f"PRAGMA table_info({table})"))
         material = tuple({"blob_sha256": __import__('hashlib').sha256(value).hexdigest(), "size": len(value)}
@@ -864,3 +889,189 @@ def capture_frozen_model_budget_originals_v1(*, core_db, business, namespace_id,
     if monotonic_ns() - meter.started_ns > meter.budget.max_local_ns:
         raise C09PagedCaptureHold("C09 legacy model capture exceeded its actual reserved duration")
     return tuple(result)
+
+
+@dataclass(frozen=True, slots=True)
+class C09ModelNoDispatchBudgetOriginalV2(C09ModelBudgetOriginalV1):
+    no_dispatch_witness_digest: str = ""
+    no_dispatch_original_ref: str = ""
+    schema: str = "sylanne3.c09.model-no-dispatch-budget-original.v2"
+
+    def __post_init__(self):
+        if (self.schema != "sylanne3.c09.model-no-dispatch-budget-original.v2"
+                or not _digest(self.no_dispatch_witness_digest) or not self.no_dispatch_original_ref
+                or self.provider_state != "prepared" or self.admission_id_or_none is not None
+                or self.observation_digest_or_none is not None or self.terminal_digest_or_none is not None
+                or self.provider_query_ref_or_none is not None or self.reservation_state != "settled"
+                or any(unit.actual_or_none != 0 or unit.settled or unit.pending_known or unit.debt
+                    or unit.unknown_upper_bound or unit.settlement_id_or_none is None for unit in self.units)):
+            raise AuthorityUnavailable("C09 no-dispatch original has another fixed execution/zero-settlement variant")
+        base = {f.name: getattr(self, f.name) for f in fields(C09ModelBudgetOriginalV1) if f.name != "original_digest"}
+        base["schema"] = "sylanne3.c09.model-budget-original.v1"
+        C09ModelBudgetOriginalV1(**base, original_digest=canonical_digest(tuple(
+            base[f.name] for f in fields(C09ModelBudgetOriginalV1) if f.name != "original_digest")))
+        if canonical_digest(tuple(getattr(self, f.name) for f in fields(self) if f.name != "original_digest")) != self.original_digest:
+            raise AuthorityUnavailable("C09 no-dispatch original digest differs")
+
+
+def _read_frozen_artifact_no_dispatch_budget_original_v2(*, core_db, business, namespace_id,
+        seal, resource_issuer, budget_job_issuer, call_id, witness_row, provider_scope_sink=None):
+    from ..runtime.issuers import D11BudgetJobIssuer
+    from .v2_model_egress_contract import ModelNoDispatchWitnessV1
+    from .v2_model_egress_wire import from_wire
+    from .v2_model_egress_store import AuthorityV2ModelEgressStore
+    from .v2_fence_store import AuthorityV2FenceStore
+    from ..runtime.d11_life_preparation_v1 import _read, TABLE as LIFE_TABLE
+    from ..runtime.d11_artifact_draft_model_v1 import (
+        ArtifactDraftModelPreparedV1, ArtifactDraftModelPreparedV2,
+        artifact_draft_model_from_wire_v1, artifact_draft_model_from_wire_v2,
+        artifact_model_no_dispatch_original_ref_v1, read_artifact_model_no_dispatch_settlement_v1)
+    from ..model_broker.artifact_draft_v1 import (
+        ArtifactDraftTaskSelectorV1, ArtifactDraftPhaseSelectorV2, artifact_draft_from_wire_v1,
+        artifact_draft_from_wire_v2, artifact_draft_model_ids_v1, artifact_draft_model_ids_v2)
+    from ..runtime.c09_life_originals_v1 import validate_c4_no_dispatch_original_joins_v1
+    from ..runtime.jobs import get_job
+    from ..runtime.budget import BudgetReceipt, get_budget_lease
+    from ..runtime.model_cost_settlement import original_model_cost_operation_id_v1
+    from ..runtime.d11_types import runtime_job_key
+    if type(budget_job_issuer) is not D11BudgetJobIssuer or budget_job_issuer.resource_issuer is not resource_issuer:
+        raise AuthorityUnavailable("C09 no-dispatch needs its actual installed Core/Graph issuer")
+    validate_model_core_row_v1("authority_model_no_dispatch_witnesses_v1",
+        MODEL_COLUMNS["authority_model_no_dispatch_witnesses_v1"], witness_row)
+    witness = from_wire(_json(witness_row[6]), ModelNoDispatchWitnessV1)
+    witness.require_signature_v1(budget_job_issuer._signer)
+    intent = witness.request.intent
+    record = AuthorityV2ModelEgressStore._read(core_db, call_id)
+    fence = AuthorityV2FenceStore._row(core_db, intent.operation_id)
+    if (record is None or record.intent != intent or record.state != "prepared"
+            or record.observation_digest is not None or call_id != intent.call_id
+            or (intent.authority_id, intent.namespace) != (seal.authority_id, seal.namespace)
+            or fence is None or AuthorityV2FenceStore._permit(fence) != witness.original_permit
+            or fence[6] != "finished" or fence[8:11] != (witness.finish_request_id, witness.finish_digest, None)
+            or witness.original_permit.pinned_anchor.execution_journal_id != seal.execution_journal_id
+            or witness.original_permit.pinned_anchor.execution_seq > seal.execution_seq):
+        raise AuthorityUnavailable("C09 no-dispatch witness lost its actual prepared/finished Core truth")
+    for table in ("authority_model_admissions_v2", "authority_model_egress_observations_v1",
+            "authority_model_egress_observation_status_v1"):
+        if core_db.execute("SELECT 1 FROM " + table + " WHERE call_id=?", (call_id,)).fetchone() is not None:
+            raise AuthorityUnavailable("C09 no-dispatch call acquired admission/dispatch/observation")
+    binding = core_db.execute("SELECT * FROM authority_model_egress_bindings_v1 WHERE call_id=?", (call_id,)).fetchone()
+    identity = core_db.execute("SELECT * FROM authority_model_original_identity_v2 WHERE call_id=?", (call_id,)).fetchone()
+    if (binding != (call_id, intent.operation_id, intent.fence_token) or identity !=
+            (call_id, intent.authority_id, witness.request.installation_id, intent.namespace, intent.job_id,
+             intent.acquire_operation_id, intent.operation_id, intent.request_digest, intent.binding_digest)):
+        raise AuthorityUnavailable("C09 no-dispatch original binding/installation differs")
+    job = get_job(business, intent.job_id)
+    if (job.bot_id, job.persona_id, job.budget_ref, job.work_kind, job.phase, job.result_ref) != (
+            *namespace_id.as_tuple, intent.budget_lease_id, "artifact_draft_v1", "cancelled", None):
+        raise AuthorityUnavailable("C09 no-dispatch actual cancelled model job differs")
+    phase = job.continuation["schema"] == "d11.artifact-draft-phase-model-job.v2"
+    if job.continuation["schema"] not in {"d11.artifact-draft-model-job.v1", "d11.artifact-draft-phase-model-job.v2"}:
+        raise AuthorityUnavailable("C09 no-dispatch job has another closed descriptor")
+    selector = (artifact_draft_from_wire_v2(job.continuation["selector"], ArtifactDraftPhaseSelectorV2) if phase
+        else artifact_draft_from_wire_v1(job.continuation["selector"], ArtifactDraftTaskSelectorV1))
+    ids = (artifact_draft_model_ids_v2 if phase else artifact_draft_model_ids_v1)(selector)
+    prepared_kind, call_kind = ("c4_phase_prepared", "c4_phase_call") if phase else ("c4_prepared", "c4_call")
+    prepared_row = _read(business, issuer=budget_job_issuer, namespace=namespace_id, kind=prepared_kind, ref=ids["job"])
+    call_row = _read(business, issuer=budget_job_issuer, namespace=namespace_id, kind=call_kind, ref=ids["call"])
+    if prepared_row is None or call_row is None:
+        raise AuthorityUnavailable("C09 no-dispatch signed original prepared/call absent")
+    prepared = (artifact_draft_model_from_wire_v2(prepared_row[0], ArtifactDraftModelPreparedV2) if phase else
+        artifact_draft_model_from_wire_v1(prepared_row[0], ArtifactDraftModelPreparedV1))
+    if (from_wire(call_row[0], type(intent)) != intent or prepared.digest != intent.binding_digest
+            or prepared.selector != selector or job.continuation["prepared_digest"] != prepared.digest
+            or (prepared.job_id, prepared.call_id, prepared.operation_id, prepared.acquire_operation_id,
+                prepared.reservation_digest, prepared.parent_budget_lease_ref, prepared.worker_subject, prepared.deadline_utc) !=
+               (intent.job_id, call_id, intent.budget_reservation_operation_id, intent.acquire_operation_id,
+                intent.budget_reservation_digest, intent.budget_lease_id, intent.subject, witness.request.requested_deadline_utc)):
+        raise AuthorityUnavailable("C09 no-dispatch financial originals changed their original call")
+    settled = read_artifact_model_no_dispatch_settlement_v1(business, prepared=prepared, issuer=budget_job_issuer)
+    if settled is None or settled.witness_digest != witness.digest:
+        raise AuthorityUnavailable("C09 no-dispatch lacks its independently signed local zero settlement")
+    from ..domains.d01.production_operations_v1 import plain_v1
+    validate_c4_no_dispatch_original_joins_v1(business, namespace=namespace_id,
+        original_ref=settled.original_ref, producing_operation_id=settled.cost_commit.operation_id,
+        raw=plain_v1(settled), issuer=budget_job_issuer)
+    quote = resource_issuer.original_signed_quote(business, prepared.quote_id, 1)
+    ceiling = dict(intent.budget_ceiling)
+    if (quote.operation_id != intent.budget_reservation_operation_id or dict(quote.ceiling) != ceiling
+            or not set(ceiling) <= UNITS or quote.parent_budget_lease_ref != intent.budget_lease_id
+            or quote.graph_job_ref != runtime_job_key(*namespace_id.as_tuple, job.activity_id, job.job_id).token
+            or (quote.bot_id, quote.persona_id, quote.work_kind, canonical_digest(quote)) !=
+                (*namespace_id.as_tuple, job.work_kind, prepared.quote_digest)):
+        raise AuthorityUnavailable("C09 no-dispatch signed original quote differs")
+    lease = get_budget_lease(business, intent.budget_lease_id)
+    reservation = business.execute("SELECT * FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+        (intent.budget_lease_id, intent.budget_reservation_operation_id)).fetchone()
+    reserve = business.execute("SELECT * FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+        (*namespace_id.as_tuple, intent.budget_reservation_operation_id)).fetchone()
+    zero = {unit: 0 for unit in ceiling}
+    settle = business.execute("SELECT * FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
+        (*namespace_id.as_tuple, intent.budget_reservation_operation_id)).fetchone()
+    if (reservation is None or reservation[2] != intent.budget_reservation_digest
+            or _json(reservation[3]) != ceiling or reservation[4] != "settled" or _json(reservation[5]) != zero
+            or reserve is None or settle is None or reserve[4:6] != (intent.budget_reservation_digest, intent.budget_lease_id)
+            or settle[4:6] != reserve[4:6]):
+        raise AuthorityUnavailable("C09 no-dispatch actual reserve/settle vector differs")
+    reserve_receipt, settle_receipt = BudgetReceipt(**_json(reserve[6])), BudgetReceipt(**_json(settle[6]))
+    if (reserve_receipt.status != "reserved" or settle_receipt.status != "settled"
+            or canonical_digest(asdict(settle_receipt)) != settled.cost_commit.budget_receipt_digest
+            or (lease.bot_id, lease.persona_id) != namespace_id.as_tuple):
+        raise AuthorityUnavailable("C09 no-dispatch zero receipt identity differs")
+    def commitment(db, table, row):
+        columns = tuple(item[1] for item in db.execute("PRAGMA table_info(" + table + ")"))
+        material = tuple({"blob_sha256": __import__("hashlib").sha256(value).hexdigest(), "size": len(value)}
+            if type(value) is bytes else value for value in row)
+        return canonical_digest((table, columns, material))
+    ledger = core_db.execute("SELECT * FROM authority_model_egress_v1 WHERE call_id=?", (call_id,)).fetchone()
+    from hashlib import sha256
+    if (witness.prepared_row_commitment != canonical_digest(ledger)
+            or witness.finished_row_commitment != canonical_digest((fence[:7], sha256(bytes(fence[7])).hexdigest(), fence[8:11]))
+            or witness.absence_scope_commitment != canonical_digest(("core.model-no-dispatch-absence.v1",
+                intent.authority_id, intent.namespace, witness.request.installation_id, intent.call_id,
+                canonical_digest(asdict(intent)), "prepared", "no_admission", "no_observation", "no_pending",
+                witness.original_permit.token, witness.original_permit.revision, witness.namespace_epoch))):
+        raise AuthorityUnavailable("C09 no-dispatch original Core row/absence commitments differ")
+    source = [commitment(core_db, table, row) for table, row in (
+        ("authority_model_no_dispatch_witnesses_v1", witness_row), ("authority_model_egress_v1", ledger),
+        ("authority_model_egress_bindings_v1", binding), ("authority_model_original_identity_v2", identity),
+        ("authority_v2_fences", fence))]
+    for table, row in (
+            ("runtime_jobs", business.execute("SELECT * FROM runtime_jobs WHERE job_id=?", (job.job_id,)).fetchone()),
+            ("runtime_budget_reservations", reservation), ("runtime_budget_operations", reserve),
+            ("runtime_budget_operations", settle),
+            ("runtime_resource_quotes", business.execute("SELECT * FROM runtime_resource_quotes WHERE quote_id=? AND version=?",
+                (quote.quote_id, quote.version)).fetchone())):
+        source.append(commitment(business, table, row))
+    for kind, ref in ((prepared_kind, prepared.job_id), (call_kind, prepared.call_id),
+            ("c4_phase_no_dispatch" if phase else "c4_no_dispatch", settled.original_ref)):
+        source.append(commitment(business, LIFE_TABLE, business.execute("SELECT * FROM " + LIFE_TABLE +
+            " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace_id.as_tuple, kind, ref)).fetchone()))
+    cost_id = original_model_cost_operation_id_v1(namespace_id, call_id)
+    body = dict(authority_id=seal.authority_id, installation_id=witness.request.installation_id,
+        namespace=seal.namespace, operation_id=seal.operation_id, call_id=call_id,
+        model_operation_id=intent.operation_id, job_id=intent.job_id, acquire_operation_id=intent.acquire_operation_id,
+        admission_id_or_none=None, request_digest=intent.request_digest, binding_digest=intent.binding_digest,
+        provider_id=intent.provider_id, provider_query_ref_or_none=None, provider_state="prepared",
+        dispatch_generation=intent.authority_activation_generation,
+        originating_journal_id=witness.original_permit.pinned_anchor.execution_journal_id,
+        original_execution_seq=witness.original_permit.pinned_anchor.execution_seq,
+        original_execution_digest=witness.original_permit.pinned_anchor.execution_digest,
+        parent_budget_id=lease.lease_id, reservation_operation_id=intent.budget_reservation_operation_id,
+        reservation_digest=intent.budget_reservation_digest, reservation_state="settled",
+        quote_id=quote.quote_id, quote_version=quote.version, quote_digest=canonical_digest(quote),
+        observation_digest_or_none=None, terminal_digest_or_none=None,
+        source_row_commitments=tuple(sorted(set(source))),
+        units=tuple(C09ModelUnitObligationV1(unit, amount, 0, 0, 0, 0, 0, cost_id) for unit, amount in sorted(ceiling.items())),
+        no_dispatch_witness_digest=witness.digest, no_dispatch_original_ref=settled.original_ref,
+        schema="sylanne3.c09.model-no-dispatch-budget-original.v2")
+    original = C09ModelNoDispatchBudgetOriginalV2(**body, original_digest=canonical_digest(tuple(
+        body[f.name] for f in fields(C09ModelNoDispatchBudgetOriginalV2) if f.name != "original_digest")))
+    if provider_scope_sink is not None:
+        from .c09_provider_scope_v3 import issue_verified_model_provider_scope_v3
+        proof = issue_verified_model_provider_scope_v3(token=_MODEL_PROVIDER_SCOPE_ISSUER_V3,
+            core_db=core_db, business=business, seal=seal, original=original, intent=intent,
+            source_ledger_commitment=commitment(core_db, "authority_model_egress_v1", ledger))
+        provider_scope_sink.retain_verified_provider_scope_v3(proof, original, core=core_db, graph=business)
+    return original
+

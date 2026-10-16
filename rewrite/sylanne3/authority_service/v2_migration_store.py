@@ -142,6 +142,8 @@ class AuthorityV2MigrationStore:
                     db.execute(ddl)
                 db.execute("INSERT INTO authority_migration_v2_meta VALUES('version','2')")
             self.check_schema_locked(db)
+            from .migration_snapshot_certificate_members_v1 import install_migration_snapshot_certificate_members_schema_v1
+            install_migration_snapshot_certificate_members_schema_v1(db, create=create)
 
     @staticmethod
     def _objects(db):

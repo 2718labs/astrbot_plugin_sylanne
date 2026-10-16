@@ -140,6 +140,7 @@ async def test_raw_window_projection_is_read_only_and_model_bound(monkeypatch):
     assert result.frame.stable_history == ()
     assert result.frame.history[0].text == "user: 原始消息。"
     assert graph.reads == graph.releases == 1
+    result.close()
 
     async def changed(_self):
         return replace(runtime.installed_d13_main_model_v1(), model_id="other")

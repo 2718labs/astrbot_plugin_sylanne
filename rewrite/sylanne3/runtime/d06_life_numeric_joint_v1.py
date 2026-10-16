@@ -576,29 +576,29 @@ def read_life_numeric_joint_prepared_v1(db, *, namespace, request):
     return prepared
 
 
-def issue_current_life_numeric_math_ticket_v1(graph, bootstrap, bundle, queue, *, request):
+def issue_current_life_numeric_math_ticket_v1(graph, bootstrap, bundle, queue, *, request, prepared_read):
     """Issue only the real installed queue's fresh claim; never run native here."""
     from .c04_authority_port_v3 import InstalledC04AuthorityPortV3
     from .d04_numeric_math_ticket_v3 import InstalledD04MathQueueV3
     from .d04_installed_numeric_v3 import (D04ExecutedNumericV3, _ready_from_original_v3,
         _MeasuredNumericV3, _pending_measured, _flush_actual_measurement_v3)
-    from .d04_appraisal_driver_v3 import read_d04_original_v3
     graph._admin(bootstrap)
     if (type(request) is not PrepareLifeNumericJointRequestV1 or type(queue) is not InstalledD04MathQueueV3
             or getattr(graph, '_GraphCoordinator__d04_math_queue_v3', None) is not queue):
         raise ValueError('Life CPU queue needs its exact installed composition and locator')
-    port, store = graph._GraphCoordinator__c04_authority_port_v3, graph._GraphCoordinator__store
+    port = graph._GraphCoordinator__c04_authority_port_v3
     if type(port) is not InstalledC04AuthorityPortV3 or port._bundle is not bundle:
         raise ValueError('Life CPU queue needs its actual paired Authority')
     namespace = bundle.installation_policy.namespace
     identity = life_numeric_joint_ids_v1(namespace, request.episode_ref, request.appraisal_ref)
+    from .current_life_numeric_native_read_v3 import require_current_native_numeric_prepared_result_v3
+    prepared, measured_original, artifact_original = require_current_native_numeric_prepared_result_v3(
+        graph, request, prepared_read, bundle)
     if not queue.reserve(graph, identity['operation']):
         returned = queue.completed(graph, identity['operation'])
         return queue.accept(graph, returned) if returned is not None else {
             'status': 'numeric_executor_busy', 'operation_id': identity['operation']}
     try:
-        with store._lock:
-            prepared = read_life_numeric_joint_prepared_v1(store._db, namespace=namespace, request=request)
         if prepared is None: raise ValueError('Life CPU lacks actual current W01 preparation; HOLD')
         ready = _ready_from_original_v3(prepared)
         binding = prepared.binding
@@ -614,9 +614,7 @@ def issue_current_life_numeric_math_ticket_v1(graph, bootstrap, bundle, queue, *
                     raise ValueError('Life pending native measurement belongs to another claim')
                 return _flush_actual_measurement_v3(graph, pending)
             from ..authority_service.d04_numeric_contract_v3 import D04NumericMeasurementV3, from_wire
-            with store._lock:
-                measured = read_d04_original_v3(store._db, namespace, 'numeric_measurement', binding.operation_id)
-                artifact = read_d04_original_v3(store._db, namespace, 'numeric_artifact', binding.operation_id)
+            measured, artifact = measured_original, artifact_original
             if measured is None: return D04ExecutedNumericV3(prepared, None, 'claimed_execution_unknown')
             pending = _MeasuredNumericV3(ready, claim, from_wire(measured[0]['measurement'], D04NumericMeasurementV3),
                 None if artifact is None else artifact[0])

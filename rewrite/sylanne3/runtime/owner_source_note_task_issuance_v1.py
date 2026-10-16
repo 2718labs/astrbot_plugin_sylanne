@@ -93,6 +93,9 @@ def require_owner_source_note_task_issuance_v1(issued, graph, scope):
 
 
 def reobserve_owner_source_note_task_v1(issued, graph, scope):
+    from .foreground_mesh_issuance_v1 import is_personal_mesh_issuance_v1,reobserve_personal_mesh_activity_v1
+    if is_personal_mesh_issuance_v1(issued):
+        return reobserve_personal_mesh_activity_v1(issued,graph,scope)
     evidence = require_owner_source_note_task_issuance_v1(issued, graph, scope)
     if graph._GraphCoordinator__store._db.in_transaction:
         raise ValueError('Owner task currentness RPC must run outside SQL')

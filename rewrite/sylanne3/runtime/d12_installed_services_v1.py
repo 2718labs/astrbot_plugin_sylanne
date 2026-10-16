@@ -61,7 +61,24 @@ class InstalledD12OwnerAccessV1:
         return frame
 
     def execute_current_owner_command_v1(self, authority, lease, *, operation_id,
-                                         request_digest, capability, commit, domains=()):
+                                         request_digest, capability, commit, domains=(),job_cancel_request=None):
+        if job_cancel_request is not None:
+            from .current_owner_job_cancel_v3 import prepare_current_job_cancel_v3
+            if capability!="workbench.control":raise PermissionError("D12 cancel requires current Owner control")
+            return prepare_current_job_cancel_v3(self,authority,lease,operation_id=operation_id,
+                request_digest=request_digest,command=job_cancel_request,commit=commit,domains=domains)
+        return self._execute_current_owner_command_v3(authority,lease,operation_id=operation_id,
+            request_digest=request_digest,capability=capability,commit=commit,domains=domains)
+
+    def _execute_prepared_cancel_v3(self,reader,capsule):
+        if reader.cancel_access is not self or capsule.reader is not reader:
+            raise PermissionError("D12 cancel capsule crossed installed producer")
+        return self._execute_current_owner_command_v3(reader.authority,reader.lease,operation_id=reader.operation_id,
+            request_digest=reader.request_digest,capability="workbench.control",commit=reader.cancel_commit,
+            domains=reader.cancel_domains,job_cancel_prepare=capsule)
+
+    def _execute_current_owner_command_v3(self,authority,lease,*,operation_id,request_digest,capability,commit,
+            domains,job_cancel_prepare=None):
         c = self.coordinator
         def current_commit(db, metadata, epoch, now, owner, scope):
             if db is not self.store.db or not db.in_transaction:
@@ -75,7 +92,11 @@ class InstalledD12OwnerAccessV1:
                 if original.kind == "control" and original.result.control == "cancel_job":
                     job = get_job(db, original.result.object_ref.removeprefix("job:"))
                     write = job_graph_write(job)
-                    row = db.execute("SELECT revision,value FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
+                    if job_cancel_prepare is None:
+                        raise PermissionError("D12 cancel requires its actual exact job Source preparation")
+                    from .current_owner_job_cancel_v3 import current_cancel_projection_v3
+                    projection=current_cancel_projection_v3(db,job.job_id)
+                    row=(projection.revision,canonical_serialize(projection.value))
                     from ..contracts import canonical_json
                     if row is None or row[1] != canonical_json(write.value):
                         candidate = GraphCandidate(Event(
@@ -93,7 +114,7 @@ class InstalledD12OwnerAccessV1:
         result = c._owner_domain_write_v3(authority, lease,
             operation_id=operation_id, request_digest=request_digest,
             domains=domains,
-            capability=capability, commit=current_commit)
+            capability=capability, commit=current_commit,job_cancel_prepare=job_cancel_prepare)
         return decode_original(result)
 
     def read_current_backend_operation_original_v1(self, authority, lease, *, original_ref):

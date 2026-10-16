@@ -332,7 +332,12 @@ def _read_committed_life_numeric_request_originals_v1(db, *, namespace, issuer, 
     receipt = _receipt(db, namespace, b.acquire_operation_id)
     adopted = read_adopted_domain_operation_v1(db, namespace, b.acquire_operation_id)
     key = job_graph_write(get_job(db, job_id)).key
-    history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=2', (key.token,)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    prior=_producer_original_point_v3(db,table="graph_history",columns=("event_id","value","valid"),
+        key_columns=("token","revision"),key=(key.token,2),
+        legacy_reader=lambda:db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=2",
+            (key.token,)).fetchone())
+    history=None if prior is None else(prior[1],prior[2],prior[0])
     if (b.prepared_digest != p.digest or b.job_id != p.job_id or b.namespace != namespace
             or any(r[1] != b.acquire_operation_id for r in rows)
             or raw['prepared_digest'] != p.digest or raw['binding_digest'] != b.digest

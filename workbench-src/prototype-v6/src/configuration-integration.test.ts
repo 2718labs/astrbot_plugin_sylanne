@@ -123,26 +123,27 @@ async function component(name:string):Promise<any>{
   const injected=javascript.replace(/^import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"];?\s*$/gm,(_match,names,path)=>`const {${names.replace(/\bas\b/g,':')}}=Modules[${JSON.stringify(path)}];`).replace(/^import\s+(\w+)\s+from\s+['"]([^'"]+)['"];?\s*$/gm,(_match,name,path)=>`const ${name}=Modules[${JSON.stringify(path)}].default;`).replace('export default ','return ')
   return new Function('Modules',injected)(modules)
 }
-test('actual advanced Vue panel exposes seven groups, real SDK model options, explicit Chinese typed examples and consumed preferences without automatic requests',async()=>{
+test('actual advanced Vue panel exposes all ten groups, V8 model observations and blank structured forms without automatic requests',async()=>{
   const Panel=await component('ConfigurationPanel'),descriptors=['document','window','Document','ShadowRoot'].map(key=>[key,Object.getOwnPropertyDescriptor(globalThis,key)] as const)
   class DocumentStub{hidden=false;activeElement=null;addEventListener(){}removeEventListener(){}}
   const events=new DocumentStub()
   Object.defineProperty(globalThis,'Document',{configurable:true,value:DocumentStub});Object.defineProperty(globalThis,'ShadowRoot',{configurable:true,value:class{}})
   Object.defineProperty(globalThis,'document',{configurable:true,value:events});Object.defineProperty(globalThis,'window',{configurable:true,value:{addEventListener:events.addEventListener,removeEventListener:events.removeEventListener,localStorage:{getItem:()=>null,setItem(){}}}})
-  type Node={type:string;text:string;children:Node[];parent:Node|null;props:Record<string,any>;tagName:string;listeners:Record<string,Function>;getRootNode:()=>typeof events;addEventListener:(name:string,fn:Function)=>void;removeEventListener:(name:string)=>void;setAttribute:(name:string,value:unknown)=>void;removeAttribute:(name:string)=>void}
-  const make=(type:string,text=''):Node=>({type,text,children:[],parent:null,props:{},tagName:type.toUpperCase(),listeners:{},getRootNode:()=>events,addEventListener(name,fn){this.listeners[name]=fn},removeEventListener(name){delete this.listeners[name]},setAttribute(name,value){this.props[name]=value},removeAttribute(name){delete this.props[name]}})
+  type Node={type:string;text:string;children:Node[];parent:Node|null;props:Record<string,any>;tagName:string;listeners:Record<string,Function>;readonly options:Node[];selectedIndex:number;value:unknown;getRootNode:()=>typeof events;addEventListener:(name:string,fn:Function)=>void;removeEventListener:(name:string)=>void;setAttribute:(name:string,value:unknown)=>void;removeAttribute:(name:string)=>void}
+  const make=(type:string,text=''):Node=>({type,text,children:[],parent:null,props:{},tagName:type.toUpperCase(),listeners:{},get options(){return this.children.filter(child=>child.type==='option')},selectedIndex:-1,get value(){return this.props.value},set value(value){this.props.value=value},getRootNode:()=>events,addEventListener(name,fn){this.listeners[name]=fn},removeEventListener(name){delete this.listeners[name]},setAttribute(name,value){this.props[name]=value},removeAttribute(name){delete this.props[name]}})
   const renderer=createRenderer<Node,Node>({createElement:type=>make(type),createText:text=>make('text',text),createComment:text=>make('comment',text),setText:(node,text)=>{node.text=text},setElementText:(node,text)=>{node.text=text;node.children=[]},parentNode:node=>node.parent,nextSibling:node=>node.parent?.children[node.parent.children.indexOf(node)+1]??null,insert(node,parent,anchor=null){if(node.parent)this.remove(node);node.parent=parent;const index=anchor?parent.children.indexOf(anchor):-1;if(index<0)parent.children.push(node);else parent.children.splice(index,0,node)},remove(node){if(node.parent){const index=node.parent.children.indexOf(node);if(index>=0)node.parent.children.splice(index,1);node.parent=null}},patchProp(node,key,_old,value){node.props[key]=value}})
+  const configuration=wire(),named=(slot:string)=>({slot,selected_provider_id:null,model_id:null,provider_config_digest:null,installed:null,state:'pending',reason_code:'model_unselected'}),v8={...configuration,model_slots:[...configuration.model_slots,named('d07_relationship_cognition'),named('growth_cognition'),named('general_growth_cognition')],installed_policy:{...configuration.installed_policy,workflow_version:8}}
   const root=make('root');let backend!:BackendController,calls=0
-  const app=renderer.createApp({setup(){backend=useBackend({enabled:true,origin,fetchImpl:async(url,init)=>{calls++;if(url.endsWith('/session'))return response(session);if(url.endsWith('/configuration/v1'))return response(wire());return response({status:'ready',projection:creator()})}});return()=>h(Panel,{backend})}})
+  const app=renderer.createApp({setup(){backend=useBackend({enabled:true,origin,fetchImpl:async(url,init)=>{calls++;if(url.endsWith('/session'))return response(session);if(url.endsWith('/configuration/v1'))return response(v8);return response({status:'ready',projection:creator()})}});return()=>h(Panel,{backend})}})
   const renderErrors:unknown[]=[];app.config.errorHandler=error=>{renderErrors.push(error)}
   const text=(node:Node):string=>node.text+node.children.filter(child=>child.type!=='comment').map(text).join('')
   const find=(node:Node,predicate:(node:Node)=>boolean):Node|undefined=>{if(predicate(node))return node;for(const child of node.children){const found=find(child,predicate);if(found)return found}}
   const button=(label:string)=>{const node=find(root,node=>node.type==='button'&&text(node)===label);assert.ok(node,`missing ${label}`);return node}
   try{
-    app.mount(root);await nextTick();assert.equal(calls,0);for(const label of ['基本','模型策略','角色与场景','注意与表达','记忆与关系','Life 与联系','资源与安装'])assert.ok(button(label))
-    await button('读取当前配置').props.onClick();await nextTick();await button('模型策略').props.onClick();await nextTick();assert.match(text(root),/provider-a · model-a/);assert.match(text(root),/provider-b · model-b/);assert.match(text(root),/与已安装模型身份匹配/);assert.match(text(root),/model_unselected/)
+    app.mount(root);await nextTick();assert.equal(calls,0);for(const label of ['基本','模型策略','角色与场景','世界与时间','习惯','长期计划','注意与表达','记忆与关系','Life 与联系','资源与安装'])assert.ok(button(label))
+    await button('读取当前配置').props.onClick();await nextTick();await button('模型策略').props.onClick();await nextTick();assert.match(text(root),/provider-a · model-a/);assert.match(text(root),/provider-b · model-b/);assert.match(text(root),/与已安装模型身份匹配/);assert.match(text(root),/model_unselected/);assert.match(text(root),/关系认知/);assert.match(text(root),/通用成长认知/);assert.match(text(root),/general_growth_cognition/)
     await backend.checkSession();backend.setScope(scope);await button('角色与场景').props.onClick();await nextTick();await backend.creator.read();await nextTick();assert.match(text(root),/人格方案|身体方案|场景方案/)
-    const before=JSON.stringify(backend.creator.state.draft),readsBefore=calls;await button('从结构示例开始').props.onClick();await nextTick();assert.notEqual(JSON.stringify(backend.creator.state.draft),before);assert.equal(calls,readsBefore);assert.equal(backend.creator.state.adopted,null);assert.match(text(root),/不是当前配置、校准结果或已采纳方案/)
+    const before=JSON.stringify(backend.creator.state.draft),readsBefore=calls;await button('建立空白方案表单').props.onClick();await nextTick();assert.equal(JSON.stringify(backend.creator.state.draft),before);assert.equal(calls,readsBefore);assert.equal(backend.creator.state.adopted,null);assert.match(text(root),/空白表单只生成待填写字段/);assert.match(text(root),/有 1 项表单修改尚未应用/);assert.equal(button('保存方案草稿并独立回读').props.disabled,true)
     await button('基本').props.onClick();await nextTick();assert.match(text(root),/不是 D01 人格名称/);assert.deepEqual(renderErrors,[])
   }finally{app.unmount();await nextTick();for(const[key,descriptor]of descriptors){if(descriptor)Object.defineProperty(globalThis,key,descriptor);else Reflect.deleteProperty(globalThis,key)}}
 })
@@ -189,4 +190,20 @@ test('configuration V6 preserves eleven legacy rows and ten overrides while appe
   assert.throws(()=>validateConfigurationWire({...current,model_slots:[...base.model_slots,named('growth_cognition'),named('d07_relationship_cognition')]}),{code:'invalid_response'})
   assert.throws(()=>validateConfigurationWire({...current,installed_policy:{...current.installed_policy,workflow_version:5}}),{code:'invalid_response'})
   assert.throws(()=>validateConfigurationWire({...current,values:{...base.values,model_selection:{...base.values.model_selection,overrides:{...base.values.model_selection.overrides,growth_cognition:''}}}}),{code:'invalid_response'})
+})
+
+
+test('configuration V8 consumes the exact general-growth installed slot without adding an override or admitting unknown versions',()=>{
+  const base=wire(),named=(slot:string)=>({slot,selected_provider_id:null,model_id:null,provider_config_digest:null,installed:null,state:'pending',reason_code:'model_unselected'})
+  const current={...base,model_slots:[...base.model_slots,named('d07_relationship_cognition'),named('growth_cognition'),named('general_growth_cognition')],
+    installed_policy:{...base.installed_policy,workflow_version:8,configured_model_slots:['general_growth_cognition'],limits:{general_growth_cognition:4096}}}
+  const decoded=validateConfigurationWire(current)
+  assert.equal(decoded.installed_policy.workflow_version,8)
+  assert.deepEqual(decoded.model_slots.slice(11).map(row=>row.slot),['d07_relationship_cognition','growth_cognition','general_growth_cognition'])
+  assert.equal(Object.keys(decoded.values.model_selection.overrides).length,10)
+  assert.throws(()=>validateConfigurationWire({...current,installed_policy:{...current.installed_policy,workflow_version:9}}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,installed_policy:{...current.installed_policy,workflow_version:7}}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,model_slots:current.model_slots.slice(0,-1)}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,model_slots:[...current.model_slots.slice(0,-1),named('unknown_workflow')]}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,values:{...base.values,model_selection:{...base.values.model_selection,overrides:{...base.values.model_selection.overrides,general_growth_cognition:''}}}}),{code:'invalid_response'})
 })

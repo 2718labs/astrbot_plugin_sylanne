@@ -1,12 +1,11 @@
 """Finite actual v6 paid adoption and named derived-cache retirement via retained W01 writes."""
 from dataclasses import asdict,replace
-import json
 
 from ..contracts import Event,Scope
 from ..graph_types import AtomKey,GraphCandidate,GraphVersion,GraphWrite
-from ..domains.d13.derived_block_metadata_v2 import (METADATA_TYPE,decode_derived_block_metadata_v2,
+from ..domains.d13.derived_block_metadata_v2 import (METADATA_TYPE,
     derived_block_metadata_key_v2,derived_block_metadata_value_v2)
-from ..runtime_contracts import canonical_digest,canonical_serialize
+from ..runtime_contracts import canonical_digest
 from .d11_derived_cache_payload_v1 import (prepare_derived_payload_v1,insert_derived_payload_v1,
     reclaim_derived_payload_v1)
 from .d13_paid_product_v1 import _authorize,_read_original_locked
@@ -102,81 +101,55 @@ def complete_d13_paid_derived_graph_v6(graph, authority, lease, *, job_id, selec
 
 
 def retire_due_d13_derived_graph_v6(graph,authority,lease,*,block_ref,expected_revision):
-    """One finite original; no model call, budget release or old-history reclamation."""
-    store,_port,_policy,_resource,_budget=_authorize(graph,authority,lease)
+    """Retire one actual expired metadata original through its own fresh W01 WRITE."""
+    _authorize(graph,authority,lease)
     from ..graph_types import Owner
+    from .d13_derived_retirement_read_v3 import (bound_d13_derived_retirement_v3,
+        prepare_d13_derived_retirement_v3,retirement_identity_v3)
     key=AtomKey(Owner('persona',*authority.namespace.as_tuple),METADATA_TYPE,block_ref)
-    if type(expected_revision) is not int or expected_revision<1:
-        raise ValueError('derived retirement requires the original exact positive CAS revision')
-    with store._lock:
-        row=store._db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
-        if row is None or row[2]!=1:
-            raise ValueError('derived retirement current head unavailable')
-        if row[0]==expected_revision:
-            original=decode_derived_block_metadata_v2(json.loads(row[1]))
-        else:
-            history=store._db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=? '
-                'AND event_bot=? AND event_persona=?',(key.token,expected_revision,*authority.namespace.as_tuple)).fetchone()
-            if history is None or history[1]!=1:
-                raise ValueError('derived retirement original CAS history unavailable')
-            original=decode_derived_block_metadata_v2(json.loads(history[0]))
-            if original.status not in {'standby','active'} or row!=(expected_revision+1,canonical_serialize(replace(original,status='retired')),1):
-                raise ValueError('derived retirement selector changed beyond its one actual retirement')
-    if original.namespace!=authority.namespace or original.conversation_ref!=authority.audience[0]:
-        raise ValueError('derived retirement crossed its actual namespace/audience')
-    digest=canonical_digest({'schema':'d13.derived-retirement.v6','namespace':authority.namespace,
-        'block_ref':block_ref,'revision':expected_revision,'metadata_digest':canonical_digest(original)})
-    operation_id='d13-derived-retire:'+digest[:48]
-    if row[0]!=expected_revision:
-        with store._lock:
-            adopted=store._db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=? '
-                'AND event_bot=? AND event_persona=?',(key.token,expected_revision+1,*authority.namespace.as_tuple)).fetchone()
-            if adopted!=(row[1],1,operation_id):
-                raise ValueError('derived retirement head is not this actual original operation')
-        recovered=graph._d13_worker_replay_v2(authority,operation_id,digest)
-        if recovered is None:
-            raise ValueError('derived retirement committed result has not been observed; retain original operation')
+    if type(expected_revision)is not int or expected_revision<1:
+        raise ValueError('Derived retirement requires its original exact positive CAS revision')
+    args={'token':key.token,'expected_revision':expected_revision};proof=bound_d13_derived_retirement_v3()
+    if proof is None:return prepare_d13_derived_retirement_v3(graph,authority,lease,mode='retire',args=args)
+    r=proof.require(graph,authority,lease,'retire',args)
+    if proof.used:raise ValueError('D13 retirement capsule has already been consumed')
+    proof.used=True;original=r.original
+    operation_id,digest=retirement_identity_v3(authority.namespace,original,expected_revision)
+    if r.head[1]!=expected_revision:
+        recovered=graph._d13_worker_replay_v2(authority,operation_id,digest,derived_retirement=proof)
+        if recovered is None:raise ValueError('D13 retirement committed original has not been observed; retain original operation')
         return recovered
     def commit(db,metadata,epoch,now):
-        current=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
-        if current!=(expected_revision,canonical_serialize(original),1):
-            raise ValueError('derived retirement current metadata CAS changed')
-        if now<original.expires_at_utc:
-            raise ValueError('derived retirement cannot shorten a still-live original without actual invalidation')
+        if now<original.expires_at_utc:raise ValueError('D13 retirement cannot shorten its original lifetime')
         retired=replace(original,status='retired')
         receipt,reclaims=_commit_derived_graph(graph,db,metadata,epoch,authority,operation_id,now,
             (GraphWrite(key,derived_block_metadata_value_v2(retired)),),retired=(retired,))
-        # This mutable scene exclusion index is derived scheduling state, not immutable paid cost evidence.
         db.execute("UPDATE graph_d13_paid_scene_jobs_v1 SET state='retired' WHERE bot=? AND persona=? AND job_ref=? "
             "AND state IN ('standby','active')",(*authority.namespace.as_tuple,original.job_ref))
         return {'schema':'d13.derived-retirement-result.v6','operation_id':operation_id,'metadata_ref':key.token,
             'metadata_revision':expected_revision+1,'graph_receipt':asdict(receipt),'reclaim':asdict(reclaims[0]),
             'legacy_v2_history_and_paid_originals':'preserved_legacy_only','secure_erasure':'unsupported'}
-    return graph._d13_worker_write_v2(authority,operation_id,digest,commit)
+    return graph._d13_worker_write_v2(authority,operation_id,digest,commit,derived_retirement=proof)
 
 
 def due_d13_derived_refs_v6(db,namespace,*,conversation_ref,now_utc):
-    """At most 16 current candidates per invocation; callers do not auto-loop."""
-    if not db.in_transaction:
-        raise ValueError('derived cleanup discovery requires the current fenced read transaction')
-    return tuple(db.execute("SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? "
-        "AND valid=1 AND json_extract(value,'$.conversation_ref')=? AND json_extract(value,'$.expires_at_utc')<=? "
-        "AND json_extract(value,'$.status') IN ('standby','active') ORDER BY token LIMIT 16",
-        (*namespace.as_tuple,METADATA_TYPE,conversation_ref,now_utc)).fetchall())
+    """At most sixteen expired descriptors from the actual once-only metadata Work."""
+    from .d13_derived_retirement_read_v3 import bound_d13_derived_retirement_v3
+    proof=bound_d13_derived_retirement_v3()
+    if proof is None:raise ValueError('D13 discovery requires its actual named metadata Work')
+    r=proof.reader
+    if (db is not r.db or namespace!=r.namespace or conversation_ref!=r.authority.audience[0]
+            or now_utc!=r.initial_now or r.mode!='discover' or not r.complete):
+        raise ValueError('D13 expired descriptor page is outside its exact metadata scope')
+    return tuple((head[0],head[1])for head,value,header,origin in r.records)
 
 
 def discover_due_d13_derived_graph_v6(graph,authority,lease):
-    _store,port,_policy,_resource,_budget=_authorize(graph,authority,lease)
-    from .first_ingress_v2 import trusted_upper
-    assembly=graph._GraphCoordinator__d04_installed_joint_assembly
-    if assembly is None or assembly.admin_bundle is None:
-        raise ValueError('derived cleanup requires the actual installed current Source/clock context')
-    now=trusted_upper(port.read_ingress_clock(assembly.admin_bundle.ingress_clock))
-    def read():
-        db=graph._GraphCoordinator__store._db
-        db.execute('BEGIN')
-        try:
-            return due_d13_derived_refs_v6(db,authority.namespace,conversation_ref=authority.audience[0],now_utc=now)
-        finally:
-            db.rollback()
-    return graph._read_v2(authority,read)
+    _authorize(graph,authority,lease)
+    from .d13_derived_retirement_read_v3 import bound_d13_derived_retirement_v3,prepare_d13_derived_retirement_v3
+    proof=bound_d13_derived_retirement_v3()
+    if proof is None:return prepare_d13_derived_retirement_v3(graph,authority,lease,mode='discover',args={})
+    r=proof.require(graph,authority,lease,'discover',{})
+    if proof.used:raise ValueError('D13 expired descriptor page has already been consumed')
+    proof.used=True
+    return due_d13_derived_refs_v6(r.db,r.namespace,conversation_ref=authority.audience[0],now_utc=r.initial_now)

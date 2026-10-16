@@ -1,4 +1,5 @@
 """Append-only contact originals in the installed Graph business database."""
+from .contact_original_read_v3 import contact_original_point_v3
 import json
 import sqlite3
 from ..runtime_contracts import canonical_digest, canonical_serialize
@@ -58,8 +59,8 @@ def read_contact_original_v2(db, issuer, namespace, kind, ref):
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone() is None:
         return None
     require_contact_original_schema_v2(db)
-    row = db.execute(f"SELECT payload_json,payload_digest,signature FROM {TABLE} "
-        "WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone()
+    row = contact_original_point_v3(db,table='graph_contact_model_originals_v2',columns=('payload_json', 'payload_digest', 'signature'),key_columns=('bot', 'persona', 'kind', 'original_ref'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],_contact_values[3]))((*namespace.as_tuple, kind, ref)),legacy_reader=lambda: db.execute(f"SELECT payload_json,payload_digest,signature FROM {TABLE} "
+        "WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone())
     if row is None:
         return None
     raw = json.loads(row[0])

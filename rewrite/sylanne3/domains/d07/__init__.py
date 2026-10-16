@@ -812,6 +812,7 @@ class D07DomainProvider:
     def type_specs() -> tuple[TypeSpec, ...]:
         """Return D11 catalogue candidates; D11 still owns migration/activation."""
 
+        from .prediction_v1 import prediction_type_specs_v1
         definitions = (
             ("d07.concern.v1", ("persona",), "state", Concern,
              ("reason_refs", "wake_conditions"), False),
@@ -853,7 +854,7 @@ class D07DomainProvider:
                 }),
             )
             for name, owners, storage_role, value_type, tuple_fields, immutable in definitions
-        ) + (concern_round_type_spec(),)
+        ) + (concern_round_type_spec(),) + prediction_type_specs_v1()
 
     def attention_focus_proposal(
         self, envelope: CommandEnvelope, snapshot: GraphSnapshot,

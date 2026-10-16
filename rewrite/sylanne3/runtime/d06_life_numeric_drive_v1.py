@@ -118,9 +118,13 @@ def decode_life_numeric_drive_original_v1(raw):
 
 def _adoption(db, namespace, appraisal_ref):
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
-    history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (appraisal_ref,)).fetchone()
-    if history is None or history[1] != 1: raise ValueError('Life drive actual appraisal history is absent')
-    adopted = read_adopted_domain_operation_v1(db, namespace, history[2])
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    history = _producer_original_point_v3(db,table="graph_history",columns=("event_id","value","valid"),
+        key_columns=("token","revision"),key=(appraisal_ref,1),
+        legacy_reader=lambda:db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1",
+            (appraisal_ref,)).fetchone())
+    if history is None or history[2] != 1: raise ValueError('Life drive actual appraisal history is absent')
+    adopted = read_adopted_domain_operation_v1(db, namespace, history[0])
     if (adopted is None or adopted['domain'] != 'd04'
             or adopted['operation_kind'] != 'adopt_internal_life_numeric'
             or GraphVersion(AtomKey.from_token(appraisal_ref), 1) not in adopted['receipt'].write_versions):
@@ -147,9 +151,10 @@ def _plan_inputs(db, namespace, request):
     refs = tuple(sorted(m.checkpoint.ref for m in before.members))
     checkpoints = []
     for ref in refs:
-        row = db.execute('SELECT value,valid FROM graph_atoms WHERE token=?', (ref,)).fetchone()
-        if row is None or row[1] != 1: raise ValueError('Life drive actual selected checkpoint is absent')
-        checkpoints.append(decode_authored_numeric_checkpoint_v2(json.loads(row[0])))
+        from .d01_production_operations_v1 import raw_head_value_v1
+        raw = raw_head_value_v1(db,namespace,AtomKey.from_token(ref))
+        if raw is None: raise ValueError('Life drive actual selected checkpoint is absent')
+        checkpoints.append(decode_authored_numeric_checkpoint_v2(raw))
     clock = read_current_d04_role_clock_v3(db, mapping_id=mapping.mapping_id, expected_mapping_version=mapping.version,
         checkpoints=tuple(checkpoints), checkpoint_refs=refs, wall_end_utc=wall_end)
     keys = tuple(AtomKey(Owner('persona', *namespace.as_tuple), DRIVE_TYPE,
@@ -249,6 +254,7 @@ def stage_life_numeric_drive_in_transaction_v1(db, *, frame, request, installed_
     for proposal in primary.proposals: validate_life_numeric_drive_proposal_v1(proposal, frame.snapshot)
     result = LifeNumericDriveStageV1(frame, request, context, mapping_stage, original, primary)
     identity = id(result); _STAGES[identity] = (weakref.ref(result, lambda _: _STAGES.pop(identity, None)), db)
+    bind_prepared_numeric_drive_stage_v3(db,result)
     return result
 
 
@@ -259,16 +265,17 @@ def verify_life_numeric_drive_stage_v1(db, stage, *, installed_readers):
     _, mapping, original = _compile(db, stage.frame, stage.request, installed_readers)
     if original != stage.original or mapping != stage.mapping_stage:
         raise ValueError('Life current paid mapping/clock/dose changed before CAS')
+    bind_prepared_numeric_drive_stage_v3(db,stage)
     return stage
 
 
-def record_life_numeric_drive_after_cas_v1(db, *, stage, issuer, receipt):
-    from .c04_encoding_baseline_store_v3 import _receipt
-    from .d11_life_preparation_v1 import _record
+def record_life_numeric_drive_after_cas_v1(db, *, stage, issuer, receipt,drive_commit_witness_v3):
+    from .d06_life_numeric_commit_v1 import require_current_life_numeric_drive_write_v3,record_current_life_numeric_drive_original_v3
     issued = _STAGES.get(id(stage)); original = stage.original
     if issued is None or issued[0]() is not stage or issued[1] is not db or not db.in_transaction:
         raise ValueError('Life drive record requires original issuing transaction')
-    actual = _receipt(db, original.namespace, original.operation_id)
+    actual=require_current_life_numeric_drive_write_v3(db,witness=drive_commit_witness_v3,stage=stage,receipt=receipt,writes=stage.mapping_stage.writes)
+    capsule=require_active_numeric_drive_inputs_v3(db,drive_commit_witness_v3,stage,receipt)
     if (actual != receipt or actual.read_versions != stage.frame.envelope.version_guard.read_versions
             or set(actual.write_versions) != {GraphVersion(w.key, 1) for w in stage.mapping_stage.writes}):
         raise ValueError('Life drive actual all-member W01 CAS differs')
@@ -276,18 +283,24 @@ def record_life_numeric_drive_after_cas_v1(db, *, stage, issuer, receipt):
     for write in stage.mapping_stage.writes:
         for version in stage.mapping_stage.read_versions:
             if version.revision > 0 and version.key not in written_keys:
-                existing = db.execute('SELECT dependency_revision FROM graph_dependency_edges '
-                    'WHERE dependent_token=? AND dependency_token=? AND edge_kind=? AND operation_id=?',
-                    (write.key.token, version.key.token, 'historical_provenance', original.operation_id)).fetchone()
+                key=(write.key.token,version.key.token,'historical_provenance',original.operation_id)
+                prior=next((None if row[4]is None else (dict(zip(row[3],row[4]))["dependency_revision"],)
+                    for row in capsule.points if row[:3]==("graph_dependency_edges",
+                    ("dependent_token","dependency_token","edge_kind","operation_id"),key)),None)
+                if not any(row[:3]==("graph_dependency_edges",("dependent_token","dependency_token","edge_kind","operation_id"),key)
+                        for row in capsule.points):raise ValueError('Drive dependency edge lacked actual prepared EOF')
+                with runtime_storage_quantum_v3(db)as meter:
+                    existing=_runtime_bounded_fixed_row_v3(db,meter,"graph_dependency_edges",("dependency_revision",),
+                        "dependent_token=? AND dependency_token=? AND edge_kind=? AND operation_id=?",key)
+                if existing!=prior:raise ValueError('Drive dependency edge changed after actual prepared EOF')
                 if existing is not None and existing != (version.revision,):
                     raise ValueError('Life drive historical edge conflicts with its actual mapping read')
                 if existing is None:
                     db.execute('INSERT INTO graph_dependency_edges(dependent_token,dependency_token,'
                         'dependency_revision,edge_kind,operation_id) VALUES(?,?,?,?,?)',
                         (write.key.token, version.key.token, version.revision, 'historical_provenance', original.operation_id))
-    record_d04_mapping_acceptance_after_cas_v3(db, stage.mapping_stage)
-    return _record(db, issuer=issuer, namespace=original.namespace, kind=KIND, ref=original.original_ref,
-        operation_id=original.operation_id, value=original)
+    record_d04_mapping_acceptance_after_cas_v3(db,stage.mapping_stage,drive_commit_witness_v3=drive_commit_witness_v3)
+    return record_current_life_numeric_drive_original_v3(db,witness=drive_commit_witness_v3,stage=stage,issuer=issuer,receipt=receipt,writes=stage.mapping_stage.writes)
 
 
 def _require_life_numeric_drive_producer_membership_v1(db, original):
@@ -346,3 +359,373 @@ def require_current_life_numeric_drive_v1(value, *, db, frame):
         raise ValueError('Life drive DTO is not this current SQL-qualified producer')
     require_current_life_numeric_context_v1(value.context, db=db, frame=frame)
     return value
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from weakref import WeakKeyDictionary
+from types import MappingProxyType
+from dataclasses import asdict
+from ..authority_service.contract import AuthorityUnavailable
+from ..runtime_storage_v3 import runtime_storage_quantum_v3,_runtime_bounded_fixed_row_v3
+from .current_method_learning_read_v3 import _MethodBudgetGrantReadV3
+
+_DRIVE_INPUTS_V3=WeakKeyDictionary()
+_DRIVE_SELECTIONS_V3=WeakKeyDictionary()
+_DRIVE_STAGE_INPUTS_V3={}
+_DRIVE_ACTIVE_V3=ContextVar("sylanne_numeric_drive_active_write_v3",default=None)
+_DRIVE_ORIGINAL_COLUMNS_V3=("producing_operation_id","payload_json","payload_digest","signature")
+_CLOCK_COLUMNS_V3=("mapping_id","version","wall_origin_utc","character_origin","rate","valid_from_utc","valid_until_utc","policy_ref","issuer_domain")
+
+def _drive_reader_v3(reader):
+    from .current_method_learning_read_v3 import require_actual_source_owner_metadata_work_v1
+    from .current_life_numeric_metadata_v1 import require_numeric_method_sources_v1
+    r=require_actual_source_owner_metadata_work_v1(reader)
+    if r.operation_kind!=OPERATION:raise AuthorityUnavailable("Drive inputs require the exact current Numeric Method")
+    require_numeric_method_sources_v1(r)
+    return r
+
+def _drive_policy_v3(reader):
+    r=_drive_reader_v3(reader)
+    assembly=r.graph._GraphCoordinator__d04_installed_joint_assembly
+    policy=assembly.admin_bundle.d04_semantic_drive
+    if policy is None:raise AuthorityUnavailable("Drive requires its actual installed dose policy")
+    return assembly,policy
+
+class DriveDoseGrantTaskV3(_MethodBudgetGrantReadV3):
+    def __init__(self,reader,lease_id):
+        assembly,policy=_drive_policy_v3(reader)
+        if lease_id!=policy.lease_id or lease_id==reader.parent_budget_lease_ref:
+            raise AuthorityUnavailable("Drive dose grant needs the exact distinct installed policy lease")
+        super().__init__(reader,lease_id)
+        self.assembly,self.policy=assembly,policy
+        self.ancestry=None
+    def advance(self,meter):
+        if self.metadata is not None and self.column is None:
+            from .current_method_learning_read_v3 import MethodJSONColumnV3,_ISSUER
+            self.owner.require_current(meter=meter)
+            self.require_metadata_v3(meter)
+            # Bind the actual task column before its constructor starts HMAC.
+            self.column=object.__new__(MethodJSONColumnV3)
+            MethodJSONColumnV3.__init__(self.column,_ISSUER,self.owner,
+                table="runtime_budget_grants",column="grant_json",
+                key_columns=("lease_id","version"),key=self.metadata[:2],
+                signer=self.owner.graph._GraphCoordinator__d11_issuer._signer,
+                signature_kind="budget-grant.v1",signature=self.metadata[2])
+            return
+        return super().advance(meter)
+    def require_metadata_v3(self,meter):
+        r=self.owner
+        assembly,policy=_drive_policy_v3(r)
+        if assembly is not self.assembly or policy is not self.policy:
+            raise AuthorityUnavailable("Drive dose grant changed actual installation policy")
+        row=super().require_metadata_v3(meter)
+        if row[:2]!=(policy.lease_id,policy.grant_version):
+            raise AuthorityUnavailable("Drive dose grant latest approved version differs")
+        headers=[];current=policy.lease_id;seen=set()
+        while current is not None:
+            if current in seen:raise AuthorityUnavailable("Drive dose budget ancestry has a cycle")
+            seen.add(current)
+            value=_runtime_bounded_fixed_row_v3(r.db,meter,"runtime_budget_leases",
+                ("parent_id","bot_id","persona_id","currency","version","state"),"lease_id=?",(current,))
+            if value is None or value[1:3]!=r.namespace.as_tuple or value[5]!="active":
+                raise AuthorityUnavailable("Drive dose budget ancestry is unavailable")
+            headers.append((current,value))
+            current=value[0]
+        if r.parent_budget_lease_ref not in seen:
+            raise AuthorityUnavailable("Drive dose policy is not in the actual original Root budget family")
+        from .budget import require_budget_family_admissible
+        require_budget_family_admissible(r.db,policy.lease_id)
+        actual=tuple(headers)
+        if self.ancestry is not None and actual!=self.ancestry:
+            raise AuthorityUnavailable("Drive dose budget ancestry changed after EOF")
+        if self.ancestry is None:self.ancestry=actual;r.operation.retain(sum(len(str(x))for x in actual)*8+4096)
+        return row
+
+def require_drive_dose_signature_v3(original,*,signer,kind,signature=None,verifier=None,complete=False):
+    r=original.owner
+    _,policy=_drive_policy_v3(r)
+    task=r.attachments.get(("drive_dose_grant",policy.lease_id))
+    if (type(task)is not DriveDoseGrantTaskV3 or task.owner is not r or task.column is not original
+            or original.table!="runtime_budget_grants" or original.column!="grant_json"
+            or original.key_columns!=("lease_id","version") or original.key!=task.metadata[:2]
+            or original.key!=(policy.lease_id,policy.grant_version)or kind!="budget-grant.v1"
+            or signer is not r.graph._GraphCoordinator__d11_issuer._signer
+            or original.signer is not signer or original.signature_kind!=kind or original.signature!=task.metadata[2]):
+        raise AuthorityUnavailable("Drive dose signature escaped its actual fixed policy task")
+    with runtime_storage_quantum_v3(r.db)as meter:task.require_metadata_v3(meter)
+    if complete and (not original.complete or signature!=original.signature
+            or verifier is not original.signature_state or original.signature_bytes!=original.byte_count):
+        raise AuthorityUnavailable("Drive dose signature lacks actual complete HMAC EOF")
+    return original
+
+def read_bound_drive_dose_grant_v3(reader,lease_id):
+    from .current_method_learning_read_v3 import _need_method_input
+    r=_drive_reader_v3(reader)
+    _,policy=_drive_policy_v3(r)
+    if lease_id!=policy.lease_id or lease_id==r.parent_budget_lease_ref:
+        raise AuthorityUnavailable("Drive dose read escaped actual distinct policy lease")
+    identity=("drive_dose_grant",lease_id);task=r.attachments.get(identity)
+    if task is None or not task.complete:_need_method_input(r,identity)
+    if type(task)is not DriveDoseGrantTaskV3 or task.owner is not r:
+        raise AuthorityUnavailable("Drive dose grant is not this actual Work EOF")
+    with runtime_storage_quantum_v3(r.db)as meter:task.require_metadata_v3(meter)
+    if not task.column.signature_verified:raise AuthorityUnavailable("Drive dose HMAC EOF is unavailable")
+    from .issuers import BudgetLeaseGrant
+    raw=task.column.json_v3();raw["allowed_work_kinds"]=tuple(raw["allowed_work_kinds"]);grant=BudgetLeaseGrant(**raw)
+    if ((grant.grant_id,grant.version,grant.lease_id)!=(policy.grant_id,policy.grant_version,policy.lease_id)
+            or (grant.bot_id,grant.persona_id)!=r.namespace.as_tuple or policy.work_kind not in grant.allowed_work_kinds
+            or grant.valid_until_utc<=r.frame_fields[2]):
+        raise AuthorityUnavailable("Drive dose grant identity/work/namespace/deadline differs")
+    return True,grant
+
+def require_drive_input_selector_v3(reader,request):
+    r=_drive_reader_v3(reader)
+    table,columns,keycols,key=request
+    if table=="graph_d11_life_originals_v1" and (len(key)!=4 or key[2]!=KIND):return False
+    if table=="graph_d04_originals_v3" and (len(key)!=4 or key[2]!="semantic_mapping"):return False
+    selection=_DRIVE_SELECTIONS_V3.get(r)
+    if selection is None:raise AuthorityUnavailable("Drive fixed point lacks its actual derived Sourcequalified selection")
+    mapping_ref,ids,keys,versions,clock=selection
+    table,columns,keycols,key=request
+    if table=="graph_d04_originals_v3":
+        expected=(table,("payload_json","payload_digest"),("bot","persona","kind","original_ref"),
+            (*r.namespace.as_tuple,"semantic_mapping",mapping_ref))
+    elif table=="graph_d11_life_originals_v1":
+        expected=(table,_DRIVE_ORIGINAL_COLUMNS_V3,("bot","persona","kind","original_ref"),
+            (*r.namespace.as_tuple,KIND,ids["original"]))
+    elif table=="graph_dependency_edges":
+        if (tuple(columns)!=("dependency_revision",)or tuple(keycols)!=("dependent_token","dependency_token","edge_kind","operation_id")
+                or len(key)!=4 or key[0]not in keys or key[1]not in versions
+                or tuple(key[2:])!=("historical_provenance",ids["operation"])):
+            raise AuthorityUnavailable("Drive provenance edge escaped actual derived members/read set")
+        return True
+    else:return False
+    if (table,tuple(columns),tuple(keycols),tuple(key))!=expected:
+        raise AuthorityUnavailable("Drive original prior escaped its exact derived metadata identity")
+    return True
+
+class PreparedNumericDriveInputsV3:
+    def __init__(self,reader,context,before,adopted,clock,keys,installed,acceptance,mapping_ref,mapping_prior,life_prior,points,clock_rows,dose_task):
+        self.reader,self.work,self.operation,self.selection=reader,reader.work,reader.operation,reader.selection_digest
+        self.context,self.before,self.adopted,self.clock=context,before,adopted,clock
+        self.keys,self.installed,self.acceptance,self.mapping_ref=keys,installed,acceptance,mapping_ref
+        self.mapping_prior,self.life_prior=mapping_prior,life_prior
+        self.points,self.clock_rows,self.dose_task=tuple(points),tuple(clock_rows),dose_task
+        self.frame_fields=reader.frame_fields;self.before_stamp=reader.graph_stamp
+        _DRIVE_INPUTS_V3[self]=self._identity_v3()
+    def _identity_v3(self):
+        return (self.reader,self.work,self.operation,self.selection,self.context,self.before,self.adopted,self.clock,
+            self.keys,self.installed,self.acceptance,self.mapping_ref,self.mapping_prior,self.life_prior,
+            self.points,self.clock_rows,self.dose_task,self.frame_fields,self.before_stamp)
+    def require_stage_v3(self,db,stage):
+        from .current_method_learning_read_v3 import _method_active,_READERS
+        r=self.reader;issued=_STAGES.get(id(stage))
+        if (_DRIVE_INPUTS_V3.get(self)!=self._identity_v3()or r not in _READERS or _method_active(db)is not r
+                or r.work is not self.work or r.operation is not self.operation or self.operation.closed
+                or not r.inputs_sealed or not r.business_started or issued is None or issued[0]()is not stage or issued[1]is not db
+                or type(stage)is not LifeNumericDriveStageV1 or stage.request!=r.request
+                or stage.frame.envelope.identity!=self.frame_fields[0].identity
+                or stage.frame.snapshot!=self.frame_fields[1]or stage.frame.owner_guard!=self.frame_fields[3]
+                or stage.context.original!=self.context or stage.context.before!=self.before
+                or stage.original.clock!=self.clock or stage.original.mapping_ref!=self.mapping_ref
+                or stage.original.appraisal_acceptance_digest!=self.acceptance.digest
+                or {w.key.token for w in stage.mapping_stage.writes}!=set(self.keys)
+                or stage.mapping_stage.proofs!=(self.acceptance,self.installed)
+                or not {v.key.token for v in stage.mapping_stage.read_versions if v.revision>0 and v.key.token not in self.keys}
+                    <=set(_DRIVE_SELECTIONS_V3[r][3])):
+            raise AuthorityUnavailable("Drive fresh WRITE stage differs from actual retained Source EOF")
+        return self
+
+def capture_prepared_numeric_drive_inputs_v3(reader):
+    from .domain_production_contracts_v1 import CurrentOperationFrameV1
+    from .domain_production_registry_v1 import installed_operation_v1,installed_readers_for_operation_v1
+    from .d06_life_numeric_task_v1 import require_current_life_numeric_appraisal_acceptance_v1
+    from .current_method_learning_read_v3 import read_bound_method_learning_attachment_v3
+    from .d04_semantic_mapping_v3 import evidence_payload_v3
+    from .dispatch_current_inventory_v3 import _heap
+    r=_drive_reader_v3(reader)
+    if r.read_finished:raise AuthorityUnavailable("Drive preparation requires actual unfinished current READ")
+    frame=CurrentOperationFrameV1(*r.frame_fields)
+    readers=installed_readers_for_operation_v1(r.graph,installed_operation_v1(OPERATION),scope=r.fence.scope,owner_guard=r.owner_guard)
+    context,before,adopted,clock,keys=_plan_inputs(r.db,r.namespace,r.request)
+    current=read_current_life_numeric_context_v1(r.db,frame=frame,
+        request=PrepareLifeNumericContextRequestV1(r.request.episode_ref,r.request.causal_operation_id),installed_readers=readers)
+    if current.original!=context or current.before!=before:raise AuthorityUnavailable("Drive actual READ context/before differs")
+    acceptance=require_current_life_numeric_appraisal_acceptance_v1(r.db,frame=frame,context=current,
+        appraisal_ref=r.request.appraisal_ref,installed_readers=readers)
+    installed=readers.life_numeric_mapping_reader(r.db,r.namespace)
+    mapping_ref="d04-mapping:"+canonical_digest({"appraisal_acceptance":acceptance.digest,
+        "mapping_installation":installed.digest,"clock":evidence_payload_v3(clock)})
+    ids=life_numeric_drive_ids_v1(r.namespace,r.request.episode_ref,r.request.appraisal_ref)
+    refs=frozenset(key.token for key in keys);versions={v.key.token:v.revision for v in frame.snapshot.versions if v.revision>0 and v.key.token not in refs}
+    _DRIVE_SELECTIONS_V3[r]=(mapping_ref,ids,refs,MappingProxyType(versions),clock)
+    _,mapping_prior=read_bound_method_learning_attachment_v3(r.db,table="graph_d04_originals_v3",
+        columns=("payload_json","payload_digest"),key_columns=("bot","persona","kind","original_ref"),
+        key=(*r.namespace.as_tuple,"semantic_mapping",mapping_ref))
+    _,life_prior=read_bound_method_learning_attachment_v3(r.db,table="graph_d11_life_originals_v1",
+        columns=_DRIVE_ORIGINAL_COLUMNS_V3,key_columns=("bot","persona","kind","original_ref"),
+        key=(*r.namespace.as_tuple,KIND,ids["original"]))
+    if mapping_prior is not None and (canonical_serialize(json.loads(mapping_prior[0]))!=mapping_prior[0]
+            or canonical_digest(json.loads(mapping_prior[0]))!=mapping_prior[1]):
+        raise AuthorityUnavailable("Drive mapping prior canonical EOF differs")
+    if life_prior is not None:
+        from .d11_life_preparation_v1 import SIGN_KIND
+        raw=json.loads(life_prior[1])
+        if life_prior[0]!=ids["operation"]or canonical_serialize(raw)!=life_prior[1]or canonical_digest(raw)!=life_prior[2]:
+            raise AuthorityUnavailable("Drive signed prior canonical EOF differs")
+        readers.issuer._signer.verify(SIGN_KIND,canonical_serialize((r.namespace,KIND,ids["original"],life_prior[2])),life_prior[3])
+    for ref in sorted(refs):
+        for token,revision in sorted(versions.items()):
+            _,edge=read_bound_method_learning_attachment_v3(r.db,table="graph_dependency_edges",columns=("dependency_revision",),
+                key_columns=("dependent_token","dependency_token","edge_kind","operation_id"),
+                key=(ref,token,"historical_provenance",ids["operation"]))
+            if edge is not None and edge!=(revision,):raise AuthorityUnavailable("Drive existing provenance edge differs")
+    assembly,policy=_drive_policy_v3(r)
+    if policy.lease_id!=r.parent_budget_lease_ref:read_bound_drive_dose_grant_v3(r,policy.lease_id)
+    dose_task=r.budget_task if policy.lease_id==r.parent_budget_lease_ref else r.attachments[("drive_dose_grant",policy.lease_id)]
+    clock_rows=[]
+    with runtime_storage_quantum_v3(r.db)as meter:
+        row=_runtime_bounded_fixed_row_v3(r.db,meter,"runtime_character_clocks",_CLOCK_COLUMNS_V3,
+            "mapping_id=? AND version=?",(clock.mapping_id,clock.mapping_version))
+        latest=_runtime_bounded_fixed_row_v3(r.db,meter,"runtime_character_clocks",("version",),
+            "mapping_id=? ORDER BY version DESC",(clock.mapping_id,))
+        if row is None or latest!=(clock.clock_head_version,):raise AuthorityUnavailable("Drive current clock header differs")
+        clock_rows.extend((("runtime_character_clocks",_CLOCK_COLUMNS_V3,"mapping_id=? AND version=?",(clock.mapping_id,clock.mapping_version),row),
+            ("runtime_character_clocks",("version",),"mapping_id=? ORDER BY version DESC",(clock.mapping_id,),latest)))
+    points=[(p.table,p.key_columns,p.key,p.metadata_columns,p.metadata)for p in r.points.values()if p.complete]
+    capsule=PreparedNumericDriveInputsV3(r,context,before,adopted,clock,refs,installed,acceptance,mapping_ref,mapping_prior,life_prior,points,clock_rows,dose_task)
+    r.operation.retain(_heap((context,before,adopted,clock,refs,mapping_prior,life_prior,points,clock_rows))*2+65536)
+    r.prepared_numeric_drive_inputs_v3=capsule
+    return capsule
+
+def bind_prepared_numeric_drive_stage_v3(db,stage):
+    from .current_method_learning_read_v3 import _method_active,_require_current_general_method_source_write_phase_v1
+    r=_method_active(db)
+    if r is None:return
+    capsule=r.prepared_numeric_drive_inputs_v3
+    capsule.require_stage_v3(db,stage)
+    phase=_require_current_general_method_source_write_phase_v1(r)
+    identity=id(stage)
+    _DRIVE_STAGE_INPUTS_V3[identity]=(weakref.ref(stage,lambda _:_DRIVE_STAGE_INPUTS_V3.pop(identity,None)),capsule,phase[1])
+
+@contextmanager
+def bind_active_numeric_drive_inputs_v3(db,*,witness,receipt):
+    from .current_method_learning_read_v3 import _method_active
+    r=_method_active(db);capsule=r.prepared_numeric_drive_inputs_v3
+    capsule.require_stage_v3(db,witness.stage)
+    registered=_DRIVE_STAGE_INPUTS_V3.get(id(witness.stage))
+    if registered is None or registered[0]()is not witness.stage or registered[1]is not capsule or registered[2]is not witness.scope:
+        raise AuthorityUnavailable("Drive ACTIVE writer differs from registered fresh WRITE stage")
+    with runtime_storage_quantum_v3(db)as meter:
+        for table,keycols,key,cols,expected in capsule.points:
+            actual=_runtime_bounded_fixed_row_v3(db,meter,table,cols," AND ".join(n+"=?"for n in keycols),key)
+            if table=="graph_atoms"and key[0]in capsule.keys:continue
+            if actual!=expected:raise AuthorityUnavailable("Drive ACTIVE original metadata changed after actual EOF")
+        for table,cols,where,key,expected in capsule.clock_rows:
+            if _runtime_bounded_fixed_row_v3(db,meter,table,cols,where,key)!=expected:
+                raise AuthorityUnavailable("Drive ACTIVE clock changed after actual frozen EOF")
+    token=_DRIVE_ACTIVE_V3.set((capsule,witness,receipt))
+    try:yield capsule
+    finally:_DRIVE_ACTIVE_V3.reset(token)
+
+def require_active_numeric_drive_inputs_v3(db,witness,stage,receipt):
+    from .domain_production_commit_v1 import _ACTIVE
+    active=_DRIVE_ACTIVE_V3.get()
+    if (active is None or active[1]is not witness or active[2]is not receipt or _ACTIVE.get(id(witness))is not witness
+            or witness.stage is not stage or witness.scope.operation!="write"or not db.in_transaction
+            or not witness.graph._GraphCoordinator__store._lock._is_owned()):
+        raise AuthorityUnavailable("Drive record requires actual private ACTIVE WRITE inputs")
+    active[0].require_stage_v3(db,stage)
+    return active[0]
+
+def release_prepared_numeric_drive_inputs_v3(reader):
+    _DRIVE_SELECTIONS_V3.pop(reader,None)
+    peak=_DRIVE_RECHECKS_V3.pop(reader,None)
+    if peak is not None:peak.value=None
+    capsule=reader.prepared_numeric_drive_inputs_v3
+    if capsule is None:return
+    _DRIVE_INPUTS_V3.pop(capsule,None)
+    for key,record in tuple(_DRIVE_STAGE_INPUTS_V3.items()):
+        if record[1]is capsule:_DRIVE_STAGE_INPUTS_V3.pop(key,None)
+    capsule.context=capsule.before=capsule.adopted=capsule.installed=capsule.acceptance=None
+    capsule.mapping_prior=capsule.life_prior=capsule.points=capsule.clock_rows=capsule.frame_fields=capsule.dose_task=None
+    reader.prepared_numeric_drive_inputs_v3=None
+
+_DRIVE_RECHECKS_V3=WeakKeyDictionary()
+
+class _DriveMetadataPeakV3:
+    def __init__(self,reader):
+        self.reader,self.value=reader,None
+        reader.operation.register_retained_state_v3(self)
+    def _runtime_retained_heap_bytes_v3(self):
+        from .dispatch_current_inventory_v3 import _heap
+        return _heap(self.value)+256
+
+def _drive_metadata_row_v3(reader,meter,table,columns,where,key):
+    from .current_method_learning_read_v3 import require_actual_source_owner_metadata_work_v1
+    from .c09_paged_sql_v2 import _quote
+    r=require_actual_source_owner_metadata_work_v1(reader)
+    if r.operation_kind!=OPERATION:raise AuthorityUnavailable("Drive metadata peak requires exact actual Method Work")
+    peak=_DRIVE_RECHECKS_V3.get(r)
+    if peak is None:peak=_DriveMetadataPeakV3(r);_DRIVE_RECHECKS_V3[r]=peak
+    lengths=r.db.execute("SELECT "+",".join("length(CAST("+_quote(n)+" AS BLOB))"for n in columns)
+        +" FROM "+_quote(table)+" WHERE "+where+" LIMIT 1",key).fetchone()
+    meter.charge_read(8*len(columns))
+    if lengths is None:
+        peak.value=None;r.operation.refresh_retained_state_v3(peak);return None
+    amount=sum(n or 0 for n in lengths)
+    meter.require_available(amount+256)
+    r.operation.reserve_retained_state_growth_v3(peak,amount*8+4096)
+    peak.value=meter.read_fixed_row(r.db,table,columns,where,key)
+    r.operation.finish_retained_state_growth_v3(peak)
+    return peak.value
+
+def recheck_drive_numeric_metadata_header_v3(task,meter):
+    from .current_life_numeric_metadata_v1 import NumericMetadataTaskV1
+    r=task.reader
+    if type(task)is not NumericMetadataTaskV1 or r.attachments.get(("numeric_owner_metadata",task.identity))is not task:
+        raise AuthorityUnavailable("Drive metadata header lacks exact actual fixed task registry")
+    return _drive_metadata_row_v3(r,meter,task.table,task.header_columns,
+        " AND ".join(n+"=?"for n in task.key_columns),task.key)
+
+def recheck_drive_numeric_source_header_v3(reader,meter,task):
+    from .current_method_learning_read_v3 import _GENERAL_METHOD_SOURCE_TASKS_V1
+    if (_GENERAL_METHOD_SOURCE_TASKS_V1.get(reader,{}).get(task.key.token)is not task or task.reader()is not reader
+            or NamespaceId.from_key(task.key)!=reader.namespace):
+        raise AuthorityUnavailable("Drive Source header lacks exact actual ancestor task registry")
+    return _drive_metadata_row_v3(reader,meter,"graph_atoms",("revision","valid","value_cell_id"),
+        "token=? AND bot=? AND persona=?",(task.key.token,*reader.namespace.as_tuple))
+
+def recheck_drive_numeric_point_header_v3(task,meter):
+    from .current_method_learning_read_v3 import _MethodPointReadV3
+    r=task.owner
+    if type(task)is not _MethodPointReadV3 or r.points.get(task.request)is not task:
+        raise AuthorityUnavailable("Drive point header lacks exact actual fixed EOF task registry")
+    return _drive_metadata_row_v3(r,meter,task.table,task.metadata_columns,
+        " AND ".join(n+"=?"for n in task.key_columns),task.key)
+
+
+def record_current_drive_mapping_original_v3(db,mapping_stage,witness):
+    stage=witness.stage
+    active=_DRIVE_ACTIVE_V3.get()
+    if active is None:raise AuthorityUnavailable("Drive mapping requires actual ACTIVE writer")
+    capsule=require_active_numeric_drive_inputs_v3(db,witness,stage,active[2])
+    if (stage.mapping_stage is not mapping_stage or mapping_stage.original_ref!=capsule.mapping_ref
+            or mapping_stage.clock!=capsule.clock):
+        raise AuthorityUnavailable("Drive mapping record escaped actual selected typed mapping/clock")
+    from .d06_life_numeric_commit_v1 import require_current_life_numeric_drive_write_v3
+    require_current_life_numeric_drive_write_v3(db,witness=witness,stage=stage,receipt=active[2],writes=mapping_stage.writes)
+    raw=json.loads(mapping_stage.original_payload_json)
+    wire=canonical_serialize(raw);digest=canonical_digest(raw)
+    if wire!=mapping_stage.original_payload_json or digest!=mapping_stage.original_digest:
+        raise AuthorityUnavailable("Drive typed mapping original canonical digest differs")
+    key=(*mapping_stage.namespace.as_tuple,"semantic_mapping",mapping_stage.original_ref)
+    with runtime_storage_quantum_v3(db)as meter:
+        actual=_runtime_bounded_fixed_row_v3(db,meter,"graph_d04_originals_v3",("payload_digest",),
+            "bot=? AND persona=? AND kind=? AND original_ref=?",key)
+    prior=None if capsule.mapping_prior is None else (capsule.mapping_prior[1],)
+    if actual!=prior:raise AuthorityUnavailable("Drive mapping prior changed after actual EOF")
+    if capsule.mapping_prior is not None:
+        if capsule.mapping_prior!=(wire,digest):raise AuthorityUnavailable("Drive immutable mapping prior differs")
+    else:db.execute("INSERT INTO graph_d04_originals_v3 VALUES(?,?,?,?,?,?)",(*key,wire,digest))
+    return digest

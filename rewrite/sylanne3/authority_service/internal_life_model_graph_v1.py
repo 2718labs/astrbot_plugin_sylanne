@@ -38,6 +38,7 @@ from ..host.model_workflows_v4 import AdminModelWorkflowsV4
 from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
 from .v2_model_egress_contract import ModelEgressIntentV1
 
@@ -125,7 +126,7 @@ class InstalledInternalLifeModelGraphReaderV1:
     def __init__(self, *, owner_storage, structured_readers, workflows):
         if (type(owner_storage) is not InstalledD12OwnerStorageAdmissionServiceV1
                 or type(structured_readers) is not InstalledD06StructuredExperienceReadersV1
-                or type(workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7) or workflows.life_content is None
+                or type(workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7, AdminModelWorkflowsV8) or workflows.life_content is None
                 or structured_readers.resource_issuer is not structured_readers.issuer.resource_issuer):
             raise TypeError('actual installed Life Owner/original readers and workflow required')
         self.owner_storage, self.readers, self.workflows = owner_storage, structured_readers, workflows
@@ -135,6 +136,13 @@ class InstalledInternalLifeModelGraphReaderV1:
                 or not math.isfinite(now) or type(allow_accounted_result) is not bool):
             raise ValueError('actual Life model input and trusted clock required')
         owner_service = self.owner_storage
+        from .owner_location_read_v3 import require_owner_location_for_model_graph_read_v3
+        owner_location = require_owner_location_for_model_graph_read_v3(
+            db, installed_reader=self, intent=intent)
+        anchor, head, actor, login = (owner_location.anchor, owner_location.head,
+            owner_location.actor, owner_location.login)
+        metadata, grant, admission = (owner_location.metadata, owner_location.grant,
+            owner_location.admission)
         job = get_job(db, intent.job_id)
         if job is None or job.work_kind != WORK_KIND:
             raise ValueError('Life model once running job is missing')
@@ -145,11 +153,6 @@ class InstalledInternalLifeModelGraphReaderV1:
             namespace=ns, issuer=self.readers.issuer, job_id=job.job_id)
         frozen = thaw_internal_life_content_request_v1(json.loads(prepared.frozen_json))
         workflow = self.workflows.life_content
-        with owner_service.fences._frozen() as (core_db, deletion, execution, _):
-            anchor = owner_service.fences._current_locked(core_db, deletion, execution)
-            head = owner_service._head_in_tx(core_db)
-            actor, login = owner_service._background_identity_in_tx(core_db, head)
-        metadata, grant, admission = owner_service._read_graph(owner_head=head, anchor=anchor)
         current = GraphStore._decode_recovery(db.execute('SELECT schema,requirements_json,graph_revision '
             'FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?', ns.as_tuple).fetchone(), ns)
         epoch = db.execute('SELECT revision FROM graph_epochs WHERE bot=? AND persona=?', ns.as_tuple).fetchone()
@@ -225,11 +228,15 @@ class InstalledInternalLifeModelGraphReaderV1:
         atom = db.execute('SELECT value,valid FROM graph_atoms WHERE token=?', (job_graph_write(job).key.token,)).fetchone()
         if atom != (canonical_serialize(job_graph_write(job).value), 1):
             raise ValueError('Life model actual running-job projection changed')
-        with owner_service.fences._frozen() as (core_db, deletion, execution, _):
-            if (owner_service.fences._current_locked(core_db, deletion, execution) != anchor
-                    or owner_service._head_in_tx(core_db) != head
-                    or owner_service._background_identity_in_tx(core_db, head) != (actor, login)):
-                raise ValueError('Life model actual Owner/paired identity changed during current read')
+        current_owner_location = require_owner_location_for_model_graph_read_v3(
+            db, installed_reader=self, intent=intent)
+        if (current_owner_location is not owner_location
+                or (current_owner_location.anchor, current_owner_location.head,
+                    current_owner_location.actor, current_owner_location.login,
+                    current_owner_location.metadata, current_owner_location.grant,
+                    current_owner_location.admission) !=
+                   (anchor, head, actor, login, metadata, grant, admission)):
+            raise ValueError('Life model actual Owner/paired identity changed during current read')
         scope_digest = canonical_digest({'schema':'d06.internal-life-content-current-model.v1',
             'prepared_digest':prepared.digest, 'current_reads':frame.snapshot.versions,
             'query_coverage':frame.query_coverage, 'owner_guard':head.guard,

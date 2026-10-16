@@ -307,6 +307,7 @@ TYPE_SCHEMA_HASHES = {
     name: schema_hash(_type_schema(name, value_type))
     for name, value_type in sorted(_VALUE_TYPES.items())
 }
+TYPE_SCHEMA_HASHES["d11.semantic_tick.v1"] = schema_hash({"type":"d11.semantic_tick.v1","version":1})
 D11_PROPOSAL_SCHEMA_HASH = schema_hash({
     "proposal": D11_PROPOSAL_SCHEMA,
     "runtime_schema": RUNTIME_SCHEMA,
@@ -322,7 +323,12 @@ def graph_type_specs() -> tuple[TypeSpec, ...]:
             writer_domain="d11", schema_hash=TYPE_SCHEMA_HASHES[name],
         )
         for name, value_type in sorted(_VALUE_TYPES.items())
-    )
+    ) + (_semantic_tick_spec_v1(),)
+
+
+def _semantic_tick_spec_v1():
+    from .domain_mesh_tick_v1 import semantic_tick_type_spec_v1
+    return semantic_tick_type_spec_v1()
 
 
 def runtime_job_key(bot_id: str, persona_id: str, activity_id: str,
@@ -424,6 +430,10 @@ def validate_d11_writes(writes: tuple[GraphWrite, ...], namespace: NamespaceId,
     cost_operations: set[str] = set()
     decoded: list[tuple[GraphWrite, object]] = []
     for write in writes:
+        if write.key.type_name == 'd11.semantic_tick.v1':
+            from .domain_mesh_tick_v1 import validate_semantic_tick_write_v1
+            validate_semantic_tick_write_v1(write,namespace,operation_id=operation_id,activity_id=activity_id)
+            continue
         if write.key in companion_keys:
             continue
         from .d11_life_graph_types_v1 import TYPES as LIFE_TYPES, validate_life_graph_value_v1
@@ -500,9 +510,10 @@ class D11RuntimeProvider:
     def type_specs(self) -> tuple[TypeSpec, ...]:
         from .d11_life_graph_types_v1 import life_graph_type_specs_v1
         from .contact_p2_qualification_v1 import contact_p2_graph_proof_type_spec_v1
+        from .contact_continuation_p2_v1 import contact_continuation_p2_graph_proof_type_spec_v1
         from .contact_observation_v1 import contact_platform_observation_type_spec_v1
         return graph_type_specs() + (role_resources_spec(), dispatch_claim_type_spec()) + life_graph_type_specs_v1() + (
-            contact_p2_graph_proof_type_spec_v1(), contact_platform_observation_type_spec_v1())
+            contact_p2_graph_proof_type_spec_v1(), contact_continuation_p2_graph_proof_type_spec_v1(), contact_platform_observation_type_spec_v1())
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
@@ -538,7 +549,19 @@ class D11RuntimeProvider:
 
 def _budget_operation(db, bot_id: str, persona_id: str,
                       operation_id: str, phase: str):
-    row = db.execute(
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,row=read_bound_native_numeric_point_v3(db,table='runtime_budget_operations',columns=('digest', 'lease_id', 'receipt_json'),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(bot_id,persona_id,operation_id,phase))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,row=read_bound_life_model_body_point_v3(db,table='runtime_budget_operations',columns=('digest', 'lease_id', 'receipt_json'),
+        key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(bot_id,persona_id,operation_id,phase))
+    if not handled:
+        from .current_life_numeric_accounting_v3 import numeric_accounting_current_point_v3
+        handled,row=numeric_accounting_current_point_v3(db,table='runtime_budget_operations',columns=('digest','lease_id','receipt_json'),
+            key_columns=('bot_id','persona_id','operation_id','phase'),key=(bot_id,persona_id,operation_id,phase))
+    if not handled:
+        row = db.execute(
         "SELECT digest,lease_id,receipt_json FROM runtime_budget_operations "
         "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase=?",
         (bot_id, persona_id, operation_id, phase),
@@ -557,7 +580,19 @@ def cost_settlement_from_runtime(
     lease = get_budget_lease(db, lease_id)
     if (lease.bot_id, lease.persona_id) != (bot_id, persona_id):
         raise ValueError("budget lease belongs to another namespace")
-    reservation = db.execute(
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_point_v3
+    handled,reservation=read_bound_native_numeric_point_v3(db,table='runtime_budget_reservations',columns=('ceiling_json', 'state', 'actual_json'),
+        key_columns=('lease_id', 'operation_id'),key=(lease_id,cost_operation_id))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_body_point_v3
+        handled,reservation=read_bound_life_model_body_point_v3(db,table='runtime_budget_reservations',columns=('ceiling_json', 'state', 'actual_json'),
+        key_columns=('lease_id', 'operation_id'),key=(lease_id,cost_operation_id))
+    if not handled:
+        from .current_life_numeric_accounting_v3 import numeric_accounting_current_point_v3
+        handled,reservation=numeric_accounting_current_point_v3(db,table='runtime_budget_reservations',columns=('ceiling_json','state','actual_json'),
+            key_columns=('lease_id','operation_id'),key=(lease_id,cost_operation_id))
+    if not handled:
+        reservation = db.execute(
         "SELECT ceiling_json,state,actual_json FROM runtime_budget_reservations "
         "WHERE lease_id=? AND operation_id=?", (lease_id, cost_operation_id),
     ).fetchone()

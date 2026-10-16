@@ -8,6 +8,7 @@ from .model_workflows_v4 import AdminModelWorkflowsV4
 from .model_workflows_v5 import AdminModelWorkflowsV5
 from .model_workflows_v6 import AdminModelWorkflowsV6
 from .model_workflows_v7 import AdminModelWorkflowsV7
+from .model_workflows_v8 import AdminModelWorkflowsV8
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
 from weakref import WeakSet
@@ -358,7 +359,7 @@ class V2FencePort:
                    != grant.installation_id
                 or bundle.installation_policy.manifest_digest
                    != grant.manifest_digest
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -689,6 +690,29 @@ class V2FencePort:
             raise RuntimeError("v2 fence status identity mismatch")
         return permit, state
 
+    def read_d13_paid_terminal_fact_v3(self, *, scope, intent):
+        """Observe an exact paid terminal through this installation's paired channel."""
+        return self._submit(self._with_session_repair(
+            lambda: self._read_d13_paid_terminal_fact_v3(scope, intent)))
+
+    async def _read_d13_paid_terminal_fact_v3(self, scope, intent):
+        from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        if (type(scope) is not FenceScope or scope.operation != "read"
+                or type(intent) is not ModelEgressIntentV1
+                or intent.namespace != scope.authority_namespace):
+            raise RuntimeError("D13 terminal observation requires its current exact READ")
+        handshake, grant = await self._check_scope(scope)
+        if (intent.authority_id, intent.subject) != (grant.authority_id, grant.subject):
+            raise RuntimeError("D13 terminal observation crossed the installed model identity")
+        if await self._transport.v2_validate_fence(self._request, handshake, scope.permit) != scope.permit:
+            raise RuntimeError("D13 terminal observation READ changed")
+        result = await self._transport.model_terminal_fact_v2(
+            self._request, handshake, grant, namespace=scope.authority_namespace,
+            holder=grant.administrator_holder, intent=intent)
+        if await self._transport.v2_validate_fence(self._request, handshake, scope.permit) != scope.permit:
+            raise RuntimeError("D13 terminal observation READ ended during query")
+        return result
+
     def read_contact_finished_original_v3(self,scope,*,request_id,request_digest):
         """Authenticate exact finished identity and converge only its local ACK."""
         from ..authority_service.contact_fence_finished_v3 import ContactFenceFinishedOriginalV3
@@ -844,14 +868,17 @@ class V2FencePort:
     def accept_owner_session(self, *, namespace: NamespaceId,
                              authority_namespace: str,
                              challenge: OwnerSessionLoginChallengeV1,
-                             signature: bytes) -> str:
+                             signature: bytes,
+                             session_expires_no_later_than_utc: str | None = None) -> str:
         return self._submit(self._accept_owner_session(
-            namespace, authority_namespace, challenge, signature))
+            namespace, authority_namespace, challenge, signature,
+            session_expires_no_later_than_utc))
 
     async def _accept_owner_session(self, namespace: NamespaceId,
                                     authority_namespace: str,
                                     challenge: OwnerSessionLoginChallengeV1,
-                                    signature: bytes) -> str:
+                                    signature: bytes,
+                                    session_expires_no_later_than_utc: str | None = None) -> str:
         await self._mapped(namespace, authority_namespace)
         if type(challenge) is not OwnerSessionLoginChallengeV1:
             raise TypeError("Owner login challenge is required")
@@ -859,7 +886,8 @@ class V2FencePort:
         handshake, _ = self._identity()
         return await self._transport.v2_accept_owner_session(
             self._request, handshake, namespace=authority_namespace,
-            challenge=challenge, signature=signature)
+            challenge=challenge, signature=signature,
+            session_expires_no_later_than_utc=session_expires_no_later_than_utc)
 
     def current_owner_session(self, *, namespace: NamespaceId,
                               authority_namespace: str,
@@ -1285,6 +1313,40 @@ class V2FencePort:
         from .d12_target_owner_port_v1 import get_current_background_owner_authority_for_fence_v1
         return get_current_background_owner_authority_for_fence_v1(self, **request)
 
+    def admit_conditioned_child_for_fence_v1(self,*,scope,request):
+        return self._submit(self._with_session_repair(lambda:self._conditioned_child_v1(
+            'conditioned_child_admit_v1',scope=scope,request=request)))
+
+    def read_current_conditioned_child_for_fence_v1(self,*,scope,original_request):
+        return self._submit(self._with_session_repair(lambda:self._conditioned_child_v1(
+            'conditioned_child_current_v1',scope=scope,request=original_request)))
+
+    async def _conditioned_child_v1(self,method,*,scope,request):
+        from ..authority_service.conditioned_child_contract_v1 import (ConditionedChildSelectorV1,
+            ConditionedChildEvidenceV1,conditioned_child_fence_operation_id_v1,
+            conditioned_child_to_wire_v1,conditioned_child_from_wire_v1)
+        from ..authority_service.v2_contract import from_wire,to_wire
+        if(type(scope)is not FenceScope or type(request)is not ConditionedChildSelectorV1
+                or scope.namespace!=request.namespace):
+            raise RuntimeError('conditioned child exact selector and scope namespace differ')
+        await self._mapped(scope.namespace,scope.authority_namespace)
+        handshake,grant=self._identity();permit=scope.permit
+        if(permit.operation!='write'or(permit.authority_id,permit.namespace,permit.subject,permit.holder)!=
+                (grant.authority_id,scope.authority_namespace,grant.subject,grant.administrator_holder)
+                or request.installation_id!=grant.installation_id
+                or permit.operation_id!=conditioned_child_fence_operation_id_v1(request)):
+            raise RuntimeError('conditioned child changed its actual paired installation or fresh WRITE permit')
+        response=await self._transport._content_rpc(self._request,handshake,method,
+            {'namespace':scope.authority_namespace,'permit':to_wire(permit),
+                'request':conditioned_child_to_wire_v1(request)},protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response)!={'evidence','permit','channel_binding_sha256'}:
+            raise RuntimeError('conditioned child paired response fields differ')
+        evidence=conditioned_child_from_wire_v1(response['evidence'],ConditionedChildEvidenceV1)
+        observed=from_wire(response['permit'])
+        if observed!=permit or evidence.selector!=request or evidence.current_self.permit!=permit:
+            raise RuntimeError('conditioned child response changed its exact selector, current Self or permit')
+        return evidence,observed
+
     def admit_owner_source_note_task_for_fence_v1(self, *, scope, request):
         return self._submit(self._with_session_repair(lambda: self._owner_source_note_task_v1(
             'owner_source_note_task_admit_v1', scope=scope, request=request)))
@@ -1319,6 +1381,26 @@ class V2FencePort:
         if observed != permit or evidence.request != request or evidence.current_self.permit != permit:
             raise RuntimeError('Owner task response changed its actual request/permit/Self')
         return evidence, observed
+
+    def admit_foreground_mesh_activity_for_fence_v1(self, *, scope, request):
+        from .foreground_mesh_activity_port_v1 import personal_mesh_activity_rpc_v1
+        return self._submit(self._with_session_repair(lambda: personal_mesh_activity_rpc_v1(
+            self,'foreground_mesh_activity_admit_v1',scope=scope,request=request)))
+
+    def read_current_foreground_mesh_activity_for_fence_v1(self, *, scope, original_request):
+        from .foreground_mesh_activity_port_v1 import personal_mesh_activity_rpc_v1
+        return self._submit(self._with_session_repair(lambda: personal_mesh_activity_rpc_v1(
+            self,'foreground_mesh_activity_current_v1',scope=scope,request=original_request)))
+
+    def admit_owner_task_mesh_activity_for_fence_v1(self, *, scope, request):
+        from .foreground_mesh_activity_port_v1 import personal_mesh_activity_rpc_v1
+        return self._submit(self._with_session_repair(lambda: personal_mesh_activity_rpc_v1(
+            self,'owner_task_mesh_activity_admit_v1',scope=scope,request=request)))
+
+    def read_current_owner_task_mesh_activity_for_fence_v1(self, *, scope, original_request):
+        from .foreground_mesh_activity_port_v1 import personal_mesh_activity_rpc_v1
+        return self._submit(self._with_session_repair(lambda: personal_mesh_activity_rpc_v1(
+            self,'owner_task_mesh_activity_current_v1',scope=scope,request=original_request)))
 
     def admit_foreground_activity_for_fence_v1(self, *, scope, request):
         return self._submit(self._with_session_repair(lambda: self._foreground_activity_v1(
@@ -1540,6 +1622,65 @@ class V2FencePort:
             raise RuntimeError("natural disposition private witness differs from its fixed Graph read/write stamp")
         return value
 
+    def read_current_artifact_no_dispatch_metadata_v1(self, *, bundle, request):
+        return self._submit(self._with_session_repair(lambda:self._artifact_no_dispatch_metadata_rpc_v1(
+            method="artifact_no_dispatch_metadata_issue_v1",bundle=bundle,request=request)))
+
+    def validate_current_artifact_no_dispatch_metadata_v1(self, *, bundle, grant):
+        return self._submit(self._with_session_repair(lambda:self._artifact_no_dispatch_metadata_rpc_v1(
+            method="artifact_no_dispatch_metadata_validate_v1",bundle=bundle,grant=grant)))
+
+    def read_current_artifact_no_dispatch_cancellation_v1(self, *, bundle, grant, prepared, prepared_signature):
+        return self._submit(self._with_session_repair(lambda:self._artifact_no_dispatch_metadata_rpc_v1(
+            method="artifact_no_dispatch_metadata_cancel_v1",bundle=bundle,grant=grant,
+            prepared=prepared,prepared_signature=prepared_signature)))
+
+    async def _artifact_no_dispatch_metadata_rpc_v1(self, *, method, bundle, request=None,
+            grant=None, prepared=None, prepared_signature=None):
+        from ..authority_service.artifact_no_dispatch_metadata_contract_v1 import (
+            ModelNoDispatchMetadataRequestV1,ModelNoDispatchMetadataGrantV1,to_wire_v1,from_wire_v1)
+        from ..authority_service.owner_goal_cancellation_contract_v1 import (
+            OwnerGoalCancellationOriginalV1,owner_goal_cancellation_from_wire_v1)
+        from ..runtime.artifact_no_dispatch_metadata_invocation_v1 import (
+            _accept_verified_artifact_metadata_rpc_v1,_ARTIFACT_METADATA_RPC_ISSUER_V1,
+            require_verified_artifact_metadata_grant_v1)
+        from ..domains.d01.production_operations_v1 import plain_v1
+        policy=bundle.installation_policy
+        await self._mapped(policy.namespace,policy.authority_namespace)
+        handshake,installed=self._identity()
+        if (installed.installation_id,installed.manifest_digest,installed.administrator_holder)!=(
+                policy.installation_id,policy.manifest_digest,policy.administrator_holder):
+            raise RuntimeError("financial metadata crossed its actual paired installation")
+        command={"namespace":policy.authority_namespace}
+        if method=="artifact_no_dispatch_metadata_issue_v1":
+            if type(request) is not ModelNoDispatchMetadataRequestV1:
+                raise TypeError("actual typed original financial metadata request required")
+            command["request"]=to_wire_v1(request)
+        else:
+            require_verified_artifact_metadata_grant_v1(grant,port=self,bundle=bundle)
+            command["grant"]=to_wire_v1(grant)
+        if method=="artifact_no_dispatch_metadata_cancel_v1":
+            command.update(prepared=plain_v1(prepared),prepared_signature=prepared_signature)
+        response=await self._transport._content_rpc(self._request,handshake,method,command,protocol=AUTHORITY_V2_PROTOCOL)
+        required=({"original","grant_digest","channel_binding_sha256"} if method=="artifact_no_dispatch_metadata_cancel_v1"
+            else {"grant","channel_binding_sha256"})
+        if (type(response) is not dict or set(response)!=required
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("financial metadata response crossed its authenticated channel")
+        if method=="artifact_no_dispatch_metadata_cancel_v1":
+            if response["grant_digest"]!=grant.digest:raise RuntimeError("cancel metadata changed actual original financial grant")
+            return None if response["original"] is None else owner_goal_cancellation_from_wire_v1(
+                response["original"],OwnerGoalCancellationOriginalV1)
+        if response["grant"] is None:
+            if method!="artifact_no_dispatch_metadata_issue_v1":raise RuntimeError("financial grant validation became absent")
+            return None
+        observed=from_wire_v1(response["grant"],ModelNoDispatchMetadataGrantV1)
+        if (method=="artifact_no_dispatch_metadata_issue_v1" and observed.request!=request
+                or method=="artifact_no_dispatch_metadata_validate_v1" and observed.digest!=grant.digest):
+            raise RuntimeError("financial metadata changed the actual read operation/original target")
+        return _accept_verified_artifact_metadata_rpc_v1(_ARTIFACT_METADATA_RPC_ISSUER_V1,
+            port=self,bundle=bundle,grant=observed,channel_binding=response["channel_binding_sha256"])
+
     def observe_owner_stop_reply_projection_for_fence_v1(self, *, scope, original_ref):
         return self._submit(self._with_session_repair(lambda:
             self._observe_owner_stop_reply_projection_v1(scope=scope, original_ref=original_ref)))
@@ -1578,6 +1719,44 @@ class V2FencePort:
     def get_current_owner_authority_for_fence_v1(self, **request):
         from .d12_target_owner_port_v1 import get_current_owner_authority_for_fence_v1
         return get_current_owner_authority_for_fence_v1(self, **request)
+
+    def capture_contact_background_invocation_v1(self, **request):
+        from ..authority_service.contact_background_rpc_v1 import METHOD
+        return self._contact_background_observation_v1(METHOD, **request)
+
+    def read_contact_background_observation_v1(self, **request):
+        from ..authority_service.contact_background_rpc_v1 import READ_METHOD
+        return self._contact_background_observation_v1(READ_METHOD, **request)
+
+    def _contact_background_observation_v1(self, method, *, namespace, authority_namespace, permit, selector):
+        from ..authority_service.contact_background_rpc_v1 import METHOD, validate_background_observation_v1
+        from ..authority_service.d12_target_owner_admission_v1 import current_owner_authority_from_wire_v1
+        from ..authority_service.v2_contract import SCHEMA, to_wire, from_wire
+        from ..runtime_contracts import canonical_digest
+        async def read():
+            await self._mapped(namespace, authority_namespace)
+            handshake, grant = self._identity()
+            if permit.authority_id != grant.authority_id or permit.subject != grant.subject:
+                raise PermissionError('Contact background permit belongs to another installation')
+            response = await self._transport._content_rpc(self._request, handshake, method,
+                {'namespace':authority_namespace,'permit':to_wire(permit),'selector':selector}, protocol=SCHEMA)
+            if set(response) != {'observation','authority','channel_binding_sha256'}:
+                raise RuntimeError('Contact background observation response fields differ')
+            observation = validate_background_observation_v1(response['observation'])
+            authority = response['authority']
+            current = current_owner_authority_from_wire_v1({k:v for k,v in authority.items() if k != 'permit'})
+            if (from_wire(authority['permit']) != permit or current.guard.namespace != namespace
+                    or observation['authority_id'] != grant.authority_id
+                    or observation['installation_id'] != grant.installation_id
+                    or method == METHOD and (observation['owner_authority_digest'] != canonical_digest(authority)
+                        or observation['permit_digest'] != canonical_digest(to_wire(permit)))
+                    or current.guard.authorization_head != observation['owner_head_digest']
+                    or current.guard.authorization_revision != observation['owner_revision']
+                    or observation['inputs']['operation_id'] != selector['operation_id']
+                    or observation['inputs']['request_digest'] != selector['request_digest']):
+                raise PermissionError('Contact background exact current authority/selector differs')
+            return {'observation':observation,'authority':authority}
+        return self._submit(self._with_session_repair(read))
 
     def capture_current_contact_owner_session_v3(self, **request):
         from ..authority_service.contact_owner_session_rpc_v3 import CAPTURE
@@ -2501,6 +2680,57 @@ class V2FencePort:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def observe_current_owner_goal_cancellation_projection_v1(self,*,scope,cancel_operation_id,original_ref):
+        return self._submit(self._with_session_repair(lambda:self._observe_current_owner_goal_cancellation_projection_v1(
+            scope=scope,cancel_operation_id=cancel_operation_id,original_ref=original_ref)))
+
+    async def _observe_current_owner_goal_cancellation_projection_v1(self,*,scope,cancel_operation_id,original_ref):
+        from ..runtime_contracts import FenceScope
+        from ..authority_service.v2_contract import to_wire as fence_to_wire
+        from ..authority_service.owner_goal_projection_contract_v1 import goal_projection_from_wire_v1
+        if type(scope) is not FenceScope or scope.operation not in {"read","write"}:
+            raise TypeError("actual independent Goal projection WRITE scope required")
+        await self._mapped(scope.namespace,scope.authority_namespace)
+        handshake,installed=self._identity()
+        observed=await self._transport._content_rpc(self._request,handshake,
+            "owner_goal_cancellation_projection_observe_v1",
+            {"namespace":scope.authority_namespace,"cancel_operation_id":cancel_operation_id,
+                "original_ref":original_ref,"permit":fence_to_wire(scope.permit)},protocol=AUTHORITY_V2_PROTOCOL)
+        if type(observed) is not dict or set(observed)!={"observation"}:
+            raise RuntimeError("actual Goal projection response fields differ")
+        value=goal_projection_from_wire_v1(observed["observation"])
+        if (value.original.request.namespace!=scope.namespace
+                or value.original.request.installation_id!=installed.installation_id
+                or value.original.request.cancel_operation_id!=cancel_operation_id or value.original.original_ref!=original_ref
+                or value.permit!=scope.permit
+                or scope.operation!={"projection_write":"write","projection_lookup":"read"}[value.scope_kind]
+                or value.scope_kind=="projection_write" and value.committed_bridge is None and (value.metadata.graph_revision!=scope.graph_revision
+                    or value.metadata.graph_epoch!=scope.graph_epoch.revision)):
+            raise RuntimeError("actual Goal projection response changed its held WRITE/causal/metadata scope")
+        return value
+
+    def read_next_owner_goal_cancellation_projection_v1(self,*,bundle,after_cancel_operation_id):
+        return self._submit(self._with_session_repair(lambda:self._read_next_owner_goal_cancellation_projection_v1(
+            bundle=bundle,after_cancel_operation_id=after_cancel_operation_id)))
+
+    async def _read_next_owner_goal_cancellation_projection_v1(self,*,bundle,after_cancel_operation_id):
+        from ..authority_service.owner_goal_cancellation_contract_v1 import OwnerGoalCancellationOriginalV1,owner_goal_cancellation_from_wire_v1
+        policy=bundle.installation_policy
+        await self._mapped(policy.namespace,policy.authority_namespace)
+        handshake,installed=self._identity()
+        response=await self._transport._content_rpc(self._request,handshake,"owner_goal_cancellation_projection_next_v1",
+            {"namespace":policy.authority_namespace,"after_cancel_operation_id":after_cancel_operation_id},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if type(response) is not dict or set(response)!={"original"}:
+            raise RuntimeError("Goal metadata cursor response fields differ")
+        if response["original"] is None:return None
+        original=owner_goal_cancellation_from_wire_v1(response["original"],OwnerGoalCancellationOriginalV1)
+        if (original.request.namespace!=policy.namespace or original.request.installation_id!=installed.installation_id
+                or original.request.cancel_operation_id<=after_cancel_operation_id):
+            raise RuntimeError("Goal metadata cursor changed its exact original installation/order")
+        return original
+
 
 
 __all__ = ("V2FenceOutcomeUnknown", "V2FencePort", "VerifiedIngressClockV2")

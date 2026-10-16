@@ -17,8 +17,21 @@ from test_d11_installed_life_source_note_v1 import installed_d04_root, run_insta
 
 async def run_installed_life_before_case(tmp_path, installed_d04_root, *,
         natural_workflow_builder=None, after_before_async=None,
-        enable_d04_semantic_drive=False, enable_d04_joint_numeric=False):
-    root_operation_id = str(uuid4())
+        enable_d04_semantic_drive=False, enable_d04_joint_numeric=False,
+        initial_phase_fixture_installation=None,complete_c09_current_v3=False,
+        c09_protected_root=None,c09_phase_setup_file=None):
+    if initial_phase_fixture_installation is None:
+        from beta1_fixture_phase_controller_v1 import current_beta1_fixture_case_v3
+        current=current_beta1_fixture_case_v3(installed_d04_root)
+        if current is not None:
+            if after_before_async is not None:await after_before_async(current)
+            return
+        root_operation_id=str(uuid4())
+    else:
+        selected=initial_phase_fixture_installation.initial_bundle.life_d04_before_capture_policy
+        if selected is None:
+            raise ValueError("Numeric first phase requires its Root-prepared explicit prospective selector")
+        root_operation_id=selected.root_operation_id
 
     async def after_episode(case):
         def inspect():
@@ -69,7 +82,10 @@ async def run_installed_life_before_case(tmp_path, installed_d04_root, *,
             await after_before_async(complete)
 
     await run_installed_owner_life_case(tmp_path, installed_d04_root,
-        natural_workflow_builder=natural_workflow_builder,
+        natural_workflow_builder=natural_workflow_builder if initial_phase_fixture_installation is None else None,
+        initial_phase_fixture_installation=initial_phase_fixture_installation,
+        complete_c09_current_v3=complete_c09_current_v3,c09_protected_root=c09_protected_root,
+        c09_phase_setup_file=c09_phase_setup_file,enable_c09_maintenance=complete_c09_current_v3,
         life_before_root_operation_id=root_operation_id, after_episode_async=after_episode,
         enable_d04_semantic_drive=enable_d04_semantic_drive,
         enable_d04_joint_numeric=enable_d04_joint_numeric)

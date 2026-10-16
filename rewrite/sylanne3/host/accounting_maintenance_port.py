@@ -77,4 +77,39 @@ class InstalledAccountingMaintenancePort:
         return self._call("accounting_recover_finish_v1", request)
 
 
+    def _call_no_dispatch_v1(self, stage, request, grant=None):
+        from ..authority_service.v2_accounting_contract import ModelNoDispatchAccountingRequestV1, ModelNoDispatchAccountingGrantV1
+        if type(request) is not ModelNoDispatchAccountingRequestV1:
+            raise TypeError("exact original no-dispatch accounting request required")
+        if not self._loop.is_running(): raise RuntimeError("installed Authority observer event loop unavailable")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop: raise RuntimeError("no-dispatch accounting belongs on the actual graph worker")
+        methods = {"begin": self._client.model_no_dispatch_accounting_begin_v1,
+            "validate": self._client.model_no_dispatch_accounting_validate_v1,
+            "finish": self._client.model_no_dispatch_accounting_finish_v1,
+            "recover": self._client.model_no_dispatch_accounting_recover_finish_v1}
+        if stage not in methods: raise ValueError("unregistered no-dispatch accounting stage")
+        args = {"accounting_request": request}
+        if stage in {"validate", "finish"}:
+            if type(grant) is not ModelNoDispatchAccountingGrantV1: raise TypeError("actual original no-dispatch grant required")
+            args["accounting_grant"] = grant
+        elif grant is not None:
+            raise ValueError("unexpected no-dispatch accounting grant")
+        future = asyncio.run_coroutine_threadsafe(methods[stage](self._bundle, self._grant, **args), self._loop)
+        try:
+            return future.result(self._timeout)
+        except FutureTimeout as exc:
+            future.cancel()
+            raise RuntimeError("original no-dispatch accounting outcome unresolved") from exc
+
+    def begin_no_dispatch_v1(self, request): return self._call_no_dispatch_v1("begin", request)
+    def validate_no_dispatch_v1(self, request, grant): return self._call_no_dispatch_v1("validate", request, grant)
+    def finish_no_dispatch_v1(self, request, grant): return self._call_no_dispatch_v1("finish", request, grant)
+    def recover_no_dispatch_finish_v1(self, request): return self._call_no_dispatch_v1("recover", request)
+
+
+
 __all__ = ("InstalledAccountingMaintenancePort",)

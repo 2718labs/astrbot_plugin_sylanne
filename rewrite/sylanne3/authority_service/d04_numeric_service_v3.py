@@ -270,63 +270,11 @@ class AuthorityD04NumericServiceV3:
             bridge.core.require_current_content_ready_locked(db,namespace=bridge.namespace)
         return bridge.core._anchor(db,bridge.namespace,row),row[0]
 
-    def _owner_observation(self, permit, binding=None):
-        from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        if self.target_owner_service is None and self.storage_owner_service is not None:
-            return self._storage_owner_observation(permit,binding)
-        if self.target_owner_service is None:
-            selectors=self._read_source_owner_selectors(binding) if binding is not None else ()
-            with self.bridge.core._tx() as db:
-                head=self.owner_tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)
-                if head is None or head.state!="active":
-                    raise AuthorityUnavailable("numeric current Owner head unavailable")
-                if binding is not None:self._require_accepting_owners_locked(db,binding,selectors)
-                return D12CurrentOwnerAuthorityV1(head.guard,None)
-        target=self.target_owner_service
-        if binding is None:
-            return target.get_current_background_owner_authority_for_fence_v1(
-                credential=self.credential,subject=permit.subject,permit=permit)[0]
-        # A target Graph intentionally retains its before-head during its own
-        # numeric claim/terminal appends. Only this actual installed numeric
-        # service may prove that bounded interval; ordinary target reads remain
-        # exact-current and never fall back on a failed authorization.
-        with self._frozen() as (db,deletion,execution):
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
-            _,claim,_,claim_row,terminal_row=read_numeric_rows_locked_v3(self.bridge.journal,binding)
-            head=self.owner_tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)
-            if head is None or head.state!="active" or holder!=target.holder:
-                raise AuthorityUnavailable("numeric target current holder/Owner changed")
-            history=target._current_transfer(db,generation=anchor.activation_generation)
-            if claim is not None:
-                self._verify_claim(binding,claim)
-                original,_=self._gate_locked(db,binding,"claim")
-                before=original.pinned_anchor
-            else:
-                before=anchor
-        metadata,_=self._read_graph_requirements_only()
-        graph_head=(metadata["execution_seq"],metadata["execution_digest"])
-        if graph_head==(anchor.execution_seq,anchor.execution_digest):
-            location_anchor=anchor
-        else:
-            last=terminal_row or claim_row
-            if (claim is None or last is None or not self._same_location_epoch(before,anchor)
-                    or graph_head!=(before.execution_seq,before.execution_digest)
-                    or claim_row[0]!=before.execution_seq+1
-                    or terminal_row is not None and (terminal_row[0]!=claim_row[0]+1 or terminal_row[5]!=claim_row[6])
-                    or (anchor.execution_seq,anchor.execution_digest)!=(last[0],last[6])):
-                raise AuthorityUnavailable("target numeric identity cannot bridge unrelated execution")
-            location_anchor=before
-        location=target._read_graph(history=history,owner_head=head,anchor=location_anchor)
-        graph_metadata,revision,grant_digest,imported,continuation=location
-        with self._frozen() as (db,deletion,execution):
-            current,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-            if current!=anchor or target.tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)!=head:
-                raise AuthorityUnavailable("target numeric identity changed after location read")
-            return target._current_background_identity_for_verified_location_in_tx_v1(db,head=head,history=history,
-                metadata=graph_metadata,revision=revision,grant_digest=grant_digest,imported=imported,
-                continuation=continuation,anchor=current)
+    def _owner_observation(self,permit,binding=None):
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            from .owner_location_read_v3 import prepare_owner_location_for_numeric_v3
+            return prepare_owner_location_for_numeric_v3(self,permit=permit,binding=binding)
 
     def _gate_locked(self, db, binding, phase):
         row=self.bridge.fences._row(db,numeric_gate_operation_id_v3(binding,phase))
@@ -451,36 +399,38 @@ class AuthorityD04NumericServiceV3:
         return row
 
     def claim_d04_numeric_v3(self, binding, executor_incarnation):
-        self._binding(binding)
-        identifier(executor_incarnation,"executor_incarnation")
-        bridge=self.bridge
-        bridge.core._require(self.credential,"execution",bridge.namespace)
-        with self._frozen() as (db,deletion,before):
-            _,old,_,old_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding)
+            identifier(executor_incarnation,"executor_incarnation")
+            bridge=self.bridge
+            bridge.core._require(self.credential,"execution",bridge.namespace)
+            with self._frozen() as (db,deletion,before):
+                _,old,_,old_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
+                if old is not None:
+                    self._reconcile_locked(db,binding,terminal_row or old_row,before)
+                else:
+                    anchor,holder=self._current_anchor_locked(db,deletion,before)
+                    if anchor.activation_generation!=binding.activation_generation:
+                        raise AuthorityUnavailable("numeric source generation changed")
+                    permit=bridge.fences.begin_fence_locked(db,
+                        subject=self._subject+":claim:"+canonical_digest((binding.digest,executor_incarnation)),holder=holder,operation="write",
+                        current_anchor=anchor,operation_id=numeric_gate_operation_id_v3(binding,"claim"))
             if old is not None:
-                self._reconcile_locked(db,binding,terminal_row or old_row,before)
-            else:
-                anchor,holder=self._current_anchor_locked(db,deletion,before)
-                if anchor.activation_generation!=binding.activation_generation:
-                    raise AuthorityUnavailable("numeric source generation changed")
-                permit=bridge.fences.begin_fence_locked(db,
-                    subject=self._subject+":claim:"+canonical_digest((binding.digest,executor_incarnation)),holder=holder,operation="write",
-                    current_anchor=anchor,operation_id=numeric_gate_operation_id_v3(binding,"claim"))
-        if old is not None:
-            raise AuthorityUnavailable("D04 execution claim already consumed; inspect originals")
-        try:
-            # The exclusive durable permit now excludes cancellation/source
-            # writes. Graph reads and any target Owner RPC are outside Core SQL.
-            prepared=self._graph_read(binding)
-            owner=self._owner_observation(permit,binding)
-            claim=D04NumericClaimV3(binding.digest,binding.execution_id,numeric_mutation_id_v3(binding,"claim"),
-                permit.pinned_anchor.execution_seq+1,self.installation_id,executor_incarnation,"pending")
-            claim=replace(claim,signature=self._sign(claim))
-            self._durable_append_v3(binding,permit,claim,None,prepared=prepared,owner=owner)
-            return claim
-        except BaseException:
-            self._abandon_unappended_gate(binding,"claim")
-            raise
+                raise AuthorityUnavailable("D04 execution claim already consumed; inspect originals")
+            try:
+                # The exclusive durable permit now excludes cancellation/source
+                # writes. Graph reads and any target Owner RPC are outside Core SQL.
+                prepared=self._graph_read(binding)
+                owner=self._owner_observation(permit,binding)
+                claim=D04NumericClaimV3(binding.digest,binding.execution_id,numeric_mutation_id_v3(binding,"claim"),
+                    permit.pinned_anchor.execution_seq+1,self.installation_id,executor_incarnation,"pending")
+                claim=replace(claim,signature=self._sign(claim))
+                self._durable_append_v3(binding,permit,claim,None,prepared=prepared,owner=owner)
+                return claim
+            except BaseException:
+                self._abandon_unappended_gate(binding,"claim")
+                raise
 
     def read_d04_numeric_originals_v3(self, binding):
         """Content-free status; a claim-only result is unknown, never zero CPU."""
@@ -596,41 +546,43 @@ class AuthorityD04NumericServiceV3:
         Content-free measurements remain recordable after cancellation; full
         artifact bytes additionally require current source/job/Owner closure.
         """
-        self._binding(binding);self._verify_claim(binding,claim)
-        bridge=self.bridge;bridge.core._require(self.credential,"execution",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,actual,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
-            if actual!=claim:raise AuthorityUnavailable("technical original lacks its real consumed claim")
-            self._reconcile_locked(db,binding,terminal_row or claim_row,execution)
-            if terminal_row is not None:
-                raise AuthorityUnavailable("numeric terminal already durable; inspect this original")
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            source_permit,_=self._gate_locked(db,binding,"claim")
-            if not self._same_location_epoch(source_permit.pinned_anchor,anchor):
-                raise AuthorityUnavailable("numeric technical append cannot restore a retired location/deletion epoch")
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="accounting",
-                current_anchor=anchor,operation_id=numeric_gate_operation_id_v3(binding,"original"),
-                command_digest="sha256:"+canonical_digest((binding.digest,claim.signature,"technical-originals")))
-        prepared,metadata,revision,_,_=self._read_original_payloads(binding)
-        if not self._graph_location_matches(metadata,permit.pinned_anchor):
-            raise AuthorityUnavailable("technical original Graph storage/deletion location differs")
-        content=False;owner=None
-        try:
-            current_digest=self._content_retention_current(binding)
-            owner=self._owner_observation(permit,binding)
-            content=current_digest==prepared.digest
-        except (AuthorityUnavailable,ValueError):
-            # This gate has an explicitly narrower historical measurement lane.
-            # It never permits source-derived artifact bytes on stale rights.
-            content=False
-        with self._frozen() as (db,deletion,execution):
-            anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
-            if content:
-                try:self._require_owner_locked(db,binding,owner)
-                except AuthorityUnavailable:content=False
-        qualification=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,permit,content))
-        return D04NumericOriginalAppendV3(binding,claim,prepared.digest,canonical_serialize(metadata),revision,source_permit.pinned_anchor,permit,content,qualification)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);self._verify_claim(binding,claim)
+            bridge=self.bridge;bridge.core._require(self.credential,"execution",bridge.namespace)
+            with self._frozen() as (db,deletion,execution):
+                _,actual,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
+                if actual!=claim:raise AuthorityUnavailable("technical original lacks its real consumed claim")
+                self._reconcile_locked(db,binding,terminal_row or claim_row,execution)
+                if terminal_row is not None:
+                    raise AuthorityUnavailable("numeric terminal already durable; inspect this original")
+                anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                source_permit,_=self._gate_locked(db,binding,"claim")
+                if not self._same_location_epoch(source_permit.pinned_anchor,anchor):
+                    raise AuthorityUnavailable("numeric technical append cannot restore a retired location/deletion epoch")
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="accounting",
+                    current_anchor=anchor,operation_id=numeric_gate_operation_id_v3(binding,"original"),
+                    command_digest="sha256:"+canonical_digest((binding.digest,claim.signature,"technical-originals")))
+            prepared,metadata,revision,_,_=self._read_original_payloads(binding)
+            if not self._graph_location_matches(metadata,permit.pinned_anchor):
+                raise AuthorityUnavailable("technical original Graph storage/deletion location differs")
+            content=False;owner=None
+            try:
+                current_digest=self._content_retention_current(binding)
+                owner=self._owner_observation(permit,binding)
+                content=current_digest==prepared.digest
+            except (AuthorityUnavailable,ValueError):
+                # This gate has an explicitly narrower historical measurement lane.
+                # It never permits source-derived artifact bytes on stale rights.
+                content=False
+            with self._frozen() as (db,deletion,execution):
+                anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
+                if content:
+                    try:self._require_owner_locked(db,binding,owner)
+                    except AuthorityUnavailable:content=False
+            qualification=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,permit,content))
+            return D04NumericOriginalAppendV3(binding,claim,prepared.digest,canonical_serialize(metadata),revision,source_permit.pinned_anchor,permit,content,qualification)
 
     def record_d04_numeric_terminal_v3(self, binding, claim, measurement):
         self._binding(binding);self._verify_claim(binding,claim)
@@ -724,97 +676,101 @@ class AuthorityD04NumericServiceV3:
 
     def begin_d04_numeric_adoption_bridge_v3(self,binding):
         """Only this binding's consecutive claim+terminal may bridge old Graph."""
-        self._binding(binding);bridge=self.bridge
-        bridge.core._require(self.credential,"execution",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,claim,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
-            if claim is None or terminal_row is None or measurement.status!="completed" or numeric_cost_closure_basis_v3(terminal_row) is not None:
-                raise AuthorityUnavailable("numeric adoption requires actual completed terminal")
-            if measurement.actual_cpu_ms>binding.cpu_ceiling_ms:
-                raise AuthorityUnavailable("numeric CPU overrun permits historical accounting only")
-            self._reconcile_locked(db,binding,terminal_row,execution)
-            source_permit,_=self._gate_locked(db,binding,"claim")
-            before=source_permit.pinned_anchor
-            after,holder=self._current_anchor_locked(db,deletion,execution)
-            if (not self._same_location_epoch(before,after) or source_permit.holder!=holder
-                    or claim.claim_sequence!=before.execution_seq+1 or terminal_row[0]!=claim.claim_sequence+1
-                    or terminal_row[5]!=claim_row[6] or after.execution_seq!=terminal_row[0] or after.execution_digest!=terminal_row[6]):
-                raise AuthorityUnavailable("numeric adoption cannot skip interleaved/later execution or changed storage/deletion")
-            from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
-            require_lifecycle_admission_in_tx_v1(db,bridge.namespace,action="numeric_adoption")
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="write",current_anchor=after,
-                operation_id=numeric_gate_operation_id_v3(binding,"adoption"))
-        try:
-            prepared=self._graph_read(binding)
-            owner=self._owner_observation(permit,binding)
-            old=json.loads(prepared.authority_anchor_json)
-            if (not self._graph_location_matches(old,before)
-                    or (old["execution_seq"],old["execution_digest"])!=(before.execution_seq,before.execution_digest)):
-                raise AuthorityUnavailable("numeric adoption Graph is not its exact prepared execution prefix")
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);bridge=self.bridge
+            bridge.core._require(self.credential,"execution",bridge.namespace)
             with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution)
-                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-                self._require_owner_locked(db,binding,owner)
-                self._require_accepting_owners_locked(db,binding,prepared.owner_selectors,owner)
-            _,metadata,revision,_,_=self._read_original_payloads(binding)
-            terminal=self._terminal(binding,claim,measurement,terminal_row)
-            qualification=canonical_digest((binding.digest,prepared.prepared_digest,metadata,revision,before,after,claim_row[6],terminal_row[6],permit,current_owner_authority_material_v1(owner)))
-            return D04NumericAdoptionBridgeV3(binding,terminal,owner,prepared.prepared_digest,canonical_serialize(metadata),revision,before,after,permit,qualification)
-        except BaseException:
-            # Exact unused adoption fences have no external effect. Release only
-            # if their actual unchanged anchor is still current.
-            with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
-                    request_id=permit.operation_id+":rejected",request_digest="sha256:"+canonical_digest((binding.digest,"adoption-rejected")))
-            raise
+                _,claim,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
+                if claim is None or terminal_row is None or measurement.status!="completed" or numeric_cost_closure_basis_v3(terminal_row) is not None:
+                    raise AuthorityUnavailable("numeric adoption requires actual completed terminal")
+                if measurement.actual_cpu_ms>binding.cpu_ceiling_ms:
+                    raise AuthorityUnavailable("numeric CPU overrun permits historical accounting only")
+                self._reconcile_locked(db,binding,terminal_row,execution)
+                source_permit,_=self._gate_locked(db,binding,"claim")
+                before=source_permit.pinned_anchor
+                after,holder=self._current_anchor_locked(db,deletion,execution)
+                if (not self._same_location_epoch(before,after) or source_permit.holder!=holder
+                        or claim.claim_sequence!=before.execution_seq+1 or terminal_row[0]!=claim.claim_sequence+1
+                        or terminal_row[5]!=claim_row[6] or after.execution_seq!=terminal_row[0] or after.execution_digest!=terminal_row[6]):
+                    raise AuthorityUnavailable("numeric adoption cannot skip interleaved/later execution or changed storage/deletion")
+                from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                require_lifecycle_admission_in_tx_v1(db,bridge.namespace,action="numeric_adoption")
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="write",current_anchor=after,
+                    operation_id=numeric_gate_operation_id_v3(binding,"adoption"))
+            try:
+                prepared=self._graph_read(binding)
+                owner=self._owner_observation(permit,binding)
+                old=json.loads(prepared.authority_anchor_json)
+                if (not self._graph_location_matches(old,before)
+                        or (old["execution_seq"],old["execution_digest"])!=(before.execution_seq,before.execution_digest)):
+                    raise AuthorityUnavailable("numeric adoption Graph is not its exact prepared execution prefix")
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution)
+                    bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
+                    self._require_owner_locked(db,binding,owner)
+                    self._require_accepting_owners_locked(db,binding,prepared.owner_selectors,owner)
+                _,metadata,revision,_,_=self._read_original_payloads(binding)
+                terminal=self._terminal(binding,claim,measurement,terminal_row)
+                qualification=canonical_digest((binding.digest,prepared.prepared_digest,metadata,revision,before,after,claim_row[6],terminal_row[6],permit,current_owner_authority_material_v1(owner)))
+                return D04NumericAdoptionBridgeV3(binding,terminal,owner,prepared.prepared_digest,canonical_serialize(metadata),revision,before,after,permit,qualification)
+            except BaseException:
+                # Exact unused adoption fences have no external effect. Release only
+                # if their actual unchanged anchor is still current.
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
+                        request_id=permit.operation_id+":rejected",request_digest="sha256:"+canonical_digest((binding.digest,"adoption-rejected")))
+                raise
 
     def validate_d04_numeric_gate_v3(self,binding,gate):
         """Authenticate an exact issued bridge before the Host Graph SQL opens."""
-        if type(gate) not in {D04NumericOriginalAppendV3,D04NumericAdoptionBridgeV3} or gate.binding!=binding:
-            raise AuthorityUnavailable("typed exact numeric gate required")
-        self._binding(binding);bridge=self.bridge
-        bridge.core._require(self.credential,"current",bridge.namespace)
-        prepared,metadata,revision,_,_=self._read_original_payloads(binding)
-        if (prepared.digest!=gate.prepared_digest or canonical_serialize(metadata)!=gate.before_requirements_json
-                or revision!=gate.before_graph_revision):
-            raise AuthorityUnavailable("numeric gate old Graph requirements/revision changed")
-        owner=(self._owner_observation(gate.permit,binding) if type(gate) is D04NumericAdoptionBridgeV3 or gate.content_artifact_permitted else None)
-        selectors=self._read_source_owner_selectors(binding) if owner is not None else ()
-        with self._frozen() as (db,deletion,execution):
-            anchor,_=self._current_anchor_locked(db,deletion,execution,
-                action="accounting" if type(gate) is D04NumericOriginalAppendV3 else "business")
-            bridge.fences.validate_fence_locked(db,gate.permit,subject=gate.permit.subject,current_anchor=anchor)
-            _,claim,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
-            if claim is None:raise AuthorityUnavailable("numeric gate has no actual claim")
-            self._verify_claim(binding,claim)
-            source,_=self._gate_locked(db,binding,"claim")
-            if type(gate) is D04NumericOriginalAppendV3:
-                if gate.claim!=claim or gate.source_anchor!=source.pinned_anchor or terminal_row is not None:
-                    raise AuthorityUnavailable("numeric technical gate original changed")
-                expected=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,gate.permit,gate.content_artifact_permitted))
-            else:
-                if (terminal_row is None or gate.terminal!=self._terminal(binding,claim,measurement,terminal_row)
-                        or gate.before_anchor!=source.pinned_anchor or gate.after_anchor!=anchor
-                        or not self._same_location_epoch(gate.before_anchor,anchor)
-                        or claim_row[0]!=gate.before_anchor.execution_seq+1 or terminal_row[0]!=claim_row[0]+1
-                        or execution.seq!=terminal_row[0] or terminal_row[5]!=claim_row[6]):
-                    raise AuthorityUnavailable("numeric adoption exact consecutive transition changed")
-                self._require_owner_locked(db,binding,owner)
-                self._require_accepting_owners_locked(db,binding,selectors,owner)
-                expected=canonical_digest((binding.digest,prepared.digest,metadata,revision,gate.before_anchor,anchor,claim_row[6],terminal_row[6],gate.permit,current_owner_authority_material_v1(owner)))
-            if type(gate) is D04NumericAdoptionBridgeV3 and gate.owner_authority!=owner:
-                raise AuthorityUnavailable("numeric bridge current Owner identity changed")
-            if gate.qualification_digest!=expected:
-                raise AuthorityUnavailable("numeric gate observation commitment changed")
-        if type(gate) is D04NumericOriginalAppendV3 and gate.content_artifact_permitted:
-            if self._content_retention_current(binding)!=prepared.digest:
-                raise AuthorityUnavailable("numeric content artifact no longer has exact source closure")
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            if type(gate) not in {D04NumericOriginalAppendV3,D04NumericAdoptionBridgeV3} or gate.binding!=binding:
+                raise AuthorityUnavailable("typed exact numeric gate required")
+            self._binding(binding);bridge=self.bridge
+            bridge.core._require(self.credential,"current",bridge.namespace)
+            prepared,metadata,revision,_,_=self._read_original_payloads(binding)
+            if (prepared.digest!=gate.prepared_digest or canonical_serialize(metadata)!=gate.before_requirements_json
+                    or revision!=gate.before_graph_revision):
+                raise AuthorityUnavailable("numeric gate old Graph requirements/revision changed")
+            owner=(self._owner_observation(gate.permit,binding) if type(gate) is D04NumericAdoptionBridgeV3 or gate.content_artifact_permitted else None)
+            selectors=self._read_source_owner_selectors(binding) if owner is not None else ()
             with self._frozen() as (db,deletion,execution):
-                anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                anchor,_=self._current_anchor_locked(db,deletion,execution,
+                    action="accounting" if type(gate) is D04NumericOriginalAppendV3 else "business")
                 bridge.fences.validate_fence_locked(db,gate.permit,subject=gate.permit.subject,current_anchor=anchor)
-                self._require_owner_locked(db,binding,owner)
-        return gate
+                _,claim,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
+                if claim is None:raise AuthorityUnavailable("numeric gate has no actual claim")
+                self._verify_claim(binding,claim)
+                source,_=self._gate_locked(db,binding,"claim")
+                if type(gate) is D04NumericOriginalAppendV3:
+                    if gate.claim!=claim or gate.source_anchor!=source.pinned_anchor or terminal_row is not None:
+                        raise AuthorityUnavailable("numeric technical gate original changed")
+                    expected=canonical_digest((binding.digest,claim.signature,prepared.digest,metadata,revision,gate.permit,gate.content_artifact_permitted))
+                else:
+                    if (terminal_row is None or gate.terminal!=self._terminal(binding,claim,measurement,terminal_row)
+                            or gate.before_anchor!=source.pinned_anchor or gate.after_anchor!=anchor
+                            or not self._same_location_epoch(gate.before_anchor,anchor)
+                            or claim_row[0]!=gate.before_anchor.execution_seq+1 or terminal_row[0]!=claim_row[0]+1
+                            or execution.seq!=terminal_row[0] or terminal_row[5]!=claim_row[6]):
+                        raise AuthorityUnavailable("numeric adoption exact consecutive transition changed")
+                    self._require_owner_locked(db,binding,owner)
+                    self._require_accepting_owners_locked(db,binding,selectors,owner)
+                    expected=canonical_digest((binding.digest,prepared.digest,metadata,revision,gate.before_anchor,anchor,claim_row[6],terminal_row[6],gate.permit,current_owner_authority_material_v1(owner)))
+                if type(gate) is D04NumericAdoptionBridgeV3 and gate.owner_authority!=owner:
+                    raise AuthorityUnavailable("numeric bridge current Owner identity changed")
+                if gate.qualification_digest!=expected:
+                    raise AuthorityUnavailable("numeric gate observation commitment changed")
+            if type(gate) is D04NumericOriginalAppendV3 and gate.content_artifact_permitted:
+                if self._content_retention_current(binding)!=prepared.digest:
+                    raise AuthorityUnavailable("numeric content artifact no longer has exact source closure")
+                with self._frozen() as (db,deletion,execution):
+                    anchor,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
+                    bridge.fences.validate_fence_locked(db,gate.permit,subject=gate.permit.subject,current_anchor=anchor)
+                    self._require_owner_locked(db,binding,owner)
+            return gate
 
     def read_d04_numeric_gate_state_v3(self,binding,gate):
         if type(gate) not in {D04NumericOriginalAppendV3,D04NumericAdoptionBridgeV3} or gate.binding!=binding:
@@ -937,44 +893,46 @@ class AuthorityD04NumericServiceV3:
 
     def read_d04_numeric_restore_original_v3(self,binding):
         """Concrete installed content recovery; caller DTOs never attest terminal."""
-        self._binding(binding);bridge=self.bridge
-        bridge.core._require(self.credential,"current",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,claim,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
-            if claim is None or terminal_row is None or measurement.status!="completed" or numeric_cost_closure_basis_v3(terminal_row) is not None:
-                raise AuthorityUnavailable("numeric restoration requires original completed terminal")
-            self._reconcile_locked(db,binding,terminal_row,execution)
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="recovery")
-            source,_=self._gate_locked(db,binding,"claim")
-            if not self._same_location_epoch(source.pinned_anchor,anchor):
-                raise AuthorityUnavailable("numeric restore requires explicit current deletion/location lineage")
-            # Reads may repeat after a finished original gate; use a fresh read
-            # identity, never a new execution/adoption identity.
-            import secrets
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="read",current_anchor=anchor,
-                operation_id=numeric_gate_operation_id_v3(binding,"restore")+":"+secrets.token_hex(8))
-        try:
-            prepared,metadata,revision,artifact,measured=self._read_original_payloads(binding)
-            if not self._graph_location_matches(metadata,anchor):
-                raise AuthorityUnavailable("numeric restored content belongs to retired Graph storage")
-            if measured!={"binding":to_wire(binding),"claim":to_wire(claim),"measurement":to_wire(measurement)}:
-                raise AuthorityUnavailable("numeric restored measurement original differs")
-            from ..runtime.d04_numeric_artifact_v3 import verify_d04_numeric_artifact_commitments_v3
-            verify_d04_numeric_artifact_commitments_v3(prepared,claim,measurement,artifact)
-            self._require_current_artifact_source_rights(prepared)
-            owner=self._owner_observation(permit,binding)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);bridge=self.bridge
+            bridge.core._require(self.credential,"current",bridge.namespace)
             with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-                self._require_owner_locked(db,binding,owner)
-            terminal=self._terminal(binding,claim,measurement,terminal_row)
-            return D04NumericRestoreOriginalV3(terminal,prepared,artifact,canonical_serialize(artifact),
-                canonical_digest((binding.digest,terminal.digest,prepared.digest,artifact,metadata,revision,permit)))
-        finally:
-            with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
-                    request_id=permit.operation_id+":closed",request_digest="sha256:"+canonical_digest((binding.digest,"restore-read",permit.operation_id)))
+                _,claim,measurement,claim_row,terminal_row=read_numeric_rows_locked_v3(bridge.journal,binding)
+                if claim is None or terminal_row is None or measurement.status!="completed" or numeric_cost_closure_basis_v3(terminal_row) is not None:
+                    raise AuthorityUnavailable("numeric restoration requires original completed terminal")
+                self._reconcile_locked(db,binding,terminal_row,execution)
+                anchor,holder=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                source,_=self._gate_locked(db,binding,"claim")
+                if not self._same_location_epoch(source.pinned_anchor,anchor):
+                    raise AuthorityUnavailable("numeric restore requires explicit current deletion/location lineage")
+                # Reads may repeat after a finished original gate; use a fresh read
+                # identity, never a new execution/adoption identity.
+                import secrets
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="read",current_anchor=anchor,
+                    operation_id=numeric_gate_operation_id_v3(binding,"restore")+":"+secrets.token_hex(8))
+            try:
+                prepared,metadata,revision,artifact,measured=self._read_original_payloads(binding)
+                if not self._graph_location_matches(metadata,anchor):
+                    raise AuthorityUnavailable("numeric restored content belongs to retired Graph storage")
+                if measured!={"binding":to_wire(binding),"claim":to_wire(claim),"measurement":to_wire(measurement)}:
+                    raise AuthorityUnavailable("numeric restored measurement original differs")
+                from ..runtime.d04_numeric_artifact_v3 import verify_d04_numeric_artifact_commitments_v3
+                verify_d04_numeric_artifact_commitments_v3(prepared,claim,measurement,artifact)
+                self._require_current_artifact_source_rights(prepared)
+                owner=self._owner_observation(permit,binding)
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
+                    self._require_owner_locked(db,binding,owner)
+                terminal=self._terminal(binding,claim,measurement,terminal_row)
+                return D04NumericRestoreOriginalV3(terminal,prepared,artifact,canonical_serialize(artifact),
+                    canonical_digest((binding.digest,terminal.digest,prepared.digest,artifact,metadata,revision,permit)))
+            finally:
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
+                        request_id=permit.operation_id+":closed",request_digest="sha256:"+canonical_digest((binding.digest,"restore-read",permit.operation_id)))
 
     def read_d04_numeric_restore_packet_bytes_v3(self,binding):
         """Qualified raw continuation frames; the manifest verifies full codec.
@@ -983,56 +941,58 @@ class AuthorityD04NumericServiceV3:
         original hashes, without rebuilding every trajectory DTO for each slice.
         The concrete receiver checks the entire manifest hash and full codec.
         """
-        self._binding(binding);bridge=self.bridge
-        bridge.core._require(self.credential,"current",bridge.namespace)
-        with self._frozen() as (db,deletion,execution):
-            _,claim,measurement,claim_row,row=read_numeric_rows_locked_v3(bridge.journal,binding)
-            if claim is None or row is None or measurement.status!="completed" or numeric_cost_closure_basis_v3(row) is not None:
-                raise AuthorityUnavailable("numeric restore frame has no full original terminal")
-            self._reconcile_locked(db,binding,row,execution)
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="recovery")
-            source,_=self._gate_locked(db,binding,"claim")
-            if not self._same_location_epoch(source.pinned_anchor,anchor):
-                raise AuthorityUnavailable("numeric restore frame crossed deletion/storage lineage")
-            import secrets
-            permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="read",current_anchor=anchor,
-                operation_id=numeric_gate_operation_id_v3(binding,"restore")+":"+secrets.token_hex(8))
-        try:
-            from ..runtime.d04_numeric_cost_v3 import read_d04_numeric_prepared_v3
-            db=sqlite3.connect(self.graph_path.as_uri()+"?mode=ro",uri=True,isolation_level=None)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding);bridge=self.bridge
+            bridge.core._require(self.credential,"current",bridge.namespace)
+            with self._frozen() as (db,deletion,execution):
+                _,claim,measurement,claim_row,row=read_numeric_rows_locked_v3(bridge.journal,binding)
+                if claim is None or row is None or measurement.status!="completed" or numeric_cost_closure_basis_v3(row) is not None:
+                    raise AuthorityUnavailable("numeric restore frame has no full original terminal")
+                self._reconcile_locked(db,binding,row,execution)
+                anchor,holder=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                source,_=self._gate_locked(db,binding,"claim")
+                if not self._same_location_epoch(source.pinned_anchor,anchor):
+                    raise AuthorityUnavailable("numeric restore frame crossed deletion/storage lineage")
+                import secrets
+                permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="read",current_anchor=anchor,
+                    operation_id=numeric_gate_operation_id_v3(binding,"restore")+":"+secrets.token_hex(8))
             try:
-                db.execute("BEGIN")
-                prepared=read_d04_numeric_prepared_v3(db,binding.namespace,binding.operation_id)
-                if prepared is None or prepared.binding!=binding:raise AuthorityUnavailable("restore frame actual preparation differs")
-                originals={}
-                for kind in ("numeric_prepared","numeric_artifact","numeric_measurement"):
-                    current=db.execute("SELECT payload_json,payload_digest FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
-                        (*binding.namespace.as_tuple,kind,binding.operation_id)).fetchone()
-                    if current is None or hashlib.sha256(current[0].encode()).hexdigest()!=current[1]:
-                        raise AuthorityUnavailable("restore frame immutable original is absent/changed")
-                    originals[kind]=current[0]
-                if json.loads(originals["numeric_measurement"])!={"binding":to_wire(binding),"claim":to_wire(claim),"measurement":to_wire(measurement)}:
-                    raise AuthorityUnavailable("restore frame measured terminal binding differs")
-                metadata=db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",binding.namespace.as_tuple).fetchone()
-                if metadata is None or not self._graph_location_matches(json.loads(metadata[0]),anchor):
-                    raise AuthorityUnavailable("restore frame current Graph location differs")
+                from ..runtime.d04_numeric_cost_v3 import read_d04_numeric_prepared_v3
+                db=sqlite3.connect(self.graph_path.as_uri()+"?mode=ro",uri=True,isolation_level=None)
+                try:
+                    db.execute("BEGIN")
+                    prepared=read_d04_numeric_prepared_v3(db,binding.namespace,binding.operation_id)
+                    if prepared is None or prepared.binding!=binding:raise AuthorityUnavailable("restore frame actual preparation differs")
+                    originals={}
+                    for kind in ("numeric_prepared","numeric_artifact","numeric_measurement"):
+                        current=db.execute("SELECT payload_json,payload_digest FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
+                            (*binding.namespace.as_tuple,kind,binding.operation_id)).fetchone()
+                        if current is None or hashlib.sha256(current[0].encode()).hexdigest()!=current[1]:
+                            raise AuthorityUnavailable("restore frame immutable original is absent/changed")
+                        originals[kind]=current[0]
+                    if json.loads(originals["numeric_measurement"])!={"binding":to_wire(binding),"claim":to_wire(claim),"measurement":to_wire(measurement)}:
+                        raise AuthorityUnavailable("restore frame measured terminal binding differs")
+                    metadata=db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",binding.namespace.as_tuple).fetchone()
+                    if metadata is None or not self._graph_location_matches(json.loads(metadata[0]),anchor):
+                        raise AuthorityUnavailable("restore frame current Graph location differs")
+                finally:
+                    db.close()
+                self._require_current_artifact_source_rights(prepared)
+                owner=self._owner_observation(permit,binding)
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
+                    self._require_owner_locked(db,binding,owner)
+                terminal=self._terminal(binding,claim,measurement,row)
+                packet=(b'{"artifact_payload":'+originals["numeric_artifact"].encode()+b',"prepared":'+originals["numeric_prepared"].encode()
+                    +b',"terminal":'+canonical_serialize(to_wire(terminal)).encode()+b'}')
+                return packet,canonical_digest((binding.digest,terminal.digest,prepared.digest,hashlib.sha256(packet).hexdigest(),metadata,permit))
             finally:
-                db.close()
-            self._require_current_artifact_source_rights(prepared)
-            owner=self._owner_observation(permit,binding)
-            with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-                self._require_owner_locked(db,binding,owner)
-            terminal=self._terminal(binding,claim,measurement,row)
-            packet=(b'{"artifact_payload":'+originals["numeric_artifact"].encode()+b',"prepared":'+originals["numeric_prepared"].encode()
-                +b',"terminal":'+canonical_serialize(to_wire(terminal)).encode()+b'}')
-            return packet,canonical_digest((binding.digest,terminal.digest,prepared.digest,hashlib.sha256(packet).hexdigest(),metadata,permit))
-        finally:
-            with self._frozen() as (db,deletion,execution):
-                current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
-                bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
-                    request_id=permit.operation_id+":closed",request_digest="sha256:"+canonical_digest((binding.digest,"restore-frame",permit.operation_id)))
+                with self._frozen() as (db,deletion,execution):
+                    current,_=self._current_anchor_locked(db,deletion,execution,action="recovery")
+                    bridge.fences.finish_fence_locked(db,permit,subject=permit.subject,current_anchor=current,
+                        request_id=permit.operation_id+":closed",request_digest="sha256:"+canonical_digest((binding.digest,"restore-frame",permit.operation_id)))
 
     def read_d04_numeric_terminal_v3(self, binding):
         return self.read_d04_numeric_originals_v3(binding)[1]
@@ -1053,38 +1013,4 @@ class AuthorityD04NumericServiceV3:
         return binding, claim, (self._cost_closure(binding,claim,measurement,row) if numeric_cost_closure_basis_v3(row) is not None
                                 else self._terminal(binding, claim, measurement, row))
 
-    def _storage_owner_observation(self,permit,binding):
-        """Actual source C09 identity over only this consumed execution prefix."""
-        from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        service=self.storage_owner_service
-        if binding is None:return service.get_current_background_owner_authority_for_fence_v1(credential=self.credential,subject=permit.subject,permit=permit)[0]
-        with self._frozen() as (db,deletion,execution):
-            anchor,holder=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=anchor)
-            _,claim,_,claim_row,terminal_row=read_numeric_rows_locked_v3(self.bridge.journal,binding)
-            head=service._head_in_tx(db)
-            if holder!=service.holder:raise AuthorityUnavailable("source storage Owner holder changed")
-            service._background_identity_in_tx(db,head)
-            if claim is not None:
-                self._verify_claim(binding,claim);source,_=self._gate_locked(db,binding,"claim");before=source.pinned_anchor
-            else:before=anchor
-        metadata,_=self._read_graph_requirements_only()
-        if (metadata["execution_seq"],metadata["execution_digest"])==(anchor.execution_seq,anchor.execution_digest):location_anchor=anchor
-        else:
-            last=terminal_row or claim_row
-            if (claim is None or last is None or not self._same_location_epoch(before,anchor)
-                    or (metadata["execution_seq"],metadata["execution_digest"])!=(before.execution_seq,before.execution_digest)
-                    or claim_row[0]!=before.execution_seq+1
-                    or terminal_row is not None and (terminal_row[0]!=claim_row[0]+1 or terminal_row[5]!=claim_row[6])
-                    or (anchor.execution_seq,anchor.execution_digest)!=(last[0],last[6])):
-                raise AuthorityUnavailable("source storage Owner cannot skip unrelated execution")
-            location_anchor=before
-        _,grant,admission=service._read_graph(owner_head=head,anchor=location_anchor)
-        if head.grant_digest.removeprefix("sha256:")!=binding.owner_grant_digest:
-            raise AuthorityUnavailable("source storage original Owner grant changed")
-        with self._frozen() as (db,deletion,execution):
-            current,_=self._current_anchor_locked(db,deletion,execution,action="accounting")
-            self.bridge.fences.validate_fence_locked(db,permit,subject=permit.subject,current_anchor=current)
-            if current!=anchor or service._head_in_tx(db)!=head:raise AuthorityUnavailable("source storage Owner changed after independent graph read")
-            service._background_identity_in_tx(db,head)
-        return D12CurrentOwnerAuthorityV1(head.guard,None,admission)
+

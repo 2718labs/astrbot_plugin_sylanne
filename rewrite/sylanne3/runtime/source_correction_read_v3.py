@@ -379,3 +379,20 @@ class SourceCorrectionContextReadV3:
             with runtime_storage_quantum_v3(self.db) as meter:
                 self._step(meter)
         return self
+
+
+class PersonalEligibilityRecoverySourcesV1(SourceCorrectionContextReadV3):
+    """Exact family-only front door; it never scans Interpretation claim bodies."""
+    def __init__(self,db,*,roots,namespace,storage_lease,read_scope,graph_stamp,purpose,audiences):
+        roots=tuple(roots)
+        if not roots or len(roots)>32:raise AuthorityUnavailable("finite saved eligibility Source roots required")
+        super().__init__(db,namespace=namespace,source_id=AtomKey.from_token(roots[0]).owner.subject,
+            storage_lease=storage_lease,read_scope=read_scope,graph_stamp=graph_stamp,
+            purpose=purpose,audiences=audiences)
+        self.saved_roots=roots
+    def _step(self,meter):
+        if self.cell is None and self.phase=="epochs":
+            self.epochs=self._epochs(meter);self._family(self.saved_roots,"eligibility");return
+        if self.cell is None and self.phase=="scan":
+            self.scan_complete=True;self.final_tokens=tuple(sorted(self.heads));self.phase="recheck";return
+        super()._step(meter)

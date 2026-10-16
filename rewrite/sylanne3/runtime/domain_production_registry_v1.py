@@ -68,6 +68,13 @@ _OPERATIONS = {
 
 
 _PERSONAL_OPERATIONS = {
+    "freeze_general_growth_intent_v1": ("d01", ".d01_general_growth_v1", "FreezeCurrentGeneralGrowthRequestV1", "stage_freeze_current_general_growth_in_transaction_v1", "", "workbench.activate"),
+    "register_general_growth_trial_start_v1": ("d01", ".d01_general_growth_v1", "RegisterCurrentGeneralGrowthTrialStartRequestV1", "stage_register_current_general_growth_trial_start_in_transaction_v1", "", "workbench.activate"),
+    "derive_general_growth_trial_v1": ("d01", ".d01_general_growth_v1", "DeriveCurrentGeneralGrowthTrialRequestV1", "stage_derive_current_general_growth_trial_in_transaction_v1", "", "workbench.activate"),
+    "adopt_general_growth_v1": ("d01", ".d01_general_growth_v1", "AdoptCurrentGeneralGrowthRequestV1", "stage_adopt_current_general_growth_in_transaction_v1", "", "workbench.activate"),
+    "focus_owner_source_note_task_v1": ("d07", ".d07_life_project_focus_v1", "FocusOwnerSourceNoteTaskRequestV1", "stage_focus_owner_source_note_task_v1", "", "workbench.create"),
+    'prepare_personal_candidate_eligibility_v1': ('d08', '.personal_candidate_eligibility_v1', 'PersonalEligibilityRequestV1', 'stage_prepare_personal_candidate_eligibility_v1', '', 'workbench.create'),
+    'adopt_personal_candidate_eligibility_v1': ('d08', '.personal_candidate_eligibility_v1', 'PersonalEligibilityRequestV1', 'stage_adopt_personal_candidate_eligibility_v1', '', 'workbench.create'),
     "cancel_owner_source_note_task_v1": ("d11", ".cancel_owner_source_note_task_v1", "CancelOwnerSourceNoteTaskRequestV1", "stage_cancel_owner_source_note_task_v1", "verify_cancel_owner_source_note_task_stage_v1", "workbench.control"),
     "register_owner_source_note_life_plan_v1": ("d10", ".owner_source_note_life_v1", "RegisterOwnerSourceNoteLifePlanRequestV1", "stage_register_owner_source_note_life_plan_v1", "", "workbench.create"),
     "register_owner_source_note_life_outcome_v1": ("d10", ".owner_source_note_life_v1", "RegisterOwnerSourceNoteLifeOutcomeRequestV1", "stage_register_owner_source_note_life_outcome_v1", "", "workbench.create"),
@@ -159,6 +166,39 @@ _POSTCONDITION_OPERATIONS = {
 
 
 def installed_operation_v1(operation_kind):
+    from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS,_REQUESTS as LONG_TERM_REQUESTS
+    from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,_REQUESTS as HABIT_REQUESTS
+    if operation_kind in LONG_TERM_OPERATIONS:
+        return InstalledDomainOperationV1('d08',operation_kind,LONG_TERM_REQUESTS[operation_kind],
+            'stage_current_long_term_operation_v1','','workbench.create')
+    if operation_kind in HABIT_OPERATIONS:
+        domain='d08'if operation_kind in {'instantiate_current_habit_source_note_context_v1',
+            'prepare_current_habit_source_note_action_v1'}else'd10'
+        return InstalledDomainOperationV1(domain,operation_kind,HABIT_REQUESTS[operation_kind],
+            'stage_current_habit_operation_v1','','workbench.create')
+    if operation_kind=='record_habit_window_cue_v1':
+        from .habit_schedule_driver_v1 import RecordHabitWindowCueRequestV1
+        return InstalledDomainOperationV1('d11',operation_kind,RecordHabitWindowCueRequestV1,
+            'stage_record_habit_window_cue_v1','','workbench.create')
+    from .conditioned_self_operations_v1 import OPERATIONS as CONDITIONED_OPERATIONS
+    if operation_kind in CONDITIONED_OPERATIONS:
+        domain,request_type,capability=CONDITIONED_OPERATIONS[operation_kind]
+        return InstalledDomainOperationV1(domain,operation_kind,request_type,'stage_current_conditioned_self_v1',
+            'verify_conditioned_self_stage_v1',capability)
+    from ..domains.d03.world_history_v1 import WORLD_OPERATIONS,AdoptWorldAssertionRequestV1,WorldViewRequestV1,ProjectWorldPerspectiveRequestV1,RelearnWorldAssertionRequestV1
+    if operation_kind in WORLD_OPERATIONS:
+        request_type={"adopt_world_assertion_v1":AdoptWorldAssertionRequestV1,"relearn_world_assertion_v1":RelearnWorldAssertionRequestV1,"query_world_view_v1":WorldViewRequestV1,
+            "project_world_perspective_v1":ProjectWorldPerspectiveRequestV1}[operation_kind]
+        return InstalledDomainOperationV1("d09" if operation_kind=="project_world_perspective_v1" else "d03",
+            operation_kind,request_type,"stage_world_operation_v1","","workbench.create")
+    if operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import PrepareCurrentContactProspectiveRequestV1
+        return InstalledDomainOperationV1('d08',operation_kind,PrepareCurrentContactProspectiveRequestV1,
+            'stage_prepare_contact_prospective_in_transaction_v1','verify_contact_prospective_stage_v1','workbench.create')
+    if operation_kind == "register_general_growth_attention_v1":
+        from .d07_general_growth_attention_v1 import RegisterGeneralGrowthAttentionRequestV1
+        return InstalledDomainOperationV1("d07", operation_kind, RegisterGeneralGrowthAttentionRequestV1,
+            "stage_register_general_growth_attention_v1", "", "workbench.create")
     if operation_kind == "input:freeze_owner_source_note_values_parent_v1":
         from .owner_source_note_values_v1 import FreezeOwnerSourceNoteValuesParentRequestV1
         return InstalledDomainOperationV1("d08", operation_kind, FreezeOwnerSourceNoteValuesParentRequestV1,
@@ -268,9 +308,25 @@ def installed_operation_v1(operation_kind):
 
 
 def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, execution_reader=None, foreground_issuance=None, owner_binding=None, owner_task_issuance=None):
+    from ..domains.d03.world_history_v1 import WORLD_OPERATIONS
+    if operation.operation_kind in WORLD_OPERATIONS:
+        from .d03_world_history_v1 import InstalledWorldHistoryReadersV1
+        if owner_binding is None:
+            from .current_method_learning_read_v3 import _method_active
+            from .world_owner_read_v3 import require_world_owner_work_v3
+            actual=_method_active(graph._GraphCoordinator__store._db)
+            require_world_owner_work_v3(actual)
+            owner_binding=actual.owner_binding
+        return InstalledWorldHistoryReadersV1(issuer=graph._GraphCoordinator__d11_issuer,owner_binding=owner_binding)
     from ..graph_coordinator import GraphCoordinator
     from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
     from ..runtime_contracts import FenceScope
+    from .domain_production_contracts_v1 import ProductionOwnerGuardV1
+    if type(owner_guard)is ProductionOwnerGuardV1 and foreground_issuance is None and owner_task_issuance is None:
+        from .current_habit_source_read_v3 import current_habit_installed_owner_guard_v3
+        actual_guard=current_habit_installed_owner_guard_v3(graph,scope=scope,operation=operation,
+            owner_guard=owner_guard,owner_binding=owner_binding)
+        if actual_guard is not None:owner_guard=actual_guard
     if (type(graph) is not GraphCoordinator or type(operation) is not InstalledDomainOperationV1
             or type(scope) is not FenceScope
             or installed_operation_v1(operation.operation_kind) != operation
@@ -294,6 +350,39 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
                 or task_evidence.request.operation_kind != operation.operation_kind):
             raise ValueError("Owner task readers changed their actual paired current Core issuance")
     issuer = graph._GraphCoordinator__d11_issuer
+    from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS
+    from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,SOURCE_NOTE_OPERATIONS,InstalledHabitSourceNoteReadersV1
+    if operation.operation_kind in LONG_TERM_OPERATIONS:
+        from .d08_production_operations_v1 import InstalledD08ProductionReadersV1
+        return InstalledD08ProductionReadersV1(issuer=issuer)
+    if operation.operation_kind in HABIT_OPERATIONS or operation.operation_kind=='record_habit_window_cue_v1':
+        from .d10_production_operations_v1 import InstalledD10ProductionReadersV1
+        from .d02_production_operations_v1 import InstalledD02ProductionReadersV1
+        from .d08_production_operations_v1 import InstalledD08ProductionReadersV1
+        clock=graph._GraphCoordinator__d04_semantic_mapping_reader
+        body=InstalledD02ProductionReadersV1(issuer=issuer,body_quote_authority=graph._GraphCoordinator__body_quote_authority,
+            role_clock_reader=clock)
+        life=InstalledD10ProductionReadersV1(issuer=issuer,role_clock_reader=clock,
+            current_restore_anchor=scope.pinned_anchor,body_readers=body)
+        life.life_scope=scope
+        life.life_execution_inventory=graph._GraphCoordinator__domain_production_runtime_v1._active_life_execution_inventory_v1
+        if operation.operation_kind not in SOURCE_NOTE_OPERATIONS:return life
+        assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+        if assembly is None:raise ValueError('Habit SourceNote requires its actual installed package assembly')
+        legacy=InstalledD08ProductionReadersV1(issuer=issuer)
+        legacy.body_readers=body;legacy.package_root=assembly.package_root
+        legacy.manifest_digest=assembly.installation_policy.manifest_digest
+        return InstalledHabitSourceNoteReadersV1(legacy,life)
+    from .conditioned_self_operations_v1 import OPERATIONS as CONDITIONED_OPERATIONS
+    if operation.operation_kind in CONDITIONED_OPERATIONS:
+        from .current_conditioned_self_read_v3 import install_conditioned_self_readers_v1
+        return install_conditioned_self_readers_v1(graph,scope=scope,owner_guard=owner_guard,
+            operation_kind=operation.operation_kind,owner_binding=owner_binding,
+            foreground_issuance=foreground_issuance,owner_task_issuance=owner_task_issuance)
+    if operation.operation_kind == "register_general_growth_attention_v1":
+        from .d07_general_growth_attention_v1 import InstalledD07GeneralGrowthAttentionReadersV1
+        assembly = graph._GraphCoordinator__d04_installed_joint_assembly
+        return InstalledD07GeneralGrowthAttentionReadersV1(graph=graph, issuer=issuer, bundle=assembly.admin_bundle)
     if operation.operation_kind == "input:approve_artifact_standing_predecision_v2":
         if foreground_issuance is not None or type(owner_guard) is not OwnerAuthorizationGuardV1 or owner_guard.namespace != scope.namespace:
             raise ValueError("standing approval is exclusive to the actual Owner fence, never Self issuance")
@@ -379,7 +468,7 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
         from .owner_source_note_task_execution_v1 import install_owner_source_note_task_execution_readers_v1
         return install_owner_source_note_task_execution_readers_v1(graph, scope=scope, owner_guard=owner_guard,
             owner_binding=owner_binding, owner_task_issuance=owner_task_issuance)
-    if operation.operation_kind == "prepare_owner_source_note_need_v1":
+    if operation.operation_kind in {"prepare_owner_source_note_need_v1","focus_owner_source_note_task_v1"}:
         if owner_task_issuance is None:
             raise ValueError("Owner fixed-recipe Need requires its actual independent Core issued handle")
         from .owner_source_note_need_v1 import install_owner_source_note_need_readers_v1
@@ -482,7 +571,7 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
         assembly = graph._GraphCoordinator__d04_installed_joint_assembly
         return InstalledForegroundCycleReadersV1(issuer,
             None if assembly is None else assembly.admin_bundle)
-    if operation.operation_kind in {"quote_current_method_choices_v1", "prepare_personal_candidates_v1", "select_personal_step_v2",
+    if operation.operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "quote_current_method_choices_v1", "prepare_personal_candidates_v1", "select_personal_step_v2",
             "input:register_artifact_task_text_extent"}:
         from .d08_personal_candidate_v1 import (InstalledPersonalCandidateReadersV1,
             install_personal_candidate_readers_v1)
@@ -568,7 +657,7 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
         return InstalledD06StructuredExperienceReadersV1(issuer=issuer,
             resource_issuer=graph._GraphCoordinator__d02_issuer,
             body_quote_authority=graph._GraphCoordinator__body_quote_authority)
-    contact = operation.operation_kind in {"adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}
+    contact = operation.operation_kind in {"adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"}
     reader_domain = "d10" if contact else operation.domain
     module = import_module("." + reader_domain + "_production_operations_v1", package=__package__)
     cls = getattr(module, "Installed" + reader_domain.upper() + "ProductionReadersV1")
@@ -611,10 +700,36 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
 
 
 def stage_installed_domain_operation_v1(db, *, operation, frame, request, installed_readers):
+    from ..domains.d03.world_history_v1 import WORLD_OPERATIONS
+    if operation.operation_kind in WORLD_OPERATIONS:
+        from .d03_world_history_v1 import stage_world_operation_v1
+        return stage_world_operation_v1(db,operation_kind=operation.operation_kind,frame=frame,
+            request=request,installed_readers=installed_readers)
     if (type(operation) is not InstalledDomainOperationV1
             or installed_operation_v1(operation.operation_kind) != operation
             or type(request) is not operation.request_type or not db.in_transaction):
         raise ValueError("exact registered domain request and current transaction required")
+    from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS,stage_current_long_term_operation_v1
+    from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,stage_current_habit_operation_v1
+    if operation.operation_kind in LONG_TERM_OPERATIONS:
+        return stage_current_long_term_operation_v1(db,frame=frame,request=request,installed_readers=installed_readers,
+            operation_kind=operation.operation_kind)
+    if operation.operation_kind in HABIT_OPERATIONS:
+        return stage_current_habit_operation_v1(db,frame=frame,request=request,installed_readers=installed_readers,
+            operation_kind=operation.operation_kind)
+    if operation.operation_kind=='record_habit_window_cue_v1':
+        from .habit_schedule_driver_v1 import stage_record_habit_window_cue_v1
+        return stage_record_habit_window_cue_v1(db,frame=frame,request=request,installed=installed_readers)
+    from .conditioned_self_operations_v1 import OPERATIONS as CONDITIONED_OPERATIONS,stage_current_conditioned_self_v1
+    if operation.operation_kind in CONDITIONED_OPERATIONS:
+        return stage_current_conditioned_self_v1(db,frame=frame,request=request,installed_readers=installed_readers,
+            operation_kind=operation.operation_kind)
+    if operation.operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import stage_prepare_contact_prospective_in_transaction_v1
+        return stage_prepare_contact_prospective_in_transaction_v1(db,frame=frame,request=request,installed_readers=installed_readers)
+    if operation.operation_kind == "register_general_growth_attention_v1":
+        from .d07_general_growth_attention_v1 import stage_register_general_growth_attention_v1
+        return stage_register_general_growth_attention_v1(db, frame=frame, request=request, installed_readers=installed_readers)
     if operation.operation_kind == "input:freeze_owner_source_note_values_parent_v1":
         from .owner_source_note_values_v1 import stage_freeze_owner_source_note_values_parent_v1
         return stage_freeze_owner_source_note_values_parent_v1(db, frame=frame, request=request, installed_readers=installed_readers)

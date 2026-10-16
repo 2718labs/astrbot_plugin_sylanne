@@ -349,10 +349,18 @@ class C09ColdDomainOriginalCellV3:
         meter=current_c09_sql_meter_v2();progress.session.require_current();progress.pair.require_current()
         self.progress,self.shape,self.key=progress,shape,tuple(key)
         self.scope=progress.session.begin_source_physical_read_v3(progress.pair,meter=meter)
-        original=meter.read_fixed_row(progress.pair.source,PHYSICAL_TABLE,('original_payload_cell_id',),
+        original=meter.read_fixed_row(progress.pair.source,PHYSICAL_TABLE,('domain','operation_kind','original_payload_cell_id'),
             'bot=? AND persona=? AND operation_id=?',self.key)
-        self.source_header=self.scope.read_cell_header_v3(original[0],meter=meter)
-        namespace=NamespaceId(*self.key[:2]);owner=source_key(*namespace.as_tuple,owner_material_source_id_v1(namespace,self.key[2])).token
+        self.source_header=self.scope.read_cell_header_v3(original[2],meter=meter)
+        namespace=NamespaceId(*self.key[:2])
+        if original[:2]==('d08','adopt_contact_expression_plan_v2'):
+            from ..graph_types import AtomKey
+            owner_key=AtomKey.from_token(self.source_header[2])
+            if NamespaceId.from_key(owner_key)!=namespace or owner_key.type_name!='d08.contact_expression_plan.v2':
+                raise C09PagedCaptureHold('Contact domain cold actual Source erasure owner/type differs')
+            owner=owner_key.token
+        else:
+            owner=source_key(*namespace.as_tuple,owner_material_source_id_v1(namespace,self.key[2])).token
         target=meter.read_row(progress.read_db,shape,self.key)
         if target is None:raise C09PagedCaptureHold('Domain target physical row is absent')
         self.physical=tuple(target);cell=target[shape.columns.index('original_payload_cell_id')]
@@ -409,6 +417,7 @@ def _domain_removed_v3(capture,closure,nested_hit):
 
 
 def advance_domain_original_target_v3(build,progress,shape):
+    from .c09_contact_plan_physical_v3 import C09MappedContactDomainCaptureV3
     """Use actual target quantum; publish new ref/disposition/page/cursor atomically."""
     from ..segmented_sql_cell_v1 import open_c09_segmented_target_v1,VerifiedSealedCellV1
     from .c09_closure_index_v2 import C09ClosureIndexV2
@@ -424,7 +433,7 @@ def advance_domain_original_target_v3(build,progress,shape):
     if build.segmented_target_v3 is None:build.segmented_target_v3=open_c09_segmented_target_v1(build.session,build.pair)
     key=tuple(progress['row_complete']);target=build.segmented_target_v3;started=monotonic_ns()
     capture=build.source_row_capture_v3
-    if type(capture) is not C09MappedDomainOriginalCaptureV3 or capture.key!=key:
+    if type(capture) not in (C09MappedDomainOriginalCaptureV3,C09MappedContactDomainCaptureV3) or capture.key!=key:
         raise C09PagedCaptureHold('Domain target requires the actual completed same-row Source producer')
     writer=build.segmented_writer_v3;seal=build.segmented_seal_v3;next_progress=dict(progress)
     with target.quantum() as quantum:
@@ -503,6 +512,10 @@ def advance_domain_original_target_v3(build,progress,shape):
 
 
 def verify_cold_domain_original_v3(progress,shape,key,metadata,meter,*,verify_semantics=True):
+    from .c09_contact_plan_physical_v3 import C09MappedContactDomainCaptureV3
+    if shape.table=='graph_contact_expression_plan_originals_v3':
+        from .c09_contact_plan_physical_v3 import verify_cold_contact_plan_v3
+        return verify_cold_contact_plan_v3(progress,shape,key,metadata,meter,verify_semantics=verify_semantics)
     from .c09_closure_index_v2 import C09ClosureIndexV2
     from .c09_graph_rebase_candidate_v2 import (_advance_source_nested_match_v3,
         _actual_streamed_source_origin_v3,
@@ -519,7 +532,7 @@ def verify_cold_domain_original_v3(progress,shape,key,metadata,meter,*,verify_se
     progress.prospective_source_capture_v3=pending
     if not done:return None
     capture=pending if pending is not None else build.source_row_capture_v3
-    if type(capture) is not C09MappedDomainOriginalCaptureV3:
+    if type(capture) not in (C09MappedDomainOriginalCaptureV3,C09MappedContactDomainCaptureV3):
         raise C09PagedCaptureHold('Domain cold lost its actual completed typed producer')
     origin=_actual_streamed_source_origin_v3(build,shape,key,metadata,capture,meter)
     proof=_read_graph_disposition_original_row_v3(progress.read_db,progress.session.scope.scope_digest,shape.table,key,meter)

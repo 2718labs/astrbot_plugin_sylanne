@@ -47,6 +47,9 @@ def read_source_correction_barrier(
         raise ValueError("correction barrier graph epoch changed")
     if type(source_refs) is not tuple or not source_refs or type(dependent_ref) is not str:
         raise ValueError("correction barrier needs dependent source refs")
+    from .contact_initial_plan_source_v3 import initial_contact_source_barrier_v3
+    initial=initial_contact_source_barrier_v3(db,namespace,query,source_refs,dependent_ref)
+    if initial is not None:return initial
     from .dispatch_current_projection import _bound_dispatch_projection_v3
     from .current_graph_full_read_v3 import (
         require_bound_graph_full_source_metadata_for_barrier_v3,require_bound_graph_full_atom_v3)

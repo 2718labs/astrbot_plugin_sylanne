@@ -79,6 +79,8 @@ def bilateral_acceptance_scope_v1(commitment):
 def install_d08_production_schema_v1(db):
     if db.in_transaction:
         raise ValueError("install D08 production schema before runtime transactions")
+    from .joint_external_observation_v1 import install_joint_external_schema_v1
+    install_joint_external_schema_v1(db)
     db.execute("CREATE TABLE IF NOT EXISTS graph_d08_joint_plan_intents_v1 ("
         "bot TEXT NOT NULL,persona TEXT NOT NULL,original_ref TEXT NOT NULL,producing_operation_id TEXT NOT NULL,"
         "payload_json TEXT NOT NULL,payload_digest TEXT NOT NULL,signature TEXT NOT NULL,source_refs_json TEXT NOT NULL,"
@@ -243,13 +245,14 @@ class InstalledD08ProductionReadersV1:
                 (*frame.envelope.authority.namespace.as_tuple, original_ref, *expected))
         return ProductionOriginalRefV1("d08.party_consent", original_ref, digest)
 
-    def read_joint_plan(self, db, frame, request):
+    def read_joint_plan(self, db, frame, request, *, for_execution=False):
         read = CurrentDomainReadV1(frame)
         read.check(db)
         intent, proposal_original = self._read_intent(db, read, request.joint_plan_proposal_ref)
         read.source_family(db, intent.source_refs)
         goals = tuple(read.head(db, ref, required=True) for ref in intent.current_goal_refs)
-        if any(goal.key.type_name != "d08.goal.v1" or goal.value["state"] != "active" for goal in goals):
+        allowed_goal_states = {"active", "satisfied"} if for_execution else {"active"}
+        if any(goal.key.type_name != "d08.goal.v1" or goal.value["state"] not in allowed_goal_states for goal in goals):
             raise ValueError("joint plan current goal is no longer active")
         acceptances, originals = [], []
         for ref in request.party_consent_original_refs:
@@ -441,7 +444,7 @@ adopt_current_bilateral_plan_v1 = stage_adopt_current_joint_plan_in_transaction_
 D08_PRODUCTION_STORAGE_INVENTORY_V1 = {table: {"namespace_columns": ("bot", "persona"),
     "content_columns": ("payload_json",), "source_closure_column": "source_refs_json",
     "operation_column": "producing_operation_id", "recovery": "revalidate_actual_plan_terms_and_bilateral_evidence"}
-    for table in ("graph_d08_joint_plan_intents_v1", "graph_d08_party_consents_v1")}
+    for table in ("graph_d08_joint_plan_intents_v1", "graph_d08_party_consents_v1", "graph_d08_joint_node_originals_v1")}
 
 
 def read_plan_current_d08_operation_v1(db, *, namespace, activity_id, operation_kind, request):

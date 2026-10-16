@@ -64,7 +64,7 @@ def verify_d06_algorithm_build(
     if require_formal and installed.build_mode != "formal-alpha1":
         raise ValueError("formal D06 build binding requires a formal-alpha1 package")
     if require_backend_runtime and installed.runtime_scope not in {
-        "formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance",
+        "formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test",
     }:
         raise ValueError("D06 production runtime qualification is unavailable")
     manifest_bytes = (package_root / "release-manifest.json").read_bytes()
@@ -125,6 +125,8 @@ def verify_d06_algorithm_build(
                    if installed.runtime_scope == "backend-production-acceptance"
                    else "local_alpha2_package_bytes_only"
                    if installed.build_mode == "alpha2-candidate" and installed.runtime_scope == "backend-local-alpha2-acceptance"
+                   else "beta1_server_test_package_bytes_only"
+                   if installed.build_mode == "beta1-candidate" and installed.runtime_scope == "backend-beta1-server-test"
                    else "diagnostic_installed_source_only"),
         "runtime_scope": installed.runtime_scope,
     }

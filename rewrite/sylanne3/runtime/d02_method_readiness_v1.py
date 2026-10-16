@@ -213,9 +213,9 @@ def stage_quote_current_method_choices_v1(db, *, frame, request, installed_reade
             c02_operation_id=request.task.c02_operation_id, source_ref=_read(db, issuer=readers.issuer,
                 namespace=request.task.namespace, kind="artifact_task_scope", ref=prepare.bindings[0].activity_scope_ref)[0]["source_ref"],
             issuer=readers.issuer)
-        from ..host.authority_profile import AdminArtifactDraftToolScopeV1, AdminArtifactDraftToolScopeV2, AdminArtifactDraftToolScopeV3
+        from ..host.authority_profile import AdminArtifactDraftToolScopeV1, AdminArtifactDraftToolScopeV2
         tool = readers.bundle.artifact_draft.tool_scope
-        if type(tool) in {AdminArtifactDraftToolScopeV2, AdminArtifactDraftToolScopeV3}: version_cap = tool.maximum_artifact_version
+        if type(tool) is AdminArtifactDraftToolScopeV2: version_cap = tool.maximum_artifact_version
         elif type(tool) is AdminArtifactDraftToolScopeV1: version_cap = 1
         else: raise MissingProductionOriginalV1("actual_installed_method_file_scope")
         quotes, choices, counts = [], [], []

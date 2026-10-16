@@ -324,7 +324,14 @@ def stage_current_d04_drive_in_transaction_v3(
         tuple(writes), tuple(versions.values()), (acceptance, installed_mapping), tuple(families), clock)
 
 
-def record_d04_mapping_acceptance_after_cas_v3(db, stage):
+def record_d04_mapping_acceptance_after_cas_v3(db, stage,*,drive_commit_witness_v3=None):
+    if drive_commit_witness_v3 is not None:
+        from .d06_life_numeric_drive_v1 import record_current_drive_mapping_original_v3
+        return record_current_drive_mapping_original_v3(db,stage,drive_commit_witness_v3)
+    from .current_method_learning_read_v3 import _method_active
+    reader=_method_active(db)
+    if reader is not None and reader.operation_kind=="prepare_internal_life_numeric_drive":
+        raise ValueError("selected Drive mapping record requires actual ACTIVE WRITE witness")
     if not db.in_transaction:
         raise ValueError("D04 mapping record requires same fenced CAS transaction")
     for write in stage.writes:

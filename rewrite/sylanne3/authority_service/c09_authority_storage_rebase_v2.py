@@ -201,7 +201,7 @@ def scope_role(pair):
 
 class _AuthorityRowTransformV2:
     """One actual source row; all cross-row state remains indexed on disk."""
-    __slots__ = ('pair','scope','basis','facts','completion','role','origin','probe','probe_seen','source_physical_census_v3')
+    __slots__ = ('pair','scope','basis','facts','completion','role','origin','probe','probe_seen','source_physical_census_v3','habit_current_v1')
 
     def __init__(self,pair,scope,basis):
         self.pair,self.scope,self.basis = pair,scope,basis
@@ -213,7 +213,7 @@ class _AuthorityRowTransformV2:
             scope_digest=scope.scope_digest,facts_pin_digest=basis.pin_digest,
             graph_issue_digest=basis.graph_issue_digest)
         self.role = scope_role(pair)
-        self.origin=None;self.probe=None;self.probe_seen=False;self.source_physical_census_v3=None
+        self.origin=None;self.probe=None;self.probe_seen=False;self.source_physical_census_v3=None;self.habit_current_v1=None
 
     def _consume(self,kind,item,operation,commitment,meter):
         if self.probe==(kind,item,operation,commitment): self.probe_seen=True
@@ -280,6 +280,9 @@ class _AuthorityRowTransformV2:
 
     def _core(self,shape,old,meter):
         table,columns=shape.table,shape.columns
+        if table in legacy._HABIT_CORE_TABLES:
+            from .c09_habit_policy_rows_v1 import transform_habit_core_row_v1
+            return transform_habit_core_row_v1(self,shape,old,meter)
         namespace=self.scope.authority_namespace
         from ..segmented_sql_cell_v1 import DDLS as PHYSICAL_CONTAINER_DDLS
         if table in PHYSICAL_CONTAINER_DDLS:
@@ -292,6 +295,17 @@ class _AuthorityRowTransformV2:
             expected=meter.read_one(self.pair.source,'sqlite_master',('sql',),'type=? AND name=?',('table',table))
             if expected!=(PHYSICAL_CONTAINER_DDLS[table],):raise C09PagedCaptureHold('actual physical Source retirement schema differs')
             return None,'retired_physical_container_v3'
+        if table=='authority_owner_goal_cancellations_v1':
+            from .owner_goal_cancellation_contract_v1 import (
+                GOAL_CANCEL_DDL_V1,validate_goal_cancellation_core_row_v1)
+            actual=meter.read_one(self.pair.source,'sqlite_master',('sql',),
+                'type=? AND name=?',('table',table))
+            if actual!=(GOAL_CANCEL_DDL_V1,):
+                raise C09PagedCaptureHold('actual Goal cancellation schema differs')
+            value=validate_goal_cancellation_core_row_v1(columns,old)
+            if value.request.authority_namespace==namespace:
+                value.require_signature_v1(self.facts.original_port.budget_job_issuer)
+            return old,'preserved_exact'
         if table=='sqlite_sequence': return old,'preserved_exact'
         ns = old[columns.index('namespace')] if 'namespace' in columns else None
         commitment=lambda: legacy._row_commitment(table,columns,old)
@@ -528,7 +542,12 @@ def _has_table(db,name,meter):
 
 
 def _validate_preserved_core_row(transform,table,columns,row,meter,*,shape):
-    if table==D13_RETIREMENT_TABLE:
+    if table=='authority_migration_snapshot_certificate_members_v1':
+        from .migration_snapshot_certificate_members_v1 import validate_snapshot_certificate_member_row_v1
+        if shape.primary_key_columns!=('namespace','transfer_id','member_key') or shape.primary_key_types!=('text','text','text'):
+            raise C09PagedCaptureHold('actual migration certificate member exact PK differs')
+        return validate_snapshot_certificate_member_row_v1(transform.basis.session._control.maintenance.core,columns,row)
+    elif table==D13_RETIREMENT_TABLE:
         from .c09_d13_source_retirement_v3 import COLUMNS,validate_retirement_original_v3
         if columns!=COLUMNS:raise C09PagedCaptureHold('actual bodyless D13 retirement row columns differ')
         original=validate_retirement_original_v3(transform.basis.session._control.maintenance.control,json.loads(row[7]))
@@ -582,6 +601,10 @@ def _validate_preserved_core_row(transform,table,columns,row,meter,*,shape):
                 value.guard.authority_id!=transform.scope.authority_id
                 or value.guard.installation_id!=transform.scope.installation_id):
             raise C09PagedCaptureHold('paid Owner guard original target installation/Authority differs')
+    elif table in legacy._HABIT_CORE_TABLES:
+        from .c09_habit_policy_rows_v1 import validate_habit_core_row_v1,_installed_v1
+        config,control=_installed_v1(transform)
+        validate_habit_core_row_v1(table,columns,row,config=config,control=control)
     elif table==legacy._CONTACT_POLICY_TABLE:
         from .c09_contact_policy_rows_v1 import validate_contact_policy_core_row_v1
         validate_contact_policy_core_row_v1(columns,row)
@@ -724,6 +747,18 @@ def _verify_schema(transform,original,meter):
             else:expected=None
             if expected is None or original.sql!=expected:
                 raise C09PagedCaptureHold('registered D13 Core source table/immutable trigger differs')
+        elif table=='authority_migration_snapshot_certificate_members_v1':
+            from .migration_snapshot_certificate_members_v1 import _OBJECTS as MEMBER_OBJECTS
+            expected=MEMBER_OBJECTS.get(original.primary_key)
+            if expected is None or original.sql!=expected:
+                raise C09PagedCaptureHold('actual migration certificate member Source schema differs')
+            for (kind,name),ddl in MEMBER_OBJECTS.items():
+                row=meter.read_one(pair.source,'sqlite_master',('tbl_name','sql'),'type=? AND name=?',(kind,name))
+                if row!=(table,ddl):
+                    raise C09PagedCaptureHold('actual migration certificate member table/index/immutable triggers required')
+        elif table in legacy._HABIT_CORE_TABLES:
+            from .c09_habit_policy_rows_v1 import validate_habit_schema_object_v1
+            validate_habit_schema_object_v1(transform,original,meter)
         elif table==D13_RETIREMENT_TABLE:
             expected=D13_RETIREMENT_DDL if original.object_type=='table' else D13_RETIREMENT_TRIGGERS.get(original.name)
             if original.sql!=expected:raise C09PagedCaptureHold('actual immutable D13 retirement Source schema differs')
@@ -895,11 +930,14 @@ def _suffix_transform(transform,execution_pair,*,readonly=False):
         if type(encoded) is not bytes: raise C09PagedCaptureHold('execution suffix pending bytes differ')
         namespace=transform.scope.authority_namespace
         binding=None;pending=None
-        from .d04_numeric_v3 import ROOT_ENTRY_PREFIX_V3,ENTRY_PREFIX,root_from_wire,numeric_from_wire,D04AuthoredRootBindingV3,D04NumericExecutionBindingV3
+        from .d04_root_execution_journal_v3 import ROOT_ENTRY_PREFIX_V3
+        from .d04_numeric_journal_v3 import ENTRY_PREFIX
+        from .d04_root_execution_contract_v3 import D04RootExecutionBindingV3,root_execution_from_wire_v3
+        from .d04_numeric_contract_v3 import D04NumericBindingV3,from_wire as numeric_from_wire
         if encoded.startswith(ROOT_ENTRY_PREFIX_V3):
-            binding=root_from_wire(json.loads(encoded)['d04_authored_root_original']['binding'],D04AuthoredRootBindingV3)
+            binding=root_execution_from_wire_v3(json.loads(encoded)['d04_root_execution_original']['binding'],D04RootExecutionBindingV3)
         elif encoded.startswith(ENTRY_PREFIX):
-            binding=numeric_from_wire(json.loads(encoded)['d04_numeric_original']['binding'],D04NumericExecutionBindingV3)
+            binding=numeric_from_wire(json.loads(encoded)['d04_numeric_original']['binding'],D04NumericBindingV3)
         elif encoded.startswith(b'{"d04_series_original":'):
             from .d04_series_contract_v1 import D04SeriesChunkBindingV1,from_wire
             binding=from_wire(json.loads(encoded)['d04_series_original']['binding'],D04SeriesChunkBindingV1).numeric
@@ -11682,7 +11720,8 @@ class _InstalledAuthorityRoleBuilderV2:
                'natural_core_required_v4','natural_core_obligations_v4','natural_core_obligations_proof_v4',
                '_pending_natural_core_required_v4','_pending_natural_core_obligations_v4',
                'paid_owner_final_retention_v3','_pending_paid_owner_final_retention_v3','paid_owner_final_retention_proof_v3',
-               'graph_imported_wire_census_v3','_pending_graph_imported_wire_census_v3','_pending_graph_imported_wire_cold_v3')
+               'graph_imported_wire_census_v3','_pending_graph_imported_wire_census_v3','_pending_graph_imported_wire_cold_v3',
+               '_pending_habit_read_v1')
 
     def __init__(self,token,session,pair,basis):
         if token is not _BUILDER_TOKEN: raise AuthorityUnavailable('installed authority role builder required')
@@ -11695,7 +11734,7 @@ class _InstalledAuthorityRoleBuilderV2:
                 self.scope.scope_digest,completion.pin_digest,basis.graph_issue_digest,
                 completion.old_journal_id,completion.old_seq,completion.old_digest):
             raise C09PagedCaptureHold('stable build plan differs from current sealed originals')
-        self.execution_pair=None;self.cold=None
+        self.execution_pair=None;self.cold=None;self._pending_habit_read_v1=None
         self.segmented_target_v3=None;self.segmented_census_v3=None;self.segmented_sweep_v3=None;self.segmented_finish_pending_v3=False;self.d13_source_capture_v3=None
         self.cold_position_v3=None;self._pending_cold_position_v3=None;self._pending_d13_capture_v3=None
         self.d13_projection_v3=None;self._pending_d13_projection_v3=None
@@ -12321,6 +12360,11 @@ def _row_phase(builder,budget,phase,position,meter):
         result=_advance_c09_census_v2(pair.source,pair.candidate,stream,shape,_reduced_budget(budget,meter),check_frozen_source=pair.check_source)
         if result['eof']: phase='table_rows'
     elif phase=='table_rows':
+        if transform.role=='core'and table in legacy._HABIT_CORE_TABLES:
+            from .c09_habit_policy_rows_v1 import advance_habit_core_source_row_v1
+            value=advance_habit_core_source_row_v1(builder,budget,position,meter)
+            if value is not None:return value
+            budget=replace(budget,max_records=1)
         from ..segmented_sql_cell_v1 import CORE_REF_DDLS_V2
         if transform.role=='core' and table in CORE_REF_DDLS_V2:
             value=_advance_d13_core_source_row_v3(builder,budget,position,meter)
@@ -12805,6 +12849,7 @@ class _AuthorityColdSweepV2:
     def __init__(self,builder):
         from ..runtime.c09_paged_capture_contract_v2 import begin_c09_stream_v2
         self.builder=builder;self.reader=_open_candidate_readback(builder.pair);self.census_reader=_open_candidate_readback(builder.pair)
+        builder.transform.habit_current_v1=None
         self.after=None;self.active=None;self.verification=None;self.source=None;self.shape=None
         self.phase='schema_census';self.root=canonical_digest(('sylanne3.c09.authority-cold.v2',builder.scope.scope_digest,builder.transform.role))
         self.count=0;self.schema_after=None;self.schema_count=0
@@ -12972,6 +13017,9 @@ class _AuthorityColdSweepV2:
             parent=_PAGED_PARENT_METER_V2.get()
             if parent is None:raise C09PagedCaptureHold('actual authority cold callback requires its shared reserved engine meter')
             meter=_ReadOnlyAuthorityRowMeterV2(parent.remaining_bytes)
+            if transform.role=='core'and self.active[0]in legacy._HABIT_CORE_TABLES and self.active[1]=='row_dispositions':
+                from .c09_habit_policy_rows_v1 import verify_habit_core_cold_record_v1
+                return verify_habit_core_cold_record_v1(builder,self.reader,stream,record,meter)
             if (transform.role=='core' and self.active[0] in {'authority_d13_counter_originals_v1','authority_d13_provider_http_bindings_v1'}
                     and self.active[1] in {'row_dispositions','source_originals_v3'}):
                 return _verify_d13_cold_record_v3(builder,self.reader,stream,self.active[1],record,budget,meter)
@@ -13206,9 +13254,13 @@ def advance_installed_authority_role_rebase_v2(builder):
     builder._pending_cold_position_v3=None;builder._pending_d13_capture_v3=None;builder._pending_d13_projection_v3=None;builder._pending_d13_wire_v3=None;builder._pending_d13_graph_refs_v3=None;builder._pending_d13_question_source_v3=None;builder._pending_d13_root_access_v3=None;builder._pending_d13_root_epoch_v3=None
     builder._pending_natural_core_required_v4=None;builder._pending_natural_core_obligations_v4=None
     builder._pending_paid_owner_final_retention_v3=None
+    builder._pending_habit_read_v1=None
     builder._pending_source_physical_reader_v3=None
     builder._pending_d13_disposition_v3=None;builder._pending_graph_imported_wire_census_v3=None;builder._pending_graph_imported_wire_cold_v3=None
     result=_advance_installed_authority_role_quantum_v2(builder)
+    if builder._pending_habit_read_v1 is not None:
+        state=builder._pending_habit_read_v1;state.quantum_completed=True
+        builder.transform.habit_current_v1=state;builder._pending_habit_read_v1=None
     if builder._pending_source_physical_reader_v3 is not None:
         builder.source_physical_reader_v3=builder._pending_source_physical_reader_v3
         builder._pending_source_physical_reader_v3=None

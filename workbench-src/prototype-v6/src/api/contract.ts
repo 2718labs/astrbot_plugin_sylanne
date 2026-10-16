@@ -1,6 +1,4 @@
 import {operationIdV1} from './browser-crypto.ts'
-/** Verified against 2718labs/astrbot_plugin_sylanne @ 00049ab3f547bd996113c8ef1c478b1e8f991f5a. */
-export const BACKEND_COMMIT = '00049ab3f547bd996113c8ef1c478b1e8f991f5a'
 export const DEFAULT_API_BASE = '/api/v1/plugins/extensions/astrbot_plugin_sylanne/workbench/v1'
 export const D12_SCHEMA = 'd12.contract.v1'
 export const OWNER_SCHEMA = 'sylanne3.authority.owner-session.v1'

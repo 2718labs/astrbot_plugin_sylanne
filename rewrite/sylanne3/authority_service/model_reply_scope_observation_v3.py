@@ -100,13 +100,13 @@ class _ReplyScopeMetadataScanV3:
         if self.pending is not None:
             if not self.pending.complete:self.pending.advance(meter);return
             row=self.pending.require_row_v3(meter)
-            if self.kind in('life_c4','life_c4_call','life_binding'):
+            if self.kind in('life_c4','life_c4_call','life_c4_call_original','life_binding'):
                 value=background_json_loads_v3(row[0])
                 expected=self.parameters[0]
-                match=(value.get('call_id')==expected if self.kind=='life_c4_call' else
+                match=(value.get('call_id')==expected if self.kind in('life_c4_call','life_c4_call_original') else
                     value.get('selector',{}).get('cycle_job_ref')==expected if self.kind=='life_c4'
                     else value.get('binding',{}).get('activity_id')==expected)
-                if match:self.rows.append((self.candidate[0],))
+                if match:self.rows.append(self.candidate if self.kind=='life_c4_call_original' else (self.candidate[0],))
             elif self.kind=='message_history':
                 value=background_json_loads_v3(row[0]);paid=value.get('paid_review',{})
                 if(paid.get('generation_original_operation_id'),paid.get('review_original_operation_id'))==self.parameters:
@@ -116,6 +116,17 @@ class _ReplyScopeMetadataScanV3:
                         paid.get('generation_call_id'),paid.get('review_call_id')))
             else:self.rows.append(row)
             self.pending=None;return
+        if self.kind=='life_c4_call_original':
+            table='graph_d11_life_originals_v1'
+            where="bot=? AND persona=? AND kind IN ('c4_prepared','c4_phase_prepared')"
+            args=ns
+            if self.after is not None:where+=' AND (kind,original_ref)>(?,?)';args=(*args,*self.after)
+            row=meter.read_fixed_row(owner.db,table,('kind','original_ref'),
+                where+' ORDER BY kind,original_ref LIMIT 1',args)
+            if row is None:self.complete=True;return
+            self.after=row;self.candidate=row
+            request=(table,('payload_json',),('bot','persona','kind','original_ref'),(*ns,*row))
+            self.pending=_BackgroundPointReadV3(owner,request);return
         if self.kind in('life_c4','life_c4_call','life_binding'):
             table='graph_d11_life_originals_v1';where='bot=? AND persona=? AND kind=?';args=(*ns,'c4_prepared'if self.kind in('life_c4','life_c4_call')else'prepared')
             if self.after is not None:where+=' AND original_ref>?';args=(*args,self.after)
@@ -391,7 +402,11 @@ class _ModelReplyScopeObservationV3:
                 'cycle_digest','call_plan_digest','c02_operation_id','cancel_generation','proposal_head',
                 'proposal_digest','source_head','source_digest','parent_budget_lease_ref','original_deadline_utc',
                 'need_ref','need_digest','cycle_job_ref','responsibility_ref','responsibility_digest',
-                'recall_policy_digest','adoption_operation_id','self_authority_json','owner_guard_json')
+                'recall_policy_digest','adoption_operation_id','self_authority_json','owner_guard_json',
+                'reflection_request_ref','reflection_request_digest','reflection_continuation_ref',
+                'reflection_continuation_digest','parent_prepared_ref','parent_prepared_digest',
+                'parent_execution_ref','parent_execution_digest','checkpoint_ref','checkpoint_digest',
+                'parent_grant_digest','source_refs','ticket_id')
             selected=tuple((name,)for name in fields)
         elif self.appraisal_parentage_column_v3(column):
             selected=tuple((name,)for name in('schema','namespace','operation_id','job_id','call_id','model_request_digest'))
@@ -550,14 +565,21 @@ def read_bound_model_reply_scope_point_v3(db,*,table,columns,key_columns,key):
 
 
 def model_reply_scope_point_v3(db,*,table,columns,key_columns,key,legacy_reader):
+    from .named_joint_binding_body_v1 import named_joint_core_point_v1
+    named,row=named_joint_core_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if named:return row
     handled,row=read_bound_model_reply_scope_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
-    return row if handled else legacy_reader()
+    if handled:
+        return row
+    from ..runtime.domain_background_read_v3 import read_bound_d07_mutable_runtime_row_v3
+    current,row=read_bound_d07_mutable_runtime_row_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    return row if current else legacy_reader()
 
 
 def model_reply_scope_rows_v3(db,*,kind,parameters,legacy_reader):
     owner=_active_observation_v3(db)
     if owner is None or owner.legacy:return legacy_reader()
-    if kind not in('life_c4','life_c4_call','life_binding','message_history','foreground_parents','children','message_jobs','outbound'):
+    if kind not in('life_c4','life_c4_call','life_c4_call_original','life_binding','message_history','foreground_parents','children','message_jobs','outbound'):
         raise AuthorityUnavailable('unregistered model reply parentage metadata selector')
     request=('scan',kind,tuple(parameters));task=owner.scans.get(request)
     if task is None or not task.complete:raise ModelReplyScopeObservationNeededV3(request)

@@ -45,6 +45,37 @@ class InstalledOwnerStopReplyPortV1:
         return await self.client._transport._content_rpc(request, handshake, method,
             command, protocol=AUTHORITY_V2_PROTOCOL)
 
+    async def submit_owner_goal_cancel_v1(self, *, session, request):
+        from dataclasses import asdict
+        from ..authority_service.owner_goal_cancellation_contract_v1 import OwnerGoalCancellationRequestV1
+        policy=self.bundle.installation_policy
+        if (type(request) is not OwnerGoalCancellationRequestV1
+                or (request.namespace,request.authority_namespace,request.installation_id)!=(
+                    policy.namespace,policy.authority_namespace,policy.installation_id)):
+            raise PermissionError("Goal cancellation target installation differs")
+        response=await self._call("owner_goal_cancel_submit_v1",session=session,
+            selector={"cancel_request":asdict(request)})
+        return self._goal_cancel_original_v1(response,session=session,request=request)
+
+    async def read_owner_goal_cancel_status_v1(self, *, session, request):
+        response=await self._call("owner_goal_cancel_status_v1",session=session,
+            selector={"cancel_operation_id":request.cancel_operation_id})
+        return self._goal_cancel_original_v1(response,session=session,request=request)
+
+    def _goal_cancel_original_v1(self, response, *, session, request):
+        from dataclasses import asdict
+        from ..runtime_contracts import canonical_serialize
+        from ..authority_service.owner_goal_cancellation_contract_v1 import (
+            OwnerGoalCancellationOriginalV1,owner_goal_cancellation_from_wire_v1)
+        if type(response) is not dict or set(response)!={"original","channel_binding_sha256"}:
+            raise RuntimeError("Goal cancellation exact original response differs")
+        original=owner_goal_cancellation_from_wire_v1(response["original"],OwnerGoalCancellationOriginalV1)
+        if (original.request!=request or original.authority_id!=self.grant.authority_id
+                or original.actor_id!=session.actor_id
+                or original.principal_json!=canonical_serialize(asdict(session.owner_session_request.principal))):
+            raise RuntimeError("Goal cancellation returned another initiating Owner/target original")
+        return original
+
     async def list_owner_reply_controls_v1(self, *, session, cursor=None):
         response = await self._call("owner_stop_reply_list_v1", session=session, selector={"cursor": cursor})
         if (type(response) is not dict or set(response) != {"items", "next_cursor", "channel_binding_sha256"}

@@ -435,6 +435,16 @@ def _dependency_closure(db: sqlite3.Connection, affected: set[str]) -> set[str]:
                     historical.extend(((token, proof.episode_ref), (token, proof.event_ref), (token, proof.provenance_ref)))
             from ..domains.d09.contact_batch_v2 import PROVENANCE as CP, ELIGIBILITY as CE, decode_contact_batch_companion_v2, contact_batch_keys_v2
             from ..domains.d08.contact_plan_v2 import PROVENANCE as CPP,ELIGIBILITY as CPE,decode_contact_plan_member_v2,contact_plan_keys_v2
+            from ..domains.d08.contact_plan_v3 import PROVENANCE as CPP3,ELIGIBILITY as CPE3,decode_contact_plan_member_v3,contact_plan_keys_v3
+            if key.type_name in {CPP3,CPE3}:
+                proof3 = decode_contact_plan_member_v3(key.type_name,decoded)
+                if key.type_name == CPP3:
+                    if key != contact_plan_keys_v3(proof3.plan)[1]:
+                        raise GraphRebaseHold('Contact Plan3 metadata provenance key differs')
+                    historical.extend((token,row.ref) for row in proof3.historical_reads)
+                    historical.append((contact_plan_keys_v3(proof3.plan)[0].token,token))
+                else:
+                    historical.extend(((token,proof3.plan_ref.ref),(token,proof3.provenance_ref.ref)))
             if key.type_name in {CPP,CPE}:
                 proof=decode_contact_plan_member_v2(key.type_name,decoded)
                 if key.type_name==CPP:
@@ -952,6 +962,20 @@ def _build_graph_rebase_candidate_v1(
             if table in _CATALOGUE_COLUMNS:
                 for row in rows:
                     validate_catalogue_upgrade_row_v1(table, columns, row)
+            if table == 'graph_contact_background_scheduler_v3':
+                from .contact_background_scheduler_v3 import DDL as scheduler_ddl,validate_contact_scheduler_row_v3
+                if db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone() != (scheduler_ddl,):
+                    raise GraphRebaseHold('Contact scheduling metadata schema differs')
+                for row in rows:
+                    validate_contact_scheduler_row_v3(columns,row)
+            if table == 'graph_contact_background_invocations_v1':
+                from .contact_background_invocation_v1 import (
+                    require_contact_background_schema_v1, validate_contact_background_inventory_row_v1)
+                require_contact_background_schema_v1(db)
+                for row in rows:
+                    validate_contact_background_inventory_row_v1(columns,row)
+                if rows:
+                    raise GraphRebaseHold('Contact background authenticated carrier/disposal remains HOLD')
             if table == 'graph_contact_owner_invocations_v3':
                 from .c09_contact_owner_invocation_v3 import (
                     require_contact_owner_invocation_schema_v3, validate_contact_owner_inventory_row_v3,
@@ -998,6 +1022,9 @@ def _build_graph_rebase_candidate_v1(
                         read_d04_inventory_row_v3(columns, row, authority_namespace=authority_namespace)
                 except (D04ErasureInventoryHold, ValueError, TypeError, KeyError) as exc:
                     raise GraphRebaseHold("installed D04 original kind/codec differs") from exc
+            if table=="graph_owner_goal_cancellation_projections_v1":
+                from .owner_goal_projection_v1 import validate_goal_projection_row_v1
+                for row in rows:validate_goal_projection_row_v1(columns,row,db=db)
             if table in _DOMAIN_COLUMNS:
                 if columns != _DOMAIN_COLUMNS[table]:
                     raise GraphRebaseHold("installed domain input columns differ")

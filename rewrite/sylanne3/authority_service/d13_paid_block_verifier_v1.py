@@ -16,7 +16,7 @@ from ..model_broker.d13_precompression import (
     D13PrecompressionInstallationV1, freeze_d13_precompression_request_v1,
     issue_unadmitted_d13_model_request_v1, parse_d13_precompression_output_v1,
 )
-from ..runtime_contracts import canonical_digest
+from ..runtime_contracts import canonical_digest,canonical_serialize
 from .contract import AuthorityUnavailable
 
 
@@ -37,12 +37,23 @@ class InstalledD13PaidBlockVerifierV1:
         self._authority, self._max_slots = authority_store, max_slots
 
     def _current_window(self, window):
+        from ..runtime.d13_completed_paid_read_v3 import current_completed_d13_reader_v3
+        completed=current_completed_d13_reader_v3(self._db)
+        if completed is not None:return completed.reader.current_window
         from ..runtime.d13_current_window import read_current_d13_window_for_authority_v1
         return read_current_d13_window_for_authority_v1(self._db, window.namespace,
             AtomKey.from_token(window.scene_ref.ref).owner.subject, window.conversation_ref,
             self._max_slots, window.trusted_utc, expected_activation_generation=window.activation_epoch)
 
     def _stored_block(self, candidate, window, original, evidence, settlement):
+        from ..runtime.d13_completed_paid_read_v3 import current_completed_d13_reader_v3
+        completed=current_completed_d13_reader_v3(self._db)
+        if completed is not None:
+            if (window!=completed.reader.current_window or original!=completed.saved.original
+                    or evidence!=completed.saved.evidence or settlement!=completed.saved.settlement
+                    or candidate.block_ref!=completed.reader.job[13]):
+                raise AuthorityUnavailable("D13 actual paid verifier crossed completed original material")
+            return completed.block
         from ..domains.d13.provider import _block_from_graph_value
         key = AtomKey(Owner("persona", *window.namespace.as_tuple), "d13.compressed_turn_block.v2", candidate.block_ref)
         row = self._db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
@@ -158,16 +169,25 @@ class InstalledD13PaidBlockVerifierV1:
         from .current_authority_graph_read_v3 import read_bound_authority_graph_attachment_v3
         handled,job_row=read_bound_authority_graph_attachment_v3(db,table='graph_atoms',columns=('value','valid'),
             key_columns=('token',),key=(job_write.key.token,))
-        if not handled:
+        from ..runtime.d13_completed_paid_read_v3 import current_completed_d13_reader_v3
+        completed=current_completed_d13_reader_v3(db)
+        if completed is not None:
+            if job!=completed.job:
+                raise AuthorityUnavailable("D13 verifier actual completed job original differs")
+            job_row=(canonical_serialize(job_write.value),1)
+        elif not handled:
             job_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_write.key.token,)).fetchone()
         if job_row is None or job_row[1] != 1 or json.loads(job_row[0]) != job_write.value:
             return False
-        quote = self._resource.original_signed_quote(db, original.quote_id, original.quote_version)
-        grant, _signature = self._budget.signed_budget_grant_at_version(db, job.budget_ref, original.grant_version)
-        reservation = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
-            "WHERE lease_id=? AND operation_id=?", (job.budget_ref, original.budget_operation_id)).fetchone()
-        receipt = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
-            "AND operation_id=? AND phase='settle'", window.namespace.as_tuple + (original.budget_operation_id,)).fetchone()
+        if completed is not None:
+            quote,grant,reservation,receipt=completed.accounting_v3(self)
+        else:
+            quote = self._resource.original_signed_quote(db, original.quote_id, original.quote_version)
+            grant, _signature = self._budget.signed_budget_grant_at_version(db, job.budget_ref, original.grant_version)
+            reservation = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+                "WHERE lease_id=? AND operation_id=?", (job.budget_ref, original.budget_operation_id)).fetchone()
+            receipt = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
+                "AND operation_id=? AND phase='settle'", window.namespace.as_tuple + (original.budget_operation_id,)).fetchone()
         if (canonical_digest(quote) != original.quote_digest or canonical_digest(grant) != original.grant_digest
                 or quote.work_kind != PAID_WORK_KIND or quote.operation_id != original.budget_operation_id
                 or quote.parent_budget_lease_ref != job.budget_ref or dict(quote.ceiling) != original.ceiling
@@ -187,7 +207,9 @@ class InstalledD13PaidBlockVerifierV1:
         parsed = parse_d13_precompression_output_v1(result["text"], frozen)
         if compile_extractive_model_output(window,plan,parsed.model_text,_prepared_paid_eof_v3=prepared) != candidate:
             return False
-        if self._authority is not None:
+        if completed is not None:
+            completed.require_terminal_v3(fact,read)
+        elif self._authority is not None:
             # Authority owns this store and lock; W01 never supplies a "verified"
             # boolean. Holding only its read lock here performs no RPC or writes.
             store = self._authority

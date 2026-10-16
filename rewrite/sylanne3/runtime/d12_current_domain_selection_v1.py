@@ -15,7 +15,8 @@ def read_current_domain_selection_v1(db, namespace, *, domain, field_name):
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("current domain selection requires a pinned Graph transaction")
     key = active_scheme_head_key(namespace)
-    current = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
+    from .domain_background_read_v3 import background_graph_head_v3,background_history_v3
+    current = background_graph_head_v3(db,namespace,key)
     if current is None:
         return GraphVersion(key, 0), None, None
     version = GraphVersion(key, current[0])
@@ -32,8 +33,9 @@ def read_current_domain_selection_v1(db, namespace, *, domain, field_name):
         if (head.scope != namespace.persona_id or head.generation != revision
                 or expected_digest is not None and head.compiled_digest != expected_digest):
             raise ValueError("adopted scheme ancestry differs")
-        historical = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
-            (key.token, revision)).fetchone()
+        from .frozen_joint_command_source_v3 import record_frozen_joint_scheme_head_v3
+        record_frozen_joint_scheme_head_v3(db,namespace,head,revision)
+        historical = background_history_v3(db,key.token,revision,columns=("value","valid"))
         if historical != (encoded, 1):
             raise ValueError("adopted scheme has no matching immutable history")
         if head.adoption_kind == "initial":
@@ -53,8 +55,7 @@ def read_current_domain_selection_v1(db, namespace, *, domain, field_name):
             if len(selected) != 1 or selected[0].field_names != (field_name,):
                 raise ValueError("adopted domain field selection differs")
             return version, compiled, selected[0]
-        prior = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
-            (key.token, revision - 1)).fetchone()
+        prior = background_history_v3(db,key.token,revision-1,columns=("value","valid"))
         if prior is None:
             raise ValueError("inherited domain selection has missing adopted ancestry")
         row = revision - 1, prior[0], prior[1]

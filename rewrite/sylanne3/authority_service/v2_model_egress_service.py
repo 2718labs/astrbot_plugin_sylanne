@@ -14,6 +14,7 @@ from ..host.model_workflows_v4 import AdminModelWorkflowsV4
 from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.first_ingress_encoding import (
@@ -39,7 +40,7 @@ class AuthorityV2ModelEgressService:
                  fences: AuthorityV2FenceService | None = None, *,
                  graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
                  admin_model_policy: (AdminIngressModelPolicy | AdminModelWorkflowsV2 |
-                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | None) = None,
+                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | None) = None,
                  source_location=None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
@@ -51,13 +52,12 @@ class AuthorityV2ModelEgressService:
                 and type(graph_verifier) is not PinnedCurrentModelEgressGraphVerifier):
             raise TypeError("administrator-pinned model egress graph verifier required")
         if (admin_model_policy is not None
-                and type(admin_model_policy) not in (
-                    AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3,
-                    AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)):
+                and type(admin_model_policy) not in (AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)):
             raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
         self._graph_verifier = graph_verifier
+        self._owner_goal_cancellation_service_v1 = None
         self._admin_model_policy = admin_model_policy
         # Installed composition, never a caller-supplied location proof. The
         # concrete qualifier is checked when configured; old initial-generation
@@ -73,11 +73,21 @@ class AuthorityV2ModelEgressService:
         with self._store._tx() as db:
             install_d07_model_timing_schema_v1(db)
 
+    def install_owner_goal_cancellation_service_v1(self, service):
+        from .owner_goal_cancellation_v1 import InstalledOwnerGoalCancellationServiceV1
+        if (type(service) is not InstalledOwnerGoalCancellationServiceV1
+                or self._fences is None or service.core is not self._fences.core
+                or service.fences is not self._fences
+                or service.bundle is not self._graph_verifier._artifact_draft_bundle
+                or self._owner_goal_cancellation_service_v1 is not None):
+            raise AuthorityUnavailable("Goal barrier needs its actual installed same Core/model service")
+        self._owner_goal_cancellation_service_v1 = service
+
     def install_d13_provider_http_counter_v1(self, counter):
         from .d13_core_counter_service_v1 import InstalledD13CoreCounterServiceV1
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         if (type(counter) is not InstalledD13CoreCounterServiceV1
-                or type(self._admin_model_policy) is not AdminModelWorkflowsV7
+                or type(self._admin_model_policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
                 or counter.core._db is not self._store._db or counter.fences is not self._fences
                 or self._d13_provider_http_counter_v1 is not None):
             raise AuthorityUnavailable('provider HTTP counter must be the exact installed model/Core instance')
@@ -150,7 +160,7 @@ class AuthorityV2ModelEgressService:
             TEMPLATE_DIGEST, TEMPLATE_VERSION, WORK_KIND, artifact_draft_from_wire_v1,
             artifact_draft_model_ids_v1, artifact_draft_provider_messages_v1)
         verifier = self._graph_verifier
-        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
             return False
         bundle = verifier._artifact_draft_bundle
         if (type(bundle) is not AdminInstallationBundle
@@ -209,7 +219,7 @@ class AuthorityV2ModelEgressService:
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, require_paired_phase_frozen_target_v4
         verifier = self._graph_verifier
-        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
             return False
         bundle = verifier._artifact_draft_bundle
         if (type(bundle) is not AdminInstallationBundle or bundle.model_workflows is not self._admin_model_policy
@@ -259,7 +269,7 @@ class AuthorityV2ModelEgressService:
             and all(amount <= workflow.quote_ceiling[dimension] for dimension, amount in ceiling.items()))
 
     def _admin_model_matches(self, intent: ModelEgressIntentV1,
-                             request: ModelCallRequest | None) -> bool:
+                             request: ModelCallRequest | None, *, d07_source_material=None) -> bool:
         """Match a graph-bound request to this Authority installation's policy."""
         policy = self._admin_model_policy
         if type(request) is not ModelCallRequest:
@@ -270,7 +280,7 @@ class AuthorityV2ModelEgressService:
                 return self._artifact_draft_admin_matches_v2(intent, request)
             return self._artifact_draft_admin_matches_v1(intent, request)
         authority = request.envelope.authority
-        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
             if request.identity.phase == "d13.precompress":
                 from ..model_broker.d13_precompression import (
                     TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
@@ -304,7 +314,16 @@ class AuthorityV2ModelEgressService:
                     and request.max_output_tokens <= ceiling.get("output_tokens", 0)
                     and request.timeout_seconds == workflow.timeout_seconds
                 )
-            if authority.purpose == "proposal":
+            if authority.purpose=="consolidation" and request.identity.phase=="d07.cognition":
+                from ..model_broker.general_growth_cognition_v1 import TEMPLATE_VERSION as GENERAL_VERSION,TEMPLATE_DIGEST as GENERAL_DIGEST
+                if type(policy)is not AdminModelWorkflowsV8 or request.prompt_template_digest!=GENERAL_DIGEST:
+                    return False
+                verifier=self._graph_verifier
+                if verifier is None:return False
+                workflow=verifier.read_current_named_d07_model_workflow_v3(intent,request,source_material=d07_source_material)
+                if workflow is not policy.general_growth_cognition:return False
+                expected=("d07.cognition","consolidation",GENERAL_VERSION,GENERAL_DIGEST)
+            elif authority.purpose == "proposal":
                 if request.identity.phase == "context_reply":
                     from ..model_broker.context_reply import (
                         CONTEXT_REPLY_TEMPLATE_DIGEST,
@@ -338,7 +357,7 @@ class AuthorityV2ModelEgressService:
                         TEMPLATE_VERSION, TEMPLATE_DIGEST = V6_TEMPLATE_VERSION, V6_TEMPLATE_DIGEST
                     from ..model_broker.natural_reply_history_v7 import TEMPLATE_DIGEST as V7_TEMPLATE_DIGEST,TEMPLATE_VERSION as V7_TEMPLATE_VERSION
                     if request.prompt_template_digest==V7_TEMPLATE_DIGEST:
-                        if type(policy) is not AdminModelWorkflowsV7 or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
+                        if type(policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
                             raise AuthorityUnavailable('V7 natural wire requires its actual named installed V7 workflow')
                         TEMPLATE_VERSION,TEMPLATE_DIGEST=V7_TEMPLATE_VERSION,V7_TEMPLATE_DIGEST
                     expected = ("natural_generation", "proposal",
@@ -357,7 +376,7 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.contact_expression_v1 import (GENERATION_TEMPLATE_VERSION,
                         GENERATION_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                         REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
-                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
                         from ..model_broker.contact_expression_v2 import (
                             GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                             REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
@@ -377,13 +396,13 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.d07_cognition_v1 import D07_COGNITION_TEMPLATE_DIGESTS_V1
                     workflow = policy.d07_cognition
                     from ..model_broker.d07_cognition_v1 import TEMPLATE_DIGEST
-                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7} and request.prompt_template_digest == TEMPLATE_DIGEST:
+                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8} and request.prompt_template_digest == TEMPLATE_DIGEST:
                         verifier = self._graph_verifier
                         if verifier is None:
                             return False
-                        workflow = verifier.read_current_named_d07_model_workflow_v3(intent, request)
-                        installed_named = (policy.d07_relationship_cognition,)
-                        if type(policy) is AdminModelWorkflowsV6:
+                        workflow = verifier.read_current_named_d07_model_workflow_v3(intent, request,source_material=d07_source_material)
+                        installed_named = (policy.d07_cognition,policy.d07_relationship_cognition,)
+                        if type(policy)in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8}:
                             installed_named += (policy.growth_cognition,)
                         if workflow is None or not any(workflow is named for named in installed_named):
                             return False
@@ -400,13 +419,13 @@ class AuthorityV2ModelEgressService:
             else:
                 if request.identity.phase == "internal_life_content_v2":
                     from ..model_broker.internal_life_content_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
                         return False
                     workflow = policy.life_content
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
                 elif request.identity.phase == "internal_life_numeric_v1":
                     from ..model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
                         return False
                     workflow = policy.life_numeric
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
@@ -593,7 +612,36 @@ class AuthorityV2ModelEgressService:
             if exclude is not None:
                 available = model_capacity_census_locked_v1(db,self._fences.namespace,exclude=exclude)
                 fact["capacity_available"] = available["capacity_available"]
-            return {"status":status,**fact,"call_id":None if draft is None else draft.call_id,
+            selected_admission_count = None
+            selected_observation_count = None
+            if draft is not None:
+                selected_admission_count = 0
+                selected_observation_count = 0
+                identity = (draft.authority_id, draft.namespace, draft.subject,
+                    draft.operation_id, draft.call_id, draft.request_digest)
+                for table, column, admission_row in (
+                        ("authority_model_admissions_v2", "admission_json", True),
+                        ("authority_model_egress_observations_v1", "observation_json", False)):
+                    fields = ("authority_id", "namespace", "subject", "operation_id",
+                        "call_id", "request_digest")
+                    projection = ",".join("json_extract(" + column + ",'$." + field + "')"
+                        for field in fields)
+                    if admission_row:
+                        projection += ",json_extract(admission_json,'$.installation_id')"
+                    row = db.execute("SELECT " + projection + " FROM " + table +
+                        " WHERE call_id=?", (draft.call_id,)).fetchone()
+                    if row is not None:
+                        expected = identity + ((installation_id,) if admission_row else ())
+                        if original is None or row != expected:
+                            raise AuthorityUnavailable("MODEL_CAPACITY_UNRESOLVED")
+                        if admission_row:
+                            selected_admission_count = 1
+                        else:
+                            selected_observation_count = 1
+            return {"status":status,**fact,
+                "selected_admission_count":selected_admission_count,
+                "selected_observation_count":selected_observation_count,
+                "call_id":None if draft is None else draft.call_id,
                 "request_digest":None if draft is None else draft.request_digest,
                 "authority_id":anchor.authority_id,"namespace":self._fences.namespace,
                 "subject":subject,"installation_id":installation_id,
@@ -643,6 +691,11 @@ class AuthorityV2ModelEgressService:
                            if scope_observation_required else
                            self._graph_verifier.observe_current_reply_scope_for_model_v1(draft))
                            if self._graph_verifier is not None else None)
+            from .artifact_goal_barrier_v1 import observe_current_artifact_goal_target_v1
+            goal_target = (observe_current_artifact_goal_target_v1(self._graph_verifier,
+                model_service=self, credential=credential, subject=subject, holder=holder,
+                intent=draft, expected_anchor=expected_anchor)
+                if scope_observation_required else None)
             if reply_scope is not None and installation_id != reply_scope.service.installation_id:
                 raise AuthorityUnavailable("model preparation crossed its installed reply scope")
             with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
@@ -652,6 +705,9 @@ class AuthorityV2ModelEgressService:
                 if anchor != expected_anchor:
                     raise AuthorityUnavailable("model egress anchor changed")
                 self._require_reply_scope_in_tx_v1(db, reply_scope, anchor, action="model_prepare")
+                from .artifact_goal_barrier_v1 import require_model_artifact_goal_not_cancelled_in_tx_v1
+                require_model_artifact_goal_not_cancelled_in_tx_v1(db, model_service=self,
+                    target=goal_target, action="model_prepare")
                 old = self._store._read(db, draft.call_id)
                 job_row = db.execute(
                     "SELECT call_id FROM authority_model_egress_v1 WHERE namespace=? "
@@ -980,6 +1036,8 @@ class AuthorityV2ModelEgressService:
             # No journal or Authority lock is held during this independent read.
             location_observation = None
             reply_scope = None
+            goal_target = None
+            d07_source_material = None
             try:
                 if scope_observation_required:
                     scope_observation.enter_context(
@@ -997,25 +1055,37 @@ class AuthorityV2ModelEgressService:
                     if (reply_scope is not None and admission is not None
                             and admission.installation_id != reply_scope.service.installation_id):
                         raise AuthorityUnavailable("model admission crossed its installed reply scope")
+                if scope_observation_required:
+                    from .artifact_goal_barrier_v1 import observe_current_artifact_goal_target_v1
+                    goal_target = observe_current_artifact_goal_target_v1(self._graph_verifier,
+                        model_service=self, credential=credential, subject=subject, holder=holder,
+                        intent=intent, expected_anchor=expected_anchor, permit=permit)
                 if self._source_location is not None:
                     location_observation = self._source_location.observe_business_for_fence_v1(
                         credential=credential, subject=subject, permit=permit)
                 elif deletion_history:
                     raise AuthorityUnavailable("installed post-erasure model location unavailable")
+                if type(request) is ModelCallRequest and request.identity.phase == "d07.cognition":
+                    from .owner_location_read_v3 import current_d07_model_policy_source_v3
+                    d07_source_material=scope_observation.enter_context(current_d07_model_policy_source_v3(
+                        self,credential=credential,subject=subject,intent=intent,permit=permit,
+                        location_observation=location_observation))
                 graph_current = self._graph_verifier is not None
                 if graph_current:
                     if location_observation is None:
                         graph_current = self._graph_verifier.complete_graph_current(
-                            intent, model_service=self, credential=credential, subject=subject, permit=permit) is True
+                            intent, model_service=self, credential=credential, subject=subject, permit=permit,
+                            d07_source_material=d07_source_material) is True
                     else:
                         graph_current = self._graph_verifier.complete_graph_current(
                             intent, source_location=self._source_location,
                             location_observation=location_observation, model_service=self,
-                            credential=credential, subject=subject, permit=permit) is True
+                            credential=credential, subject=subject, permit=permit,
+                            d07_source_material=d07_source_material) is True
             except Exception:
                 graph_current = False
             try:
-                policy_current = self._admin_model_matches(intent, request)
+                policy_current = self._admin_model_matches(intent, request,d07_source_material=d07_source_material)
             except Exception:
                 policy_current = False
             if not graph_current or not policy_current:
@@ -1026,6 +1096,8 @@ class AuthorityV2ModelEgressService:
                     raise AuthorityUnavailable("HOLD: complete current model graph is unavailable")
                 raise AuthorityUnavailable("HOLD: independent administrator model policy is unavailable")
             try:
+                if d07_source_material is not None:
+                    d07_source_material.require_for_observer_v3(d07_source_material.work)
                 with self._fences._frozen() as (db, deletion_head, execution_head,
                                                deletion_history):
                     anchor = self._fences._current_locked(
@@ -1039,6 +1111,9 @@ class AuthorityV2ModelEgressService:
                     if location_observation is not None:
                         self._source_location.require_current_in_tx_v1(db, location_observation)
                     self._require_reply_scope_in_tx_v1(db, reply_scope, anchor, action="model_admit")
+                    from .artifact_goal_barrier_v1 import require_model_artifact_goal_not_cancelled_in_tx_v1
+                    require_model_artifact_goal_not_cancelled_in_tx_v1(db, model_service=self,
+                        target=goal_target, action="model_admit")
                     from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
                     require_lifecycle_admission_in_tx_v1(db, intent.namespace, action="first_model_dispatch")
                     from .model_capacity_v1 import require_model_capacity_locked_v1
@@ -1140,7 +1215,7 @@ class AuthorityV2ModelEgressService:
             saved, report_digest, receipt = self._store.read_admission_locked(db, intent)
             if saved != admission:
                 raise AuthorityUnavailable("original model admission differs")
-            if type(self._admin_model_policy) is AdminModelWorkflowsV7 and intent.job_id.startswith('natural-generation-job:'):
+            if type(self._admin_model_policy) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} and intent.job_id.startswith('natural-generation-job:'):
                 if self._d13_provider_http_counter_v1 is None:
                     raise AuthorityUnavailable('V7 completion requires actual installed HTTP original verifier')
                 from .d13_provider_http_admission_v1 import require_recorded_provider_http_binding_v1
@@ -1200,6 +1275,78 @@ class AuthorityV2ModelEgressService:
         raise AuthorityUnavailable(
             "HOLD: independent provider observation and fenced finish are not integrated"
         )
+
+
+    def close_prepared_no_dispatch_witness_v1(self, *, credential, subject, request):
+        """Core closure observes no Source content and asserts no D08 cancellation."""
+        from dataclasses import asdict
+        from hashlib import sha256
+        from .v2_model_egress_contract import (
+            ModelNoDispatchClosureRequestV1, ModelNoDispatchWitnessV1, MODEL_NO_DISPATCH_SIGN_KIND_V1)
+        from .v2_model_egress_store import (
+            read_model_no_dispatch_witness_locked_v1, record_model_no_dispatch_witness_locked_v1)
+        from .v2_model_egress_wire import from_wire, to_wire
+        from .v2_contract import to_wire as permit_to_wire
+        from ..runtime_contracts import canonical_serialize
+        if (self._fences is None or type(request) is not ModelNoDispatchClosureRequestV1
+                or (subject, request.intent.namespace) != (request.intent.subject, self._fences.namespace)
+                or self._graph_verifier is None):
+            raise AuthorityUnavailable("exact installed original model closure required")
+        self._fences.core._require(credential, "model_egress", self._fences.namespace, request.holder)
+        signer = self._graph_verifier._issuer._signer
+        with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            anchor = self._fences._current_locked(db, deletion_head, execution_head,
+                holder=request.holder, generation=request.expected_anchor.activation_generation)
+            if anchor != request.expected_anchor:
+                raise AuthorityUnavailable("original model closure current anchor changed")
+            intent = request.intent
+            original = self._store.lookup_original_locked(db, authority_id=intent.authority_id,
+                namespace=intent.namespace, installation_id=request.installation_id, job_id=intent.job_id,
+                acquire_operation_id=intent.acquire_operation_id, operation_id=intent.operation_id,
+                call_id=intent.call_id, request_digest=intent.request_digest, binding_digest=intent.binding_digest)
+            if original is None or original.intent != intent or original.state != "prepared" or original.observation_digest is not None:
+                raise AuthorityUnavailable("admitted, dispatched or unknown original cannot become no-dispatch")
+            row = self._fences.fences._row(db, intent.operation_id)
+            if row is None or row[10] is not None or not self._store.is_fence_bound_locked(db, intent):
+                raise AuthorityUnavailable("original model closure lacks its exact nonpending fence")
+            permit = self._fences.fences._permit(row)
+            if (permit.holder != request.holder or db.execute("SELECT 1 FROM authority_model_admissions_v2 WHERE call_id=?",
+                    (intent.call_id,)).fetchone() is not None
+                    or db.execute("SELECT 1 FROM authority_model_egress_observation_status_v1 WHERE call_id=?",
+                        (intent.call_id,)).fetchone() is not None
+                    or db.execute("SELECT 1 FROM authority_model_egress_observations_v1 WHERE call_id=?",
+                        (intent.call_id,)).fetchone() is not None):
+                raise AuthorityUnavailable("actual original admission/observation exists; no zero witness")
+            saved = read_model_no_dispatch_witness_locked_v1(self._store, db, request=request, signer=signer)
+            expected_finish = self._fences.fences.model_terminal_finish_digest(intent, permit, "not_dispatched")
+            if saved is not None:
+                if (row[6], row[8], row[9], row[10]) != ("finished", intent.call_id, expected_finish, None):
+                    raise AuthorityUnavailable("saved no-dispatch witness lost its actual Core finish")
+                if saved.original_permit != permit:
+                    raise AuthorityUnavailable("saved no-dispatch witness original permit changed")
+                return saved
+            before_row = self._store._read_ledger(db, intent.call_id)
+            self._fences.fences.finish_current_prepared_model_not_dispatched_locked(db, permit,
+                intent=intent, current_anchor=anchor, subject=subject, holder=request.holder)
+            after_row = self._fences.fences._row(db, intent.operation_id)
+            if (after_row[6], after_row[8], after_row[9], after_row[10]) != ("finished", intent.call_id, expected_finish, None):
+                raise AuthorityUnavailable("actual no-dispatch Core CAS did not finish")
+            epoch = db.execute("SELECT last_epoch FROM authority_v2_epochs WHERE namespace=?", (intent.namespace,)).fetchone()
+            if epoch is None: raise AuthorityUnavailable("actual original model namespace epoch absent")
+            unsigned = dict(request=to_wire(request), original_permit=permit_to_wire(permit),
+                namespace_epoch=epoch[0], prepared_row_commitment=canonical_digest(before_row),
+                finished_row_commitment=canonical_digest((after_row[:7], sha256(bytes(after_row[7])).hexdigest(), after_row[8:11])),
+                absence_scope_commitment=canonical_digest(("core.model-no-dispatch-absence.v1",
+                    intent.authority_id, intent.namespace, request.installation_id, intent.call_id,
+                    canonical_digest(asdict(intent)), "prepared", "no_admission", "no_observation", "no_pending",
+                    permit.token, permit.revision, epoch[0])),
+                before_anchor=asdict(anchor), after_anchor=asdict(anchor), finish_request_id=intent.call_id,
+                finish_digest=expected_finish, witness_operation_id="model-no-dispatch:" + request.identity_digest,
+                schema="sylanne3.authority.model-no-dispatch-witness.v1")
+            signature = signer.sign(MODEL_NO_DISPATCH_SIGN_KIND_V1, canonical_serialize(unsigned))
+            witness = from_wire({**unsigned, "signature": signature}, ModelNoDispatchWitnessV1)
+            return record_model_no_dispatch_witness_locked_v1(self._store, db, witness=witness)
+
 
 
 __all__ = ["AuthorityV2ModelEgressService"]

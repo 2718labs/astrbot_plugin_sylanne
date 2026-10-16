@@ -210,6 +210,18 @@ class TypeRegistry:
                         or not spec.immutable or spec.writer_domain != "d06"):
                     raise ValueError("sealed Source requires the exact registered SourceRecord schema")
                 return sealed
+        from .runtime.contact_plan_physical_write_v3 import contact_plan_sealed_value_v3
+        sealed_contact = contact_plan_sealed_value_v3(key,value)
+        if sealed_contact is not None:
+            from .domains.d08.contact_plan_v3 import KINDS,ELIGIBILITY
+            from .domains.d08.contact_plan_v2 import PLAN
+            from .runtime_contracts import schema_hash
+            version = 2 if key.type_name==PLAN else 3
+            if (key.type_name not in KINDS or spec.writer_domain != 'd08' or spec.schema_version!=version
+                    or spec.schema_hash!=schema_hash({'type':key.type_name,'version':version})
+                    or spec.immutable!=(key.type_name!=ELIGIBILITY)):
+                raise ValueError('Contact Plan3 seal requires its exact registered member family')
+            return sealed_contact
         detached = json_object(value)
         spec.validator(json_object(detached))
         return detached
@@ -378,6 +390,9 @@ class GraphWrite:
 
 def clone_graph_write_v3(write):
     """Detach an ordinary value or retain the issued full Source seal."""
+    from .runtime.contact_plan_physical_write_v3 import issued_contact_plan_graph_write_v3,clone_contact_plan_graph_write_v3
+    if issued_contact_plan_graph_write_v3(write):
+        return clone_contact_plan_graph_write_v3(write)
     if write.key.type_name == "memory.source":
         from .runtime.owner_material_source_storage_v3 import (
             issued_sealed_source_graph_write_v3, clone_sealed_source_graph_write_v3)

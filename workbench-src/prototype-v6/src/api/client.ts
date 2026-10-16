@@ -1,4 +1,7 @@
 import {operationIdV1} from './browser-crypto.ts'
+import {validateSelfViewProjection,type SelfViewProjection} from './conditioned-self.ts'
+import {BETA1_OPERATIONS,validateBeta1Input,validateBeta1Receipt,validateBeta1State,type Beta1Kind,type Beta1Input,type Beta1Domain} from './beta1-owner.ts'
+import { validateGeneralGrowthInput, validateGeneralGrowthReceipt, type GeneralGrowthKind, type GeneralGrowthInput, type GeneralGrowthReceipt } from './general-growth.ts'
 import { OWNER_TASK_ACTION, OWNER_MATERIAL_ACTION, ownerMaterialInputDigest, validateOwnerMaterialText, validateOwnerMaterialStatus, validateOwnerMaterialReceipt, type OwnerMaterialStatus, OwnerTaskContractError, validateOwnerTaskOptions, validateOwnerTaskRequest, validateOwnerTaskStatus, validateOwnerTaskReceipt, type OwnerTaskOptions, type OwnerTaskRequest, type OwnerTaskStatus, type OwnerTaskReceipt } from './owner-source-note-task.ts'
 import { MANAGEMENT_PREFIX, LOG_LIMIT, MANAGEMENT_RESPONSE_MAX_BYTES, ManagementContractError, managementRequest, binding, validateCapabilities, validateManagementProblem, validateLogFilter, validateLogPage, validateSettings, validateReceipt, type ManagementCapabilities, type LogFilter, type LogPage, type SettingsSnapshot, type SettingsReceipt } from './management.ts'
 import { SETUP_PREFIX, SETUP_RESPONSE_MAX_BYTES, validateSetupStatus, type SetupStatus } from './setup.ts'
@@ -184,12 +187,12 @@ export class WorkbenchApi {
       throw new WorkbenchApiError('无法连接本地后端。没有显示缓存或示例角色。', { code: 'network_unavailable', retryable: true })
     } finally { if (timer) clearTimeout(timer); if (abortListener) abort.signal.removeEventListener('abort', abortListener); this.#requests.delete(abort); this.#managementRequests.delete(abort); this.#setupRequests.delete(abort); this.#creatorRequests.delete(abort) }
   }
-  #creatorPayload(action:string,scope:string,input:object,operationId:string,purpose:'workbench_user_action'|'workbench_view'){
+  #creatorPayload(action:string,scope:string,input:object,operationId:string,purpose:'workbench_user_action'|'workbench_view'|'consolidation'|'context'|'expression'){
     const payload={schema_version:'d12.contract.v1',action,scope,purpose,audience:'owner',operation_id:operationId,input}
     if(new TextEncoder().encode(JSON.stringify(payload)).byteLength>64*1024)throw new WorkbenchApiError('完整请求超过当前64KiB命令上限，未发送；不会截断原文。',{code:'invalid_input'})
     return payload
   }
-  async #creatorCommand(action:string,scope:string,input:object,operationId:string,purpose:'workbench_user_action'|'workbench_view'='workbench_user_action'){
+  async #creatorCommand(action:string,scope:string,input:object,operationId:string,purpose:'workbench_user_action'|'workbench_view'|'consolidation'|'context'|'expression'='workbench_user_action'){
     if(!UUID4.test(operationId))invalid()
     makeReadCommand('open_workspace',scope)
     const generation=this.#creatorGeneration
@@ -202,9 +205,64 @@ export class WorkbenchApi {
       if(!hasFields(body,['status'],['problem'])||!['stale','unavailable','partial','pending_confirmation','unauthorized'].includes(body.status)||!hasFields(body.problem,['code'],['retryable','message',...(action==='correct_or_edit'?['schema']:[])])||typeof body.problem.code!=='string'||!/^[A-Za-z0-9_.:-]{1,128}$/.test(body.problem.code))invalid()
       if(action==='correct_or_edit'&&body.problem.schema!==undefined&&body.problem.schema!=='d12.source_correction_response.v1')invalid()
       if(body.status==='unauthorized'){this.clearSession();throw responseError(403,body)}
-      throw new WorkbenchApiError(body.problem.code==='local_module_disabled'&&typeof body.problem.message==='string'?body.problem.message:'当前领域操作未完成。请按实际状态重新读取；不会自动重放。',{code:body.status==='stale'&&body.problem.code==='draft_current_basis_changed'?'creator_conflict':body.problem.code,status:0,retryable:body.problem.retryable===true})
+      throw new WorkbenchApiError((body.problem.code==='local_module_disabled'||body.problem.code==='joint_node_input_hold')&&typeof body.problem.message==='string'?body.problem.message:'当前领域操作未完成。请按实际状态重新读取；不会自动重放。',{code:body.status==='stale'&&body.problem.code==='draft_current_basis_changed'?'creator_conflict':body.problem.code,status:0,retryable:body.problem.retryable===true})
     }
     return body
+  }
+  async submitBeta1Owner(scope:string,kind:Beta1Kind,input:Beta1Input,operationId:string){
+    const request=validateBeta1Input(kind,input)
+    const body=await this.#creatorCommand('domain_'+kind,scope,request,operationId,BETA1_OPERATIONS[kind].purpose)
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateBeta1Receipt(body.receipt,kind,operationId)
+  }
+  async prepareJointCommand(scope:string,input:import('./beta1-owner.ts').JointCommandSelectionInput,operationId:string):Promise<import('./beta1-owner.ts').PreparedJointCommand>{
+    if(!['draft_file','contact'].includes(input.executor_kind)||![input.long_plan_ref,input.joint_plan_ref,input.node_id,input.input_original_ref].every(isText)||input.executor_kind==='draft_file'&&!isText(input.role_ref)||input.executor_kind==='contact'&&input.role_ref!==null)throw new WorkbenchApiError('请选择真实计划、节点、输入原件和角色。',{code:'invalid_input'})
+    const body=await this.#creatorCommand('prepare_current_joint_window_command_v1',scope,{...input},operationId,'context')
+    if(!hasFields(body,['status','projection'])||!hasFields(body.projection,['schema','scope','operation_id','prepared'])||body.projection.schema!=='d12.prepared-joint-command-view.v1'||body.projection.scope!==scope||body.projection.operation_id!==operationId)invalid()
+    const value=body.projection.prepared
+    if(!hasFields(value,['schema','selection','request','digest'])||value.schema!=='d12.prepared-joint-command.v1'||!hasFields(value.selection,['long_plan_ref','joint_plan_ref','node_id','executor_kind','input_original_ref','role_ref'])||!hasFields(value.request,['command'])||!hasFields(value.request.command,['binding'])||!isRecord(value.request.command.binding)||!isText(value.digest)||!/^[0-9a-f]{64}$/.test(value.digest))invalid()
+    const selection=value.selection
+    if(Object.entries(input).some(([key,selected])=>selection[key]!==selected))invalid()
+    return {schema:'d12.prepared-joint-command.v1',selection:{...input},request:value.request,digest:value.digest}
+  }
+  async freezeNamedJointCommand(scope:string,prepared:import('./beta1-owner.ts').PreparedJointCommand,operationId:string):Promise<import('./beta1-owner.ts').FrozenJointCommandReceipt>{
+    const input=prepared.selection
+    const body=await this.#creatorCommand('freeze_current_joint_window_command_v1',scope,{prepared},operationId,'context')
+    if(!hasFields(body,['status','receipt'])||!hasFields(body.receipt,['schema','operation_id','actual_operation_id','command_original_ref','command_original_digest','node_id','executor_kind','typed_input_original_ref','typed_input_original_digest','typed_request_digest','original_digest','original']))invalid()
+    const value=body.receipt
+    if(value.schema!=='d12.frozen-joint-command-receipt.v1'||value.operation_id!==operationId||value.node_id!==input.node_id||value.executor_kind!==input.executor_kind||value.typed_input_original_ref!==input.input_original_ref||!isText(value.actual_operation_id)||!isText(value.command_original_ref)||!isRecord(value.original)||![value.command_original_digest,value.typed_input_original_digest,value.typed_request_digest,value.original_digest].every(v=>typeof v==='string'&&/^[0-9a-f]{64}$/.test(v)))invalid()
+    return {operationId,actualOperationId:value.actual_operation_id,commandOriginalRef:value.command_original_ref,commandOriginalDigest:String(value.command_original_digest),nodeId:input.node_id,executorKind:input.executor_kind,typedInputOriginalRef:input.input_original_ref,typedInputOriginalDigest:String(value.typed_input_original_digest),typedRequestDigest:String(value.typed_request_digest),originalDigest:String(value.original_digest)}
+  }
+  async prepareNamedJointNode(scope:string,windowRef:string,nodeId:string,operationId:string){
+    if(!isText(windowRef)||!isText(nodeId))throw new WorkbenchApiError('请选择已独立读取的实际窗口节点。',{code:'invalid_input'})
+    const body=await this.#creatorCommand('prepare_current_joint_window_node_v1',scope,{window_ref:windowRef,node_id:nodeId},operationId,'context')
+    if(!hasFields(body,['status','receipt'])||!hasFields(body.receipt,['schema','operation_id','actual_operation_id','window_ref','node_id','command_original_ref','command_original_digest','original_digest','original']))invalid()
+    const receipt=body.receipt
+    if(receipt.schema!=='d12.named-joint-node-receipt.v1'||receipt.operation_id!==operationId||receipt.window_ref!==windowRef||receipt.node_id!==nodeId||!isText(receipt.actual_operation_id)||!isText(receipt.command_original_ref)||!isText(receipt.command_original_digest)||!isText(receipt.original_digest)||!/^[0-9a-f]{64}$/.test(receipt.original_digest)||!/^[0-9a-f]{64}$/.test(receipt.command_original_digest)||!isRecord(receipt.original))invalid()
+    return {operationId,actualOperationId:receipt.actual_operation_id,originalDigest:receipt.original_digest,commandOriginalRef:receipt.command_original_ref}
+  }
+  async readBeta1OwnerState(scope:string,domain:Exclude<Beta1Domain,'self'>,refs:string[]){
+    if(!['world','habit','long_window'].includes(domain)||refs.length<1||refs.length>16||new Set(refs).size!==refs.length||!refs.every(isText))throw new WorkbenchApiError('请选择1至16个当前对象引用。',{code:'invalid_input'})
+    const operationId=operationIdV1()
+    const body=await this.#creatorCommand('read_beta1_owner_state_v1',scope,{domain,refs},operationId,'context')
+    if(!hasFields(body,['status','projection']))invalid()
+    const result=validateBeta1State(body.projection,scope,domain,operationId)
+    if(result.items.some(item=>!refs.includes(item.ref))||new Set(result.items.map(item=>item.ref)).size!==result.items.length||result.coverage==='complete'&&(result.items.length!==refs.length||result.missing_inputs.length>0))invalid()
+    return result
+  }
+  async readCurrentSelfView(scope:string,blockIds:string[]=[]):Promise<SelfViewProjection>{
+    if(blockIds.length>32||new Set(blockIds).size!==blockIds.length||!blockIds.every(isText))
+      throw new WorkbenchApiError('请选择至多32个不重复的实际角色块。',{code:'invalid_input'})
+    const operationId=operationIdV1()
+    const body=await this.#creatorCommand('read_current_self_view_v4',scope,{request:{block_ids:blockIds}},operationId,'consolidation')
+    if(!hasFields(body,['status','projection']))invalid()
+    return validateSelfViewProjection(body.projection,scope,operationId)
+  }
+  async submitGeneralGrowth<K extends GeneralGrowthKind>(scope:string,kind:K,input:GeneralGrowthInput<K>,operationId:string):Promise<GeneralGrowthReceipt>{
+    const request=validateGeneralGrowthInput(kind,input)
+    const body=await this.#creatorCommand('domain_'+kind,scope,request,operationId,'consolidation')
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateGeneralGrowthReceipt(body.receipt,kind,operationId)
   }
   #creatorValidate<T>(validate:()=>T):T{try{return validate()}catch(error){if(error instanceof CreatorContractError)invalid();throw error}}
   readConfigurationDraft(scope:string):Promise<CreatorConfiguration>{

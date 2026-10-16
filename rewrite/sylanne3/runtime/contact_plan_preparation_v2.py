@@ -56,12 +56,19 @@ def prepare_contact_plan_in_transaction_v2(db, *, frame, request, installed_read
     ids = contact_ids_v1(ns, cause.original_ref, route.target_entity_ref, "private_text")
     expires = min(frame.envelope.deadline_utc, opportunity.value["expires_at"],
         inputs.candidate.check.valid_until, grant.valid_until_utc)
+    from .contact_initial_plan_source_v3 import initial_contact_plan_business_deadline_v3
+    business_deadline=initial_contact_plan_business_deadline_v3(db,frame,request,opportunity,inputs,grant)
+    if business_deadline is not None:expires=business_deadline
     if expires <= now + generation.timeout_seconds + review.timeout_seconds:
         raise MissingProductionOriginalV1("contact_two_stage_deadline")
     guard = frame.envelope.version_guard
-    candidate = prepare_qualified_expression_unit(frame.snapshot, namespace=ns,
+    from .contact_initial_plan_source_v3 import initial_contact_expression_kwargs_v3
+    material_kwargs=initial_contact_expression_kwargs_v3(db)
+    projection=frame.snapshot if material_kwargs is None else material_kwargs['prepared_source_material'].work.projection
+    candidate = prepare_qualified_expression_unit(projection, namespace=ns,
         request=QualifiedExpressionRequest(source.key.token, "attributed_report", SourceTextSpan(0, len(source_record.text))),
-        audiences=(audience,), access_epoch=guard.access_epoch, deletion_epoch=guard.delete_epoch, valid_until=expires)
+        audiences=(audience,), access_epoch=guard.access_epoch, deletion_epoch=guard.delete_epoch, valid_until=expires,
+        **({} if material_kwargs is None else material_kwargs))
     versions = {row.key.token: row.revision for row in candidate.read_versions}
     unit = QualifiedExpressionUnitV2("basis:contact-source", ClaimKind.REPORTED_CLAIM, candidate.source_excerpt, None,
         tuple(VersionedRef(ref, versions[ref]) for ref in candidate.lineage_source_refs),

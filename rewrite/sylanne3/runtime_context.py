@@ -8,6 +8,7 @@ from .host.model_workflows_v4 import AdminModelWorkflowsV4
 from .host.model_workflows_v5 import AdminModelWorkflowsV5
 from .host.model_workflows_v6 import AdminModelWorkflowsV6
 from .host.model_workflows_v7 import AdminModelWorkflowsV7
+from .host.model_workflows_v8 import AdminModelWorkflowsV8
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -448,6 +449,7 @@ class RuntimeContext:
         self._worker: GraphWorker | None = None
         self._v2_artifact_draft_model_runtime_v1 = None
         self._artifact_draft_resume_task_v1 = None
+        self._artifact_no_dispatch_deadline_handle_v1 = None
         self._artifact_draft_rescan_requested_v1 = False
         self._artifact_draft_active_cycles_v1 = set()
         self._artifact_draft_stopping_v1 = False
@@ -473,6 +475,11 @@ class RuntimeContext:
         self._domain_followup_task = None
         self._domain_followup_stopping = False
         self._domain_followup_rescan_requested = False
+        self._contact_background_task = None
+        self._contact_background_stopping = False
+        self._contact_background_rescan_requested = False
+        self._contact_background_host = None
+        self._contact_background_last_status = None
         self._host_lifecycle_observer = None
         self._host_lifecycle_startup_task = None
         self._host_lifecycle_startup_receipt = None
@@ -480,6 +487,13 @@ class RuntimeContext:
         self._offline_recovery_task = None
         self._offline_recovery_stopping = False
         self._offline_recovery_last_status = None
+        self._habit_occurrence_port_v1 = None
+        self._habit_schedule_driver_v1 = None
+        self._semantic_recovery_task_v1 = None
+        self._semantic_recovery_stopping_v1 = False
+        self._semantic_recovery_rescan_requested_v1 = False
+        self._semantic_recovery_last_status_v1 = None
+        self._semantic_recovery_first_failure_v1 = None
         self._lifecycle_bootstrap_original = None
         self._v2_provision: Callable | None = None
         self._v2_ingress: Callable | None = None
@@ -502,6 +516,15 @@ class RuntimeContext:
         self._lock = asyncio.Lock()
         self._d04_numeric_tasks: dict[str, asyncio.Task] = {}
         self._d04_numeric_attempted: set[str] = set()
+        self._personal_eligibility_executor_v1 = None
+        self._personal_eligibility_semaphore_v1 = asyncio.Semaphore(1)
+        self._personal_eligibility_tasks_v1 = set()
+        self._owner_source_note_tasks_v1 = {}
+        self._owner_source_note_scan_v1 = None
+        self._owner_source_note_stopping_v1 = False
+        self._owner_source_note_last_status_v1 = None
+        self._personal_domain_mesh_catalog_v1 = ()
+        self._personal_eligibility_stopping_v1 = False
         self._d04_numeric_semaphore = asyncio.Semaphore(1)
         self._d04_numeric_stopping = False
         self._d04_numeric_scan_task: asyncio.Task | None = None
@@ -521,9 +544,12 @@ class RuntimeContext:
                 return self.health
             if self._worker is not None:
                 return self.health
+            self._owner_source_note_stopping_v1 = False
+            self._personal_eligibility_stopping_v1 = False
             self._d04_numeric_stopping = False
             self._domain_followup_stopping = False
             self._domain_followup_rescan_requested = False
+            self._contact_background_stopping = False
             self._d04_numeric_attempted.clear()
             if self._store is not None:
                 return self.health
@@ -559,7 +585,7 @@ class RuntimeContext:
                 policy.manifest_digest,
                 available_cpu_features=installation.available_cpu_features,
             )
-            if not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}:
+            if not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}:
                 self.health = RuntimeHealth(
                     "blocked", ("installed_package",),
                     package.reason if not package.verified else "formal-alpha1 package required",
@@ -641,7 +667,7 @@ class RuntimeContext:
                         grant=client_grant, owner_loop=loop)
                     workflows = bundle.model_workflows
                     if (bundle.installation_policy == policy
-                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                             and type(workflows.natural_generation)
                             is AdminModelWorkflowV2
                             and type(workflows.natural_review)
@@ -804,7 +830,7 @@ class RuntimeContext:
                 body_quote_authority = _installed_body_quote_authority_v1(installation)
                 c04_cpu_quote_authority = _installed_c04_cpu_quote_authority_v1(installation)
                 counter_cpu_quote_authority = None
-                if type(bundle.model_workflows) is AdminModelWorkflowsV7:
+                if type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
                     from .runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
                     counter_cpu_quote_authority = D13CounterCpuQuotePolicyAuthorityV1(hmac.digest(
                         installation.d11_signing_key,
@@ -838,7 +864,7 @@ class RuntimeContext:
                 workflows = (bundle.model_workflows
                              if type(bundle) is AdminInstallationBundle else None)
                 workflow = (workflows.encode
-                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7) else None)
+                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8) else None)
                 if (type(workflow) is AdminModelWorkflowV2
                         and bundle.installation_policy == policy
                         and bundle.ingress_encoding == installation.ingress_encoding
@@ -950,8 +976,10 @@ class RuntimeContext:
                 d12_backend_port = install_d12_services_v1(coordinator, bootstrap=bootstrap)
                 if counter_cpu_quote_authority is not None:
                     coordinator.install_d13_counter_cpu_quote_authority_v1(bootstrap, counter_cpu_quote_authority)
+                from .runtime.contact_effect_accounting_v1 import install_contact_effect_runtime_v1
+                install_contact_effect_runtime_v1(coordinator, bootstrap, bundle, port)
                 if bundle.model_workflows.contact_generation is not None:
-                    if type(bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+                    if type(bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
                         coordinator.install_contact_model_runtime_v2(bootstrap, bundle)
                     else:
                         coordinator.install_contact_model_runtime_v1(bootstrap, bundle)
@@ -962,7 +990,7 @@ class RuntimeContext:
                 selection = self._model_selection_port
                 if (type(selection) is InstalledModelCapabilityPort
                         and type(bundle) is AdminInstallationBundle
-                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                         and selection._installation_bundle is bundle
                         and selection._installed_namespace == policy.namespace
                         and selection._host_loop is natural_owner_loop
@@ -1058,12 +1086,14 @@ class RuntimeContext:
             self._v2_authority_client = natural_authority_client
             self._v2_authority_client_grant = natural_client_grant
             self._v2_authority_loop = natural_owner_loop
-            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                     and (bundle.model_workflows.d07_cognition is not None
-                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                              and bundle.model_workflows.d07_relationship_cognition is not None)
-                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV6, AdminModelWorkflowsV7)
-                             and bundle.model_workflows.growth_cognition is not None))
+                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                             and bundle.model_workflows.growth_cognition is not None)
+                          or (type(bundle.model_workflows) is AdminModelWorkflowsV8
+                              and bundle.model_workflows.general_growth_cognition is not None))
                     and type(natural_authority_client) is AuthorityClient
                     and natural_owner_loop is asyncio.get_running_loop()):
                 from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
@@ -1078,7 +1108,7 @@ class RuntimeContext:
                     graph._GraphCoordinator__body_quote_authority = service.body_authority
                     return service
                 self._v2_d07_execution_service = await self._worker.call(install_d07)
-            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                     and bundle.artifact_draft is not None and bundle.foreground is not None
                     and type(natural_authority_client) is AuthorityClient
                     and type(natural_client_grant) is InstallationGrantV2
@@ -1097,16 +1127,21 @@ class RuntimeContext:
                 def wake():
                     owner_loop.call_soon_threadsafe(self.resume_pending_domain_followups_v1, installation)
                     owner_loop.call_soon_threadsafe(self.resume_pending_artifact_drafts_v1, installation)
+                    owner_loop.call_soon_threadsafe(self.resume_pending_owner_source_note_tasks_v1, installation)
+                    owner_loop.call_soon_threadsafe(self.resume_semantic_recovery_v1)
+                    owner_loop.call_soon_threadsafe(self.notify_habit_subscriptions_v1)
                 graph._GraphCoordinator__domain_followup_wake_v1 = wake
                 graph._GraphCoordinator__host_lifecycle_wake_v1 = lambda: owner_loop.call_soon_threadsafe(
                     self.resume_host_lifecycle_observation_v1)
                 graph._GraphCoordinator__offline_recovery_wake_v1 = lambda: owner_loop.call_soon_threadsafe(
                     self.resume_offline_recovery_v1)
             await self._worker.call(install_followup_wake)
+            self.resume_pending_owner_source_note_tasks_v1(installation)
             from .runtime.d11_host_lifecycle_v1 import InstalledHostLifecycleObserverV1
             self._host_lifecycle_observer = InstalledHostLifecycleObserverV1(self)
             self._host_lifecycle_startup_receipt = None
             self._offline_recovery_stopping = False
+            self._semantic_recovery_stopping_v1 = False
             self._v2_natural_generation_output_bound = (
                 natural_generation_output_port is not None)
             self._v2_natural_generation_content_bound = (
@@ -1270,6 +1305,8 @@ class RuntimeContext:
             return verified, writer
 
     async def uninstall_final_handoff_pairing_v1(self) -> None:
+        self._contact_background_stopping = True
+        self._contact_background_host = None
         async with self._lock:
             lease, self._final_claim_lease = self._final_claim_lease, None
             self._final_claim_authority = None
@@ -1484,16 +1521,22 @@ class RuntimeContext:
             authority, lease, writer = await worker.call(install)
         except Exception as exc:
             return ContactDispatchResultV3('hold', str(exc))
+        dispatch_result = None
         try:
             continuation = InstalledContactContinuationV3(worker=worker, authority=authority,
                 local_module_admission=self.local_module_admission,
                 lease=lease, fence_port=port, policy=policy, grant=grant, server=server,
                 claim_writer=writer, context=context, candidates=candidates,
                 clock_policy=bundle.ingress_clock)
-            return await ContactDispatchDriverV3(worker, authority, lease, continuation).run_once(
+            dispatch_result = await ContactDispatchDriverV3(worker, authority, lease, continuation).run_once(
                 operation_id=operation_id)
+            return dispatch_result
         finally:
-            await worker.call(lambda graph: graph.release_authority_lease(bootstrap, lease))
+            try:
+                await worker.call(lambda graph: graph.release_authority_lease(bootstrap, lease))
+            except BaseException:
+                if dispatch_result is not None: dispatch_result.release_v3()
+                raise
 
     def queue_post_c02_numeric_v3(self, installation, *, c02_operation_id, source_ref):
         """Wake one bounded stage from its already adopted appraisal original."""
@@ -1561,6 +1604,125 @@ class RuntimeContext:
                 asyncio.get_running_loop().call_soon(self.resume_pending_d04_numeric_v3, installation)
         self._d04_numeric_scan_task = asyncio.create_task(scan())
 
+    def install_contact_background_host_v1(self, installation, *, context, server, listener, candidates):
+        from .host.reverse_handoff import HostReverseGraphClaimServer
+        from .host.scene_candidates import SceneCandidateCatalog
+        if (installation.admin_bundle is not self._v2_model_bundle
+                or type(server) is not HostReverseGraphClaimServer or type(candidates) is not SceneCandidateCatalog
+                or not isinstance(listener, asyncio.AbstractServer) or not listener.is_serving()
+                or server.profile is not installation.reverse_handoff.profile
+                or self._final_claim_writer is None):
+            raise ValueError('Contact background requires the actual installed serving Host handoff')
+        self._contact_background_stopping = False
+        self._contact_background_host = (context,server,listener,candidates)
+        self.resume_pending_contact_background_v1(installation)
+
+    def resume_pending_contact_background_v1(self, installation):
+        if (self._contact_background_stopping or self._worker is None or self._contact_background_host is None
+                or installation.admin_bundle is not self._v2_model_bundle
+                or installation.admin_bundle.model_workflows.contact_generation is None
+                or installation.admin_bundle.model_workflows.contact_review is None):
+            return
+        if self._contact_background_task is not None and not self._contact_background_task.done():
+            self._contact_background_rescan_requested = True
+            return
+        self._contact_background_rescan_requested = False
+        async def consume():
+            from .host.installed_contact_background_driver_v1 import run_contact_background_page_v1
+            cursor = None
+            try:
+                while not self._contact_background_stopping:
+                    result = await run_contact_background_page_v1(self,installation,self._contact_background_host,after=cursor)
+                    self._contact_background_last_status = result
+                    if result['next_after'] is None:
+                        break
+                    cursor = result['next_after']
+                    await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._contact_background_last_status = {'status':'held','error_code':type(exc).__name__}
+            finally:
+                self._contact_background_task = None
+                if self._contact_background_rescan_requested and not self._contact_background_stopping:
+                    asyncio.get_running_loop().call_soon(self.resume_pending_contact_background_v1,installation)
+        self._contact_background_task = asyncio.create_task(consume())
+
+    async def _start_habit_schedule_v1(self):
+        if self._habit_occurrence_port_v1 is None or self._habit_schedule_driver_v1 is not None:
+            return
+        from .runtime.habit_schedule_driver_v1 import InstalledHabitScheduleDriverV1
+        driver = InstalledHabitScheduleDriverV1(self)
+        self._habit_schedule_driver_v1 = driver
+        await driver.start_v1()
+
+    def notify_habit_subscriptions_v1(self):
+        driver = self._habit_schedule_driver_v1
+        if driver is not None:
+            driver.notify_v1()
+
+    def resume_semantic_recovery_v1(self):
+        """Observe one fixed watermark through EOF; only a genuine notice starts another sweep."""
+        if (self._worker is None or self._semantic_recovery_stopping_v1
+                or not self._v2_namespace_provisioned
+                or self.health.status not in {'ready', 'limited'}):
+            return
+        if self._semantic_recovery_task_v1 is not None and not self._semantic_recovery_task_v1.done():
+            self._semantic_recovery_rescan_requested_v1 = True
+            return
+        self._semantic_recovery_rescan_requested_v1 = False
+
+        async def observe():
+            from .graph_worker import OwnedGraphStorageResultV3
+            from .runtime.domain_mesh_continuation_read_v3 import (
+                SemanticRecoveryPageSelectorV1, SemanticRecoveryPageV1)
+            cursor, watermark = '', None
+            try:
+                while not self._semantic_recovery_stopping_v1 and self.health.status in {'ready', 'limited'}:
+                    selector = SemanticRecoveryPageSelectorV1(self._v2_namespace,
+                        self._v2_installation_grant.installation_id, cursor, watermark)
+                    owned = await self._worker.call(lambda graph, selected=selector:
+                        graph.read_semantic_recovery_page_v3(self, selected))
+                    if type(owned) is not OwnedGraphStorageResultV3:
+                        raise TypeError('semantic recovery requires its actual owned READ result')
+                    page, retention = owned.take_value_v3()
+                    owned = None
+                    try:
+                        if (type(page) is not SemanticRecoveryPageV1
+                                or page.namespace != self._v2_namespace or page.after_token != cursor
+                                or watermark is not None and page.through_token != watermark):
+                            raise ValueError('semantic recovery page changed its original namespace or sweep')
+                        watermark = page.through_token
+                        self._semantic_recovery_last_status_v1 = {
+                            'status': 'waiting_notice' if page.complete else 'observing',
+                            'after_token': cursor, 'through_token': watermark,
+                            'observed': len(page.observations), 'complete': page.complete}
+                        if page.complete:
+                            break
+                        if (type(page.next_token) is not str or page.next_token <= cursor
+                                or page.next_token > watermark):
+                            raise ValueError('semantic recovery page did not advance its fixed keyset')
+                        cursor = page.next_token
+                    finally:
+                        page = None
+                        retention.release()
+                    await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure = {'status': 'held', 'error_code': type(exc).__name__,
+                    'after_token': cursor, 'through_token': watermark}
+                self._semantic_recovery_last_status_v1 = failure
+                self._semantic_recovery_rescan_requested_v1 = False
+                if self._semantic_recovery_first_failure_v1 is None:
+                    self._semantic_recovery_first_failure_v1 = dict(failure)
+            finally:
+                self._semantic_recovery_task_v1 = None
+                if self._semantic_recovery_rescan_requested_v1 and not self._semantic_recovery_stopping_v1:
+                    asyncio.get_running_loop().call_soon(self.resume_semantic_recovery_v1)
+
+        self._semantic_recovery_task_v1 = asyncio.create_task(observe())
+
     def resume_pending_domain_followups_v1(self, installation):
         if self._domain_followup_stopping or self._worker is None:
             return
@@ -1578,7 +1740,7 @@ class RuntimeContext:
                         with store._lock:
                             return tuple(row[0] for row in store._db.execute(
                                 "SELECT dedupe_key FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? "
-                                "AND state IN ('pending','waiting') AND event_kind NOT IN ('artifact_task_wait_registered','artifact_task_amendment_adopted') "
+                                "AND state IN ('pending','waiting') AND event_kind NOT IN ('artifact_task_wait_registered','artifact_task_amendment_adopted','owner_source_note_task_submitted_v1') "
                                 "AND dedupe_key>? ORDER BY dedupe_key LIMIT 32",
                                 (*installation.installation_policy.namespace.as_tuple, cursor)))
                     keys = await self._worker.call(page)
@@ -1589,18 +1751,72 @@ class RuntimeContext:
                             break
                         try:
                             raw = await self._worker.call(lambda graph, selected=key: graph.consume_current_domain_followup_v1(
-                                self._v2_bootstrap, installation.admin_bundle, dedupe_key=selected))
-                            progress = self._consume_background_graph_result_v3(raw)
-                            from .runtime.domain_background_read_v3 import (
-                                BackgroundFollowupProgressV3, require_background_followup_progress_v3)
-                            if type(progress) is BackgroundFollowupProgressV3:
-                                progress = require_background_followup_progress_v3(progress)
-                                if progress.status == "child_ready":
-                                    from .runtime.domain_followup_consumer_v1 import consume_background_followup_child_v3
-                                    child = await self._worker.call(lambda graph, handoff=progress.handoff:
-                                        consume_background_followup_child_v3(graph, self._v2_bootstrap,
-                                            installation.admin_bundle, handoff=handoff))
-                                    self._consume_background_graph_result_v3(child)
+                                self._v2_bootstrap, installation.admin_bundle, dedupe_key=selected, context=self))
+                            from .graph_worker import OwnedGraphStorageResultV3
+                            retention = None
+                            if type(raw) is OwnedGraphStorageResultV3:
+                                progress, retention = raw.take_value_v3()
+                            else:
+                                progress = raw
+                            raw = None
+                            try:
+                                from .runtime.domain_background_read_v3 import (
+                                    BackgroundFollowupProgressV3, require_background_followup_progress_v3)
+                                from .runtime.current_conditioned_self_read_v3 import ConditionedFollowupPreparedV3
+                                from .runtime.habit_followup_source_v3 import HabitFollowupPreparedV3
+                                from .runtime.habit_maintenance_followup_v3 import HabitMaintenanceFollowupPreparedV3
+                                if type(progress) in {HabitFollowupPreparedV3,HabitMaintenanceFollowupPreparedV3}:
+                                    cancelled = asyncio.Event()
+                                    child_task = asyncio.create_task(self._consume_habit_followup_child_v3(
+                                        installation,progress,retention,cancelled))
+                                    retention = None
+                                    try:
+                                        await asyncio.shield(child_task)
+                                    except asyncio.CancelledError:
+                                        cancelled.set()
+                                        def drained_habit(task):
+                                            if not task.cancelled():
+                                                error = task.exception()
+                                                if error is not None:self._domain_followup_last_hold = type(error).__name__
+                                        child_task.add_done_callback(drained_habit)
+                                        raise
+                                elif type(progress) is ConditionedFollowupPreparedV3:
+                                    cancelled = asyncio.Event()
+                                    child_task = asyncio.create_task(self._consume_conditioned_followup_children_v3(
+                                        installation, progress, retention, cancelled))
+                                    retention = None
+                                    try:
+                                        await asyncio.shield(child_task)
+                                    except asyncio.CancelledError:
+                                        cancelled.set()
+                                        def drained(task):
+                                            if not task.cancelled():
+                                                error = task.exception()
+                                                if error is not None:
+                                                    self._domain_followup_last_hold = type(error).__name__
+                                        child_task.add_done_callback(drained)
+                                        raise
+                                elif type(progress) is BackgroundFollowupProgressV3:
+                                    progress = require_background_followup_progress_v3(progress)
+                                    await self._consume_joint_executor_wakes_v1(installation, progress)
+                                    if progress.status == "child_ready":
+                                        from .runtime.domain_followup_consumer_v1 import consume_background_followup_child_v3
+                                        child = await self._worker.call(lambda graph, handoff=progress.handoff:
+                                            consume_background_followup_child_v3(graph, self._v2_bootstrap,
+                                                installation.admin_bundle, handoff=handoff))
+                                        child_result = self._consume_background_graph_result_v3(child)
+                                        await self._consume_joint_executor_wakes_v1(installation, child_result)
+                                        if child_result.receipt is not None and child_result.receipt.get("coverage") == "complete":
+                                            self._domain_followup_rescan_requested = True
+                                        self.resume_pending_contact_background_v1(installation)
+                                        child_result = None
+                                        child = None
+                            finally:
+                                # The handoff shares the original payload retention.
+                                # Detach every consumer before ending that same lease.
+                                progress = None
+                                if retention is not None:
+                                    retention.release()
                         except Exception as exc:
                             self._domain_followup_last_hold = type(exc).__name__
                         cursor = key
@@ -1612,6 +1828,66 @@ class RuntimeContext:
                 if self._domain_followup_rescan_requested and not self._domain_followup_stopping:
                     asyncio.get_running_loop().call_soon(self.resume_pending_domain_followups_v1, installation)
         self._domain_followup_task = asyncio.create_task(consume())
+
+    async def _consume_habit_followup_child_v3(self, installation, prepared, retention, cancelled):
+        from .runtime.habit_followup_source_v3 import prepare_habit_followup_child_v3
+        from .graph_worker import OwnedGraphStorageResultV3
+        try:
+            if cancelled.is_set() or self._domain_followup_stopping:return
+            raw = await self._worker.call(lambda graph:
+                prepare_habit_followup_child_v3(graph,self,installation.admin_bundle,handoff=prepared))
+            child_retention = None
+            if type(raw) is OwnedGraphStorageResultV3:
+                receipt, child_retention = raw.take_value_v3()
+            else:
+                receipt = raw
+            raw = None
+            try:
+                if(type(receipt)is not dict or receipt.get('schema')!='sylanne.domain-production-receipt.v1'
+                        or receipt.get('operation_id')!=prepared.selector.operation_id or receipt.get('coverage')!='complete'):
+                    raise RuntimeError('Habit followup did not complete its exact frozen W01 phase')
+                await self._consume_joint_executor_wakes_v1(installation,receipt)
+                self._domain_followup_rescan_requested = True
+            finally:
+                receipt = None
+                if child_retention is not None:child_retention.release()
+        finally:
+            prepared = None
+            if retention is not None:retention.release()
+
+    async def _consume_conditioned_followup_children_v3(self, installation, prepared, retention, cancelled):
+        from .runtime.current_conditioned_self_read_v3 import (
+            conditioned_followup_pending_children_v3, prepare_current_conditioned_followup_child_v3)
+        from .graph_worker import OwnedGraphStorageResultV3
+        try:
+            pending = conditioned_followup_pending_children_v3(prepared, graph=self._v2_coordinator,
+                bootstrap=self._v2_bootstrap, bundle=installation.admin_bundle)
+            for child_id in pending:
+                if cancelled.is_set() or self._domain_followup_stopping:
+                    break
+                raw = await self._worker.call(lambda graph, handoff=prepared, selected=child_id:
+                    prepare_current_conditioned_followup_child_v3(graph, self._v2_bootstrap,
+                        installation.admin_bundle, handoff=handoff, child_id=selected))
+                child_retention = None
+                if type(raw) is OwnedGraphStorageResultV3:
+                    receipt, child_retention = raw.take_value_v3()
+                else:
+                    receipt = raw
+                raw = None
+                try:
+                    if (type(receipt) is not dict or receipt.get('schema') != 'sylanne.domain-production-receipt.v1'
+                            or receipt.get('operation_id') != child_id or receipt.get('coverage') != 'complete'):
+                        raise RuntimeError('conditioned child did not complete its actual finite W01 operation')
+                    await self._consume_joint_executor_wakes_v1(installation, receipt)
+                    self._domain_followup_rescan_requested = True
+                finally:
+                    receipt = None
+                    if child_retention is not None:
+                        child_retention.release()
+        finally:
+            prepared = None
+            if retention is not None:
+                retention.release()
 
     @staticmethod
     def _consume_background_graph_result_v3(result):
@@ -1763,7 +2039,9 @@ class RuntimeContext:
                 "limited", tuple(missing), detail,
             )
             if not owner_role:
+                await self._start_habit_schedule_v1()
                 self.resume_host_lifecycle_observation_v1()
+                self.resume_semantic_recovery_v1()
             return self.health
 
     @property
@@ -1914,13 +2192,14 @@ class RuntimeContext:
             authority_grant=self._v2_authority_client_grant,
             authority_loop=self._v2_authority_loop,
             backend_operation_port=self._v2_d12_backend_port,
-            package_maintenance_port=self._v2_package_maintenance_port)
+            package_maintenance_port=self._v2_package_maintenance_port,
+            runtime_context=self)
         from .workbench_api.owner_stop_reply_transport_v1 import InstalledOwnerReplyControlTransportV1
         transport = WorkbenchHttpTransport(
             service, sessions, BoundCsrfTokens() if csrf is None else csrf,
             TransportConfig(origin, self._package_root / "resources" / "workbench"),
             reply_controls=(InstalledOwnerReplyControlTransportV1(reply_control_port,
-                project_stop=self.project_owner_stop_reply_v1)
+                project_stop=self.project_owner_stop_reply_v1,goal_runtime=self)
                 if reply_control_port is not None else None))
         self._workbench_owner_sessions = (
             pairing if isinstance(pairing, BoundOwnerSessions) else None)
@@ -2551,7 +2830,7 @@ class RuntimeContext:
         if (type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy != policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or type(bundle.model_workflows.reply) is not AdminModelWorkflowV2):
             return None
         main = bundle.model_workflows.reply
@@ -3141,7 +3420,7 @@ class RuntimeContext:
                 or server.profile.namespace != policy.authority_namespace
                 or server.profile.installation_id != grant.installation_id
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3249,8 +3528,17 @@ class RuntimeContext:
             self._artifact_draft_rescan_requested_v1 = True
             return
         self._artifact_draft_rescan_requested_v1 = False
+        if self._artifact_no_dispatch_deadline_handle_v1 is not None:
+            self._artifact_no_dispatch_deadline_handle_v1.cancel()
+            self._artifact_no_dispatch_deadline_handle_v1 = None
         async def resume():
             try:
+                from .runtime.d11_artifact_draft_model_v1 import resume_original_artifact_no_dispatch_v1
+                delay = await resume_original_artifact_no_dispatch_v1(self._v2_artifact_draft_model_runtime_v1)
+                if delay is not None and not self._artifact_draft_stopping_v1:
+                    self._artifact_no_dispatch_deadline_handle_v1 = asyncio.get_running_loop().call_later(
+                        delay, self.resume_pending_artifact_drafts_v1, installation)
+                await self.resume_pending_owner_goal_cancellation_projections_v1(installation)
                 items = await self._worker.call(lambda graph: graph.discover_current_artifact_draft_resumes_v1(
                     self._v2_bootstrap, installation.admin_bundle))
                 for item in items:
@@ -3299,9 +3587,9 @@ class RuntimeContext:
                     if structure["status"] == "held":
                         return structure
                     if structure["status"] == "task_structure_prepared":
-                        await self._worker.call(lambda graph:
-                            graph.prepare_current_post_c02_artifact_phase_choice_v3(self._v2_bootstrap, installation.admin_bundle,
-                                c02_operation_id=c02_operation_id, source_ref=source_ref))
+                        from .runtime.personal_candidate_eligibility_v1 import run_installed_artifact_predecision_mesh_v1
+                        await run_installed_artifact_predecision_mesh_v1(self, installation,
+                            c02_operation_id=c02_operation_id, source_ref=source_ref)
             result = await self._run_post_c02_artifact_draft_once_v1(installation,
                 c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
             if result["status"] not in {"artifact_phase_file_structurally_verified", "artifact_phase_check_verified"}:
@@ -3649,7 +3937,7 @@ class RuntimeContext:
                 or type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3977,7 +4265,7 @@ class RuntimeContext:
         if (type(policy) is not AdminInstallationPolicy
                 or type(grant) is not InstallationGrantV2
                 or type(bundle) is not AdminInstallationBundle
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or type(bundle.model_workflows.natural_review)
                    is not AdminModelWorkflowV2
                 or generation_saved.seal.namespace != policy.namespace
@@ -5252,9 +5540,65 @@ class RuntimeContext:
             raise TypeError("ingress handler returned an invalid receipt")
         return receipt
 
+
+
+    def resume_pending_owner_source_note_tasks_v1(self, installation):
+        if self._owner_source_note_stopping_v1 or self._worker is None:
+            return
+        if self._owner_source_note_scan_v1 is not None and not self._owner_source_note_scan_v1.done():
+            return
+        async def scan():
+            try:
+                from .runtime.owner_source_note_task_driver_v1 import discover_owner_source_note_tasks_v1, drive_owner_source_note_task_v1
+                refs = await self._worker.call(lambda graph: discover_owner_source_note_tasks_v1(
+                    graph, self._v2_bootstrap, installation.admin_bundle))
+                for ref in refs:
+                    if self._owner_source_note_stopping_v1: break
+                    if ref in self._owner_source_note_tasks_v1: continue
+                    if len(self._owner_source_note_tasks_v1) >= 1: break
+                    async def run(selected=ref):
+                        try:
+                            result = await drive_owner_source_note_task_v1(self, installation, authorization_original_ref=selected)
+                            self._owner_source_note_last_status_v1 = result
+                        except asyncio.CancelledError: raise
+                        except Exception as error:
+                            self._owner_source_note_last_status_v1 = {"status": "held", "authorization_original_ref": selected,
+                                "reason_code": type(error).__name__}
+                        finally:
+                            self._owner_source_note_tasks_v1.pop(selected, None)
+                            if self._owner_source_note_last_status_v1 is not None and self._owner_source_note_last_status_v1.get('status') == 'completed':
+                                asyncio.get_running_loop().call_soon(self.resume_pending_owner_source_note_tasks_v1,installation)
+                    self._owner_source_note_tasks_v1[ref] = asyncio.create_task(run())
+            finally:
+                self._owner_source_note_scan_v1 = None
+        self._owner_source_note_scan_v1 = asyncio.create_task(scan())
+
+    async def run_personal_candidate_eligibility_wave_v1(self, installation, *, candidates,
+            c02_operation_id=None, source_ref=None, authorization_original_ref=None):
+        from .runtime.personal_candidate_eligibility_v1 import run_installed_personal_eligibility_wave_v1
+        task = asyncio.current_task()
+        if self._personal_eligibility_stopping_v1:
+            raise RuntimeError("installed eligibility mesh is draining")
+        self._personal_eligibility_tasks_v1.add(task)
+        try:
+            async with self._personal_eligibility_semaphore_v1:
+                return await run_installed_personal_eligibility_wave_v1(self, installation,
+                    candidates=candidates, c02_operation_id=c02_operation_id, source_ref=source_ref,
+                    authorization_original_ref=authorization_original_ref)
+        finally:
+            self._personal_eligibility_tasks_v1.remove(task)
+
     async def stop(self) -> RuntimeHealth:
         async with self._lock:
+            self._semantic_recovery_stopping_v1 = True
+            self._semantic_recovery_rescan_requested_v1 = False
+            habit_driver, self._habit_schedule_driver_v1 = self._habit_schedule_driver_v1, None
+            if habit_driver is not None:
+                await habit_driver.close_v1()
             self._artifact_draft_stopping_v1 = True
+            if self._artifact_no_dispatch_deadline_handle_v1 is not None:
+                self._artifact_no_dispatch_deadline_handle_v1.cancel()
+                self._artifact_no_dispatch_deadline_handle_v1 = None
             if self._artifact_draft_resume_task_v1 is not None:
                 await self._artifact_draft_resume_task_v1
             if "v2_fence_recovery" in self.health.missing_capabilities:
@@ -5262,6 +5606,19 @@ class RuntimeContext:
             if self._host_lifecycle_startup_task is not None:
                 await self._host_lifecycle_startup_task
             self.health = RuntimeHealth("draining")
+            if self._semantic_recovery_task_v1 is not None:
+                await self._semantic_recovery_task_v1
+            self._owner_source_note_stopping_v1 = True
+            if self._owner_source_note_scan_v1 is not None:
+                await self._owner_source_note_scan_v1
+            if self._owner_source_note_tasks_v1:
+                await asyncio.gather(*tuple(self._owner_source_note_tasks_v1.values()), return_exceptions=True)
+            self._personal_eligibility_stopping_v1 = True
+            if self._personal_eligibility_tasks_v1:
+                await asyncio.gather(*tuple(self._personal_eligibility_tasks_v1), return_exceptions=True)
+            if self._personal_eligibility_executor_v1 is not None:
+                pool, self._personal_eligibility_executor_v1 = self._personal_eligibility_executor_v1, None
+                await asyncio.to_thread(pool.shutdown, wait=True)
             self._offline_recovery_stopping = True
             if self._offline_recovery_task is not None:
                 await self._offline_recovery_task
@@ -5270,6 +5627,10 @@ class RuntimeContext:
                 await d07.close_v1()
                 self._v2_d07_execution_service = None
             self._domain_followup_stopping = True
+            self._contact_background_stopping = True
+            if self._contact_background_task is not None:
+                await self._contact_background_task
+            self._contact_background_host = None
             if self._domain_followup_task is not None:
                 await self._domain_followup_task
             self._d04_numeric_stopping = True
@@ -5349,6 +5710,52 @@ class RuntimeContext:
                 await asyncio.to_thread(store.close)
             self.health = RuntimeHealth("stopped")
             return self.health
+
+    async def project_owner_goal_cancellation_v1(self,*,original):
+        from .authority_service.owner_goal_cancellation_contract_v1 import OwnerGoalCancellationOriginalV1
+        if (type(original) is not OwnerGoalCancellationOriginalV1 or type(self._v2_model_bundle) is not AdminInstallationBundle
+                or self._worker is None or self._v2_bootstrap is None or not self._v2_namespace_provisioned):
+            return {"status":"held","missing_inputs":["actual_installed_goal_projection"]}
+        try:
+            receipt=await self._worker.call(lambda graph:graph.project_current_owner_goal_cancellation_v1(
+                self._v2_bootstrap,self._v2_model_bundle,original=original))
+            return {"status":"metadata_projected","projection":receipt,"cancellation_confirmed":False}
+        except Exception as error:
+            return {"status":"held","reason_code":type(error).__name__,
+                "missing_inputs":["actual_current_goal_metadata_WRITE_projection"],"cancellation_confirmed":False}
+
+    async def resume_pending_owner_goal_cancellation_projections_v1(self,installation):
+        if self._artifact_draft_stopping_v1 or self._worker is None:return
+        bundle=installation.admin_bundle
+        if bundle is not self._v2_model_bundle:return
+        after=""
+        while not self._artifact_draft_stopping_v1:
+            original=await self._worker.call(lambda graph:graph._GraphCoordinator__content_fence_v2.
+                read_next_owner_goal_cancellation_projection_v1(bundle=bundle,after_cancel_operation_id=after))
+            if original is None:return
+            after=original.request.cancel_operation_id
+            await self.project_owner_goal_cancellation_v1(original=original)
+
+    async def _consume_joint_executor_wakes_v1(self, installation, progress):
+        from .runtime.domain_background_read_v3 import BackgroundFollowupProgressV3
+        from .runtime.joint_node_execution_v1 import SourceNoteJointExecutorV1, ArtifactJointExecutorV1, ContactJointExecutorV1
+        result = progress.receipt if type(progress) is BackgroundFollowupProgressV3 else progress
+        if type(result) is not dict:
+            return
+        for binding in result.get("joint_executor_wakes", ()):
+            executor = binding.executor
+            if type(executor) is SourceNoteJointExecutorV1:
+                await self._worker.call(lambda graph, ref=executor.authorization_original_ref:
+                    graph.drive_owner_source_note_task_v1(self._v2_bootstrap, installation.admin_bundle, authorization_original_ref=ref))
+            elif type(executor) is ArtifactJointExecutorV1:
+                await self.run_post_c02_artifact_draft_v1(installation, c02_operation_id=executor.c02_operation_id, source_ref=executor.source_ref)
+            elif type(executor) is ContactJointExecutorV1:
+                raw = await self._worker.call(lambda graph, key=executor.qualified_outbox_dedupe_key:
+                    graph.consume_current_domain_followup_v1(self._v2_bootstrap, installation.admin_bundle, dedupe_key=key))
+                self._consume_background_graph_result_v3(raw)
+                self.resume_pending_contact_background_v1(installation)
+
+
 
 
 __all__ = (

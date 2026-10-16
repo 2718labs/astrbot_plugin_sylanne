@@ -139,7 +139,7 @@ def stage_create_owner_source_note_task_v1(db, *, frame, request, installed_read
     after = PersistentJob(ids["job_id"], ids["create_operation_id"], ids["activity_id"], None,
         *auth.cause.namespace.as_tuple, "owner-note-snapshot:" + canonical_digest(auth)[:40], "queued", TASK_WORK_KIND,
         plain_v1(continuation), None, _utc_text(datetime.fromtimestamp(auth.cause.original_deadline_utc, timezone.utc)),
-        auth.cause.parent_budget_lease_ref, "owner-note-resource:" + canonical_digest(auth)[:40], {}, None, None, 0, 0, {}, None)
+        auth.cause.parent_budget_lease_ref, "owner-note-resource:" + canonical_digest(auth)[:40], {"d11.personal-semantic-mesh":"1"}, None, None, 0, 0, {}, None)
     return verify_owner_source_note_task_stage_v1(_stage(frame, request, None, after, responsibility, CREATE_OPERATION))
 
 
@@ -450,7 +450,7 @@ def decode_owner_source_note_task_job_v1(raw, *, namespace=None):
     ns = NamespaceId(job.bot_id, job.persona_id)
     if (namespace is not None and namespace != ns or job.work_kind != TASK_WORK_KIND or job.effect_id is not None
             or not job.job_id.startswith("owner-note-job:") or not job.operation_id.startswith("owner-note-create:")
-            or not job.activity_id.startswith("owner-note-task:") or job.operator_versions != {} or job.usage != {}
+            or not job.activity_id.startswith("owner-note-task:") or job.operator_versions not in ({}, {"d11.personal-semantic-mesh":"1"}) or job.usage != {}
             or job.cancel_epoch != cont.cancel_generation
             or any(NamespaceId.from_key(AtomKey.from_token(ref)) != ns for ref in cont.source_refs)
             or job.phase == "completed" and (cont.step != "completed" or cont.pending_effect_refs or job.result_ref is None)

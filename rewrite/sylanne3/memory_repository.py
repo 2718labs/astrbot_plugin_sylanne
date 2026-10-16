@@ -335,6 +335,13 @@ class MemoryRepository:
             record = None
         return record, self._proof(atoms, epoch)
 
+    def read_world_view_evidence_v1(self, *, frame, request, installed_readers):
+        """Read a real sequence-selected World page under the current W01 fence."""
+        from .runtime.d03_world_history_v1 import read_world_cold_page_v1
+        if frame.envelope.authority.namespace.as_tuple != (self.bot,self.persona):
+            raise ValueError("World historical query crossed its repository namespace")
+        return read_world_cold_page_v1(self._store._db,frame=frame,request=request,installed_readers=installed_readers)
+
     def read_interpretation(self, iid, *, audience, purpose,
                             as_known_at=None, valid_at=None):
         return self.read_interpretation_evidence(

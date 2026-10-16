@@ -92,15 +92,22 @@ class DraftLifeSemanticScopeV1(LifeSemanticScopeV1):
 
 
 def life_scope_from_action_v1(db, *, namespace, action_ref, project_ref, input_source_ref, audiences, now_utc):
-    row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-        (action_ref, *namespace.as_tuple)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row=_producer_original_point_v3(db,table="graph_atoms",columns=("value","valid"),
+        key_columns=("token","bot","persona"),key=(action_ref,*namespace.as_tuple),
+        legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+            (action_ref,*namespace.as_tuple)).fetchone())
     if row is None or row[1] != 1:
         raise MissingProductionOriginalV1("current_life_action_scope")
     from ..domains.d08.execution import _decode
     action = _decode("d08.action_intent.v1", json.loads(row[0]))
     # Entity owners can differ from the action owner. Locate the real bounded
     # inventory member, rather than inventing a namespace key as provenance.
-    entities = db.execute("SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d03.entity_anchor' AND valid=1 ORDER BY token LIMIT 129",
+    from .borrowed_habit_classification_v3 import read_bound_borrowed_habit_inventory_v3
+    handled,atoms=read_bound_borrowed_habit_inventory_v3(db,namespace,"d03.entity_anchor")
+    from ..runtime_contracts import canonical_serialize
+    entities=tuple((atom.key.token,canonical_serialize(atom.value))for atom in atoms if atom.valid)if handled else db.execute(
+        "SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d03.entity_anchor' AND valid=1 ORDER BY token LIMIT 129",
         namespace.as_tuple).fetchall()
     if len(entities) > 128:
         raise MissingProductionOriginalV1("complete_life_input_inventory:d03.entity_anchor")

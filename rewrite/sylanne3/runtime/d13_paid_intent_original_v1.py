@@ -262,11 +262,15 @@ def read_current_d13_paid_intent_original_v1(
     """
     if not db.in_transaction:
         raise ValueError("paid intent read needs caller-owned current transaction")
-    row = db.execute(
-        "SELECT operation_id,original_json,original_digest FROM "
-        "graph_d13_paid_intent_originals_v1 WHERE bot=? AND persona=? AND job_ref=?",
-        namespace.as_tuple + (binding.job_ref,),
-    ).fetchone()
+    from .d13_paid_original_read_v3 import d13_paid_original_point_v3
+    handled, row = d13_paid_original_point_v3(db, table='graph_d13_paid_intent_originals_v1', columns=('operation_id', 'original_json', 'original_digest'),
+        key_columns=("bot","persona","job_ref"), key=(*namespace.as_tuple,binding.job_ref))
+    if not handled:
+        row = db.execute(
+            "SELECT operation_id,original_json,original_digest FROM "
+            "graph_d13_paid_intent_originals_v1 WHERE bot=? AND persona=? AND job_ref=?",
+            namespace.as_tuple + (binding.job_ref,),
+        ).fetchone()
     if row is None:
         return None
     payload = json.loads(row[1])
@@ -457,11 +461,15 @@ def read_d13_paid_call_original_v1(
     """Read W01's stored wire; the caller must still verify current authority."""
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("paid call read needs caller-owned graph transaction")
-    row = db.execute(
-        "SELECT call_id,original_json,original_digest FROM "
-        "graph_d13_paid_call_originals_v1 WHERE bot=? AND persona=? AND job_ref=?",
-        namespace.as_tuple + (job_ref,),
-    ).fetchone()
+    from .d13_paid_original_read_v3 import d13_paid_original_point_v3
+    handled, row = d13_paid_original_point_v3(db, table='graph_d13_paid_call_originals_v1', columns=('call_id', 'original_json', 'original_digest'),
+        key_columns=("bot","persona","job_ref"), key=(*namespace.as_tuple,job_ref))
+    if not handled:
+        row = db.execute(
+            "SELECT call_id,original_json,original_digest FROM "
+            "graph_d13_paid_call_originals_v1 WHERE bot=? AND persona=? AND job_ref=?",
+            namespace.as_tuple + (job_ref,),
+        ).fetchone()
     if row is None:
         return None
     payload = json.loads(row[1])
@@ -491,11 +499,15 @@ def load_d13_paid_intent_original_v1(
     """Restore original identity only; this never grants current source access."""
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("original identity read requires caller transaction")
-    row = db.execute(
-        "SELECT operation_id,original_json,original_digest FROM "
-        "graph_d13_paid_intent_originals_v1 WHERE bot=? AND persona=? AND job_ref=?",
-        namespace.as_tuple + (job_ref,),
-    ).fetchone()
+    from .d13_paid_original_read_v3 import d13_paid_original_point_v3
+    handled, row = d13_paid_original_point_v3(db, table='graph_d13_paid_intent_originals_v1', columns=('operation_id', 'original_json', 'original_digest'),
+        key_columns=("bot","persona","job_ref"), key=(*namespace.as_tuple,job_ref))
+    if not handled:
+        row = db.execute(
+            "SELECT operation_id,original_json,original_digest FROM "
+            "graph_d13_paid_intent_originals_v1 WHERE bot=? AND persona=? AND job_ref=?",
+            namespace.as_tuple + (job_ref,),
+        ).fetchone()
     if row is None:
         return None
     payload = json.loads(row[1])

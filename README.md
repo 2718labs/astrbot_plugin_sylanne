@@ -1,4 +1,4 @@
-# Sylanne 3.0.0-alpha2 · AstrBot 插件安装候选
+# Sylanne 3.0.0-beta1 · AstrBot 插件安装候选
 
 本包用于 AstrBot 的本地 ZIP 插件导入，包含 Sylanne 后端、2718lab 0.25.0 同源工作台，以及 Linux 原生内核。工作台保持 v24 视觉基线、原 GLB/logo 和选择、退出动效。当前属于本地测试快照，完整安装、真实授权业务与浏览器验收仍为 HOLD。
 
@@ -10,14 +10,14 @@ ZIP 根目录包含 [main.py](main.py)、[metadata.yaml](metadata.yaml)、[_conf
 
 ## 导入和启动
 
-新服务器的隔离安装、Docker 端口与同包复验入口见 [alpha2 服务器安装与复验](docs/install/linux-alpha2-server.md)。日常导入只需要插件安装 ZIP；工程源码与测试依赖单独用于复验，不导入 AstrBot。
+新服务器的隔离安装、Docker 端口与同包复验入口见 [服务器安装与同包复验](docs/install/linux-alpha2-server.md)。日常导入只需要插件安装 ZIP；工程源码与测试依赖单独用于复验，不导入 AstrBot。
 
 1. 使用全新隔离数据目录中的匹配平台 AstrBot，在插件管理的本地 ZIP 上传入口选择本插件 ZIP。直接上传 ZIP，保留包内目录结构。首次测试保留默认 `enabled=false`。
-2. 导入成功后核对插件名 `astrbot_plugin_sylanne`、版本 `3.0.0-alpha2` 和加载日志。导入只安装插件文件；完整运行仍由实际安装身份、当前授权和运行状态决定。
+2. 导入成功后核对插件名 `astrbot_plugin_sylanne`、版本 `3.0.0-beta1` 和加载日志。导入只安装插件文件；完整运行仍由实际安装身份、当前授权和运行状态决定。
 3. 由管理员按 [Linux 安装与生命周期说明](docs/install/linux-alpha1-lifecycle.md) 完成正式 Authority/Host 安装绑定。`authority_profile` 只选择已有的管理员配置档，不能代替安装授权。本快照的 release manifest 是新的身份输入，旧快照的授权或 PASS 不能自动沿用。
 4. 在 AstrBot 的 Sylanne 配置中选择真实 LLM provider、已安装的 `authority_profile`，并明确本机运行许可 `enabled`。下拉选项来自 AstrBot 已启用的聊天模型 provider；模型名从所选 provider 的真实当前配置读取。空选择保持未选择，不自动使用列表中的第一个模型。保存配置会按 AstrBot 的正式插件重载流程重新检查。
 5. 通过既有 Owner 签名器和正式配对、会话及授权协议取得当前安装权限；安装管理权限另行按真实服务授予。运行时需要本机 `enabled` 和 Authority 设置服务的 `enabled` 同时为真。工作台修改 Authority 设置仍按 `next_restart` 生效，不会覆盖本机许可。
-6. 在实际可信 HTTPS AstrBot 宿主上打开下列工作台相对路径。先登录 Dashboard，再完成独立 Owner 解锁；Persona/Memory 读取及日志、设置操作分别按当前权限执行。
+6. 打开实际监听协议的独立 WebUI，或下列 AstrBot 工作台相对路径。未配置 Dashboard TLS 时使用 `http://服务器IP:2718/`，已配置时使用证书匹配的 HTTPS 地址。先登录 Dashboard，再完成独立 Owner 解锁；Persona/Memory 读取及日志、设置操作分别按当前权限执行。HTTP 按此前明确授权的未加密模式运行，正式 `workbench_origin` 必须匹配实际协议、域名和端口。
 
 ```text
 /api/v1/plugins/extensions/astrbot_plugin_sylanne/workbench
@@ -49,7 +49,7 @@ AstrBot 配置页保留本机运行许可 `enabled`、已登记 Authority 配置
 
 源码编译、前端契约与构建、真实 Authority/mTLS 管理接口的既有收据分别保持其原范围。插件 ZIP 的结构、实际导入来源、native 和 release manifest 应以本快照的新收据核对；源码检查和归档检查不等于完整宿主安装通过。
 
-导入后手动确认插件加载、可信 HTTPS 静态入口、Dashboard/Owner 两层验证、真实授权 Persona/Memory 投影、日志分页及设置写入后真实读回。再检查实际 GPU/WebGL、光盘居中、键盘焦点、主题切换与退出；会话失效、页面隐藏和导航后旧响应不得恢复授权。最终包还需在第二个全新隔离目录复验关键链路。未执行的项目保持 NOT RUN；拒绝和首次失败保留原证据。
+导入后手动确认插件加载、实际 HTTP 或 HTTPS 监听与端口映射、Dashboard/Owner 两层验证、真实授权 Persona/Memory 投影、日志分页及设置写入后真实读回。再检查实际 GPU/WebGL、光盘居中、键盘焦点、主题切换与退出；会话失效、页面隐藏和导航后旧响应不得恢复授权。最终包还需在第二个全新隔离目录复验关键链路。未执行的项目保持 NOT RUN；拒绝和首次失败保留原证据。
 
 Numeric、Contact/C09、D04 完整验收与生产 Host 独立身份继续按各自实际证据保持 HOLD。本次包不调用真实付费模型或 sender，不修改生产数据库，不直接修账。
 

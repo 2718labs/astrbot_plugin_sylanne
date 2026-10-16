@@ -108,27 +108,31 @@ def _assemble_current_stage_result_v1(frame, domain, kind, request, *, writes=()
         raise ValueError("domain output is not a bounded explicitly CAS-read write set")
     payload = current_stage_payload_v1(frame,domain,kind,request,writes=writes,
         provenance=provenance,coverage=coverage,missing=missing,continuation=continuation)
+    from ...runtime.domain_production_contracts_v1 import actual_frame_read_versions_v1
+    read_versions=actual_frame_read_versions_v1(frame)
     digest = canonical_digest(payload)
     original = ProductionOriginalRefV1(domain + ".current-" + kind,
-        domain + "-current:" + digest[:48], digest, frame.snapshot.versions)
+        domain + "-current:" + digest[:48], digest, read_versions)
     proposals = ()
     if writes:
         if not proposal_schema or not proposal_hash:
             raise ValueError("domain proposal requires its actual installed schema")
         current_keys = {key for write in writes for key in write.dependencies}
         dependencies = DependencySet(current_invalidation=tuple(
-            version for version in frame.snapshot.versions if version.key in current_keys),
+            version for version in read_versions if version.key in current_keys),
             historical_provenance=tuple(version for version in frame.snapshot.versions
                 if version.key.type_name == "memory.source" and version.revision > 0))
         if {version.key for version in dependencies.current_invalidation} != current_keys:
             raise ValueError("domain output invalidation dependency lacks its actual CAS read")
         proposals = (DomainProposal(domain, proposal_schema, proposal_hash, envelope,
             tuple(writes), dependencies, tuple(contribution_keys), tuple(required_parts)),)
+    from ...runtime.habit_followup_source_v3 import habit_stage_events_v3
+    receiver_events=habit_stage_events_v3(frame,domain,kind,receiver_events)
     outbox = tuple(ProductionOutboxStageV1(ns, envelope.identity.operation_id,
         receiver, event, original) for receiver, event in receiver_events)
     return StagedDomainOperationV1(domain, kind, ns, envelope.identity.activity_id,
         envelope.identity.operation_id, canonical_digest({"request": request, "envelope": envelope}),
-        frame.snapshot.versions, frame.query_coverage, proposals, tuple(jobs), outbox,
+        read_versions, frame.query_coverage, proposals, tuple(jobs), outbox,
         canonical_serialize(payload), digest, tuple(costs), coverage, tuple(missing), continuation)
 
 
@@ -417,11 +421,22 @@ def current_stage_payload_v1(frame,domain,kind,request,*,writes=(),provenance=No
                              coverage="complete",missing=(),continuation=None):
     """The same actual v1 business payload used by inline and physical encoders."""
     envelope,ns=frame.envelope,frame.envelope.authority.namespace
+    from ...runtime.domain_production_contracts_v1 import actual_frame_read_versions_v1
+    from ...runtime.habit_activity_runtime_v1 import append_current_habit_provenance_v1
+    from ...runtime.habit_census_provenance_v1 import append_habit_owner_census_v1
+    provenance=append_habit_owner_census_v1(frame,domain,kind,request,provenance)
+    provenance = append_current_habit_provenance_v1(frame, domain, kind, request, provenance)
+    from ...runtime.habit_maintenance_provenance_v1 import append_current_habit_maintenance_provenance_v1
+    provenance = append_current_habit_maintenance_provenance_v1(frame, domain, kind, request, provenance)
+    from ...runtime.habit_followup_source_v3 import append_body_preparation_provenance_v3
+    provenance=append_body_preparation_provenance_v3(frame,domain,kind,provenance)
+    from ...runtime.artifact_frame_control_reads_v3 import append_current_artifact_model_control_v3
+    provenance=append_current_artifact_model_control_v3(frame,domain,kind,request,provenance)
     return plain_v1({"schema":domain+".current-"+kind+".v1","request":request,
         "namespace":ns,"identity":envelope.identity,"authority":envelope.authority,
         "parent_budget":envelope.parent_budget_lease_ref,"now_utc":frame.now_utc,
         "owner_guard":frame.owner_guard,"policy_refs":frame.installed_policy_refs,
-        "read_versions":frame.snapshot.versions,"query_coverage":frame.query_coverage,
+        "read_versions":actual_frame_read_versions_v1(frame),"query_coverage":frame.query_coverage,
         "observed_originals":frame.observed_originals,"provenance":provenance or {},
         "writes":writes,"coverage":coverage,"missing_inputs":missing,
         "continuation_ref":continuation})

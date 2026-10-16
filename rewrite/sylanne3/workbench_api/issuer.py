@@ -121,7 +121,8 @@ class GraphWorkbenchIssuer:
                  erasure_accepted_read: object | None = None,
                  backend_operation_port: object | None = None,
                  maintenance_port: object | None = None,
-                 package_maintenance_port: object | None = None) -> None:
+                 package_maintenance_port: object | None = None,
+                 runtime_context: object | None = None) -> None:
         if not callable(getattr(coordinator, "query", None)):
             raise TypeError("coordinator must expose query")
         if not callable(getattr(grants, "resolve", None)):
@@ -148,6 +149,7 @@ class GraphWorkbenchIssuer:
         if package_maintenance_port is not None and type(package_maintenance_port) is not InstalledD12PackageWorkbenchPortV2:
             raise TypeError("actual paired package maintenance port required")
         self._package_maintenance_port = package_maintenance_port
+        self._runtime_context = runtime_context
 
     def read_owner_artifact_project_context_options(self, *, session: AuthenticatedSession,
             scope: str, purpose: str, audience: str) -> Mapping[str, Any]:
@@ -691,6 +693,9 @@ class GraphWorkbenchIssuer:
         routes.update({action: callable(getattr(self._coordinator, action, None))
             for action in ("pause_project_v1", "resume_project_v1", "read_project_control_context_v1", "read_project_control_context_v2",
                 "read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1")})
+        routes["read_current_self_view_v4"] = callable(getattr(self._coordinator, "read_current_self_view_v4", None))
+        from ..runtime.beta1_owner_state_read_v3 import prepare_owner_state_read_v3
+        routes['read_beta1_owner_state_v1'] = callable(prepare_owner_state_read_v3)
         routes["d02_fixed_work_policy"] = callable(getattr(self._coordinator, "adopt_current_fixed_body_work_policy_v1", None))
         routes["d07_cognition_budget"] = callable(getattr(self._coordinator, "allocate_current_d07_cognition_budget_v1", None))
         routes["d03_context_catalogue"] = callable(getattr(self._coordinator, "adopt_current_context_catalogue_v1", None))

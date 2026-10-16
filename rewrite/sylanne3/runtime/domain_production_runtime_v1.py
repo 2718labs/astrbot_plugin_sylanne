@@ -22,6 +22,7 @@ class InstalledDomainOperationRuntimeV1:
         graph._admin(bootstrap)
         self.graph, self._bootstrap = graph, bootstrap
         self._active_life_execution_inventory_v1 = None
+        self._active_habit_issuance_v1 = None
         self._active_foreground_issuance_v1 = None
         self._active_foreground_process_lease_v1 = None
         self._active_draft_root_registration_v1 = None
@@ -48,20 +49,29 @@ class InstalledDomainOperationRuntimeV1:
         reader_operations = {*_POSTCONDITION_OPERATIONS, *METHOD_OPERATIONS,
             "create_artifact_task_plan_v1", "adopt_current_c1_method_conditions_v1",
             "adopt_current_task_no_search_v1", "quote_current_method_choices_v1",
-            "observe_method_comparison_v1", "evaluate_values", "prepare_personal_candidates_v1",
+            "observe_method_comparison_v1", "evaluate_values", "prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "prepare_personal_candidates_v1",
             "select_personal_step_v2", "prepare_selected_source_note_action_v2",
             "input:register_artifact_task_text_extent"} | METHOD_INPUT_OPERATIONS_V3
+        from .current_beta1_source_read_v3 import beta1_source_operation_v3
+        from .current_method_learning_read_v3 import _method_active
+        source_reader_v3=_method_active(db)
+        own_source_plan_v3=(beta1_source_operation_v3(operation.operation_kind)
+            and (operation.operation_kind!="serve_concern"or source_reader_v3 is not None))
+        if own_source_plan_v3:
+            from .current_beta1_source_read_v3 import require_beta1_source_plan_metadata_v3
+            require_beta1_source_plan_metadata_v3(source_reader_v3)
         phase_readers = (installed_readers_for_operation_v1(graph, operation,
             scope=scope, owner_guard=owner_guard)
-            if operation.operation_kind in reader_operations else None)
+            if operation.operation_kind in reader_operations or beta1_source_operation_v3(operation.operation_kind) else None)
         plan = read_plan_current_domain_operation_v1(db, namespace=scope.namespace,
             activity_id=activity_id, domain=operation.domain, operation_kind=operation.operation_kind,
             request=request, operation_id=operation_id, now_utc=now_utc, audiences=(audience_ref,),
             life_d04_before_capture_policy=graph._GraphCoordinator__life_d04_before_capture_policy,
             personal_candidate_readers=phase_readers
-                if operation.operation_kind in {"prepare_personal_candidates_v1", "select_personal_step_v2",
+                if operation.operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "prepare_personal_candidates_v1", "select_personal_step_v2",
                     "input:register_artifact_task_text_extent"} else None,
             artifact_phase_readers=phase_readers, installed_readers=phase_readers)
+        if own_source_plan_v3:return plan,()
         return plan, read_independent_current_original_requests_v1(db, namespace=scope.namespace, plan=plan)
 
     def read_current_borrowed_operation_plan_v3(self, db, *, operation, request, issued, scope, now_utc):
@@ -89,7 +99,7 @@ class InstalledDomainOperationRuntimeV1:
                 request=request, operation_id=evidence.request.operation_id, now_utc=now_utc,
                 audiences=auth.cause.audiences, installed_readers=readers, artifact_phase_readers=readers,
                 personal_candidate_readers=readers if operation.operation_kind in {
-                    "prepare_personal_candidates_v1", "select_personal_step_v2"} else None)
+                    "prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "prepare_personal_candidates_v1", "select_personal_step_v2"} else None)
         elif type(issued) is _IssuedForegroundActivityV1:
             evidence = require_foreground_activity_issuance_v1(issued, graph, scope)
             readers = installed_readers_for_operation_v1(graph, operation, scope=scope,
@@ -106,10 +116,22 @@ class InstalledDomainOperationRuntimeV1:
                 self_c04_readers=readers if operation.operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"} else None,
                 ingress_task_scope_readers=readers if operation.operation_kind == "derive_ingress_artifact_task_scope_v1" else None,
                 personal_candidate_readers=readers if operation.operation_kind in {
-                    "prepare_personal_candidates_v1", "select_personal_step_v2"} else None,
+                    "prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "prepare_personal_candidates_v1", "select_personal_step_v2"} else None,
                 artifact_phase_readers=readers, installed_readers=readers)
         else:
             raise TypeError("borrowed recipe requires an actual active typed Self issuance")
+        from .joint_node_execution_v1 import (joint_source_note_binding_for_authorization_v1,
+            augment_joint_binding_read_plan_v1)
+        if type(issued) is _IssuedOwnerSourceNoteTaskV1:
+            binding = joint_source_note_binding_for_authorization_v1(db, namespace=auth.cause.namespace,
+                authorization_ref=auth.original_ref, issuer=graph._GraphCoordinator__d11_issuer)
+            plan = augment_joint_binding_read_plan_v1(db, namespace=auth.cause.namespace, plan=plan, binding=binding)
+        else:
+            from .joint_node_execution_v1 import augment_joint_operation_read_plan_v1
+            plan = augment_joint_operation_read_plan_v1(db, namespace=scope.namespace, operation_kind=operation.operation_kind,
+                request=request, plan=plan, issuer=graph._GraphCoordinator__d11_issuer)
+        from .foreground_mesh_issuance_v1 import augment_personal_mesh_plan_v1
+        plan = augment_personal_mesh_plan_v1(graph,issued,plan)
         from .current_method_learning_read_v3 import read_bound_method_borrowed_plan_v3
         handled, prepared_plan = read_bound_method_borrowed_plan_v3(db, graph=graph, issued=issued, plan=plan)
         if handled:
@@ -134,7 +156,7 @@ class InstalledDomainOperationRuntimeV1:
         return (*policies, ProductionPolicyRefV1(actual.policy_ref, actual.policy_version, actual.digest))
 
     def compile_in_transaction(self, db, *, operation, request, envelope, scope, owner, guard,
-            now_utc, external_originals=(), source_storage_prepare=None):
+            now_utc, external_originals=(), source_storage_prepare=None, contact_plan_prepare=None):
         self._current()
         if operation.operation_kind == "owner_stop_reply_v1":
             return self.compile_owner_stop_projection_in_transaction_v1(db, operation=operation,
@@ -185,7 +207,7 @@ class InstalledDomainOperationRuntimeV1:
         if operation.operation_kind == "input:set_contact_policy":
             readers.contact_policy_original = contact_policy
         current_contact = getattr(self, "_active_current_contact_policy_v1", None)
-        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
+        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"}:
             readers.contact_policy_scope = scope
             readers.current_contact_policy = current_contact
         identity = read_current_domain_command_identity_v1(db, namespace=envelope.authority.namespace,
@@ -231,10 +253,14 @@ class InstalledDomainOperationRuntimeV1:
             now_utc=now_utc, audiences=envelope.authority.audience,
             life_d04_before_capture_policy=self.graph._GraphCoordinator__life_d04_before_capture_policy,
             personal_candidate_readers=readers if operation.operation_kind in {
-                "prepare_personal_candidates_v1", "select_personal_step_v2", "input:register_artifact_task_text_extent"} else None,
+                "prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "prepare_personal_candidates_v1", "select_personal_step_v2", "input:register_artifact_task_text_extent"} else None,
             artifact_phase_readers=readers, installed_readers=readers)
+        from .joint_node_execution_v1 import augment_joint_operation_read_plan_v1
+        plan = augment_joint_operation_read_plan_v1(db, namespace=envelope.authority.namespace, operation_kind=operation.operation_kind,
+            request=request, plan=plan, issuer=self.graph._GraphCoordinator__d11_issuer)
         followup = getattr(self, "_active_background_followup_v1", None)
-        if followup is not None:
+        from .domain_production_followups_v1 import GeneralGrowthTrialFollowupCommandV1
+        if followup is not None and type(followup.command)is not GeneralGrowthTrialFollowupCommandV1:
             from .domain_production_followups_v1 import read_plan_current_domain_followup_v1
             from .domain_production_contracts_v1 import ProductionReadPlanV1
             extra = read_plan_current_domain_followup_v1(db, namespace=envelope.authority.namespace, event=followup.event)
@@ -254,7 +280,7 @@ class InstalledDomainOperationRuntimeV1:
         if operation.operation_kind == "input:set_contact_policy" and contact_policy is not None:
             originals += (ProductionOriginalRefV1("d10.owner_contact_policy",
                 contact_policy.original_ref, contact_policy.digest),)
-        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"} and current_contact is not None:
+        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"} and current_contact is not None:
             originals += (ProductionOriginalRefV1("d10.owner_contact_policy",
                 current_contact.original.original_ref, current_contact.original.digest),)
         frame = freeze_domain_production_frame_v1(self.graph, db, envelope=envelope,
@@ -266,7 +292,15 @@ class InstalledDomainOperationRuntimeV1:
             frame = freeze_domain_production_frame_v1(self.graph, db, envelope=envelope,
                 current_owner=owner, scope=scope, plan=plan, now_utc=now_utc,
                 observed_originals=originals, installed_policy_refs=policies)
-        if source_storage_prepare is not None:
+        if contact_plan_prepare is not None:
+            from .contact_plan_adoption_v2 import OPERATION
+            from .contact_plan_adoption_v3 import prepare_contact_plan_physical_in_transaction_v3
+            if operation.operation_kind != OPERATION or source_storage_prepare is not None:
+                raise ValueError('Contact physical producer cannot replace another installed stage')
+            parent,metadata,epoch = contact_plan_prepare
+            stage = prepare_contact_plan_physical_in_transaction_v3(db,runtime=self,parent=parent,frame=frame,
+                request=request,installed_readers=readers,scope=scope,owner=owner,guard=guard,metadata=metadata,epoch=epoch)
+        elif source_storage_prepare is not None:
             from .owner_material_source_v1 import OPERATION
             from .owner_material_source_storage_v3 import prepare_owner_material_source_storage_v3
             if operation.operation_kind != OPERATION:
@@ -277,6 +311,9 @@ class InstalledDomainOperationRuntimeV1:
         else:
             stage = stage_installed_domain_operation_v1(db, operation=operation, frame=frame, request=request,
                 installed_readers=readers)
+        if operation.operation_kind=='prepare_contact_prospective_v1':
+            from .contact_prospective_v1 import contact_prospective_stage_frame_v1
+            frame=contact_prospective_stage_frame_v1(stage)
         return frame, stage, readers
 
     def compile_owner_stop_projection_in_transaction_v1(self, db, *, operation, request,
@@ -336,6 +373,11 @@ class InstalledDomainOperationRuntimeV1:
                 plan=plan,now_utc=now_utc,operation=operation,request=request,
                 process_lease=self._active_owner_task_process_lease_v1,observed_originals=originals,
                 installed_policy_refs=policies)
+        from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
+        from .owner_source_note_life_v1 import owner_source_note_life_ids_v1
+        if operation.operation_kind not in {"register_owner_source_note_life_outcome_v1", "advance_life", "settle_personal_goal", "checkpoint_owner_source_note_task_v1"}:
+            require_joint_bound_action_gate_v1(db, namespace=auth.cause.namespace,
+                action_ref=owner_source_note_life_ids_v1(auth)["action_ref"], issuer=readers.issuer, frame=frame)
         stage=stage_installed_domain_operation_v1(db,operation=operation,frame=frame,request=request,installed_readers=readers)
         from .domain_production_commit_v1 import _members
         primary,proposals,_,_,_=_members(stage)
@@ -427,6 +469,14 @@ class InstalledDomainOperationRuntimeV1:
             self._active_owner_task_issuance_v1=None
             self._active_owner_task_process_lease_v1=None
             self.graph.release_authority_lease(self._bootstrap,token)
+
+    def run_personal_mesh_current_v1(self, *, selector, operation_kind, request):
+        from ..authority_service.foreground_mesh_contract_v1 import ForegroundMeshActivityRequestV1,OwnerTaskMeshActivityRequestV1
+        operation = installed_operation_v1(operation_kind)
+        if (type(selector) not in (ForegroundMeshActivityRequestV1,OwnerTaskMeshActivityRequestV1)
+                or selector.original.operation_kind != operation_kind or selector.companion.command != request):
+            raise ValueError('Personal mesh requires its exact independently qualified original request')
+        return self.graph._personal_mesh_domain_write_v1(self,selector=selector,operation=operation,request=request)
 
     def run_foreground_current(self, *, selector, operation_kind, request):
         """Closed self entry; the actual W01 coordinator owns begin/recovery/finish."""
@@ -732,8 +782,9 @@ class InstalledDomainOperationRuntimeV1:
 
     def run_current(self, authority, lease, *, operation_kind, request, operation_id,
             activity_id, audience_ref, parent_budget_lease_ref, _background_followup=None,
-            _background_host_lifecycle=None, _background_offline=None,
-            _owner_material_command_v3=None, _owner_material_work_v3=None, _method_inputs_v3=None):
+            _background_host_lifecycle=None, _background_offline=None, _background_contact_recovery=None,
+            _owner_material_command_v3=None, _owner_material_work_v3=None, _method_inputs_v3=None, _contact_plan_parent_v3=None,
+            _contact_owner_source_v3=None):
         self._current()
         self._last_refusal_exception_v1 = None
         graph = self.graph
@@ -744,6 +795,48 @@ class InstalledDomainOperationRuntimeV1:
             if type(value) is not str or not value or len(value) > 4096:
                 raise ValueError("production operation original identity is invalid")
         namespace = authority.namespace
+        from .contact_owner_command_source_v3 import contact_owner_command_request_kind_v3
+        contact_owner_kind=contact_owner_command_request_kind_v3(request)
+        if contact_owner_kind is not None and operation_kind==contact_owner_kind and _contact_owner_source_v3 is None:
+            if any(value is not None for value in (_background_followup,_background_host_lifecycle,
+                    _background_offline,_background_contact_recovery,_owner_material_command_v3,
+                    _owner_material_work_v3,_method_inputs_v3,_contact_plan_parent_v3)):
+                raise ValueError('Joint Contact preparation requires the actual current Owner command Source path')
+            from .contact_owner_command_source_v3 import prepare_joint_contact_owner_command_v3
+            work = prepare_joint_contact_owner_command_v3(graph,authority,lease,request=request,operation_id=operation_id)
+            def write_owner_preparation(state):
+                from .contact_owner_command_source_v3 import require_contact_owner_command_source_v3
+                from ..runtime_storage_v3 import bind_runtime_storage_operation_v3
+                require_contact_owner_command_source_v3(state.owner_command,state=state)
+                actual = state.result
+                if (activity_id,audience_ref,parent_budget_lease_ref) != (
+                        actual['activity_id'],actual['audience_ref'],actual['parent_budget_lease_ref']):
+                    raise ValueError('Joint Contact Owner request changed the signed Contact activity/audience/parent budget')
+                with bind_runtime_storage_operation_v3(state.operation,state.db):
+                    return self.run_current(authority,lease,operation_kind=operation_kind,request=request,
+                        operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,
+                        parent_budget_lease_ref=parent_budget_lease_ref,_contact_owner_source_v3=state)
+            work.map_terminal_v3('service',write_owner_preparation,lambda error:(_ for _ in ()).throw(error))
+            return work
+        if _contact_owner_source_v3 is not None:
+            from .contact_owner_command_source_v3 import require_contact_owner_command_source_v3
+            command = require_contact_owner_command_source_v3(_contact_owner_source_v3.owner_command,state=_contact_owner_source_v3)
+            if (operation_kind != command.operation_kind or command.request != request
+                    or command.operation_id != operation_id or command.authority is not authority or command.lease != lease):
+                raise ValueError('Contact Owner Source holder is not this exact registered input command')
+        if _contact_plan_parent_v3 is not None:
+            from .domain_background_read_v3 import require_actual_background_attachment_owner_v3
+            parent = require_actual_background_attachment_owner_v3(_contact_plan_parent_v3,db=_contact_plan_parent_v3.db)
+            if (parent.graph is not graph or parent.kind!='followup_child' or not parent.sealed
+                    or _background_followup is None or operation_kind!='adopt_contact_expression_plan_v2'
+                    or parent.local_result[6] != _background_followup.command):
+                raise ValueError('Contact physical WRITE lacks its exact qualified actual child')
+        if _background_contact_recovery is not None:
+            from .contact_background_invocation_v1 import require_background_contact_recovery_v1
+            require_background_contact_recovery_v1(_background_contact_recovery,graph,authority,operation_id)
+            if (_background_followup is not None or _background_host_lifecycle is not None or _background_offline is not None
+                    or operation_kind != 'prepare_contact_dispatch_v3' or request != _background_contact_recovery.command.request):
+                raise ValueError('Contact background recovery cannot select another operation or new work')
         if _background_offline is not None:
             from .d10_offline_recovery_driver_v1 import require_background_offline_command_v1
             require_background_offline_command_v1(_background_offline, graph, authority, operation_id)
@@ -780,13 +873,32 @@ class InstalledDomainOperationRuntimeV1:
             request_digest = require_owner_material_command_digest_v3(_owner_material_command_v3,
                 self, authority, lease, request=request, operation_id=operation_id, activity_id=activity_id,
                 audience_ref=audience_ref, parent_budget_lease_ref=parent_budget_lease_ref,
-                storage_work=_owner_material_work_v3)
+                storage_work=_owner_material_work_v3,
+                contact_plan_prepare=prepare_contact_plan if _contact_plan_parent_v3 is not None else None,
+                contact_plan_parent=_contact_plan_parent_v3)
         else:
             if _owner_material_command_v3 is not None or _owner_material_work_v3 is not None:
                 raise ValueError("material Source command witness cannot alter another operation")
             request_digest = canonical_digest(("sylanne.domain-production-command.v1", namespace,
                 authority.actor, operation_kind, request, operation_id, activity_id, audience_ref, parent_budget_lease_ref))
+        general_trial_background=False
+        if _background_followup is not None and operation_kind=='derive_general_growth_trial_v1':
+            from .domain_production_followups_v1 import GeneralGrowthTrialFollowupCommandV1
+            if type(_background_followup.command)is GeneralGrowthTrialFollowupCommandV1:
+                from .domain_followup_consumer_v1 import general_growth_trial_child_command_allowed_v1
+                from .domain_background_read_v3 import _active_v3,require_background_followup_handoff_v3
+                actual_general_reader=_active_v3(graph._GraphCoordinator__store._db)
+                if (not general_growth_trial_child_command_allowed_v1(_background_followup,graph,_background_followup.command)
+                        or actual_general_reader is None or not actual_general_reader.sealed
+                        or actual_general_reader.kind!='followup_child'
+                        or actual_general_reader.handoff.command is not _background_followup.command
+                        or request is not _background_followup.command.request
+                        or authority!=_background_followup.authority or operation_id!=_background_followup.operation_id):
+                    raise ValueError('General derive child lost its actual retained Background EOF and private issuance')
+                require_background_followup_handoff_v3(actual_general_reader.handoff,graph,actual_general_reader.bundle)
+                general_trial_background=True
         from .current_method_learning_read_v3 import (METHOD_INPUT_OPERATIONS_V3, PreparedMethodDomainInputsV3)
+        from .current_beta1_source_read_v3 import beta1_source_operation_v3
         if _method_inputs_v3 is not None:
             if (type(_method_inputs_v3) is not PreparedMethodDomainInputsV3
                     or _method_inputs_v3.owner.runtime is not self
@@ -801,7 +913,23 @@ class InstalledDomainOperationRuntimeV1:
                     or _method_inputs_v3.owner.parent_budget_lease_ref != parent_budget_lease_ref):
                 raise ValueError("method prepared inputs changed their actual installed command")
             _method_inputs_v3._actual_v3()
-        elif (operation_kind in METHOD_INPUT_OPERATIONS_V3
+        elif beta1_source_operation_v3(operation_kind)and not(operation_kind=="serve_concern"and _background_followup is not None):
+            if any(v is not None for v in (_background_followup,_background_host_lifecycle,_background_offline,
+                    _background_contact_recovery,_owner_material_command_v3,_owner_material_work_v3,_contact_plan_parent_v3,_contact_owner_source_v3)):
+                raise ValueError("Source commands require their actual independent Owner/session issuer")
+            classified=None
+            if operation_kind=="serve_concern":
+                from .d07_source_dispatch_read_v3 import current_d07_classified_command_v3
+                classified=current_d07_classified_command_v3(graph,authority=authority,lease=lease,request=request,
+                    operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,
+                    parent_budget_lease_ref=parent_budget_lease_ref)
+            if operation_kind!="serve_concern"or classified is None or classified["locator"][-1]=="world":
+                return graph._prepare_current_method_operation_v3(self,authority,lease,operation_kind=operation_kind,
+                    request=request,operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,
+                    parent_budget_lease_ref=parent_budget_lease_ref,request_digest=request_digest,
+                    d07_dispatch_classify_v3=operation_kind=="serve_concern"and classified is None,
+                    d07_dispatch_v3=classified)
+        elif (operation_kind in METHOD_INPUT_OPERATIONS_V3 and not general_trial_background
                 and runtime_storage_v3(graph._GraphCoordinator__store._db) is not None):
             with graph._GraphCoordinator__store._lock:
                 saved_method = graph._GraphCoordinator__store._db.execute(
@@ -844,9 +972,39 @@ class InstalledDomainOperationRuntimeV1:
         @contextmanager
         def fence_context(scope, guard, owner):
             context.update(scope=scope, guard=guard, owner=owner)
+            with ExitStack() as contact_domain_write_lifetime:
+                if _contact_owner_source_v3 is not None:
+                    from .contact_owner_command_source_v3 import bind_contact_owner_command_write_v3
+                    contact_domain_write_lifetime.enter_context(bind_contact_owner_command_write_v3(self,
+                        state=_contact_owner_source_v3,authority=authority,lease=lease,operation_kind=operation_kind,
+                        request=request,operation_id=operation_id,request_digest=request_digest,
+                        scope=scope,guard=guard,owner=owner))
+                from .domain_production_followups_v1 import GeneralGrowthTrialFollowupCommandV1
+                if _background_followup is not None and type(_background_followup.command)is GeneralGrowthTrialFollowupCommandV1:
+                    from .domain_background_read_v3 import _active_v3,bind_general_growth_trial_fresh_write_v1
+                    actual_general_reader=_active_v3(graph._GraphCoordinator__store._db)
+                    contact_domain_write_lifetime.enter_context(bind_general_growth_trial_fresh_write_v1(
+                        actual_general_reader,issued=_background_followup,scope=scope,guard=guard,current_owner=owner))
+                from .contact_initial_plan_source_v3 import bind_initial_contact_fresh_write_v3
+                contact_domain_write_lifetime.enter_context(bind_initial_contact_fresh_write_v3(self,authority=authority,
+                    operation_kind=operation_kind,request=request,operation_id=operation_id,request_digest=request_digest,
+                    scope=scope,guard=guard,owner=owner))
+                from .contact_domain_source_v3 import bind_contact_domain_fresh_write_v3
+                contact_domain_write_lifetime.enter_context(bind_contact_domain_fresh_write_v3(self,authority=authority,
+                    operation_kind=operation_kind,request=request,operation_id=operation_id,request_digest=request_digest,
+                    scope=scope,guard=guard,owner=owner))
+                if operation_kind=='prepare_contact_prospective_v1':
+                    from .contact_prospective_v1 import capture_contact_prospective_call_v1,revoke_contact_prospective_call_v1
+                    capture_contact_prospective_call_v1(self,request=request,operation_id=operation_id,
+                        request_digest=request_digest,scope=scope,owner=owner)
+                    try:yield from contact_domain_fence_body(scope,guard,owner)
+                    finally:revoke_contact_prospective_call_v1(self)
+                else:
+                    yield from contact_domain_fence_body(scope,guard,owner)
+        def contact_domain_fence_body(scope,guard,owner):
             reader = getattr(graph, "_GraphCoordinator__d04_semantic_mapping_reader", None)
             if (operation.domain in {"d02", "d07", "d10"} or operation.operation_kind in {
-                    "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}) and reader is None:
+                    "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"}) and reader is None:
                 raise ValueError("actual installed role-clock reader is unavailable")
             from .domain_production_read_plans_v1 import (read_plan_current_domain_operation_v1,
                 read_independent_current_original_requests_v1)
@@ -859,6 +1017,9 @@ class InstalledDomainOperationRuntimeV1:
             with store._lock:
                 store._db.execute("BEGIN")
                 try:
+                    from .current_method_learning_read_v3 import _NUMERIC_OWNER_OPERATIONS_V1
+                    if _method_inputs_v3 is not None and (operation_kind in _NUMERIC_OWNER_OPERATIONS_V1 or beta1_source_operation_v3(operation_kind)):
+                        _method_inputs_v3.require_current_v3(store._db,scope,owner)
                     if _background_host_lifecycle is not None:
                         requests = ()
                     else:
@@ -866,7 +1027,7 @@ class InstalledDomainOperationRuntimeV1:
                             operation=operation, request=request, operation_id=operation_id,
                             activity_id=activity_id, audience_ref=audience_ref, scope=scope,
                             owner_guard=guard, now_utc=read_now_utc)
-                        if operation.operation_kind in {"prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
+                        if operation.operation_kind in {"prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"}:
                             from .contact_plan_adoption_v1 import read_adopted_contact_plan_v1
                             if operation.operation_kind in {"prepare_contact_model_v2", "prepare_contact_dispatch_v3"}:
                                 from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2 as read_adopted_contact_plan_v1
@@ -923,6 +1084,13 @@ class InstalledDomainOperationRuntimeV1:
             with ExitStack() as qualifications:
                 # These observations belong to this exact independently held
                 # scope, including failures while subsequent observers enter.
+                if operation.operation_kind in {'create_habit_policy_v1', 'revise_habit_policy_v1',
+                        'pause_habit_policy_v1', 'resume_habit_policy_v1', 'stop_habit_policy_v1'}:
+                    from .habit_owner_policy_issuance_v1 import observe_habit_owner_policy_write_v1
+                    actual_policy = qualifications.enter_context(observe_habit_owner_policy_write_v1(
+                        graph, authority=authority, lease=lease, scope=scope,
+                        operation_kind=operation.operation_kind, request=request, operation_id=operation_id))
+                    originals.append(actual_policy)
                 qualifications.callback(setattr, self, '_active_draft_root_registration_v1', None)
                 if operation.operation_kind == "register_artifact_draft_root":
                     from .foreground_activity_issuance_v1 import draft_root_registration_for_fence_v1
@@ -932,7 +1100,7 @@ class InstalledDomainOperationRuntimeV1:
                         owner_session_token=session_token, owner_session_request=session_request))
                 qualifications.callback(setattr, self, '_active_life_numeric_environment_v1', None)
                 qualifications.callback(setattr, self, '_active_life_numeric_topology_v1', None)
-                if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
+                if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"}:
                     from ..graph_types import AtomKey
                     from .d10_contact_policy_authority_v1 import read_installed_current_contact_policy_v1
                     policy_key = AtomKey.from_token(contact_policy_ref if contact_policy_ref is not None else request.contact_policy_ref)
@@ -958,7 +1126,7 @@ class InstalledDomainOperationRuntimeV1:
                     self._active_life_numeric_topology_v1 = topology
                 context["external_originals"] = tuple(originals)
                 qualifications.enter_context(reader.current_fence(scope) if operation.domain in {"d02", "d07", "d10"}
-                                              or operation.operation_kind in {"prepare_internal_life_numeric_drive", "prepare_internal_life_numeric_joint", "prepare_source_note_action", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}
+                                              or operation.operation_kind in {"prepare_internal_life_numeric_drive", "prepare_internal_life_numeric_joint", "prepare_source_note_action", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3", "prepare_contact_prospective_v1"}
                                              else nullcontext())
                 if operation.operation_kind in {"prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
                     from .contact_final_stage_v2 import command_identity_contact_final_v2
@@ -1046,7 +1214,7 @@ class InstalledDomainOperationRuntimeV1:
                         self._active_contact_final_scope_v1 = None
                         self._active_contact_final_stage_call_v1 = None
                         self._active_contact_final_stage_v1 = None
-        def staged_commit(db, metadata, epoch, now, owner, scope, *, prepare_source_storage=False):
+        def staged_commit(db, metadata, epoch, now, owner, scope, *, prepare_source_storage=False, prepare_contact_plan=False):
             from .domain_production_commit_v1 import commit_installed_domain_operation_v1
             resolution = None
             if _background_followup is not None:
@@ -1090,7 +1258,8 @@ class InstalledDomainOperationRuntimeV1:
                 tuple(sorted(graph._GraphCoordinator__leases[token][5])),
                 'workbench_user_action' if management_cancel else
                 "consolidation" if operation.operation_kind == "adopt_owner_artifact_project_context_v1" else
-                    authority.purpose if _background_offline is not None else "context",
+                    authority.purpose if _background_offline is not None else
+                    "consolidation" if _background_followup is not None and _background_followup.general_growth_parent_metadata is not None else "context",
                 authority.audience if _background_offline is not None or _background_followup is not None
                     else (audience_ref,),
                 grant.policy_ref, authority.activation_generation)
@@ -1104,6 +1273,9 @@ class InstalledDomainOperationRuntimeV1:
                 if generation is None or review is None:
                     raise ValueError("both actual installed contact workflows are required")
                 deadline_seconds = generation.timeout_seconds + review.timeout_seconds + 30.0
+            if operation_kind == 'prepare_contact_model_v2':
+                workflow = getattr(graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle.model_workflows,request.phase)
+                deadline_seconds = workflow.timeout_seconds + 30.0
             if operation.domain == "d07":
                 execution = getattr(graph, "_GraphCoordinator__d07_execution_service_v1", None)
                 if execution is not None:
@@ -1111,8 +1283,23 @@ class InstalledDomainOperationRuntimeV1:
                     if workflow is not None:
                         deadline_seconds = 2.0 * workflow.timeout_seconds + 30.0
             deadline = now+deadline_seconds if management_cancel else min(now + deadline_seconds, grant.valid_until_utc)
+            if _background_followup is not None:
+                from .domain_followup_consumer_v1 import actual_general_growth_trial_child_deadline_v1
+                trial_deadline=actual_general_growth_trial_child_deadline_v1(_background_followup,graph)
+                if trial_deadline is not None:
+                    deadline=min(deadline,trial_deadline)
+                    if now>=deadline:raise ValueError('General Start original deadline expired before its fresh WRITE')
+            if _background_followup is not None and _background_followup.general_growth_parent_metadata is not None:
+                from .d07_general_growth_attention_v1 import actual_general_growth_child_deadline_v1
+                deadline = min(deadline,actual_general_growth_child_deadline_v1(_background_followup,graph))
+                if now>=deadline:raise ValueError("General original absolute deadline expired before WRITE")
             if _owner_material_command_v3 is not None:
                 deadline = min(deadline, _owner_material_command_v3.deadline_utc)
+            if _contact_owner_source_v3 is not None:
+                deadline = min(deadline,_contact_owner_source_v3.operation.deadline_utc,
+                    _contact_owner_source_v3.result['deadline_utc'])
+                if now >= deadline:
+                    raise ValueError('Joint Contact actual Owner Source/Plan/root deadline expired before WRITE')
             if _method_inputs_v3 is not None:
                 deadline = min(deadline, _method_inputs_v3.envelope.deadline_utc)
                 if now >= deadline:
@@ -1142,6 +1329,23 @@ class InstalledDomainOperationRuntimeV1:
                 counted_deadline = original_personal_phase_count_deadline_v1(self, operation_id=operation_id)
                 if counted_deadline is not None:
                     deadline = min(deadline, counted_deadline)
+            if operation_kind in {'prepare_contact_model_v2','prepare_contact_dispatch_v3'}:
+                from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2
+                plan = read_adopted_contact_plan_v2(db,namespace=namespace,contact_id=request.contact_id,
+                    issuer=graph._GraphCoordinator__d11_issuer)[0]
+                deadline = min(deadline,plan.valid_until_utc)
+                if operation_kind == 'prepare_contact_dispatch_v3':
+                    from .contact_reviewed_content_v2 import read_contact_reviewed_content_original_v2
+                    content = read_contact_reviewed_content_original_v2(db,namespace=namespace,contact_id=request.contact_id,
+                        issuer=graph._GraphCoordinator__d11_issuer,resource_issuer=graph._GraphCoordinator__d02_issuer)
+                    deadline = min(deadline,content.valid_until)
+            if operation_kind=="serve_concern":
+                from .d07_source_dispatch_read_v3 import require_d07_classified_write_v3
+                dispatch=require_d07_classified_write_v3(graph,db,scope,owner,request)
+                if dispatch is not None:
+                    deadline=min(deadline,dispatch["deadline"])
+                    if now>=deadline or time.monotonic()>=dispatch["monotonic_deadline"]:
+                        raise ValueError("D07 original classification Root deadline expired before fresh WRITE")
             inputs = ()
             versions = dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
                 "AND ref='current' AND kind IN ('scheme','operator','policy')", namespace.as_tuple).fetchall())
@@ -1160,10 +1364,22 @@ class InstalledDomainOperationRuntimeV1:
                     'authored_content','ineligible',None,'not_applicable'),
                     monotonic_deadline=min(envelope.monotonic_deadline,_owner_material_command_v3.monotonic_deadline)
                         if _owner_material_command_v3 is not None else envelope.monotonic_deadline)
+            if operation_kind=="serve_concern":
+                from .d07_source_dispatch_read_v3 import current_d07_classified_command_v3
+                dispatch=current_d07_classified_command_v3(graph,authority=authority,lease=lease,request=request,
+                    operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,
+                    parent_budget_lease_ref=parent_budget_lease_ref)
+                if dispatch is not None:
+                    envelope=replace(envelope,monotonic_deadline=min(envelope.monotonic_deadline,dispatch["monotonic_deadline"]))
             frame, stage, readers = self.compile_in_transaction(db, operation=operation, request=request,
                 envelope=envelope, scope=scope, owner=owner, guard=context["guard"], now_utc=now,
                 external_originals=context["external_originals"],
-                source_storage_prepare=(metadata, epoch) if prepare_source_storage else None)
+                source_storage_prepare=(metadata, epoch) if prepare_source_storage else None,
+                contact_plan_prepare=(_contact_plan_parent_v3,metadata,epoch) if prepare_contact_plan else None)
+            if prepare_contact_plan:
+                stage.process_lease,stage.external_originals,stage.followup = token,context['external_originals'],_background_followup
+                process_lease.remove(token)
+                return stage
             if prepare_source_storage:
                 stage.process_lease = token
                 actual_session = graph._GraphCoordinator__owner_session_proofs.get(lease)
@@ -1187,9 +1403,16 @@ class InstalledDomainOperationRuntimeV1:
                 external_originals=context["external_originals"])
             if _background_followup is not None:
                 from .domain_followup_consumer_v1 import finish_followup_command_in_transaction_v1
-                result["followup_disposition"] = finish_followup_command_in_transaction_v1(
+                disposition = finish_followup_command_in_transaction_v1(
                     _background_followup, graph, db, resolution, result)
+                if operation_kind != 'prepare_contact_dispatch_v3':
+                    result["followup_disposition"] = disposition
             return result
+        def prepare_contact_plan(db,metadata,epoch,now,owner,scope):
+            if _contact_plan_parent_v3 is None or operation_kind!='adopt_contact_expression_plan_v2':
+                raise ValueError('Contact streamed Plan preparation requires its exact actual parent Work')
+            return staged_commit(db,metadata,epoch,now,owner,scope,prepare_contact_plan=True)
+
         def prepare_source_storage(db, metadata, epoch, now, owner, scope):
             from .owner_material_source_v1 import OPERATION
             if operation.operation_kind != OPERATION:
@@ -1230,18 +1453,26 @@ class InstalledDomainOperationRuntimeV1:
         self._active_background_offline_v1 = _background_offline
         try:
             if operation.operation_kind in {'prepare_contact_dispatch', 'prepare_contact_dispatch_v3'}:
-                from .contact_final_ack_v1 import issue_contact_owner_call_v1
-                issue_contact_owner_call_v1(self,authority=authority,lease=lease,request=request,
-                    operation_id=operation_id,request_digest=request_digest)
+                if _background_followup is not None or _background_contact_recovery is not None:
+                    from .contact_background_invocation_v1 import issue_contact_background_call_v1
+                    issue_contact_background_call_v1(self,authority=authority,lease=lease,request=request,
+                        operation_id=operation_id,request_digest=request_digest,
+                        issued=_background_followup or _background_contact_recovery)
+                else:
+                    from .contact_final_ack_v1 import issue_contact_owner_call_v1
+                    issue_contact_owner_call_v1(self,authority=authority,lease=lease,request=request,
+                        operation_id=operation_id,request_digest=request_digest)
             result = graph._owner_domain_write_v3(authority, lease, operation_id=operation_id,
                 request_digest=request_digest, domains=(operation.domain,), capability=operation.capability,
                 commit=commit, fence_context=fence_context,
-                background_original=_background_followup or _background_host_lifecycle or _background_offline,
+                background_original=_background_followup or _background_host_lifecycle or _background_offline or _background_contact_recovery,
                 new_work_admission=new_work_admission,
                 storage_prepare=prepare_source_storage if _owner_material_work_v3 is not None else None,
-                storage_work=_owner_material_work_v3)
+                storage_work=_owner_material_work_v3,
+                contact_owner_source=_contact_owner_source_v3)
             from ..graph_worker import GraphStorageWorkV3
-            if type(result) is GraphStorageWorkV3:
+            from .contact_plan_physical_write_v3 import PreparedContactPlanPhysicalV3
+            if type(result) in (GraphStorageWorkV3,PreparedContactPlanPhysicalV3):
                 return result
             if operation.operation_kind == 'acquire_internal_life_content' and result.get('job_states'):
                 from contextlib import closing
@@ -1289,6 +1520,8 @@ class InstalledDomainOperationRuntimeV1:
             if operation.operation_kind in {'prepare_contact_dispatch', 'prepare_contact_dispatch_v3'}:
                 from .contact_final_ack_v1 import revoke_contact_owner_call_v1
                 revoke_contact_owner_call_v1(self)
+                from .contact_background_invocation_v1 import revoke_contact_background_call_v1
+                revoke_contact_background_call_v1(self)
                 from .contact_final_stage_v1 import revoke_contact_final_material_v1
                 if operation.operation_kind == "prepare_contact_dispatch_v3":
                     from .contact_final_stage_v3 import revoke_contact_final_material_v3 as revoke_contact_final_material_v1

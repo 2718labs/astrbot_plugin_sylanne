@@ -1,7 +1,9 @@
 """Installed Graph paged-build/cold interface; never a DTO authority entry."""
 from __future__ import annotations
+from .contact_effect_accounting_v1 import ORIGINAL_TABLE as CONTACT_EFFECT_ORIGINAL, ATTEMPT_TABLE as CONTACT_EFFECT_ATTEMPT
 
 from dataclasses import asdict
+from ..authority_service.v3_owner_paid_guard_observation import GRAPH_TABLE,GRAPH_DDL_MAP
 import hashlib
 import json
 from pathlib import Path
@@ -15,7 +17,7 @@ from .c09_paged_sql_v2 import (c09_sql_meter_quantum_v2,C09PagedCaptureHold,requ
     read_c09_next_schema_object_v2,apply_c09_schema_object_v2,
     begin_c09_stream_verification_v2,advance_verify_c09_census_v2,advance_verify_c09_stream_v2,
     read_c09_table_shape_v2,_bounded_capture_row,begin_capture_stream_v2,advance_c09_census_v2,advance_c09_rows_v2,
-    seal_capture_stream_v2,read_capture_cursor_v2,current_c09_sql_meter_v2,C09RowTransformResultV2)
+    seal_capture_stream_v2,read_capture_cursor_v2,current_c09_sql_meter_v2,C09RowTransformResultV2,c09_row_commitment_v2)
 from .c09_closure_index_v2 import CLOSURE_TABLES_V2
 from .c09_domain_original_index_v2 import DOMAIN_INDEX_TABLES_V2
 
@@ -41,6 +43,8 @@ GRAPH_NESTED_DIRECTORY_DDLS_V2={
     for name in ('c09_graph_disposition_directory_v2','c09_graph_target_directory_v2','c09_graph_closure_directory_v2')}
 GRAPH_PROOF_DDLS_V2.update(GRAPH_NESTED_DIRECTORY_DDLS_V2)
 GRAPH_PROOF_DDLS_V2['c09_graph_target_schema_v2']=GRAPH_SCHEMA_DDL_V2
+from .c09_contact_plan_prefix_history_v3 import DDL_MAP as CONTACT_PREFIX_DDLS_V3
+GRAPH_PROOF_DDLS_V2.update(CONTACT_PREFIX_DDLS_V3)
 GRAPH_PROOF_TABLES_V2=frozenset(GRAPH_PROOF_DDLS_V2)
 _GRAPH_DIRECTORY_TABLES_V2=('c09_graph_target_schema_v2','c09_graph_disposition_directory_v2',
     'c09_graph_closure_directory_v2','graph_c09_erased_keys_v1','c09_graph_target_directory_v2','c09_graph_generated_rows_v2')
@@ -121,6 +125,10 @@ def _install_graph_proof_schema(candidate):
         saved=meter.read_fixed_row(candidate,'sqlite_master',('sql',),"type='table' AND name=?",(name,))
         if saved is None:meter.charge_write(len(ddl.encode('utf-8')));candidate.execute(ddl)
         elif saved!=(ddl,):raise C09PagedCaptureHold('registered fixed Graph bootstrap table differs: '+name)
+    from .c09_contact_plan_prefix_history_v3 import INDEX as CONTACT_PREFIX_INDEX
+    saved=meter.read_fixed_row(candidate,'sqlite_master',('sql',),"type='index' AND name=?",('c09_contact_prefix_operation_v3',))
+    if saved is None:meter.charge_write(len(CONTACT_PREFIX_INDEX.encode()));candidate.execute(CONTACT_PREFIX_INDEX)
+    elif saved!=(CONTACT_PREFIX_INDEX,):raise C09PagedCaptureHold('Contact prefix operation lookup index differs')
     for name,ddl in (*CAPTURE_TRIGGERS_V2,*GRAPH_DISPOSITION_TRIGGERS_V3):
         saved=meter.read_fixed_row(candidate,'sqlite_master',('sql',),"type='trigger' AND name=?",(name,))
         if saved is None:meter.charge_write(len(ddl.encode('utf-8')));candidate.execute(ddl)
@@ -129,12 +137,18 @@ def _install_graph_proof_schema(candidate):
 
 
 class InstalledGraphRebaseBuildV2:
-    __slots__=('_issuer', 'session', 'pair', 'scope', 'prior_reader', 'prior_view', 'barrier_view', 'hash_file', 'hash_identity', 'hash_value', 'hash_offset', 'candidate_done', 'source_disposition_view', 'historical_verification', 'source_row_capture_v3', 'segmented_target_v3', 'segmented_writer_v3', 'segmented_seal_v3', 'target_prior_checked_v3', 'marker_cause_capture_v3', 'mapped_source_scope_v3', 'mapped_source_shapes_v3', 'source_container_reader_v3', 'source_container_proof_v3', 'pre_graph_core_source_v3', 'pre_graph_owner_links_v3', 'pre_graph_history_reader_v3', 'owner_output_publisher_v3', 'owner_family_mode_v3', 'owner_family_reader_v3', 'owner_family_proof_v3')
+    __slots__=('_issuer', 'session', 'pair', 'scope', 'prior_reader', 'prior_view', 'barrier_view', 'hash_file', 'hash_identity', 'hash_value', 'hash_offset', 'candidate_done', 'source_disposition_view', 'historical_verification', 'source_row_capture_v3', 'segmented_target_v3', 'segmented_writer_v3', 'segmented_seal_v3', 'target_prior_checked_v3', 'marker_cause_capture_v3', 'mapped_source_scope_v3', 'mapped_source_shapes_v3', 'source_container_reader_v3', 'source_container_proof_v3', 'pre_graph_core_source_v3', 'pre_graph_owner_links_v3', 'pre_graph_history_reader_v3', 'owner_output_publisher_v3', 'owner_family_mode_v3', 'owner_family_reader_v3', 'owner_family_proof_v3', 'contact_plan_birth_reader_v3', 'contact_plan_birth_after_v3', 'contact_plan_birth_complete_v3', 'contact_plan_birth_proofs_v3', 'contact_plan_target_v3', 'contact_plan_birth_capture_v3', 'contact_prefix_source_v3', 'contact_prefix_publisher_v3', 'contact_prospective_reader_v1', 'contact_prospective_after_v1', 'contact_prospective_table_v1', 'contact_prospective_complete_v1', 'contact_prospective_proofs_v1', 'world_producer_capture_v1', 'b3_managed_metadata_proof_v1')
     def __init__(self,token,session,pair):
         if token is not _BUILD:raise TypeError('installed Graph builder is not caller constructible')
         self._issuer=token;self.session=session;self.pair=pair;self.scope=session.scope
         self.prior_reader=None;self.prior_view=None;self.barrier_view=None
-        self.source_row_capture_v3=None;self.owner_output_publisher_v3=None
+        self.source_row_capture_v3=None;self.owner_output_publisher_v3=None;self.world_producer_capture_v1=None
+        self.contact_plan_birth_reader_v3=None;self.contact_plan_birth_capture_v3=None;self.contact_plan_birth_after_v3=('','','')
+        self.contact_plan_birth_complete_v3=False;self.contact_plan_birth_proofs_v3={};self.contact_plan_target_v3=None
+        self.contact_prospective_reader_v1=None;self.contact_prospective_after_v1=None;self.contact_prospective_table_v1=0
+        self.contact_prospective_complete_v1=False;self.contact_prospective_proofs_v1={}
+        self.b3_managed_metadata_proof_v1=None
+        self.contact_prefix_source_v3=self.contact_prefix_publisher_v3=None
         self.owner_family_mode_v3=self.owner_family_reader_v3=self.owner_family_proof_v3=None
         self.mapped_source_scope_v3=None;self.mapped_source_shapes_v3={}
         self.source_container_reader_v3=self.source_container_proof_v3=None
@@ -193,12 +207,21 @@ def advance_current_graph_rebase_candidate_v2(build):
     if _advance_graph_pre_graph_owner_qualification_v3(build):return {'status':'progress','phase':'pre_graph_owner_qualification'}
     if phase=='index':return _advance_graph_original_index_v2(build,progress)
     if phase=='closure':
+        from .c09_contact_plan_birth_v3 import advance_contact_plan_birth_v3
+        if advance_contact_plan_birth_v3(build):
+            return {'status':'progress','phase':'contact_plan_birth'}
+        from .c09_contact_prospective_history_v1 import advance_contact_prospective_history_v1
+        if advance_contact_prospective_history_v1(build):
+            return {'status':'progress','phase':'contact_prospective_history'}
         if build.session._control.maintenance.control.read_build_original_v1(operation_id=build.scope.operation_id,kind='capture_prior_graph_certificate_v2') is None:
             result=capture_prior_graph_certificate_v2(build)
             if result is None:return {'status':'progress','phase':'prior_certificate'}
         return _advance_graph_closure_v2(build,progress)
     if phase=='target':return _advance_graph_target_v2(build,progress)
     if phase=='owner_outputs':return _advance_graph_owner_outputs_v3(build,progress)
+    if phase=='contact_prefix_history':
+        from .c09_contact_plan_prefix_history_v3 import advance_contact_prefix_history_stage_v3
+        return advance_contact_prefix_history_stage_v3(build,progress)
     if phase=='generated':return _advance_graph_generated_v2(build,progress)
     if phase=='deferred_schema':return _advance_deferred_graph_schema_v2(build,progress)
     if phase=='nested_directories':return _advance_graph_nested_directories_v2(build,progress)
@@ -216,6 +239,9 @@ def advance_current_graph_rebase_candidate_v2(build):
         from .c09_graph_originals_read_v5 import PRIOR_GRAPH_VIEW_TABLES_V2
         from .domain_production_originals_v1 import PHYSICAL_TABLE,PHYSICAL_DDL
         from .c09_owner_source_output_mappings_v3 import TABLE as OUTPUT_TABLE,DDL_MAP as OUTPUT_DDLS
+        from ..authority_service.c09_source_physical_read_v3 import source_owner_storage_catalogue_v3
+        owner_catalogue={(kind,name):ddl for kind,name,ddl in source_owner_storage_catalogue_v3()}
+        owner_tables={name for kind,name,ddl in source_owner_storage_catalogue_v3() if kind=='table'}
         known={OUTPUT_TABLE}|{GRAPH_TABLE}|owner_tables|(_KNOWN|{PHYSICAL_TABLE})|CAPTURE_TABLES_V2|CLOSURE_TABLES_V2|DOMAIN_INDEX_TABLES_V2|GRAPH_PROOF_TABLES_V2|SOURCE_PLAN_BARRIER_TABLES_V2|PRIOR_GRAPH_VIEW_TABLES_V2
         count=0
         with c09_sql_meter_quantum_v2(meter):
@@ -243,6 +269,16 @@ def advance_current_graph_rebase_candidate_v2(build):
                             continue
                         if obj.table_name==OUTPUT_TABLE and OUTPUT_DDLS.get(obj.name)!=obj.sql:
                             raise C09PagedCaptureHold('prior Owner output mapping registered DDL differs')
+                        from .contact_background_scheduler_v3 import TABLE as scheduler_table,DDL as scheduler_ddl
+                        if obj.table_name == scheduler_table and (obj.object_type != 'table' or obj.sql != scheduler_ddl):
+                            raise C09PagedCaptureHold('Contact durable scheduler exact schema differs')
+                        from .contact_plan_adoption_v3 import TABLE as PLAN3,DDL_MAP as PLAN3_DDLS
+                        from .contact_plan_physical_write_v3 import STREAM_TABLE,STREAM_DDL
+                        if obj.table_name==STREAM_TABLE and obj.object_type=='table' and obj.sql!=STREAM_DDL:
+                            raise C09PagedCaptureHold('Contact Plan3 exact staged stream schema differs')
+                        if obj.table_name == PLAN3 and obj.object_type in {'table','trigger'}:
+                            if PLAN3_DDLS.get(obj.name) != obj.sql:
+                                raise C09PagedCaptureHold('Contact Plan3 exact schema/immutable trigger differs')
                         if obj.table_name not in known:raise C09PagedCaptureHold('unregistered Graph table schema: '+obj.table_name)
                         meter.charge_read(len(obj.sql.encode('utf-8')))
                         if obj.object_type=='table':
@@ -268,13 +304,23 @@ def advance_current_graph_rebase_candidate_v2(build):
 def _begin_graph_source_capture_v3(build,shape,key,metadata,**profile):
     from .c09_graph_row_codec_v2 import C09MemorySourceRowCaptureV3,C09MappedGraphRowCaptureV3
     from .c09_domain_original_source_v3 import C09MappedDomainOriginalCaptureV3
-    if shape.table=='graph_domain_production_originals_v3':return C09MappedDomainOriginalCaptureV3(build,shape,key,metadata,**profile)
+    if shape.table=='graph_contact_expression_plan_originals_v3':
+        from .c09_contact_plan_physical_v3 import C09MappedContactPlanCaptureV3
+        return C09MappedContactPlanCaptureV3(build,shape,key,metadata,**profile)
+    if shape.table=='graph_domain_production_originals_v3':
+        from .c09_paged_sql_v2 import current_c09_sql_meter_v2
+        actual=current_c09_sql_meter_v2().read_fixed_row(build.pair.source,shape.table,('domain','operation_kind'),
+            'bot=? AND persona=? AND operation_id=?',tuple(key))
+        if actual==('d08','adopt_contact_expression_plan_v2'):
+            from .c09_contact_plan_physical_v3 import C09MappedContactDomainCaptureV3
+            return C09MappedContactDomainCaptureV3(build,shape,key,metadata,**profile)
+        return C09MappedDomainOriginalCaptureV3(build,shape,key,metadata,**profile)
     kind=C09MappedGraphRowCaptureV3 if 'value_cell_id' in shape.columns else C09MemorySourceRowCaptureV3
     return kind(build,shape,key,metadata,**profile)
 
 
 def _mapped_graph_source_shape_v3(build,shape,meter):
-    if shape.table!='graph_domain_production_originals_v3' and (shape.table not in ('graph_atoms','graph_history') or 'value_cell_id' not in shape.columns):
+    if shape.table not in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3') and (shape.table not in ('graph_atoms','graph_history') or 'value_cell_id' not in shape.columns):
         return None
     from .c09_logical_source_v3 import read_c09_logical_source_shape_v3
     if build.mapped_source_scope_v3 is None:
@@ -494,10 +540,13 @@ def _index_actual_graph_original_row_v2(build,stream,shape,key,row,budget,meter)
     from .c09_paged_sql_v2 import current_c09_capture_row_position_v2
     actual_stream_id,actual_ordinal=current_c09_capture_row_position_v2()
     if actual_stream_id!=stream.stream_id:raise C09PagedCaptureHold('domain index origin belongs to another source stream')
+    from .c09_b3_managed_metadata_v1 import index_b3_managed_original_v1
+    index_b3_managed_original_v1(build,stream,shape,key,row,meter)
     # Index only declared domain families; Graph atoms/events are separately
     # validated and traversed by the closure and target codecs.
     from .domain_production_erasure_v1 import DERIVED_STORE_TABLES_V6
-    if shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2}:
+    from .contact_plan_adoption_v3 import TABLE as PLAN3
+    if shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2,PLAN3,CONTACT_EFFECT_ORIGINAL}:
         decoded=read_c09_domain_row_v2(shape.table,shape.columns,row,
             authority_namespace=build.scope.authority_namespace,issuer=build.session.get_c09_domain_original_issuer_v2())
         index=C09DomainOriginalIndexV2(candidate=build.pair.candidate,source=build.pair.source,
@@ -511,6 +560,10 @@ def _index_actual_graph_original_row_v2(build,stream,shape,key,row,budget,meter)
 
 
 def _require_known_graph_object(original,known):
+    from .c09_b3_managed_metadata_v1 import require_b3_managed_schema_object_v1
+    if require_b3_managed_schema_object_v1(original):return
+    from .c09_contact_effect_accounting_v1 import require_financial_schema_object_v1
+    require_financial_schema_object_v1(original)
     if original.table_name not in known:raise C09PagedCaptureHold('unknown installed Graph schema object')
 
 
@@ -555,7 +608,7 @@ class VerifiedGraphRebaseColdV2:
 
 
 class GraphRebaseColdProgressV2:
-    __slots__=('session', 'pair', 'candidate', 'read_db', 'locator_index', 'verification', 'table_verifications', 'file', 'file_hash', 'file_offset', 'done', 'phase', 'table_name', 'source_key', 'completed_rows', 'cold_phase', 'validated_mirror_digest', 'issued_digest', 'file_identity', 'target_table', 'target_key', 'directory_phase', 'directory_after', '_issuer', 'source_eof', 'target_eof', 'verified_directories', 'census_db', 'nested_field', 'nested_after', 'nested_locator', 'nested_verification', 'schema_key', 'schema_count', 'cold_build', 'pattern_progress', 'originals_after', 'originals_locator', 'originals_verification', 'source_semantic_eof', 'semantic_table', 'semantic_key', 'target_schema_eof', 'closure_semantic_eof', 'verification_run_id', 'closure_replay_phase', 'closure_replay_progress', 'prospective_source_capture_v3', 'cold_graph_cell_v3', 'prospective_marker_cause_capture_v3', 'segmented_census_v3', 'segmented_sweep_v3', 'logical_descriptor_after_v3', 'logical_descriptor_count_v3', 'domain_cold_cell_v3', 'prospective_domain_cell_v3', 'disposition_inventory_version_v3', 'disposition_inventory_after_v3', 'disposition_inventory_count_v3', 'owner_outputs_cold_reader_v3', 'prospective_owner_outputs_cold_v3', 'owner_outputs_cold_proof_v3')
+    __slots__=('session', 'pair', 'candidate', 'read_db', 'locator_index', 'verification', 'table_verifications', 'file', 'file_hash', 'file_offset', 'done', 'phase', 'table_name', 'source_key', 'completed_rows', 'cold_phase', 'validated_mirror_digest', 'issued_digest', 'file_identity', 'target_table', 'target_key', 'directory_phase', 'directory_after', '_issuer', 'source_eof', 'target_eof', 'verified_directories', 'census_db', 'nested_field', 'nested_after', 'nested_locator', 'nested_verification', 'schema_key', 'schema_count', 'cold_build', 'pattern_progress', 'originals_after', 'originals_locator', 'originals_verification', 'source_semantic_eof', 'semantic_table', 'semantic_key', 'target_schema_eof', 'closure_semantic_eof', 'verification_run_id', 'closure_replay_phase', 'closure_replay_progress', 'prospective_source_capture_v3', 'cold_graph_cell_v3', 'prospective_marker_cause_capture_v3', 'segmented_census_v3', 'segmented_sweep_v3', 'logical_descriptor_after_v3', 'logical_descriptor_count_v3', 'domain_cold_cell_v3', 'prospective_domain_cell_v3', 'disposition_inventory_version_v3', 'disposition_inventory_after_v3', 'disposition_inventory_count_v3', 'owner_outputs_cold_reader_v3', 'prospective_owner_outputs_cold_v3', 'owner_outputs_cold_proof_v3', 'contact_plan_cold_cells_v3', 'prospective_contact_plan_cold_v3', 'contact_prefix_cold_v3', 'prospective_contact_prefix_cold_v3', 'contact_prefix_cold_proof_v3', 'prospective_world_producer_capture_v1')
     def __init__(self,token,session,pair,candidate):
         if token is not _SWEEP:raise TypeError('actual installed cold sweep required')
         self._issuer=token;self.source_eof=False;self.target_eof=False;self.verified_directories=0
@@ -568,10 +621,12 @@ class GraphRebaseColdProgressV2:
         self.schema_key=None;self.schema_count=0
         self.cold_build=InstalledGraphRebaseBuildV2(_BUILD,session,pair)
         self.owner_outputs_cold_reader_v3=self.prospective_owner_outputs_cold_v3=self.owner_outputs_cold_proof_v3=None
-        self.prospective_source_capture_v3=None
+        self.prospective_source_capture_v3=None;self.prospective_world_producer_capture_v1=None
         self.prospective_marker_cause_capture_v3=None
         self.segmented_census_v3=None;self.segmented_sweep_v3=None
         self.cold_graph_cell_v3=None;self.domain_cold_cell_v3=None;self.prospective_domain_cell_v3=None
+        self.contact_plan_cold_cells_v3=self.prospective_contact_plan_cold_v3=None
+        self.contact_prefix_cold_v3=self.prospective_contact_prefix_cold_v3=self.contact_prefix_cold_proof_v3=None
         self.pattern_progress={'pattern_kind':'atom','pattern_after':None,'nested_hit':False}
         self.originals_after=None;self.originals_locator=None;self.originals_verification=None
         self.logical_descriptor_after_v3="";self.logical_descriptor_count_v3=0
@@ -679,6 +734,9 @@ def _read_graph_disposition_original_row_v3(db,scope_digest,table,key,meter):
 def _graph_logical_preservation_original_v3(scope_digest,table,key,descriptor,source_header,header,new_commitment):
     """Recipe called only after real producer or independent cold qualification."""
     from ..graph_types import AtomKey
+    if table=='graph_contact_expression_plan_originals_v3':
+        from .c09_contact_plan_physical_v3 import contact_plan_logical_preservation_original_v3
+        return contact_plan_logical_preservation_original_v3(scope_digest,key,descriptor,source_header,header,new_commitment)
     bindings=descriptor['cell_bindings']
     domain=table=='graph_domain_production_originals_v3';logical_column='original_payload_json' if domain else 'value'
     if len(bindings)!=1 or bindings[0]['logical_column']!=logical_column:
@@ -691,11 +749,21 @@ def _graph_logical_preservation_original_v3(scope_digest,table,key,descriptor,so
         from ..memory_types import source_key
         from .owner_material_source_v1 import owner_material_source_id_v1,AdmitOwnerMaterialSourceRequestV1
         from .domain_production_registry_v1 import installed_operation_v1
-        ns=NamespaceId(*key[:2]);owner=source_key(*ns.as_tuple,owner_material_source_id_v1(ns,key[2])).token
-        operation=installed_operation_v1('admit_owner_material_source_v1')
-        if operation.domain!='d06' or operation.request_type is not AdmitOwnerMaterialSourceRequestV1:
-            raise C09PagedCaptureHold('Domain logical type registry differs')
-        logical_type='d06.current-admit_owner_material_source_v1.v1'
+        ns=NamespaceId(*key[:2])
+        owner_key=AtomKey.from_token(source_header[2])
+        if owner_key.type_name=='d08.contact_expression_plan.v2':
+            from .contact_plan_adoption_v2 import AdoptCurrentContactExpressionPlanRequestV2
+            operation=installed_operation_v1('adopt_contact_expression_plan_v2')
+            if (NamespaceId.from_key(owner_key)!=ns or operation.domain!='d08'
+                    or operation.request_type is not AdoptCurrentContactExpressionPlanRequestV2):
+                raise C09PagedCaptureHold('Contact domain logical type/request registration differs')
+            owner=owner_key.token;logical_type='d08.current-adopt_contact_expression_plan_v2.v1'
+        else:
+            owner=source_key(*ns.as_tuple,owner_material_source_id_v1(ns,key[2])).token
+            operation=installed_operation_v1('admit_owner_material_source_v1')
+            if operation.domain!='d06' or operation.request_type is not AdmitOwnerMaterialSourceRequestV1:
+                raise C09PagedCaptureHold('Domain logical type registry differs')
+            logical_type='d06.current-admit_owner_material_source_v1.v1'
     else:
         owner=key[0];logical_type=AtomKey.from_token(key[0]).type_name
     if (canonical_digest(tuple(source_header))!=binding['header_digest']
@@ -732,17 +800,33 @@ def _require_graph_logical_disposition_original_v3(build,db,shape,key,proof,mete
     raw=json.loads(proof[12])
     if type(raw) is not dict or set(raw)!={'target_cell_seal','logical_equivalence_original'}:
         raise C09PagedCaptureHold('logical disposition producer original grammar differs')
-    if target_header is None:
-        from .c09_paged_sql_v2 import _quote
-        where=' AND '.join(_quote(name)+'=?' for name in shape.primary_key_columns)
-        ref=meter.read_fixed_row(db,shape.table,('original_payload_cell_id' if shape.table=='graph_domain_production_originals_v3' else 'value_cell_id',),where,key)
-        if ref is None:raise C09PagedCaptureHold('logical disposition target row absent')
-        target_header=meter.read_fixed_row(db,'segmented_cells_v1',
-            ('cell_id','codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
-             'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(ref[0],))
-    if target_header is None:raise C09PagedCaptureHold('logical disposition actual target seal absent')
-    expected=_graph_logical_preservation_original_v3(build.scope.scope_digest,shape.table,key,
-        descriptor,raw['logical_equivalence_original']['source_cell_header'],target_header,proof[6])
+    if shape.table=='graph_contact_expression_plan_originals_v3':
+        from .contact_plan_adoption_v3 import COLUMNS,contact_plan_logical_descriptor_v3,SIGN_KIND
+        row=meter.read_fixed_row(db,shape.table,COLUMNS,'bot=? AND persona=? AND contact_id=?',key)
+        if row is None:
+            raise C09PagedCaptureHold('Contact Plan3 actual target physical row absent')
+        build.session.get_c09_domain_original_issuer_v2()._signer.verify(SIGN_KIND,
+            canonical_serialize(contact_plan_logical_descriptor_v3(row)),row[13])
+        if target_header is None:
+            target_header=tuple(meter.read_fixed_row(db,'segmented_cells_v1',
+                ('cell_id','codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                    'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(cell,))for cell in (row[4],row[9]))
+        if any(header is None for header in target_header):
+            raise C09PagedCaptureHold('Contact Plan3 actual target two-cell seals absent')
+        expected=_graph_logical_preservation_original_v3(build.scope.scope_digest,shape.table,key,descriptor,
+            raw['logical_equivalence_original']['source_cell_headers'],target_header,proof[6])
+    else:
+        if target_header is None:
+            from .c09_paged_sql_v2 import _quote
+            where=' AND '.join(_quote(name)+'=?' for name in shape.primary_key_columns)
+            ref=meter.read_fixed_row(db,shape.table,('original_payload_cell_id' if shape.table=='graph_domain_production_originals_v3' else 'value_cell_id',),where,key)
+            if ref is None:raise C09PagedCaptureHold('logical disposition target row absent')
+            target_header=meter.read_fixed_row(db,'segmented_cells_v1',
+                ('cell_id','codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                 'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(ref[0],))
+        if target_header is None:raise C09PagedCaptureHold('logical disposition actual target seal absent')
+        expected=_graph_logical_preservation_original_v3(build.scope.scope_digest,shape.table,key,
+            descriptor,raw['logical_equivalence_original']['source_cell_header'],target_header,proof[6])
     if proof[9:]!=expected or proof[4]!=expected[0]:
         raise C09PagedCaptureHold('logical disposition Source/target/equivalence original differs')
     return GraphRowDispositionV3(proof[2],proof[4],proof[5],proof[6],*proof[9:12])
@@ -873,6 +957,14 @@ def _verify_cold_source_row_v2(progress,shape,key,row,meter,*,verify_semantics=T
         raise C09PagedCaptureHold('actual source row lacks its exact disposition original')
     disposition=GraphRowDispositionV1(key_digest,proof[1],proof[2],proof[3])
     _source_row_codec_v2(progress,shape,row)
+    if verify_semantics:
+        from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
+        if not prepare_b3_managed_source_row_v1(progress.cold_build,shape,key,row,meter):return None
+    if shape.table=='graph_world_revision_index_v1':
+        from .d03_world_history_v1 import decode_world_revision_index_row_v1
+        from .c09_world_producer_metadata_v1 import prepare_cold_world_producer_v1
+        index=decode_world_revision_index_row_v1(shape.columns,row)
+        if prepare_cold_world_producer_v1(progress,index,meter.budget) is None:return None
     from .c09_closure_index_v2 import C09ClosureIndexV2
     closure=C09ClosureIndexV2(progress.read_db,progress.session.scope)
     if closure._state()[3]!='sealed':raise C09PagedCaptureHold('cold Graph dependency closure has not reached its actual fixed point')
@@ -904,10 +996,20 @@ def _verify_cold_source_row_v2(progress,shape,key,row,meter,*,verify_semantics=T
 
 def advance_current_graph_rebase_cold_v2(progress):
     if type(progress) is not GraphRebaseColdProgressV2:raise TypeError('actual cold progress required')
-    progress.prospective_source_capture_v3=None
+    progress.prospective_source_capture_v3=None;progress.prospective_world_producer_capture_v1=None
     progress.prospective_marker_cause_capture_v3=None
     progress.prospective_domain_cell_v3=None
     result=_advance_current_graph_rebase_cold_quantum_v2(progress)
+    if progress.prospective_world_producer_capture_v1 is not None:
+        capture=progress.prospective_world_producer_capture_v1
+        capture.quantum_completed=True
+        progress.cold_build.world_producer_capture_v1=capture
+        progress.prospective_world_producer_capture_v1=None
+    if progress.prospective_contact_prefix_cold_v3 is not None:
+        advanced=progress.prospective_contact_prefix_cold_v3
+        advanced.quantum_completed=True
+        progress.contact_prefix_cold_v3=advanced
+        progress.prospective_contact_prefix_cold_v3=None
     if progress.prospective_owner_outputs_cold_v3 is not None:
         adopted=progress.prospective_owner_outputs_cold_v3
         adopted.quantum_completed=True
@@ -926,6 +1028,9 @@ def advance_current_graph_rebase_cold_v2(progress):
         capture.quantum_completed=True
         progress.cold_build.marker_cause_capture_v3=capture
         progress.prospective_marker_cause_capture_v3=None
+    if progress.prospective_contact_plan_cold_v3 is not None:
+        progress.contact_plan_cold_cells_v3=progress.prospective_contact_plan_cold_v3
+        progress.prospective_contact_plan_cold_v3=None
     if progress.prospective_domain_cell_v3 is not None:
         progress.domain_cold_cell_v3=progress.prospective_domain_cell_v3[0]
         progress.prospective_domain_cell_v3=None
@@ -940,6 +1045,12 @@ def _advance_current_graph_rebase_cold_quantum_v2(progress):
     if _advance_graph_pre_graph_owner_qualification_v3(progress.cold_build):return {'status':'progress','phase':'pre_graph_owner_historical_qualification'}
     if _advance_source_container_census_for_graph_v3(progress.cold_build):return {'status':'progress','phase':'source_container_independent_census'}
     if _advance_graph_owner_family_qualification_v3(progress.cold_build):return {'status':'progress','phase':'owner_family_independent_qualification'}
+    from .c09_contact_plan_birth_v3 import advance_contact_plan_birth_v3
+    if advance_contact_plan_birth_v3(progress.cold_build):
+        return {'status':'progress','phase':'contact_plan_birth_independent_qualification'}
+    from .c09_contact_prospective_history_v1 import advance_contact_prospective_history_v1
+    if advance_contact_prospective_history_v1(progress.cold_build):
+        return {'status':'progress','phase':'contact_prospective_independent_history'}
     started=monotonic_ns();completed=0
     if progress.phase=='segmented_physical':
         from ..authority_service.c09_segmented_census_v3 import begin_segmented_census_v3,VerifiedSegmentedPhysicalSweepV3
@@ -966,11 +1077,17 @@ def _advance_current_graph_rebase_cold_quantum_v2(progress):
             return _advance_source_semantic_stage_v2(progress,budget,meter,started)
         if progress.phase=='owner_outputs_cold':
             return _advance_graph_owner_outputs_cold_v3(progress,budget,meter,started)
+        if progress.phase=='contact_prefix_cold':
+            return _advance_graph_contact_prefix_cold_v3(progress,budget,meter,started)
         if progress.phase=='source_qualified':
             if progress.owner_outputs_cold_proof_v3 is None:
                 progress.phase='owner_outputs_cold'
                 return _advance_graph_owner_outputs_cold_v3(progress,budget,meter,started)
             progress.owner_outputs_cold_proof_v3.require_current(meter=meter)
+            if progress.contact_prefix_cold_proof_v3 is None:
+                progress.phase='contact_prefix_cold'
+                return _advance_graph_contact_prefix_cold_v3(progress,budget,meter,started)
+            progress.contact_prefix_cold_proof_v3.require_current(meter)
             progress.cold_build.source_disposition_view=VerifiedC09SourceDispositionV2(_SOURCE_DISPOSITION_V2,progress)
             progress.phase='source_rows'
             return {'status':'progress','phase':'source_rows','source_disposition_qualified':True}
@@ -989,7 +1106,7 @@ def _advance_current_graph_rebase_cold_quantum_v2(progress):
                         if next_table is None:progress.source_eof=True;progress.phase='segmented_physical';break
                         progress.table_name=next_table;progress.source_key=None;continue
                     key,metadata=found
-                    if shape.table=='graph_domain_production_originals_v3':
+                    if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
                         from .c09_domain_original_source_v3 import verify_cold_domain_original_v3
                         with c09_sql_meter_quantum_v2(meter):
                             if verify_cold_domain_original_v3(progress,shape,key,metadata,meter) is None:break
@@ -1209,6 +1326,16 @@ def _advance_cold_graph_ref_row_v3(progress,shape,key,metadata,meter):
 
 
 def _verify_actual_target_row_v2(progress,shape,key,row,meter):
+    from .c09_b3_managed_metadata_v1 import require_b3_managed_target_row_v1
+    if require_b3_managed_target_row_v1(progress,shape,key,row,meter):return
+    from .c09_contact_plan_prefix_history_v3 import TABLE as PREFIX_TABLE,COLUMNS as PREFIX_COLUMNS,decode_contact_prefix_history_row_v3,_contact_prefix_target_family_v3
+    if shape.table==PREFIX_TABLE and row[0]==progress.session.scope.scope_digest:
+        from .c09_historical_proof_row_codec_v2 import _require_exact_structural_member
+        if shape.columns!=PREFIX_COLUMNS or tuple(key)!=tuple(row[:3]) or row[0]!=progress.session.scope.scope_digest:
+            raise C09PagedCaptureHold('Contact prefix target row has another actual current schema/primary key')
+        decode_contact_prefix_history_row_v3(tuple(row))
+        _require_exact_structural_member(progress.read_db,_contact_prefix_target_family_v3(progress,meter),key,tuple(row),meter)
+        return
     from .c09_owner_source_output_mappings_v3 import TABLE,COLUMNS,decode_owner_source_output_mapping_row_v3
     if shape.table==TABLE:
         from .c09_owner_source_outputs_cold_v3 import _family
@@ -1245,10 +1372,13 @@ def _verify_actual_target_row_v2(progress,shape,key,row,meter):
         (progress.candidate.scope.scope_digest,shape.table,key_digest))
     if generated is None or generated[:2]!=(canonical_serialize(key),actual):
         raise C09PagedCaptureHold('actual target row has no complete source/generated proof')
-    _verify_actual_generated_graph_row_v2(progress,shape,key,row,generated[2],generated[3],generated[4],meter)
+    return _verify_actual_generated_graph_row_v2(progress,shape,key,row,generated[2],generated[3],generated[4],meter)
 
 
 def _verify_actual_generated_graph_row_v2(progress,shape,key,row,producer,origin_ref,origin_digest,meter):
+    from .b3_managed_metadata_v1 import TABLES as B3_MANAGED_TABLES
+    if shape.table in B3_MANAGED_TABLES:
+        raise C09PagedCaptureHold('managed metadata target must have its actual source disposition, never a guessed generated birth')
     namespace=tuple(json.loads(progress.session.scope.graph_namespace))
     if producer=='c09_erased_key_v2':
         if shape.table!='graph_c09_erased_keys_v1' or tuple(row[:2])!=namespace or row[3:]!=(progress.session.scope.maintenance_generation,progress.session.scope.operation_id):
@@ -1259,6 +1389,8 @@ def _verify_actual_generated_graph_row_v2(progress,shape,key,row,producer,origin
             (progress.session.scope.scope_digest,'atom',origin_ref))
         if member!=(origin_ref,origin_digest) or canonical_digest(origin_ref)!=row[2]:
             raise C09PagedCaptureHold('generated erased marker lacks its actual atom closure origin')
+    elif producer=='world_erasure_barrier_v1':
+        return _verify_generated_world_erasure_barrier_v1(progress,shape,key,row,origin_ref,origin_digest,meter)
     elif producer=='d09_turn_slot_origin_v3':
         if shape.table!='graph_d09_turn_slot_origins_v3' or key!=(origin_ref,) or tuple(row[1:3])!=namespace:
             raise C09PagedCaptureHold('generated turn-slot origin has another actual logical namespace/key')
@@ -1311,7 +1443,7 @@ def _advance_actual_graph_cold_targets_v2(progress,budget,meter,started):
                     progress.target_eof=True;progress.phase='file_hash' if progress.verified_directories==6 and progress.target_schema_eof else 'target_schema';break
                 progress.target_table=following;progress.target_key=None;continue
             key,metadata=found;raw_size=sum(size or 0 for _,size in metadata)
-            if shape.table=='graph_domain_production_originals_v3':
+            if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
                 from .c09_domain_original_source_v3 import verify_cold_domain_original_v3
                 source_shape=read_c09_table_shape_v2(progress.pair.source,shape.table)
                 source_metadata=_read_frozen_source_row_metadata_v3(progress.cold_build,source_shape,key,meter)
@@ -1328,7 +1460,7 @@ def _advance_actual_graph_cold_targets_v2(progress,budget,meter,started):
                 break
             row=meter.read_row(progress.read_db,shape,key)
             if row is None:raise C09PagedCaptureHold('actual cold target row disappeared')
-            _verify_actual_target_row_v2(progress,shape,key,tuple(row),meter)
+            if _verify_actual_target_row_v2(progress,shape,key,tuple(row),meter) is False:break
             progress.target_key=key;completed+=1
     finally:progress.read_db.rollback()
     read_ns=monotonic_ns()-read_started
@@ -1373,7 +1505,7 @@ def _verify_actual_graph_directory_record_v2(progress,field,shape,record,meter):
         target=meter.read_row(progress.read_db,target_shape,target_key)
         if target is None or _row_digest(target)!=values['row_commitment']:
             raise C09PagedCaptureHold('generated directory target commitment differs')
-        _verify_actual_generated_graph_row_v2(progress,target_shape,target_key,target,values['producer'],values['origin_ref'],values['origin_digest'],meter)
+        return _verify_actual_generated_graph_row_v2(progress,target_shape,target_key,target,values['producer'],values['origin_ref'],values['origin_digest'],meter)
     elif field in {'disposition_directory','target_directory','closure'}:
         values=dict(zip(shape.columns,row,strict=True))
         nested=c09_paged_value_from_wire_v2(json.loads(values['identity_json']),C09StreamIdentityV2)
@@ -1486,6 +1618,15 @@ def _advance_deferred_graph_schema_v2(build,progress):
 
 
 def _require_source_graph_schema_object_v2(source,obj):
+    from .d03_world_history_v1 import TABLE,DDL,INDEX_DDL,ERASURE_TABLE,ERASURE_DDL,ERASURE_INDEX_DDL
+    expected={('table',TABLE):DDL,('index','graph_world_revision_temporal_v1'):INDEX_DDL,
+        ('table',ERASURE_TABLE):ERASURE_DDL,('index','graph_world_erased_knowledge_v1'):ERASURE_INDEX_DDL}
+    if obj.table_name in {TABLE,ERASURE_TABLE} and not obj.name.startswith('sqlite_autoindex_'):
+        wanted=expected.get((obj.object_type,obj.name))
+        if wanted is None or obj.sql!=wanted.replace(' IF NOT EXISTS',''):
+            raise C09PagedCaptureHold('World C09 schema object differs from its exact installed metadata schema')
+    from .c09_contact_effect_accounting_v1 import require_financial_schema_object_v1
+    require_financial_schema_object_v1(obj)
     actual=source.execute('SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type=? AND name=?',obj.primary_key).fetchone()
     if actual!=(obj.object_type,obj.name,obj.table_name,obj.sql):
         raise C09PagedCaptureHold('deferred Graph DDL differs from its actual frozen original')
@@ -1696,6 +1837,16 @@ def _actual_domain_index_v2(build,shape,budget,meter):
 
 
 def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
+    if shape.table=="graph_owner_goal_cancellation_projections_v1":
+        from .owner_goal_projection_v1 import validate_goal_projection_row_v1
+        observed,receipt=validate_goal_projection_row_v1(shape.columns,row,issuer=build.session.get_c09_domain_original_issuer_v2())
+        # The original event is metadata-only. Requiring an independently read
+        # exact event digest keeps this receipt tied to its actual W01 CAS.
+        event=meter.read_fixed_row(build.pair.source,"graph_events",("digest",),
+            "bot=? AND persona=? AND session=? AND event_id=?",
+            (*receipt.namespace.as_tuple,receipt.event_session,receipt.operation_id))
+        if event!=(receipt.event_digest,):raise C09PagedCaptureHold("Goal projection actual W01 event join changed")
+        return
     from .c09_graph_row_codec_v2 import verify_c09_life_domain_join_v2,verify_c09_d07_accounting_join_v2,verify_c09_contact_accounting_join_v2
     from .c09_d07_execution_v1 import TABLE as D07
     from .c09_contact_originals_v1 import TABLE as CONTACT
@@ -1705,7 +1856,13 @@ def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
     index=_actual_domain_index_v2(build,shape,budget,meter)
     def read(kind,ref):
         saved=index.get(ns,kind,ref);return None if saved is None else saved[1]
-    if shape.table=='graph_d11_life_originals_v1':
+    if shape.table in ('graph_contact_prospective_originals_v1','graph_contact_prospective_successors_v1'):
+        from .c09_contact_prospective_history_v1 import require_contact_prospective_c09_join_v1
+        require_contact_prospective_c09_join_v1(build,shape,row,original,meter)
+    elif shape.table == CONTACT_EFFECT_ORIGINAL:
+        from .c09_contact_effect_accounting_v1 import verify_financial_original_join_v1
+        verify_financial_original_join_v1(original, read_original=read)
+    elif shape.table=='graph_d11_life_originals_v1':
         verify_c09_life_domain_join_v2(build.pair.source,original,shape.columns,row,index=index)
     elif shape.table==D07:verify_c09_d07_accounting_join_v2(original,read_original=read)
     elif shape.table in {CONTACT,CONTACT2}:
@@ -1718,6 +1875,36 @@ def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
 
 
 def _validate_graph_source_row_v2(session,shape,row):
+    from .c09_b3_managed_metadata_v1 import validate_b3_managed_source_row_v1
+    if validate_b3_managed_source_row_v1(session,shape,row):return
+    if shape.table=='graph_world_revision_index_v1':
+        from .d03_world_history_v1 import decode_world_revision_index_row_v1,SIGN_KIND
+        decode_world_revision_index_row_v1(shape.columns,row)
+        session.get_c09_domain_original_issuer_v2()._signer.verify(SIGN_KIND,row[5],row[7])
+        return
+    if shape.table=='graph_world_revision_erasure_barriers_v1':
+        from .d03_world_history_v1 import decode_world_erasure_barrier_row_v1,ERASURE_SIGN_KIND
+        decode_world_erasure_barrier_row_v1(shape.columns,row)
+        session.get_c09_domain_original_issuer_v2()._signer.verify(ERASURE_SIGN_KIND,row[8],row[10])
+        return
+    if shape.table in {CONTACT_EFFECT_ORIGINAL, CONTACT_EFFECT_ATTEMPT}:
+        from .c09_contact_effect_accounting_v1 import validate_graph_financial_row_v1
+        validate_graph_financial_row_v1(shape.table,shape.columns,row,issuer=session.get_c09_domain_original_issuer_v2())
+        return
+    from .contact_plan_adoption_v3 import TABLE as PLAN3
+    from .contact_plan_physical_write_v3 import STREAM_TABLE,validate_contact_plan_stream_row_v3
+    if shape.table==STREAM_TABLE:
+        validate_contact_plan_stream_row_v3(shape.columns,row)
+        return
+    if shape.table == PLAN3:
+        from .c09_graph_row_codec_v2 import read_c09_domain_row_v2
+        read_c09_domain_row_v2(shape.table,shape.columns,row,authority_namespace=session.scope.authority_namespace,
+            issuer=session.get_c09_domain_original_issuer_v2())
+        return
+    from .contact_background_scheduler_v3 import TABLE as scheduler_table,validate_contact_scheduler_row_v3
+    if shape.table == scheduler_table:
+        validate_contact_scheduler_row_v3(shape.columns,row)
+        return
     from .c09_budget_rows_v1 import TABLES,validate_c09_budget_row_v1
     from .c09_d07_execution_v1 import STAGE_TABLE,ACCOUNTING_TABLE,validate_d07_stage_attempt_row_v1,validate_d07_accounting_attempt_row_v1
     if shape.table in TABLES:validate_c09_budget_row_v1(shape.table,shape.columns,row);return
@@ -1762,7 +1949,7 @@ def _graph_nested_advance_v2(closure,value,progress,budget,meter):
 
 
 def _large_memory_source_v3(shape,key,metadata,meter):
-    if shape.table=='graph_domain_production_originals_v3':return True
+    if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):return True
     if shape.table not in {'graph_atoms','graph_history'}:
         return False
     if 'value_cell_id' in shape.columns:
@@ -1775,10 +1962,17 @@ def _large_memory_source_v3(shape,key,metadata,meter):
 
 def _source_row_small_sql_v3(build,shape,key,meter,*,capture=None):
     """Actual nonbody SQL columns; oversized second cells keep their codec HOLD."""
-    if shape.table=='graph_domain_production_originals_v3':
-        from .c09_domain_original_source_v3 import C09MappedDomainOriginalCaptureV3
+    if shape.table=='graph_contact_expression_plan_originals_v3':
+        from .c09_contact_plan_physical_v3 import C09MappedContactPlanCaptureV3
         current=build.source_row_capture_v3 if capture is None else capture
-        if type(current) is not C09MappedDomainOriginalCaptureV3 or current.key!=tuple(key) or not current.row.complete or not current.value.complete:
+        if type(current) is not C09MappedContactPlanCaptureV3 or current.key!=tuple(key) or not current.row.complete or not current.value.complete:
+            raise C09PagedCaptureHold('Contact Plan3 metadata requires its actual complete physical producer')
+        return {'bot':key[0],'persona':key[1],'contact_id':key[2],'producing_operation_id':current.physical[3],'payload_digest':current.physical[8]}
+    if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
+        from .c09_domain_original_source_v3 import C09MappedDomainOriginalCaptureV3
+        from .c09_contact_plan_physical_v3 import C09MappedContactDomainCaptureV3
+        current=build.source_row_capture_v3 if capture is None else capture
+        if type(current) not in (C09MappedDomainOriginalCaptureV3,C09MappedContactDomainCaptureV3) or current.key!=tuple(key) or not current.row.complete or not current.value.complete:
             raise C09PagedCaptureHold('Domain small metadata needs its actual completed producer')
         return {'bot':key[0],'persona':key[1],'operation_id':key[2],'original_digest':current.identity[2]}
     from .c09_paged_sql_v2 import _quote
@@ -1815,7 +2009,7 @@ def _actual_streamed_source_origin_v3(build,shape,key,metadata,capture,meter):
     from .c09_paged_sql_v2 import require_c09_capture_member_v2
     commitment=capture.require_complete(build,shape,key,metadata)
     locator=_actual_source_locator_v2(build,shape,meter)
-    if 'value_cell_id' in shape.columns or shape.table=='graph_domain_production_originals_v3':
+    if 'value_cell_id' in shape.columns or shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
         from .c09_paged_sql_v2 import require_c09_logical_source_row_member_v3
         original=meter.read_fixed_row(build.pair.candidate,'c09_capture_members_v2',('record_ordinal','commitment'),
             'stream_id=? AND primary_key_json=?',(locator.identity.stream_id,canonical_serialize(key)))
@@ -1842,6 +2036,7 @@ def _advance_source_nested_match_v3(build,shape,key,metadata,closure,progress,bu
         encoded=canonical_serialize(pattern)
         from .c09_closure_index_v2 import C09ClosureIndexV2
         if type(closure) is C09ClosureIndexV2:meter.charge_read(len(encoded.encode()))
+    capture=build.source_row_capture_v3
     if shape.table in {'graph_atoms','graph_history'} and 'value_cell_id' not in shape.columns and _actual_erased_graph_marker_v3(build,shape,key,meter):
         _require_prior_erased_graph_row_v3(build,shape,key,meter)
         row=tuple(meter.read_row(build.pair.source,shape,key))
@@ -1875,9 +2070,29 @@ def _expand_streamed_source_closure_v3(build,shape,key,small,origin,closure,hit,
     # The existing typed-edge codec has no memory.source auxiliary branch.
     # Historical SQL dependencies and the actual nested hit retain V2 directions.
     capture=build.source_row_capture_v3 if capture is None else capture
-    if shape.table=='graph_domain_production_originals_v3':
+    if shape.table=='graph_contact_expression_plan_originals_v3':
+        from .c09_contact_plan_physical_v3 import C09MappedContactPlanCaptureV3
+        from ..domains.d08.contact_plan_v3 import contact_plan_keys_v3
+        from ..graph_types import AtomKey
+        if type(capture) is not C09MappedContactPlanCaptureV3:
+            raise C09PagedCaptureHold('Contact closure lost its actual mapped Plan3 producer')
+        born=build.contact_plan_birth_proofs_v3.get(tuple(key))
+        if born is None:
+            raise C09PagedCaptureHold('Contact closure requires its actual complete historical birth joins')
+        born.require_complete(build,current_c09_sql_meter_v2())
+        refs=tuple(row.ref for row in capture.proof.historical_reads if AtomKey.from_token(row.ref).type_name=='memory.source')
+        for member in contact_plan_keys_v3(capture.plan):
+            for dependency in refs:
+                closure.add_edge(member.token,dependency,**origin)
+                if closure.contains_atom(dependency):
+                    closure.add_atom(member.token,**origin)
+        if hit or any(closure.contains_atom(ref)for ref in refs):
+            closure.add_member('operation',capture.proof.producing_operation_id,**origin)
+        return
+    if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
         from .c09_domain_original_source_v3 import C09MappedDomainOriginalCaptureV3,_domain_removed_v3
-        if type(capture) is not C09MappedDomainOriginalCaptureV3:raise C09PagedCaptureHold('Domain closure actual producer missing')
+        from .c09_contact_plan_physical_v3 import C09MappedContactDomainCaptureV3
+        if type(capture) not in (C09MappedDomainOriginalCaptureV3,C09MappedContactDomainCaptureV3):raise C09PagedCaptureHold('Domain closure actual producer missing')
         if _domain_removed_v3(capture,closure,hit):
             closure.add_member('operation',capture.operation_id,**origin)
         return
@@ -1963,6 +2178,11 @@ def _advance_graph_closure_v2(build,progress):
                 else:
                     if size*9>meter.remaining_bytes:raise C09PagedCaptureHold('actual closure row needs its registered streaming semantic codec')
                     row=tuple(meter.read_row(source,shape,key));_validate_graph_source_row_v2(build.session,shape,row)
+                    from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
+                    if not prepare_b3_managed_source_row_v1(build,shape,key,row,meter):
+                        progress['table']=table
+                        with capture_transaction_v2(candidate):_save_graph_progress_v2(build,'closure',progress,meter)
+                        return _graph_step_report_v2(build,'closure',meter,started)
                     with capture_transaction_v2(candidate):
                         hit,done=_graph_nested_advance_v2(closure,_graph_row_nested_value_v2(shape,row),progress,budget,meter)
                         if done:
@@ -1986,6 +2206,8 @@ def _expand_graph_closure_row_v2(build,shape,key,row,closure,hit,origin,budget,m
     from .c09_d07_execution_v1 import TABLE as D07
     from .c09_contact_originals_v1 import TABLE as CONTACT
     from .c09_contact_originals_v2 import TABLE as CONTACT2
+    from .c09_b3_managed_metadata_v1 import expand_b3_managed_metadata_closure_v1
+    if expand_b3_managed_metadata_closure_v1(build,shape,key,row,closure,hit,origin):return
     values=dict(zip(shape.columns,row,strict=True));namespace=tuple(json.loads(build.scope.graph_namespace))
     if _require_source_owner_mapping_metadata_v3(build,shape,key,row,meter):return
     if _require_owner_source_metadata_row_for_graph_v3(build,shape,key,row,meter):return
@@ -2013,7 +2235,7 @@ def _expand_graph_closure_row_v2(build,shape,key,row,closure,hit,origin,budget,m
         if dependent.type_name!='memory.access' and closure.contains_atom(dependency.token):closure.add_atom(dependent.token,**origin)
     elif shape.table=='graph_events' and hit:
         if (values.get('bot'),values.get('persona'))==namespace:closure.add_member('operation',values['event_id'],**origin)
-    elif shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2}:
+    elif shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL}:
         original=read_c09_domain_row_v2(shape.table,shape.columns,row,authority_namespace=build.scope.authority_namespace,
             issuer=build.session.get_c09_domain_original_issuer_v2())
         classify_c09_domain_row_v2(original,shape.columns,row,closure=closure,nested_hit=hit,origin=origin,
@@ -2030,11 +2252,20 @@ def _classify_graph_target_row_v2(build,shape,key,row,closure,nested_hit,origin,
     from .c09_contact_originals_v1 import TABLE as CONTACT
     from .c09_contact_originals_v2 import TABLE as CONTACT2
     from ..graph_types import AtomKey
+    if shape.table=='graph_world_revision_index_v1':
+        _authenticated_world_revision_index_v1(build,shape,row,meter)
+    if shape.table=='graph_world_revision_erasure_barriers_v1':
+        _require_prior_world_erasure_barrier_v1(build,shape,key,row,meter)
+        return 'preserved_exact',tuple(row)
     if _require_source_owner_mapping_metadata_v3(build,shape,key,row,meter):return 'derived_removed',None
     if _require_owner_source_metadata_row_for_graph_v3(build,shape,key,row,meter):return 'preserved_exact',row
     if _require_paid_owner_graph_source_row_v3(build,shape,row,meter):
         removed=closure.contains_operation(row[2]) or nested_hit
         return ('derived_removed',None) if removed else ('preserved_exact',row)
+    from .b3_managed_metadata_v1 import TABLES as B3_MANAGED_TABLES
+    if shape.table in B3_MANAGED_TABLES:
+        from .c09_b3_managed_metadata_v1 import classify_b3_managed_metadata_row_v1
+        return classify_b3_managed_metadata_row_v1(build,shape,key,row,closure,nested_hit)
     values=dict(zip(shape.columns,row,strict=True));updated=list(row);disposition='preserved_exact'
     from .c09_foreground_attempt_v1 import TABLE as FOREGROUND_TABLE
     from .c09_source_plan_barrier_v2 import SOURCE_PLAN_BARRIER_TABLES_V2,SOURCE_PLAN_BARRIER_DDLS_V2
@@ -2073,7 +2304,7 @@ def _classify_graph_target_row_v2(build,shape,key,row,closure,nested_hit,origin,
     elif shape.table in DERIVED_STORE_TABLES_V6:
         disposition=classify_c09_derived_store_row_v2(build.pair.source,shape.table,shape.columns,row,closure=closure,
             authority_namespace=build.scope.authority_namespace,require_erased_fact=lambda *args,**kw:_require_previous_derived_fact_v2(build,*args,**kw),meter=meter)
-    elif shape.table in TABLE_COLUMNS or shape.table in {D04,D07,CONTACT,CONTACT2}:
+    elif shape.table in TABLE_COLUMNS or shape.table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL}:
         original=read_c09_domain_row_v2(shape.table,shape.columns,row,authority_namespace=build.scope.authority_namespace,
             issuer=build.session.get_c09_domain_original_issuer_v2())
         disposition=classify_c09_domain_row_v2(original,shape.columns,row,closure=closure,nested_hit=nested_hit,origin=origin,
@@ -2136,7 +2367,7 @@ def _actual_erased_graph_marker_v3(build,shape,key,meter):
         if header[4]!=len(expected):return False
         if header[2]!=key[0]:raise C09PagedCaptureHold('mapped marker source owner differs from canonical key')
         block,total=scope.read_cell_fragment_v3(cell[0],start=0,length=header[4],meter=meter)
-        if total!=header[4] or sha256(block).hexdigest()!=header[6]:
+        if total!=header[4] or hashlib.sha256(block).hexdigest()!=header[6]:
             raise C09PagedCaptureHold('actual complete mapped marker payload SHA differs')
         # Even this small body must have the declared ordered segments and EOF.
         root=canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell[0]));offset=0
@@ -2567,9 +2798,15 @@ def _advance_graph_target_v2(build,progress):
     from .c09_paged_sql_v2 import c09_row_commitment_v2 as _row_digest
     from .c09_paged_sql_v2 import read_c09_next_row_metadata_v2
     source=build.pair.source;candidate=build.pair.candidate;started=monotonic_ns()
+    if progress.get('scan_phase')=='world_producer_metadata':
+        from .c09_world_producer_metadata_v1 import advance_world_producer_target_phase_v1
+        return advance_world_producer_target_phase_v1(build,progress)
     source_target_used=False;source_target_pending=None
     table=progress.get('table') or _next_graph_logical_source_table_v3(build,None)
     shape=read_c09_table_shape_v2(source,table);stream=_source_stream_identity_v2(build,shape,'row_dispositions')
+    if shape.table=='graph_contact_expression_plan_originals_v3' and progress.get('scan_phase') in {'contact_plan_copy','contact_plan_publish','contact_plan_remove'}:
+        from .c09_contact_plan_physical_v3 import advance_contact_plan_target_v3
+        return advance_contact_plan_target_v3(build,progress,shape)
     if shape.table=='graph_domain_production_originals_v3' and progress.get('scan_phase') in {'domain_copy','domain_publish','domain_remove'}:
         from .c09_domain_original_source_v3 import advance_domain_original_target_v3
         return advance_domain_original_target_v3(build,progress,shape)
@@ -2598,7 +2835,10 @@ def _advance_graph_target_v2(build,progress):
                                 build,shape,key,metadata,closure,progress,budget,meter)
                             source_target_pending=pending;source_target_used=True
                             if done:
-                                if shape.table=='graph_domain_production_originals_v3':
+                                if shape.table=='graph_contact_expression_plan_originals_v3':
+                                    removed=closure.contains_operation(pending.proof.producing_operation_id) or hit
+                                    progress.update(scan_phase='contact_plan_remove' if removed else 'contact_plan_copy',row_complete=key,nested_hit=hit)
+                                elif shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
                                     from .c09_domain_original_source_v3 import _domain_removed_v3
                                     removed=_domain_removed_v3(pending,closure,hit)
                                     progress.update(scan_phase='domain_remove' if removed else 'domain_copy',row_complete=key,nested_hit=hit)
@@ -2606,7 +2846,10 @@ def _advance_graph_target_v2(build,progress):
                         else:
                             if sum(n or 0 for _,n in metadata)*9>meter.remaining_bytes:raise C09PagedCaptureHold('target pattern row needs registered streaming semantic codec')
                             row=tuple(meter.read_row(source,shape,key))
-                            if _prepare_historical_row_stream_v2(build,shape,row,meter):
+                            from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
+                            if not prepare_b3_managed_source_row_v1(build,shape,key,row,meter):
+                                progress['historical_waiting']=False
+                            elif _prepare_historical_row_stream_v2(build,shape,row,meter):
                                 progress['historical_waiting']=True
                             else:
                                 progress['historical_waiting']=False
@@ -2615,6 +2858,8 @@ def _advance_graph_target_v2(build,progress):
                                     progress.update(scan_phase='ref_copy' if shape.table in {'graph_atoms','graph_history'} else 'rows',
                                         row_complete=key,nested_hit=hit)
                 finally:source.rollback()
+                if shape.table=='graph_world_revision_index_v1' and progress.get('scan_phase')=='rows':
+                    progress['scan_phase']='world_producer_metadata'
                 if progress.get('historical_waiting'):
                     _advance_historical_row_stream_v2(build,budget,meter)
             else:
@@ -2627,6 +2872,8 @@ def _advance_graph_target_v2(build,progress):
                     origin=_actual_source_row_origin_v2(build,shape,key,row,row_meter)
                     disposition,target=_classify_graph_target_row_v2(build,shape,key,row,closure,progress.get('nested_hit',False),origin,one,row_meter)
                     if target is not None:row_meter.write_row(db,shape.table,shape.columns,target)
+                    if disposition=='derived_removed' and shape.table=='graph_world_revision_index_v1':
+                        _generate_world_erasure_barrier_v1(build,db,shape,key,row,origin,row_meter)
                     proof=(build.scope.scope_digest,shape.table,canonical_digest((shape.table,key)),canonical_serialize(key),
                         _row_digest(row),disposition,None if target is None else _row_digest(target),origin['origin_stream_id'],origin['origin_record_ordinal'])
                     row_meter.write_row(db,'c09_graph_dispositions_v2',
@@ -2755,7 +3002,7 @@ def _verify_actual_nested_record_v2(progress,field,shape,record,meter):
         proof=_read_graph_disposition_original_row_v3(progress.read_db,progress.session.scope.scope_digest,shape.table,record.primary_key,meter)
         if proof is None or proof[3]!=canonical_serialize(record.primary_key) or _row_digest(tuple(proof))!=record.commitment:
             raise C09PagedCaptureHold('nested disposition record differs from its exact nine-field original')
-        if shape.table=='graph_domain_production_originals_v3':
+        if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
             from .c09_domain_original_source_v3 import verify_cold_domain_original_v3
             metadata=_read_frozen_source_row_metadata_v3(progress.cold_build,shape,record.primary_key,meter)
             result=verify_cold_domain_original_v3(progress,shape,record.primary_key,metadata,meter,verify_semantics=False)
@@ -2769,9 +3016,10 @@ def _verify_actual_nested_record_v2(progress,field,shape,record,meter):
                 return False if result is None else None
         row=meter.read_row(progress.pair.source,shape,record.primary_key)
         if row is None or _row_digest(tuple(row))!=proof[4]:raise C09PagedCaptureHold('nested disposition lost its actual source row')
-        _verify_cold_source_row_v2(progress,shape,record.primary_key,tuple(row),meter,verify_semantics=False)
+        result=_verify_cold_source_row_v2(progress,shape,record.primary_key,tuple(row),meter,verify_semantics=False)
+        return False if result is None else None
     elif field=='target_directory':
-        if shape.table=='graph_domain_production_originals_v3':
+        if shape.table in ('graph_domain_production_originals_v3','graph_contact_expression_plan_originals_v3'):
             from .c09_domain_original_source_v3 import verify_cold_domain_original_v3
             source_shape=read_c09_table_shape_v2(progress.pair.source,shape.table)
             metadata=_read_frozen_source_row_metadata_v3(progress.cold_build,source_shape,record.primary_key,meter)
@@ -2789,7 +3037,7 @@ def _verify_actual_nested_record_v2(progress,field,shape,record,meter):
             # completed header/segments/original bytes and layout disposition.
             complete=_advance_cold_graph_ref_row_v3(progress,shape,record.primary_key,None,meter)
             return None if complete else False
-        _verify_actual_target_row_v2(progress,shape,record.primary_key,tuple(row),meter)
+        return _verify_actual_target_row_v2(progress,shape,record.primary_key,tuple(row),meter)
     elif field=='closure':
         if shape.table not in {'c09_closure_members_v2','c09_closure_edges_v2'}:raise C09PagedCaptureHold('closure nested stream has an unregistered physical family')
         row=meter.read_row(progress.read_db,shape,record.primary_key)
@@ -2887,7 +3135,8 @@ def _managed_graph_metadata_tables_v2():
     from .c09_paged_sql_v2 import CAPTURE_TABLES_V2
     from .c09_graph_originals_read_v5 import PRIOR_GRAPH_VIEW_TABLES_V2
     from .c09_owner_source_output_mappings_v3 import TABLE
-    return CAPTURE_TABLES_V2|CLOSURE_TABLES_V2|DOMAIN_INDEX_TABLES_V2|GRAPH_PROOF_TABLES_V2|PRIOR_GRAPH_VIEW_TABLES_V2|{TABLE}
+    from .c09_contact_plan_prefix_history_v3 import TABLE as CONTACT_PREFIX
+    return CAPTURE_TABLES_V2|CLOSURE_TABLES_V2|DOMAIN_INDEX_TABLES_V2|GRAPH_PROOF_TABLES_V2|PRIOR_GRAPH_VIEW_TABLES_V2|{TABLE,CONTACT_PREFIX}
 
 
 
@@ -2895,7 +3144,8 @@ def _managed_graph_metadata_tables_v2():
 def _next_graph_target_directory_table_v3(build,after):
     following=_next_target_business_table_v2(build,after)
     from .c09_owner_source_output_mappings_v3 import TABLE
-    for projection in ('graph_d09_turn_slot_origins_v3',TABLE):
+    from .c09_contact_plan_prefix_history_v3 import TABLE as CONTACT_PREFIX
+    for projection in ('graph_d09_turn_slot_origins_v3',TABLE,CONTACT_PREFIX):
         if (after is None or projection>after) and (following is None or projection<following):following=projection
     return following
 
@@ -3163,10 +3413,12 @@ def _advance_source_semantic_stage_v2(progress,budget,meter,started):
                     if count==0:raise C09PagedCaptureHold('semantic source row requires its registered streaming codec')
                     break
                 row=tuple(meter.read_row(source,shape,key));_validate_graph_source_row_v2(progress.session,shape,row)
+                from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
+                if not prepare_b3_managed_source_row_v1(progress.cold_build,shape,key,row,meter):break
                 _require_source_owner_mapping_metadata_v3(progress.cold_build,shape,key,row,meter)
                 _require_owner_source_metadata_row_for_graph_v3(progress.cold_build,shape,key,row,meter)
                 _require_paid_owner_graph_source_row_v3(progress.cold_build,shape,row,meter)
-                if table in TABLE_COLUMNS or table in {D04,D07,CONTACT,CONTACT2}:
+                if table in TABLE_COLUMNS or table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL}:
                     original=read_c09_domain_row_v2(table,shape.columns,row,
                         authority_namespace=progress.session.scope.authority_namespace,
                         issuer=progress.session.get_c09_domain_original_issuer_v2())
@@ -3406,7 +3658,10 @@ def _advance_independent_graph_closure_v2(progress,budget,meter,started):
                             if sum(n or 0 for _,n in metadata)*9>meter.remaining_bytes:
                                 raise C09PagedCaptureHold('independent closure Source row requires its registered streaming codec')
                             row=tuple(meter.read_row(source,shape,key))
-                            hit,done=_graph_nested_advance_v2(closure,_graph_row_nested_value_v2(shape,row),state,budget,meter)
+                            from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
+                            qualified=prepare_b3_managed_source_row_v1(progress.cold_build,shape,key,row,meter)
+                            hit,done=(_graph_nested_advance_v2(closure,_graph_row_nested_value_v2(shape,row),state,budget,meter)
+                                if qualified else(False,False))
                             if done:
                                 origin=_actual_source_row_origin_v2(progress.cold_build,shape,key,row,meter)
                                 _expand_graph_closure_row_v2(progress.cold_build,shape,key,row,closure,hit,origin,budget,meter)
@@ -3578,8 +3833,8 @@ def _advance_graph_owner_outputs_v3(build,progress):
                         ('prepared_digest',),'capture_scope_digest=? ORDER BY prepared_digest,cell_name',(build.scope.scope_digest,))
                     if extra is not None:raise C09PagedCaptureHold('zero Source family has an extra target output mapping')
                 with capture_transaction_v2(build.pair.candidate):
-                    _save_graph_progress_v2(build,'generated',{'after_ref':None},meter)
-                return _graph_step_report_v2(build,'generated',meter,monotonic_ns())
+                    _save_graph_progress_v2(build,'contact_prefix_history',{'after_cell':''},meter)
+                return _graph_step_report_v2(build,'contact_prefix_history',meter,monotonic_ns())
             name=NAMES[progress.get('name_index',0)]
     publisher=build.owner_output_publisher_v3
     if publisher is None:publisher=PreparedOwnerOutputPublicationV3(build,prepared,name)
@@ -3699,3 +3954,176 @@ def _require_graph_owner_zero_family_v3(build,meter,*,record):
     if original is None or original['details']!=json.loads(canonical_serialize(details)):
         raise C09PagedCaptureHold('zero output family lacks its real producer/source absence original')
     return original
+
+
+def _advance_graph_contact_prefix_cold_v3(progress,budget,meter,started):
+    from .c09_contact_plan_prefix_history_v3 import ContactPlanPrefixesColdReadV3
+    reader=progress.contact_prefix_cold_v3
+    if reader is None:
+        progress.prospective_contact_prefix_cold_v3=ContactPlanPrefixesColdReadV3(progress,meter)
+    elif not reader.complete:
+        progress.prospective_contact_prefix_cold_v3=reader.advance(meter)
+    else:
+        progress.contact_prefix_cold_proof_v3=reader.require_complete(meter)
+        progress.phase='source_qualified'
+    return {'status':'progress','phase':progress.phase,'actual_meter_bytes':meter.consumed_bytes,
+        'local_ns':monotonic_ns()-started}
+
+
+def _authenticated_world_revision_index_v1(build,shape,row,meter):
+    """Authenticate only this fixed signed locator and its actual frozen W01 metadata."""
+    from .d03_world_history_v1 import (TABLE,COLUMNS,SIGN_KIND,
+        decode_world_revision_index_row_v1,world_assertion_commitment_v1)
+    from ..runtime_contracts import NamespaceId
+    if shape.table!=TABLE or shape.columns!=COLUMNS or len(row[5].encode('utf-8'))>16384:
+        raise C09PagedCaptureHold('World C09 signed index exceeds its registered exact shape/bound')
+    namespace=NamespaceId(row[0],row[1])
+    if namespace.as_tuple!=tuple(json.loads(build.scope.graph_namespace)):
+        raise C09PagedCaptureHold('World C09 index lacks its actual namespace maintenance scope')
+    issuer=build.session.get_c09_domain_original_issuer_v2()
+    index=decode_world_revision_index_row_v1(shape.columns,row,namespace=namespace)
+    issuer._signer.verify(SIGN_KIND,row[5],row[7])
+    if index.assertion_commitment!=world_assertion_commitment_v1(namespace,index.assertion_id,issuer):
+        raise C09PagedCaptureHold('World C09 index assertion commitment differs from its actual signer')
+    receipt=meter.read_fixed_row(build.pair.source,'graph_bundle_operations',('receipt_json','commit_seq'),
+        'bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,index.adoption_operation_id))
+    history=meter.read_fixed_row(build.pair.source,'graph_history',('event_bot','event_persona','event_id','valid'),
+        'token=? AND revision=?',(index.input_version.key.token,index.input_version.revision))
+    if receipt is None or history!=(*namespace.as_tuple,index.adoption_operation_id,1):
+        raise C09PagedCaptureHold('World C09 index has no actual frozen immutable adoption')
+    from .domain_production_originals_v1 import _receipt
+    original=_receipt(json.loads(receipt[0]))
+    if (receipt[1]!=index.known_from_sequence or original.commit_seq!=receipt[1]
+            or canonical_digest(original)!=index.adoption_receipt_digest
+            or index.input_version not in original.write_versions):
+        raise C09PagedCaptureHold('World C09 index knowledge sequence differs from its actual W01 receipt')
+    from .c09_world_producer_metadata_v1 import require_world_producer_metadata_v1
+    require_world_producer_metadata_v1(build,index)
+    return namespace,index,issuer
+
+
+def _world_erasure_barrier_row_v1(build,shape,row,meter):
+    from .d03_world_history_v1 import (world_revision_commitment_v1,
+        world_erasure_barrier_payload_v1,ERASURE_SIGN_KIND)
+    namespace,index,issuer=_authenticated_world_revision_index_v1(build,shape,row,meter)
+    barrier=world_erasure_barrier_payload_v1(index,namespace=namespace,
+        revision_commitment=world_revision_commitment_v1(index,issuer),
+        deletion_generation=build.scope.maintenance_generation,
+        deletion_knowledge_sequence=_world_deletion_knowledge_sequence_v1(build,namespace,meter),
+        delete_original_commitment=build.scope.accepted_receipt_digest)
+    from ..domains.d01.production_operations_v1 import plain_v1
+    plain=plain_v1(barrier)
+    payload=canonical_serialize(plain)
+    meter.charge_encode(len(payload.encode('utf-8'))*3)
+    return (*namespace.as_tuple,barrier.assertion_commitment,barrier.known_from_sequence,
+        barrier.revision_commitment,barrier.deletion_generation,barrier.deletion_knowledge_sequence,barrier.delete_original_commitment,
+        payload,canonical_digest(plain),issuer._signer.sign(ERASURE_SIGN_KIND,payload))
+
+
+def _require_prior_world_erasure_barrier_v1(build,shape,key,row,meter):
+    from .d03_world_history_v1 import ERASURE_TABLE,ERASURE_SIGN_KIND,decode_world_erasure_barrier_row_v1
+    from .c09_paged_sql_v2 import c09_row_commitment_v2
+    if shape.table!=ERASURE_TABLE:
+        raise C09PagedCaptureHold('World barrier retention requires its exact metadata family')
+    value=decode_world_erasure_barrier_row_v1(shape.columns,row)
+    namespace=tuple(json.loads(build.scope.graph_namespace))
+    if value.namespace.as_tuple!=namespace:
+        raise C09PagedCaptureHold('World foreign barrier lacks its namespace-specific prior certificate view')
+    issuer=build.session.get_c09_domain_original_issuer_v2()
+    issuer._signer.verify(ERASURE_SIGN_KIND,row[8],row[10])
+    if value.deletion_knowledge_sequence>_world_deletion_knowledge_sequence_v1(build,value.namespace,meter):
+        raise C09PagedCaptureHold('World retained barrier knowledge watermark moved backwards')
+    if value.deletion_generation>=build.scope.maintenance_generation or build.prior_view is None:
+        raise C09PagedCaptureHold('World barrier lacks a preceding actual deletion generation/certificate')
+    from .c09_graph_originals_read_v5 import VerifiedPagedPriorGraphCertificateViewV2
+    if type(build.prior_view)is not VerifiedPagedPriorGraphCertificateViewV2:
+        raise C09PagedCaptureHold('World barrier requires its actual complete V2 prior certificate view')
+    prior_scope=build.prior_view.reader.certificate.candidate.scope
+    if prior_scope.graph_namespace!=build.scope.graph_namespace:
+        raise C09PagedCaptureHold('World barrier prior certificate belongs to another namespace')
+    if value.deletion_generation==prior_scope.maintenance_generation:
+        build.prior_view.require_generated_world_erasure_barrier_v1(key,row,meter=meter)
+    else:
+        proof=build.prior_view.require_target_row_disposition(shape.table,key,c09_row_commitment_v2(row),meter=meter)
+        if (value.deletion_generation>prior_scope.maintenance_generation
+                or proof.disposition!='preserved_exact' or proof.old_commitment!=proof.new_commitment):
+            raise C09PagedCaptureHold('World barrier is not an identical actual prior target output')
+
+
+def _generate_world_erasure_barrier_v1(build,db,shape,key,row,origin,meter):
+    from .d03_world_history_v1 import ERASURE_TABLE,ERASURE_COLUMNS,ERASURE_DDL
+    from .c09_paged_sql_v2 import c09_row_commitment_v2
+    actual=meter.read_fixed_row(db,'sqlite_master',('sql',),'type=? AND name=?',('table',ERASURE_TABLE))
+    if actual!=(ERASURE_DDL.replace(' IF NOT EXISTS',''),):
+        raise C09PagedCaptureHold('World generated erasure barrier lacks its exact installed target schema')
+    barrier=_world_erasure_barrier_row_v1(build,shape,row,meter);barrier_key=tuple(barrier[:4])
+    present=meter.read_fixed_row(db,ERASURE_TABLE,ERASURE_COLUMNS,
+        'bot=? AND persona=? AND assertion_commitment=? AND known_sequence=?',barrier_key)
+    if present is not None:
+        raise C09PagedCaptureHold('World generated barrier would replace an existing deletion original')
+    meter.write_row(db,ERASURE_TABLE,ERASURE_COLUMNS,barrier)
+    locator=canonical_serialize(dict(schema='sylanne3.c09.world-erasure-origin.v1',
+        stream_id=origin['origin_stream_id'],ordinal=origin['origin_record_ordinal']))
+    proof=(build.scope.scope_digest,ERASURE_TABLE,canonical_digest((ERASURE_TABLE,barrier_key)),
+        canonical_serialize(barrier_key),c09_row_commitment_v2(barrier),'world_erasure_barrier_v1',
+        locator,origin['origin_commitment'])
+    meter.write_row(db,'c09_graph_generated_rows_v2',
+        ('scope_digest','table_name','key_digest','key_json','row_commitment','producer','origin_ref','origin_digest'),proof)
+
+
+def _verify_generated_world_erasure_barrier_v1(progress,shape,key,row,origin_ref,origin_digest,meter):
+    from .d03_world_history_v1 import TABLE,COLUMNS,ERASURE_TABLE,ERASURE_COLUMNS
+    from .c09_paged_sql_v2 import require_c09_capture_member_v2,c09_row_commitment_v2
+    if shape.table!=ERASURE_TABLE or shape.columns!=ERASURE_COLUMNS or not progress.source_semantic_eof:
+        raise C09PagedCaptureHold('World generated barrier lacks its actual completed source semantic sweep')
+    locator=json.loads(origin_ref)
+    if (type(locator)is not dict or set(locator)!={'schema','stream_id','ordinal'}
+            or locator['schema']!='sylanne3.c09.world-erasure-origin.v1'
+            or type(locator['stream_id'])is not str or type(locator['ordinal'])is not int or locator['ordinal']<0
+            or canonical_serialize(locator)!=origin_ref):
+        raise C09PagedCaptureHold('World generated barrier origin is not its closed opaque capture locator')
+    raw=meter.read_fixed_row(progress.read_db,'c09_capture_streams_v2',('identity_json','status'),
+        'stream_id=?',(locator['stream_id'],))
+    if raw is None or raw[1]!='sealed':
+        raise C09PagedCaptureHold('World generated barrier origin source stream is not sealed')
+    stream=c09_paged_value_from_wire_v2(json.loads(raw[0]),C09StreamIdentityV2)
+    if (stream.stream_id!=locator['stream_id'] or stream.scope_digest!=progress.session.scope.scope_digest
+            or stream.stream_kind!='graph_facts' or stream.family!=TABLE):
+        raise C09PagedCaptureHold('World generated barrier origin has another actual scope/family')
+    member=meter.read_fixed_row(progress.read_db,'c09_capture_members_v2',('primary_key_json','commitment'),
+        'stream_id=? AND record_ordinal=?',(stream.stream_id,locator['ordinal']))
+    if member is None or member[1]!=origin_digest:
+        raise C09PagedCaptureHold('World generated barrier lost its exact actual source member commitment')
+    source_key=tuple(json.loads(member[0]))
+    require_c09_capture_member_v2(progress.read_db,stream,locator['ordinal'],source_key,origin_digest,meter=meter)
+    source_shape=read_c09_table_shape_v2(progress.pair.source,TABLE)
+    if source_shape.columns!=COLUMNS:
+        raise C09PagedCaptureHold('World generated barrier source index physical shape differs')
+    original=meter.read_row(progress.pair.source,source_shape,source_key)
+    if original is None or c09_row_commitment_v2(tuple(original))!=origin_digest:
+        raise C09PagedCaptureHold('World generated barrier source is not the identical frozen captured row')
+    disposition=_read_graph_disposition_original_row_v3(progress.read_db,
+        progress.session.scope.scope_digest,TABLE,source_key,meter)
+    if disposition is None or disposition[4:7]!=(origin_digest,'derived_removed',None):
+        raise C09PagedCaptureHold('World generated barrier has no independently verified removed index original')
+    from .d03_world_history_v1 import decode_world_revision_index_row_v1
+    from .c09_world_producer_metadata_v1 import prepare_cold_world_producer_v1
+    index=decode_world_revision_index_row_v1(source_shape.columns,tuple(original))
+    if prepare_cold_world_producer_v1(progress,index,meter.budget) is None:return False
+    expected=_world_erasure_barrier_row_v1(progress.cold_build,source_shape,tuple(original),meter)
+    target_sequence=meter.read_fixed_row(progress.read_db,'graph_bundle_sequence',('last_seq',),
+        'bot=? AND persona=?',tuple(row[:2]))
+    if target_sequence!=(expected[6],):
+        raise C09PagedCaptureHold('World deletion watermark is not monotonically preserved in actual target sequence')
+    if tuple(row)!=expected or key!=tuple(expected[:4]):
+        raise C09PagedCaptureHold('World generated barrier differs from its actual signed deletion conversion')
+
+def _world_deletion_knowledge_sequence_v1(build,namespace,meter):
+    shape=read_c09_table_shape_v2(build.pair.source,'graph_bundle_sequence')
+    if shape.columns!=('bot','persona','last_seq') or shape.primary_key_columns!=('bot','persona'):
+        raise C09PagedCaptureHold('World deletion watermark source sequence physical shape differs')
+    key=namespace.as_tuple;row=meter.read_row(build.pair.source,shape,key)
+    if row is None or tuple(row[:2])!=key or type(row[2])is not int or row[2]<1:
+        raise C09PagedCaptureHold('World deletion watermark has no actual namespace sequence original')
+    _actual_source_row_origin_v2(build,shape,key,tuple(row),meter)
+    return row[2]

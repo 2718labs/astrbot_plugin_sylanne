@@ -146,6 +146,9 @@ def require_foreground_activity_issuance_v1(value, graph, scope):
 
 
 def reobserve_foreground_activity_v1(value, graph, scope):
+    from .foreground_mesh_issuance_v1 import is_personal_mesh_issuance_v1,reobserve_personal_mesh_activity_v1
+    if is_personal_mesh_issuance_v1(value):
+        return reobserve_personal_mesh_activity_v1(value,graph,scope)
     require_foreground_activity_issuance_v1(value, graph, scope)
     if graph._GraphCoordinator__store._db.in_transaction:
         raise ValueError("foreground currentness RPC must precede the Graph transaction")
@@ -321,6 +324,7 @@ def record_live_post_c02_foreground_cause_after_cas_v1(db, *, graph, bundle, rec
     from ..host.model_workflows_v5 import AdminModelWorkflowsV5
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+    from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from .foreground_cycle_v1 import ForegroundPostC02CauseV1, foreground_post_c02_cause_ref_v1
     from .ingress_observation import read_committed_ingress_identity
     from ..memory_types import SourceRecord
@@ -337,7 +341,7 @@ def record_live_post_c02_foreground_cause_after_cas_v1(db, *, graph, bundle, rec
     if assembly is None:
         return None
     installed = assembly.admin_bundle
-    if (type(installed.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+    if (type(installed.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
             or type(installed.foreground) is not AdminForegroundPolicyV1
             or installed.foreground.deadline_policy.natural is None):
         return None
@@ -434,7 +438,7 @@ def foreground_receipt_read_for_fence_v1(graph, *, scope, operation_id, source_r
         del _ACTIVE[id(issued)]
 
 
-def read_foreground_receipt_in_transaction_v1(db, *, graph, issued):
+def read_foreground_receipt_in_transaction_v1(db, *, graph, issued, streaming_source_qualification=None, streaming_graph_stamp=None):
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from ..domains.d03.self_identity_qualification import self_identity_mapping_from_current
@@ -460,7 +464,8 @@ def read_foreground_receipt_in_transaction_v1(db, *, graph, issued):
     if original is None or issued.source_ref not in {version.key.token for version in original["read_versions"]}:
         raise ValueError("foreground narrow read requires its actual historical Source-bound adopted original")
     roots = tuple(version.key.token for version in original["read_versions"] if version.key.type_name == "memory.source")
-    _source_family_current_sql_v1(db, namespace=ns, roots=roots, purpose=issued.purpose, audiences=issued.audiences)
+    _source_family_current_sql_v1(db, namespace=ns, roots=roots, purpose=issued.purpose, audiences=issued.audiences,
+        streaming_qualified=streaming_source_qualification,streaming_scope=issued.scope,streaming_graph_stamp=streaming_graph_stamp)
     if original["payload"]["authority"]["actor"] != issued.current_self.self_entity_ref:
         raise ValueError("foreground historical receipt belongs to another original actor")
     saved = db.execute("SELECT receipt_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?",

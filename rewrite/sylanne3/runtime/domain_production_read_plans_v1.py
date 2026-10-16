@@ -32,6 +32,7 @@ _READ_PLANNERS = {"d01": read_plan_current_d01_operation_v1, "d02": read_plan_cu
     "d05": read_plan_current_d05_operation_v1, "d08": read_plan_current_d08_operation_v1,
     "d10": read_plan_current_d10_operation_v1}
 _INPUT_TABLES = (
+    ("graph_d08_joint_node_originals_v1", "d11.d08-joint-node-original.v1", "d08", "kind"),
     ("graph_d01_production_inputs_v1", "d11.d01-production-input.v1", "d01", "kind"),
     ("graph_d05_boundary_intents_v1", "d11.d05-boundary-intent.v1", "d05", "boundary_intent"),
     ("graph_d08_joint_plan_intents_v1", "d11.d08-joint-plan-intent.v1", "d08", "joint_plan_intent"),
@@ -46,8 +47,48 @@ _POLICY_TABLES = (
 
 
 def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None, life_d04_before_capture_policy=None, d06_recall_policy=None, d07_execution_service=None, ingress_c03_readers=None, self_c04_readers=None, ingress_task_scope_readers=None, personal_candidate_readers=None, artifact_phase_readers=None, installed_readers=None):
+    from .conditioned_self_operations_v1 import OPERATIONS as CONDITIONED_OPERATIONS
+    if operation_kind in CONDITIONED_OPERATIONS:
+        from .current_conditioned_self_read_v3 import read_plan_current_conditioned_self_v1
+        return read_plan_current_conditioned_self_v1(db,namespace,activity_id,operation_kind,request,installed_readers)
+    from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS,read_plan_current_long_term_operation_v1
+    from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,read_plan_current_habit_operation_v1
+    if operation_kind in LONG_TERM_OPERATIONS or operation_kind in HABIT_OPERATIONS or operation_kind=='record_habit_window_cue_v1':
+        from .domain_production_registry_v1 import installed_operation_v1
+        actual=installed_operation_v1(operation_kind)
+        if actual.domain!=domain or type(request)is not actual.request_type:
+            raise ValueError('Habit/LongWindow read plan changed its exact installed domain/request')
+        if operation_kind=='record_habit_window_cue_v1':
+            from .current_habit_source_read_v3 import current_habit_source_read_plan_v3
+            return current_habit_source_read_plan_v3(db,namespace=namespace,activity_id=activity_id,
+                operation_kind=operation_kind,request=request)
+        planner=read_plan_current_long_term_operation_v1 if operation_kind in LONG_TERM_OPERATIONS else read_plan_current_habit_operation_v1
+        return planner(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
+    from ..domains.d03.world_history_v1 import WORLD_OPERATIONS
+    if operation_kind in WORLD_OPERATIONS:
+        from .d03_world_history_v1 import read_plan_world_operation_v1
+        return read_plan_world_operation_v1(db,namespace=namespace,activity_id=activity_id,operation_id=operation_id,
+            operation_kind=operation_kind,request=request,installed_readers=installed_readers)
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("domain read plan needs the actual W01 current transaction")
+    from .current_method_learning_read_v3 import _NUMERIC_OWNER_OPERATIONS_V1
+    if operation_kind in _NUMERIC_OWNER_OPERATIONS_V1:
+        from .current_life_numeric_metadata_v1 import require_bound_numeric_plan_v1
+        require_bound_numeric_plan_v1(db,operation_kind)
+    if operation_kind in ("freeze_general_growth_intent_v1","register_general_growth_trial_start_v1","derive_general_growth_trial_v1","adopt_general_growth_v1"):
+        from .d01_general_growth_v1 import (
+            read_plan_freeze_current_general_growth_v1,
+            read_plan_register_current_general_growth_trial_start_v1,
+            read_plan_derive_current_general_growth_trial_v1,
+            read_plan_adopt_current_general_growth_v1)
+        if domain!='d01':raise ValueError('General growth read belongs to its exact D01 issuer')
+        planner={"freeze_general_growth_intent_v1":read_plan_freeze_current_general_growth_v1,"register_general_growth_trial_start_v1":read_plan_register_current_general_growth_trial_start_v1,"derive_general_growth_trial_v1":read_plan_derive_current_general_growth_trial_v1,"adopt_general_growth_v1":read_plan_adopt_current_general_growth_v1}[operation_kind]
+        return planner(db,namespace=namespace,request=request,issuer=_issuer(installed_readers))
+    if operation_kind == "register_general_growth_attention_v1":
+        from .d07_general_growth_attention_v1 import read_plan_register_general_growth_attention_v1
+        from .domain_background_read_v3 import _active_v3
+        return read_plan_register_general_growth_attention_v1(db, namespace=namespace, request=request,
+            issuer=installed_readers.issuer if installed_readers is not None else _active_v3(db).graph._GraphCoordinator__d11_issuer)
     from .domain_production_registry_v1 import _POSTCONDITION_OPERATIONS
     if operation_kind in _POSTCONDITION_OPERATIONS:
         from .artifact_phase_postconditions_v1 import read_plan_artifact_phase_postconditions_v1
@@ -160,6 +201,10 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
             raise ValueError("foreground cycle compiler has a different issuer domain")
         from .foreground_cycle_v1 import read_plan_current_foreground_cycle_v1
         return read_plan_current_foreground_cycle_v1(db, namespace=namespace, request=request)
+    if operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1"}:
+        from .personal_candidate_eligibility_v1 import read_plan_personal_eligibility_v1
+        return read_plan_personal_eligibility_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request, readers=personal_candidate_readers)
     if operation_kind in {"prepare_personal_candidates_v1", "select_personal_step_v2"}:
         if domain != "d08":
             raise ValueError("personal candidate operation belongs to D08")
@@ -270,6 +315,10 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         from .d05_relationship_revision_v2 import read_plan_current_relationship_revision_v2
         return read_plan_current_relationship_revision_v2(db, namespace=namespace, activity_id=activity_id,
             operation_kind=operation_kind, request=request)
+    if operation_kind == "focus_owner_source_note_task_v1":
+        from .d07_life_project_focus_v1 import read_plan_owner_source_note_focus_v1
+        return read_plan_owner_source_note_focus_v1(db,namespace=namespace,operation_id=operation_id,
+            request=request,installed_readers=installed_readers)
     if operation_kind in _PERSONAL_OPERATIONS:
         if _PERSONAL_OPERATIONS[operation_kind][0] != domain:
             raise ValueError("personal operation belongs to a different domain")
@@ -295,6 +344,9 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         from .domain_production_inputs_v1 import read_plan_current_domain_input_v1
         return read_plan_current_domain_input_v1(db, namespace=namespace, activity_id=activity_id,
             producer_kind=operation_kind[len("input:"):], request=request, installed_readers=artifact_phase_readers)
+    if operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import read_plan_contact_prospective_v1
+        return read_plan_contact_prospective_v1(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
     if operation_kind == "prepare_contact_dispatch_v3":
         from .contact_final_stage_v3 import read_plan_contact_final_v3
         return read_plan_contact_final_v3(db, namespace=namespace, activity_id=activity_id,
@@ -747,6 +799,12 @@ def _outbound_original(db, namespace, ref):
 
 
 def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_readers, authenticated_external_originals=()):
+    from .current_d07_simulation_source_read_v3 import read_bound_current_d07_simulation_original_refs_v3
+    handled,refs=read_bound_current_d07_simulation_original_refs_v3(db,namespace=namespace,plan=plan,installed_readers=installed_readers,external=authenticated_external_originals)
+    if handled:return refs
+    from .d07_source_owner_read_v3 import read_bound_d07_source_original_refs_v3
+    handled,refs=read_bound_d07_source_original_refs_v3(db,namespace=namespace,plan=plan,installed_readers=installed_readers,external=authenticated_external_originals)
+    if handled:return refs
     if not db.in_transaction or type(namespace) is not NamespaceId or type(plan) is not ProductionReadPlanV1:
         raise ValueError("domain originals require the current W01 transaction and exact read plan")
     issuer = _issuer(installed_readers)
@@ -781,6 +839,9 @@ def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_reade
             from .artifact_task_observer_v1 import read_current_artifact_task_milestone_original_ref_v2
             original = read_current_artifact_task_milestone_original_ref_v2(db, namespace=namespace,
                 original_ref=ref, issuer=issuer)
+        if original is None and ref.startswith('contact-prospective-original:'):
+            from .contact_prospective_v1 import read_contact_prospective_original_ref_v1
+            original=read_contact_prospective_original_ref_v1(db,namespace=namespace,original_ref=ref,issuer=issuer)
         if original is None and ref.startswith("method-readiness-quote:"):
             from .d02_method_readiness_v1 import read_current_method_readiness_quote_original_v1
             original = read_current_method_readiness_quote_original_v1(db, namespace=namespace, ref=ref, issuer=issuer)
@@ -824,6 +885,12 @@ def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_reade
             if original.kind not in {"d11.restore_anchor", "d11.trusted_tick", "d11.clock_sample", "d03.current_self_identity"}:
                 continue
             result.append(original)
+    from .current_habit_source_read_v3 import current_habit_independent_core_original_refs_v3
+    for original in current_habit_independent_core_original_refs_v3(db):
+        prior=next((value for value in result if value.original_ref==original.original_ref),None)
+        if prior is not None and prior!=original:
+            raise ValueError('Habit actual independent Core original conflicts with the stored original')
+        if prior is None:result.append(original)
     return tuple(result)
 
 
@@ -866,7 +933,18 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("command identity must be derived in the current W01 transaction")
     activity, effect, purpose = requested_activity_id, None, "context"
-    if operation_kind in {"prepare_life_project_context", "focus_life_project", "prepare_personal_candidates_v1", "select_personal_step_v2",
+    from ..domains.d03.world_history_v1 import WORLD_OPERATIONS
+    if operation_kind in WORLD_OPERATIONS:
+        purpose=("consolidation" if operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"} else
+            "expression" if operation_kind=="project_world_perspective_v1" else request.purpose)
+        if operation_kind=="query_world_view_v1" and request.audience!=requested_audience_ref:
+            raise ValueError("World command audience differs from its explicit query")
+        return CurrentDomainCommandIdentityV1(activity,None,purpose,requested_audience_ref)
+    if operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1"}:
+        from .d08_personal_candidate_v1 import actual_personal_candidate_activity_v2
+        activity = actual_personal_candidate_activity_v2(db, namespace=namespace, request=request.candidates, issuer=_issuer(installed_readers))
+        return CurrentDomainCommandIdentityV1(activity, None, "consolidation", requested_audience_ref)
+    if operation_kind in {"prepare_life_project_context", "focus_life_project", "focus_owner_source_note_task_v1", "prepare_personal_candidates_v1", "select_personal_step_v2",
             "input:register_artifact_phase_postcondition_policy_v1", "register_artifact_phase_postcondition_contract_v1",
             "observe_artifact_phase_postconditions_v1"}:
         purpose = "consolidation"
@@ -988,8 +1066,17 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
         purpose = 'consolidation'
     elif operation_kind in {"encode_structured_experience", "form_association", "adopt_growth", "migrate_semantic_identity_v3", "project_self_model_v3", "adopt_relationship_contribution", "reevaluate_relationship",
             "input:prepare_growth_input", "input:derive_growth_trial", "input:prepare_semantic_growth_input_v3",
-            "input:start_semantic_growth_trial_v3"}:
+            "input:start_semantic_growth_trial_v3",
+            "freeze_general_growth_intent_v1", "register_general_growth_trial_start_v1",
+            "derive_general_growth_trial_v1", "adopt_general_growth_v1"}:
         purpose = "consolidation"
+    elif operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import command_identity_contact_prospective_v1
+        activity,effect,audience=command_identity_contact_prospective_v1(db,namespace=namespace,
+            request=request,operation_id=operation_id,issuer=_issuer(installed_readers))
+        if (requested_activity_id,requested_audience_ref)!=(activity,audience):
+            raise ValueError('Contact prospective changed its actual paid activity/audience')
+        purpose='expression'
     elif operation_kind == "prepare_contact_dispatch_v3":
         from .contact_final_stage_v3 import command_identity_contact_final_v3
         activity, effect, audience = command_identity_contact_final_v3(db, namespace=namespace,
@@ -1141,6 +1228,9 @@ def read_independent_current_original_requests_v1(db, *, namespace, plan):
     from .d11_c04_internal_cost import read_c04_cpu_cost_original_v1
     if not table_exists_v1(db, "graph_c04_internal_work_prepared_v1"):
         return ()
+    from .current_life_numeric_metadata_v1 import read_numeric_c04_original_requests_v1
+    handled,selected=read_numeric_c04_original_requests_v1(db,namespace,plan)
+    if handled:return selected
     requested = set(plan.required_original_refs)
     rows = db.execute("SELECT operation_id FROM graph_c04_internal_work_prepared_v1 WHERE bot=? AND persona=? ORDER BY operation_id LIMIT 129",
                       namespace.as_tuple).fetchall()
@@ -1160,65 +1250,22 @@ def read_independent_current_original_requests_v1(db, *, namespace, plan):
 
 
 def rebuild_current_domain_stage_v1(db, *, frame, request, domain, operation_kind, installed_readers):
-    """Closed current issuer dispatcher used by W01's private commit witness."""
+    """Reissue through the same exact installed registry used by the initial W01 stage."""
+    from .domain_production_registry_v1 import installed_operation_v1,stage_installed_domain_operation_v1
     if not db.in_transaction:
         raise ValueError("domain stage reissuance requires W01's current business transaction")
-    from .domain_production_registry_v1 import (
-        _PERSONAL_OPERATIONS, installed_operation_v1,
-        stage_installed_domain_operation_v1)
-    from .domain_production_registry_v1 import _FOREGROUND_OPERATIONS
-    if operation_kind in _PERSONAL_OPERATIONS or operation_kind in _FOREGROUND_OPERATIONS:
-        operation = installed_operation_v1(operation_kind)
-        if operation.domain != domain:
-            raise ValueError("personal operation belongs to a different domain")
-        return stage_installed_domain_operation_v1(
-            db, operation=operation, frame=frame, request=request,
-            installed_readers=installed_readers)
-    if domain == "d01":
-        from .d01_production_operations_v1 import stage_evaluate_current_values_in_transaction_v1, stage_adopt_current_growth_in_transaction_v1, stage_migrate_semantic_identity_v3, stage_project_self_model_v3
-        dispatch = {"evaluate_values": stage_evaluate_current_values_in_transaction_v1,
-                    "adopt_growth": stage_adopt_current_growth_in_transaction_v1,
-                    "migrate_semantic_identity_v3": stage_migrate_semantic_identity_v3,
-                    "project_self_model_v3": stage_project_self_model_v3}
-    elif domain == "d02":
-        from .d02_production_operations_v1 import stage_advance_current_body_in_transaction_v1, stage_apply_current_body_effect_in_transaction_v1
-        dispatch = {"advance_body": stage_advance_current_body_in_transaction_v1,
-                    "apply_body_effect": stage_apply_current_body_effect_in_transaction_v1}
-    elif domain == "d05":
-        from .d05_production_operations_v1 import stage_adopt_current_relationship_contribution_in_transaction_v1, stage_revise_current_boundary_in_transaction_v1, stage_reevaluate_current_relationship_in_transaction_v1
-        dispatch = {"adopt_relationship_contribution": stage_adopt_current_relationship_contribution_in_transaction_v1,
-            "revise_boundary": stage_revise_current_boundary_in_transaction_v1,
-            "reevaluate_relationship": stage_reevaluate_current_relationship_in_transaction_v1}
-    elif domain == "d07":
-        from .d07_production_operations_v1 import stage_serve_current_concern_in_transaction_v1, stage_advance_current_reflection_in_transaction_v1, stage_run_current_simulation_in_transaction_v1
-        dispatch = {"serve_concern": stage_serve_current_concern_in_transaction_v1,
-            "advance_reflection": stage_advance_current_reflection_in_transaction_v1,
-            "run_simulation": stage_run_current_simulation_in_transaction_v1}
-    elif domain == "d06" and operation_kind == "encode_structured_experience":
-        from .d06_structured_experience_v1 import stage_encode_current_structured_experience_in_transaction_v1
-        dispatch = {"encode_structured_experience": stage_encode_current_structured_experience_in_transaction_v1}
-    elif domain == "d06" and operation_kind == "form_association":
-        from .d06_association_formation_v1 import stage_form_current_association_in_transaction_v1
-        dispatch = {"form_association": stage_form_current_association_in_transaction_v1}
-    elif domain == "d08":
-        from .d08_production_operations_v1 import stage_acknowledge_current_bilateral_in_transaction_v1, stage_adopt_current_joint_plan_in_transaction_v1, stage_recheck_current_action_in_transaction_v1
-        dispatch = {"acknowledge_bilateral": stage_acknowledge_current_bilateral_in_transaction_v1,
-            "adopt_joint_plan": stage_adopt_current_joint_plan_in_transaction_v1,
-            "recheck_action": stage_recheck_current_action_in_transaction_v1}
-    elif domain == "d10":
-        from .d10_production_operations_v1 import stage_current_life_effect_experience_bundle_in_transaction_v1, stage_current_offline_body_experience_bundle_in_transaction_v1, stage_prepare_current_contact_in_transaction_v1
-        dispatch = {"advance_life": stage_current_life_effect_experience_bundle_in_transaction_v1,
-            "advance_offline": stage_current_offline_body_experience_bundle_in_transaction_v1,
-            "prepare_contact": stage_prepare_current_contact_in_transaction_v1}
-    else:
-        raise ValueError("unregistered production domain stage")
-    if operation_kind not in dispatch:
-        raise ValueError("unregistered exact current domain operation")
-    return dispatch[operation_kind](db, frame=frame, request=request, installed_readers=installed_readers)
+    operation=installed_operation_v1(operation_kind)
+    if operation.domain!=domain or type(request)is not operation.request_type:
+        raise ValueError('current stage reissuance changed its exact registered domain/request')
+    return stage_installed_domain_operation_v1(db,operation=operation,frame=frame,request=request,
+        installed_readers=installed_readers)
 
 
 def verify_current_domain_operation_stage_v1(db, *, frame, request, domain, operation_kind,
         installed_readers, stage):
+    if operation_kind=='prepare_contact_prospective_v1':
+        from .contact_prospective_v1 import verify_contact_prospective_stage_v1
+        return verify_contact_prospective_stage_v1(db,frame=frame,request=request,installed_readers=installed_readers,stage=stage)
     current = rebuild_current_domain_stage_v1(db, frame=frame, request=request, domain=domain,
         operation_kind=operation_kind, installed_readers=installed_readers)
     if current != stage:

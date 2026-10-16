@@ -94,6 +94,7 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
         elif draft_self_read_credential is not None:
             raise AuthorityUnavailable("draft Self read credential requires its actual installed Self service")
         self._owner_stop_reply_service_v1 = None
+        self._owner_goal_cancellation_service_v1 = None
         self._draft_reply_scopes = {}
         if owner_stop_reply_service is not None:
             self.install_owner_stop_reply_service_v1(owner_stop_reply_service)
@@ -129,6 +130,16 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
                 or self._owner_stop_reply_service_v1 is not None):
             raise AuthorityUnavailable("draft reply barrier requires the actual same installed Core/Graph service")
         self._owner_stop_reply_service_v1 = service
+
+    def install_owner_goal_cancellation_service_v1(self, service):
+        from .owner_goal_cancellation_v1 import InstalledOwnerGoalCancellationServiceV1
+        if (type(service) is not InstalledOwnerGoalCancellationServiceV1
+                or service.core is not self.bridge.core or service.fences is not self.fences
+                or service.issuer is not self.issuer or service.namespace_id != self.namespace
+                or service.installation_id != self.installation_id or service.bundle is not self.installed_bundle
+                or self._owner_goal_cancellation_service_v1 is not None):
+            raise AuthorityUnavailable("draft Goal barrier needs its actual installed same Core/Graph")
+        self._owner_goal_cancellation_service_v1 = service
 
     def _observe_draft_reply_scope_v1(self, binding):
         from ..runtime.d11_life_preparation_v1 import _read
@@ -266,6 +277,14 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
                 authority_namespace=self.bridge.namespace, installation_id=self.installation_id,
                 activation_generation=binding.activation_generation,
                 actual_cycle_identity=observation[0], action=observation[1])
+            if self._draft_claim_binding is binding:
+                from .artifact_goal_barrier_v1 import require_artifact_task_not_cancelled_in_tx_v1
+                if self._owner_goal_cancellation_service_v1 is None:
+                    raise AuthorityUnavailable("draft first claim lacks its actual installed Goal barrier")
+                require_artifact_task_not_cancelled_in_tx_v1(db,
+                    service=self._owner_goal_cancellation_service_v1, namespace=binding.namespace,
+                    c02_operation_id=observation[0].identity.c02_operation_id,
+                    root_registration_ref=binding.root_registration_ref, action="first_claim")
 
     def require_current_draft_source_in_tx_v1(self, db, binding):
         if type(binding) is not D11DraftExecutionBindingV1 or self.current_source_location is None:

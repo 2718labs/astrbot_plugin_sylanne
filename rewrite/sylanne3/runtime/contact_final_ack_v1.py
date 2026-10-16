@@ -73,6 +73,7 @@ def contact_owner_call_v1(graph, authority, lease, operation_id, request_digest)
 
 
 def _readonly(call, result):
+    require_contact_final_call_v1(call)
     from .contact_final_stage_v1 import verify_contact_final_committed_v1
     graph=call.runtime.graph; store=graph._GraphCoordinator__store
     with store._lock:
@@ -102,7 +103,7 @@ def _readonly(call, result):
 
 def _issue_saved_contact_recovery_v1(call, scope, result):
     """Bind only the actual durable Owner attempt to its original live permit."""
-    require_contact_owner_call_v1(call)
+    require_contact_final_call_v1(call)
     from ..authority_service.v2_contract import from_wire
     store=call.runtime.graph._GraphCoordinator__store
     with store._lock:
@@ -123,7 +124,7 @@ def _issue_saved_contact_recovery_v1(call, scope, result):
 
 
 def verify_contact_before_finish_v1(call, scope, result):
-    require_contact_owner_call_v1(call)
+    require_contact_final_call_v1(call)
     if result.get('schema') != 'sylanne.domain-production-receipt.v1':
         return  # A known transactional refusal has no Contact admission.
     runtime=call.runtime
@@ -169,12 +170,16 @@ def verify_contact_before_finish_v1(call, scope, result):
             raise ValueError('Contact COMMIT persisted qualification differs from the actually sealed stage')
     from .contact_final_stage_v3 import PrepareCurrentContactDispatchRequestV3
     if type(call.request) is PrepareCurrentContactDispatchRequestV3:
-        from .contact_saved_owner_projection_v3 import require_current_contact_finish_deadline_v3
-        require_current_contact_finish_deadline_v3(call,scope,result)
+        from .contact_background_invocation_v1 import _ContactBackgroundCallV1, require_contact_background_deadline_v1
+        if type(call) is _ContactBackgroundCallV1:
+            require_contact_background_deadline_v1(call,scope,result)
+        else:
+            from .contact_saved_owner_projection_v3 import require_current_contact_finish_deadline_v3
+            require_current_contact_finish_deadline_v3(call,scope,result)
 
 
 def require_contact_finish_ack_v1(call, scope):
-    require_contact_owner_call_v1(call)
+    require_contact_final_call_v1(call)
     from .contact_final_stage_v3 import PrepareCurrentContactDispatchRequestV3
     if type(call.request) is PrepareCurrentContactDispatchRequestV3:
         from ..runtime_contracts import canonical_digest
@@ -230,3 +235,11 @@ def read_finished_contact_recovery_v1(call, scope, result, *, owner, owner_sessi
             raise ValueError('Contact cold recovery durable evidence changed')
         return result
     return graph._read_v2(call.authority,read,owner_binding=owner,owner_session_proof=owner_session_proof,fence_observer=observe)
+
+
+
+def require_contact_final_call_v1(call):
+    from .contact_background_invocation_v1 import _ContactBackgroundCallV1, require_contact_background_call_v1
+    if type(call) is _ContactBackgroundCallV1:
+        return require_contact_background_call_v1(call)
+    return require_contact_owner_call_v1(call)

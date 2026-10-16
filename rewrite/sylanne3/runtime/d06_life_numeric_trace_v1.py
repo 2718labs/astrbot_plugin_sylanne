@@ -304,23 +304,20 @@ def verify_life_numeric_trace_stage_v1(db, stage, *, installed_readers):
     return stage
 
 
-def record_life_numeric_trace_after_cas_v1(db, *, stage, issuer, receipt):
-    from .c04_encoding_baseline_store_v3 import _receipt
-    from .d11_life_preparation_v1 import _record
+def record_life_numeric_trace_after_cas_v1(db, *, stage, issuer, receipt, trace_commit_witness_v3):
+    from .d06_life_numeric_commit_v1 import (require_current_life_numeric_trace_write_v3,
+        record_current_life_numeric_trace_original_v3)
     issued = _STAGES.get(id(stage))
     if issued is None or issued[0]() is not stage or issued[1] is not db or not db.in_transaction:
         raise ValueError('Life trace recording requires its original SQL stage')
     trace = stage.provenance.trace; writes = _writes(stage.provenance)
-    actual = _receipt(db, trace.namespace, trace.producing_operation_id)
+    actual=require_current_life_numeric_trace_write_v3(db,witness=trace_commit_witness_v3,
+        stage=stage,receipt=receipt,writes=writes)
     if (actual != receipt or actual.read_versions != stage.frame.envelope.version_guard.read_versions
             or set(actual.write_versions) != {GraphVersion(w.key, 1) for w in writes}):
         raise ValueError('Life numeric trace actual three-member W01 receipt differs')
-    for write in writes:
-        row = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (write.key.token,)).fetchone()
-        if row != (canonical_serialize(write.value), 1, trace.producing_operation_id):
-            raise ValueError('Life numeric trace original must follow same-transaction actual CAS')
-    return _record(db, issuer=issuer, namespace=trace.namespace, kind=SIGNED_KIND, ref=trace.trace_ref,
-        operation_id=trace.producing_operation_id, value=stage.provenance)
+    return record_current_life_numeric_trace_original_v3(db,witness=trace_commit_witness_v3,
+        stage=stage,issuer=issuer,receipt=receipt)
 
 
 def read_current_life_numeric_trace_v1(db, *, frame, request, installed_readers, environment):
@@ -345,7 +342,10 @@ def read_current_life_numeric_trace_v1(db, *, frame, request, installed_readers,
         raise ValueError('Life numeric trace shared original differs from its signed provenance')
     for write in writes:
         atom = read.head(db, write.key, required=True)
-        history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (write.key.token,)).fetchone()
+        from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+        handled, history = read_bound_native_numeric_history_v3(db,write.key.token,1,('value','valid','event_id'))
+        if not handled:
+            history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (write.key.token,)).fetchone()
         if (atom.revision != 1 or atom.value != write.value or GraphVersion(write.key, 1) not in actual.write_versions
                 or history != (canonical_serialize(write.value), 1, expected_trace.producing_operation_id)):
             raise ValueError('Life numeric trace fact/provenance/eligibility differs from its original')
@@ -355,13 +355,18 @@ def read_current_life_numeric_trace_v1(db, *, frame, request, installed_readers,
             raise ValueError('Life numeric trace current Source/Owner/context changed')
     expected_dependencies = tuple(sorted((key.token, 1 if key in {w.key for w in writes} else next(
         row.revision for row in provenance.current_reads if row.ref == key.token)) for key in writes[-1].dependencies))
-    actual_dependencies = tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
-        'WHERE dependent_token=? ORDER BY dependency_token', (writes[-1].key.token,)))
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_trace_dependencies_v3
+    handled,actual_dependencies=read_bound_native_numeric_trace_dependencies_v3(db,writes[-1].key.token)
+    if not handled:
+        actual_dependencies = tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
+            'WHERE dependent_token=? ORDER BY dependency_token', (writes[-1].key.token,)))
     if actual_dependencies != expected_dependencies:
         raise ValueError('Life numeric trace actual invalidation edges differ')
     for row in provenance.historical_reads:
         if row.revision == 0: continue
-        history = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?', (row.ref, row.revision)).fetchone()
+        handled,history=read_bound_native_numeric_history_v3(db,row.ref,row.revision,('value','valid'))
+        if not handled:
+            history = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?', (row.ref, row.revision)).fetchone()
         if history is None or canonical_digest(json.loads(history[0])) != row.digest or bool(history[1]) != row.valid:
             raise ValueError('Life numeric trace original read history changed')
     result = CurrentLifeNumericTraceV1(expected_trace, provenance, baseline)
@@ -419,6 +424,9 @@ class InstalledInternalLifeNumericReaderV1:
             raise ValueError('Life current numeric use requires its actual Owner/session and consolidation scope')
         if NamespaceId.from_key(AtomKey.from_token(request.episode_ref)) != authority.namespace:
             raise ValueError('Life current numeric locator crosses namespace')
+        from ..runtime_storage_v3 import runtime_storage_v3
+        if runtime_storage_v3(store._db) is not None:
+            return graph.read_current_life_numeric_trace_v3(authority,lease,request=request,activity_id=activity_id)
         context = {}
         def observe(scope):
             guard, current = graph._owner_binding_in_fence(authority, scope, owner.principal, owner, session)

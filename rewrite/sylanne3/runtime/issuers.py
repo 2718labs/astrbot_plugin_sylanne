@@ -1170,7 +1170,13 @@ class _Signer:
         from .domain_background_read_v3 import BackgroundJSONColumnV3, require_background_signature_column_v3
         from .current_method_learning_read_v3 import MethodJSONColumnV3, require_method_signature_column_v3
         from ..authority_service.current_authority_graph_read_v3 import AuthoritySignedJSONColumnV3, require_authority_signature_column_v3
-        if type(original) is BackgroundJSONColumnV3:
+        from ..authority_service.original_artifact_recipe_metadata_v3 import _OriginalArtifactColumnV3,require_original_artifact_signature_column_v3
+        from .artifact_borrowed_source_v3 import _ArtifactBorrowedColumnV3,require_artifact_borrowed_signature_column_v3
+        if type(original)is _ArtifactBorrowedColumnV3:
+            require_artifact_borrowed_signature_column_v3(original,signer=self,kind=kind)
+        elif type(original)is _OriginalArtifactColumnV3:
+            require_original_artifact_signature_column_v3(original,signer=self,kind=kind)
+        elif type(original) is BackgroundJSONColumnV3:
             require_background_signature_column_v3(original, signer=self, kind=kind)
         elif type(original) is MethodJSONColumnV3:
             require_method_signature_column_v3(original, signer=self, kind=kind)
@@ -1184,7 +1190,13 @@ class _Signer:
         from .domain_background_read_v3 import BackgroundJSONColumnV3, require_background_signature_column_v3
         from .current_method_learning_read_v3 import MethodJSONColumnV3, require_method_signature_column_v3
         from ..authority_service.current_authority_graph_read_v3 import AuthoritySignedJSONColumnV3, require_authority_signature_column_v3
-        if type(original) is BackgroundJSONColumnV3:
+        from ..authority_service.original_artifact_recipe_metadata_v3 import _OriginalArtifactColumnV3,require_original_artifact_signature_column_v3
+        from .artifact_borrowed_source_v3 import _ArtifactBorrowedColumnV3,require_artifact_borrowed_signature_column_v3
+        if type(original)is _ArtifactBorrowedColumnV3:
+            require_artifact_borrowed_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
+        elif type(original)is _OriginalArtifactColumnV3:
+            require_original_artifact_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
+        elif type(original) is BackgroundJSONColumnV3:
             require_background_signature_column_v3(original, signer=self, kind=kind, signature=signature, verifier=verifier, complete=True)
         elif type(original) is MethodJSONColumnV3:
             require_method_signature_column_v3(original, signer=self, kind=kind, signature=signature, verifier=verifier, complete=True)
@@ -1802,6 +1814,18 @@ class D02ResourceIssuer:
         The caller must independently join the original job, Authority call,
         and durable budget reservation before recording a cost.
         """
+        from ..authority_service.artifact_model_source_read_v3 import read_bound_artifact_model_quote_v3
+        artifact,quote=read_bound_artifact_model_quote_v3(db,self,quote_id,version)
+        if artifact:return quote
+        from .artifact_host_dispatch_source_v3 import read_bound_artifact_host_dispatch_quote_v3
+        artifact,quote=read_bound_artifact_host_dispatch_quote_v3(db,self,quote_id,version)
+        if artifact:return quote
+        from .current_life_numeric_accounting_v3 import numeric_accounting_signed_quote_v3
+        numeric,quote=numeric_accounting_signed_quote_v3(db,self,quote_id,version)
+        if numeric:return quote
+        from .current_life_numeric_read_v3 import read_bound_numeric_host_quote_v3
+        numeric,quote=read_bound_numeric_host_quote_v3(db,self,quote_id,version)
+        if numeric:return quote
         if prepared_originals is not None:
             from .current_graph_source_material_v3 import PreparedCurrentC02OriginalsV3
             from .c09_paged_sql_v2 import require_c09_reserved_meter_v3
@@ -1809,6 +1833,28 @@ class D02ResourceIssuer:
                     or meter is not require_c09_reserved_meter_v3(meter.budget)):
                 raise IssuerAuthorityDenied('actual completed caller C02 original streams required')
             return prepared_originals.require_quote_for_v3(self,db,quote_id,version)
+        from .contact_cost_metadata_v3 import contact_cost_original_point_v3
+        accounting,row = contact_cost_original_point_v3(db,table='runtime_resource_quotes',columns=('quote_json','signature'),
+            key_columns=('quote_id','version'),key=(quote_id,version))
+        if accounting:
+            if row is None:
+                raise IssuerAuthorityDenied('Contact original accounting quote absent')
+            self._signer.verify('resource-quote.v1',row[0],row[1])
+            quote = _decode_quote(row[0])
+            if (quote.quote_id,quote.version) != (quote_id,version):
+                raise IssuerAuthorityDenied('Contact accounting quote original identity differs')
+            return quote
+        from .contact_host_stage_work_v3 import contact_host_original_point_v3
+        host,row = contact_host_original_point_v3(db,table='runtime_resource_quotes',columns=('quote_json','signature'),
+            key_columns=('quote_id','version'),key=(quote_id,version))
+        if host:
+            if row is None:
+                raise IssuerAuthorityDenied('Contact original signed D02 quote is absent')
+            self._signer.verify('resource-quote.v1',row[0],row[1])
+            quote = _decode_quote(row[0])
+            if (quote.quote_id,quote.version) != (quote_id,version):
+                raise IssuerAuthorityDenied('Contact original signed D02 quote identity differs')
+            return quote
         from ..authority_service.current_authority_graph_read_v3 import (
             read_bound_authority_graph_attachment_v3,authority_verify_signature_v3)
         authority,row=read_bound_authority_graph_attachment_v3(db,table='runtime_resource_quotes',
@@ -1940,6 +1986,13 @@ class D11BudgetGrantIssuer:
         return signature
 
     def _load_grant(self, db, lease_id: str) -> BudgetLeaseGrant:
+        from ..authority_service.life_numeric_source_read_v3 import read_bound_numeric_model_budget_grant_v3
+        numeric,actual=read_bound_numeric_model_budget_grant_v3(db,self,lease_id)
+        if numeric:return actual[0]
+        from .contact_original_read_v3 import read_contact_budget_grant_v3
+        contact, actual = read_contact_budget_grant_v3(db,self,lease_id)
+        if contact:
+            return actual[0]
         from .current_method_learning_read_v3 import read_bound_method_budget_grant_v3
         handled, prepared = read_bound_method_budget_grant_v3(db, lease_id)
         if handled:
@@ -1968,11 +2021,23 @@ class D11BudgetGrantIssuer:
 
     def current_budget_grant(self, db, lease_id: str) -> BudgetLeaseGrant:
         """Verify and return the active signed grant in this business transaction."""
-        return self._load_grant(db, lease_id)
+        from ..authority_service.artifact_model_source_read_v3 import read_bound_artifact_model_budget_grant_v3
+        artifact,actual=read_bound_artifact_model_budget_grant_v3(db,self,lease_id)
+        if artifact:return actual[0]
+        from ..authority_service.foreground_mesh_source_read_v3 import read_bound_foreground_mesh_budget_v3
+        handled, grant = read_bound_foreground_mesh_budget_v3(db,lease_id,issuer=self)
+        return grant if handled else self._load_grant(db, lease_id)
 
     def signed_budget_grant_at_version(self, db, lease_id: str,
                                        version: int) -> tuple[BudgetLeaseGrant, str]:
         """Verify an original signed grant for receipt replay, regardless of current status."""
+        from ..authority_service.life_numeric_source_read_v3 import read_bound_numeric_model_budget_grant_v3
+        numeric,actual=read_bound_numeric_model_budget_grant_v3(db,self,lease_id,version=version)
+        if numeric:return actual
+        from .contact_original_read_v3 import read_contact_budget_grant_v3
+        contact, actual = read_contact_budget_grant_v3(db,self,lease_id,version=version)
+        if contact:
+            return actual
         from .domain_background_read_v3 import background_point_v3, background_verify_signature_v3
         row=background_point_v3(db,table='runtime_budget_grants',columns=('grant_json','signature'),
             key_columns=('lease_id','version'),key=(lease_id,version),legacy_reader=lambda:db.execute(

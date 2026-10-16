@@ -144,8 +144,12 @@ def validate_life_worker_inventory_row_v2(columns,row):
 def read_life_worker_original_v2(db,*,namespace,issuer,kind,job_id):
     if db.execute('SELECT 1 FROM sqlite_master WHERE type=? AND name=?',('table',TABLE)).fetchone() is None:return None
     require_life_worker_schema_v2(db)
-    row=db.execute(f'SELECT payload_json,payload_digest,signature FROM {TABLE} WHERE bot=? AND persona=? AND kind=? AND job_id=?',
-        (*namespace.as_tuple,kind,job_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table=TABLE,
+        columns=('payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','job_id'), key=(*namespace.as_tuple,kind,job_id),
+        legacy_reader=lambda: db.execute(f'SELECT payload_json,payload_digest,signature FROM {TABLE} WHERE bot=? AND persona=? AND kind=? AND job_id=?',
+            (*namespace.as_tuple,kind,job_id)).fetchone())
     if row is None:return None
     raw=validate_life_worker_inventory_row_v2(COLUMNS,(*namespace.as_tuple,kind,job_id,*row))
     issuer._signer.verify(SIGN_KIND,canonical_serialize((namespace,kind,job_id,row[1])),row[2])
@@ -376,8 +380,9 @@ def read_committed_internal_life_request_v2(db,*,namespace,issuer,job_id):
     receipt=_receipt(db,namespace,p.acquire_operation_id)
     adopted=read_adopted_domain_operation_v1(db,namespace,p.acquire_operation_id)
     key=runtime_job_key(*namespace.as_tuple,p.activity_id,p.job_id)
-    actual=db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?',
-        (key.token,2)).fetchone()
+    from ..runtime_storage_v3 import read_graph_row_v3
+    actual = read_graph_row_v3(db, ('value','valid','event_id'),
+        where='token=? AND revision=?', parameters=(key.token,2), history=True)
     if adopted is None or actual is None:raise ValueError('Life worker input has no actual shared COMMIT/history')
     authority=adopted['payload']['authority']
     expected_authority={**authority,'actor':b.worker_subject,'worker_fence':1,

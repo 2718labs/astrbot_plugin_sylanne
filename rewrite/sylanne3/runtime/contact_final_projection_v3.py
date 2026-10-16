@@ -55,7 +55,7 @@ def _require(witness, db):
     offset = int(witness.phase != 'pre_e')
     if (m.runtime is not witness.runtime or m.scope is not scope
             or m.operation.operation_kind != 'prepare_contact_dispatch_v3'
-            or m.request.segment_index != 0 or type(m.request.segment_index) is not int
+            or type(m.request.segment_index) is not int or not 0<=m.request.segment_index<len(m.content.segments)
             or scope.operation != 'write' or scope.permit.operation != 'write'
             or scope.permit.operation_id != scope.operation_id
             or scope.permit.pinned_anchor != scope.pinned_anchor
@@ -66,10 +66,20 @@ def _require(witness, db):
             or stamp.graph_revision != scope.graph_revision
             or epoch.revision != scope.graph_epoch.revision + offset
             or not witness.graph._anchor_matches(stamp.requirements, scope.pinned_anchor)
-            or frame.envelope.identity.operation_id != m.content.segments[0].operation_id
-            or frame.envelope.identity.effect_id != m.content.segments[0].segment.effect_id
+            or frame.envelope.identity.operation_id != m.content.segments[m.request.segment_index].operation_id
+            or frame.envelope.identity.effect_id != m.content.segments[m.request.segment_index].segment.effect_id
             or frame.envelope.identity.activity_id != m.content.activity_id):
         raise ValueError('Contact private reader original R/E, permit, stage or identity differs')
+    if m.request.segment_index>0:
+        from ..authority_service.contact_continuation_contract_v1 import ContactContinuationObservationV1
+        observed=m.continuation_observation
+        if (type(observed)is not ContactContinuationObservationV1 or observed.selector.segment_index!=m.request.segment_index
+                or observed.selector.operation_id!=frame.envelope.identity.operation_id
+                or observed.current_effect.effect_id!=frame.envelope.identity.effect_id
+                or observed.current_effect!=m.current_effect or observed.effect_snapshot!=m.effect_snapshot
+                or observed.owner_actor!=m.owner.actor or observed.owner_head_digest!=m.owner.authorization_head
+                or observed.owner_revision!=m.owner.authorization_revision or len(observed.prefix)!=m.request.segment_index):
+            raise ValueError('Contact continuation private projection lacks actual independent Core scope')
     if offset:
         receipt = witness.receipt
         proof = _RECEIPTS.get((id(m), witness.phase))
@@ -104,13 +114,28 @@ def _actual_frame(witness, db):
     _, epoch = witness.graph._v2_graph_stamp(ns)
     atoms = {}
     limits = original.limits
+    born = {atom.key:atom for atom in original.snapshot.atoms}
+    produced = {write.key:write for _,write in witness.material.provisional_writes} if witness.phase!='pre_e' else {}
     def load(key):
         if key in atoms:
             return
-        if len(atoms) >= limits.max_graph_heads:
+        if len(atoms)>=limits.max_graph_heads:
             raise MissingProductionOriginalV1('bounded_complete_contact_projection')
-        row = read_graph_row_v3(db, columns=('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(key.token, *ns.as_tuple))
-        atoms[key] = GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])) if row else GraphAtom(key, 0, {}, False)
+        metadata = db.execute('SELECT revision,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
+            (key.token,*ns.as_tuple)).fetchone()
+        if metadata is None:
+            atoms[key] = GraphAtom(key,0,{},False)
+            return
+        if key in produced:
+            write = produced[key]
+            if metadata[0]!=1:
+                raise ValueError('Contact private projected output changed its exact birth revision')
+            atoms[key] = GraphAtom(key,1,write.value,bool(metadata[1]))
+        else:
+            source = born.get(key)
+            if source is None or source.revision!=metadata[0]:
+                raise MissingProductionOriginalV1('actual_prepared_contact_projection_body:'+key.type_name)
+            atoms[key] = GraphAtom(key,source.revision,source.value,bool(metadata[1]))
     pages = []
     for page in original.query_coverage:
         rows = db.execute('SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? '
@@ -144,16 +169,44 @@ class _CurrentContactProjectionReadV3(CurrentDomainReadV1):
         return self._witness.phase
 
     def check(self, db):
-        _require(self._witness, db)
-        return super().check(db)
+        _require(self._witness,db)
+        ns = self.frame.envelope.authority.namespace
+        epoch = db.execute('SELECT revision FROM graph_epochs WHERE bot=? AND persona=?',ns.as_tuple).fetchone()
+        rights = db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',ns.as_tuple).fetchone()
+        guard = self.frame.envelope.version_guard
+        if epoch!=(self.frame.snapshot.epochs[0].revision,) or rights!=(guard.access_epoch,guard.delete_epoch):
+            raise ValueError('Contact private projection current epoch/Source rights changed')
+        for atom in self.frame.snapshot.atoms:
+            self.head(db,atom.key)
+        return self.frame.snapshot
 
-    def head(self, db, key, *, required=False):
-        _require(self._witness, db)
-        return super().head(db, key, required=required)
+    def head(self,db,key,*,required=False):
+        _require(self._witness,db)
+        if type(key) is str:
+            key = AtomKey.from_token(key)
+        from ..runtime_contracts import NamespaceId
+        ns = self.frame.envelope.authority.namespace
+        if NamespaceId.from_key(key)!=ns:
+            raise ValueError('Contact private projection head crossed namespace')
+        atom = self.frame.snapshot.get(key)
+        metadata = db.execute('SELECT revision,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',(key.token,*ns.as_tuple)).fetchone()
+        if metadata!=((atom.revision,int(atom.valid)) if atom.revision else None):
+            raise ValueError('Contact private projection immutable body/current metadata changed')
+        if required and (atom.revision==0 or not atom.valid):
+            raise MissingProductionOriginalV1('current_contact_projection_head:'+key.type_name)
+        return atom
 
-    def complete_inventory(self, db, type_name):
-        _require(self._witness, db)
-        return super().complete_inventory(db, type_name)
+    def complete_inventory(self,db,type_name):
+        _require(self._witness,db)
+        ns = self.frame.envelope.authority.namespace
+        query = next((page for page in self.frame.query_coverage if page.type_id==type_name),None)
+        if query is None or not query.complete or query.continuation_ref is not None:
+            raise MissingProductionOriginalV1('complete_current_contact_inventory:'+type_name)
+        rows = tuple(db.execute('SELECT token,revision FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT ?',
+            (*ns.as_tuple,type_name,self.frame.limits.max_query_rows+1)))
+        if rows!=tuple((version.key.token,version.revision) for version in query.row_versions):
+            raise ValueError('Contact private projected positive/negative inventory changed')
+        return tuple(self.head(db,version.key) for version in query.row_versions)
 
     def source_family(self, db, roots, **kwargs):
         _require(self._witness, db)

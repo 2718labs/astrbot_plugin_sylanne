@@ -58,8 +58,14 @@ def verify_durable_life_artifact_v1(db, prepared, *, digest=None, length=None):
     if not db.in_transaction:
         raise ValueError("Life postcondition requires a new pinned durable read")
     b = prepared.binding
-    row = db.execute("SELECT binding_digest,artifact_ref,artifact_bytes,artifact_digest,artifact_length FROM " + STAGE_TABLE +
-        " WHERE bot=? AND persona=? AND execution_id=?", (*b.namespace.as_tuple, b.execution_id)).fetchone()
+    from .current_life_numeric_native_read_v3 import read_bound_native_life_artifact_v3
+    handled,row=read_bound_native_life_artifact_v3(db,prepared)
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_artifact_v3
+        handled,row=read_bound_life_model_artifact_v3(db,prepared)
+    if not handled:
+        row = db.execute("SELECT binding_digest,artifact_ref,artifact_bytes,artifact_digest,artifact_length FROM " + STAGE_TABLE +
+            " WHERE bot=? AND persona=? AND execution_id=?", (*b.namespace.as_tuple,b.execution_id)).fetchone()
     if row is None or row[:2] != (b.digest, b.artifact_ref):
         raise ValueError("Life durable artifact stage is absent or crossed binding")
     data = row[2]

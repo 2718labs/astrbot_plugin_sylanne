@@ -34,7 +34,8 @@ FIELDS = frozenset(('schema','authority_commitment','installation_commitment','k
     'writer_quiescence','history_digest','signature'))
 FRAME_FIELDS = frozenset(('source_prepared_digest','source_signature_commitment','source_generation',
     'source_row_commitment','facts','bindings','association_digest'))
-UNRESOLVED = frozenset(('graph_contact_owner_invocations_v3',))
+UNRESOLVED = frozenset(('graph_contact_owner_invocations_v3','graph_contact_background_invocations_v1',
+    'authority_contact_background_observations_v1'))
 LIFE_TABLES = ('graph_internal_life_content_originals_v1','graph_internal_life_worker_originals_v2','graph_internal_life_paid_originals_v2')
 
 

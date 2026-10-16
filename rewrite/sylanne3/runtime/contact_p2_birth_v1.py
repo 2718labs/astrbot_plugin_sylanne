@@ -4,6 +4,7 @@ This verifies the eleven members at their real birth COMMIT and the complete
 historical qualification inventory. It neither requires the current epoch to
 remain the birth epoch nor grants permission to read a current payload or send.
 """
+from ..runtime_storage_v3 import read_graph_row_v3,read_graph_rows_v3
 from dataclasses import dataclass
 import json
 
@@ -52,7 +53,7 @@ def read_contact_p2_birth_v1(db, *, namespace, operation_id, prepared_original=N
     receipt = original['receipt']
     if (evidence.namespace != namespace or evidence.operation_id != operation_id
             or request.operation_id != operation_id or request.proactive_contact is not True
-            or request.segment_index != 0 or request.segment_count != 1
+            or request.segment_index != 0 or not 1<=request.segment_count<=3
             or request.effect_id != receipt.effect_id
             or request.activation_generation != evidence.activation_generation
             or request.dispatch_generation != request.activation_generation
@@ -68,8 +69,7 @@ def read_contact_p2_birth_v1(db, *, namespace, operation_id, prepared_original=N
         raise ValueError('Contact P2 birth eleven-member identity/qualification differs')
     if prepared_original is None:
         for member in proof['write_commitments']:
-            history = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
-                (member['ref'],member['revision'])).fetchone()
+            history = read_graph_row_v3(db,columns=('event_id', 'value', 'valid'),where='token=? AND revision=?',parameters=(member['ref'],member['revision']),history=True)
             if (history is None or history[0] != operation_id or history[2] != 1
                     or canonical_digest(json.loads(history[1])) != member['digest']):
                 raise ValueError('Contact P2 birth producing member commitment differs')
@@ -127,4 +127,7 @@ def read_contact_p2_birth_v1(db, *, namespace, operation_id, prepared_original=N
         if v.key.type_name == 'd09.contact_verified_batch.v3')
     if len(batches) != 1 or receipt.outbox_refs != (proof['outbox_ref'],):
         raise ValueError('Contact P2 historical whole batch/outbox identity differs')
+    from .contact_first_p2_source_v1 import validate_contact_first_whole_birth_v1
+    validate_contact_first_whole_birth_v1(db,namespace=namespace,operation_id=operation_id,receipt=receipt,
+        admission=admission,request=request,qualification=evidence)
     return ContactP2BirthV1(original,admission,request,evidence,batches[0],proof['job_ref'],proof['outbox_ref'])

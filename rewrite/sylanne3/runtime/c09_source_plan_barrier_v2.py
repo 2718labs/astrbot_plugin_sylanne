@@ -510,7 +510,8 @@ def authority_c09_plan_request_identity_v2(authority_namespace,plan):
 
 
 def prepare_c09_source_barrier_page_v2(db,*,namespace,operation_id,budget):
-    from ..graph_types import Event,Scope,GraphWrite,GraphCandidate,NamespaceEpoch
+    from ..graph_types import Event,GraphWrite,GraphCandidate,NamespaceEpoch
+    from ..contracts import Scope
     if not db.in_transaction:raise ValueError('actual pending Graph page transaction required')
     state=read_c09_source_work_v2(db,namespace,operation_id);require_c09_source_stamp_v2(db,namespace,state)
     if state['phase']!='barrier':raise C09PagedCaptureHold('Source barrier is not ready for a write page')

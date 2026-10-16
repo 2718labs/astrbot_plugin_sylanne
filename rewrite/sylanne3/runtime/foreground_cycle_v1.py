@@ -383,7 +383,7 @@ def decode_foreground_job_v1(raw, *, namespace=None):
     if type(raw) is not dict or set(raw) != {field.name for field in fields(PersistentJob)}:
         raise ValueError("foreground PersistentJob fields differ from its exact installed schema")
     if (raw["work_kind"] != WORK_KIND or raw["effect_id"] is not None
-            or type(raw["operator_versions"]) is not dict or raw["operator_versions"] != {}
+            or type(raw["operator_versions"]) is not dict or raw["operator_versions"] not in ({}, {"d11.personal-semantic-mesh":"1"})
             or type(raw["usage"]) is not dict or raw["usage"] != {}
             or any(type(raw[name]) is not int for name in ("fence", "cancel_epoch"))):
         raise ValueError("foreground job work/operator/usage/effect fields differ from its actual producer")
@@ -510,7 +510,7 @@ def prepare_foreground_cycle_in_transaction_v1(db, *, frame, c02_receipt, source
     job = PersistentJob(job_id, frame.envelope.identity.operation_id, activity_id, None, *ns.as_tuple,
         "foreground:" + canonical_digest((ns, c02_receipt.operation_id))[:40], "queued", WORK_KIND,
         plain_v1(continuation), None, deadline, call_plan.parent_budget_lease_ref,
-        "foreground-cycle:" + canonical_digest((ns, c02_receipt.operation_id))[:40], {}, None, None, 0, 0, {}, None)
+        "foreground-cycle:" + canonical_digest((ns, c02_receipt.operation_id))[:40], {"d11.personal-semantic-mesh":"1"} if responsibility is not None else {}, None, None, 0, 0, {}, None)
     stage = stage_result_v1(frame, "d11", "create_foreground_cycle", (c02_receipt.operation_id, source_ref),
         writes=(job_graph_write(job),), provenance={"continuation": continuation, "c02_receipt": c02_receipt},
         receiver_events=(("d11", "foreground_cycle_ready"),), proposal_schema=D11_PROPOSAL_SCHEMA,
@@ -519,7 +519,7 @@ def prepare_foreground_cycle_in_transaction_v1(db, *, frame, c02_receipt, source
 
 
 def checkpoint_foreground_cycle_in_transaction_v1(db, *, frame, job_id, holder, fence, continuation, usage,
-        completion_result_ref=None, method_completion_history=None):
+        completion_result_ref=None, method_completion_history=None, frame_issuer=None, frame_bundle=None):
     read = CurrentDomainReadV1(frame)
     read.check(db)
     job = get_job(db, job_id)
@@ -574,6 +574,9 @@ def checkpoint_foreground_cycle_in_transaction_v1(db, *, frame, job_id, holder, 
         if changed:
             updated = replace(updated, phase="queued", wake_condition=None)
     elif continuation.stage == "completed":
+        from .d07_reflection_execution_v1 import require_no_pending_self_reflection_v3
+        require_no_pending_self_reflection_v3(db,frame=frame,job=job,continuation=continuation,
+            issuer=frame_issuer,installed_bundle=frame_bundle)
         if type(continuation.call_plan) is ForegroundCallPlanV2:
             from ..model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
             group = continuation.call_plan.phase_group
@@ -783,6 +786,7 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
     from ..host.model_workflows_v5 import AdminModelWorkflowsV5
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+    from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from ..domains.d03.self_perspective import self_mapping_key
     from ..graph_types import owner_grant_key
     from .budget import get_budget_lease, require_budget_family_admissible
@@ -793,7 +797,7 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     if (not db.in_transaction or type(request) is not CreateForegroundCycleRequestV2
             or type(installed_bundle) is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+            or type(installed_bundle.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
             or type(installed_bundle.foreground) is not AdminForegroundPolicyV1
             or installed_bundle.installation_policy.namespace != namespace or type(issuer) is not D11BudgetJobIssuer
             or type(owner_guard) is not ProductionOwnerGuardV1):
@@ -929,14 +933,28 @@ def foreground_cycle_read_plan_v1(*, namespace, c02_receipt, source_ref):
 
 
 def _adopted_c02_v1(db, namespace, operation_id):
-    from .domain_production_originals_v1 import _receipt
+    from .domain_production_originals_v1 import reconstruct_graph_bundle_commit_receipt_v1
     from .domain_production_read_plans_v1 import _committed
     _committed(db, namespace, operation_id)
-    raw = background_json_loads_v3(model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('receipt_json',),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, operation_id))[0],((*namespace.as_tuple, operation_id))[1],((*namespace.as_tuple, operation_id))[2],),legacy_reader=lambda:db.execute("SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, operation_id)).fetchone())[0])
+    bundle = model_reply_scope_point_v3(db, table="graph_bundle_operations",
+        columns=("digest", "activity_id", "effect_id", "commit_seq", "receipt_json"),
+        key_columns=("bot", "persona", "operation_id"), key=(*namespace.as_tuple, operation_id),
+        legacy_reader=lambda: db.execute("SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+            "FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+            (*namespace.as_tuple, operation_id)).fetchone())
+    if bundle is None:
+        raise MissingProductionOriginalV1("actual_first_ingress_c02_original")
+    raw = background_json_loads_v3(bundle[4])
     if "first_ingress_c02" not in raw:
         raise MissingProductionOriginalV1("actual_first_ingress_c02_original")
-    return _receipt({name: raw[name] for name in CommitReceipt.__dataclass_fields__})
+    event = model_reply_scope_point_v3(db, table="graph_events",
+        columns=("reads", "revisions", "epoch_revision"),
+        key_columns=("bot", "persona", "session", "event_id"),
+        key=(*namespace.as_tuple, bundle[1], operation_id),
+        legacy_reader=lambda: db.execute("SELECT reads,revisions,epoch_revision FROM graph_events "
+            "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+            (*namespace.as_tuple, bundle[1], operation_id)).fetchone())
+    return reconstruct_graph_bundle_commit_receipt_v1(namespace, operation_id, bundle, event)
 
 
 def _original_encoding_attempt_v1(db, *, namespace, c02_operation_id, source_ref, parent_budget_ref, issuer):
@@ -1108,7 +1126,7 @@ def _current_attempt_original_v1(db, *, namespace, continuation, attempt, issuer
         return ForegroundModelAttemptV1("C2", original.call_id, None, quote.operation_id,
             reservation[0], quote.parent_budget_lease_ref, quote.ceiling["input_tokens"], quote.ceiling["output_tokens"], state, terminal_ref)
     if attempt.slot == "C3":
-        from .d07_execution_v1 import TABLE, read_prepared_d07_execution_v1, D07IngressRecallPreparedV1, D07RelationshipPreparedV2
+        from .d07_execution_v1 import TABLE, read_prepared_d07_execution_v1, D07IngressRecallPreparedV1, D07RelationshipPreparedV2, D07ReflectionPreparedV3
         rows = db.execute("SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared' "
             "AND json_extract(payload_json,'$.call_id')=? LIMIT 2", (*namespace.as_tuple, attempt.call_id)).fetchall()
         if len(rows) != 1:
@@ -1119,7 +1137,7 @@ def _current_attempt_original_v1(db, *, namespace, continuation, attempt, issuer
             return read_current_ingress_recall_attempt_v1(db, namespace=namespace,
                 continuation=continuation, attempt=attempt, issuer=issuer)
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-        if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2}:
+        if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2, D07ReflectionPreparedV3}:
             from .foreground_call_plan_v1 import read_current_named_c3_attempt_v2
             return read_current_named_c3_attempt_v2(db, namespace=namespace,
                 continuation=continuation, attempt=attempt, issuer=issuer)
@@ -1845,7 +1863,8 @@ def stage_current_foreground_cycle_in_transaction_v1(db, *, frame, request, inst
                 raise ValueError("foreground checkpoint model states differ from their actual adopted originals")
             after, primary = checkpoint_foreground_cycle_in_transaction_v1(db, frame=frame, job_id=before.job_id,
                 holder=request.holder, fence=request.fence, continuation=proposed, usage=before.usage,
-                completion_result_ref=request.completion_result_ref, method_completion_history=completed_history)
+                completion_result_ref=request.completion_result_ref, method_completion_history=completed_history,
+                frame_issuer=issuer,frame_bundle=installed_readers.installed_bundle)
         elif type(request) is WakeArtifactDraftCycleRequestV2:
             after, primary = wake_artifact_draft_cycle_in_transaction_v2(db, frame=frame, request=request, issuer=issuer)
         elif type(request) is WakeArtifactDraftCycleRequestV1:
@@ -1937,7 +1956,9 @@ def read_plan_current_foreground_cycle_v1(db, *, namespace, request):
         keys.extend(AtomKey.from_token(row.ref) for row in request.continuation.wait.observed_versions)
     if current.wait is not None:
         keys.extend(AtomKey.from_token(row.ref) for row in current.wait.observed_versions)
-    return production_read_plan_v1((), keys, (current.source_ref,), ())
+    from .d07_reflection_execution_v1 import reflection_obligation_read_plan_inputs_v3
+    extra_keys,extra_roots,extra_originals=reflection_obligation_read_plan_inputs_v3(db,namespace,job_graph_write(job).key.token)
+    return production_read_plan_v1((),(*keys,*extra_keys),(current.source_ref,*extra_roots),extra_originals)
 
 
 def wake_artifact_draft_cycle_in_transaction_v2(db, *, frame, request, issuer):

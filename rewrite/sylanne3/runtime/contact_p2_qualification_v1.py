@@ -105,7 +105,7 @@ def _p2_plan_policy(db, read, content, capsule, scope, now):
 
 def _actual_action_and_resources_v1(db, read):
     content=read.batch.content;ns=read.scope.namespace
-    ids=contact_final_action_ids_v1(content.contact_id,0);owner=Owner('activity',*ns.as_tuple,content.activity_id)
+    ids=contact_final_action_ids_v1(content.contact_id,read.birth.request.segment_index);owner=Owner('activity',*ns.as_tuple,content.activity_id)
     specs={s.name:s.validator for s in GoalExecutionProvider().register_types()}
     atom=read.head(db,AtomKey(owner,'d08.action_intent.v1',ids['action']),required=True)
     actual=specs['d08.action_intent.v1'](atom.value)
@@ -328,6 +328,8 @@ def _issue_own_claimed_d08_v1(db, read, actual_intent, actual_schema, intent, sc
             raise ValueError("D08 effect is shared by another action")
         if other.target_ref != intent.target_ref:
             continue
+        from .contact_continuation_stage_v1 import is_actual_contact_prefix_action_v1
+        if is_actual_contact_prefix_action_v1(db,read,intent,other):continue
         complete = tuple(outcome for outcome in facts.action_outcomes
                          if (outcome.action_id, outcome.effect_id,
                              outcome.attempt_id) == (
@@ -422,7 +424,12 @@ def _issue_own_quota_policy_v1(db, read, intent, deadline):
     from .contact_final_action_v1 import contact_whole_grant_request_v1
     parent=contact_whole_grant_request_v1(content)
     original=read.capsule.policy_original
-    if (own_atom.revision!=1 or own.status!='claimed' or own.observations
+    index=read.birth.request.segment_index
+    if index:
+        from .contact_continuation_p2_v1 import require_current_continuation_p2_prefix_v1
+        require_current_continuation_p2_prefix_v1(read,db)
+    if ((index==0 and own_atom.revision!=1)or own.status in {'released','pending_confirmation'}
+            or dict(own.observations)!={part.segment.effect_id:'accepted'for part in content.segments[:index]}
             or own.communication_action_id!=parent.communication_action_id
             or own.segment_effects!=tuple(v.segment.effect_id for v in content.segments)
             or own.subject_ref!=plan.target_entity_ref or (own.channel,own.category)!=(policy.channel,policy.category)
@@ -452,7 +459,7 @@ def _recompute_current_contact_p2_qualification_v1(db, read):
     route=read_current_contact_route_binding_v1(db,read,account_ref=read.birth.qualification.route.account_version.key.token,
         target_entity_ref=actual.target_ref,audience=content.audience_id)
     versions=_read_current_contact_p2_versions_v1(db,snapshot,query,read.scope,current_read=read,
-        content=content,segment_index=0,route=route,context=context,d02_issuer=read.graph._GraphCoordinator__d11_issuer._d02,
+        content=content,segment_index=read.birth.request.segment_index,route=route,context=context,d02_issuer=read.graph._GraphCoordinator__d11_issuer._d02,
         d11_issuer=read.graph._GraphCoordinator__d11_issuer,quote=quote,grant=grant,
         current_policy=read.capsule,now_utc=read.now_utc)
     sets={v.kind:v for v in versions.sets}

@@ -289,27 +289,32 @@ class InstalledD12OwnerStorageAdmissionServiceV1:
         return D12OwnerStorageAdmissionV1(**body,original_digest=digest(material))
 
     def _observe(self,*,credential,subject,permit,actor=None,session_token=None,session_request=None):
-        from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        self.fences.validate_fence(credential=credential,subject=subject,permit=permit)
-        if permit.holder!=self.holder or permit.namespace!=self.namespace:raise AuthorityUnavailable('source storage actual holder differs')
-        guard=self.tickets.get_current_guard(credential=credential,authority_namespace=self.namespace,
-            installation_id=self.installation_id,subject=subject,permit=permit,owner_actor_id=actor,
-            owner_session_token=session_token,owner_session_request=session_request)
-        with self.core._tx() as db:
-            head=self._head_in_tx(db)
-            if head.guard!=guard:raise AuthorityUnavailable('source Owner guard changed')
-            if actor is None:self._background_identity_in_tx(db,head)
-        metadata,grant,admission=self._read_graph(owner_head=head,anchor=permit.pinned_anchor)
-        with self.fences._frozen() as (db,deletion,execution,_):
-            anchor=self.fences._current_locked(db,deletion,execution)
-            self.fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=anchor)
-            if self._head_in_tx(db)!=head:raise AuthorityUnavailable('source Owner changed after C09 location read')
-            if actor is None:self._background_identity_in_tx(db,head)
-            else:
-                self.sessions.require_current_in_tx(db,token=session_token,request=session_request)
-                self.sessions._current_pairing_source.require_current_actor_in_tx(db,authority_namespace=self.namespace,
-                    installation_id=self.installation_id,actor_id=actor,principal=session_request.principal)
-        return D12CurrentOwnerAuthorityV1(guard,None,admission),permit
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
+            self.fences.validate_fence(credential=credential,subject=subject,permit=permit)
+            if permit.holder!=self.holder or permit.namespace!=self.namespace:raise AuthorityUnavailable('source storage actual holder differs')
+            guard=self.tickets.get_current_guard(credential=credential,authority_namespace=self.namespace,
+                installation_id=self.installation_id,subject=subject,permit=permit,owner_actor_id=actor,
+                owner_session_token=session_token,owner_session_request=session_request)
+            with self.core._tx() as db:
+                head=self._head_in_tx(db)
+                if head.guard!=guard:raise AuthorityUnavailable('source Owner guard changed')
+                if actor is None:self._background_identity_in_tx(db,head)
+            from .owner_location_read_v3 import prepare_current_owner_location_for_source_fence_v3
+            metadata,grant,admission=prepare_current_owner_location_for_source_fence_v3(self,
+                credential=credential,subject=subject,permit=permit,head=head,actor=actor,
+                session_token=session_token,session_request=session_request)
+            with self.fences._frozen() as (db,deletion,execution,_):
+                anchor=self.fences._current_locked(db,deletion,execution)
+                self.fences.fences.validate_fence_locked(db,permit,subject=subject,current_anchor=anchor)
+                if self._head_in_tx(db)!=head:raise AuthorityUnavailable('source Owner changed after C09 location read')
+                if actor is None:self._background_identity_in_tx(db,head)
+                else:
+                    self.sessions.require_current_in_tx(db,token=session_token,request=session_request)
+                    self.sessions._current_pairing_source.require_current_actor_in_tx(db,authority_namespace=self.namespace,
+                        installation_id=self.installation_id,actor_id=actor,principal=session_request.principal)
+            return D12CurrentOwnerAuthorityV1(guard,None,admission),permit
 
     def get_current_owner_authority_for_fence_v1(self,*,credential,subject,permit,actor,session_token,session_request):
         return self._observe(credential=credential,subject=subject,permit=permit,actor=actor,session_token=session_token,session_request=session_request)

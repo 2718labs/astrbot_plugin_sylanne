@@ -33,11 +33,14 @@ from ..runtime.domain_production_read_plans_v1 import read_current_domain_origin
 from ..runtime.jobs import get_job
 from ..runtime.d11_types import job_graph_write
 from ..runtime.budget import require_budget_family_admissible
+from ..runtime_storage_v3 import read_graph_row_v3
+from ..runtime.natural_producer_qualification_v1 import _producer_original_point_v3
 from ..host.model_workflows_v3 import AdminModelWorkflowsV3
 from ..host.model_workflows_v4 import AdminModelWorkflowsV4
 from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
 from .v2_model_egress_contract import ModelEgressIntentV1
 
@@ -75,8 +78,8 @@ def _current_frame(db, prepared, request, readers, now):
         if key not in atoms:
             if len(atoms) >= limits.max_graph_heads:
                 raise ValueError('Life model complete read inventory exceeds installed bound; HOLD')
-            row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
-                (key.token, *ns.as_tuple)).fetchone()
+            row = read_graph_row_v3(db, ('revision','value','valid'),
+                where='token=? AND bot=? AND persona=?', parameters=(key.token, *ns.as_tuple), history=False)
             atoms[key] = _atom(key, row)
         return atoms[key]
     pages = []
@@ -130,7 +133,7 @@ class InstalledInternalLifeModelGraphReaderV2:
                 or not read_subject.startswith("mtls:sha256:")
                 or type(owner_storage) is not InstalledD12OwnerStorageAdmissionServiceV1
                 or type(structured_readers) is not InstalledD06StructuredExperienceReadersV1
-                or type(workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7) or workflows.life_content is None
+                or type(workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7, AdminModelWorkflowsV8) or workflows.life_content is None
                 or structured_readers.resource_issuer is not structured_readers.issuer.resource_issuer):
             raise TypeError('actual installed Life Owner/original readers and workflow required')
         policy=bundle.installation_policy
@@ -147,7 +150,17 @@ class InstalledInternalLifeModelGraphReaderV2:
         if (type(intent) is not ModelEgressIntentV1 or type(now) not in (float, int)
                 or not math.isfinite(now) or type(allow_accounted_result) is not bool):
             raise ValueError('actual Life model input and trusted clock required')
+        from .internal_life_model_source_read_v3 import require_internal_life_model_body_v3
+        source_capability = (None if allow_accounted_result else
+            require_internal_life_model_body_v3(db, self, intent))
         owner_service = self.owner_storage
+        from .owner_location_read_v3 import require_owner_location_for_model_graph_read_v3
+        owner_location = require_owner_location_for_model_graph_read_v3(
+            db, installed_reader=self, intent=intent)
+        anchor, head, actor, login = (owner_location.anchor, owner_location.head,
+            owner_location.actor, owner_location.login)
+        metadata, grant, admission = (owner_location.metadata, owner_location.grant,
+            owner_location.admission)
         job = get_job(db, intent.job_id)
         if job is None or job.work_kind != WORK_KIND:
             raise ValueError('Life model once running job is missing')
@@ -158,13 +171,11 @@ class InstalledInternalLifeModelGraphReaderV2:
             namespace=ns, issuer=self.readers.issuer, job_id=job.job_id)
         frozen = thaw_internal_life_content_request_v1(json.loads(prepared.frozen_json))
         workflow = self.workflows.life_content
-        with owner_service.fences._frozen() as (core_db, deletion, execution, _):
-            anchor = owner_service.fences._current_locked(core_db, deletion, execution)
-            head = owner_service._head_in_tx(core_db)
-            actor, login = owner_service._background_identity_in_tx(core_db, head)
-        metadata, grant, admission = owner_service._read_graph(owner_head=head, anchor=anchor)
-        current = GraphStore._decode_recovery(db.execute('SELECT schema,requirements_json,graph_revision '
-            'FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?', ns.as_tuple).fetchone(), ns)
+        recovery = _producer_original_point_v3(db, table='graph_recovery_metadata_v2',
+            columns=('schema','requirements_json','graph_revision'), key_columns=('bot','persona'), key=ns.as_tuple,
+            legacy_reader=lambda: db.execute('SELECT schema,requirements_json,graph_revision '
+                'FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?', ns.as_tuple).fetchone())
+        current = GraphStore._decode_recovery(recovery, ns)
         epoch = db.execute('SELECT revision FROM graph_epochs WHERE bot=? AND persona=?', ns.as_tuple).fetchone()
         if current != metadata or current is None or epoch is None:
             raise ValueError('Life model selected current Graph/storage snapshot differs')
@@ -226,10 +237,16 @@ class InstalledInternalLifeModelGraphReaderV2:
                     datetime.fromisoformat(job.lease_expires_utc.replace('Z', '+00:00')).timestamp())):
             raise ValueError('Life model installed workflow/current worker/input identity changed')
         quote = self.readers.resource_issuer.original_signed_quote(db, prepared.quote_id, prepared.quote_version)
-        reservation = db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations '
-            'WHERE lease_id=? AND operation_id=?', (quote.parent_budget_lease_ref, prepared.prepare_operation_id)).fetchone()
-        reserve = db.execute("SELECT digest FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-            (*ns.as_tuple, prepared.prepare_operation_id)).fetchone()
+        reservation = _producer_original_point_v3(db, table='runtime_budget_reservations',
+            columns=('digest','ceiling_json','state'), key_columns=('lease_id','operation_id'),
+            key=(quote.parent_budget_lease_ref, prepared.prepare_operation_id),
+            legacy_reader=lambda: db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations '
+                'WHERE lease_id=? AND operation_id=?', (quote.parent_budget_lease_ref, prepared.prepare_operation_id)).fetchone())
+        reserve = _producer_original_point_v3(db, table='runtime_budget_operations',
+            columns=('digest',), key_columns=('bot_id','persona_id','operation_id','phase'),
+            key=(*ns.as_tuple, prepared.prepare_operation_id,'reserve'),
+            legacy_reader=lambda: db.execute("SELECT digest FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+                (*ns.as_tuple, prepared.prepare_operation_id)).fetchone())
         allowed = {'settled'} if allow_accounted_result else {'reserved'}
         if (canonical_digest(quote) != prepared.quote_digest or quote.work_kind != WORK_KIND
                 or quote.operation_id != prepared.prepare_operation_id or quote.resource_ref != prepared.provider_config_ref
@@ -253,16 +270,22 @@ class InstalledInternalLifeModelGraphReaderV2:
                 or (intent.access_epoch, intent.delete_epoch) !=
                     (frame.envelope.version_guard.access_epoch, frame.envelope.version_guard.delete_epoch)):
             raise ValueError('Life model Source/access closure differs from actual acquired input')
-        atom = db.execute('SELECT value,valid FROM graph_atoms WHERE token=?', (job_graph_write(job).key.token,)).fetchone()
+        atom = read_graph_row_v3(db, ('value','valid'), where='token=?',
+            parameters=(job_graph_write(job).key.token,), history=False)
         if atom != (canonical_serialize(job_graph_write(job).value), 1):
             raise ValueError('Life model actual running-job projection changed')
-        with owner_service.fences._frozen() as (core_db, deletion, execution, _):
-            if (owner_service.fences._current_locked(core_db, deletion, execution) != anchor
-                    or owner_service._head_in_tx(core_db) != head
-                    or owner_service._background_identity_in_tx(core_db, head) != (actor, login)):
-                raise ValueError('Life model actual Owner/paired identity changed during current read')
+        current_owner_location = require_owner_location_for_model_graph_read_v3(
+            db, installed_reader=self, intent=intent)
+        if (current_owner_location is not owner_location
+                or (current_owner_location.anchor, current_owner_location.head,
+                    current_owner_location.actor, current_owner_location.login,
+                    current_owner_location.metadata, current_owner_location.grant,
+                    current_owner_location.admission) !=
+                   (anchor, head, actor, login, metadata, grant, admission)):
+            raise ValueError('Life model actual Owner/paired identity changed during current read')
         scope_digest = canonical_digest({'schema':'d06.internal-life-content-current-model.v2',
             'prepared_digest':prepared.digest, 'worker_binding_digest':binding.digest, 'current_reads':frame.snapshot.versions,
             'query_coverage':frame.query_coverage, 'owner_guard':head.guard,
             'storage_admission':admission, 'source_rights':(intent.access_epoch,intent.delete_epoch)})
-        return InternalLifeCurrentModelGraphV2(prepared, binding, frozen, job, request, head.guard, admission, scope_digest)
+        current = InternalLifeCurrentModelGraphV2(prepared, binding, frozen, job, request, head.guard, admission, scope_digest)
+        return current if source_capability is None else source_capability.seal_v3(current)

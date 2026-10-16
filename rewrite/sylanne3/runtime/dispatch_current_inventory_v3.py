@@ -653,8 +653,11 @@ class _DispatchCommittedDeltaCaptureV3:
                 or self.pending is not None):
             raise AuthorityUnavailable('actual committed Contact delta capture identity changed')
         ns=self.base.namespace
-        expected={dispatch_claim_key(ns,self.binding.origin.effect_id),
-            contact_p2_graph_proof_key_v1(ns,self.binding.origin.effect_id,self.binding.origin.activity_id)}
+        proof_key=contact_p2_graph_proof_key_v1(ns,self.binding.origin.effect_id,self.binding.origin.activity_id)
+        if self.binding.origin.segment_index>0:
+            from .contact_continuation_p2_v1 import contact_continuation_p2_graph_proof_key_v1
+            proof_key=contact_continuation_p2_graph_proof_key_v1(ns,self.binding.origin.effect_id,self.binding.origin.activity_id)
+        expected={dispatch_claim_key(ns,self.binding.origin.effect_id),proof_key}
         if ({write.key for write in candidate.writes}!=expected
                 or {version.key for version in receipt.revisions}!=expected
                 or candidate.event.scope.bot!=ns.bot_id or candidate.event.scope.persona!=ns.persona_id

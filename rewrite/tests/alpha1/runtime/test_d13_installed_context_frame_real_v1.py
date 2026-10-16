@@ -78,6 +78,7 @@ async def test_current_window_read_and_access_withdrawal_hold(
     assert result.frame.status == "candidate_requires_exact_token_count"
     assert result.frame.history[0].text == "sender: hello"
     assert store._db.total_changes == before
+    result.close()
 
     async def changed(_self):
         return replace(runtime.installed_d13_main_model_v1(), model_id="other")

@@ -32,7 +32,8 @@ class AsyncGraphWorkbenchService:
                  authority_loop: asyncio.AbstractEventLoop | None = None,
                  backend_operation_port: object | None = None,
                  maintenance_port: object | None = None,
-                 package_maintenance_port: object | None = None) -> None:
+                 package_maintenance_port: object | None = None,
+                 runtime_context: object | None = None) -> None:
         self._worker = worker
         self._grants = grants
         self._view_registry = view_registry
@@ -49,10 +50,33 @@ class AsyncGraphWorkbenchService:
         self._backend_operation_port = backend_operation_port
         self._maintenance_port = maintenance_port
         self._package_maintenance_port = package_maintenance_port
+        self._runtime_context = runtime_context
 
     async def handle(self, payload: Any, *, session: AuthenticatedSession | None,
                      context: RequestContext) -> ApiResponse | OwnedGraphStorageResultV3:
-        return await self._worker.call(self._handle_on_worker, payload, session, context)
+        response=await self._worker.call(self._handle_on_worker,payload,session,context)
+        from .named_joint_node_v1 import take_named_joint_node_handoff_v1,abandon_named_joint_node_handoff_v1
+        named=take_named_joint_node_handoff_v1(response)
+        if named is not None:
+            try:return await self._worker.call(self._resume_named_on_worker,named)
+            except asyncio.CancelledError:raise
+            except BaseException:
+                abandon_named_joint_node_handoff_v1(named);raise
+        from ..runtime.d07_source_dispatch_read_v3 import (
+            take_current_d07_dispatch_handoff_v3,resume_current_d07_classified_command_v3,
+            abandon_unaccepted_d07_dispatch_v3)
+        handoff=take_current_d07_dispatch_handoff_v3(response)
+        if handoff is None:return response
+        proof,root=handoff
+        try:
+            return await self._worker.call(resume_current_d07_classified_command_v3,proof)
+        except asyncio.CancelledError:
+            # GraphWorker drains the accepted second ordinary call and releases
+            # its abandoned terminal through its existing ownership path.
+            raise
+        except BaseException:
+            abandon_unaccepted_d07_dispatch_v3(proof,root)
+            raise
 
     def _handle_on_worker(self, coordinator: object, payload: Any,
                           session: AuthenticatedSession | None,
@@ -68,19 +92,38 @@ class AsyncGraphWorkbenchService:
                                       erasure_accepted_read=self._erasure_accepted_read_port(),
                                       backend_operation_port=self._backend_operation_port,
                                       maintenance_port=self._maintenance_port,
-                                      package_maintenance_port=self._package_maintenance_port)
+                                      package_maintenance_port=self._package_maintenance_port,
+                                      runtime_context=self._runtime_context)
         scope = getattr(self._grants, "request_scope", None)
         with ExitStack() as lifetime:
-            lifetime.enter_context(scope() if callable(scope) else nullcontext())
+            entered_scope=lifetime.enter_context(scope() if callable(scope) else nullcontext())
             response = WorkbenchService(issuer).handle(payload, session=session, context=context)
             if type(response) is GraphStorageWorkV3:
-                retained = lifetime.pop_all()
+                if response.kind=="current_d07_dispatch_read_v3":
+                    from .owner_grant import detach_current_owner_request_lifetime_v3
+                    retained=detach_current_owner_request_lifetime_v3(entered_scope)
+                else:retained=lifetime.pop_all()
                 try:
                     response.adopt_request_lifetime_v3(retained)
                 except BaseException:
                     retained.close()
                     raise
             return response
+
+    def _resume_named_on_worker(self,coordinator,proof):
+        from .named_joint_node_v1 import resume_named_joint_node_v1
+        issuer=GraphWorkbenchIssuer(coordinator,self._grants,self._view_registry,runtime_context=self._runtime_context)
+        scope=getattr(self._grants,'request_scope',None)
+        with ExitStack()as lifetime:
+            lifetime.enter_context(scope()if callable(scope)else nullcontext())
+            try:work=resume_named_joint_node_v1(issuer,proof)
+            except Exception as error:
+                from .named_joint_node_v1 import named_node_error_v1
+                return named_node_error_v1(error)
+            retained=lifetime.pop_all()
+            try:work.adopt_request_lifetime_v3(retained)
+            except BaseException:retained.close();raise
+            return work
 
     def _erasure_prepare_port(self):
         client = self._authority_client

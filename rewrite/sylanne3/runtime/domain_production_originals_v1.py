@@ -19,7 +19,7 @@ PHYSICAL_DDL = """CREATE TABLE IF NOT EXISTS graph_domain_production_originals_v
     PRIMARY KEY(bot,persona,operation_id)) STRICT"""
 
 
-DOMAINS = frozenset({"d01", "d02", "d03", "d05", "d06", "d07", "d08", "d10", "d11"})
+DOMAINS = frozenset({"d01", "d02", "d03", "d05", "d06", "d07", "d08", "d09", "d10", "d11"})
 
 
 def install_domain_production_originals_v1(db):
@@ -93,6 +93,9 @@ def record_adopted_domain_operation_v1(db, stage, receipt):
 
 
 def read_adopted_domain_operation_v1(db, namespace, operation_id):
+    from ..authority_service.named_joint_binding_body_v1 import named_joint_adopted_operation_v1
+    named,value=named_joint_adopted_operation_v1(db,namespace,operation_id)
+    if named:return value
     from .natural_producer_qualification_v1 import _producer_original_point_v3
     from .domain_background_read_v3 import (read_bound_background_graph_attachment_v3,
         background_physical_payload_v3, background_json_loads_v3, background_json_matches_v3,
@@ -140,8 +143,13 @@ def read_adopted_domain_operation_v1(db, namespace, operation_id):
         "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation_id)).fetchone())
     if actual != (receipt.operation_digest, receipt.activity_id, receipt.effect_id, receipt.commit_seq):
         raise ValueError("domain adopted original lost its actual W01 commit")
-    return {"domain": domain, "operation_kind": kind, "request_digest": request,
+    original={"domain": domain, "operation_kind": kind, "request_digest": request,
         "original_digest": original_digest, "payload": payload, "read_versions": reads, "receipt": receipt}
+    from .habit_census_provenance_v1 import validate_habit_census_original_v1
+    validate_habit_census_original_v1(original)
+    from ..authority_service.artifact_model_original_family_v3 import register_artifact_model_positive_parent_v3
+    register_artifact_model_positive_parent_v3(db,original)
+    return original
 
 
 def record_adopted_physical_domain_operation_v3(db, stage, receipt):
@@ -295,3 +303,26 @@ def read_adopted_physical_domain_operation_v3(db,namespace,operation_id):
         reader=DomainOriginalPayloadReadV3(db,namespace,operation_id,row)
     raise RuntimeStorageNeedsContinuationV3(RuntimeStorageProgressV3(reader.handle.selection_digest,row[4],0,0,
         row[3],reader.operation.operation_id,reader.operation.deadline_utc),continuation=reader)
+
+
+def reconstruct_graph_bundle_commit_receipt_v1(namespace, operation_id, bundle_row, event_row):
+    """Decode the original bundle/event metadata without changing its historical wire."""
+    from .d01_production_operations_v1 import MissingProductionOriginalV1
+    from .domain_background_read_v3 import background_json_loads_v3
+    from ..graph_store import GraphStore
+    if type(namespace) is not NamespaceId or type(operation_id) is not str or not operation_id:
+        raise ValueError("committed receipt requires its exact namespace and operation")
+    if bundle_row is None or event_row is None:
+        raise MissingProductionOriginalV1("actual_committed_graph_bundle_event_metadata")
+    if len(bundle_row) != 5 or len(event_row) != 3:
+        raise ValueError("committed bundle/event metadata fields differ")
+    operation_digest, activity_id, effect_id, commit_seq, encoded = bundle_row
+    raw = background_json_loads_v3(encoded)
+    if (type(raw) is not dict or type(commit_seq) is not int or commit_seq < 1
+            or raw["commit_seq"] != commit_seq):
+        raise ValueError("committed bundle sequence differs from its original metadata")
+    receipt = CommitReceipt("committed", operation_id, operation_digest, activity_id, effect_id, commit_seq,
+        GraphStore._version_rows(event_row[0]), GraphStore._version_rows(event_row[1]),
+        (NamespaceEpoch(namespace.bot_id, namespace.persona_id, event_row[2]),),
+        tuple(raw["ledger_refs"]), tuple(raw["outbox_refs"]))
+    return _receipt(_receipt_wire(receipt))

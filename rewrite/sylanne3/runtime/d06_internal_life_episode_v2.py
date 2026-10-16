@@ -5,6 +5,7 @@ identity of an activity just authenticated against the actual SQL/frame.
 """
 from dataclasses import dataclass
 import json
+from ..runtime_storage_v3 import read_graph_row_v3, read_graph_rows_v3
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -312,16 +313,16 @@ def validate_internal_life_episode_history_v2(db, proof):
         if reads.get(frozen.ref) != frozen.revision:
             raise ValueError('Life historical provenance is outside its actual committed readset')
         if frozen.revision:
-            actual = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
-                (frozen.ref, frozen.revision)).fetchone()
+            actual = read_graph_row_v3(db, ('value','valid'), where='token=? AND revision=?',
+                parameters=(frozen.ref, frozen.revision), history=True)
             if actual is None or (canonical_digest(json.loads(actual[0])), bool(actual[1])) != (frozen.digest, frozen.valid):
                 raise ValueError('Life episode historical Source/qualification original changed or deleted')
     current = {row.ref:row.revision for row in proof.current_reads}
     produced = {write.key.token for write in expected}
     for write in expected:
         deps = tuple(sorted((key.token, 1 if key.token in produced else current[key.token]) for key in write.dependencies))
-        row = db.execute('SELECT value,valid,event_bot,event_persona,event_id,dependencies FROM graph_history '
-            'WHERE token=? AND revision=1', (write.key.token,)).fetchone()
+        row = read_graph_row_v3(db, ('value','valid','event_bot','event_persona','event_id','dependencies'),
+            where='token=? AND revision=?', parameters=(write.key.token,1), history=True)
         if (versions.get(write.key.token) != 1 or row is None or row[:5] !=
                 (canonical_serialize(write.value), 1, *proof.event.namespace.as_tuple, proof.producing_operation_id)
                 or tuple(sorted(tuple(item) for item in json.loads(row[5]))) != deps):
@@ -334,9 +335,10 @@ def internal_life_episode_read_inputs_v2(db, namespace, episode_ref):
     if episode.type_name != EPISODE or NamespaceId.from_key(episode) != namespace:
         raise ValueError('Life episode read scope differs')
     key = AtomKey(episode.owner, PROVENANCE, 'record')
-    row = db.execute('SELECT value FROM graph_atoms WHERE token=?', (key.token,)).fetchone()
-    if row is None: raise ValueError('Life episode lacks actual typed provenance; HOLD')
-    proof = decode_internal_life_value_v2(PROVENANCE, json.loads(row[0]))
+    from .d01_production_operations_v1 import raw_head_value_v1
+    raw = raw_head_value_v1(db,namespace,key)
+    if raw is None: raise ValueError('Life episode lacks actual typed provenance; HOLD')
+    proof = decode_internal_life_value_v2(PROVENANCE, raw)
     keys = internal_life_episode_keys_v2(namespace, proof.event.activity.source_ref)
     if keys[1] != episode: raise ValueError('Life episode provenance locator differs')
     from .d06_life_activity_lineage_v1 import life_activity_read_inputs_v1
@@ -370,8 +372,12 @@ def require_current_internal_life_episode_v2(db, *, frame, episode_ref, installe
     proof_atom = read.head(db, AtomKey(key.owner, PROVENANCE, 'record'), required=True)
     proof = decode_internal_life_value_v2(PROVENANCE, proof_atom.value)
     require_internal_life_episode_locator_v2(ns,episode_ref,proof)
-    metadata = GraphStore._decode_recovery(db.execute('SELECT schema,requirements_json,graph_revision '
-        'FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?', ns.as_tuple).fetchone(), ns)
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    recovery = _producer_original_point_v3(db, table='graph_recovery_metadata_v2',
+        columns=('schema','requirements_json','graph_revision'), key_columns=('bot','persona'), key=ns.as_tuple,
+        legacy_reader=lambda: db.execute('SELECT schema,requirements_json,graph_revision '
+            'FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?', ns.as_tuple).fetchone())
+    metadata = GraphStore._decode_recovery(recovery, ns)
     if (metadata is None or metadata.requirements.activation_generation != proof.event.activation_generation
             or metadata.requirements.graph_incarnation != proof.event.graph_incarnation
             or frame.envelope.authority.activation_generation != metadata.requirements.activation_generation
@@ -385,8 +391,13 @@ def require_current_internal_life_episode_v2(db, *, frame, episode_ref, installe
             raise ValueError('Life episode current fact/provenance/projection differs')
     expected = tuple(sorted((dep.token, 1 if dep in {write.key for write in writes} else next(
         row.revision for row in proof.current_reads if row.ref == dep.token)) for dep in writes[-1].dependencies))
-    if tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
-            'WHERE dependent_token=? ORDER BY dependency_token', (writes[-1].key.token,))) != expected:
+    from .natural_producer_qualification_v1 import _producer_original_many_v3
+    dependencies = _producer_original_many_v3(db, table='graph_dependencies',
+        columns=('dependency_token','dependency_revision'), key_columns=('dependent_token',),
+        key=(writes[-1].key.token,), order_column='dependency_token',
+        legacy_reader=lambda: tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies '
+            'WHERE dependent_token=? ORDER BY dependency_token', (writes[-1].key.token,))))
+    if tuple(dependencies) != expected:
         raise ValueError('Life episode actual invalidation edges changed')
     for frozen in proof.current_reads:
         atom = read.head(db, frozen.ref)

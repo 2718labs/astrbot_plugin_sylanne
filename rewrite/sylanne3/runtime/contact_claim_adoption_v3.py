@@ -65,7 +65,7 @@ def read_current_own_contact_continuation_v3(db, read, *, content, segment_index
     expected, _, _ = _expected_claim_v3(db, read, content, current_policy, scope, now_utc)
     atom = read.head(db, contact_claim_key_v2(content.namespace, content.contact_id), required=True)
     current = decode_contact_claim_v2(atom.value)
-    if current != expected or current.status != 'claimed':
+    if replace(current,observations=(),status='claimed')!=expected or current.status in {'released','pending_confirmation'}:
         raise ValueError('contact occupancy scope or approval changed')
     effect = content.segments[segment_index].segment.effect_id
     if current.status in {'released', 'pending_confirmation'} or effect in dict(current.observations):
@@ -74,7 +74,13 @@ def read_current_own_contact_continuation_v3(db, read, *, content, segment_index
         if atom.revision != 1 or current.observations:
             raise ValueError('initial contact claim must be its unconsumed staged original')
     else:
-        # Mutable claim observations and a batch receipt cannot authenticate the
-        # immutable D11, Authority and PlatformObservation predecessor prefix.
-        raise ValueError('contact continuation lacks its authenticated predecessor prefix')
+        from .contact_final_stage_v3 import require_installed_contact_material_v3
+        from .contact_continuation_stage_v1 import _require_current_continuation_v1
+        material=require_installed_contact_material_v3(read._witness.material)
+        if material.request.segment_index!=segment_index:
+            raise ValueError('Contact continuation current provider has another segment')
+        _require_current_continuation_v1(material,db)
+        expected_prefix={part.segment.effect_id:'accepted'for part in content.segments[:segment_index]}
+        if dict(current.observations)!=expected_prefix:
+            raise ValueError('Contact continuation actual own-claim prefix is incomplete')
     return ContactContinuation(content.contact_id, current.communication_action_id, effect)

@@ -236,8 +236,9 @@ def _context_provider(db,read):
     version,compiled,receipt=read_current_domain_selection_v1(db,ns,domain="d03",field_name=CONTEXT_SCHEME_FIELD)
     read.head(db,version.key,required=True)
     if receipt is None: raise MissingProductionOriginalV1("adopted_life_context_role_catalogue")
-    row=db.execute("SELECT candidate_json,candidate_sha256 FROM graph_d12_domain_candidates_v1 WHERE bot=? AND persona=? AND candidate_ref=?",
-        (*ns.as_tuple,receipt.candidate_ref)).fetchone()
+    from .domain_background_read_v3 import background_point_v3
+    row=background_point_v3(db,table='graph_d12_domain_candidates_v1',columns=('candidate_json','candidate_sha256'),key_columns=('bot','persona','candidate_ref'),key=(*ns.as_tuple,receipt.candidate_ref),
+        legacy_reader=lambda:db.execute('SELECT candidate_json,candidate_sha256 FROM graph_d12_domain_candidates_v1 WHERE bot=? AND persona=? AND candidate_ref=?',(*ns.as_tuple,receipt.candidate_ref)).fetchone())
     if row is None or hashlib.sha256(row[0].encode()).hexdigest()!=row[1]: raise ValueError("actual Context candidate changed")
     raw=json.loads(row[0])
     if raw.pop("$type",None)!="sylanne3.runtime.d12_domain_scheme_compile_v1.D12ContextSchemeCandidateV1": raise ValueError("wrong Context candidate type")

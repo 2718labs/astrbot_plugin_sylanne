@@ -111,7 +111,7 @@
         "description": "监听端口",
         "type": "int",
         "default": 2718,
-        "hint": "Docker 需要映射此容器端口。HTTPS 复用 AstrBot 已配置证书；未配置 TLS 时仅提供前端和监听状态。"
+        "hint": "Docker 需要映射此容器端口。配置证书时复用 AstrBot HTTPS；未配置证书时使用完整 HTTP 入口，可登录和管理配置。HTTP 传输未加密。"
       }
     }
   },

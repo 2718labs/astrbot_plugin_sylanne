@@ -60,12 +60,12 @@ def _read_verified_d04_output_policy_v1(
     root, trusted_manifest_sha256, installed, *, require_formal, require_backend_runtime,
 ):
     """Consume the result of this reader's actual package verification."""
-    if installed.build_mode not in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate"}:
+    if installed.build_mode not in {"formal-alpha1", "backend-alpha1-candidate", "snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}:
         raise ValueError("D04 output policy requires a formal or backend candidate package")
     if require_formal and installed.build_mode != "formal-alpha1":
         raise ValueError("formal D04 output policy requires a formal-alpha1 package")
     if require_backend_runtime and installed.runtime_scope not in {
-        "formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance",
+        "formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test",
     }:
         raise ValueError("installed D04 runtime qualification is unavailable")
     manifest_path = _safe_file(root, "release-manifest.json")

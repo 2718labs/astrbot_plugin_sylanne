@@ -262,6 +262,24 @@ def _lease_from_row(row) -> BudgetLease:
 
 def get_budget_lease(db, lease_id: str) -> BudgetLease:
     _identifier(lease_id, "lease_id")
+    from ..authority_service.foreground_mesh_source_read_v3 import read_bound_foreground_mesh_budget_v3
+    mesh, lease = read_bound_foreground_mesh_budget_v3(db,lease_id)
+    if mesh:
+        return lease
+    from .current_life_numeric_accounting_v3 import numeric_accounting_current_point_v3,_LEASE_COLUMNS
+    numeric,row=numeric_accounting_current_point_v3(db,table='runtime_budget_leases',columns=_LEASE_COLUMNS,
+        key_columns=('lease_id',),key=(lease_id,))
+    if numeric:return _lease_from_row(row)
+    from ..authority_service.life_numeric_source_read_v3 import read_bound_numeric_model_budget_lease_v3
+    numeric,lease=read_bound_numeric_model_budget_lease_v3(db,lease_id)
+    if numeric:return lease
+    from .current_life_numeric_read_v3 import read_bound_numeric_host_lease_v3
+    numeric,lease=read_bound_numeric_host_lease_v3(db,lease_id)
+    if numeric:return lease
+    from .contact_domain_source_work_v3 import contact_domain_budget_lease_v3
+    contact,row = contact_domain_budget_lease_v3(db,lease_id)
+    if contact:
+        return _lease_from_row(row)
     from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
     row=model_reply_scope_point_v3(db,table='runtime_budget_leases',
         columns=('lease_id','parent_id','bot_id','persona_id','currency','limits_json','used_json',
@@ -522,14 +540,21 @@ def _settlement_binding(actual: Mapping[str, int] | None,
     }, sort_keys=True, separators=(",", ":"))
 
 
+def _numeric_accounting_budget_point_v3(db,*,table,columns,key_columns,key,legacy_reader):
+    from .current_life_numeric_accounting_v3 import numeric_accounting_current_point_v3
+    handled,row=numeric_accounting_current_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    return row if handled else legacy_reader()
+
+
 def _prior(db, lease: BudgetLease, operation_id: str, phase: str,
            digest: str, *, resolution_binding: str | None = None) -> BudgetReceipt | None:
-    row = db.execute(
+    row = _numeric_accounting_budget_point_v3(db,table='runtime_budget_operations',columns=('digest','lease_id','receipt_json','resolution_binding_json'),
+        key_columns=('bot_id','persona_id','operation_id','phase'),key=(lease.bot_id,lease.persona_id,operation_id,phase),legacy_reader=lambda:db.execute(
         "SELECT digest,lease_id,receipt_json,resolution_binding_json "
         "FROM runtime_budget_operations WHERE "
         "bot_id=? AND persona_id=? AND operation_id=? AND phase=?",
         (lease.bot_id, lease.persona_id, operation_id, phase),
-    ).fetchone()
+    ).fetchone())
     if row is None:
         return None
     if row[0] != digest or row[1] != lease.lease_id:
@@ -550,6 +575,8 @@ def _record(db, lease: BudgetLease, operation_id: str, phase: str,
         (lease.bot_id, lease.persona_id, operation_id, phase, digest,
          lease.lease_id, _receipt_json(receipt), resolution_binding),
     )
+    from .current_life_numeric_accounting_v3 import numeric_accounting_budget_transition_v3
+    numeric_accounting_budget_transition_v3(db,lease,operation_id,phase,digest,receipt)
 
 
 def create_budget_lease(db, lease: BudgetLease, operation_id: str,
@@ -638,10 +665,11 @@ def settle_budget(db, lease_id: str, operation_id: str, digest: str,
                    resolution_binding=binding)
     if prior is not None:
         return prior
-    row = db.execute(
+    row = _numeric_accounting_budget_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json','state'),
+        key_columns=('lease_id','operation_id'),key=(lease_id,operation_id),legacy_reader=lambda:db.execute(
         "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
         "WHERE lease_id=? AND operation_id=?", (lease_id, operation_id),
-    ).fetchone()
+    ).fetchone())
     if row is None or row[0] != digest:
         raise BudgetConflict("no matching budget reservation")
     if row[2] != "reserved":
@@ -720,10 +748,11 @@ def settle_budget_partial(
     lease = get_budget_lease(db, lease_id)
     prior = _prior(db, lease, operation_id, "settle", digest)
     if prior is not None:
-        row = db.execute(
+        row = _numeric_accounting_budget_point_v3(db,table='runtime_budget_reservations',columns=('ceiling_json','actual_json','state'),
+        key_columns=('lease_id','operation_id'),key=(lease_id,operation_id),legacy_reader=lambda:db.execute(
             "SELECT ceiling_json,actual_json,state FROM runtime_budget_reservations "
             "WHERE lease_id=? AND operation_id=?", (lease_id, operation_id),
-        ).fetchone()
+        ).fetchone())
         if (row is None or prior.status not in {
                 "pending_confirmation", "pending_overrun"}
                 or row[2] not in {"partial_unknown", "partial_overrun",
@@ -733,10 +762,11 @@ def settle_budget_partial(
                        for key, value in known_actual.items())):
             raise BudgetConflict("replayed partial cost differs from original")
         return prior
-    row = db.execute(
+    row = _numeric_accounting_budget_point_v3(db,table='runtime_budget_reservations',columns=('digest','ceiling_json','state'),
+        key_columns=('lease_id','operation_id'),key=(lease_id,operation_id),legacy_reader=lambda:db.execute(
         "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
         "WHERE lease_id=? AND operation_id=?", (lease_id, operation_id),
-    ).fetchone()
+    ).fetchone())
     if row is None or row[0] != digest or row[2] != "reserved":
         raise BudgetConflict("no settleable original budget reservation")
     ceiling = _amounts(json.loads(row[1]), allow_empty=False)

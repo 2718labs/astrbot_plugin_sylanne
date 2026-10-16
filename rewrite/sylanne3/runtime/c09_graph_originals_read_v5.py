@@ -686,6 +686,60 @@ class VerifiedPagedPriorGraphCertificateViewV2:
         require_c09_capture_member_v2(r.pair.source,identity,member[0],primary_key,member[1],meter=meter)
 
 
+    def require_generated_world_erasure_barrier_v1(self,primary_key,barrier,*,meter):
+        """Verify the first barrier in the actual signed six-directory prior output."""
+        from .d03_world_history_v1 import ERASURE_TABLE,ERASURE_COLUMNS,ERASURE_SIGN_KIND,decode_world_erasure_barrier_row_v1,TABLE
+        from .c09_paged_sql_v2 import require_c09_capture_member_v2,c09_row_commitment_v2
+        r=self.reader;r.session.require_current();r.pair.require_current()
+        if r.complete_directories!=6:
+            raise C09PagedCaptureHold('World prior generated barrier lacks complete six-directory verification')
+        scope=r.certificate.candidate.scope
+        value=decode_world_erasure_barrier_row_v1(ERASURE_COLUMNS,barrier)
+        if (value.namespace.as_tuple!=tuple(json.loads(scope.graph_namespace))
+                or primary_key!=tuple(barrier[:4])
+                or value.deletion_generation!=scope.maintenance_generation
+                or value.delete_original_commitment!=scope.accepted_receipt_digest):
+            raise C09PagedCaptureHold('World prior generated barrier has another actual deletion original')
+        issuer=r.session.get_c09_domain_original_issuer_v2()
+        issuer._signer.verify(ERASURE_SIGN_KIND,barrier[8],barrier[10])
+        columns=('scope_digest','table_name','key_digest','key_json','row_commitment','producer','origin_ref','origin_digest')
+        key=(scope.scope_digest,ERASURE_TABLE,canonical_digest((ERASURE_TABLE,primary_key)))
+        row=meter.read_fixed_row(r.pair.source,'c09_graph_generated_rows_v2',columns,
+            'scope_digest=? AND table_name=? AND key_digest=?',key)
+        if (row is None or row[3]!=canonical_serialize(primary_key)
+                or row[4]!=c09_row_commitment_v2(barrier) or row[5]!='world_erasure_barrier_v1'):
+            raise C09PagedCaptureHold('World prior generated barrier lost its exact generated original')
+        directory=r.certificate.candidate.generated_directory
+        member=meter.read_fixed_row(r.pair.source,'c09_capture_members_v2',('record_ordinal','commitment'),
+            'stream_id=? AND primary_key_json=?',(directory.identity.stream_id,canonical_serialize(key)))
+        if member is None or member[1]!=c09_row_commitment_v2(row):
+            raise C09PagedCaptureHold('World prior generated barrier is outside the signed complete directory')
+        require_c09_capture_member_v2(r.pair.source,directory.identity,member[0],key,member[1],meter=meter)
+        origin=json.loads(row[6])
+        if (type(origin)is not dict or set(origin)!={'schema','stream_id','ordinal'}
+                or origin['schema']!='sylanne3.c09.world-erasure-origin.v1'
+                or type(origin['stream_id'])is not str or type(origin['ordinal'])is not int or origin['ordinal']<0
+                or canonical_serialize(origin)!=row[6]):
+            raise C09PagedCaptureHold('World prior generated barrier opaque origin differs')
+        stream_row=meter.read_fixed_row(r.pair.source,'c09_capture_streams_v2',('identity_json','status'),
+            'stream_id=?',(origin['stream_id'],))
+        if stream_row is None or stream_row[1]!='sealed':
+            raise C09PagedCaptureHold('World prior barrier source origin is not sealed')
+        from .c09_paged_capture_contract_v2 import C09StreamIdentityV2,c09_paged_value_from_wire_v2
+        stream=c09_paged_value_from_wire_v2(json.loads(stream_row[0]),C09StreamIdentityV2)
+        if (stream.stream_id!=origin['stream_id'] or stream.scope_digest!=scope.scope_digest
+                or stream.stream_kind!='graph_facts' or stream.family!=TABLE):
+            raise C09PagedCaptureHold('World prior barrier source origin has another scope/family')
+        captured=meter.read_fixed_row(r.pair.source,'c09_capture_members_v2',('primary_key_json','commitment'),
+            'stream_id=? AND record_ordinal=?',(stream.stream_id,origin['ordinal']))
+        if captured is None or captured[1]!=row[7]:
+            raise C09PagedCaptureHold('World prior barrier exact source commitment differs')
+        original_key=tuple(json.loads(captured[0]))
+        require_c09_capture_member_v2(r.pair.source,stream,origin['ordinal'],original_key,row[7],meter=meter)
+        r.session.require_current();r.pair.require_current()
+        return {'generated_member_commitment':member[1],'generated_directory_digest':directory.complete.digest}
+
+
 def require_c09_erased_derived_fact_v2(db,table,columns,row,*,namespace,key,revision,view,meter):
     """Exact retained fact and erased history target inside a completed prior view."""
     from .c09_graph_rebase_candidate_v1 import _row_digest

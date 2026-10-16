@@ -91,8 +91,11 @@ def _refs(namespace, activity, operation):
 def read_plan_source_note_body_v1(db, *, namespace, activity_id, operation_id, request, now_utc, installed_readers=None):
     from .d11_life_product_adapter_v1 import life_inventory_read_inputs_v1, raw_life_original_v1, LIFE_CURRENT_TYPES
     from .d11_life_scope_v1 import life_scope_from_action_v1
-    row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-        (request.action_intent_ref, *namespace.as_tuple)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db,table="graph_atoms",columns=("value","valid"),
+        key_columns=("token","bot","persona"),key=(request.action_intent_ref,*namespace.as_tuple),
+        legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+            (request.action_intent_ref,*namespace.as_tuple)).fetchone())
     if row is None or row[1] != 1:
         raise MissingProductionOriginalV1("current_source_note_body_root")
     action = json.loads(row[0])
@@ -125,6 +128,8 @@ def stage_prepare_source_note_body_in_transaction_v1(db, *, frame, request, inst
     read = CurrentDomainReadV1(frame)
     read.check(db)
     ns, identity = frame.envelope.authority.namespace, frame.envelope.identity
+    from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
+    require_joint_bound_action_gate_v1(db, namespace=ns, action_ref=request.action_intent_ref, issuer=installed_readers.issuer, frame=frame)
     if type(request) not in {PrepareSourceNoteBodyRequestV1, PrepareArtifactDraftBodyRequestV1}:
         raise TypeError("exact registered source-note or artifact-draft Body request required")
     draft = type(request) is PrepareArtifactDraftBodyRequestV1
@@ -137,6 +142,11 @@ def stage_prepare_source_note_body_in_transaction_v1(db, *, frame, request, inst
             issuer=installed_readers.issuer, frame=frame,
             installed_bundle=installed_readers.installed_bundle,
             body_quote_authority=installed_readers.body_quote_authority)
+        from .d08_source_note_action_v1 import SourceNoteActionOriginalV1,SelectedSourceNoteActionOriginalV2
+        if type(root)in {SourceNoteActionOriginalV1,SelectedSourceNoteActionOriginalV2}:
+            from .ordinary_source_note_habit_classification_v3 import require_current_ordinary_source_note_habit_classification_v3
+            require_current_ordinary_source_note_habit_classification_v3(db,frame=frame,
+                action_ref=request.action_intent_ref,issuer=installed_readers.issuer)
     work_kind = DRAFT_WORK_KIND if draft else WORK_KIND
     action = read.head(db, request.action_intent_ref, required=True)
     if (identity.operation_id != "d02-life-body:" + root.action_operation_id
@@ -244,7 +254,13 @@ def require_life_body_preparation_v1(db, *, prepared, issuer, resource_issuer, b
     if (canonical_digest(receipt) != original.receipt_digest or len(receipt.write_versions) != 1
             or (receipt.write_versions[0].key.token, receipt.write_versions[0].revision) != (original.reservation_ref, original.reservation_revision)):
         raise ValueError("Life Body preparation loses its actual Graph reservation receipt")
-    history = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+    handled,history=read_bound_native_numeric_history_v3(db,original.reservation_ref,original.reservation_revision,('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'))
+    if not handled:
+        from ..authority_service.life_model_original_family_read_v3 import read_bound_life_model_history_v3
+        handled,history=read_bound_life_model_history_v3(db,original.reservation_ref,original.reservation_revision,('value', 'valid', 'event_bot', 'event_persona', 'event_session', 'event_id'))
+    if not handled:
+        history = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?",
         (original.reservation_ref, original.reservation_revision)).fetchone()
     if (history is None or history[1:] != (1, *b.namespace.as_tuple, b.activity_id, operation)
             or canonical_digest(json.loads(history[0])) != original.reservation_digest):

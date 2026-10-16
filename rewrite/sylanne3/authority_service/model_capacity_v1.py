@@ -38,7 +38,7 @@ def _ledger_source_commitment(*row):
     """Match capture_frozen_model_budget_originals_v1's exact ledger commitment."""
     # SQL bounds each argument before it crosses into Python. This row has no
     # BLOB columns, so the capture producer's material tuple is the row itself.
-    if any(type(value) is not str for value in row):
+    if any(type(value) is not str for value in row[:6]) or row[6] is not None and type(row[6]) is not str:
         return None
     columns = ("call_id", "operation_id", "namespace", "subject",
                "identity_json", "state", "observation_digest")
@@ -71,9 +71,18 @@ def _retained_sql():
           AND json_extract(r.original_json,'$.call_id')=r.call_id
           AND json_extract(r.original_json,'$.operation_id')=r.operation_id
           AND json_extract(r.original_json,'$.original_digest')=r.original_digest
-          AND json_extract(r.original_json,'$.provider_state')='observed'
+          AND ((json_extract(r.original_json,'$.provider_state')='observed'
           AND length(json_extract(r.original_json,'$.observation_digest_or_none'))=64
-          AND length(json_extract(r.original_json,'$.terminal_digest_or_none'))=64
+          AND length(json_extract(r.original_json,'$.terminal_digest_or_none'))=64) OR
+          (json_extract(r.original_json,'$.schema')='sylanne3.c09.model-no-dispatch-budget-original.v2'
+          AND json_extract(r.original_json,'$.provider_state')='prepared'
+          AND json_extract(r.original_json,'$.reservation_state')='settled'
+          AND json_extract(r.original_json,'$.observation_digest_or_none') IS NULL
+          AND json_extract(r.original_json,'$.terminal_digest_or_none') IS NULL
+          AND length(json_extract(r.original_json,'$.no_dispatch_witness_digest'))=64
+          AND NOT EXISTS (SELECT 1 FROM json_each(r.original_json,'$.units') u
+              WHERE json_extract(u.value,'$.actual_or_none')<>0 OR json_extract(u.value,'$.actual_or_none') IS NULL
+              OR json_extract(u.value,'$.unknown_upper_bound')<>0 OR json_extract(u.value,'$.pending_known')<>0)))
         THEN 1 ELSE 0 END released
         FROM authority_c09_model_budget_originals_v1 r"""
 
@@ -107,7 +116,7 @@ def _moved_terminal_ledger_sql():
          AND consumed_fence.item_id=r.operation_id
          AND consumed_fence.operation_id=r.operation_id
          AND consumed_fence.facts_pin_digest=consumed_call.facts_pin_digest
-        WHERE r.released=1 AND r.state='observed' AND l.state='observed'
+        WHERE r.released=1 AND r.state=l.state AND r.state IN ('observed','prepared')
           AND r.namespace=l.namespace AND r.call_id=l.call_id
           AND r.operation_id=l.operation_id AND r.request_digest=l.request_digest
           AND NOT EXISTS (SELECT 1 FROM authority_v2_fences f

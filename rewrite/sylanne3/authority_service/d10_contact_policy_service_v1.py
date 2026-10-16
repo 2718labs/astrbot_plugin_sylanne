@@ -102,6 +102,8 @@ class InstalledD10ContactPolicyServiceV1:
         self.owner_service, self.namespace, self.installation_id = owner_service, namespace, installation_id
         self._key, self._clock = signing_key, trusted_now_utc
         with self.core._tx() as db:
+            from .contact_background_rpc_v1 import install_background_observation_schema_v1
+            install_background_observation_schema_v1(db, create=create)
             row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone()
             if row is None and create:
                 db.execute(DDL)

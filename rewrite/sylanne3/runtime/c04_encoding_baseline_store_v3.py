@@ -112,6 +112,9 @@ def _versions(encoded: str) -> tuple[GraphVersion, ...]:
 
 def _receipt(db: sqlite3.Connection, namespace: NamespaceId,
              operation_id: str) -> CommitReceipt:
+    from .c04_encoding_context_original_v3 import active_w01_life_encoding_inputs_v3
+    prepared=active_w01_life_encoding_inputs_v3(db)
+    if prepared is not None:return prepared.receipt_v3(db,namespace,operation_id)
     from .natural_producer_qualification_v1 import _producer_original_point_v3
     row = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'activity_id', 'effect_id', 'commit_seq', 'receipt_json'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
         "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
@@ -170,18 +173,11 @@ def _historical_reads(db: sqlite3.Connection,
                    not in versions for item in required)):
         raise C04EncodingBaselineStoreHold("encoding exact originals are not graph reads")
     for item in required:
-        row = _producer_original_point_v3(db, table='graph_history', columns=('value', 'valid'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((item.ref, item.revision)), legacy_reader=lambda: db.execute(
-            "SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
-            (item.ref, item.revision),
-        ).fetchone())
-        if row is None or row[1] != 1:
-            raise C04EncodingBaselineStoreHold("encoding historical graph row is absent")
-        try:
-            value = json.loads(row[0])
-            if canonical_json(value) != row[0]:
-                raise ValueError("history is noncanonical")
-        except (TypeError, ValueError) as exc:
-            raise C04EncodingBaselineStoreHold("encoding historical graph row differs") from exc
+        from .c04_encoding_context_original_v3 import _historical
+        value,_=_historical(db,original.namespace,GraphVersion(AtomKey.from_token(item.ref),item.revision))
+        if type(value)is not dict:
+            raise C04EncodingBaselineStoreHold("encoding historical graph row differs")
+
 
 
 def _exact(cls: type, raw: object) -> object:
@@ -271,13 +267,17 @@ def _joint_numeric(db: sqlite3.Connection, namespace: NamespaceId,
                    expected_digest: str) -> JointNumericOriginalV1:
     from .natural_producer_qualification_v1 import _producer_original_point_v3
     from .d04_series_original_v1 import require_series_adopted_original_v1
-    require_series_adopted_original_v1(db, namespace, operation_id)
-    row = _producer_original_point_v3(db, table='graph_d04_joint_numeric_originals_v1', columns=('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
-        "SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,"
-        "verification_digest FROM graph_d04_joint_numeric_originals_v1 "
-        "WHERE bot=? AND persona=? AND operation_id=?",
-        namespace.as_tuple + (operation_id,),
-    ).fetchone())
+    from .c04_encoding_context_original_v3 import active_w01_life_encoding_inputs_v3
+    prepared=active_w01_life_encoding_inputs_v3(db)
+    if prepared is None:require_series_adopted_original_v1(db, namespace, operation_id)
+    if prepared is not None:row=prepared.numeric_row_v3(db,namespace,operation_id)
+    else:
+        row = _producer_original_point_v3(db, table='graph_d04_joint_numeric_originals_v1', columns=('numeric_receipt_json', 'numeric_receipt_digest', 'verification_json', 'verification_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))(namespace.as_tuple + (operation_id,)), legacy_reader=lambda: db.execute(
+            "SELECT numeric_receipt_json,numeric_receipt_digest,verification_json,"
+            "verification_digest FROM graph_d04_joint_numeric_originals_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone())
     if row is None:
         raise C04EncodingBaselineStoreHold("joint numeric original is absent")
     try:
@@ -312,7 +312,10 @@ def _joint_numeric(db: sqlite3.Connection, namespace: NamespaceId,
 def _joint_output_digest(db: sqlite3.Connection, namespace: NamespaceId,
                          operation_id: str, expected: str) -> None:
     try:
-        value = read_d04_joint_output_original_v1(db, namespace, operation_id)
+        from .c04_encoding_context_original_v3 import active_w01_life_encoding_inputs_v3
+        prepared=active_w01_life_encoding_inputs_v3(db)
+        value=(prepared.output_v3(db,namespace,operation_id) if prepared is not None
+            else read_d04_joint_output_original_v1(db, namespace, operation_id))
         if value is None or value.original_digest != expected:
             raise ValueError("joint output original differs")
     except (TypeError, ValueError) as exc:
@@ -397,15 +400,23 @@ def record_c04_encoding_baseline_v3(
                        historical_closure_digest, numeric_original)
     key = namespace.as_tuple + (original.encoding_operation_id,
                                 original.source.ref)
-    prior = db.execute(
-        "SELECT joint_operation_id,original_json,original_digest,proof_json,"
-        "proof_digest,as_known_at_json,historical_closure_digest,"
-        "read_versions_json,read_versions_digest,encoding_receipt_digest,"
-        "joint_receipt_digest,numeric_original_ref,numeric_original_revision,"
-        "record_digest FROM graph_c04_encoding_baselines_v3 "
-        "WHERE bot=? AND persona=? AND encoding_operation_id=? AND source_ref=?",
-        key,
-    ).fetchone()
+    from .c04_encoding_context_original_v3 import active_w01_life_encoding_inputs_v3
+    prepared=active_w01_life_encoding_inputs_v3(db)
+    if prepared is not None:
+        prepared.require_active_v3(db)
+        if key!=prepared.context.original.namespace.as_tuple+(prepared.reader.operation_id,prepared.context.original.source_ref):
+            raise C04EncodingBaselineStoreHold("encoding prior escaped actual selected key")
+        prior=prepared.prior
+    else:
+        prior = db.execute(
+            "SELECT joint_operation_id,original_json,original_digest,proof_json,"
+            "proof_digest,as_known_at_json,historical_closure_digest,"
+            "read_versions_json,read_versions_digest,encoding_receipt_digest,"
+            "joint_receipt_digest,numeric_original_ref,numeric_original_revision,"
+            "record_digest FROM graph_c04_encoding_baselines_v3 "
+            "WHERE bot=? AND persona=? AND encoding_operation_id=? AND source_ref=?",
+            key,
+        ).fetchone()
     if prior is not None:
         if prior != payload:
             raise C04EncodingBaselineStoreHold("same encoding operation/source differs")

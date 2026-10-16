@@ -3,6 +3,7 @@
 The stage dispatch is fixed. Durable attempt/permit/receipt originals share the
 Graph originals table; they never introduce another budget or execution store.
 """
+from .contact_original_read_v3 import contact_original_point_v3
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -24,6 +25,7 @@ from ..host.model_workflows_v4 import AdminModelWorkflowsV4
 from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from .contact_paid_original_v2 import record_contact_original_v2, require_contact_original_v2, read_contact_original_v2
 from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2, require_contact_inventory_current_v2
 from .contact_model_job_v2 import contact_model_ids_v2, read_contact_prepared_v2
@@ -46,6 +48,7 @@ class _ContactStageWitnessV2:
     phase: str
     operation_id: str
     now: float
+    seal_intent: object = None
 
 
 _ACTIVE = {}
@@ -59,7 +62,7 @@ class InstalledContactModelGraphRuntimeV2:
         assembly = graph._GraphCoordinator__d04_installed_joint_assembly
         if (not isinstance(store, ProductionGraphStore) or type(bundle) is not AdminInstallationBundle
                 or type(bundle.model_workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
-                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
                 or port is None or assembly is None or assembly.admin_bundle is not bundle
                 or graph._GraphCoordinator__model_terminal_cost_port is None):
             raise ValueError("contact stages require actual installed W01/Authority/model accounting")
@@ -93,7 +96,7 @@ class InstalledContactModelGraphRuntimeV2:
         require_contact_inventory_current_v2(db, prepared.namespace, raw)
         require_contact_scope_current_v2(db, plan, expression, now=now)
         expected = raw["proof"]["owner_guard"]
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (expected["grant_ref"],)).fetchone()
+        row = contact_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((expected["grant_ref"],)),legacy_reader=lambda: db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (expected["grant_ref"],)).fetchone())
         if (row is None or (row[0], row[2]) != (expected["grant_revision"], 1)
                 or canonical_digest(json.loads(row[1])) != expected["grant_digest"]
                 or owner is not None and owner.authorization_head.removeprefix("sha256:") != expected["owner_head_digest"]):
@@ -101,14 +104,76 @@ class InstalledContactModelGraphRuntimeV2:
 
     def read_preparation(self, *, contact_id, phase):
         self._current()
-        with self.store._lock:
-            db = self.store._db
-            db.execute("BEGIN")
-            try:
-                prepared, frozen, *_ = self._original(db, contact_id, phase)
-                return prepared, frozen, get_job(db, prepared.job_id)
-            finally:
-                db.rollback()
+        return self._contact_host_read_work_v3(contact_id,phase,'preparation')
+
+    def _read_contact_host_stage_data_v3(self, work):
+        from .contact_host_source_v3 import require_contact_host_work_v3
+        require_contact_host_work_v3(work,db=self.store._db)
+        if work.service is not self or work.phase != 'semantic' or not self.store._db.in_transaction:
+            raise ValueError('Contact Host stage read lost its actual installed Work/Scope')
+        selector = work.selector
+        if hasattr(work,'replay_operation'):
+            raw,_ = require_contact_original_v2(self.store._db,self.issuer,work.namespace,'stage_receipt',work.replay_operation)
+            if canonical_digest(raw) != work.stage_receipt_metadata.digest:
+                raise ValueError('Contact replay body differs from the already ACKed full receipt EOF')
+            return raw['result']
+        if selector.stage == 'dispatch_text':
+            from .contact_dispatch_host_read_v1 import read_qualified_contact_dispatch_text_v1
+            return read_qualified_contact_dispatch_text_v1(work)
+        if selector.stage == 'background_item':
+            from ..host.installed_contact_background_driver_v1 import _qualified_contact_background_item_v3
+            return _qualified_contact_background_item_v3(self,work)
+        prepared,frozen,plan,expression,raw = self._original(self.store._db,selector.contact_id,selector.model_phase)
+        self._content(self.store._db,(prepared,frozen,plan,expression,raw),work.now_utc,work.owner_guard)
+        work.prepared = prepared
+        job = get_job(self.store._db,prepared.job_id)
+        if selector.stage == 'preparation':
+            return prepared,frozen,job
+        if selector.stage == 'egress':
+            from .natural_reply_job_v2 import _request_from_wire
+            request_raw,_ = require_contact_original_v2(self.store._db,self.issuer,prepared.namespace,'request',prepared.job_id)
+            request = _request_from_wire(request_raw['wire'])
+            draft = contact_model_draft_v2(prepared=prepared,frozen=frozen,request=request,job=job,
+                metadata=work.graph_stamp[0],epoch=work.graph_stamp[1])
+            sealed = read_contact_original_v2(self.store._db,self.issuer,prepared.namespace,'call',prepared.job_id)
+            intent = None if sealed is None else model_unwire(sealed[0],ModelEgressIntentV1)
+            return prepared,frozen,job,request,draft,intent,work.scope.pinned_anchor
+        if selector.stage == 'attempts':
+            from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadRequestV2,contact_result_from_wire_v2
+            refs = self._contact_result_attempt_refs_v3(self.store._db,prepared)
+            return tuple(contact_result_from_wire_v2(require_contact_original_v2(self.store._db,self.issuer,
+                prepared.namespace,'read_attempt',ref)[0],ContactModelResultReadRequestV2) for ref in refs)
+        if selector.stage in {'paid_result','paid_progress','paid_batch'}:
+            if selector.stage == 'paid_batch':
+                return read_paid_contact_batch_v2(self.store._db,namespace=prepared.namespace,contact_id=selector.contact_id,
+                    issuer=self.issuer,resource_issuer=self.resource_issuer)
+            paid = read_paid_contact_result_v2(self.store._db,namespace=prepared.namespace,contact_id=selector.contact_id,
+                phase=selector.model_phase,issuer=self.issuer,resource_issuer=self.resource_issuer)
+            if selector.stage == 'paid_result':
+                return paid
+            actual,frozen,candidate,cost = paid
+            from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadV2,contact_result_from_wire_v2
+            result_raw,_ = require_contact_original_v2(self.store._db,self.issuer,prepared.namespace,'result',actual.job_id)
+            result = contact_result_from_wire_v2(result_raw,ContactModelResultReadV2)
+            row = contact_original_point_v3(self.store._db,table='graph_bundle_operations',columns=('receipt_json',),
+                key_columns=('bot','persona','operation_id'),key=(*prepared.namespace.as_tuple,cost['cost_operation_id']),
+                legacy_reader=lambda:None)
+            committed = OriginalModelCostCommitV1(**json.loads(row[0])['original_model_cost'])
+            return actual,candidate,result.terminal_receipt,committed
+        if selector.stage in {'acquire','paid_cost','result_read','terminal','seal'}:
+            return prepared,frozen,plan,expression,raw
+        raise ValueError('Contact Host fixed stage selector has no consumer')
+
+    def _contact_host_read_work_v3(self, contact_id, phase, stage, *, result_attempt=1,borrowed_scope=None,seal_intent=None,seal_permit=None):
+        from .contact_host_stage_work_v3 import prepare_contact_host_stage_work_v3
+        work = prepare_contact_host_stage_work_v3(self,contact_id=contact_id,model_phase=phase,stage=stage,
+            result_attempt=result_attempt,borrowed_scope=borrowed_scope,seal_intent=seal_intent,seal_permit=seal_permit)
+        def result(state):
+            if state.service is not self or not state.complete:
+                raise ValueError('Contact Host result was not issued by this installed Work')
+            return state.result
+        work.map_terminal_v3('issuer',result,lambda error: (_ for _ in ()).throw(error))
+        return work
 
     def _attempt(self, value, phase, anchor, metadata, epoch):
         prepared = value[0]
@@ -122,121 +187,7 @@ class InstalledContactModelGraphRuntimeV2:
 
     def _write(self, contact_id, model_phase, phase, *, result_attempt=1):
         self._current()
-        if phase not in {"acquire", "paid_cost", "result_read", "terminal"}:
-            raise ValueError("unregistered installed contact stage")
-        graph, ns, policy = self.graph, self.bundle.installation_policy.namespace, self.bundle.installation_policy
-        with self.store._lock:
-            value = self._original(self.store._db, contact_id, model_phase)
-            metadata, epoch = graph._v2_graph_stamp(ns)
-            prepared = value[0]
-            original_operation = (prepared.acquire_operation_id if phase == "acquire" else
-                "contact-" + phase + ":" + canonical_digest((prepared.namespace, prepared.job_id, phase))[:48])
-            if phase == "result_read":
-                original_operation += ":" + str(result_attempt)
-            replay_attempt = read_contact_original_v2(self.store._db, self.issuer, ns, "stage_attempt", original_operation)
-            replay_permit = read_contact_original_v2(self.store._db, self.issuer, ns, "stage_permit", original_operation)
-            replay_result = read_contact_original_v2(self.store._db, self.issuer, ns, "stage_receipt", original_operation)
-        if replay_result is not None:
-            if replay_attempt is None or replay_permit is None or replay_result[0]["prepared_digest"] != prepared.digest:
-                raise ValueError("contact committed stage lost its actual attempt/permit identity")
-            details = replay_attempt[0]
-            permit = permit_unwire(replay_permit[0]["permit"])
-            actual, state = self.port.get_fence_operation(namespace=ns, authority_namespace=policy.authority_namespace, operation_id=details["attempt_id"])
-            if actual != permit or state not in {"active", "finished"}:
-                raise ValueError("contact committed original ACK recovery fence differs")
-            if state == "active":
-                scope = FenceScope(ns, policy.authority_namespace, permit.generation, "write", details["attempt_id"], permit,
-                    permit.pinned_anchor, NamespaceEpoch(*ns.as_tuple, details["graph_epoch"]), details["graph_revision"])
-                finish = "sha256:" + canonical_digest(("d10.contact-stage-finish.v2", original_operation, details["request_digest"], permit.token))
-                self.port.finish_fence(scope, request_id="finish:" + details["attempt_id"], request_digest=finish)
-            return replay_result[0]["result"]
-        anchor = self.port.current_anchor(namespace=ns, authority_namespace=policy.authority_namespace)
-        if not graph._anchor_matches(metadata.requirements, anchor):
-            raise StaleRead("contact current W01/Authority heads differ")
-        operation, details = self._attempt(value, phase, anchor, metadata, epoch)
-        if phase == "result_read":
-            operation += ":" + str(result_attempt)
-            details["attempt_id"] = "contact-stage-fence:" + canonical_digest((operation, details["request_digest"]))[:48]
-        with self.store._lock:
-            db = self.store._db
-            previous = read_contact_original_v2(db, self.issuer, ns, "stage_attempt", operation)
-            if previous is None:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    if graph._v2_graph_stamp(ns) != (metadata, epoch):
-                        raise StaleRead("contact Graph changed before durable stage attempt")
-                    record_contact_original_v2(db, self.issuer, ns, "stage_attempt", operation, details)
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
-            else:
-                saved = previous[0]
-                if any(saved[key] != details[key] for key in ("job_id", "phase", "request_digest", "attempt_id", "prepared_digest")):
-                    raise ValueError("contact original stage identity changed")
-                details = saved
-            saved_permit = read_contact_original_v2(db, self.issuer, ns, "stage_permit", operation)
-            saved_result = read_contact_original_v2(db, self.issuer, ns, "stage_receipt", operation)
-        if saved_permit is None:
-            if (details["anchor"] != asdict(anchor) or (details["graph_revision"], details["graph_epoch"]) != (metadata.graph_revision, epoch.revision)):
-                raise StaleRead("contact unresolved stage cannot replace its frozen original snapshot")
-            permit = self.port.begin_fence(namespace=ns, authority_namespace=policy.authority_namespace,
-                holder=policy.administrator_holder, generation=anchor.activation_generation, operation="write",
-                operation_id=details["attempt_id"], expected_anchor=anchor, retain_on_unknown=True)
-            state = "active"
-            with self.store._lock:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    record_contact_original_v2(db, self.issuer, ns, "stage_permit", operation,
-                        {"schema": "d10.contact-stage-permit.v2", "attempt_id": details["attempt_id"], "permit": permit_wire(permit)})
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
-        else:
-            permit = permit_unwire(saved_permit[0]["permit"])
-            actual, state = self.port.get_fence_operation(namespace=ns, authority_namespace=policy.authority_namespace, operation_id=details["attempt_id"])
-            if actual != permit or state not in {"active", "finished"}:
-                raise ValueError("contact actual saved stage fence differs")
-        scope = FenceScope(ns, policy.authority_namespace, permit.generation, "write", details["attempt_id"], permit,
-            permit.pinned_anchor, NamespaceEpoch(*ns.as_tuple, details["graph_epoch"]), details["graph_revision"])
-        finish = "sha256:" + canonical_digest(("d10.contact-stage-finish.v2", operation, details["request_digest"], permit.token))
-        if saved_result is not None:
-            if state == "active":
-                self.port.finish_fence(scope, request_id="finish:" + details["attempt_id"], request_digest=finish)
-            return saved_result[0]["result"]
-        if state != "active" or self.port.validate_fence(scope) != permit:
-            raise ValueError("contact original stage cannot write after its retirement")
-        owner, owner_permit = self.port.get_current_background_owner_authority_for_fence_v1(namespace=ns,
-            authority_namespace=policy.authority_namespace, permit=permit)
-        from ..authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        if type(owner) is not D12CurrentOwnerAuthorityV1 or owner_permit != permit:
-            raise ValueError("contact actual current background Owner original unavailable")
-        now = trusted_upper(self.port.read_ingress_clock(self.bundle.ingress_clock))
-        reader = graph._GraphCoordinator__d04_semantic_mapping_reader
-        witness = _ContactStageWitnessV2(self, scope, owner, value[0], phase, operation, now)
-        with (reader.current_fence(scope) if reader is not None else nullcontext()):
-            with self.store._lock:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    if graph._v2_graph_stamp(ns) != (metadata, epoch):
-                        raise StaleRead("contact Graph changed before actual stage CAS")
-                    graph._scene_binding_state_locked(ns, owner.guard)
-                    value = self._original(db, contact_id, model_phase)
-                    self._content(db, value, now, owner.guard)
-                    _ACTIVE[id(witness)] = witness
-                    result = self._apply(db, witness, value, metadata, epoch, result_attempt)
-                    record_contact_original_v2(db, self.issuer, ns, "stage_receipt", operation,
-                        {"schema": "d10.contact-stage-receipt.v2", "prepared_digest": value[0].digest,
-                         "operation_id": operation, "attempt_id": details["attempt_id"], "result": plain_v1(result)})
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
-                finally:
-                    _ACTIVE.pop(id(witness), None)
-        self.port.finish_fence(scope, request_id="finish:" + details["attempt_id"], request_digest=finish)
-        return plain_v1(result)
+        return self._contact_host_read_work_v3(contact_id,model_phase,phase,result_attempt=result_attempt)
 
     def _commit(self, db, witness, metadata, epoch, writes, reads):
         if (_ACTIVE.get(id(witness)) is not witness or witness.service is not self
@@ -269,6 +220,12 @@ class InstalledContactModelGraphRuntimeV2:
     def _apply(self, db, witness, value, metadata, epoch, result_attempt):
         prepared, frozen, plan, expression, raw = value
         job = get_job(db, prepared.job_id)
+        if witness.phase == 'seal':
+            intent = witness.seal_intent
+            if type(intent) is not ModelEgressIntentV1 or intent.binding_digest != prepared.digest:
+                raise ValueError('Contact seal WRITE lacks its original exact intent')
+            seal_contact_call_in_transaction_v2(db,prepared=prepared,issuer=self.issuer,intent=intent)
+            return {'status':'sealed','job_id':prepared.job_id,'intent_digest':canonical_digest(intent)}
         if witness.phase == "acquire":
             if job.phase != "queued" or job.fence or job.cancel_epoch:
                 raise ValueError("contact once acquired job cannot be replaced by another worker")
@@ -281,7 +238,7 @@ class InstalledContactModelGraphRuntimeV2:
                 prepared.namespace, ("activity", "event", "persona", "scene"), "proposal", (plan.audience_id,),
                 workflow.provider_config_ref, metadata.requirements.activation_generation)
             job_key = job_graph_write(job).key
-            old = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (job_key.token,)).fetchone()[0]
+            old = contact_original_point_v3(db,table='graph_atoms',columns=('revision',),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((job_key.token,)),legacy_reader=lambda: db.execute("SELECT revision FROM graph_atoms WHERE token=?", (job_key.token,)).fetchone())[0]
             envelope = CommandEnvelope(RUNTIME_SCHEMA, OperationIdentity(prepared.activity_id, None, prepared.acquire_operation_id,
                 prepared.phase, prepared.acquire_operation_id, canonical_digest({"input_refs": list(refs)})), authority,
                 VersionGuard((*plan.qualified_read_versions, GraphVersion(job_key, old + 1)),
@@ -304,9 +261,9 @@ class InstalledContactModelGraphRuntimeV2:
         if witness.phase == "paid_cost":
             fact = self._fact(prepared)
             receipt = self._actual_cost_commits[prepared.job_id]
-            cost = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (receipt.cost_ref,)).fetchone()
-            budget = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
-                (*prepared.namespace.as_tuple, prepared.prepare_operation_id)).fetchone()
+            cost = contact_original_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((receipt.cost_ref,)),legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (receipt.cost_ref,)).fetchone())
+            budget = contact_original_point_v3(db,table='runtime_budget_operations',columns=('receipt_json',),key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],'settle'))((*prepared.namespace.as_tuple, prepared.prepare_operation_id)),legacy_reader=lambda: db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
+                (*prepared.namespace.as_tuple, prepared.prepare_operation_id)).fetchone())
             quote = self.resource_issuer.original_signed_quote(db, prepared.quote_id, prepared.quote_version)
             from .budget import _receipt_from_json
             actual_receipt = _receipt_from_json(budget[0])
@@ -327,7 +284,7 @@ class InstalledContactModelGraphRuntimeV2:
             fence=job.fence, now_utc=witness.now)
         if len(writes) != 1 or writes[0].key != job_graph_write(job).key:
             raise ValueError("contact result completion cannot repeat cost or change its fixed job write")
-        old = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (writes[0].key.token,)).fetchone()[0]
+        old = contact_original_point_v3(db,table='graph_atoms',columns=('revision',),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((writes[0].key.token,)),legacy_reader=lambda: db.execute("SELECT revision FROM graph_atoms WHERE token=?", (writes[0].key.token,)).fetchone())[0]
         receipt = self._commit(db, witness, metadata, epoch, writes,
             (*plan.qualified_read_versions, GraphVersion(writes[0].key, old)))
         return {"status": "completed", "job_id": job.job_id, "output_digest": candidate.output_digest,
@@ -344,104 +301,39 @@ class InstalledContactModelGraphRuntimeV2:
 
     def prepare_result_read(self, *, contact_id, phase, attempt=1):
         from ..authority_service.contact_model_result_contract_v2 import contact_result_from_wire_v2, ContactModelResultReadRequestV2
-        raw = self._write(contact_id, phase, "result_read", result_attempt=attempt)
-        return contact_result_from_wire_v2(raw, ContactModelResultReadRequestV2)
+        work = self._write(contact_id,phase,'result_read',result_attempt=attempt)
+        work.map_terminal_v3('service',lambda raw: contact_result_from_wire_v2(raw,ContactModelResultReadRequestV2),
+            lambda error: (_ for _ in ()).throw(error))
+        return work
 
     def read_result_attempts(self, *, contact_id, phase):
-        """Read the actual bounded selector chain; never derive a new model call."""
-        from .contact_paid_original_v2 import TABLE
-        from ..authority_service.contact_model_result_contract_v2 import contact_result_from_wire_v2, ContactModelResultReadRequestV2
         self._current()
-        ns = self.bundle.installation_policy.namespace
-        with self.store._lock:
-            job_id = self._original(self.store._db, contact_id, phase)[0].job_id
-        consumer = "contact-terminal:" + canonical_digest((ns, job_id))[:48]
-        with self.store._lock:
-            db = self.store._db
-            account, _ = require_contact_original_v2(db, self.issuer, ns, "accounting_prepared", job_id)
-            refs = tuple(row[0] for row in db.execute(f"SELECT original_ref FROM {TABLE} WHERE bot=? AND persona=? AND kind='read_attempt' ORDER BY original_ref LIMIT 129",
-                ns.as_tuple))
-            if len(refs)>128:
-                raise ValueError("Contact V2 read selector inventory exceeds bound; HOLD")
-            requests = []
-            for ref in refs:
-                raw, _ = require_contact_original_v2(db, self.issuer, ns, "read_attempt", ref)
-                request = contact_result_from_wire_v2(raw, ContactModelResultReadRequestV2)
-                if request.job_id == job_id:
-                    if (request.consumer_operation_id != consumer or request.binding_digest != account["prepared_digest"]
-                            or request.call_id != account["call_id"] or request.phase != phase or request.contact_id != contact_id):
-                        raise ValueError("contact durable result selector crossed its exact once call")
-                    requests.append(request)
-            if len(requests) > 128:
-                raise ValueError("contact durable result selector count exceeded its installed bound")
-            by_ref = {request.read_attempt_id: request for request in requests}
-            chain = []
-            for number in range(1, len(requests) + 1):
-                ref = "contact-result-read:" + canonical_digest((consumer, number))[:48]
-                if ref not in by_ref:
-                    raise ValueError("contact durable result selector chain is incomplete")
-                chain.append(by_ref[ref])
-            return tuple(chain)
+        return self._contact_host_read_work_v3(contact_id,phase,'attempts')
+
+    def _contact_result_attempt_refs_v3(self,db,prepared):
+        from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadRequestV2,contact_result_from_wire_v2
+        consumer = 'contact-terminal:'+canonical_digest((prepared.namespace,prepared.job_id))[:48]
+        account,_ = require_contact_original_v2(db,self.issuer,prepared.namespace,'accounting_prepared',prepared.job_id)
+        chain,missing = [],False
+        for number in range(1,129):
+            ref = 'contact-result-read:'+canonical_digest((consumer,number))[:48]
+            original = read_contact_original_v2(db,self.issuer,prepared.namespace,'read_attempt',ref)
+            if original is None:
+                missing = True
+                continue
+            if missing:
+                raise ValueError('Contact durable result attempt chain has a gap')
+            request = contact_result_from_wire_v2(original[0],ContactModelResultReadRequestV2)
+            if (request.job_id,request.contact_id,request.phase,request.consumer_operation_id,request.binding_digest,request.call_id) != (
+                    prepared.job_id,prepared.contact_id,prepared.phase,consumer,account['prepared_digest'],account['call_id']):
+                raise ValueError('Contact original result attempt crossed its exact once call')
+            chain.append(ref)
+        return tuple(chain)
 
     def commit_cost(self, *, contact_id, phase, intent):
         self._current()
-        ns = self.bundle.installation_policy.namespace
-        if type(intent) is not ModelEgressIntentV1 or not intent.job_id.startswith('contact-model-job-v2:'):
-            raise ValueError('Contact V2 cost requires the actual sealed call job locator')
-        job_id = intent.job_id
-        with self.store._lock:
-            account, _ = require_contact_original_v2(self.store._db, self.issuer, ns, "accounting_prepared", job_id)
-            saved_call, _ = require_contact_original_v2(self.store._db, self.issuer, ns, "call", job_id)
-            actual_intent = model_unwire(saved_call, ModelEgressIntentV1)
-            quote = self.resource_issuer.original_signed_quote(self.store._db, account["quote_id"], account["quote_version"])
-        if (phase not in {"contact_generation", "contact_review"} or actual_intent != intent
-                or account['contact_id'] != contact_id
-                or (intent.job_id, intent.call_id, intent.binding_digest, intent.operation_id,
-                    intent.budget_reservation_operation_id, intent.budget_reservation_digest, intent.budget_lease_id) !=
-                   (job_id, account["call_id"], account["prepared_digest"], account["acquire_operation_id"],
-                    account["prepare_operation_id"], account["reservation_digest"], account["parent_budget_lease_id"])
-                or account["namespace"] != plain_v1(ns) or account["work_kind"] != phase
-                or canonical_digest(quote) != account["quote_digest"]):
-            raise ValueError("contact retained accounting cannot substitute another actual once call")
-        fact = read_original_model_cost(self.graph._GraphCoordinator__model_terminal_cost_port, intent)
-        receipt = self.graph._commit_original_model_cost_v1(self.bootstrap, ns, intent,
-            quote_id=account["quote_id"], quote_version=account["quote_version"], work_kind=phase)
-        self._cost_facts[job_id], self._actual_cost_commits[job_id] = fact, receipt
-        # This is a post-CAS seal of the existing accounting fact. It reads no
-        # Source body and therefore remains available after content deletion.
-        with self.store._lock:
-            db = self.store._db
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                from .budget import _receipt_from_json
-                original = db.execute("SELECT receipt_json,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-                    (*ns.as_tuple, receipt.operation_id)).fetchone()
-                cost = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (receipt.cost_ref,)).fetchone()
-                budget = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
-                    (*ns.as_tuple, account["prepare_operation_id"])).fetchone()
-                if original is None or cost is None or cost[1] != 1 or budget is None:
-                    raise ValueError("contact actual independent cost commit is incomplete")
-                raw = json.loads(original[0])
-                committed = OriginalModelCostCommitV1(**raw["original_model_cost"])
-                actual_receipt = _receipt_from_json(budget[0])
-                if (committed.call_id != intent.call_id or committed.operation_id != receipt.operation_id
-                        or committed.commit_seq != original[1] or committed.cost_ref != receipt.cost_ref
-                        or raw["original_intent_digest"] != canonical_digest(asdict(intent))
-                        or raw["terminal_receipt_digest"] != canonical_digest(asdict(fact.receipt))
-                        or committed.terminal_receipt_digest != canonical_digest(asdict(fact.receipt))
-                        or committed.budget_receipt_digest != canonical_digest(asdict(actual_receipt))
-                        or (committed.quote_id, committed.quote_version) != (quote.quote_id, quote.version)):
-                    raise ValueError("contact actual committed cost/terminal/budget original differs")
-                _, unknown = original_model_budget_measurement(fact, quote, work_kind=phase)
-                paid = {"schema": "d10.contact-paid-cost-original.v2", "prepared_digest": account["prepared_digest"],
-                    "terminal_digest": canonical_digest(asdict(fact.receipt)), "cost_ref": receipt.cost_ref, "cost_value": json.loads(cost[0]),
-                    "budget_receipt": plain_v1(actual_receipt), "unknown_dimensions": list(unknown), "cost_operation_id": receipt.operation_id}
-                record_contact_original_v2(db, self.issuer, ns, "paid_cost", job_id, paid)
-                db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-        return receipt
+        from .contact_cost_metadata_v3 import prepare_contact_cost_metadata_work_v3
+        return prepare_contact_cost_metadata_work_v3(self,contact_id=contact_id,phase=phase,intent=intent)
 
     async def read_result_delivery(self, *, client, grant, request):
         from ..host.authority_client import AuthorityClient
@@ -455,126 +347,30 @@ class InstalledContactModelGraphRuntimeV2:
         return self._write(contact_id, phase, "terminal")
 
     def read_egress(self, *, contact_id, phase):
-        from .natural_reply_job_v2 import _request_from_wire
         self._current()
-        policy, ns = self.bundle.installation_policy, self.bundle.installation_policy.namespace
-        with self.store._lock:
-            metadata, _ = self.graph._v2_graph_stamp(ns)
-            value = self._original(self.store._db, contact_id, phase)
-        authority = AuthorityContext(self.port.installation_grant.subject, "d11", "contact-read:" + value[0].digest,
-            ns, ("activity", "event", "persona", "scene"), "proposal", (value[2].audience_id,),
-            value[0].provider_config_ref, metadata.requirements.activation_generation)
-        current_owner = []
-        now = trusted_upper(self.port.read_ingress_clock(self.bundle.ingress_clock))
-        def observe(scope):
-            owner, permit = self.port.get_current_owner_guard_for_fence(namespace=ns,
-                authority_namespace=policy.authority_namespace, permit=scope.permit)
-            if permit != scope.permit:
-                raise ValueError("contact actual current Owner read permit differs")
-            current_owner[:] = [owner]
-            return owner, permit
-        def read():
-            db = self.store._db
-            db.execute("BEGIN")
-            try:
-                metadata, epoch = self.graph._v2_graph_stamp(ns)
-                value = self._original(db, contact_id, phase)
-                self._content(db, value, now, current_owner[0])
-                prepared, frozen, *_ = value
-                job = get_job(db, prepared.job_id)
-                saved, _ = require_contact_original_v2(db, self.issuer, ns, "request", prepared.job_id)
-                call = _request_from_wire(saved["wire"])
-                draft = contact_model_draft_v2(prepared=prepared, frozen=frozen, request=call, job=job, metadata=metadata, epoch=epoch)
-                sealed = read_contact_original_v2(db, self.issuer, ns, "call", prepared.job_id)
-                intent = None if sealed is None else model_unwire(sealed[0], ModelEgressIntentV1)
-                return prepared, frozen, job, call, draft, intent
-            finally:
-                db.rollback()
-        value, anchor, _, _ = self.graph._read_v2(authority, read, fence_observer=observe, return_recovery_context=True)
-        return (*value, anchor)
+        return self._contact_host_read_work_v3(contact_id,phase,'egress')
 
     def seal_egress(self, *, contact_id, phase, intent, permit):
         self._current()
-        policy = self.bundle.installation_policy
-        actual, state = self.port.get_fence_operation(namespace=policy.namespace, authority_namespace=policy.authority_namespace,
-            operation_id=intent.operation_id)
-        anchor = self.port.current_anchor(namespace=policy.namespace, authority_namespace=policy.authority_namespace)
-        if (actual != permit or state != "active" or permit.operation != "model_egress" or anchor != permit.pinned_anchor
-                or (permit.subject, permit.token, permit.revision, permit.fence_epoch) !=
-                   (intent.subject, intent.fence_token, intent.fence_revision, intent.fence_epoch)):
-            raise ValueError("contact exact actual model preparation permit differs")
-        now = trusted_upper(self.port.read_ingress_clock(self.bundle.ingress_clock))
-        with self.store._lock:
-            db = self.store._db
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                metadata, epoch = self.graph._v2_graph_stamp(policy.namespace)
-                if (metadata.graph_revision, epoch.revision) != (intent.graph_revision, intent.graph_epoch):
-                    raise StaleRead("contact Graph changed before actual egress seal")
-                value = self._original(db, contact_id, phase)
-                self._content(db, value, now)
-                seal_contact_call_in_transaction_v2(db, prepared=value[0], issuer=self.issuer, intent=intent)
-                db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-        return {"status": "sealed", "job_id": value[0].job_id}
+        if type(intent) is not ModelEgressIntentV1:
+            raise ValueError('Contact seal requires its original typed model intent')
+        return self._contact_host_read_work_v3(contact_id,phase,'seal',seal_intent=intent,seal_permit=permit)
 
     def read_paid_result(self, *, contact_id, phase):
-        return self._read_paid_current(contact_id, phase, batch=False)
+        return self._contact_host_read_work_v3(contact_id,phase,'paid_result')
 
     def read_paid_progress(self, *, contact_id, phase):
-        return self._read_paid_current(contact_id, phase, batch=False, completion=True)
+        return self._contact_host_read_work_v3(contact_id,phase,'paid_progress')
 
     def read_paid_batch(self, *, contact_id):
-        return self._read_paid_current(contact_id, "contact_generation", batch=True)
-
-    def _read_paid_current(self, contact_id, phase, *, batch, completion=False):
-        self._current()
-        ns, policy = self.bundle.installation_policy.namespace, self.bundle.installation_policy
-        now = trusted_upper(self.port.read_ingress_clock(self.bundle.ingress_clock))
-        with self.store._lock:
-            value = self._original(self.store._db, contact_id, phase)
-            metadata, _ = self.graph._v2_graph_stamp(ns)
-        authority = AuthorityContext(self.port.installation_grant.subject, "d11", "contact-paid-read:" + value[0].digest,
-            ns, ("activity", "event", "persona", "scene"), "proposal", (value[2].audience_id,), value[0].provider_config_ref,
-            metadata.requirements.activation_generation)
-        owner = []
-        def observe(scope):
-            observed, permit = self.port.get_current_owner_guard_for_fence(namespace=ns,
-                authority_namespace=policy.authority_namespace, permit=scope.permit)
-            if permit != scope.permit:
-                raise ValueError("contact paid current Owner read fence differs")
-            owner[:] = [observed]
-            return observed, permit
-        def read():
-            db = self.store._db
-            db.execute("BEGIN")
-            try:
-                self._content(db, self._original(db, contact_id, phase), now, owner[0])
-                if batch:
-                    return read_paid_contact_batch_v2(db, namespace=ns, contact_id=contact_id,
-                        issuer=self.issuer, resource_issuer=self.resource_issuer, now_utc=now)
-                paid = read_paid_contact_result_v2(db, namespace=ns, contact_id=contact_id, phase=phase,
-                    issuer=self.issuer, resource_issuer=self.resource_issuer)
-                if not completion:
-                    return paid
-                from ..authority_service.contact_model_result_contract_v2 import contact_result_from_wire_v2, ContactModelResultReadV2
-                prepared, frozen, candidate, paid_cost = paid
-                result, _ = require_contact_original_v2(db, self.issuer, ns, "result", prepared.job_id)
-                actual_result = contact_result_from_wire_v2(result, ContactModelResultReadV2)
-                row = db.execute("SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-                    (*ns.as_tuple, paid_cost["cost_operation_id"])).fetchone()
-                committed = OriginalModelCostCommitV1(**json.loads(row[0])["original_model_cost"])
-                return prepared, candidate, actual_result.terminal_receipt, committed
-            finally:
-                db.rollback()
-        return self.graph._read_v2(authority, read, fence_observer=observe)
+        return self._contact_host_read_work_v3(contact_id,'contact_generation','paid_batch')
 
 
 def install_contact_model_graph_runtime_v2(graph, bootstrap, bundle):
     graph._admin(bootstrap)
     from .contact_paid_original_v2 import install_contact_original_schema_v2
+    from .contact_plan_adoption_v3 import install_contact_plan_original_schema_v3
+    from .contact_prospective_v1 import install_contact_prospective_schema_v1
     if getattr(graph, "_GraphCoordinator__contact_model_runtime_v2", None) is not None:
         raise ValueError("actual contact runtime is already installed")
     store = graph._GraphCoordinator__store
@@ -582,6 +378,8 @@ def install_contact_model_graph_runtime_v2(graph, bootstrap, bundle):
         store._db.execute("BEGIN IMMEDIATE")
         try:
             install_contact_original_schema_v2(store._db)
+            install_contact_plan_original_schema_v3(store._db)
+            install_contact_prospective_schema_v1(store._db)
             store._db.commit()
         except BaseException:
             store._db.rollback()

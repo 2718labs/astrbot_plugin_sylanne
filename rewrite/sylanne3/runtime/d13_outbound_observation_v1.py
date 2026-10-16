@@ -42,6 +42,13 @@ def install_d13_outbound_schema_v1(db):
 
 
 def _atom(db, namespace, key):
+    from .d13_paid_original_read_v3 import d13_paid_current_reader_v3
+    paid=d13_paid_current_reader_v3(db)
+    if paid is not None:
+        if paid.namespace!=namespace:raise ValueError('D13 paid outbound atom crossed namespace')
+        atom=paid.window_atom_v3(key)
+        if not atom.valid:raise ValueError('D13 paid current outbound atom unavailable')
+        return atom
     from ..authority_service.current_authority_graph_read_v3 import (
         _authority_attachment_owner_v3,authority_collection_source_atom_v6)
     work=_authority_attachment_owner_v3(db)
@@ -348,7 +355,14 @@ def read_current_outbound_turn_v1(db, namespace, slot, completion, *, now_utc):
         read_authority_current_point_v3,authority_current_json_v3,require_authority_outbound_collection_source_v6,
         authority_collection_source_atom_v6)
     work=_authority_attachment_owner_v3(db)
-    if work is None:
+    from .d13_paid_original_read_v3 import d13_paid_current_reader_v3
+    paid=d13_paid_current_reader_v3(db)
+    if paid is not None:
+        row=paid.window_original_point_v3(TABLE,
+            ('source_ref','batch_ref','observation_json','original_json','original_digest'),
+            ('bot','persona','slot_ref','observation_digest'),
+            (*namespace.as_tuple,slot.key.token,completion.value['evidence_ref']))
+    elif work is None:
         row = db.execute(f"SELECT source_ref,batch_ref,observation_json,original_json,original_digest "
             f"FROM {TABLE} WHERE bot=? AND persona=? AND slot_ref=? AND observation_digest=?",
             (*namespace.as_tuple, slot.key.token, completion.value["evidence_ref"])).fetchone()
@@ -404,7 +418,18 @@ def read_current_outbound_turn_v1(db, namespace, slot, completion, *, now_utc):
         active.add(sid)
         if len(seen) + len(active) > 128:
             raise ValueError("outbound context ancestry exceeds bounded coverage")
-        if work is None:
+        if paid is not None:
+            from types import SimpleNamespace
+            ref=source_key(*namespace.as_tuple,sid).token
+            leaf=paid.sources[ref]
+            parent_record=SimpleNamespace(**leaf.metadata)
+            access_parent=paid.window_atom_v3(access_key(*namespace.as_tuple,sid))
+            correction=source_correction_head_key(namespace,sid)
+            correction_atom=paid.window_atom_v3(correction)
+            if correction_atom.revision!=0 or correction_atom.valid:
+                raise ValueError('D13 paid outbound Source ancestor was corrected')
+            reads.extend((VersionedRef(ref,leaf.revision),VersionedRef(access_parent.key.token,access_parent.revision),VersionedRef(correction.token,0)))
+        elif work is None:
             parent = _atom(db, namespace, source_key(*namespace.as_tuple, sid))
             access_parent = _atom(db, namespace, access_key(*namespace.as_tuple, sid))
             parent_record = _source_guard(namespace, slot.value["conversation_ref"], parent, access_parent)

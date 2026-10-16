@@ -215,11 +215,11 @@ def life_d04_before_current_read_inputs_v1(db, *, namespace, episode_ref):
     if (not db.in_transaction or key.type_name != EPISODE
             or NamespaceId.from_key(key) != namespace):
         raise ValueError('Life before read-plan requires its actual Episode namespace')
-    row = db.execute('SELECT value FROM graph_atoms WHERE token=?',
-        (AtomKey(key.owner, PROVENANCE, 'record').token,)).fetchone()
-    if row is None:
+    from .d01_production_operations_v1 import raw_head_value_v1
+    raw_proof = raw_head_value_v1(db,namespace,AtomKey(key.owner,PROVENANCE,'record'))
+    if raw_proof is None:
         raise MissingProductionOriginalV1('actual_life_episode_provenance')
-    proof = decode_internal_life_value_v2(PROVENANCE, json.loads(row[0]))
+    proof = decode_internal_life_value_v2(PROVENANCE, raw_proof)
     if proof.episode.episode_ref != episode_ref or proof.event.namespace != namespace:
         raise ValueError('Life before Episode read-plan identity differs')
     ref = life_d04_before_ref_v1(namespace, proof.event.activity.execution_id)

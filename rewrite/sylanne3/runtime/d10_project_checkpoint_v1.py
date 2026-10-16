@@ -24,20 +24,26 @@ class CreateCurrentArtifactProjectRequestV1(ComposeCurrentArtifactGoalPlanReques
     pass
 
 
+def project_capacity_locator_inputs_v3(checkpoints, jobs):
+    """Compose current capacity locators; headers cannot admit an execution."""
+    keys, originals = [], []
+    for token, valid in checkpoints:
+        keys.append(AtomKey.from_token(token))
+        if valid:originals.append(token)
+    for token, work_kind, job_id in jobs:
+        if work_kind == "artifact_draft_v1":
+            keys.append(AtomKey.from_token(token)); originals.append(job_id)
+    return keys, originals
+
+
 def read_plan_current_project_capacity_v1(db, *, namespace, selector=None):
     """Select existing metadata and signed C4 predecessors; grant no slot."""
-    keys, originals = [], []
-    for token, encoded, valid in db.execute("SELECT token,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
-            "AND type_name=? ORDER BY token LIMIT 129", (*namespace.as_tuple, CHECKPOINT_TYPE)).fetchall():
-        keys.append(AtomKey.from_token(token))
-        if valid:
-            originals.append(token)
-    for token, encoded in db.execute("SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? "
-            "AND type_name='runtime.job' ORDER BY token LIMIT 129", namespace.as_tuple).fetchall():
-        value = json.loads(encoded)
-        if value["work_kind"] == "artifact_draft_v1":
-            keys.append(AtomKey.from_token(token))
-            originals.append(value["job_id"])
+    from .domain_background_read_v3 import background_inventory_v3
+    checkpoints = background_inventory_v3(db, namespace, CHECKPOINT_TYPE, valid_only=False)
+    jobs = background_inventory_v3(db, namespace, "runtime.job", valid_only=True)
+    keys, originals = project_capacity_locator_inputs_v3(
+        ((atom.key.token, atom.valid) for atom in checkpoints),
+        ((atom.key.token, atom.value["work_kind"], atom.value["job_id"]) for atom in jobs))
     # The prospective selection is an adopted original. Its old controls are
     # metadata reads only; never add old Source roots to the capacity scope.
     if selector is not None:
@@ -55,7 +61,8 @@ def _current_project_capacity_v1(db, *, frame, project_ref, issuer):
     """One namespace capacity invariant shared by preparation and initialization."""
     from .d08_life_admission_v1 import _adopted
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
-    from .jobs import get_job, job_graph_write
+    from .jobs import get_job
+    from .d11_types import job_graph_write
     from ..model_broker.artifact_draft_v1 import (ArtifactDraftTaskSelectorV1,
         artifact_draft_from_wire_v1, artifact_draft_model_ids_v1)
     from .d11_artifact_draft_model_v1 import read_artifact_draft_prepared_v1

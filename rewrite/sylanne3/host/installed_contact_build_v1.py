@@ -33,7 +33,7 @@ FILES = (
 def read_installed_contact_build_v1(package_root, manifest_digest):
     root = Path(package_root).resolve(strict=True)
     installed = verify_installed_backend_runtime_v1(root, manifest_digest)
-    if not installed.verified or installed.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}:
+    if not installed.verified or installed.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}:
         raise ValueError("contact models require actual qualified installed backend")
     manifest = json.loads((root / "release-manifest.json").read_bytes())
     identity = []

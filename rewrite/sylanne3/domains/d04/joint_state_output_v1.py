@@ -388,7 +388,9 @@ def issue_joint_state_outputs_v1(
                     or installed_policy.build_mode in {"backend-alpha1-candidate", "snapshot-alpha1-test"}
                     and installed_policy.runtime_scope == "backend-production-acceptance"
                     or installed_policy.build_mode == "alpha2-candidate"
-                    and installed_policy.runtime_scope == "backend-local-alpha2-acceptance")
+                    and installed_policy.runtime_scope == "backend-local-alpha2-acceptance"
+                    or installed_policy.build_mode == "beta1-candidate"
+                    and installed_policy.runtime_scope == "backend-beta1-server-test")
             or type(installed_policy.policy) is not JointStateOutputPolicyV1):
         raise JointStateOutputHold("formal installed replay and output policy are required")
     policy = installed_policy.policy
@@ -579,7 +581,7 @@ def verify_current_joint_state_output_original_v1(
     if (type(original) is not JointStateOutputOriginalV1
             or not is_package_bound_joint_numeric_replay_v1(installed_replay)
             or type(installed_policy) is not InstalledD04OutputPolicyBindingV1
-            or installed_policy.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}
+            or installed_policy.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}
             or type(installed_policy.policy) is not JointStateOutputPolicyV1
             or installed_policy.manifest_sha256
                != installed_replay.candidate.native_manifest_sha256):

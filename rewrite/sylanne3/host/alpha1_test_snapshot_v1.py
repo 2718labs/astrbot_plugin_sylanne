@@ -12,6 +12,19 @@ ALPHA2_VERSION = '3.0.0-alpha2'
 ALPHA2_SCHEMA = 'sylanne.alpha2-local-candidate.v1'
 ALPHA2_QUALIFICATION_SCHEMA = 'sylanne.alpha2-local-qualification.v1'
 ALPHA2_RUNTIME_SCOPE = 'backend-local-alpha2-acceptance'
+BETA1_MODE = 'beta1-candidate'
+BETA1_VERSION = '3.0.0-beta1'
+BETA1_SCHEMA = 'sylanne.beta1-server-test-candidate.v1'
+BETA1_QUALIFICATION_SCHEMA = 'sylanne.beta1-server-test-qualification.v1'
+BETA1_RUNTIME_SCOPE = 'backend-beta1-server-test'
+BETA1_UNMET_GATES = ['catalogue_runtime_verified', 'migration_validated',
+    'beta1_server_acceptance', 'full_product_acceptance']
+BETA1_LOCAL_CHECKS = ('beta1_source_closure', 'beta1_python_compile')
+BETA1_NATIVE = {
+    'path': 'rewrite/sylanne3/_native/linux-x86_64/libsylanne3_kernel.so',
+    'bytes': 596248,
+    'sha256': '2883b3bd4af107a953fe86c6ee785da1fc51688e36e7a9f5fef7d7016d91d56c',
+}
 ALPHA2_UNMET_GATES = ['catalogue_runtime_verified', 'migration_validated',
     'alpha2_source_freeze', 'full_v3_39_local_acceptance']
 ALPHA2_SPECIFICATION = {
@@ -44,6 +57,32 @@ def qualify_alpha2_candidate_v1(candidate):
     return value
 
 
+def qualify_beta1_candidate_v1(candidate):
+    value = dict(candidate)
+    value.update(schema=BETA1_QUALIFICATION_SCHEMA, status='beta1_candidate',
+        product_status='candidate_only', runtime_scope=BETA1_RUNTIME_SCOPE,
+        unmet_product_gates=list(BETA1_UNMET_GATES))
+    return value
+
+
+def validate_beta1_candidate_manifest_v1(manifest):
+    value = _validate_candidate_manifest_v1(manifest, BETA1_MODE)
+    platform = manifest.get('platform', {})
+    if (tuple(platform.get(name) for name in ('os', 'arch', 'libc', 'abi_version')) !=
+            ('linux', 'x86_64', 'glibc', 2) or manifest.get('native') != BETA1_NATIVE):
+        raise ValueError('Beta1 requires the unchanged pinned Linux x86_64/glibc ABI2 binary')
+    checks = value['verification_evidence']['checks']
+    by_name = {row['name']: row for row in checks}
+    source_pin = value['engineering_source_inventory']['sha256']
+    if (len(by_name) != len(checks)
+            or any(row['source_pin'] != source_pin for row in checks)
+            or any(name not in by_name or by_name[name]['status'] != 'passed' for name in BETA1_LOCAL_CHECKS)
+            or 'beta1_server_acceptance' not in by_name
+            or by_name['beta1_server_acceptance']['status'] != 'not_run'):
+        raise ValueError('Beta1 requires current source closure/compile receipts and server NOT_RUN')
+    return value
+
+
 def validate_test_snapshot_manifest_v1(manifest):
     return _validate_candidate_manifest_v1(manifest, MODE)
 
@@ -58,6 +97,8 @@ def _validate_candidate_manifest_v1(manifest, expected_mode):
             'sylanne.alpha1-test-evidence.v1'),
         ALPHA2_MODE: (ALPHA2_VERSION, ALPHA2_SCHEMA, 'alpha2-local', 'Sylanne 3.0.0-alpha2 local candidate',
             'sylanne.alpha2-local-evidence.v1'),
+        BETA1_MODE: (BETA1_VERSION, BETA1_SCHEMA, 'beta1-server-test', 'Sylanne 3.0.0-beta1 server test candidate',
+            'sylanne.beta1-source-evidence.v1'),
     }
     version, schema, scope, label, evidence_schema = contracts[expected_mode]
     value=manifest.get('test_snapshot')

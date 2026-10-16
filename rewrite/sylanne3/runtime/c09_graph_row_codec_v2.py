@@ -6,7 +6,7 @@ Accounting joins use exact source SQL keys rather than namespace dictionaries.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass,asdict
 
 from .c09_paged_sql_v2 import C09PagedCaptureHold
 
@@ -37,7 +37,47 @@ def read_c09_domain_row_v2(table,columns,row,*,authority_namespace,issuer):
     from . import c09_contact_originals_v1 as contact
     from . import c09_contact_originals_v2 as contact2
     from . import domain_production_erasure_v1 as domain
-    if table==d04.TABLE:
+    from .contact_plan_adoption_v3 import TABLE as PLAN3_TABLE,COLUMNS as PLAN3_COLUMNS,SIGN_KIND as PLAN3_SIGN,validate_contact_plan_original_payload_v3
+    from .c09_contact_effect_accounting_v1 import GRAPH_TABLES, validate_graph_financial_row_v1
+    if table=="graph_world_revision_erasure_barriers_v1":
+        from .d03_world_history_v1 import decode_world_erasure_barrier_row_v1,ERASURE_SIGN_KIND
+        value=decode_world_erasure_barrier_row_v1(columns,row)
+        from ..runtime_contracts import namespace_ref,canonical_digest
+        if authority_namespace is not None and namespace_ref(value.namespace)!=authority_namespace:
+            raise C09PagedCaptureHold('World barrier differs from actual Authority namespace')
+        issuer._signer.verify(ERASURE_SIGN_KIND,row[8],row[10])
+        kind,ref,raw,digest,body='world_erasure_barrier',canonical_digest(tuple(row[:4])),asdict(value),row[9],False
+    elif table=="graph_owner_goal_cancellation_projections_v1":
+        from .owner_goal_projection_v1 import validate_goal_projection_row_v1
+        observed,receipt=validate_goal_projection_row_v1(columns,row,issuer=issuer)
+        kind,ref,raw,digest,body="goal_metadata_projection",receipt.operation_id,asdict(receipt),receipt.digest,False
+    elif table=='graph_contact_prospective_successors_v1':
+        from .contact_prospective_v1 import read_c09_contact_successor_row_v1
+        kind,ref,raw,digest=read_c09_contact_successor_row_v1(columns,row,authority_namespace=authority_namespace,issuer=issuer)
+        body=True
+    elif table=='graph_contact_prospective_originals_v1':
+        from .contact_prospective_v1 import read_c09_contact_prospective_row_v1
+        kind,ref,raw,digest=read_c09_contact_prospective_row_v1(columns,row,authority_namespace=authority_namespace,issuer=issuer)
+        body=True
+    elif table=='graph_contact_segment_originals_v1':
+        from .contact_continuation_v1 import read_c09_contact_segment_row_v1
+        kind,ref,raw,digest=read_c09_contact_segment_row_v1(columns,row,authority_namespace=authority_namespace,issuer=issuer)
+        body=True
+    elif table in GRAPH_TABLES:
+        kind,ref,raw,digest=validate_graph_financial_row_v1(table,columns,row,issuer=issuer)
+        body=False
+    elif table == PLAN3_TABLE:
+        from .contact_plan_adoption_v3 import contact_plan_logical_descriptor_v3
+        from ..runtime_contracts import NamespaceId,canonical_digest,canonical_serialize,namespace_ref
+        if tuple(columns)!=PLAN3_COLUMNS or len(row)!=len(PLAN3_COLUMNS):
+            raise C09PagedCaptureHold('Contact Plan3 exact physical original columns differ')
+        raw = contact_plan_logical_descriptor_v3(row)
+        ns = NamespaceId(row[0],row[1])
+        if namespace_ref(ns)!=authority_namespace:
+            raise C09PagedCaptureHold('Contact Plan3 physical original namespace differs')
+        issuer._signer.verify(PLAN3_SIGN,canonical_serialize(raw),row[13])
+        kind,ref,digest,body = 'plan_physical',row[2],row[8],True
+    elif table==d04.TABLE:
         kind,ref,raw,digest=d04.read_d04_inventory_row_v3(columns,row,authority_namespace=authority_namespace)
         body=kind in d04.BODY_KINDS
     elif table==d07.TABLE:
@@ -209,6 +249,16 @@ def iter_c09_typed_graph_edges_v2(db,key,decoded):
             yield from ((token, proof.episode_ref), (token, proof.event_ref), (token, proof.provenance_ref))
     from ..domains.d09.contact_batch_v2 import PROVENANCE as CP, ELIGIBILITY as CE, decode_contact_batch_companion_v2, contact_batch_keys_v2
     from ..domains.d08.contact_plan_v2 import PROVENANCE as CPP, ELIGIBILITY as CPE, decode_contact_plan_member_v2, contact_plan_keys_v2
+    from ..domains.d08.contact_plan_v3 import PROVENANCE as CPP3,ELIGIBILITY as CPE3,decode_contact_plan_member_v3,contact_plan_keys_v3
+    if key.type_name in {CPP3,CPE3}:
+        proof3 = decode_contact_plan_member_v3(key.type_name,decoded)
+        if key.type_name == CPP3:
+            if key != contact_plan_keys_v3(proof3.plan)[1]:
+                raise GraphRebaseHold('Contact Plan3 metadata historical provenance key differs')
+            yield from ((token,row.ref) for row in proof3.historical_reads)
+            yield (contact_plan_keys_v3(proof3.plan)[0].token,token)
+        else:
+            yield from ((token,proof3.plan_ref.ref),(token,proof3.provenance_ref.ref))
     if key.type_name in {CPP, CPE}:
         proof = decode_contact_plan_member_v2(key.type_name, decoded)
         if key.type_name == CPP:

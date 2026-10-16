@@ -545,8 +545,11 @@ class AuthorityRpcServer:
         self._v2_foreground_activity = foreground_services
         self._d13_core_counters_v1 = {}
         self._v2_owner_source_note_tasks = {}
+        self._v2_conditioned_children = {}
         self._d12_operation_status_services_v1 = {}
         self._owner_stop_reply_services_v1 = {}
+        self._owner_goal_cancellation_services_v1 = {}
+        self._artifact_no_dispatch_metadata_services_v1 = {}
         observers = dict(model_observers_v2 or {})
         if any(namespace not in model_services
                or type(observer) is not tuple or len(observer) != 2
@@ -646,6 +649,12 @@ class AuthorityRpcServer:
         self._contact_model_reads_v1 = {}
         self._contact_model_reads_v2 = {}
         self._d10_contact_policy_services_v1 = {}
+        self._d10_habit_policy_services_v1 = {}
+        self._current_habit_occurrence_v1 = {}
+        self._current_named_joint_binding_v1 = {}
+        self._contact_effect_accounting_v1 = {}
+        self._contact_prospective_observers_v1 = {}
+        self._contact_continuation_observers_v1 = {}
         self._internal_life_model_reads_v2 = {}
         self._artifact_draft_model_reads_v1 = {}
         self._life_numeric_model_reads_v1 = {}
@@ -998,6 +1007,33 @@ class AuthorityRpcServer:
                 or service._path != model._graph_verifier._path):
             raise AuthorityUnavailable("contact actual model/result services differ")
         self._contact_model_reads_v2[namespace] = service
+        from .contact_model_work_v3 import install_contact_work_pair_v3
+        install_contact_work_pair_v3(model,service)
+
+    def install_contact_prospective_observer_v1(self, namespace, *, bundle):
+        from .contact_prospective_service_v1 import InstalledContactProspectiveObserverV1
+        reader = self._contact_model_reads_v2.get(namespace)
+        key = (namespace, bundle.installation_policy.installation_id)
+        if (reader is None or key in self._contact_prospective_observers_v1
+                or reader._fences is not self._v2_fences.get(namespace)
+                or reader._policy is not self._d10_contact_policy_services_v1.get(key)):
+            raise AuthorityUnavailable('Contact prospective installation differs from its actual result reader')
+        self._contact_prospective_observers_v1[key] = InstalledContactProspectiveObserverV1(
+            result_service=reader, execution=self._v2_execution[namespace], bundle=bundle)
+
+    def install_contact_continuation_observer_v1(self, namespace, *, bundle):
+        from .contact_continuation_service_v1 import InstalledContactContinuationObserverV1
+        from .contact_continuation_p2_service_v1 import InstalledContactContinuationP2ServiceV1
+        from .contact_first_p2_source_v1 import InstalledContactFirstP2SourceServiceV1
+        key=(namespace,bundle.installation_policy.installation_id)
+        prospective=self._contact_prospective_observers_v1.get(key)
+        accounting=self._contact_effect_accounting_v1.get(key)
+        if prospective is None or accounting is None or key in self._contact_continuation_observers_v1:
+            raise AuthorityUnavailable('Contact continuation exact installed observation/financial pair differs')
+        observer=InstalledContactContinuationObserverV1(prospective=prospective,accounting=accounting)
+        self._contact_continuation_observers_v1[key]=observer
+        accounting.p2.install_contact_first_p2_source_service_v1(InstalledContactFirstP2SourceServiceV1(first=accounting.p2,prospective=prospective))
+        accounting.p2.install_contact_continuation_p2_service_v1(InstalledContactContinuationP2ServiceV1(first=accounting.p2,observer=observer))
 
     def install_artifact_draft_model_result_reader_v1(self, namespace, service):
         from .d11_artifact_draft_model_v1 import AuthorityArtifactDraftModelResultServiceV1
@@ -1164,6 +1200,16 @@ class AuthorityRpcServer:
         if model is None:raise AuthorityUnavailable("Core counter requires its actual installed model service")
         model.install_d13_provider_http_counter_v1(service)
 
+    def install_current_conditioned_child_v1(self,namespace,service):
+        from .current_conditioned_child_v1 import InstalledCurrentConditionedChildV1
+        if(type(service)is not InstalledCurrentConditionedChildV1
+                or service.self_identity is not self._v2_self_identity.get(namespace)
+                or service._core is not self._core or service._fences is not self._v2_fences.get(namespace)
+                or namespace not in self._self_identity_readers_v2 or namespace in self._v2_conditioned_children):
+            raise TypeError('conditioned child service requires its actual paired Self/Core/fences installation')
+        service.require_installed_v1()
+        self._v2_conditioned_children[namespace]=service
+
     def install_current_owner_source_note_task_v1(self, namespace, service):
         from .current_owner_source_note_task_v1 import InstalledCurrentOwnerSourceNoteTaskV1
         if (type(service) is not InstalledCurrentOwnerSourceNoteTaskV1
@@ -1232,6 +1278,16 @@ class AuthorityRpcServer:
         draft_result = self._artifact_draft_model_reads_v1.get(status_service.namespace)
         if draft_result is not None:
             draft_result.install_owner_stop_reply_service_v1(service)
+        from .owner_goal_cancellation_v1 import InstalledOwnerGoalCancellationServiceV1
+        goal_service=InstalledOwnerGoalCancellationServiceV1(owner_service=service,
+            bundle=verifier._artifact_draft_bundle)
+        self._owner_goal_cancellation_services_v1[key]=goal_service
+        from .artifact_no_dispatch_metadata_v1 import InstalledArtifactNoDispatchMetadataServiceV1
+        self._artifact_no_dispatch_metadata_services_v1[key]=InstalledArtifactNoDispatchMetadataServiceV1(
+            model_service=model,owner_service=service,bundle=verifier._artifact_draft_bundle)
+        model.install_owner_goal_cancellation_service_v1(goal_service)
+        if life is not None:life.install_owner_goal_cancellation_service_v1(goal_service)
+        if draft_result is not None:draft_result.install_owner_goal_cancellation_service_v1(goal_service)
         return service
 
     def _owner_session_kwargs(self, command: dict[str, object], namespace: str,
@@ -1287,6 +1343,15 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            from .life_numeric_source_read_v3 import NUMERIC_MODEL_SEAL_OBSERVER_METHOD_V3, dispatch_current_numeric_model_seal_observe_v3
+            if method == NUMERIC_MODEL_SEAL_OBSERVER_METHOD_V3:
+                return dispatch_current_numeric_model_seal_observe_v3(self, method, command,
+                    credential=credential, profile_id=profile_id, manifest_digest=manifest_digest)
+            from .owner_location_read_v3 import (
+                D07_MODEL_OWNER_OBSERVER_METHOD_V3, dispatch_current_d07_model_seal_owner_observe_v3)
+            if method == D07_MODEL_OWNER_OBSERVER_METHOD_V3:
+                return dispatch_current_d07_model_seal_owner_observe_v3(self, method, command,
+                    credential=credential, profile_id=profile_id, manifest_digest=manifest_digest)
             from .d12_operation_status_rpc_v1 import dispatch_d12_operation_status_v1
             from .d12_target_owner_rpc_v1 import dispatch_d12_target_owner_v1
             from .d12_installation_lifecycle_rpc_v1 import dispatch_d12_installation_lifecycle_v1
@@ -1296,16 +1361,25 @@ class AuthorityRpcServer:
             from .d11_offline_tick_rpc_v1 import dispatch_d11_offline_tick_v1
             from .d11_life_rpc_v1 import dispatch_d11_life_v1
             from .d10_contact_policy_rpc_v1 import dispatch_d10_contact_policy_v1
+            from .d10_habit_policy_rpc_v1 import dispatch_d10_habit_policy_v1
+            from .current_habit_occurrence_rpc_v1 import dispatch_current_habit_occurrence_v1
+            from .current_named_joint_binding_rpc_v1 import dispatch_current_named_joint_binding_v1
             from .d12_package_maintenance_rpc_v2 import dispatch_d12_package_maintenance_v2
             from .first_owner_reverse_v1 import dispatch_first_owner_issue_v1
             from .contact_owner_session_rpc_v3 import dispatch_contact_owner_session_v3
+            from .contact_background_rpc_v1 import dispatch_contact_background_v1
+            from .contact_effect_accounting_rpc_v1 import dispatch_contact_effect_accounting_v1
+            from .contact_prospective_rpc_v1 import dispatch_contact_prospective_v1
+            from .contact_continuation_rpc_v1 import dispatch_contact_continuation_v1
             from .contact_finished_owner_read_rpc_v1 import dispatch_contact_finished_owner_read_v1
             from .installation_management_rpc_v1 import dispatch_installation_management_v1
             for dispatch in (dispatch_d12_operation_status_v1, dispatch_d12_target_owner_v1,
                              dispatch_d12_installation_lifecycle_v1, dispatch_d04_numeric_bridge_v3, dispatch_d04_series_rpc_v1,
                              dispatch_d04_root_execution_v3, dispatch_d11_offline_tick_v1, dispatch_d11_life_v1, dispatch_d10_contact_policy_v1,
+                             dispatch_d10_habit_policy_v1, dispatch_current_habit_occurrence_v1, dispatch_current_named_joint_binding_v1,
                              dispatch_d12_package_maintenance_v2, dispatch_first_owner_issue_v1,
-                             dispatch_contact_owner_session_v3, dispatch_contact_finished_owner_read_v1,
+                             dispatch_contact_owner_session_v3, dispatch_contact_background_v1, dispatch_contact_finished_owner_read_v1,
+                             dispatch_contact_effect_accounting_v1, dispatch_contact_prospective_v1, dispatch_contact_continuation_v1,
                              dispatch_installation_management_v1):
                 handled = dispatch(self, method, credential, profile_id, manifest_digest, command)
                 if handled is not None:
@@ -1410,6 +1484,14 @@ class AuthorityRpcServer:
             if method in OWNER_ARTIFACT_READ_METHODS:
                 return dispatch_owner_artifact_read_v1(self, method, command, credential=credential,
                     profile_id=profile_id, manifest_digest=manifest_digest)
+            from .artifact_no_dispatch_metadata_rpc_v1 import METHODS as financial_metadata_methods,dispatch_artifact_no_dispatch_metadata_v1
+            if method in financial_metadata_methods:
+                return dispatch_artifact_no_dispatch_metadata_v1(self,method,command,
+                    credential=credential,profile_id=profile_id,manifest_digest=manifest_digest)
+            from .owner_goal_cancellation_rpc_v1 import METHODS as goal_cancel_methods, dispatch_owner_goal_cancellation_v1
+            if method in goal_cancel_methods:
+                return dispatch_owner_goal_cancellation_v1(self,method,command,
+                    credential=credential,profile_id=profile_id,manifest_digest=manifest_digest)
             if method in {"owner_stop_reply_submit_v1", "owner_stop_reply_list_v1", "owner_stop_reply_status_v1",
                     "owner_stop_reply_projection_v1", "owner_stop_reply_projection_observe_v1"}:
                 from .owner_stop_reply_v1 import owner_stop_reply_request_from_wire_v1
@@ -1456,6 +1538,30 @@ class AuthorityRpcServer:
                     return {"original": original.to_wire()}
                 page = service.list_owner_reply_controls_v1(cursor=command["cursor"], subject=subject, **kwargs)
                 return {"items": [item.to_wire() for item in page.items], "next_cursor": page.next_cursor}
+            if method in {'foreground_mesh_activity_admit_v1','foreground_mesh_activity_current_v1',
+                    'owner_task_mesh_activity_admit_v1','owner_task_mesh_activity_current_v1'}:
+                from .current_foreground_mesh_v1 import dispatch_personal_mesh_rpc_v1
+                return dispatch_personal_mesh_rpc_v1(self,method,command,credential=credential,
+                    subject=subject,profile_id=profile_id,manifest_digest=manifest_digest)
+            if method in {'conditioned_child_admit_v1','conditioned_child_current_v1'}:
+                from .conditioned_child_contract_v1 import (ConditionedChildSelectorV1,
+                    conditioned_child_from_wire_v1,conditioned_child_to_wire_v1)
+                if set(command)!={'namespace','permit','request'}:
+                    raise AuthorityUnavailable('conditioned child exact command fields differ')
+                namespace=identifier(command['namespace'],'namespace')
+                self._bound_v2_service(credential,profile_id,manifest_digest,namespace)
+                service=self._v2_conditioned_children.get(namespace)
+                if(service is None or self._self_identity_readers_v2.get(namespace)!=
+                        (credential.certificate_sha256,profile_id)):
+                    raise AuthorityUnavailable('conditioned child actual installed Self reader differs')
+                request=conditioned_child_from_wire_v1(command['request'],ConditionedChildSelectorV1)
+                permit=from_wire(command['permit'])
+                if(type(permit)is not FencePermitV2 or permit.operation!='write'or permit.subject!=subject
+                        or permit.namespace!=namespace or self._namespace_bindings_v2.get(
+                            (credential.certificate_sha256,profile_id,request.namespace))!=namespace):
+                    raise AuthorityUnavailable('conditioned child changed its paired Host or same-namespace WRITE permit')
+                evidence,observed=service.current(credential=credential,subject=subject,permit=permit,request=request)
+                return {'evidence':conditioned_child_to_wire_v1(evidence),'permit':to_wire(observed)}
             if method in {'owner_source_note_task_admit_v1', 'owner_source_note_task_current_v1'}:
                 from .current_owner_source_note_task_v1 import (OwnerTaskActivityRequestV1, OwnerTaskActivityValuesChildRequestV1,
                     owner_task_activity_from_wire_v1, owner_task_activity_to_wire_v1)
@@ -2304,6 +2410,56 @@ class AuthorityRpcServer:
                     owner_session_token=session["session_token"],
                     request=read_request)
                 return {"result": result_to_wire(result)}
+
+            if method == "model_no_dispatch_witness_v1":
+                from .v2_model_egress_contract import ModelNoDispatchClosureRequestV1
+                if set(command) != {"namespace", "closure_request"}:
+                    raise AuthorityUnavailable("no-dispatch witness command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                model = self._v2_model_egress.get(namespace)
+                if model is None or self._model_observers_v2.get(namespace) != (credential.certificate_sha256, profile_id):
+                    raise AuthorityUnavailable("actual installed original model observer required")
+                request = model_from_wire(command["closure_request"], ModelNoDispatchClosureRequestV1)
+                if (request.installation_id, request.holder, request.intent.authority_id,
+                        request.intent.namespace, request.intent.subject) != (
+                        installed.installation_id, installed.administrator_holder,
+                        self._authority_id(), namespace, subject):
+                    raise AuthorityUnavailable("no-dispatch original installation/subject differs")
+                witness = model.close_prepared_no_dispatch_witness_v1(
+                    credential=credential, subject=subject, request=request)
+                return {"witness": model_to_wire(witness)}
+            if method in {"model_no_dispatch_accounting_begin_v1", "model_no_dispatch_accounting_validate_v1",
+                    "model_no_dispatch_accounting_finish_v1", "model_no_dispatch_accounting_recover_finish_v1"}:
+                from .v2_accounting_contract import ModelNoDispatchAccountingRequestV1, ModelNoDispatchAccountingGrantV1
+                expected = {"namespace", "request"} if method in {
+                    "model_no_dispatch_accounting_begin_v1", "model_no_dispatch_accounting_recover_finish_v1"} else {"namespace", "request", "grant"}
+                if set(command) != expected: raise AuthorityUnavailable("no-dispatch accounting exact command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                service, model = self._v2_accounting.get(namespace), self._v2_model_egress.get(namespace)
+                if (service is None or model is None or service._subject != subject
+                        or self._accounting_observers_v2.get(namespace) != (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("actual installed no-dispatch accounting observer required")
+                request = accounting_from_wire(command["request"], ModelNoDispatchAccountingRequestV1)
+                if (request.witness.request.installation_id, request.witness.request.holder,
+                        request.intent.authority_id, request.intent.namespace, request.intent.subject) != (
+                        installed.installation_id, installed.administrator_holder, self._authority_id(), namespace, subject):
+                    raise AuthorityUnavailable("no-dispatch accounting original installation differs")
+                if method == "model_no_dispatch_accounting_begin_v1":
+                    return {"grant": accounting_to_wire(service.begin_no_dispatch_v1(
+                        credential=credential, request=request, model_service=model))}
+                if method == "model_no_dispatch_accounting_recover_finish_v1":
+                    service.recover_no_dispatch_finish_v1(credential=credential, request=request, model_service=model)
+                    return {"finished": True}
+                grant = accounting_from_wire(command["grant"], ModelNoDispatchAccountingGrantV1)
+                if method == "model_no_dispatch_accounting_validate_v1":
+                    service.validate_no_dispatch_v1(credential=credential, request=request, grant=grant, model_service=model)
+                    return {"valid": True}
+                service.finish_no_dispatch_v1(credential=credential, request=request, grant=grant, model_service=model)
+                return {"finished": True}
             if method == "model_capacity_reconcile_v1":
                 if set(command) != {"namespace", "holder", "expected_anchor",
                                     "draft", "close_prepared"}:
@@ -2326,6 +2482,29 @@ class AuthorityRpcServer:
                     expected_anchor=anchor, installation_id=installed.installation_id,
                     draft=draft, close_prepared=command["close_prepared"])
                 return {"fact": fact}
+            if method == "qualify_current_life_numeric_model_candidate_v3":
+                if set(command)!={"namespace","holder","original_intent","original_permit","case","candidate_intent"}:
+                    raise AuthorityUnavailable("Numeric MODEL qualification command fields differ")
+                namespace=identifier(command["namespace"],"namespace")
+                self._bound_v2_service(credential,profile_id,manifest_digest,namespace)
+                installed=self._installations_v2[(credential.certificate_sha256,profile_id)]
+                holder=identifier(command["holder"],"holder")
+                model=self._v2_model_egress.get(namespace)
+                if (model is None or holder!=installed.administrator_holder
+                        or self._model_observers_v2.get(namespace)!=(credential.certificate_sha256,profile_id)):
+                    raise AuthorityUnavailable("Numeric MODEL qualification installed observer unavailable")
+                original=model_from_wire(command["original_intent"],ModelEgressIntentV1)
+                candidate=model_from_wire(command["candidate_intent"],ModelEgressIntentV1)
+                permit=from_wire(command["original_permit"])
+                if (original.authority_id,original.namespace,original.subject,permit.holder)!=(
+                        self._authority_id(),namespace,subject,holder):
+                    raise AuthorityUnavailable("Numeric MODEL qualification original installation differs")
+                from .life_numeric_model_qualification_v3 import (
+                    qualify_current_life_numeric_model_candidate_v3,numeric_model_qualification_to_wire_v3)
+                result=qualify_current_life_numeric_model_candidate_v3(model,credential=credential,
+                    subject=subject,holder=holder,original_intent=original,original_permit=permit,
+                    case=command["case"],candidate_intent=candidate,installation_id=installed.installation_id)
+                return {"qualification":numeric_model_qualification_to_wire_v3(result)}
             if method == "model_terminal_fact_v2":
                 if set(command) != {"namespace", "holder", "intent"}:
                     raise AuthorityUnavailable("terminal fact command fields differ")
@@ -2605,7 +2784,13 @@ class AuthorityRpcServer:
                             else {"namespace", "challenge", "signature"}
                             if method == "accept_owner_session_v1"
                             else {"namespace", "request", "token"})
-                if set(command) != required:
+                cap_field = "session_expires_no_later_than_utc"
+                cap_kwargs = {}
+                if method == "accept_owner_session_v1" and set(command) == required | {cap_field}:
+                    from .v2_owner_proof import _time
+                    _time(command[cap_field])
+                    cap_kwargs[cap_field] = command[cap_field]
+                elif set(command) != required:
                     raise AuthorityUnavailable("Owner session command fields differ")
                 field = "challenge" if method == "accept_owner_session_v1" else "request"
                 raw = command[field]
@@ -2627,7 +2812,7 @@ class AuthorityRpcServer:
                     signature = self._owner_proof_signature(command["signature"])
                     token = sessions.accept_login(
                         transport_credential=credential, challenge=decoded,
-                        signature=signature)
+                        signature=signature, **cap_kwargs)
                     return {"token": token}
                 token = command["token"]
                 if method == "current_owner_session_v1":

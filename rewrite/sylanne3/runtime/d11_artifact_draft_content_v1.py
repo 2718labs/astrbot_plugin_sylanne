@@ -611,6 +611,7 @@ def decode_artifact_draft_phase_content_original_v2(kind, raw):
 
 
 def _read_phase_content_adoption_original_v2(db, *, namespace, selector, issuer):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_event_point_v3,artifact_model_graph_point_v3
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .jobs import get_job
     from .d11_types import job_graph_write
@@ -627,10 +628,8 @@ def _read_phase_content_adoption_original_v2(db, *, namespace, selector, issuer)
             or original['payload']['request'] != plain_v1(AdoptArtifactDraftContentRequestV2(selector))
             or original['payload']['provenance']['prepared_digest'] != value.prepared_digest):
         raise ValueError('phase content was not adopted by its actual paid Source/job W01 stage')
-    source = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-        (*namespace.as_tuple, value.content.content.ref)).fetchone()
-    history = db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
-        (value.content.content.ref, value.content.content.revision)).fetchone()
+    source = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=value.content.content.ref)
+    history = artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=value.content.content.ref,revision=value.content.content.revision)
     if (source is None or source[0] != value.content.content.revision or source[2] != 1
             or canonical_digest(json.loads(source[1])) != value.content.content.digest
             or history != (value.adoption_operation_id, source[1], 1)
@@ -670,8 +669,8 @@ def _read_phase_content_adoption_original_v2(db, *, namespace, selector, issuer)
     if (job.phase, job.result_ref, job.cancel_epoch, job.lease_holder, job.lease_expires_utc) != (
             'completed', ids['adopt'], 0, None, None):
         raise ValueError('phase paid content lost actual completed worker')
-    job_history = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND event_id=? ORDER BY revision DESC LIMIT 1',
-        (job_graph_write(job).key.token, value.adoption_operation_id)).fetchone()
+    job_history = artifact_model_graph_event_point_v3(db,('value', 'valid'),token=job_graph_write(job).key.token,event_id=value.adoption_operation_id,legacy_reader=lambda:db.execute('SELECT value,valid FROM graph_history WHERE token=? AND event_id=? ORDER BY revision DESC LIMIT 1',
+        (job_graph_write(job).key.token, value.adoption_operation_id)).fetchone())
     if job_history != (canonical_serialize(job_graph_write(job).value), 1):
         raise ValueError('phase completed job is not in original authored Source CAS')
     return value, row, record, actual_scope
@@ -777,6 +776,7 @@ def require_artifact_draft_phase_verified_history_v2(db, *, namespace, original_
 
 
 def read_current_artifact_phase_verified_v2(db, *, namespace, selector, issuer):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     from .issuers import D11BudgetJobIssuer
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     from ..domains.d03.self_perspective import self_mapping_key
@@ -831,10 +831,8 @@ def read_current_artifact_phase_verified_v2(db, *, namespace, selector, issuer):
             or (scope.owner_grant_ref, scope.owner_grant_revision, scope.owner_grant_digest, scope.actor_ref) !=
                 (value.owner_guard.grant_ref, value.owner_guard.grant_revision, value.owner_guard.grant_digest, value.actor_ref)):
         raise ValueError('phase verified lost actual paid content/file/extent/current Scope')
-    owner = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-        (*namespace.as_tuple, value.owner_guard.grant_ref)).fetchone()
-    mapping = db.execute('SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-        (*namespace.as_tuple, self_mapping_key(namespace).token)).fetchone()
+    owner = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=value.owner_guard.grant_ref)
+    mapping = artifact_model_graph_point_v3(db,('value', 'valid'),token=self_mapping_key(namespace).token)
     if (owner is None or owner[0] != value.owner_guard.grant_revision or owner[2] != 1
             or canonical_digest(json.loads(owner[1])) != value.owner_guard.grant_digest
             or mapping is None or mapping[1] != 1 or canonical_digest(json.loads(mapping[0])) != value.current_self_digest
@@ -959,6 +957,7 @@ def require_current_artifact_method_completion_v2(db, *, namespace, continuation
 
 
 def require_current_artifact_prior_content_v2(db, *, namespace, selector, prior, issuer):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     from .issuers import D11BudgetJobIssuer
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     import hashlib
@@ -1000,8 +999,7 @@ def require_current_artifact_prior_content_v2(db, *, namespace, selector, prior,
         if (prepared.plan.content.content.ref, prepared.plan.content.content.revision, prepared.plan.content.content.digest) != (
                 prior.source_head.ref, prior.source_head.version, prior.source_value_digest):
             raise ValueError('historical prior content changed original Source head')
-    source = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
-        (*namespace.as_tuple, prior.source_head.ref)).fetchone()
+    source = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=prior.source_head.ref)
     if source is None or source[0] != prior.source_head.version or source[2] != 1 or canonical_digest(json.loads(source[1])) != prior.source_value_digest:
         raise ValueError('actual prior content Source is no longer current')
     record = SourceRecord.from_dict(json.loads(source[1]))

@@ -171,3 +171,128 @@ def stage_focus_life_project_in_transaction_v1(db, *, frame, request, installed_
     stage = replace(stage, proposals=(replace(stage.proposals[0], dependencies=proposal.dependencies),))
     provider.validate(stage.proposals[0], frame.snapshot)
     return stage
+
+
+@dataclass(frozen=True, slots=True)
+class FocusOwnerSourceNoteTaskRequestV1:
+    authorization_original_ref: str
+    task_job_ref: str
+
+    def __post_init__(self):
+        from .owner_source_note_need_v1 import PrepareOwnerSourceNoteNeedRequestV1
+        PrepareOwnerSourceNoteNeedRequestV1(self.authorization_original_ref, self.task_job_ref)
+
+
+def owner_task_focus_operation_id_v1(namespace, authorization):
+    return "owner-note-focus:" + canonical_digest((namespace, authorization.original_ref, authorization.digest))[:40]
+
+
+def read_plan_owner_source_note_focus_v1(db, *, namespace, operation_id, request, installed_readers):
+    from .owner_source_note_need_v1 import read_plan_owner_source_note_need_v1
+    plan = read_plan_owner_source_note_need_v1(db, namespace=namespace, request=request, installed_readers=installed_readers)
+    from .owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2
+    saved = read_owner_source_note_task_authorization_v2(db,namespace=namespace,original_ref=request.authorization_original_ref,issuer=installed_readers.issuer)
+    originals = () if saved is None else (saved[0].request.project_ref,saved[0].body_policy.effect_policy_ref)
+    # Other tickets contribute closed fairness metadata only; their Source texts
+    # and Source families are not qualified under this task's Owner authority.
+    return production_read_plan_v1(("d07.attention_ticket.v1", "d02.body_profile.v1", "d02.body_state.v1", "d02.reservation.v1"),
+        tuple(dict.fromkeys((*plan.exact_keys, active_scheme_head_key(namespace), *_keys(namespace, operation_id)))),
+        plan.source_roots, tuple(dict.fromkeys((*plan.required_original_refs, *originals))))
+
+
+def stage_focus_owner_source_note_task_v1(db, *, frame, request, installed_readers):
+    from .owner_source_note_need_v1 import InstalledOwnerSourceNoteNeedReadersV1
+    from .owner_source_note_task_v1 import read_owner_source_note_task_authorization_v2, require_current_owner_source_note_task_authorization_v2
+    from .owner_source_note_task_contract_v1 import owner_source_note_task_ids_v1, OwnerSourceNoteTaskContinuationV2
+    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+    from .d11_types import runtime_job_key, job_graph_write
+    from .jobs import get_job
+    from dataclasses import replace
+    if type(request) is not FocusOwnerSourceNoteTaskRequestV1 or type(installed_readers) is not InstalledOwnerSourceNoteNeedReadersV1:
+        raise TypeError("Owner task Focus uses its actual installed fixed task reader")
+    read = CurrentDomainReadV1(frame); read.check(db)
+    ns = frame.envelope.authority.namespace
+    saved = read_owner_source_note_task_authorization_v2(db, namespace=ns,
+        original_ref=request.authorization_original_ref, issuer=installed_readers.issuer)
+    if saved is None: raise MissingProductionOriginalV1("actual_Owner_task_focus_authorization")
+    auth, origin = saved
+    require_current_owner_source_note_task_authorization_v2(db, frame=frame, authorization=auth,
+        issuer=installed_readers.issuer, installed_bundle=installed_readers.installed_bundle,
+        body_quote_authority=installed_readers.body_quote_authority)
+    ids = owner_source_note_task_ids_v1(ns, auth.cause.owner_operation_id)
+    key = runtime_job_key(*ns.as_tuple, ids["activity_id"], ids["job_id"])
+    job = get_job(db, key.name); head = read.head(db, key, required=True)
+    continuation = decode_typed_production_value_v1(dict(job.continuation), OwnerSourceNoteTaskContinuationV2)
+    if (request.task_job_ref != key.token or head.value != job_graph_write(job).value
+            or job.phase != "running" or job.cancel_epoch or continuation.cancel_generation
+            or continuation.step != "qualify" or continuation.pending_effect_refs
+            or continuation.authorization_original_ref != auth.original_ref
+            or continuation.authorization_original_digest != auth.digest
+            or frame.envelope.authority.worker_fence != job.fence
+            or frame.envelope.identity.operation_id != owner_task_focus_operation_id_v1(ns, auth)):
+        raise ValueError("Owner Focus changed its actual live task, worker, or fixed recipe")
+    read.original(auth.original_ref); read.original(auth.cause.original_ref)
+    read.committed_operation(db, origin["receipt"].operation_id)
+    for audience in frame.envelope.authority.audience:
+        for purpose in ("context", "consolidation"):
+            read.source_family(db, auth.source_refs, purpose=purpose, audience=audience)
+    project = read.head(db, auth.request.project_ref, required=True); _adopted(db, read, project)
+    if project.value["reality"] != "real_execution" or project.value["next_step"] != "source_note":
+        raise MissingProductionOriginalV1("actual_Owner_task_source_note_project")
+    selected = auth.body_policy
+    price = installed_readers.body_quote_authority.policy(db, ns, selected.body_policy_id, selected.body_policy_version)
+    profile, body, reservations = installed_readers.body_readers._current_body(db, read, price.profile.profile_id)
+    if (canonical_digest(price) != selected.body_policy_digest or price.profile != profile or price.work_kind != WORK_KIND
+            or price.component.component_id != selected.component_id or frame.now_utc >= price.valid_until
+            or BodyDomain().check_work_start(body, reservations, additional_cost=price.component.fixed_cost).status != "clear"):
+        raise MissingProductionOriginalV1("actual_Owner_task_focus_body_component")
+    read.original(selected.effect_policy_ref)
+    budget_ref = auth.cause.parent_budget_lease_ref
+    budget = get_budget_lease(db, budget_ref); grant = installed_readers.issuer.current_budget_grant(db, budget_ref)
+    require_budget_family_admissible(db, budget_ref)
+    if frame.envelope.parent_budget_lease_ref != budget_ref or budget.state != "active" or WORK_KIND not in grant.allowed_work_kinds:
+        raise MissingProductionOriginalV1("actual_Owner_task_focus_parent_budget")
+    for dimension in ("cpu_ms", "thread_cpu_ms"):
+        remaining = budget.limits.get(dimension, 0) - sum(values.get(dimension, 0) for values in (budget.used, budget.reserved, budget.unconfirmed))
+        if selected.cpu_ceiling_ms > min(remaining, grant.max_ceiling.get(dimension, 0)):
+            raise MissingProductionOriginalV1("actual_Owner_task_focus_CPU:" + dimension)
+    policy = read_current_d07_attention_policy_v1(db, ns)
+    if policy.active_head_ref not in frame.snapshot.versions:
+        raise ValueError("Owner Focus current D07 policy is outside its actual read set")
+    deadline = min(auth.cause.original_deadline_utc, grant.valid_until_utc, auth.cause.submitted_at_utc + 600)
+    if frame.now_utc >= deadline:
+        raise MissingProductionOriginalV1("actual_Owner_task_focus_original_absolute_deadline")
+    for atom in read.complete_inventory(db, "d07.attention_ticket.v1"):
+        if not atom.valid: continue
+        _adopted(db, read, atom)
+        raw = {k:v for k,v in atom.value.items() if k != "schema"}
+        old = AttentionTicket(**{**raw, "cancel_refs":tuple(raw["cancel_refs"]), "source_refs":tuple(raw["source_refs"])})
+        if old.category == "required" and old.valid_until > frame.now_utc and old.eligible:
+            raise MissingProductionOriginalV1("actual_required_attention_must_finish_or_expire:" + atom.key.token)
+    ticket_key, focus_key = _keys(ns, frame.envelope.identity.operation_id)
+    prior = read.head(db, focus_key)
+    if prior.revision:
+        _adopted(db, read, prior)
+        current = FocusState(**{**{k:v for k,v in prior.value.items() if k != "schema"},
+            "auxiliary_ticket_refs":tuple(prior.value["auxiliary_ticket_refs"])})
+    else:
+        current = FocusState(ns.persona_id, 0, None, (), "no_eligible_ticket")
+    if read.head(db, ticket_key).revision:
+        raise ValueError("Owner task focus operation already has its adopted ticket")
+    # Preserve prior auxiliary metadata without re-ranking or claiming new
+    # qualification for another task's Source family.
+    auxiliary = tuple(ref for ref in current.auxiliary_ticket_refs if ref != ticket_key.token)
+    ticket = AttentionTicket(ticket_key.name, "project:" + auth.request.project_ref, auth.request.project_ref,
+        auth.request.body_source_ref, "background", 0., 0., 0., 0., 0., 0., 0., body.fatigue[WORK_KIND], 0.,
+        frame.snapshot.epochs[0].revision, deadline, True, True, (), frame.envelope.source_qualification.source_refs)
+    focus = FocusState(ns.persona_id, current.focus_epoch + 1, ticket_key.token, auxiliary, "owner_task_project")
+    provider = D07DomainProvider()
+    proposal = provider.attention_focus_proposal(frame.envelope, frame.snapshot, ticket, focus, now=frame.now_utc)
+    stage = stage_result_v1(frame, "d07", "focus_owner_source_note_task_v1", request, writes=proposal.typed_writes,
+        provenance={"owner_project_ref":auth.request.project_ref, "owner_project_source_ref":auth.request.body_source_ref,
+            "owner_focus_selection":"owner_task_project", "authorization_original_ref":auth.original_ref,
+            "authorization_original_digest":auth.digest, "task_job_ref":key.token, "original_valid_until":deadline},
+        proposal_schema="d07.proposal.v1", proposal_hash=provider.descriptor.request_schema_hash)
+    stage = replace(stage, proposals=(replace(stage.proposals[0], dependencies=proposal.dependencies),))
+    provider.validate(stage.proposals[0], frame.snapshot)
+    return stage

@@ -949,6 +949,14 @@ def stage_propose_current_artifact_action_in_transaction_v1(db, *, frame, reques
     try:
         composition, action, schema, keys = _current_artifact_action_candidate_v1(db,
             frame=frame, request=request, installed_readers=installed_readers)
+        from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
+        from .joint_node_execution_v1 import joint_artifact_binding_for_selector_v1
+        from .joint_artifact_execution_v1 import JointArtifactProspectiveBindingV1, JointArtifactActualActionV1, require_artifact_joint_action_successor_v1
+        selector = artifact_draft_task_selector_v1(frame.envelope.authority.namespace, c02_operation_id=request.c02_operation_id, root_registration_ref=request.root_registration_ref)
+        binding = joint_artifact_binding_for_selector_v1(db, selector=selector, issuer=installed_readers.issuer)
+        if type(binding) is JointArtifactProspectiveBindingV1:
+            candidate = JointArtifactActualActionV1(action, schema, composition.adoption, keys, composition.project_key, composition.recipe_key)
+            require_artifact_joint_action_successor_v1(db, frame=frame, binding=binding, selector=selector, candidate=candidate, issuer=installed_readers.issuer)
         read = CurrentDomainReadV1(frame)
         if any(read.head(db, key).revision for key in keys):
             raise ValueError("artifact Action cannot replace an existing action/schema/cancellation identity")
@@ -1488,6 +1496,11 @@ def stage_propose_current_artifact_phase_action_in_transaction_v2(db, *, frame, 
         raise TypeError("exact phase Action request required")
     try:
         value = _current_artifact_phase_action_candidate_v2(db, frame=frame, request=request, installed_readers=installed_readers)
+        from .joint_node_execution_v1 import joint_artifact_binding_for_selector_v1
+        from .joint_artifact_execution_v1 import JointArtifactProspectiveBindingV1, require_artifact_joint_action_successor_v1
+        binding = joint_artifact_binding_for_selector_v1(db, selector=request.selector, issuer=installed_readers.issuer)
+        if type(binding) is JointArtifactProspectiveBindingV1:
+            require_artifact_joint_action_successor_v1(db, frame=frame, binding=binding, selector=request.selector, candidate=value, issuer=installed_readers.issuer)
         read = CurrentDomainReadV1(frame)
         if any(read.head(db, key).revision for key in value.keys):
             raise ValueError("phase Action cannot replace its original action/schema/cancellation")

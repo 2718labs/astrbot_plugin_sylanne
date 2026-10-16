@@ -24,6 +24,14 @@ from ..runtime_contracts import NamespaceId, canonical_digest, canonical_seriali
 
 
 TABLE_COLUMNS = {
+    "graph_world_revision_erasure_barriers_v1":("bot","persona","assertion_commitment","known_sequence","revision_commitment",
+        "deletion_generation","deletion_knowledge_sequence","delete_original_commitment","payload_json","payload_digest","signature"),
+    "graph_world_revision_index_v1":("bot","persona","original_ref","kind","producing_operation_id","payload_json","payload_digest","signature","source_refs_json","assertion_id","assertion_commitment","known_sequence","supersedes_ref"),
+    'graph_contact_segment_originals_v1':('bot','persona','contact_id','segment_index','operation_id','effect_id','payload_json','payload_digest','signature'),
+    'graph_contact_prospective_successors_v1':('bot','persona','final_operation_id','birth_ref','birth_digest','payload_json','payload_digest','signature','final_receipt_digest'),
+    'graph_contact_prospective_originals_v1':('bot','persona','contact_id','birth_operation_id','payload_json','payload_digest','signature','original_ref'),
+    "graph_owner_goal_cancellation_projections_v1": ("bot","persona","operation_id","goal_ref","root_registration_ref","core_original_ref","core_original_digest","observation_json","observation_digest","receipt_json","receipt_digest","signature"),
+    "graph_d08_joint_node_originals_v1": ("bot", "persona", "original_ref", "kind", "producing_operation_id", "payload_json", "payload_digest", "signature", "source_refs_json"),
     "graph_d01_production_inputs_v1": ("bot", "persona", "original_ref", "kind", "producing_operation_id", "payload_json", "payload_digest", "signature", "source_refs_json"),
     "graph_d02_production_policies_v1": ("bot", "persona", "policy_ref", "revision", "kind", "profile_id", "from_role_cursor", "to_role_cursor", "payload_json", "payload_digest", "signature"),
     "graph_d02_action_components_v1": ("bot", "persona", "original_ref", "producing_operation_id", "payload_json", "payload_digest", "signature", "source_refs_json"),
@@ -44,7 +52,8 @@ TABLE_COLUMNS = {
 TABLE_SCHEMAS = {name: {"columns": columns, "indexes": (), "triggers": ()}
                  for name, columns in TABLE_COLUMNS.items()}
 SOURCE_INDEPENDENT_POLICY_TABLES = frozenset({"graph_d02_production_policies_v1"})
-CONTENT_TABLES = frozenset(TABLE_COLUMNS) - SOURCE_INDEPENDENT_POLICY_TABLES
+SOURCE_INDEPENDENT_METADATA_TABLES=frozenset({'graph_owner_goal_cancellation_projections_v1','graph_world_revision_erasure_barriers_v1'})
+CONTENT_TABLES = frozenset(TABLE_COLUMNS) - SOURCE_INDEPENDENT_POLICY_TABLES - SOURCE_INDEPENDENT_METADATA_TABLES
 
 
 def validate_domain_production_schema_v1(db):
@@ -63,12 +72,25 @@ def validate_domain_production_schema_v1(db):
     from .d11_derived_cache_payload_v1 import install_derived_payload_schema_v1
     from ..authority_service.d13_wire_evidence_v6 import install_d13_wire_evidence_schema_v6
     from ..authority_service.d13_wire_evidence_v7 import install_d13_core_wire_evidence_schema_v1
+    from .d03_world_history_v1 import install_world_history_schema_v1
     expected = sqlite3.connect(":memory:")
     try:
         for installer in (install_derived_payload_schema_v1, install_d13_wire_evidence_schema_v6, install_d13_core_wire_evidence_schema_v1, install_d01_production_schema_v1, install_d02_production_schema_v1,
                           install_d05_production_schema_v1, install_d08_production_schema_v1,
                           install_d10_production_schema_v1, install_d11_offline_schema_v1, install_d11_life_schema_v1):
             installer(expected)
+        install_world_history_schema_v1(expected)
+        from .owner_goal_projection_v1 import install_owner_goal_projection_schema_v1
+        install_owner_goal_projection_schema_v1(expected)
+        from .contact_prospective_v1 import (DDL as PROSPECTIVE_DDL,TRIGGERS as PROSPECTIVE_TRIGGERS,
+            SUCCESSOR_DDL,SUCCESSOR_TRIGGERS)
+        expected.execute(SUCCESSOR_DDL)
+        for trigger in SUCCESSOR_TRIGGERS:expected.execute(trigger)
+        expected.execute(PROSPECTIVE_DDL)
+        for trigger in PROSPECTIVE_TRIGGERS:expected.execute(trigger)
+        from .contact_continuation_v1 import DDL as SEGMENT_DDL,TRIGGERS as SEGMENT_TRIGGERS
+        expected.execute(SEGMENT_DDL)
+        for trigger in SEGMENT_TRIGGERS:expected.execute(trigger)
         for table in TABLE_COLUMNS:
             actual_table = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
             if actual_table is None:
@@ -135,6 +157,11 @@ def _production_value_type_registry_v1():
 
 def decode_typed_production_value_v1(raw, expected, *, depth=0):
     """Strict decoder for the fixed dataclass types named by this module."""
+    from .joint_node_execution_v1 import RegisterJointNodeExecutionBindingRequestV1,decode_joint_binding_v1
+    if expected is RegisterJointNodeExecutionBindingRequestV1:
+        if type(raw) is not dict or set(raw)!={"binding"}:
+            raise DomainProductionErasureHold("closed Joint binding request fields differ")
+        return RegisterJointNodeExecutionBindingRequestV1(decode_joint_binding_v1(raw["binding"]))
     if depth > 64:
         raise DomainProductionErasureHold("domain production nesting exceeds its installed bound")
     from ..domains.d08.personal_candidate_v1 import (
@@ -254,7 +281,15 @@ def decode_typed_production_value_v1(raw, expected, *, depth=0):
 
 
 def _input_types():
+    from .joint_window_command_v1 import JointWindowNodeCommandOriginalV1
+    from .joint_external_observation_v1 import ORIGINAL_TYPES as JOINT_D08_ORIGINAL_TYPES
+    from .joint_node_execution_v1 import JointNodeExecutionBindingV1, JointPlanQualificationV1, JointExecutorIndexV1
+    from .joint_artifact_execution_v1 import JointArtifactProspectiveBindingV1
+    from .joint_node_execution_v1 import JointContactProspectiveBindingV1
+    from .joint_node_execution_v1 import JointContactProspectiveBindingV1
+    from .d07_general_growth_attention_v1 import D10GeneralGrowthOutcomeTriggerV1
     from .d01_production_operations_v1 import _ORIGINAL_TYPES
+    from .d01_general_growth_v1 import (GeneralGrowthIntentOriginalV1,GeneralGrowthTrialStartV1,GeneralGrowthTrialOriginalV1)
     from .d02_production_operations_v1 import CompletedActionBodyComponentV1, PassiveBodyPolicyV1, SettledBodyEffectPolicyV1
     from .d05_production_operations_v1 import BoundaryIntentOriginalV1, InstalledRelationshipPolicyV1
     from .d08_production_operations_v1 import JointPlanIntentOriginalV1, PartyConsentEvidenceV1
@@ -262,7 +297,11 @@ def _input_types():
     from ..domains.d10.offline_interval import OfflineTickRecipeV1, OfflineObservedTickV1
     from .d02_artifact_phase_price_v1 import ArtifactPhasePricePolicyV1
     return {
-        "graph_d01_production_inputs_v1": _ORIGINAL_TYPES,
+        "graph_d08_joint_node_originals_v1": JOINT_D08_ORIGINAL_TYPES,
+        "graph_d01_production_inputs_v1": {**_ORIGINAL_TYPES,
+            "general_growth_intent_v1":GeneralGrowthIntentOriginalV1,
+            "general_growth_trial_start_v1":GeneralGrowthTrialStartV1,
+            "general_growth_trial_v1":GeneralGrowthTrialOriginalV1},
         "graph_d02_production_policies_v1": {"passive": PassiveBodyPolicyV1, "effect": SettledBodyEffectPolicyV1,
             "artifact_phase_price": ArtifactPhasePricePolicyV1},
         "graph_d02_action_components_v1": {"completed_action_component": CompletedActionBodyComponentV1},
@@ -270,18 +309,38 @@ def _input_types():
         "graph_d05_boundary_intents_v1": {"boundary_intent": BoundaryIntentOriginalV1},
         "graph_d08_joint_plan_intents_v1": {"joint_plan_intent": JointPlanIntentOriginalV1},
         "graph_d08_party_consents_v1": {"party_consent": PartyConsentEvidenceV1},
-        "graph_d10_production_inputs_v1": {"life_plan": RegisteredLifePlanV1, "life_outcome": RegisteredLifeOutcomeV1,
-            "offline_recipe": OfflineTickRecipeV1, "offline_interval": RegisteredOfflineIntervalV1},
+        "graph_d10_production_inputs_v1": {"joint_window_node_command_v1":JointWindowNodeCommandOriginalV1,"joint_contact_prospective_binding_v1":JointContactProspectiveBindingV1, "joint_artifact_prospective_binding_v1": JointArtifactProspectiveBindingV1, "joint_node_execution_binding_v1": JointNodeExecutionBindingV1,
+            "joint_plan_qualification_v1": JointPlanQualificationV1, "joint_executor_index_v1": JointExecutorIndexV1, "life_plan": RegisteredLifePlanV1, "life_outcome": RegisteredLifeOutcomeV1,
+            "offline_recipe": OfflineTickRecipeV1, "offline_interval": RegisteredOfflineIntervalV1,
+            "general_growth_outcome_trigger_v1": D10GeneralGrowthOutcomeTriggerV1},
         "graph_d10_observed_ticks_v1": {"observed_tick": OfflineObservedTickV1},
     }
 
 
-_FIXED_KINDS = {"graph_d02_action_components_v1": "completed_action_component", "graph_d05_production_policies_v1": "policy",
+_FIXED_KINDS = {'graph_contact_segment_originals_v1':'segment_original','graph_contact_prospective_successors_v1':'prospective_successor','graph_contact_prospective_originals_v1':'prospective_birth',"graph_d02_action_components_v1": "completed_action_component", "graph_d05_production_policies_v1": "policy",
     "graph_d05_boundary_intents_v1": "boundary_intent", "graph_d08_joint_plan_intents_v1": "joint_plan_intent",
     "graph_d08_party_consents_v1": "party_consent", "graph_d10_observed_ticks_v1": "observed_tick"}
 
 
 def decode_domain_production_content_v1(table, kind, payload_json):
+    if table=="graph_world_revision_erasure_barriers_v1" and kind=="world_erasure_barrier":
+        from ..domains.d03.world_history_v1 import WorldErasureBarrierV1,decode_world_value_v1
+        return decode_world_value_v1(_json(payload_json),WorldErasureBarrierV1)
+    if table=="graph_world_revision_index_v1" and kind=="world_revision_index":
+        from .d03_world_history_v1 import WorldRevisionIndexV1
+        return decode_typed_production_value_v1(_json(payload_json),WorldRevisionIndexV1)
+    if table=='graph_contact_segment_originals_v1':
+        from .contact_continuation_v1 import contact_segment_original_from_wire_v1
+        if kind!='segment_original':raise DomainProductionErasureHold('Contact segment registered kind differs')
+        return contact_segment_original_from_wire_v1(json.loads(payload_json))
+    if table=='graph_contact_prospective_successors_v1':
+        from .contact_prospective_v1 import ContactProspectiveSuccessorV1
+        if kind!='prospective_successor':raise DomainProductionErasureHold('Contact successor registered kind differs')
+        return ContactProspectiveSuccessorV1(payload_json)
+    if table=='graph_contact_prospective_originals_v1':
+        from .contact_prospective_v1 import ContactProspectiveOriginalV1
+        if kind!='prospective_birth':raise DomainProductionErasureHold('Contact prospective registered birth kind differs')
+        return ContactProspectiveOriginalV1(payload_json)
     types_by_table = _input_types()
     if table == "graph_d11_life_originals_v1":
         from .c09_life_originals_v1 import decode_life_original_content_v1
@@ -375,6 +434,20 @@ def domain_production_source_closure_v1(table, kind, payload_json):
 
 
 def validate_domain_production_row_v1(table, columns, row, *, authority_namespace=None):
+    if table=="graph_world_revision_erasure_barriers_v1":
+        from .d03_world_history_v1 import decode_world_erasure_barrier_row_v1
+        from ..runtime_contracts import namespace_ref
+        value=decode_world_erasure_barrier_row_v1(columns,row)
+        if authority_namespace is not None and namespace_ref(value.namespace)!=authority_namespace:
+            raise DomainProductionErasureHold("World barrier namespace differs")
+        return ("world_erasure_barrier",canonical_digest(tuple(row[:4])),asdict(value),row[9])
+    if table=="graph_owner_goal_cancellation_projections_v1":
+        from .owner_goal_projection_v1 import validate_goal_projection_row_v1
+        observed,receipt=validate_goal_projection_row_v1(columns,row)
+        from ..runtime_contracts import namespace_ref
+        if authority_namespace is not None and namespace_ref(receipt.namespace)!=authority_namespace:
+            raise DomainProductionErasureHold("Goal projection namespace differs")
+        return ("goal_metadata_projection",receipt.operation_id,asdict(receipt),receipt.digest)
     if table in DERIVED_STORE_TABLES_V6:
         return _validate_derived_store_row_v6(table, columns, row, authority_namespace=authority_namespace)
     if table == "graph_d11_life_artifact_stage_v1":
@@ -399,6 +472,27 @@ def validate_domain_production_row_v1(table, columns, row, *, authority_namespac
             raise DomainProductionErasureHold("production signature/commitment field differs")
     if "producing_operation_id" in data and (type(data["producing_operation_id"]) is not str or not data["producing_operation_id"]):
         raise DomainProductionErasureHold("production input lacks its real producing-operation locator")
+    if table=='graph_contact_prospective_originals_v1':
+        from .contact_prospective_v1 import contact_prospective_original_ref_v1
+        if (raw['namespace']!={'bot_id':ns.bot_id,'persona_id':ns.persona_id}
+                or (raw['contact_id'],raw['birth_operation_id'])!=(data['contact_id'],data['birth_operation_id'])
+                or data['original_ref']!=contact_prospective_original_ref_v1(ns,data['contact_id'],data['birth_operation_id'])):
+            raise DomainProductionErasureHold('Contact prospective actual C09 indexed birth identity differs')
+    if table=='graph_contact_prospective_successors_v1':
+        candidate=raw['final_candidate'];action=candidate['action']
+        if (raw['birth_ref']!=data['birth_ref'] or raw['birth_digest']!=data['birth_digest']
+                or action['identity']['operation_id']!=data['final_operation_id']
+                or action['namespace']!={'bot_id':ns.bot_id,'persona_id':ns.persona_id}):
+            raise DomainProductionErasureHold('Contact prospective successor indexed birth/final namespace differs')
+    if table=='graph_contact_segment_originals_v1':
+        if (raw['namespace']!={'bot_id':ns.bot_id,'persona_id':ns.persona_id}
+                or (raw['contact_id'],raw['segment_index'],raw['operation_id'],raw['effect_id'])!=(
+                    data['contact_id'],data['segment_index'],data['operation_id'],data['effect_id'])):
+            raise DomainProductionErasureHold('Contact segment actual C09 indexed original identity differs')
+    if table=="graph_world_revision_index_v1":
+        if (decoded.input_version.key.token!=data["original_ref"] or decoded.adoption_operation_id!=data["producing_operation_id"]
+                or (decoded.assertion_id,decoded.assertion_commitment,decoded.known_from_sequence,decoded.supersedes_ref)!=(data["assertion_id"],data["assertion_commitment"],data["known_sequence"],data["supersedes_ref"])):
+            raise DomainProductionErasureHold("World derived index differs from its typed actual adoption locator")
     direct = domain_production_source_closure_v1(table, kind, data["payload_json"])
     roots = ()
     if "source_refs_json" in data:
@@ -426,6 +520,10 @@ def validate_domain_production_row_v1(table, columns, row, *, authority_namespac
         if (raw["namespace"] != {"bot_id": ns.bot_id, "persona_id": ns.persona_id}
                 or data["policy_ref"] != decoded.policy_ref or data["revision"] != decoded.revision or not direct):
             raise DomainProductionErasureHold("sourced relationship numeric policy identity/closure differs")
+    if table=='graph_d01_production_inputs_v1' and kind=='general_growth_trial_start_v1':
+        if (decoded.namespace!=ns or decoded.start_ref!=data['original_ref']
+                or decoded.producing_operation_id!=data['producing_operation_id']):
+            raise DomainProductionErasureHold('General trial start indexed identity differs from its actual original')
     if table == "graph_d08_party_consents_v1" and any(data[name] != raw[field] for name, field in (
             ("plan_proposal_ref", "plan_proposal_ref"), ("participant_ref", "participant_ref"), ("terms_digest", "terms_digest"))):
         raise DomainProductionErasureHold("party consent indexed identity differs")
@@ -510,7 +608,7 @@ def validate_domain_production_row_v1(table, columns, row, *, authority_namespac
                 else decoded["operation_id"])
             if data["producing_operation_id"] != operation_id:
                 raise DomainProductionErasureHold("offline unstarted cancellation indexed operation differs")
-    return kind, data.get("original_ref", data.get("policy_ref", data.get("interval_ref"))), raw, data["payload_digest"]
+    return kind, (data["operation_id"] if table=="graph_contact_segment_originals_v1" else data["final_operation_id"] if table=="graph_contact_prospective_successors_v1" else data.get("original_ref", data.get("policy_ref", data.get("interval_ref")))), raw, data["payload_digest"]
 
 
 def validate_artifact_phase_price_policy_joins_v1(db):
@@ -545,6 +643,8 @@ def validate_offline_original_joins_v1(db):
     This classifies persisted originals; installed Authority readers still own
     signature authentication and all execution/accounting admission.
     """
+    from .joint_node_execution_v1 import validate_joint_original_joins_v1
+    validate_joint_original_joins_v1(db)
     from .d11_offline_originals_v1 import TABLE
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone() is None:
         return
@@ -632,7 +732,7 @@ def domain_production_original_dispositions_v1(table, columns, rows, *, affected
         return life_stage_dispositions_v1(columns, rows, affected=affected, affected_operations=affected_operations,
             nested_hits=nested_hits, source_ids=source_ids, authority_namespace=authority_namespace)
     originals = [validate_domain_production_row_v1(table, columns, row, authority_namespace=authority_namespace) for row in rows]
-    if table in SOURCE_INDEPENDENT_POLICY_TABLES:
+    if table in SOURCE_INDEPENDENT_POLICY_TABLES or table in SOURCE_INDEPENDENT_METADATA_TABLES:
         return tuple("preserved_exact" for _ in originals)
     links, removed = set(affected) | set(affected_operations), set()
     while True:
@@ -816,7 +916,153 @@ def _validate_personal_candidate_provenance_v1(domain, operation_kind, provenanc
     return tuple(sorted(set(_references(provenance))))
 
 
+def _general_growth_provenance_types_v1(operation_kind):
+    from .d01_general_growth_v1 import (GeneralGrowthIntentOriginalV1,
+        GeneralGrowthTrialAdmissionV1,GeneralGrowthTrialOriginalV1)
+    from .d01_production_operations_v1 import GrowthIntentOriginalV1,GrowthCounterevidenceOriginalV1
+    from .domain_production_contracts_v1 import ProductionOriginalRefV1
+    return {
+        'freeze_general_growth_intent_v1':{'general_growth_intent':GeneralGrowthIntentOriginalV1,
+            'growth_proposal':GrowthIntentOriginalV1,'growth_counterevidence':GrowthCounterevidenceOriginalV1,
+            'semantic_interpretation':ProductionOriginalRefV1},
+        'register_general_growth_trial_start_v1':{'general_growth_trial_admission':GeneralGrowthTrialAdmissionV1},
+        'derive_general_growth_trial_v1':{'general_growth_trial':GeneralGrowthTrialOriginalV1,
+            'trial_start_original':ProductionOriginalRefV1},
+        'adopt_general_growth_v1':{'general_growth_intent':GeneralGrowthIntentOriginalV1,
+            'trial_start_originals':tuple[ProductionOriginalRefV1,...],
+            'trial_originals':tuple[ProductionOriginalRefV1,...],'growth':None}}[operation_kind]
+
+
 def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
+    from .named_joint_binding_provenance_v1 import KEY as NAMED_JOINT_KEY,validate_named_joint_provenance_v1
+    if type(provenance)is dict and NAMED_JOINT_KEY in provenance:
+        selector,current,scope,refs=validate_named_joint_provenance_v1(domain,operation_kind,provenance[NAMED_JOINT_KEY])
+        business={name:value for name,value in provenance.items()if name!=NAMED_JOINT_KEY}
+        if business.get('managed_window_argument')!=json.loads(canonical_serialize(selector.argument)):
+            raise ValueError('Named Joint provenance changed its actual managed argument')
+        return tuple(sorted(set((*refs,*validate_domain_stage_provenance_v1(domain,operation_kind,business)))))
+    from .artifact_model_control_contract_v1 import validate_artifact_model_control_provenance_v1
+    artifact=validate_artifact_model_control_provenance_v1(domain,operation_kind,provenance)
+    if artifact is not None:
+        business,refs=artifact
+        return tuple(sorted(set((*refs,*validate_domain_stage_provenance_v1(domain,operation_kind,business)))))
+    from .habit_maintenance_followup_v3 import validate_habit_maintenance_followup_provenance_v3
+    maintenance=validate_habit_maintenance_followup_provenance_v3(domain,operation_kind,provenance)
+    if maintenance is not None:return validate_domain_stage_provenance_v1(domain,operation_kind,maintenance)
+    from .habit_followup_source_v3 import validate_body_preparation_provenance_v3
+    body=validate_body_preparation_provenance_v3(domain,operation_kind,provenance)
+    if body is not None:
+        business,refs=body
+        return tuple(sorted(set((*refs,*validate_domain_stage_provenance_v1(domain,operation_kind,business)))))
+    from .habit_followup_source_v3 import PROVENANCE as HABIT_FOLLOWUP,validate_followup_target_v3
+    if type(provenance)is dict and HABIT_FOLLOWUP in provenance:
+        from .habit_activity_history_v1 import HABIT_ACTIVITY_PROVENANCE_V1,validate_habit_activity_provenance_v1
+        if HABIT_ACTIVITY_PROVENANCE_V1 not in provenance:
+            raise ValueError('Habit followup target requires its actual ordinary execution provenance')
+        selected=validate_followup_target_v3(domain,operation_kind,provenance[HABIT_FOLLOWUP])
+        actual,refs=validate_habit_activity_provenance_v1(domain,operation_kind,provenance[HABIT_ACTIVITY_PROVENANCE_V1])
+        if selected!=actual:raise ValueError('Habit followup target belongs to another signed actual phase')
+        business={name:value for name,value in provenance.items()if name!=HABIT_FOLLOWUP}
+        return tuple(sorted(set((*refs,*validate_domain_stage_provenance_v1(domain,operation_kind,business)))))
+    if type(provenance)is dict and 'managed_metadata_retirements_v1'in provenance:
+        from .b3_managed_metadata_v1 import decode_managed_metadata_retirement_shape_v1
+        decode_managed_metadata_retirement_shape_v1(domain,operation_kind,provenance['managed_metadata_retirements_v1'])
+        business={name:value for name,value in provenance.items()if name!='managed_metadata_retirements_v1'}
+        return validate_domain_stage_provenance_v1(domain,operation_kind,business)
+    from .habit_maintenance_provenance_v1 import MAINTENANCE_PROVENANCE_V1,validate_habit_maintenance_provenance_v1
+    if type(provenance)is dict and MAINTENANCE_PROVENANCE_V1 in provenance:
+        from .habit_census_provenance_v1 import OWNER_CENSUS_V1
+        from .habit_activity_history_v1 import HABIT_ACTIVITY_PROVENANCE_V1
+        if any(name in provenance for name in (OWNER_CENSUS_V1,HABIT_ACTIVITY_PROVENANCE_V1)):
+            raise ValueError('Habit maintenance cannot borrow Owner or execution provenance')
+        selector,current,owner,metadata=validate_habit_maintenance_provenance_v1(domain,operation_kind,provenance[MAINTENANCE_PROVENANCE_V1])
+        business={name:value for name,value in provenance.items()if name!=MAINTENANCE_PROVENANCE_V1}
+        refs=validate_domain_stage_provenance_v1(domain,operation_kind,business)
+        return tuple(sorted(set((*refs,selector.policy_ref,selector.occurrence_ref,*(row.key.token for row in metadata)))))
+    from .habit_census_provenance_v1 import OWNER_CENSUS_V1,validate_habit_owner_census_v1
+    if type(provenance)is dict and OWNER_CENSUS_V1 in provenance:
+        metadata=validate_habit_owner_census_v1(domain,operation_kind,provenance[OWNER_CENSUS_V1])
+        business={name:value for name,value in provenance.items()if name!=OWNER_CENSUS_V1}
+        from .habit_activity_history_v1 import HABIT_ACTIVITY_PROVENANCE_V1
+        if HABIT_ACTIVITY_PROVENANCE_V1 in business:
+            raise ValueError('Owner census and background execution carriers cannot coexist')
+        refs=validate_domain_stage_provenance_v1(domain,operation_kind,business)
+        return tuple(sorted(set((*refs,*(version.key.token for version in metadata)))))
+    from .habit_activity_history_v1 import (HABIT_ACTIVITY_PROVENANCE_V1,
+        validate_habit_activity_provenance_v1)
+    if type(provenance) is dict and HABIT_ACTIVITY_PROVENANCE_V1 in provenance:
+        selector, refs = validate_habit_activity_provenance_v1(domain, operation_kind,
+            provenance[HABIT_ACTIVITY_PROVENANCE_V1])
+        business = {key: value for key, value in provenance.items() if key != HABIT_ACTIVITY_PROVENANCE_V1}
+        return tuple(sorted(set((*refs, *validate_domain_stage_provenance_v1(domain, operation_kind, business)))))
+    from .conditioned_self_operations_v1 import OPERATIONS as CONDITIONED_OPERATIONS,validate_conditioned_business_provenance_v1
+    if operation_kind in CONDITIONED_OPERATIONS:
+        return validate_conditioned_business_provenance_v1(domain,operation_kind,provenance)
+    from .joint_habit_provenance_v1 import JOINT_HABIT_BUSINESS_KINDS_V1,validate_joint_habit_business_provenance_v1
+    if(operation_kind in JOINT_HABIT_BUSINESS_KINDS_V1
+            or (domain,operation_kind)==('d10','prepare_life')and 'habit_life_occurrence_transition'in provenance
+            or 'managed_window_argument'in provenance):
+        return validate_joint_habit_business_provenance_v1(domain,operation_kind,provenance)
+    from ..domains.d03.world_history_v1 import WORLD_OPERATIONS,WorldAssertionInputV1,WorldViewResultV1,WorldPerspectiveExpressionInputV1
+    if operation_kind in WORLD_OPERATIONS:
+        expected_domain="d09" if operation_kind=="project_world_perspective_v1" else "d03"
+        field_name,cls={"adopt_world_assertion_v1":("world_assertion",WorldAssertionInputV1),
+            "relearn_world_assertion_v1":("world_assertion",WorldAssertionInputV1),
+            "query_world_view_v1":("world_view",WorldViewResultV1),
+            "project_world_perspective_v1":("world_expression",WorldPerspectiveExpressionInputV1)}[operation_kind]
+        if domain!=expected_domain:
+            raise DomainProductionErasureHold("World provenance changed its actual writer")
+        _exact(provenance,(field_name,) if operation_kind=="query_world_view_v1" else
+            (field_name,"world_source_roots","semantic_mesh") if operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"}
+            else (field_name,"semantic_mesh"))
+        decode_typed_production_value_v1(provenance[field_name],cls)
+        if operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"}:
+            roots=decode_typed_production_value_v1(provenance["world_source_roots"],tuple[str,...])
+            if roots!=tuple(sorted(set(roots))) or not 1<=len(roots)<=16:
+                raise DomainProductionErasureHold("World producer Source root set exceeds its actual bound")
+            if any(AtomKey.from_token(ref).type_name!="memory.source" for ref in roots):
+                raise DomainProductionErasureHold("World producer Source closure has another type")
+        if operation_kind!="query_world_view_v1":
+            from .domain_mesh_tick_v1 import validate_semantic_mesh_trace_v1
+            validate_semantic_mesh_trace_v1(provenance["semantic_mesh"])
+        return tuple(sorted(set(_references(provenance))))
+    if type(provenance) is dict and 'semantic_mesh' in provenance:
+        from .domain_mesh_tick_v1 import validate_semantic_mesh_trace_v1
+        from .domain_mesh_catalog_v1 import require_semantic_recipe_operation_v1
+        trace = validate_semantic_mesh_trace_v1(provenance['semantic_mesh'])
+        profile = require_semantic_recipe_operation_v1(trace.after_tick.recipe_version,operation_kind)
+        if profile.domain != domain or trace.operation_kind != operation_kind:
+            raise DomainProductionErasureHold('semantic companion crossed its exact installed domain producer')
+        body = {key:value for key,value in provenance.items() if key != 'semantic_mesh'}
+        refs = validate_domain_stage_provenance_v1(domain,operation_kind,body)
+        return tuple(sorted(set((*refs,*_references(provenance['semantic_mesh'])))))
+    if operation_kind in {'freeze_general_growth_intent_v1','register_general_growth_trial_start_v1',
+            'derive_general_growth_trial_v1','adopt_general_growth_v1'}:
+        if domain!='d01':
+            raise DomainProductionErasureHold('General growth has another actual domain writer')
+        if provenance=={}:return ()
+        shape=_general_growth_provenance_types_v1(operation_kind)
+        _exact(provenance,shape)
+        for name,cls in shape.items():
+            if cls is not None:decode_typed_production_value_v1(provenance[name],cls)
+        if operation_kind=='adopt_general_growth_v1':
+            validate_domain_stage_provenance_v1('d01','adopt_growth',provenance['growth'])
+        return tuple(sorted(set(_references(provenance))))
+    if operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1"}:
+        if domain != "d08": raise DomainProductionErasureHold("personal eligibility has another writer")
+        from .personal_candidate_eligibility_v1 import PreparedPersonalEligibilityWaveV1, CompletedPersonalEligibilityWaveV1
+        from ..domains.d08.personal_candidate_v1 import CurrentPersonalCandidateEligibilityV1
+        if operation_kind == "prepare_personal_candidate_eligibility_v1":
+            _exact(provenance, {"personal_eligibility_inputs"})
+            decode_typed_production_value_v1(provenance["personal_eligibility_inputs"], PreparedPersonalEligibilityWaveV1)
+        else:
+            _exact(provenance, {"prepared_eligibility_digest", "projection_wave", "eligibilities"})
+            decode_typed_production_value_v1(provenance["projection_wave"], CompletedPersonalEligibilityWaveV1)
+            rows = provenance["eligibilities"]
+            if type(rows) is not list or not 1 <= len(rows) <= 6:
+                raise DomainProductionErasureHold("personal eligibility exceeds the exact candidate bound")
+            for row in rows: decode_typed_production_value_v1(row, CurrentPersonalCandidateEligibilityV1)
+        return tuple(sorted(set(_references(provenance))))
     if operation_kind in {"pause_project_v1", "resume_project_v1"}:
         if domain != "d08":
             raise DomainProductionErasureHold("project control has another domain writer")
@@ -869,6 +1115,11 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
                 "growth_proposal": GrowthProposal, "semantic_identity_changed": bool},
         }
         shape = shapes[operation_kind]
+        if operation_kind=='review_current_method_growth_v1' and type(provenance)is dict and set(provenance)==set(shape)|{'conditioned_source_roots','conditioned_original_deadline_utc'}:
+            from .conditioned_self_operations_v1 import _validate_conditioned_source_provenance_v1
+            review=decode_typed_production_value_v1(provenance['method_outcome_review'],MethodOutcomeReviewV1)
+            _validate_conditioned_source_provenance_v1(provenance,review.namespace,review.source_refs)
+            return tuple(sorted(set(_references(provenance))))
         _exact(provenance, shape)
         for field, cls in shape.items():
             decode_typed_production_value_v1(provenance[field], cls)
@@ -1021,6 +1272,20 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
                     'status':'active','recorded_at':source.recorded_at}):
             raise DomainProductionErasureHold('Owner material cannot manufacture an observation, experience, or another source right')
         return (key.token,)
+    if (domain,operation_kind) == ("d07","focus_owner_source_note_task_v1"):
+        _exact(provenance, {"owner_project_ref","owner_project_source_ref","owner_focus_selection",
+            "authorization_original_ref","authorization_original_digest","task_job_ref","original_valid_until"})
+        if (AtomKey.from_token(provenance["owner_project_ref"]).type_name != "d10.life_project.v1"
+                or AtomKey.from_token(provenance["owner_project_source_ref"]).type_name != "memory.source"
+                or AtomKey.from_token(provenance["task_job_ref"]).type_name != "runtime.job"
+                or provenance["owner_focus_selection"] != "owner_task_project"
+                or not provenance["authorization_original_ref"].startswith("owner-source-note-authorization:")
+                or type(provenance["authorization_original_digest"]) is not str
+                or len(provenance["authorization_original_digest"]) != 64
+                or type(provenance["original_valid_until"]) not in (int,float)
+                or not math.isfinite(provenance["original_valid_until"])):
+            raise DomainProductionErasureHold("Owner task Focus has another exact task recipe")
+        return tuple(sorted(set(_references(provenance))))
     if operation_kind == "prepare_owner_source_note_need_v1":
         if domain != "d07":
             raise DomainProductionErasureHold("Owner fixed-recipe Need has another writer")
@@ -1604,7 +1869,9 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
                 "task_scope_ref","task_scope_digest","checkpoint"},),
             "revise_personal_plan": ({"actual_fact_versions", "carried_effects", "pending_effects", "retained_commitment_versions"},),
             "select_personal_step": ({"decision", "candidate_evidence", "value_evaluation"},
-                {"decision", "candidate_evidence", "value_evaluation", "method_strategy"}),
+                {"decision", "candidate_evidence", "value_evaluation", "method_strategy"},
+                {"decision", "candidate_evidence", "value_evaluation", "candidate_discriminator_contracts"},
+                {"decision", "candidate_evidence", "value_evaluation", "method_strategy", "candidate_discriminator_contracts"}),
             "settle_personal_goal": ({"actual_effect"}, {"duplicate"}, {"actual_effect","task_observation"},
                 {"actual_effect","task_observation","artifact_method_completion"}),
             "initialize_project_checkpoint": ({"checkpoint"},),
@@ -1615,8 +1882,10 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
         if type(provenance) is not dict or set(provenance) not in shapes[operation_kind]:
             raise DomainProductionErasureHold("personal stage provenance differs from its exact operation")
         from ..domains.d01.production_operations_v1 import MethodStrategyProjectionV1
+        from .personal_candidate_eligibility_v1 import PersonalCandidateDiscriminatorContractV1
         types = {
             "method_strategy": MethodStrategyProjectionV1,
+            "candidate_discriminator_contracts": tuple[tuple[str,PersonalCandidateDiscriminatorContractV1],...],
             "actual_fact_versions": tuple[VersionedRef, ...],
             "carried_effects": tuple[str, ...], "pending_effects": tuple[str, ...],
             "retained_commitment_versions": tuple[tuple[str, int], ...],
@@ -1635,6 +1904,14 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
             if name=='task_observation' and type(value) is dict and value.get('schema')=='d08.artifact-task-observation.v2':
                 expected_type=ArtifactTaskObservationV2
             decode_typed_production_value_v1(value, expected_type)
+        if "candidate_discriminator_contracts" in provenance:
+            contracts=decode_typed_production_value_v1(provenance["candidate_discriminator_contracts"],
+                tuple[tuple[str,PersonalCandidateDiscriminatorContractV1],...])
+            candidates=decode_typed_production_value_v1(provenance["candidate_evidence"],tuple[QualifiedPersonalCandidateV1,...])
+            if (len(contracts)!=len(candidates) or len({ref for ref,_ in contracts})!=len(contracts)
+                    or {ref for ref,_ in contracts}!={row.candidate_ref for row in candidates}
+                    or any(row.numeric_discriminator_unresolved for row in candidates)):
+                raise DomainProductionErasureHold("legacy selection numeric flags differ from its exact closed recipe contracts")
         if "value_evaluation" in provenance and not re.fullmatch(r"[0-9a-f]{64}", provenance["value_evaluation"]):
             raise DomainProductionErasureHold("personal value evaluation original digest differs")
         return tuple(sorted(set(_references(provenance))))
@@ -1999,7 +2276,6 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
             if AtomKey.from_token(ref).type_name != type_name:
                 raise DomainProductionErasureHold("production provenance reference has another registered type")
     return tuple(sorted({ref for ref in _references(provenance) if AtomKey.from_token(ref).type_name == "memory.source"}))
-
 
 def _validate_offline_job_wire_v1(raw):
     from .jobs import PersistentJob

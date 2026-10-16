@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from .model_workflows_v5 import AdminModelWorkflowsV5
     from .model_workflows_v6 import AdminModelWorkflowsV6
     from .model_workflows_v7 import AdminModelWorkflowsV7
+    from .model_workflows_v8 import AdminModelWorkflowsV8
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
@@ -1163,7 +1164,7 @@ class AdminInstallationBundle:
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
-    model_workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | None = None
+    model_workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | None = None
     d04_encoding_baseline: AdminD04EncodingBaselinePolicy | None = None
     d06_first_ingress_c02: AdminD06FirstIngressC02Policy | None = None
     d03_self_identity_projection: AdminD03SelfIdentityProjectionPolicy | None = None
@@ -1179,8 +1180,8 @@ class AdminInstallationBundle:
     d13_wire_counter: object | None = None
     d04_joint_numeric: object | None = None
     package_selection: PackageSelectionV2 | None = None
-    # Prospective capture is currently installed only by the explicit alpha1
-    # test composition. Ordinary profile JSON does not enable this capability.
+    # Explicit prospective Root selector; current Owner and Root originals
+    # remain the production authority for the actual capture.
     life_d04_before_capture_policy: object | None = None
     foreground: AdminForegroundPolicyV1 | None = None
     artifact_draft: AdminArtifactDraftPolicyV1 | AdminArtifactDraftPolicyV2 | AdminArtifactDraftPolicyV3 | None = None
@@ -1188,8 +1189,27 @@ class AdminInstallationBundle:
     d06_recall: AdminD06RecallPolicyV1 | None = None
     artifact_phase_counter: ArtifactPhaseCountPolicyV1 | None = None
     method_measurement_policy: object | None = field(default=None, kw_only=True)
+    contact_effect_accounting: object | None = field(default=None, kw_only=True)
+    habit_runtime_policy: object | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
+        if self.habit_runtime_policy is not None:
+            from .habit_runtime_policy_v1 import HabitRuntimePolicyV1
+            if type(self.habit_runtime_policy)is not HabitRuntimePolicyV1:raise TypeError("exact Habit runtime policy required")
+            self.habit_runtime_policy.require_installation_v1(self.installation_policy)
+        if self.life_d04_before_capture_policy is not None:
+            from ..runtime.d04_life_before_original_v1 import D04LifeBeforeCapturePolicyV1
+            selected=self.life_d04_before_capture_policy;installed=self.installation_policy
+            if (type(selected) is not D04LifeBeforeCapturePolicyV1
+                    or (selected.namespace,selected.installation_id,selected.manifest_digest)!=(
+                        installed.namespace,installed.installation_id,installed.manifest_digest)):
+                raise ValueError("prospective Life before selector differs from its actual installed policy")
+        if self.contact_effect_accounting is not None:
+            from ..authority_service.contact_effect_accounting_contract_v1 import ContactEffectPricingPolicyV1
+            if type(self.contact_effect_accounting) is not ContactEffectPricingPolicyV1:
+                raise TypeError("Contact effect pricing requires its exact installed policy")
+            if self.private_reply_dispatch is None:
+                raise ValueError("Contact effect pricing requires an installed message quote policy")
         if self.method_measurement_policy is not None:
             from ..runtime.d11_method_observation_v1 import MethodMeasurementPolicyV1
             from ..domains.d01.production_operations_v1 import plain_v1
@@ -1211,10 +1231,11 @@ class AdminInstallationBundle:
             from .model_workflows_v5 import AdminModelWorkflowsV5
             from .model_workflows_v6 import AdminModelWorkflowsV6
             from .model_workflows_v7 import AdminModelWorkflowsV7
+            from .model_workflows_v8 import AdminModelWorkflowsV8
             artifact = self.artifact_draft
             phase = artifact.phase_model_workflow
             policy = self.installation_policy
-            if (type(self.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+            if (type(self.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
                     or artifact.model_workflow != self.model_workflows.artifact_draft
                     or type(self.foreground) is not AdminForegroundPolicyV1
                     or self.foreground.deadline_policy.draft_mode != "signed_scope_intersection_v1"
@@ -1243,7 +1264,8 @@ class AdminInstallationBundle:
         from .model_workflows_v5 import AdminModelWorkflowsV5
         from .model_workflows_v6 import AdminModelWorkflowsV6
         from .model_workflows_v7 import AdminModelWorkflowsV7
-        if type(self.model_workflows) not in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+        from .model_workflows_v8 import AdminModelWorkflowsV8
+        if type(self.model_workflows) not in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
             raise ValueError("provider billing requires the actual installed workflow container")
         workflows = tuple(getattr(self.model_workflows, field.name) for field in fields(self.model_workflows)
             if field.name != "version")
@@ -1262,8 +1284,9 @@ def is_installed_life_numeric_slot_v1(bundle, workflow):
     from .model_workflows_v5 import AdminModelWorkflowsV5
     from .model_workflows_v6 import AdminModelWorkflowsV6
     from .model_workflows_v7 import AdminModelWorkflowsV7
+    from .model_workflows_v8 import AdminModelWorkflowsV8
     return (type(bundle) is AdminInstallationBundle and type(workflow) is AdminModelWorkflowV2
-        and type(bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+        and type(bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
         and workflow is bundle.model_workflows.life_numeric
         and (workflow.work_kind, workflow.purpose, workflow.template_version) ==
             ('d06.encode_internal_life_numeric', 'consolidation', 'sylanne.d06.internal_life_numeric.v1'))
@@ -1276,7 +1299,8 @@ def is_installed_artifact_draft_slot_v1(bundle,workflow):
     from ..host.model_workflows_v5 import AdminModelWorkflowsV5
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-    return (type(bundle.model_workflows) in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}
+    from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+    return (type(bundle.model_workflows) in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
         and workflow is bundle.model_workflows.artifact_draft)
 
 
@@ -1626,6 +1650,8 @@ class _ArtifactPhaseFixtureInstallationV1:
     mock_transport: object
     mock_handler: object
     package_root: Path
+    data_dir: Path
+    verified_manifest: object
     profile_directory: Path
     protected_profile_digest: str
     bundle: AdminInstallationBundle | None
@@ -1640,13 +1666,14 @@ class _ArtifactPhaseFixtureInstallationV1:
     graph_db: object | None
 
     def __init__(self, token, *, qualification_ref, base_bundle, counter, authority_client, client_grant,
-            provider_client, mock_transport, package_root, profile_directory, protected_profile_digest,
+            provider_client, mock_transport, package_root, data_dir, verified_manifest, profile_directory, protected_profile_digest,
             observer_spec=None, observer_asset=None, observer_asset_digest=None):
         if token is not _ARTIFACT_PHASE_FIXTURE_ISSUER_V1:
             raise TypeError("fixture qualification requires its actual protected installation issuer")
         for name, value in (("qualification_ref", qualification_ref), ("base_bundle", base_bundle), ("counter", counter),
                 ("authority_client", authority_client), ("client_grant", client_grant), ("provider_client", provider_client),
                 ("mock_transport", mock_transport), ("mock_handler", mock_transport.handler), ("package_root", package_root),
+                ("data_dir", data_dir), ("verified_manifest", verified_manifest),
                 ("profile_directory", profile_directory), ("protected_profile_digest", protected_profile_digest), ("bundle", None),
                 ("observer_spec", observer_spec), ("observer_asset", observer_asset), ("observer_asset_digest", observer_asset_digest),
                 ("graph", None), ("graph_store", None), ("model_runtime", None), ("worker", None),
@@ -1679,6 +1706,9 @@ def _require_artifact_phase_fixture_registration_v1(bundle, *, client_grant):
     if (type(bundle) is not AdminInstallationBundle or type(qualification) is not _ArtifactPhaseFixtureInstallationV1
             or record is None or record[0] is not qualification or record[1] != qualification.qualification_ref
             or record[2] != qualification.counter.digest or record[3] != qualification.protected_profile_digest
+            or len(record)!=8 or record[4]is not qualification.verified_manifest
+            or record[5]!=_artifact_phase_fixture_verified_identity_v3(qualification)
+            or record[6]!=qualification.data_dir or record[7]!=qualification.package_root
             or qualification.bundle is not bundle or type(client_grant) is not InstallationGrantV2
             or client_grant is not qualification.client_grant or bundle.artifact_phase_counter is not qualification.counter
             or qualification.counter.source_scope != "LOCAL_FIXTURE" or not _artifact_phase_fixture_mock_binding_v1(qualification)):
@@ -1707,7 +1737,7 @@ def _require_artifact_phase_fixture_registration_v1(bundle, *, client_grant):
             or client._v2_handshake is None or not client._v2_handshake.valid_pairing()
             or client_grant.channel_binding_sha256 != client._v2_handshake.channel_binding_sha256
             or client_grant.subject != client._v2_handshake.installation_identity_ref
-            or client._package_root != qualification.package_root):
+            or client._package_root != qualification.package_root or client._data_dir!=qualification.data_dir):
         raise ValueError("fixture qualification changed its actual namespace/package/channel grant")
     import hashlib
     from ..authority_service.linux_installation_security_v1 import opened_installed_file_v1
@@ -1736,12 +1766,124 @@ def _artifact_phase_fixture_graph_database_path_v1(store):
     return Path(rows[0][2]).resolve(strict=True)
 
 
+def _artifact_phase_fixture_verified_identity_v3(qualification):
+    checked=qualification.verified_manifest
+    return (checked.verified,checked.package_version,checked.build_mode,checked.runtime_scope,
+        checked.manifest_digest,checked.catalogue_hash)
+
+
+def _require_beta1_fixture_bundle_identity_v3(qualification):
+    from .installed_package import InstalledPackageVerification
+    from ..runtime_contracts import InstallationGrantV2
+    from .authority_client import AuthorityClient
+    record=_ARTIFACT_PHASE_FIXTURE_REGISTRY_V1.get(id(qualification))
+    bundle=qualification.bundle;checked=qualification.verified_manifest;client=qualification.authority_client
+    if (type(qualification)is not _ArtifactPhaseFixtureInstallationV1
+            or type(bundle)is not AdminInstallationBundle or type(checked)is not InstalledPackageVerification
+            or type(client)is not AuthorityClient or type(qualification.client_grant)is not InstallationGrantV2
+            or record is None or len(record)!=8 or record[0]is not qualification
+            or record[1]!=qualification.qualification_ref or record[2]!=qualification.counter.digest
+            or record[3]!=qualification.protected_profile_digest or record[4]is not checked
+            or record[5]!=_artifact_phase_fixture_verified_identity_v3(qualification)
+            or record[6]!=qualification.data_dir or record[7]!=qualification.package_root
+            or _ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(bundle))is not qualification
+            or not checked.verified or (checked.package_version,checked.build_mode,checked.runtime_scope)!=
+                ('3.0.0-beta1','beta1-candidate','backend-beta1-server-test')
+            or checked.manifest_digest!=bundle.installation_policy.manifest_digest
+            or qualification.counter.source_scope!='LOCAL_FIXTURE'
+            or client._package_root!=qualification.package_root or client._data_dir!=qualification.data_dir
+            or not _artifact_phase_fixture_mock_binding_v1(qualification)):
+        raise ValueError('actual protected Beta1 LOCAL_FIXTURE bundle identity is unavailable')
+    grant=qualification.client_grant;policy=bundle.installation_policy
+    session=client._transport._sessions.get(bundle.tls_profile.profile_id)
+    handshake=client._v2_handshake
+    if (session is None or session.binding!=grant.channel_binding_sha256 or session.writer.is_closing()
+            or session.reader.at_eof() or handshake is None or not handshake.valid_pairing()
+            or grant.channel_binding_sha256!=handshake.channel_binding_sha256
+            or grant.subject!=handshake.installation_identity_ref
+            or (grant.authority_id,grant.installation_id,grant.manifest_digest,grant.administrator_holder)!=
+                (policy.expected_authority_id,policy.installation_id,policy.manifest_digest,policy.administrator_holder)):
+        raise ValueError('Beta1 local fixture actual paired channel changed')
+    return qualification
+
+
+def require_beta1_fixture_runtime_installation_v3(graph,bootstrap,runtime):
+    from ..graph_coordinator import GraphCoordinator
+    from ..graph_store import ProductionGraphStore
+    from ..graph_worker import GraphWorker
+    from ..runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if type(graph)is not GraphCoordinator or type(runtime)is not InstalledArtifactDraftModelRuntimeV1:
+        raise ValueError('Beta1 fixture installer requires its actual Graph/runtime')
+    graph._admin(bootstrap)
+    qualification=_require_artifact_phase_fixture_registration_v1(runtime.bundle,client_grant=runtime.client_grant)
+    _require_beta1_fixture_bundle_identity_v3(qualification)
+    store=graph._GraphCoordinator__store
+    if (_ARTIFACT_PHASE_FIXTURE_SCOPE_V1.get()is not qualification
+            or qualification.graph is not None or qualification.graph_store is not None
+            or qualification.model_runtime is not None or qualification.worker is not None
+            or qualification.graph_db is not None or qualification.graph_db_path is not None
+            or graph._GraphCoordinator__d04_installed_joint_assembly is not None
+            or graph._GraphCoordinator__artifact_draft_model_runtime_v1 is not None
+            or runtime.graph is not graph or runtime.bootstrap is not bootstrap
+            or runtime.bundle is not qualification.bundle or runtime.client_grant is not qualification.client_grant
+            or runtime.authority_client is not qualification.authority_client
+            or runtime.issuer is not graph._GraphCoordinator__d11_issuer
+            or type(runtime.worker)is not GraphWorker or runtime.worker._closed
+            or type(store)is not ProductionGraphStore or store._closed
+            or runtime_storage_v3(store._db)is None):
+        raise ValueError('Beta1 fixture prebind runtime does not match its protected private installation')
+    path=_artifact_phase_fixture_graph_database_path_v1(store)
+    if not path.is_relative_to(qualification.data_dir):
+        raise ValueError('Beta1 fixture selected Graph database is outside its actual data root')
+    return qualification
+
+
+def current_owner_metadata_installation_v3(graph,*,expected_bundle=None):
+    from ..graph_coordinator import GraphCoordinator
+    from .v2_installation import V2InstallationAssembly
+    from ..runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
+    if type(graph)is not GraphCoordinator:
+        raise ValueError('Owner metadata bundle requires the actual Graph')
+    assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+    if assembly is not None:
+        if (type(assembly)is not V2InstallationAssembly or type(assembly.admin_bundle)is not AdminInstallationBundle
+                or expected_bundle is not None and expected_bundle is not assembly.admin_bundle):
+            raise ValueError('Owner metadata bundle differs from its actual D04 assembly')
+        return assembly.admin_bundle,assembly.package_root,None
+    runtime=graph._GraphCoordinator__artifact_draft_model_runtime_v1
+    if type(runtime)is not InstalledArtifactDraftModelRuntimeV1:
+        raise ValueError('Owner metadata has no actual D04 or registered Beta1 fixture runtime')
+    qualification=_ARTIFACT_PHASE_FIXTURE_BUNDLES_V1.get(id(runtime.bundle))
+    if type(qualification)is not _ArtifactPhaseFixtureInstallationV1:
+        raise ValueError('Owner metadata has no private Beta1 fixture bundle registration')
+    _require_beta1_fixture_bundle_identity_v3(qualification)
+    _require_artifact_phase_fixture_components_v1(qualification)
+    if (qualification.graph is not graph or qualification.model_runtime is not runtime
+            or expected_bundle is not None and expected_bundle is not qualification.bundle):
+        raise ValueError('Owner metadata fixture does not match its actual installed Graph/runtime')
+    return qualification.bundle,qualification.package_root,qualification.verified_manifest
+
+
+def require_current_owner_metadata_installation_v3(graph,*,expected_bundle):
+    if graph._GraphCoordinator__store._db.in_transaction:
+        raise ValueError('Owner metadata protected installation observation must precede Graph SQL')
+    bundle,package_root,checked=current_owner_metadata_installation_v3(graph,expected_bundle=expected_bundle)
+    if checked is not None:
+        qualification=_ARTIFACT_PHASE_FIXTURE_BUNDLES_V1[id(bundle)]
+        require_artifact_phase_fixture_qualification_v1(bundle,client_grant=qualification.client_grant)
+    return bundle,package_root,checked
+
+
 def _require_artifact_phase_fixture_components_v1(qualification):
     from ..graph_coordinator import GraphCoordinator
     from ..graph_store import ProductionGraphStore
     from ..graph_worker import GraphWorker
     from ..runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
-    graph, runtime = qualification.graph, qualification.model_runtime
+    graph,runtime=qualification.graph,qualification.model_runtime
+    assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+    if assembly is None:
+        _require_beta1_fixture_bundle_identity_v3(qualification)
     if (type(graph) is not GraphCoordinator or type(runtime) is not InstalledArtifactDraftModelRuntimeV1
             or type(qualification.graph_store) is not ProductionGraphStore
             or type(qualification.worker) is not GraphWorker or qualification.worker._closed
@@ -1751,7 +1893,10 @@ def _require_artifact_phase_fixture_components_v1(qualification):
             or graph._GraphCoordinator__store is not qualification.graph_store
             or qualification.graph_store._closed or qualification.graph_store._db is not qualification.graph_db or qualification.graph_db is None
             or qualification.graph_db_path is None
-            or graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle is not qualification.bundle
+            or (assembly is not None and assembly.admin_bundle is not qualification.bundle)
+            or runtime.issuer is not graph._GraphCoordinator__d11_issuer
+            or qualification.authority_client is not runtime.authority_client
+            or qualification.graph_db_path is None or not qualification.graph_db_path.is_relative_to(qualification.data_dir)
             or graph._GraphCoordinator__artifact_draft_model_runtime_v1 is not runtime):
         raise ValueError("actual local fixture Graph/database/runtime component registration changed")
     graph._admin(runtime.bootstrap)
@@ -1867,9 +2012,17 @@ def readonly_artifact_phase_fixture_observer_v1(bundle):
 def artifact_phase_local_fixture_scope_v1(qualification):
     if type(qualification) is not _ArtifactPhaseFixtureInstallationV1:
         raise TypeError("actual opaque local fixture installation qualification required")
-    require_artifact_phase_fixture_qualification_v1(qualification.bundle, client_grant=qualification.client_grant)
+    if qualification.graph is None:
+        actual=_require_artifact_phase_fixture_registration_v1(qualification.bundle,client_grant=qualification.client_grant)
+        if (actual is not qualification or qualification.graph_store is not None
+                or qualification.model_runtime is not None or qualification.worker is not None
+                or qualification.graph_db is not None or qualification.graph_db_path is not None):
+            raise ValueError('fixture bootstrap scope requires the exact unbound protected registration')
+    else:
+        require_artifact_phase_fixture_qualification_v1(qualification.bundle,client_grant=qualification.client_grant)
     token = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.set(qualification)
     try:
+        require_artifact_phase_fixture_qualification_v1(qualification.bundle,client_grant=qualification.client_grant)
         yield qualification.bundle
     finally:
         _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.reset(token)
@@ -1908,7 +2061,8 @@ async def load_artifact_phase_local_fixture_bundle_v1(profile_id, *, profile_roo
     if platform.system() != "Linux" or os.name != "posix" or os.geteuid() == 0:
         raise AuthorityProfileUnavailable("local phase fixture needs its protected ordinary Linux installation process")
     root, profile_directory, data = Path(package_root), Path(profile_root) / profile_id, Path(data_dir)
-    if not root.is_absolute() or root.resolve(strict=True) != root or not data.is_absolute():
+    if (not root.is_absolute() or root.resolve(strict=True)!=root
+            or not data.is_absolute() or data.resolve(strict=False)!=data):
         raise ValueError("local phase fixture requires its actual canonical installed package/data paths")
     if (type(provider_client) is not AsyncOpenAI or type(mock_transport) is not httpx.MockTransport
             or type(provider_client._client) is not httpx.AsyncClient or provider_client._client._transport is not mock_transport
@@ -1947,6 +2101,7 @@ async def load_artifact_phase_local_fixture_bundle_v1(profile_id, *, profile_roo
             d13_paid_precompression=_d13_paid_precompression_from_payload(base_payload, policy),
             d13_wire_policy=_d13_wire_policy_from_payload(base_payload, policy), d13_wire_counter=_d13_wire_counter_from_payload(base_payload),
             d04_joint_numeric=_d04_joint_numeric_from_payload(base_payload, policy), package_selection=getattr(files, "selected_package", None),
+            life_d04_before_capture_policy=_life_d04_before_capture_policy_from_payload_v1(base_payload,policy),
             foreground=_foreground_from_payload(base_payload), artifact_draft=_artifact_draft_from_payload(base_payload),
             provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(base_payload), d06_recall=_d06_recall_from_payload(base_payload))
         from .artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
@@ -1964,8 +2119,10 @@ async def load_artifact_phase_local_fixture_bundle_v1(profile_id, *, profile_roo
                 if hashlib.file_digest(stream, "sha256").hexdigest() != policy.manifest_digest:
                     raise ValueError("local fixture protected manifest differs from installation")
         checked = await asyncio.to_thread(verify_installed_backend_runtime_v1, root, policy.manifest_digest)
-        if not checked.verified or checked.runtime_scope != "backend-local-alpha2-acceptance":
-            raise ValueError("local fixture requires the actually qualified local alpha2 backend package")
+        if not checked.verified or (checked.package_version, checked.build_mode, checked.runtime_scope) not in {
+                ("3.0.0-alpha2", "alpha2-candidate", "backend-local-alpha2-acceptance"),
+                ("3.0.0-beta1", "beta1-candidate", "backend-beta1-server-test")}:
+            raise ValueError("local fixture requires its exact qualified Alpha2 or Beta1 backend package")
         transport = MtlsAuthorityTransport({profile_id: profile})
         client = AuthorityClient(AuthoritySelection(profile_id), package_root=root, data_dir=data, transport=transport)
         qualification = None
@@ -1987,9 +2144,10 @@ async def load_artifact_phase_local_fixture_bundle_v1(profile_id, *, profile_roo
                 qualification_ref="artifact-phase-local-fixture-qualification:" + uuid4().hex,
                 base_bundle=base, counter=counter, authority_client=client, client_grant=grant,
                 provider_client=provider_client, mock_transport=mock_transport, package_root=root,
-                profile_directory=profile_directory, protected_profile_digest=canonical_digest(payload),
+                data_dir=data, verified_manifest=checked, profile_directory=profile_directory, protected_profile_digest=canonical_digest(payload),
                 observer_spec=observer_spec, observer_asset=observer_asset, observer_asset_digest=observer_asset_digest)
-            _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1[id(qualification)] = (qualification, qualification.qualification_ref, counter.digest, qualification.protected_profile_digest)
+            _ARTIFACT_PHASE_FIXTURE_REGISTRY_V1[id(qualification)] = (qualification, qualification.qualification_ref, counter.digest,
+                qualification.protected_profile_digest,checked,_artifact_phase_fixture_verified_identity_v3(qualification),data,root)
             token = _ARTIFACT_PHASE_FIXTURE_SCOPE_V1.set(qualification)
             try:
                 bundle = replace(base, artifact_phase_counter=counter)
@@ -2071,9 +2229,10 @@ def _d13_wire_policy_from_payload(payload, policy):
     workflows = _model_workflows_from_payload(payload)
     if type(raw) is dict and raw.get("schema") == "sylanne3.d13.installed-core-wire-policy.v7":
         from .model_workflows_v7 import AdminModelWorkflowsV7
+        from .model_workflows_v8 import AdminModelWorkflowsV8
         from ..authority_service.d13_core_counter_contract_v1 import installed_d13_wire_policy_from_payload_v7
         from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION
-        if type(workflows) is not AdminModelWorkflowsV7 or workflows.natural_generation is None or workflows.natural_generation.template_version != TEMPLATE_VERSION:
+        if type(workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} or workflows.natural_generation is None or workflows.natural_generation.template_version != TEMPLATE_VERSION:
             raise ValueError("D13 Core wire V7 requires the actual named V7 natural workflow")
         configured = installed_d13_wire_policy_from_payload_v7(raw)
     elif type(raw) is dict and raw.get("schema") == "sylanne3.d13.installed-wire-policy.v6":
@@ -2096,7 +2255,7 @@ def _d13_wire_policy_from_payload(payload, policy):
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff", "foreground", "artifact_draft", "provider_billing_policy_v1", "d06_recall", "astrbot_namespace_v1", "artifact_phase_counter", "artifact_phase_fixture_observer", "method_measurement_policy"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff", "foreground", "artifact_draft", "provider_billing_policy_v1", "d06_recall", "astrbot_namespace_v1", "artifact_phase_counter", "artifact_phase_fixture_observer", "method_measurement_policy", "contact_effect_accounting", "life_d04_before_capture_policy", "habit_runtime_policy"}
     )
 
 
@@ -2281,6 +2440,23 @@ def _d04_baseline_from_payload(payload: dict[str, object]) -> AdminD04EncodingBa
     return AdminD04EncodingBaselinePolicy(**values)
 
 
+def _life_d04_before_capture_policy_from_payload_v1(payload,installation):
+    from ..runtime.d04_life_before_original_v1 import D04LifeBeforeCapturePolicyV1
+    if "life_d04_before_capture_policy" not in payload:
+        return None
+    raw=_exact_object(payload["life_d04_before_capture_policy"],
+        frozenset({"namespace","installation_id","manifest_digest","root_operation_id"}),
+        "prospective Life before Root selector")
+    namespace=_exact_object(raw["namespace"],frozenset({"bot_id","persona_id"}),
+        "prospective Life before namespace")
+    selected=D04LifeBeforeCapturePolicyV1(NamespaceId(**namespace),raw["installation_id"],
+        raw["manifest_digest"],raw["root_operation_id"])
+    if (selected.namespace,selected.installation_id,selected.manifest_digest)!=(
+            installation.namespace,installation.installation_id,installation.manifest_digest):
+        raise ValueError("prospective Life before selector changed its protected installation")
+    return selected
+
+
 def _d04_joint_numeric_from_payload(payload, installation):
     from ..runtime.d04_numeric_policy_v3 import numeric_policy_from_payload_v3
     return numeric_policy_from_payload_v3(payload, installation)
@@ -2381,7 +2557,7 @@ def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModel
     })
 
 
-def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkflowsV2 | None:
+def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | None:
     if "model_workflows" not in payload:
         return None
     if payload.get("schema") != 2 or "ingress_model" in payload:
@@ -2389,6 +2565,11 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
     raw_value = payload["model_workflows"]
     if type(raw_value) is not dict:
         raise ValueError("model workflows must be an object")
+    if raw_value.get("version") == 8:
+        if not {"foreground", "artifact_draft"} <= set(payload):
+            raise ValueError("version-8 workflows require explicit foreground and artifact policy objects")
+        from .model_workflows_v8 import model_workflows_v8_from_payload
+        return model_workflows_v8_from_payload(raw_value)
     if raw_value.get("version") == 7:
         if not {"foreground","artifact_draft"}<=set(payload):
             raise ValueError("version7 workflows require explicit foreground and artifact policy objects")
@@ -2545,7 +2726,7 @@ def _foreground_for_policy_from_payload_v1(payload, policy):
         if "artifact_draft" in payload:
             raise ValueError("draft configuration requires explicit foreground policy")
         return None
-    if type(payload["model_workflows"]["version"]) is not int or payload["model_workflows"]["version"] not in {4, 5, 6}:
+    if type(payload["model_workflows"]["version"]) is not int or payload["model_workflows"]["version"] not in {4, 5, 6, 7, 8}:
         raise ValueError("foreground requires an explicit supported workflow container")
     if "d11.foreground_cycle.v1" not in policy.root_grant.allowed_work_kinds:
         raise ValueError("foreground requires its explicit installed root work kind")
@@ -2568,8 +2749,9 @@ def _artifact_draft_for_policy_from_payload_v1(payload, policy):
     from .model_workflows_v5 import AdminModelWorkflowsV5
     from .model_workflows_v6 import AdminModelWorkflowsV6
     from .model_workflows_v7 import AdminModelWorkflowsV7
+    from .model_workflows_v8 import AdminModelWorkflowsV8
     workflows = _model_workflows_from_payload(payload)
-    if type(workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7}:
+    if type(workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
         raise ValueError("draft requires version-4 workflows")
     if payload["artifact_draft"] is None:
         if workflows.artifact_draft is not None or foreground.deadline_policy.draft_mode is not None:
@@ -2646,7 +2828,8 @@ def _d13_paid_precompression_from_payload(
     from .model_workflows_v5 import AdminModelWorkflowsV5
     from .model_workflows_v6 import AdminModelWorkflowsV6
     from .model_workflows_v7 import AdminModelWorkflowsV7
-    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7)
+    from .model_workflows_v8 import AdminModelWorkflowsV8
+    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
             or type(workflows.reply) is not AdminModelWorkflowV2
             or "d13.precompress.paid.v1"
                not in policy.root_grant.allowed_work_kinds):
@@ -2795,7 +2978,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
                                   workflows.contact_generation, workflows.contact_review,
                                   getattr(workflows, "life_content", None),
                                   getattr(workflows, "life_numeric", None),
-                                  getattr(workflows, "d07_relationship_cognition", None)) if item is not None):
+                                  getattr(workflows, "d07_relationship_cognition", None),
+                                  getattr(workflows, "general_growth_cognition", None)) if item is not None):
             if workflow.work_kind not in policy.root_grant.allowed_work_kinds:
                 raise ValueError("model workflow lacks its own root grant work kind")
             if any(amount > policy.root_grant.max_ceiling.get(name, 0)
@@ -2809,6 +2993,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     _d13_paid_precompression_from_payload(payload, policy)
     _artifact_phase_counter_from_payload(payload, policy)
     _method_measurement_policy_from_payload_v1(payload)
+    _contact_effect_accounting_from_payload_v1(payload)
+    _habit_runtime_policy_from_payload_v1(payload,policy)
     return policy
 
 
@@ -2988,7 +3174,10 @@ def _load_installation_bundle_from_root(
                                       provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(payload),
                                       d06_recall=_d06_recall_from_payload(payload),
                                       artifact_phase_counter=_artifact_phase_counter_from_payload(payload, policy),
-                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload))
+                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload),
+                                      contact_effect_accounting=_contact_effect_accounting_from_payload_v1(payload),
+                                      life_d04_before_capture_policy=_life_d04_before_capture_policy_from_payload_v1(payload,policy),
+                                   habit_runtime_policy=_habit_runtime_policy_from_payload_v1(payload,policy))
 
 
 def _load_windows_installation_bundle(
@@ -3039,7 +3228,10 @@ def _load_windows_installation_bundle(
                                       provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(payload),
                                       d06_recall=_d06_recall_from_payload(payload),
                                       artifact_phase_counter=_artifact_phase_counter_from_payload(payload, policy),
-                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload))
+                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload),
+                                      contact_effect_accounting=_contact_effect_accounting_from_payload_v1(payload),
+                                      life_d04_before_capture_policy=_life_d04_before_capture_policy_from_payload_v1(payload,policy),
+                                   habit_runtime_policy=_habit_runtime_policy_from_payload_v1(payload,policy))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -3139,3 +3331,14 @@ __all__ = (
     "load_admin_d11_signing_key", "load_admin_c04_signing_key",
     "load_admin_installation_bundle",
 )
+
+
+def _contact_effect_accounting_from_payload_v1(payload):
+    from ..authority_service.contact_effect_accounting_contract_v1 import ContactEffectPricingPolicyV1, from_wire
+    raw = payload.get("contact_effect_accounting")
+    return None if raw is None else from_wire(raw, ContactEffectPricingPolicyV1)
+
+
+def _habit_runtime_policy_from_payload_v1(payload,policy):
+    from .habit_runtime_policy_v1 import habit_runtime_policy_from_payload_v1
+    return habit_runtime_policy_from_payload_v1(payload.get("habit_runtime_policy"),policy)

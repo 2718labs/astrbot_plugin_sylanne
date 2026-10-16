@@ -123,6 +123,10 @@ class AuthorityTransport(Protocol):
                                            holder, expected_anchor, draft=None,
                                            close_prepared=False): ...
 
+    async def v2_get_content_fence_operation(self,request,handshake,*,namespace,operation_id): ...
+
+    async def v2_current_anchor(self,request,handshake,namespace): ...
+
     async def model_prepare_fenced_v1(self, request, handshake, grant, *, namespace,
                                       holder, draft, expected_anchor, _on_dispatch=None): ...
 
@@ -140,6 +144,10 @@ class AuthorityTransport(Protocol):
     async def model_complete_observed_v2(self, request, handshake, grant, *, namespace,
                                          holder, intent, expected_anchor, admission,
                                          report): ...
+
+    async def qualify_current_life_numeric_model_candidate_v3(
+        self,request,handshake,grant,*,namespace,holder,original_intent,original_permit,case,candidate_intent,
+    ): ...
 
     async def model_terminal_fact_v2(self, request, handshake, grant, *, namespace,
                                      holder, intent): ...
@@ -638,6 +646,27 @@ class AuthorityClient:
             raise RuntimeError("authority model installation binding is invalid")
         return request, handshake, policy
 
+    async def model_fence_current_observation_v1(self,bundle,grant,*,intent):
+        """Observe only this installed MODEL subject through existing paired RPCs."""
+        from ..runtime_contracts import canonical_digest
+        from ..runtime.restore_anchor import RestoreAnchor
+        request,handshake,policy=await self._model_installation_context(bundle,grant)
+        if(type(intent)is not ModelEgressIntentV1 or(intent.authority_id,intent.namespace,intent.subject)!=(
+                grant.authority_id,policy.authority_namespace,grant.subject)):
+            raise RuntimeError('model current observation crossed its actual installed subject/namespace')
+        permit,state=await self._transport.v2_get_content_fence_operation(request,handshake,
+            namespace=policy.authority_namespace,operation_id=intent.operation_id)
+        anchor=await self._transport.v2_current_anchor(request,handshake,policy.authority_namespace)
+        if(type(permit)is not FencePermitV2 or type(anchor)is not RestoreAnchor
+                or state not in {'active','finished'}
+                or(permit.authority_id,permit.namespace,permit.subject,permit.holder,permit.operation,permit.operation_id)!=(
+                    grant.authority_id,policy.authority_namespace,grant.subject,grant.administrator_holder,'model_egress',intent.operation_id)
+                or(permit.token,permit.fence_epoch,permit.revision)!=(intent.fence_token,intent.fence_epoch,intent.fence_revision)
+                or intent.anchor_digest!=canonical_digest(permit.pinned_anchor)
+                or(anchor.authority_id,anchor.namespace)!=(grant.authority_id,policy.authority_namespace)):
+            raise RuntimeError('model current observation differs from its actual bound permit/anchor')
+        return permit,state,anchor
+
     async def model_capacity_reconcile_v1(
         self, bundle, grant: InstallationGrantV2, *, expected_anchor: RestoreAnchor,
         draft: ModelEgressDraftV1 | None = None, close_prepared: bool = False,
@@ -694,13 +723,14 @@ class AuthorityClient:
 
     async def bind_observed_d13_provider_http_v1(self,bundle,grant,*,intent,admission,content):
         from .model_workflows_v7 import AdminModelWorkflowsV7
+        from .model_workflows_v8 import AdminModelWorkflowsV8
         from ..authority_service.v2_model_egress_wire import to_wire as model_to_wire
         from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
         from ..authority_service.d13_provider_http_admission_v1 import DOMAIN
         from ..runtime_contracts import canonical_serialize
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         import base64,hashlib
-        if (type(bundle.model_workflows) is not AdminModelWorkflowsV7
+        if (type(bundle.model_workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
                 or type(content) is not bytes or not 0<len(content)<=65536):
             raise RuntimeError('actual installed bounded V7 SDK HTTP capture required')
         request,handshake,policy=await self._model_installation_context(bundle,grant)
@@ -741,6 +771,14 @@ class AuthorityClient:
             request, handshake, grant, namespace=policy.authority_namespace,
             holder=policy.administrator_holder, intent=intent,
             expected_anchor=expected_anchor, admission=admission, report=report)
+
+    async def qualify_current_life_numeric_model_candidate_v3(
+        self,bundle,grant:InstallationGrantV2,*,original_intent,original_permit,case,candidate_intent,
+    ):
+        request,handshake,policy=await self._model_installation_context(bundle,grant)
+        return await self._transport.qualify_current_life_numeric_model_candidate_v3(
+            request,handshake,grant,namespace=policy.authority_namespace,holder=policy.administrator_holder,
+            original_intent=original_intent,original_permit=original_permit,case=case,candidate_intent=candidate_intent)
 
     async def model_terminal_fact_v2(
         self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
@@ -1314,6 +1352,35 @@ class AuthorityClient:
         if isinstance(grant, AuthorityCapabilityGrant):
             return grant if grant.valid_for(self._handshake) else None
         return None
+
+
+    async def model_no_dispatch_witness_v1(self, bundle, grant, *, closure_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_no_dispatch_witness_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, holder=policy.administrator_holder, closure_request=closure_request)
+
+    async def model_no_dispatch_accounting_begin_v1(self, bundle, grant, *, accounting_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_no_dispatch_accounting_begin_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, holder=policy.administrator_holder, accounting_request=accounting_request)
+
+    async def model_no_dispatch_accounting_validate_v1(self, bundle, grant, *, accounting_request, accounting_grant):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_no_dispatch_accounting_validate_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, holder=policy.administrator_holder,
+            accounting_request=accounting_request, accounting_grant=accounting_grant)
+
+    async def model_no_dispatch_accounting_finish_v1(self, bundle, grant, *, accounting_request, accounting_grant):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_no_dispatch_accounting_finish_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, holder=policy.administrator_holder,
+            accounting_request=accounting_request, accounting_grant=accounting_grant)
+
+    async def model_no_dispatch_accounting_recover_finish_v1(self, bundle, grant, *, accounting_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_no_dispatch_accounting_recover_finish_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, holder=policy.administrator_holder, accounting_request=accounting_request)
+
 
 
 __all__ = (

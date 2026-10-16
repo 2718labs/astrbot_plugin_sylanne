@@ -137,7 +137,7 @@ def read_contact_check_versions_locked_v3(db, snapshot, query, scope, *, current
         VersionedRef(opportunity.opportunity_id, opportunity_atom.revision),
         VersionedRef(f'd10.contact_policy:{opportunity.subject_ref}:{opportunity.channel}:{opportunity.category}', epoch),
         *sorted(claims, key=lambda item: item.ref))
-    if projected:
+    if projected and segment_index==0:
         from ..domains.d10.contact_claim_v2 import contact_claim_key_v2
         own = current_read.head(db, contact_claim_key_v2(ns, content.contact_id))
         if own.revision != 0 or own.valid or any(v.ref == content.contact_id for v in claims):

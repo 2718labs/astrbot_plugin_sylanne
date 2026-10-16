@@ -51,23 +51,45 @@ def require_d07_parentage_v3(db,*,intent,issuer):
         canonical_serialize((owner.namespace,'prepared',intent.job_id,row[1])),row[2])
     from ..runtime.domain_background_read_v3 import background_json_loads_v3
     raw=background_json_loads_v3(column)
-    from ..runtime.d07_execution_v1 import D07PreparedExecutionV1,D07RelationshipPreparedV2,D07IngressRecallPreparedV1
+    from ..runtime.d07_execution_v1 import D07PreparedExecutionV1,D07RelationshipPreparedV2,D07IngressRecallPreparedV1,D07ReflectionPreparedV3
     from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2,PREPARED_SCHEMA,_head as growth_head,_deadline
     variants={'d07.prepared-execution.v1':D07PreparedExecutionV1,
         'd07.relationship-prepared.v2':D07RelationshipPreparedV2,
-        'd07.ingress-recall-prepared.v1':D07IngressRecallPreparedV1,PREPARED_SCHEMA:D07MethodGrowthPreparedV2}
+        'd07.ingress-recall-prepared.v1':D07IngressRecallPreparedV1,
+        'd07.reflection-prepared.v3':D07ReflectionPreparedV3,PREPARED_SCHEMA:D07MethodGrowthPreparedV2}
     variant=variants.get(raw.get('schema'))
     if variant is None or set(owner.column_kinds[column])!={field.name for field in fields(variant)}:
         raise AuthorityUnavailable('D07 parentage original closed field set differs')
     if NamespaceId(**raw['namespace'])!=owner.namespace or raw['job_id']!=intent.job_id:
         raise AuthorityUnavailable('D07 parentage crossed its actual namespace/job')
-    if variant is D07PreparedExecutionV1:
+    if variant is D07ReflectionPreparedV3 and raw["cycle_ref"] is None and any(
+            raw[name] is not None for name in ("cycle_digest","call_plan_digest","c02_operation_id","cancel_generation")):
+        raise AuthorityUnavailable("ordinary reflection cannot carry partial Self parentage")
+    if variant is D07PreparedExecutionV1 or (variant is D07ReflectionPreparedV3 and raw["cycle_ref"] is None):
         proof=_D07ParentageEOFV3(raw['schema'],owner.namespace,None,row[1])
         _PROOFS[proof]=(owner,column,raw,issuer,None)
         return proof
     if raw['call_id']!=intent.call_id or row[1]!=intent.binding_digest:
         raise AuthorityUnavailable('model barrier signed C3 call/binding identity differs')
-    if variant is D07IngressRecallPreparedV1:
+    if variant is D07ReflectionPreparedV3:
+        from ..runtime.foreground_call_plan_v1 import NamedC3ParentageDescriptorV3
+        if raw["work_kind"]!="reflection":
+            raise ValueError("reflection parentage changed its exact work kind")
+        def canonical_head(value):
+            if type(value) is not dict or set(value)!={"key","revision"} or type(value["key"]) is not str:
+                raise ValueError("reflection v3 retains its distinct canonical GraphVersion wire")
+            return GraphVersion(AtomKey.from_token(value["key"]),value["revision"])
+        names=("reflection_request_ref","reflection_request_digest","reflection_continuation_ref",
+            "reflection_continuation_digest","parent_prepared_ref","parent_prepared_digest",
+            "parent_execution_ref","parent_execution_digest","checkpoint_digest","parent_grant_digest")
+        descriptor=NamedC3ParentageDescriptorV3(namespace=owner.namespace,kind="reflection",
+            operation_id=raw["operation_id"],job_id=raw["job_id"],call_id=raw["call_id"],
+            semantic_question_ref=None,semantic_question_digest=None,cycle_ref=canonical_head(raw["cycle_ref"]),
+            cycle_digest=raw["cycle_digest"],call_plan_digest=raw["call_plan_digest"],
+            c02_operation_id=raw["c02_operation_id"],cancel_generation=raw["cancel_generation"],prepared_digest=row[1],
+            parent_budget_lease_ref=raw["parent_budget_lease_ref"],original_deadline_utc=raw["original_deadline_utc"],
+            checkpoint_ref=canonical_head(raw["checkpoint_ref"]),**{name:raw[name] for name in names})
+    elif variant is D07IngressRecallPreparedV1:
         if(raw['work_kind']!='recall_need' or type(raw['cancel_generation'])is not int
                 or raw['cancel_generation']<0 or raw['adoption_operation_id']==raw['operation_id']):
             raise ValueError('exact Self recall preparation/adoption identities required')
@@ -87,12 +109,18 @@ def require_d07_parentage_v3(db,*,intent,issuer):
     else:
         from ..runtime.foreground_call_plan_v1 import NamedC3ParentageDescriptorV3
         growth=variant is D07MethodGrowthPreparedV2
+        from ..runtime.d07_execution_v1 import decode_native_named_d07_head_v2
+        cycle_head=decode_native_named_d07_head_v2(raw["cycle_ref"],namespace=owner.namespace,
+            c02_operation_id=raw["c02_operation_id"],head_kind="cycle_ref")
         if raw['work_kind']!='concern':
             raise ValueError('named C3 changed its actual concern work kind')
         extras={}
         if growth:
             from ..domains.d01.method_learning_v1 import TRIAL_PROPOSAL_TYPE_V2
-            proposal=_head(raw['proposal_head']);source=_head(raw['source_head'])
+            proposal=decode_native_named_d07_head_v2(raw['proposal_head'],namespace=owner.namespace,
+                c02_operation_id=raw['c02_operation_id'],head_kind='proposal_head')
+            source=decode_native_named_d07_head_v2(raw['source_head'],namespace=owner.namespace,
+                c02_operation_id=raw['c02_operation_id'],head_kind='source_head')
             growth_head(proposal,TRIAL_PROPOSAL_TYPE_V2,owner.namespace)
             growth_head(source,'memory.source',owner.namespace)
             _deadline(raw['original_deadline_utc'])
@@ -102,7 +130,7 @@ def require_d07_parentage_v3(db,*,intent,issuer):
         descriptor=NamedC3ParentageDescriptorV3(namespace=owner.namespace,kind='growth'if growth else'relationship',
             operation_id=raw['operation_id'],job_id=raw['job_id'],call_id=raw['call_id'],
             semantic_question_ref=raw['semantic_question_ref'],semantic_question_digest=raw['semantic_question_digest'],
-            cycle_ref=_head(raw['cycle_ref']),cycle_digest=raw['cycle_digest'],call_plan_digest=raw['call_plan_digest'],
+            cycle_ref=cycle_head,cycle_digest=raw['cycle_digest'],call_plan_digest=raw['call_plan_digest'],
             c02_operation_id=raw['c02_operation_id'],cancel_generation=raw['cancel_generation'],
             prepared_digest=row[1],**extras)
     proof=_D07ParentageEOFV3(raw['schema'],owner.namespace,raw['c02_operation_id'],row[1])

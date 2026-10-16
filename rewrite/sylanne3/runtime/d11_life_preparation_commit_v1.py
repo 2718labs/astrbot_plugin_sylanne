@@ -14,12 +14,16 @@ def life_preparation_bundle_v1(graph, preparation):
     if preparation.stage.proposals or preparation.writes != (job_graph_write(preparation.job),):
         raise ValueError("life preparation must have only its actual running-job projection")
     proposals = []
-    for domain, writes in (("d10", ()), ("d11", preparation.writes)):
+    transition=preparation.habit_occurrence_transition
+    if transition is not None:
+        from .d10_habit_v1 import HabitLifeOccurrenceTransitionV1
+        if type(transition)is not HabitLifeOccurrenceTransitionV1:raise TypeError("Life accepts only its named actual Habit occurrence transition")
+    for domain, writes in (("d10", () if transition is None else (transition.write,)), ("d11", preparation.writes)):
         provider = graph._GraphCoordinator__providers[domain]
         dependencies = {key for write in writes for key in write.dependencies}
         proposals.append(DomainProposal(domain, provider[1], provider[2], envelope, writes,
             DependencySet(current_invalidation=tuple(version for version in preparation.read_versions
-                if version.key in dependencies)), (), ("persistent_job",)))
+                if version.key in dependencies)), (), () if domain=="d10" and transition is not None else ("persistent_job",)))
     return DomainBundle(envelope, tuple(proposals), (), (), (), (),
         (preparation.prepared.prepare_operation_id,), (job_graph_write(preparation.job).key.token,), ())
 
@@ -35,6 +39,9 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
     verify_life_preparation_in_transaction_v1(db, preparation,
         issuer=readers.issuer, resource_issuer=graph._GraphCoordinator__d02_issuer)
     bundle = life_preparation_bundle_v1(graph, preparation)
+    if runtime._active_habit_issuance_v1 is not None:
+        from .habit_activity_runtime_v1 import require_current_habit_commit_v1
+        require_current_habit_commit_v1(runtime,db,operation=operation,request=request,frame=preparation.frame,stage=preparation,scope=scope)
     for write in preparation.writes:
         reconcile_runtime_write(db, write)
     witness = _ProductionCommitWitnessV1(runtime, graph, scope, preparation.frame,
@@ -49,7 +56,22 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
         raise ValueError("life preparation has no exact current Owner fence attempt")
     owner_task=getattr(runtime,'_active_owner_task_issuance_v1',None)
     issued = runtime._active_foreground_issuance_v1
-    if owner_task is not None:
+    habit=getattr(runtime,"_active_habit_issuance_v1",None)
+    transition=preparation.habit_occurrence_transition
+    if habit is not None:
+        from .habit_activity_issuance_v1 import require_habit_activity_issuance_v1,habit_activity_request_digest_v1,habit_activity_finish_digest_v1
+        from .d11_life_contract_v1 import D11LifeExecutionBindingV1
+        evidence=require_habit_activity_issuance_v1(habit,graph,scope)
+        if (owner_task is not None or issued is not None or type(binding)is not D11LifeExecutionBindingV1
+                or transition is None or evidence.request!=transition.execution_selector
+                or evidence.request.operation_kind!="prepare_life" or evidence.request.operation_id!=binding.prepare_operation_id
+                or evidence.request.command.plan_original_ref!=binding.plan_original_ref
+                or evidence.request.command.prepare_operation_id!=binding.prepare_operation_id
+                or attempt[0]!=habit_activity_request_digest_v1(evidence.request)
+                or preparation.frame.envelope.authority.actor!=evidence.current_self.self_entity_ref):
+            raise ValueError("Habit Life preparation lost its exact independent current execution witness")
+        finish_digest=habit_activity_finish_digest_v1(habit,graph,scope)
+    elif owner_task is not None:
         from .owner_source_note_task_issuance_v1 import require_owner_source_note_task_issuance_v1
         from .domain_production_commit_v1 import owner_task_domain_finish_digest_v1
         from .d11_life_contract_v1 import D11LifeExecutionBindingV1
@@ -76,6 +98,7 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
             raise ValueError("draft Life preparation lost its exact independently issued foreground self witness")
         finish_digest = foreground_domain_finish_digest_v1(evidence.request, scope.permit)
     else:
+        if transition is not None:raise ValueError("Habit-managed Life cannot fall back to an ordinary Owner command")
         finish_digest = "sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
             "operation_id": binding.prepare_operation_id, "request_digest": attempt[0], "permit_token": scope.permit.token})
     _ACTIVE[id(witness)] = witness

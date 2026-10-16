@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
 from .runtime_storage_v3 import (
-    read_graph_head_v3, runtime_storage_operation_v3, runtime_storage_quantum_v3,
+    read_graph_head_v3, runtime_storage_operation_v3, runtime_storage_quantum_v3, runtime_storage_v3,
 )
 from .graph_store import (
     DeletionDependencyEdge, DeletionHistoryRow, GraphStore, ProductionGraphStore,
@@ -1084,6 +1084,10 @@ class _BorrowedNaturalFullReadStampV3:
     epoch: object
 
 
+_CONTACT_OWNER_DOMAIN_WRITE_ISSUER_V3 = object()
+_OWNER_LEASE_METADATA_READ_ISSUER_V3 = object()
+
+
 class GraphCoordinator:
     """One in-process authority over a GraphStore's business SQLite connection.
 
@@ -1215,6 +1219,8 @@ class GraphCoordinator:
             if type(c04_authority_port_v3) is not InstalledC04AuthorityPortV3:
                 raise TypeError("installed C04 V3 Authority port must be typed")
         self.__c04_authority_port_v3 = c04_authority_port_v3
+        self.__habit_owner_write_issuer_v3 = object()
+        self.__habit_occurrence_port_v1 = None
         if isinstance(store, ProductionGraphStore):
             with store._lock:
                 store._db.executescript("""
@@ -1233,6 +1239,10 @@ class GraphCoordinator:
                 """)
                 from .runtime.contact_owner_invocation_v3 import install_contact_owner_invocation_schema_v3
                 install_contact_owner_invocation_schema_v3(store._db)
+                from .runtime.contact_background_invocation_v1 import install_contact_background_schema_v1
+                install_contact_background_schema_v1(store._db)
+                from .runtime.contact_background_scheduler_v3 import install_contact_scheduler_schema_v3
+                install_contact_scheduler_schema_v3(store._db)
         from .runtime.d13_technical_policy import AdminD13PrecompressionPolicyV1
         if (d13_precompression_policy is not None and
                 type(d13_precompression_policy) is not AdminD13PrecompressionPolicyV1):
@@ -1565,7 +1575,8 @@ class GraphCoordinator:
 
     def _prepare_current_method_operation_v3(self, runtime, authority, lease, *, operation_kind,
             request, operation_id, activity_id, audience_ref, parent_budget_lease_ref, request_digest,
-            background_followup=None, background_host_lifecycle=None, background_offline=None):
+            background_followup=None, background_host_lifecycle=None, background_offline=None,
+            d07_dispatch_classify_v3=False,d07_dispatch_v3=None):
         from .graph_worker import require_graph_storage_work_admission_v3, create_graph_storage_work_v3
         from .runtime_storage_v3 import (begin_runtime_storage_operation_v3,
             bind_runtime_storage_operation_v3, finish_runtime_storage_operation_v3)
@@ -1576,8 +1587,10 @@ class GraphCoordinator:
         require_graph_storage_work_admission_v3(self)
         installed = installed_operation_v1(operation_kind)
         background = background_followup or background_host_lifecycle or background_offline
+        from .runtime.current_beta1_source_read_v3 import beta1_source_operation_v3,beta1_source_required_domains_v3
         if background is None:
-            self._authorize(lease, authority, frozenset({installed.domain}), owner_read=True)
+            domains=(frozenset({installed.domain})if d07_dispatch_classify_v3 else beta1_source_required_domains_v3(operation_kind)if beta1_source_operation_v3(operation_kind)else frozenset({installed.domain}))
+            self._authorize(lease,authority,domains,owner_read=True)
             owner = self.__owner_leases.get(lease)
             session = self.__owner_session_proofs.get(lease)
             if owner is None or session is None or installed.capability not in owner.capabilities:
@@ -1595,16 +1608,30 @@ class GraphCoordinator:
             workflow = self.__d07_execution_service_v1.bundle.model_workflows.d07_cognition
             if workflow is not None:
                 seconds = 2.0 * workflow.timeout_seconds + 30.0
-        operation = begin_runtime_storage_operation_v3(self.__store._db, operation_id, now + seconds)
+        operation = (d07_dispatch_v3["operation"]if d07_dispatch_v3 is not None else begin_runtime_storage_operation_v3(self.__store._db, operation_id, now + seconds))
+        if d07_dispatch_v3 is not None:
+            from .runtime.d07_source_dispatch_read_v3 import current_d07_classified_command_v3
+            if current_d07_classified_command_v3(self,authority=authority,lease=lease,request=request,operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,parent_budget_lease_ref=parent_budget_lease_ref)is not d07_dispatch_v3 or d07_dispatch_v3["locator"][-1]!="world":
+                raise AuthorityDenied("D07 Source successor lacks its private classified original command")
         fence = None
         try:
             with bind_runtime_storage_operation_v3(operation, self.__store._db):
                 read_id = "method-read:" + canonical_digest(("method-domain-input-read.v3",
                     authority.namespace, operation_id, request_digest))[:48]
+                from .runtime.current_method_learning_read_v3 import _GENERAL_OWNER_OPERATIONS_V1,_NUMERIC_OWNER_OPERATIONS_V1
+                from .runtime.current_beta1_source_read_v3 import beta1_source_operation_v3,beta1_source_work_kind_v3
+                own_source=beta1_source_operation_v3(operation_kind)
+                if own_source or operation_kind in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_OWNER_OPERATIONS_V1):
+                    from uuid import uuid4
+                    read_id="general-method-read:"+uuid4().hex
                 if background is None:
-                    fence = self._begin_read_fence_v3(authority, operation_id=read_id,
-                        owner_binding=owner, owner_session_proof=session)
-                    guard, actual_owner = fence.observed_guard, fence.observed_owner
+                    if own_source or operation_kind in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_OWNER_OPERATIONS_V1):
+                        fence=self._begin_read_fence_v3(authority,operation_id=read_id,owner_session_proof=session)
+                        guard,actual_owner=None,owner
+                    else:
+                        fence = self._begin_read_fence_v3(authority, operation_id=read_id,
+                            owner_binding=owner, owner_session_proof=session)
+                        guard, actual_owner = fence.observed_guard, fence.observed_owner
                 else:
                     from .runtime.domain_background_issuance_v1 import observe_background_owner_v1
                     fence = self._begin_read_fence_v3(authority, operation_id=read_id,
@@ -1616,11 +1643,13 @@ class GraphCoordinator:
                     parent_budget_lease_ref=parent_budget_lease_ref, request_digest=request_digest,
                     owner_binding=actual_owner, owner_guard=guard, session_proof=session, initial_now_utc=now)
                 reader.initial_clock = clock
-                reader.initial_monotonic_deadline = time.monotonic() + seconds
+                reader.initial_monotonic_deadline = (time.monotonic()+seconds if d07_dispatch_v3 is None else min(time.monotonic()+seconds,d07_dispatch_v3["monotonic_deadline"]))
+                reader.d07_dispatch_classify_v3=d07_dispatch_classify_v3
+                reader.d07_dispatch_pin_v3=(None if d07_dispatch_v3 is None else (*d07_dispatch_v3["locator"],d07_dispatch_v3["owner"],d07_dispatch_v3["deadline"],d07_dispatch_v3["monotonic_deadline"]))
                 reader.background_followup = background_followup
                 reader.background_host_lifecycle = background_host_lifecycle
                 reader.background_offline = background_offline
-            work = create_graph_storage_work_v3(self, kind="current_method_learning_read_v3",
+            work = create_graph_storage_work_v3(self, kind=("current_d07_dispatch_read_v3"if d07_dispatch_classify_v3 else beta1_source_work_kind_v3(operation_kind)if own_source else "current_method_learning_read_v3"),
                 operation_id=operation_id, selection_digest=operation.selection_digest,
                 deadline_utc=operation.deadline_utc, state=reader, operation=operation)
             attach_current_method_learning_work_v3(reader, work)
@@ -1679,6 +1708,9 @@ class GraphCoordinator:
         retained_operation = begin_runtime_storage_operation_v3(self.__store._db, selector.operation_id, deadline)
         retained_lifetime = None
         try:
+            if operation.operation_kind == 'adopt_personal_candidate_eligibility_v1':
+                from .runtime.personal_candidate_eligibility_v1 import transfer_personal_eligibility_adoption_lifetime_v1
+                transfer_personal_eligibility_adoption_lifetime_v1(runtime,operation,request,private_reads)
             with bind_runtime_storage_operation_v3(retained_operation, self.__store._db):
                 reader = begin_current_method_learning_read_in_scope_v3(self, retained_operation,
                     runtime=runtime, issued=issued, operation_kind=operation.operation_kind,
@@ -1740,6 +1772,17 @@ class GraphCoordinator:
         clock = self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy)
         now = trusted_upper(clock)
         db = self.__store._db
+        from .runtime.artifact_borrowed_source_v3 import (is_artifact_borrowed_source_reader_v3,
+            advance_artifact_borrowed_source_v3)
+        if is_artifact_borrowed_source_reader_v3(reader):
+            with self.__store._lock, runtime_storage_quantum_v3(db):
+                db.execute("BEGIN")
+                try:
+                    handled,grant=read_bound_method_budget_grant_v3(db,reader.parent_budget_lease_ref)
+                    if not handled or now>=min(grant.valid_until_utc,reader.operation.deadline_utc):
+                        raise AuthorityDenied("Artifact original parent grant expired before Source qualification")
+                finally:db.rollback()
+            if advance_artifact_borrowed_source_v3(reader):return
         with self.__store._lock, runtime_storage_quantum_v3(db):
             db.execute("BEGIN")
             try:
@@ -1864,15 +1907,51 @@ class GraphCoordinator:
         reader.seal_plan_v3(plan, envelope=envelope, observed_originals=tuple(originals))
 
     def _advance_runtime_storage_work_v3(self, work):
+        if work.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_d07_dispatch_read_v3"}:
+            from .runtime.current_beta1_source_read_v3 import advance_current_beta1_source_work_v3
+            return advance_current_beta1_source_work_v3(self,work)
+        if work.kind=='current_life_numeric_accounting_v3':
+            from .runtime.current_life_numeric_accounting_v3 import advance_current_life_numeric_accounting_v3
+            return advance_current_life_numeric_accounting_v3(self,work)
+        if work.kind=="current_life_numeric_paid_write_v3":
+            from .runtime.current_life_numeric_paid_write_v3 import advance_current_life_numeric_paid_write_v3
+            return advance_current_life_numeric_paid_write_v3(self,work)
+        if work.kind=="current_life_numeric_model_seal_v3":
+            from .runtime.current_life_numeric_paid_write_v3 import advance_current_life_numeric_call_seal_v3
+            return advance_current_life_numeric_call_seal_v3(self,work)
+        if work.kind=="current_owner_job_cancel_v3":
+            from .runtime.current_owner_job_cancel_v3 import advance_current_job_cancel_v3
+            return advance_current_job_cancel_v3(self,work)
+        if work.kind=="current_life_numeric_read_v3":
+            from .runtime.current_life_numeric_read_v3 import advance_current_life_numeric_read_v3
+            return advance_current_life_numeric_read_v3(self,work)
+        if work.kind == "contact_effect_accounting_v1":
+            from .runtime.contact_effect_accounting_v1 import advance_contact_effect_accounting_work_v1
+            return advance_contact_effect_accounting_work_v1(self, work)
+        if work.kind == "contact_cost_metadata_v3":
+            from .runtime.contact_cost_metadata_v3 import advance_contact_cost_metadata_work_v3
+            return advance_contact_cost_metadata_work_v3(self,work)
+        if work.kind == "contact_host_stage_read_v3":
+            from .runtime.contact_host_stage_work_v3 import advance_contact_host_stage_work_v3
+            return advance_contact_host_stage_work_v3(self,work)
         if work.kind == "current_method_learning_read_v3":
             from .runtime.current_method_learning_read_v3 import advance_current_method_learning_read_v3
             return advance_current_method_learning_read_v3(self, work)
         if work.kind == "domain_background_read_v3":
             from .runtime.domain_background_read_v3 import advance_domain_background_read_v3
             return advance_domain_background_read_v3(self, work)
+        if work.kind == "host_beta1_fixture_evidence_read":
+            from .graph_worker import _advance_beta1_engineering_metadata_work_v3
+            return _advance_beta1_engineering_metadata_work_v3(self, work)
         if work.kind == "d13_standby_read_v3":
             from .runtime.d13_standby_read_v3 import advance_d13_standby_read_v3
             return advance_d13_standby_read_v3(self, work)
+        if work.kind == "d13_derived_retirement_read_v3":
+            from .runtime.d13_derived_retirement_read_v3 import advance_d13_derived_retirement_v3
+            return advance_d13_derived_retirement_v3(self,work)
+        if work.kind == "d13_paid_original_read_v3":
+            from .runtime.d13_paid_original_read_v3 import advance_d13_paid_original_read_v3
+            return advance_d13_paid_original_read_v3(self, work)
         if work.kind == "dispatch_inventory_prepare_v3":
             from .runtime.dispatch_current_inventory_v3 import advance_current_dispatch_inventory_v3
             return advance_current_dispatch_inventory_v3(self,work)
@@ -1909,15 +1988,54 @@ class GraphCoordinator:
             return GraphStorageStepV3("complete", result)
 
     def _finish_runtime_storage_work_v3(self, work, error):
+        if work.kind=="current_d07_dispatch_read_v3":
+            from .runtime.d07_source_dispatch_read_v3 import finish_current_d07_dispatch_read_v3
+            return finish_current_d07_dispatch_read_v3(self,work,error)
+        if work.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_d07_dispatch_read_v3"}:
+            from .runtime.current_beta1_source_read_v3 import finish_current_beta1_source_work_v3
+            return finish_current_beta1_source_work_v3(self,work,error)
+        if work.kind=='current_life_numeric_accounting_v3':
+            from .runtime.current_life_numeric_accounting_v3 import finish_current_life_numeric_accounting_v3
+            return finish_current_life_numeric_accounting_v3(self,work,error)
+        if work.kind=="current_life_numeric_paid_write_v3":
+            from .runtime.current_life_numeric_paid_write_v3 import finish_current_life_numeric_paid_write_v3
+            return finish_current_life_numeric_paid_write_v3(self,work,error)
+        if work.kind=="current_life_numeric_model_seal_v3":
+            from .runtime.current_life_numeric_paid_write_v3 import finish_current_life_numeric_call_seal_v3
+            return finish_current_life_numeric_call_seal_v3(self,work,error)
+        if work.kind=="current_owner_job_cancel_v3":
+            from .runtime.current_owner_job_cancel_v3 import finish_current_job_cancel_v3
+            return finish_current_job_cancel_v3(self,work,error)
+        if work.kind=="current_life_numeric_read_v3":
+            from .runtime.current_life_numeric_read_v3 import finish_current_life_numeric_read_v3
+            return finish_current_life_numeric_read_v3(self,work,error)
+        if work.kind == "contact_effect_accounting_v1":
+            from .runtime.contact_effect_accounting_v1 import finish_contact_effect_accounting_work_v1
+            return finish_contact_effect_accounting_work_v1(self, work, error)
+        if work.kind == "contact_cost_metadata_v3":
+            from .runtime.contact_cost_metadata_v3 import finish_contact_cost_metadata_work_v3
+            return finish_contact_cost_metadata_work_v3(self,work,error)
+        if work.kind == "contact_host_stage_read_v3":
+            from .runtime.contact_host_stage_work_v3 import finish_contact_host_stage_work_v3
+            return finish_contact_host_stage_work_v3(self,work,error)
         if work.kind == "current_method_learning_read_v3":
             from .runtime.current_method_learning_read_v3 import finish_current_method_learning_read_v3
             return finish_current_method_learning_read_v3(self, work, error)
         if work.kind == "domain_background_read_v3":
             from .runtime.domain_background_read_v3 import finish_domain_background_read_v3
             return finish_domain_background_read_v3(self, work, error)
+        if work.kind == "host_beta1_fixture_evidence_read":
+            from .graph_worker import _finish_beta1_engineering_metadata_work_v3
+            return _finish_beta1_engineering_metadata_work_v3(self, work, error)
         if work.kind == "d13_standby_read_v3":
             from .runtime.d13_standby_read_v3 import finish_d13_standby_read_v3
             return finish_d13_standby_read_v3(self, work, error)
+        if work.kind == "d13_derived_retirement_read_v3":
+            from .runtime.d13_derived_retirement_read_v3 import finish_d13_derived_retirement_v3
+            return finish_d13_derived_retirement_v3(self,work,error)
+        if work.kind == "d13_paid_original_read_v3":
+            from .runtime.d13_paid_original_read_v3 import finish_d13_paid_original_read_v3
+            return finish_d13_paid_original_read_v3(self, work, error)
         if work.kind == "dispatch_inventory_prepare_v3":
             from .runtime.dispatch_current_inventory_v3 import finish_current_dispatch_inventory_v3
             return finish_current_dispatch_inventory_v3(self,work,error)
@@ -5487,10 +5605,15 @@ class GraphCoordinator:
             actor, "d12", ref, namespace, owner_scope, purpose,
             (audience,), "owner-grant-v1", activation_generation)
         try:
-            binding = self._read_v2(
-                authority,
-                lambda: None, owner_principal=principal, owner_view=True,
-                owner_session_proof=proof).graph_binding
+            if runtime_storage_v3(self.__store._db) is not None:
+                from .runtime.owner_lease_metadata_read_v3 import read_current_owner_lease_metadata_v3
+                binding=read_current_owner_lease_metadata_v3(_OWNER_LEASE_METADATA_READ_ISSUER_V3,self,bootstrap,
+                    authority=authority,owner_principal=principal,owner_session_proof=proof,
+                    provisional_lease=lease).graph_binding
+            else:
+                binding = self._read_v2(
+                    authority,lambda:None,owner_principal=principal,owner_view=True,
+                    owner_session_proof=proof).graph_binding
         except BaseException:
             del self.__leases[lease]
             raise
@@ -5533,9 +5656,16 @@ class GraphCoordinator:
             actor, "d12", "owner-view:" + secrets.token_hex(16), namespace,
             ("persona",), purpose, (audience,), "owner-view-v1",
             metadata.requirements.activation_generation)
+        if runtime_storage_v3(self.__store._db) is not None:
+            from .runtime.owner_lease_metadata_read_v3 import read_current_owner_lease_metadata_v3
+            principal=self._current_owner_principal(actor,namespace)
+            if principal!=expected_principal:
+                raise UnavailableGuard('Owner view expected principal differs from current pairing')
+            return read_current_owner_lease_metadata_v3(_OWNER_LEASE_METADATA_READ_ISSUER_V3,self,bootstrap,
+                authority=authority,owner_principal=expected_principal,owner_session_proof=proof)
         return self._read_v2(
-            authority, lambda: None, owner_principal=expected_principal,
-            owner_view=True, owner_session_proof=proof)
+            authority,lambda:None,owner_principal=expected_principal,
+            owner_view=True,owner_session_proof=proof)
 
     def read_owner_project_artifact_v1(self, authority, lease, *, request):
         """One actual Authority file read, inside the existing current Owner fence."""
@@ -7302,9 +7432,12 @@ class GraphCoordinator:
         self._admin(bootstrap)
         assembly = self.__d04_installed_joint_assembly
         if (type(runtime) is not InstalledArtifactDraftModelRuntimeV1 or runtime.graph is not self
-                or assembly is None or runtime.bundle is not assembly.admin_bundle
+                or (assembly is not None and runtime.bundle is not assembly.admin_bundle)
                 or runtime.issuer is not self.__d11_issuer or self.__artifact_draft_model_runtime_v1 is not None):
             raise ValueError("artifact model runtime must be the unique actual installed worker/paired client")
+        if assembly is None:
+            from .host.authority_profile import require_beta1_fixture_runtime_installation_v3
+            require_beta1_fixture_runtime_installation_v3(self,bootstrap,runtime)
         self.__artifact_draft_model_runtime_v1 = runtime
 
     def _current_artifact_draft_runtime_v1(self, bootstrap, bundle):
@@ -7316,46 +7449,22 @@ class GraphCoordinator:
             raise UnavailableGuard("actual installed artifact model worker/paired client required; HOLD")
         return runtime
 
-    def seal_current_artifact_draft_model_call_v1(self, bootstrap, bundle, *, prepared, intent, permit):
+    def seal_current_artifact_draft_model_call_v1(self, bootstrap, bundle, *, prepared, intent, permit, data_certificate):
         from .runtime.d11_artifact_draft_model_v1 import seal_artifact_draft_model_call_v1
-        from .authority_service.d11_artifact_draft_model_v1 import read_current_artifact_draft_model_graph_v1
-        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
-        from .authority_service.v2_contract import FencePermitV2
-        from .runtime.first_ingress_v2 import trusted_upper
-        runtime = self._current_artifact_draft_runtime_v1(bootstrap, bundle)
-        if type(intent) is not ModelEgressIntentV1 or type(permit) is not FencePermitV2:
-            raise TypeError("artifact seal requires its actual paired Core model intent/permit")
-        namespace, store, port = bundle.installation_policy.namespace, self.__store, self.__content_fence_v2
-        def require_current():
-            actual, state = port.get_fence_operation(namespace=namespace, authority_namespace=intent.namespace,
-                operation_id=intent.operation_id)
-            anchor = port.current_anchor(namespace=namespace, authority_namespace=intent.namespace)
-            if (actual != permit or state != "active" or permit.operation != "model_egress"
-                    or anchor != permit.pinned_anchor or permit.subject != intent.subject
-                    or permit.token != intent.fence_token or permit.revision != intent.fence_revision
-                    or permit.fence_epoch != intent.fence_epoch):
-                raise UnavailableGuard("artifact actual paired model permit is no longer current; HOLD")
-        require_current()
-        now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
-        with store._lock:
-            db = store._db
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                metadata, epoch = self._v2_graph_stamp(namespace)
-                if (metadata.graph_revision, epoch.revision) != (intent.graph_revision, intent.graph_epoch):
-                    raise StaleRead("artifact Graph changed before sealing the actual model original")
-                current, _, _ = read_current_artifact_draft_model_graph_v1(db, intent, runtime.issuer, now,
-                    installed_bundle=bundle, allow_unsealed_prepare=True)
-                if current != prepared:
-                    raise StaleRead("artifact seal differs from its actual prepared/acquired worker original")
-                original = seal_artifact_draft_model_call_v1(db, prepared=current, intent=intent, permit=permit,
-                    issuer=runtime.issuer, metadata=metadata, epoch=epoch)
-                db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-        require_current()
-        return {"status": "sealed", "job_id": prepared.job_id, "original_ref": original.original_ref}
+        from .runtime.artifact_host_seal_data_v3 import bind_artifact_host_current_seal_v3
+        runtime=self._current_artifact_draft_runtime_v1(bootstrap,bundle)
+        store=self.__store
+        with bind_artifact_host_current_seal_v3(self,runtime,prepared,intent=intent,permit=permit,
+                data_certificate=data_certificate)as(certificate,now):
+            with store._lock:
+                db=store._db;db.execute('BEGIN IMMEDIATE')
+                try:
+                    original=seal_artifact_draft_model_call_v1(db,prepared=prepared,intent=intent,permit=permit,
+                        issuer=runtime.issuer,graph=self,runtime=runtime,data_certificate=certificate,now=now)
+                    db.commit()
+                except BaseException:
+                    db.rollback();raise
+        return {'status':'sealed','job_id':prepared.job_id,'original_ref':original.original_ref}
 
     def reconcile_current_artifact_draft_model_cost_v1(self, bootstrap, bundle, *, prepared):
         from .runtime.d11_artifact_draft_model_v1 import record_artifact_draft_paid_after_cost_cas_v1
@@ -7377,71 +7486,9 @@ class GraphCoordinator:
         return actual
 
     def record_current_artifact_draft_model_result_v1(self, bootstrap, bundle, *, prepared):
-        from .runtime.d11_artifact_draft_model_v1 import record_artifact_draft_paid_after_cost_cas_v1
-        from .authority_service.d11_artifact_draft_model_v1 import read_current_artifact_draft_model_graph_v1
-        from .authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        from .authority_service.v2_contract import FencePermitV2
-        from .runtime.first_ingress_v2 import trusted_upper
-        runtime = self._current_artifact_draft_runtime_v1(bootstrap, bundle)
-        result, paid = runtime.read_cached_adoption_originals_v1(prepared)
-        fact = runtime.read_cached_cost_fact_v1(prepared.job_id)
-        port, namespace = self.__content_fence_v2, prepared.namespace
-        rr = result.request
-        delivered, state = port.get_fence_operation(namespace=namespace,
-            authority_namespace=rr.authority_namespace, operation_id=rr.read_attempt_id)
-        if (type(delivered) is not FencePermitV2 or state != "finished"
-                or (delivered.authority_id, delivered.namespace, delivered.subject, delivered.holder,
-                    delivered.generation, delivered.operation, delivered.operation_id) !=
-                   (runtime.client_grant.authority_id, rr.authority_namespace, runtime.client_grant.subject,
-                    runtime.client_grant.administrator_holder, prepared.activation_generation, "read", rr.read_attempt_id)
-                or rr.installation_id != runtime.client_grant.installation_id or rr.namespace != namespace):
-            raise UnavailableGuard("artifact original delivery read is not independently confirmed finished; HOLD")
-        now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
-        token, capability = self.grant(bootstrap, actor=prepared.worker_subject, issuer_domain="d11",
-            namespace=namespace, domains=("d11",), activation_generation=prepared.activation_generation,
-            operation_id="artifact-result-archive:" + prepared.call_id)
-        authority = AuthorityContext(prepared.worker_subject, "d11", capability, namespace,
-            tuple(sorted(self.__leases[token][5])), "consolidation", prepared.audiences,
-            "artifact-result-archive.v1", prepared.activation_generation)
-        fresh_read = []
-        def observe(scope):
-            current, observed = port.get_current_background_owner_authority_for_fence_v1(namespace=namespace,
-                authority_namespace=scope.authority_namespace, permit=scope.permit)
-            if (type(current) is not D12CurrentOwnerAuthorityV1 or observed != scope.permit
-                    or current.target_admission is not None
-                    or current.guard.authorization_head.removeprefix("sha256:") != prepared.owner_guard.owner_head_digest):
-                raise UnavailableGuard("artifact archive lost its independently current upstream Owner; HOLD")
-            if not fresh_read:
-                fresh_read.append((scope.operation_id, canonical_digest(scope.permit)))
-            return current.guard
-        def archive():
-            db = self.__store._db
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                owner = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                    (prepared.owner_guard.grant_ref, *namespace.as_tuple)).fetchone()
-                if (owner is None or owner[2] != 1 or owner[0] != prepared.owner_guard.grant_revision
-                        or canonical_digest(json.loads(owner[1])) != prepared.owner_guard.grant_digest):
-                    raise StaleRead("artifact archive actual Graph Owner grant differs from its original prepared guard")
-                current, _, _ = read_current_artifact_draft_model_graph_v1(db, fact.intent, runtime.issuer, now,
-                    installed_bundle=bundle, allow_accounted_result=True)
-                if current != prepared:
-                    raise StaleRead("artifact paired result differs from the actual current prepared worker")
-                original = record_artifact_draft_paid_after_cost_cas_v1(db, prepared=current, fact=fact,
-                    commit=paid, issuer=runtime.issuer, result=result)
-                db.commit()
-                return original
-            except BaseException:
-                db.rollback()
-                raise
-        try:
-            self._authorize(token, authority, frozenset({"d11"}), owner_read=True)
-            original = self._read_v2(authority, archive, fence_observer=observe)
-        finally:
-            self.release_authority_lease(bootstrap, token)
-        return {"status": "recorded", "job_id": prepared.job_id, "paid_original_ref": original.original_ref,
-            "historical_delivery_read_attempt_id": rr.read_attempt_id,
-            "current_archive_read_operation_id": fresh_read[0][0], "current_archive_read_permit_digest": fresh_read[0][1]}
+        from .runtime.artifact_host_result_archive_source_v3 import prepare_current_artifact_host_result_archive_v1
+        runtime=self._current_artifact_draft_runtime_v1(bootstrap,bundle)
+        return prepare_current_artifact_host_result_archive_v1(self,runtime,prepared)
 
     def project_current_owner_stop_reply_v1(self, bootstrap, installed_bundle, *, original_ref, operation_id):
         """One metadata-only W01 attempt for an already accepted Owner stop intent."""
@@ -7615,6 +7662,14 @@ class GraphCoordinator:
                 "operation_id": operation_id, "request_digest": request_digest, "permit_token": permit.token}))
         return {"status": "projected", "operation_id": operation_id}
 
+    def _personal_mesh_domain_write_v1(self, runtime, *, selector, operation, request):
+        from .authority_service.foreground_mesh_contract_v1 import ForegroundMeshActivityRequestV1,OwnerTaskMeshActivityRequestV1
+        if (type(selector) not in (ForegroundMeshActivityRequestV1,OwnerTaskMeshActivityRequestV1)
+                or selector.companion.command != request):
+            raise AuthorityDenied('Personal mesh requires its exact original selector and companion')
+        return self._durable_self_domain_write_v1(runtime,selector=selector.original,operation=operation,
+            request=request,mesh_request=selector)
+
     def _foreground_domain_write_v1(self, runtime, *, selector, operation, request):
         from .authority_service.current_foreground_activity_v1 import (ForegroundActivityRequestV1,
             ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2)
@@ -7655,10 +7710,17 @@ class GraphCoordinator:
             operation_id=owner_source_note_task_cancel_operation_id_v1(authority.namespace,owner_operation_id),
             activity_id=ids['activity_id'],audience_ref='owner',parent_budget_lease_ref=auth.cause.parent_budget_lease_ref)
 
+
     def drive_owner_source_note_task_v1(self, bootstrap, installed_bundle, *, authorization_original_ref):
-        from .runtime.owner_source_note_task_driver_v1 import drive_owner_source_note_task_v1
-        return drive_owner_source_note_task_v1(self,bootstrap,installed_bundle,
-            authorization_original_ref=authorization_original_ref)
+        self._admin(bootstrap)
+        from .runtime.owner_source_note_task_driver_v1 import _task
+        auth, _, _, _ = _task(self, installed_bundle, authorization_original_ref)
+        if self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise ValueError("Owner task wake changed its actual installed runtime")
+        wake = self._GraphCoordinator__domain_followup_wake_v1
+        if wake is None: raise ValueError("actual asynchronous Owner task driver is not installed")
+        wake()
+        return {"status": "scheduled", "authorization_original_ref": auth.original_ref}
 
     def create_owner_source_note_task_v1(self, bootstrap, installed_bundle, *, authorization_original_ref):
         from .runtime.owner_source_note_task_contract_v1 import (CreateOwnerSourceNoteTaskRequestV1,
@@ -7766,7 +7828,7 @@ class GraphCoordinator:
             raise AuthorityDenied('Owner task requires its exact independently qualified selector')
         return self._durable_self_domain_write_v1(runtime, selector=selector, operation=operation, request=request)
 
-    def _durable_self_domain_write_v1(self, runtime, *, selector, operation, request):
+    def _durable_self_domain_write_v1(self, runtime, *, selector, operation, request, mesh_request=None):
         """Fixed W01 consumer of independently issued foreground facts and one durable attempt."""
         from .authority_service.current_foreground_activity_v1 import (
             ForegroundActivityRequestV1, ForegroundActivityRequestV2, ForegroundActivityPreparationParentRequestV2,
@@ -7784,6 +7846,15 @@ class GraphCoordinator:
         typed_digest = owner_task_typed_command_digest_v1 if owner_task else foreground_typed_command_digest_v1
         issue = owner_source_note_task_for_fence_v1 if owner_task else foreground_activity_for_fence_v1
         reobserve = reobserve_owner_source_note_task_v1 if owner_task else reobserve_foreground_activity_v1
+        if mesh_request is not None:
+            from .authority_service.foreground_mesh_contract_v1 import ForegroundMeshActivityRequestV1,OwnerTaskMeshActivityRequestV1
+            from .runtime.foreground_mesh_issuance_v1 import personal_mesh_activity_for_fence_v1,reobserve_personal_mesh_activity_v1
+            expected = OwnerTaskMeshActivityRequestV1 if owner_task else ForegroundMeshActivityRequestV1
+            if (type(mesh_request) is not expected or mesh_request.original != selector
+                    or mesh_request.companion.command != request):
+                raise AuthorityDenied('Personal mesh changed its actual original typed command')
+            issue = lambda graph,scope,request: personal_mesh_activity_for_fence_v1(graph,scope=scope,request=mesh_request)
+            reobserve = reobserve_personal_mesh_activity_v1
         read_receipt = self._read_saved_owner_task_receipt_v1 if owner_task else self._read_saved_foreground_receipt_v1
         if (type(runtime) is not InstalledDomainOperationRuntimeV1
                 or runtime is not self.__domain_production_runtime_v1 or runtime.graph is not self
@@ -7816,12 +7887,19 @@ class GraphCoordinator:
                 db = store._db
                 db.execute("BEGIN")
                 try:
-                    original = read_adopted_domain_operation_v1(db, namespace, operation_id)
-                    if (original is None or original["domain"] != operation.domain
-                            or original["operation_kind"] != operation.operation_kind
-                            or decode_typed_production_value_v1(original["payload"]["request"], operation.request_type) != request
-                            or saved[1] != attempt_prefix + saved[0][:48]):
-                        raise EventConflict("foreground committed replay changed its actual original command/attempt")
+                    if operation.operation_kind == "prepare_personal_candidate_eligibility_v1":
+                        original=db.execute("SELECT domain,operation_kind,request_digest,original_digest,bundle_digest,receipt_digest "
+                            "FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND operation_id=?",
+                            (*namespace.as_tuple,operation_id)).fetchone()
+                        if original is None or original[:2]!=(operation.domain,operation.operation_kind) or saved[1]!=attempt_prefix+saved[0][:48]:
+                            raise EventConflict("saved eligibility metadata changed its exact original kind/attempt")
+                    else:
+                        original = read_adopted_domain_operation_v1(db, namespace, operation_id)
+                        if (original is None or original["domain"] != operation.domain
+                                or original["operation_kind"] != operation.operation_kind
+                                or decode_typed_production_value_v1(original["payload"]["request"], operation.request_type) != request
+                                or saved[1] != attempt_prefix + saved[0][:48]):
+                            raise EventConflict("foreground committed replay changed its actual original command/attempt")
                     db.rollback()
                 except BaseException:
                     if db.in_transaction:
@@ -7845,6 +7923,9 @@ class GraphCoordinator:
                     "operation_id": operation_id, "request_digest": saved[0], "permit_token": permit.token})
                 port.finish_fence(scope, request_id="finish:" + attempt_id,
                     request_digest=original_finish_digest)
+            if operation.operation_kind == 'prepare_personal_candidate_eligibility_v1':
+                from .runtime.personal_candidate_eligibility_v1 import begin_personal_eligibility_recovery_read_v1
+                return begin_personal_eligibility_recovery_read_v1(self,runtime,selector=selector,request=request,original=original)
             return read_receipt(selector)
         if saved is not None and saved[:2] != (request_digest, attempt_id):
             raise EventConflict("foreground unresolved operation changed its original selector")
@@ -8129,6 +8210,10 @@ class GraphCoordinator:
                         raise UnavailableGuard("foreground continuation requires its actual existing cycle; HOLD")
                     cancel, holder, fence, expires = job.cancel_epoch, job.lease_holder, job.fence, job.lease_expires_utc
                 operation_id = "foreground-op:" + canonical_digest((ns, c02_operation_id, operation_kind, request))[:40]
+                if operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1"}:
+                    from .runtime.personal_candidate_eligibility_v1 import personal_eligibility_request_id_v1
+                    operation_id = personal_eligibility_request_id_v1(db, ns, request.candidates,
+                        prepare=operation_kind == "prepare_personal_candidate_eligibility_v1")
                 if operation_kind == "prepare_ingress_recall_need_v1":
                     from .runtime.d06_ingress_recall_v1 import ingress_recall_need_operation_id_v1
                     operation_id = ingress_recall_need_operation_id_v1(ns, c02_operation_id)
@@ -8357,6 +8442,10 @@ class GraphCoordinator:
                         foreground_typed_command_digest_v1(operation, request), root.lease_id,
                         purpose, (identity["conversation_ref"],), deadline, draft_root_registration_ref=root_ref,
                         worker_holder=holder, worker_fence=fence, worker_lease_expires_utc=expires)
+                if operation_kind in {"prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1"}:
+                    selector = replace(selector, plan_ref=request.candidates.plan_ref)
+                elif operation_kind in {"prepare_personal_candidates_v1", "select_personal_step_v2"}:
+                    selector = replace(selector, plan_ref=request.plan_ref)
                 db.rollback()
                 return selector
             except BaseException:
@@ -8798,71 +8887,68 @@ class GraphCoordinator:
         return self.run_current_post_c02_artifact_task_setup_v1(bootstrap, installed_bundle,
             c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind="revise_artifact_task_plan_v2")
 
-    def prepare_current_post_c02_artifact_phase_choice_v3(self, bootstrap, installed_bundle, *,
-            c02_operation_id, source_ref):
-        """Run the bounded approved preparation and select its actual immutable Decision."""
-        from .runtime.d08_personal_candidate_v1 import CurrentArtifactTaskChoiceRequestV2
-        from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelReadersV1
-        from .runtime.artifact_phase_postconditions_v1 import (FreezeArtifactCandidatePreparationRequestV1,
-            candidate_preparation_parent_for_graph_v1, install_artifact_phase_postcondition_readers_v1)
-        from .domains.d08.personal_candidate_v1 import SelectCurrentPersonalStepRequestV2
-        arguments = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
-        runtime = self.__domain_production_runtime_v1
-        def commit(operation_kind, request):
-            selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle,
-                operation_kind=operation_kind, request=request, **arguments)
-            adopted = runtime.run_foreground_current(selector=selector, operation_kind=operation_kind, request=request)
-            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
-                raise UnavailableGuard("artifact preparation stopped at its actual incomplete " + operation_kind + "; HOLD")
-            return adopted
-        pre = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, installed_bundle, **arguments)
-        commit("input:register_artifact_task_text_extent", pre.extent_request)
-        pre = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, installed_bundle, **arguments)
-        for request in pre.policy_requests:
-            commit("input:register_artifact_phase_postcondition_policy_v1", request)
-        material = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, installed_bundle,
-            complete=True, **arguments)
-        # New method facts are a prospective prerequisite, before either D01 child.
-        # Old task encoders retain their original path and template commitments.
+
+    def read_current_post_c02_artifact_method_prerequisites_v1(self, bootstrap, bundle, *,
+            material, c02_operation_id, source_ref):
+        self._read_post_c02_foreground_cycle_v1(bootstrap, bundle,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
         with self.__store._lock:
-            encoded_version = self.__store._db.execute("SELECT json_extract(evidence_json,'$.c1_task_result_v1.template_version') "
+            encoded = self.__store._db.execute("SELECT json_extract(evidence_json,'$.c1_task_result_v1.template_version') "
                 "FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?",
-                (*installed_bundle.installation_policy.namespace.as_tuple,c02_operation_id)).fetchone()
-        from .model_broker.first_ingress_encoding import (FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION,
-            FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION)
-        if encoded_version is not None and encoded_version[0] in {FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION,FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION}:
-            from .runtime.d02_method_readiness_v1 import QuoteCurrentMethodChoicesRequestV1, method_readiness_operation_id_v1
-            from .runtime.d07_method_conditions_v1 import AdoptCurrentC1MethodConditionsRequestV1
-            from .runtime.ingress_artifact_task_scope_v1 import task_scope_ref_v1
-            commit("quote_current_method_choices_v1",QuoteCurrentMethodChoicesRequestV1(material.selector))
-            commit("adopt_current_c1_method_conditions_v1",AdoptCurrentC1MethodConditionsRequestV1(c02_operation_id,
-                task_scope_ref_v1(material.selector.root_registration_ref),material.goal_head.key.token,material.goal_head.revision,
-                method_readiness_operation_id_v1(material.selector,material.plan_head)))
-        model_readers = InstalledArtifactDraftModelReadersV1(self.__d11_issuer, installed_bundle,
-            self.__artifact_draft_model_runtime_v1)
-        postconditions = install_artifact_phase_postcondition_readers_v1(graph=self, bootstrap=bootstrap,
-            bundle=installed_bundle, model_readers=model_readers)
-        with self.__store._lock:
-            db = self.__store._db
-            db.execute("BEGIN")
-            try:
-                parent_pipeline = candidate_preparation_parent_for_graph_v1(self,
-                    request=CurrentArtifactTaskChoiceRequestV2(material.selector), installed_readers=postconditions)
-            finally:
-                db.rollback()
-        with parent_pipeline:
-            parent = commit("input:freeze_artifact_candidate_preparation_v1",
-                FreezeArtifactCandidatePreparationRequestV1(material.selector))
-            freeze = commit("input:freeze_values", material.freeze_request)
-            evaluated = commit("evaluate_values", material.evaluate_request)
-            prepared = commit("prepare_personal_candidates_v1", material.prepare_request)
-            selected = commit("select_personal_step_v2", SelectCurrentPersonalStepRequestV2(
-                material.plan_head.key.token, material.goal_head.key.token, dict(material.ids)["prepare"]))
-        phase = self.read_current_post_c02_artifact_phase_resume_v2(bootstrap, installed_bundle, **arguments)
-        if phase is None:
-            raise UnavailableGuard("actual adopted method Decision has no current phase group; HOLD")
-        return {"status": "selected", "selector": phase["selector"], "parent": parent,
-            "freeze": freeze, "evaluation": evaluated, "preparation": prepared, "selection": selected}
+                (*bundle.installation_policy.namespace.as_tuple, c02_operation_id)).fetchone()
+        from .model_broker.first_ingress_encoding import FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION, FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION
+        if encoded is None or encoded[0] not in {FIRST_INGRESS_METHOD_ENCODING_TEMPLATE_VERSION, FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION}:
+            return ()
+        from .runtime.d02_method_readiness_v1 import QuoteCurrentMethodChoicesRequestV1, method_readiness_operation_id_v1
+        from .runtime.d07_method_conditions_v1 import AdoptCurrentC1MethodConditionsRequestV1
+        from .runtime.ingress_artifact_task_scope_v1 import task_scope_ref_v1
+        return (("quote_current_method_choices_v1", QuoteCurrentMethodChoicesRequestV1(material.selector)),
+            ("adopt_current_c1_method_conditions_v1", AdoptCurrentC1MethodConditionsRequestV1(c02_operation_id,
+                task_scope_ref_v1(material.selector.root_registration_ref), material.goal_head.key.token,
+                material.goal_head.revision, method_readiness_operation_id_v1(material.selector, material.plan_head))))
+
+    def run_current_post_c02_artifact_preparation_step_v1(self, bootstrap, bundle, *,
+            operation_kind, request, c02_operation_id, source_ref):
+        from contextlib import ExitStack
+        from .graph_worker import GraphStorageWorkV3
+        allowed = {"input:register_artifact_task_text_extent", "input:register_artifact_phase_postcondition_policy_v1",
+            "quote_current_method_choices_v1", "adopt_current_c1_method_conditions_v1",
+            "input:freeze_artifact_candidate_preparation_v1", "input:freeze_values", "evaluate_values",
+            "prepare_personal_candidates_v1", "select_personal_step_v2"}
+        if operation_kind not in allowed:
+            raise ValueError("unregistered exact artifact preparation step")
+        runtime = self.__domain_production_runtime_v1
+        parent_steps = {"input:freeze_artifact_candidate_preparation_v1", "input:freeze_values", "evaluate_values",
+            "prepare_personal_candidates_v1", "select_personal_step_v2"}
+        lifetime = ExitStack()
+        try:
+            if operation_kind in parent_steps:
+                from .runtime.d08_personal_candidate_v1 import CurrentArtifactTaskChoiceRequestV2
+                from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelReadersV1
+                from .runtime.artifact_phase_postconditions_v1 import candidate_preparation_parent_for_graph_v1, install_artifact_phase_postcondition_readers_v1
+                material = self.read_current_post_c02_artifact_task_choice_material_v3(bootstrap, bundle,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref, complete=True)
+                model_readers = InstalledArtifactDraftModelReadersV1(self.__d11_issuer, bundle, self.__artifact_draft_model_runtime_v1)
+                readers = install_artifact_phase_postcondition_readers_v1(graph=self, bootstrap=bootstrap,
+                    bundle=bundle, model_readers=model_readers)
+                with self.__store._lock:
+                    db = self.__store._db; db.execute("BEGIN")
+                    try:
+                        context = candidate_preparation_parent_for_graph_v1(self,
+                            request=CurrentArtifactTaskChoiceRequestV2(material.selector), installed_readers=readers)
+                    finally: db.rollback()
+                lifetime.enter_context(context)
+            selector = self._post_c02_foreground_selector_v1(bootstrap, bundle, c02_operation_id=c02_operation_id,
+                source_ref=source_ref, operation_kind=operation_kind, request=request)
+            result = runtime.run_foreground_current(selector=selector, operation_kind=operation_kind, request=request)
+            if type(result) is GraphStorageWorkV3:
+                result.hold_request_lifetime_v3(lifetime)
+                return result
+        except BaseException:
+            lifetime.close()
+            raise
+        lifetime.close()
+        return result
 
     def _read_current_artifact_task_checkpoint_activation_v1(self, db, *, namespace, phase):
         from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
@@ -10513,7 +10599,8 @@ class GraphCoordinator:
 
     def _owner_domain_write_v3(self, authority, lease, *, operation_id,
                                request_digest, domains, capability, commit, fence_context=None, background_original=None,
-                               new_work_admission=None, storage_prepare=None, storage_work=None):
+                               new_work_admission=None, storage_prepare=None, storage_work=None, contact_plan_prepare=None, contact_plan_parent=None,
+                               contact_owner_source=None,job_cancel_prepare=None,numeric_paid_prepare=None):
         """Keep a current Owner write and its original unknown attempt durable.
 
         ``commit`` is a W01-owned transaction implementation, never a public
@@ -10523,6 +10610,34 @@ class GraphCoordinator:
         from .runtime.restore_anchor import RestoreAnchor
         from .runtime.first_ingress_v2 import trusted_upper
 
+        if numeric_paid_prepare is not None:
+            from .runtime.current_life_numeric_paid_write_v3 import _NumericPaidWriteCapsuleV3,require_numeric_paid_write_work_v3
+            if type(numeric_paid_prepare)is not _NumericPaidWriteCapsuleV3:
+                raise AuthorityDenied("Numeric paid requires its actual independent preparation capsule")
+            paid_reader=require_numeric_paid_write_work_v3(numeric_paid_prepare.reader)
+            if (paid_reader.authority is not authority or paid_reader.lease is not lease
+                    or paid_reader.numeric_paid_operation_id!=operation_id or paid_reader.request_digest!=request_digest
+                    or capability!="workbench.create" or tuple(domains)!=("d11",)
+                    or any(item is not None for item in (background_original,storage_prepare,contact_plan_prepare,contact_owner_source,job_cancel_prepare))):
+                raise AuthorityDenied("Numeric paid preparation crossed its exact current writer")
+        if job_cancel_prepare is not None:
+            from .runtime.current_owner_job_cancel_v3 import _JobCancelCapsuleV3,require_current_job_cancel_work_v3
+            if type(job_cancel_prepare)is not _JobCancelCapsuleV3:
+                raise AuthorityDenied("D12 cancel requires its actual private preparation capsule")
+            cancel_reader=require_current_job_cancel_work_v3(job_cancel_prepare.reader)
+            if (cancel_reader.authority is not authority or cancel_reader.lease is not lease
+                    or cancel_reader.operation_id!=operation_id or cancel_reader.request_digest!=request_digest
+                    or capability!="workbench.control"or tuple(domains)!=("d11",)
+                    or any(item is not None for item in (background_original,storage_prepare,contact_plan_prepare,contact_owner_source))):
+                raise AuthorityDenied("D12 cancel preparation crossed its exact Owner command")
+        if contact_owner_source is not None:
+            from .runtime.contact_owner_command_source_v3 import require_contact_owner_command_source_v3
+            command=require_contact_owner_command_source_v3(contact_owner_source.owner_command,state=contact_owner_source)
+            if (background_original is not None or storage_prepare is not None or contact_plan_prepare is not None
+                    or command.authority is not authority or command.lease is not lease
+                    or command.operation_id!=operation_id or not contact_owner_source.complete
+                    or contact_owner_source.result is None):
+                raise AuthorityDenied('Contact Owner WRITE requires its exact completed native Source command')
         if background_original is None:
             self._authorize(lease, authority, frozenset(domains), owner_read=True)
             owner = self.__owner_leases.get(lease)
@@ -10538,16 +10653,33 @@ class GraphCoordinator:
         from .runtime.contact_final_ack_v1 import (contact_owner_call_v1,
             verify_contact_before_finish_v1, require_contact_finish_ack_v1,
             read_finished_contact_recovery_v1, _issue_saved_contact_recovery_v1)
+        from .runtime.contact_background_invocation_v1 import contact_background_call_v1, _ContactBackgroundCallV1
         contact_call = contact_owner_call_v1(self, authority, lease, operation_id, request_digest)
+        background_contact_call = contact_background_call_v1(self, authority, lease, operation_id, request_digest)
+        if contact_call is not None and background_contact_call is not None:
+            raise ValueError('Contact invocation cannot have both session and background originals')
+        if background_contact_call is not None:
+            contact_call = background_contact_call
         attempt_id = "owner-domain-" + canonical_digest((
             namespace, operation_id, request_digest))[:48]
-        with store._lock:
+        with store._lock,(runtime_storage_quantum_v3(store._db)if job_cancel_prepare is not None or numeric_paid_prepare is not None else nullcontext()):
             metadata, epoch = self._v2_graph_stamp(namespace)
-            saved = store._db.execute(
-                "SELECT request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,"
-                "permit_json,receipt_json FROM graph_owner_domain_attempts_v3 "
-                "WHERE bot=? AND persona=? AND operation_id=?",
-                namespace.as_tuple + (operation_id,)).fetchone()
+            if numeric_paid_prepare is not None:
+                from .runtime.current_life_numeric_paid_write_v3 import read_current_numeric_paid_attempt_v3
+                saved=read_current_numeric_paid_attempt_v3(numeric_paid_prepare,store._db)
+            elif job_cancel_prepare is not None:
+                from .runtime.current_owner_job_cancel_v3 import read_current_cancel_attempt_v3
+                saved=read_current_cancel_attempt_v3(job_cancel_prepare,store._db)
+            else:
+                saved = store._db.execute(
+                    "SELECT request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,"
+                    "permit_json,receipt_json FROM graph_owner_domain_attempts_v3 "
+                    "WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (operation_id,)).fetchone()
+        if background_original is not None:
+            from .runtime.contact_continuation_readback_v1 import require_contact_continuation_saved_recovery_attempt_v1
+            require_contact_continuation_saved_recovery_attempt_v1(self,background_original,authority,
+                operation_id=operation_id,request_digest=request_digest,saved=saved)
         target = metadata.requirements
         anchor = port.current_anchor(namespace=namespace,
                                      authority_namespace=target.authority_namespace)
@@ -10567,7 +10699,7 @@ class GraphCoordinator:
                 with store._lock:
                     new_work_admission(store._db)
             with store._lock, (runtime_storage_quantum_v3(store._db)
-                    if storage_prepare is not None else nullcontext()):
+                    if storage_prepare is not None or job_cancel_prepare is not None or numeric_paid_prepare is not None else nullcontext()):
                 db = store._db
                 db.execute("BEGIN IMMEDIATE")
                 try:
@@ -10634,10 +10766,32 @@ class GraphCoordinator:
             "schema": "w01.owner-domain-write.v3", "operation_id": operation_id,
             "request_digest": request_digest, "permit_token": permit.token})
         if saved is not None and saved[6] is not None:
+            if numeric_paid_prepare is not None:
+                from .runtime.current_life_numeric_paid_write_v3 import replay_current_numeric_paid_original_v3
+                port.finish_fence(scope,request_id=finish_id,request_digest=finish_digest)
+                observed,state=port.get_fence_operation(namespace=namespace,authority_namespace=target.authority_namespace,operation_id=attempt_id)
+                if observed!=permit or state!="finished":
+                    raise UnavailableGuard("Numeric paid original WRITE finish acknowledgement is unresolved; HOLD")
+                replay_now=trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+                with store._lock,runtime_storage_quantum_v3(store._db):
+                    return replay_current_numeric_paid_original_v3(numeric_paid_prepare,store._db,permit=permit,state=state,now=replay_now)
+            if job_cancel_prepare is not None:
+                from .runtime.current_owner_job_cancel_v3 import replay_current_cancel_original_v3
+                port.finish_fence(scope,request_id=finish_id,request_digest=finish_digest)
+                observed,state=port.get_fence_operation(namespace=namespace,authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+                if observed!=permit or state!="finished":
+                    raise UnavailableGuard("D12 cancel original WRITE finish acknowledgement is unresolved; HOLD")
+                replay_now=trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+                with store._lock,runtime_storage_quantum_v3(store._db):
+                    return replay_current_cancel_original_v3(job_cancel_prepare,store._db,permit=permit,state=state,now=replay_now)
             saved_result = json.loads(saved[6])
             if (saved_result.get('operation_kind') in {'prepare_contact_dispatch','prepare_contact_dispatch_v3'}
                     and contact_call is None):
                 raise ValueError('Contact saved receipt requires its exact installed recovery invocation')
+            if type(contact_call) is _ContactBackgroundCallV1:
+                from .runtime.contact_background_invocation_v1 import recover_contact_background_saved_v1
+                return recover_contact_background_saved_v1(contact_call,scope,saved_result,state)
             if contact_call is not None:
                 if state == 'finished':
                     return read_finished_contact_recovery_v1(contact_call,scope,saved_result,
@@ -10678,14 +10832,36 @@ class GraphCoordinator:
                 owner_session_proof=proof)
         if state != "active" or port.validate_fence(scope) != permit:
             raise UnavailableGuard("Owner domain original write is not active; HOLD")
-        with store._lock:
+        with store._lock,(runtime_storage_quantum_v3(store._db)if job_cancel_prepare is not None or numeric_paid_prepare is not None else nullcontext()):
             store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? "
                 "WHERE bot=? AND persona=? AND operation_id=? AND attempt_id=? AND permit_json IS NULL",
                 (canonical_json(to_wire(permit)), *namespace.as_tuple, operation_id, attempt_id))
             if new_work_admission is not None:
                 new_work_admission(store._db)
         try:
-            if background_original is None:
+            contact_owner_birth=nullcontext()
+            if contact_owner_source is not None:
+                token,session_request=proof
+                current_authority,current_permit=port.get_current_owner_authority_for_fence_v1(
+                    namespace=namespace,authority_namespace=scope.authority_namespace,permit=scope.permit,
+                    owner_actor_id=authority.actor,owner_session_token=token,owner_session_request=session_request)
+                from .authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
+                if type(current_authority)is not D12CurrentOwnerAuthorityV1 or current_permit!=scope.permit:
+                    raise AuthorityDenied('Contact Owner WRITE has no actual current session Authority')
+                _guard,current_owner=current_authority.guard,owner
+                from .runtime.contact_owner_command_source_v3 import bind_contact_owner_source_write_birth_v3
+                contact_owner_birth=bind_contact_owner_source_write_birth_v3(
+                    _CONTACT_OWNER_DOMAIN_WRITE_ISSUER_V3,self,runtime=self.__domain_production_runtime_v1,
+                    state=contact_owner_source,authority=authority,lease=lease,operation_id=operation_id,
+                    request_digest=request_digest,attempt_id=attempt_id,scope=scope,current_authority=current_authority,
+                    owner=owner,owner_session_proof=proof,metadata=metadata,epoch=epoch)
+            elif numeric_paid_prepare is not None:
+                from .runtime.current_life_numeric_paid_write_v3 import observe_current_numeric_paid_owner_write_v3
+                _guard,current_owner=observe_current_numeric_paid_owner_write_v3(numeric_paid_prepare,self,authority,lease,scope,owner,proof)
+            elif job_cancel_prepare is not None:
+                from .runtime.current_owner_job_cancel_v3 import observe_current_cancel_owner_write_v3
+                _guard,current_owner=observe_current_cancel_owner_write_v3(job_cancel_prepare,self,authority,lease,scope,owner,proof)
+            elif background_original is None:
                 _guard, current_owner = self._owner_binding_in_fence(
                     authority, scope, owner.principal, owner, proof)
             else:
@@ -10695,13 +10871,30 @@ class GraphCoordinator:
                     raise AuthorityDenied("current background Owner capability is unavailable")
             context = (fence_context(scope, _guard, current_owner)
                        if fence_context is not None else nullcontext())
-            contact_session_observation = None
-            if contact_call is not None:
-                from .runtime.contact_final_stage_v3 import PrepareCurrentContactDispatchRequestV3
-                if type(contact_call.request) is PrepareCurrentContactDispatchRequestV3:
-                    from .runtime.contact_owner_invocation_v3 import capture_contact_owner_invocation_v3
-                    contact_session_observation = capture_contact_owner_invocation_v3(
-                        contact_call, scope, owner, proof)
+            if contact_plan_prepare is not None:
+                from .runtime.domain_background_read_v3 import require_actual_background_attachment_owner_v3
+                from .runtime.contact_plan_physical_write_v3 import PreparedContactPlanPhysicalV3
+                parent = require_actual_background_attachment_owner_v3(contact_plan_parent,db=store._db)
+                if (storage_prepare is not None or parent.graph is not self or parent.kind!='followup_child'
+                        or not parent.sealed or parent.operation.closed or parent.local_result[7][0]!=operation_id):
+                    raise AuthorityDenied('Contact Plan WRITE preparation requires its exact retained child Work')
+                with context,store._lock,runtime_storage_quantum_v3(store._db):
+                    db = store._db
+                    db.execute('BEGIN')
+                    try:
+                        if self._v2_graph_stamp(namespace)!=(metadata,epoch):
+                            raise StaleRead('Contact Plan selected Graph changed before WRITE preparation')
+                        if self._owner_graph_binding_locked(authority,owner.principal,
+                                target_admission=current_owner.target_admission,storage_admission=current_owner.storage_admission,
+                                current_guard=_guard)!=current_owner:
+                            raise StaleRead('Contact Plan actual current Owner changed before WRITE preparation')
+                        prepared = contact_plan_prepare(db,metadata,epoch,parent.now,current_owner,scope)
+                        if type(prepared) is not PreparedContactPlanPhysicalV3 or prepared.parent is not parent:
+                            raise AuthorityDenied('Contact Plan physical preparation crossed its actual child Work')
+                        prepared.fence_context,prepared.finish_id,prepared.finish_digest = fence_context,finish_id,finish_digest
+                    finally:
+                        db.rollback()
+                return prepared
             if storage_prepare is not None:
                 from contextlib import ExitStack
                 from .graph_worker import GraphStorageWorkV3
@@ -10743,24 +10936,53 @@ class GraphCoordinator:
                     return storage_work
                 finally:
                     lifetime.close()
-            with context:
+            # Persist the actual WRITE permit before installed observers enter.
+            with store._lock,(runtime_storage_quantum_v3(store._db)if job_cancel_prepare is not None or numeric_paid_prepare is not None else nullcontext()):
+                store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? "
+                    "WHERE bot=? AND persona=? AND operation_id=? AND permit_json IS NULL",
+                    (canonical_json(to_wire(permit)),*namespace.as_tuple,operation_id))
+            from .runtime.current_habit_owner_write_v3 import observe_current_habit_owner_write_v3
+            habit_owner_write = observe_current_habit_owner_write_v3(self,
+                self.__habit_owner_write_issuer_v3, authority=authority, lease=lease,
+                scope=scope, guard=_guard, current_owner=current_owner, original_owner=owner,
+                session_proof=proof, metadata=metadata, epoch=epoch, operation_id=operation_id,
+                request_digest=request_digest, attempt_id=attempt_id, background_original=background_original)
+            with contact_owner_birth,habit_owner_write,context:
+                contact_session_observation = None
+                contact_background_observation = None
+                if type(contact_call) is _ContactBackgroundCallV1:
+                    from .runtime.contact_background_invocation_v1 import capture_contact_background_invocation_v1
+                    contact_background_observation = capture_contact_background_invocation_v1(contact_call,scope,current_owner)
+                elif contact_call is not None:
+                    from .runtime.contact_final_stage_v3 import PrepareCurrentContactDispatchRequestV3
+                    if type(contact_call.request) is PrepareCurrentContactDispatchRequestV3:
+                        from .runtime.contact_owner_invocation_v3 import capture_contact_owner_invocation_v3
+                        contact_session_observation = capture_contact_owner_invocation_v3(
+                            contact_call, scope, owner, proof)
                 # Form a new frame from current time after acquiring its
                 # installed context; existing signed deadlines stay intact.
                 clock = port.read_ingress_clock(self.__scene_clock_policy)
                 now = trusted_upper(clock)
-                with store._lock:
+                with store._lock,(runtime_storage_quantum_v3(store._db)if job_cancel_prepare is not None or numeric_paid_prepare is not None else nullcontext()):
                     db = store._db
-                    # Save the real permit independently of the business transaction.
-                    db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? "
-                               "WHERE bot=? AND persona=? AND operation_id=? AND permit_json IS NULL",
-                               (canonical_json(to_wire(permit)), *namespace.as_tuple, operation_id))
                     db.execute("BEGIN IMMEDIATE")
                     try:
                         if self._v2_graph_stamp(namespace) != (metadata, epoch):
                             raise StaleRead("Owner domain graph changed before write")
-                        if self._owner_graph_binding_locked(authority, owner.principal,
+                        if contact_owner_source is not None:
+                            from .runtime.contact_owner_command_source_v3 import require_contact_owner_source_write_v3
+                            binding=require_contact_owner_source_write_v3(contact_owner_source,db)
+                            if binding.owner_entry.require_for_v3(contact_owner_source,write=binding)!=(_guard,current_owner):
+                                raise StaleRead('Contact Owner fresh WRITE full metadata binding changed')
+                        elif job_cancel_prepare is None and numeric_paid_prepare is None and self._owner_graph_binding_locked(authority, owner.principal,
                                 target_admission=current_owner.target_admission, storage_admission=current_owner.storage_admission, current_guard=_guard) != current_owner:
                             raise StaleRead("Owner domain graph grant changed")
+                        if numeric_paid_prepare is not None:
+                            numeric_paid_prepare.require_write_v3(self,authority=authority,lease=lease,operation_id=operation_id,
+                                request_digest=request_digest,metadata=metadata,epoch=epoch,owner=current_owner,guard=_guard,scope=scope,now=now)
+                        if job_cancel_prepare is not None:
+                            job_cancel_prepare.require_write_v3(self,authority=authority,lease=lease,operation_id=operation_id,
+                                request_digest=request_digest,metadata=metadata,epoch=epoch,owner=current_owner,guard=_guard,scope=scope,now=now)
                         result = commit(db, metadata, epoch, now, current_owner, scope)
                         db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? "
                                    "WHERE bot=? AND persona=? AND operation_id=? AND receipt_json IS NULL",
@@ -10771,6 +10993,9 @@ class GraphCoordinator:
                             from .runtime.contact_owner_invocation_v3 import record_contact_owner_invocation_v3
                             record_contact_owner_invocation_v3(db, contact_call, scope,
                                 result, current_owner, contact_session_observation)
+                        if contact_background_observation is not None:
+                            from .runtime.contact_background_invocation_v1 import record_contact_background_invocation_v1
+                            record_contact_background_invocation_v1(db,contact_call,scope,result,current_owner,contact_background_observation)
                         db.execute("COMMIT")
                     except BaseException:
                         if db.in_transaction:
@@ -10853,15 +11078,81 @@ class GraphCoordinator:
         from .runtime.d07_graph_stages_v1 import seal_current_d07_egress_v1
         return seal_current_d07_egress_v1(self, bootstrap, bundle, job_id=job_id, intent=intent, permit=permit)
 
-    def consume_current_domain_followup_v1(self, bootstrap, bundle, *, dedupe_key):
+    def read_current_habit_schedule_v3(self, context):
+        """Read actual subscription metadata through its installed Source Work."""
+        from .runtime.current_habit_source_read_v3 import prepare_current_habit_schedule_read_v3
+        return prepare_current_habit_schedule_read_v3(self, context)
+
+    def record_current_habit_window_cue_v1(self, context, selector):
+        """Use the independent Core-qualified cue path, never a caller authority DTO."""
+        from .runtime.current_habit_source_read_v3 import prepare_current_habit_window_cue_write_v3
+        return prepare_current_habit_window_cue_write_v3(self, context, selector)
+
+    def maintain_current_habit_original_v1(self, context, selector):
+        """Admit exact historical metadata maintenance through its own Source Work."""
+        from .runtime.habit_maintenance_source_v3 import prepare_current_habit_original_maintenance_source_v3
+        return prepare_current_habit_original_maintenance_source_v3(self, context, selector=selector)
+
+    def read_current_self_view_v4(self, authority, lease, *, request):
+        """Project current conditioned Self through its own Source-qualified READ."""
+        from .runtime.current_conditioned_self_read_v3 import prepare_current_self_view_source_read_v4
+        return prepare_current_self_view_source_read_v4(self, authority, lease, request=request)
+
+    def read_semantic_recovery_page_v3(self, context, selector):
+        """Read current registered recovery projections without a W01 command."""
+        from .runtime.semantic_recovery_source_v3 import prepare_current_semantic_recovery_page_v3
+        return prepare_current_semantic_recovery_page_v3(self, context, selector)
+
+    def consume_current_domain_followup_v1(self, bootstrap, bundle, *, dedupe_key, context=None):
         from .runtime.domain_followup_consumer_v1 import consume_current_domain_followup_v1
-        return consume_current_domain_followup_v1(self, bootstrap, bundle, dedupe_key=dedupe_key)
+        return consume_current_domain_followup_v1(self, bootstrap, bundle, dedupe_key=dedupe_key, context=context)
 
     def register_current_domain_input_v1(self, authority, lease, *, producer_kind, request,
             operation_id, activity_id, audience_ref, parent_budget_lease_ref):
         return self.run_current_domain_operation_v1(authority, lease, operation_kind="input:" + producer_kind,
             request=request, operation_id=operation_id, activity_id=activity_id,
             audience_ref=audience_ref, parent_budget_lease_ref=parent_budget_lease_ref)
+
+    def prepare_current_life_numeric_result_read_v3(self,authority,lease,*,episode_ref,causal_operation_id,job_id,attempt=1):
+        from .runtime.current_life_numeric_paid_write_v3 import prepare_current_life_numeric_paid_write_v3,NUMERIC_SELECTOR_OPERATION_V3
+        return prepare_current_life_numeric_paid_write_v3(self,authority,lease,operation_kind=NUMERIC_SELECTOR_OPERATION_V3,
+            episode_ref=episode_ref,causal_operation_id=causal_operation_id,job_id=job_id,attempt=attempt)
+
+    def record_current_life_numeric_paid_result_v3(self,authority,lease,*,episode_ref,causal_operation_id,job_id,delivery,fact):
+        from .runtime.current_life_numeric_paid_write_v3 import prepare_current_life_numeric_paid_write_v3,NUMERIC_PAID_OPERATION_V3
+        return prepare_current_life_numeric_paid_write_v3(self,authority,lease,operation_kind=NUMERIC_PAID_OPERATION_V3,
+            episode_ref=episode_ref,causal_operation_id=causal_operation_id,job_id=job_id,delivery=delivery,fact=fact)
+
+    def seal_current_life_numeric_call_v3(self,authority,lease,*,episode_ref,causal_operation_id,job_id,intent,permit):
+        from .runtime.current_life_numeric_paid_write_v3 import prepare_current_life_numeric_call_seal_v3
+        return prepare_current_life_numeric_call_seal_v3(self,authority,lease,episode_ref=episode_ref,
+            causal_operation_id=causal_operation_id,job_id=job_id,intent=intent,permit=permit)
+
+    def read_current_life_numeric_identity_v3(self,authority,lease,*,episode_ref,causal_operation_id):
+        from .runtime.current_life_numeric_read_v3 import (prepare_current_life_numeric_read_v3,
+            ReadCurrentLifeNumericIdentityRequestV3,IDENTITY_READ_V3)
+        return prepare_current_life_numeric_read_v3(self,authority,lease,operation_kind=IDENTITY_READ_V3,
+            request=ReadCurrentLifeNumericIdentityRequestV3(episode_ref,causal_operation_id))
+
+    def read_current_life_numeric_model_draft_v3(self,authority,lease,*,episode_ref,causal_operation_id,job_id):
+        from .runtime.current_life_numeric_read_v3 import (prepare_current_life_numeric_read_v3,
+            ReadCurrentLifeNumericModelDraftRequestV3,DRAFT_READ_V3)
+        return prepare_current_life_numeric_read_v3(self,authority,lease,operation_kind=DRAFT_READ_V3,
+            request=ReadCurrentLifeNumericModelDraftRequestV3(episode_ref,causal_operation_id,job_id))
+
+    def qualify_current_life_numeric_candidate_v3(self,authority,lease,*,episode_ref,causal_operation_id,job_id,candidate,installed_reader):
+        from .runtime.current_life_numeric_read_v3 import (prepare_current_life_numeric_read_v3,
+            QualifyCurrentLifeNumericCandidateRequestV3,CANDIDATE_READ_V3)
+        return prepare_current_life_numeric_read_v3(self,authority,lease,operation_kind=CANDIDATE_READ_V3,
+            request=QualifyCurrentLifeNumericCandidateRequestV3(episode_ref,causal_operation_id,job_id,candidate,installed_reader))
+
+    def read_current_life_numeric_joint_prepared_v3(self,authority,lease,*,request):
+        from .runtime.current_life_numeric_read_v3 import prepare_current_life_numeric_read_v3,JOINT_PREPARED_READ_V3
+        return prepare_current_life_numeric_read_v3(self,authority,lease,operation_kind=JOINT_PREPARED_READ_V3,request=request)
+
+    def read_current_life_numeric_trace_v3(self,authority,lease,*,request,activity_id):
+        from .runtime.current_life_numeric_read_v3 import prepare_current_life_numeric_read_v3,TRACE_READ_V3
+        return prepare_current_life_numeric_read_v3(self,authority,lease,operation_kind=TRACE_READ_V3,request=request,activity_id=activity_id)
 
     def run_current_domain_operation_v1(self, authority, lease, *, operation_kind, request,
             operation_id, activity_id, audience_ref, parent_budget_lease_ref):
@@ -11018,13 +11309,22 @@ class GraphCoordinator:
 
     def adopt_current_life_v1(self, bootstrap, *, namespace, prepared_original_ref):
         from .runtime.d11_life_adoption_v1 import adopt_current_life_v1
-        return adopt_current_life_v1(self, bootstrap, namespace=namespace,
+        result = adopt_current_life_v1(self, bootstrap, namespace=namespace,
             prepared_original_ref=prepared_original_ref)
+        wake = getattr(self, "_GraphCoordinator__domain_followup_wake_v1", None)
+        if callable(wake):
+            wake()
+        return result
 
     def run_prepared_source_note_v1(self, bootstrap, *, namespace, prepared_original_ref):
         from .runtime.d11_life_driver_v1 import run_prepared_source_note_v1
-        return run_prepared_source_note_v1(self, bootstrap, namespace=namespace,
+        result = run_prepared_source_note_v1(self, bootstrap, namespace=namespace,
             prepared_original_ref=prepared_original_ref)
+        if result.adoption is not None:
+            wake = getattr(self, "_GraphCoordinator__domain_followup_wake_v1", None)
+            if callable(wake):
+                wake()
+        return result
 
     def reconcile_historical_offline_tick_cost_v1(self, bootstrap, *, binding):
         from .runtime.d11_offline_historical_accounting_v1 import reconcile_historical_offline_tick_cost_v1
@@ -11325,11 +11625,12 @@ class GraphCoordinator:
         port, store = self.__content_fence_v2, self.__store
         assembly=self.__d04_installed_joint_assembly
         from .host.model_workflows_v7 import AdminModelWorkflowsV7
-        if (assembly is None or type(assembly.admin_bundle.model_workflows) is not AdminModelWorkflowsV7
+        from .host.model_workflows_v8 import AdminModelWorkflowsV8
+        if (assembly is None or type(assembly.admin_bundle.model_workflows) not in {AdminModelWorkflowsV7,AdminModelWorkflowsV8}
                 or policy.algorithm_ref != "d13.full_http_counter.v1"
                 or policy.valid_until_utc > assembly.installation_policy.root_grant.valid_until_utc
                 or policy.cpu_ms_ceiling > dict(assembly.installation_policy.root_grant.max_ceiling).get("cpu_ms",0)):
-            raise UnavailableGuard("D13 counter policy must fit the actual V7 Root and its unchanged limits")
+            raise UnavailableGuard("D13 counter policy must fit the actual V7/V8 Root and its unchanged limits")
         if policy.installation_id != port.installation_grant.installation_id:
             raise UnavailableGuard("D13 counter CPU policy installation differs")
         request_digest = canonical_digest((namespace, operation_id, policy))
@@ -11909,6 +12210,25 @@ class GraphCoordinator:
             "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
             "WHERE bot=? AND persona=?", namespace.as_tuple,
         ).fetchone()
+        return self._owner_graph_binding_from_current_metadata_v3(
+            authority, principal, metadata=metadata, graph_epoch=graph_epoch,
+            atom=atom, proof_row=proof_row, epochs=epochs,
+            target_admission=target_admission, storage_admission=storage_admission,
+            current_guard=current_guard)
+
+    def _owner_graph_binding_from_current_metadata_v3(self, authority, principal, *, metadata,
+            graph_epoch, atom, proof_row, epochs, target_admission=None,
+            storage_admission=None, current_guard=None):
+        """Apply the existing Owner contract to an actual scope-bound metadata read."""
+        from .authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, OwnerPrincipalV1,
+            canonical_digest as owner_contract_digest,
+        )
+
+        if type(principal) is not OwnerPrincipalV1:
+            raise UnavailableGuard("trusted Owner principal is unavailable")
+        namespace = authority.namespace
+        target = metadata.requirements
         if (atom is None or atom[0] != 1 or atom[2] != 1
                 or proof_row is None or epochs is None):
             raise UnavailableGuard("current Owner graph grant is unavailable")
@@ -11963,6 +12283,7 @@ class GraphCoordinator:
             frozenset(grant["purposes"]), frozenset(grant["audiences"]),
             proof.grant_digest, 1, epochs[0], epochs[1], target.graph_incarnation,
             owner_contract_digest(proof), 1, 0, target_admission, storage_admission)
+
 
     def _owner_binding_in_fence(self, authority: AuthorityContext,
                                 scope: FenceScope, principal,
@@ -22787,6 +23108,11 @@ class GraphCoordinator:
             bootstrap, namespace, original_intent, quote_id=quote_id,
             quote_version=quote_version, work_kind="natural_review")
 
+    def commit_current_life_numeric_cost_v3(self,bootstrap,namespace,intent,*,quote_id,quote_version):
+        from .runtime.current_life_numeric_accounting_v3 import prepare_current_life_numeric_accounting_v3
+        return prepare_current_life_numeric_accounting_v3(self,bootstrap,namespace,intent,
+            quote_id=quote_id,quote_version=quote_version)
+
     def _commit_original_model_cost_v1(
         self, bootstrap: object, namespace: NamespaceId, original_intent,
         *, quote_id: str, quote_version: int, work_kind: str,
@@ -22815,6 +23141,13 @@ class GraphCoordinator:
             RUNTIME_SCHEMA,
         )
 
+        from .runtime.contact_cost_metadata_v3 import capture_contact_accounting_operation_v3
+        from .runtime.current_life_numeric_accounting_v3 import (
+            numeric_accounting_state_v3,numeric_accounting_quantum_v3,
+            bind_numeric_accounting_grant_v3,numeric_accounting_attempt_transition_v3,
+            numeric_accounting_graph_cas_v3,numeric_accounting_cost_receipt_v3,numeric_accounting_rollback_v3)
+        from .runtime.natural_producer_qualification_v1 import _producer_original_point_v3
+
         self._admin(bootstrap)
         if (type(namespace) is not NamespaceId
                 or type(original_intent) is not ModelEgressIntentV1
@@ -22826,7 +23159,8 @@ class GraphCoordinator:
             raise UnavailableGuard("installed original model accounting authorities required")
         store, port = self.__store, self.__accounting_maintenance_port
         # The receipt is an Authority fact, never a caller-supplied cost.
-        fact = read_original_model_cost(self.__model_terminal_cost_port, original_intent)
+        numeric_accounting=numeric_accounting_state_v3(self)
+        fact = numeric_accounting.fact if numeric_accounting is not None else read_original_model_cost(self.__model_terminal_cost_port, original_intent)
         if fact.recovery.state != "observed":
             raise UnavailableGuard("unobserved model cost retains original upper bound; HOLD")
         intent_digest = canonical_digest(asdict(original_intent))
@@ -22836,11 +23170,13 @@ class GraphCoordinator:
             namespace, original_intent.call_id)
 
         def business_receipt_locked():
-            row = store._db.execute(
+            row = _producer_original_point_v3(store._db,table='graph_bundle_operations',
+                columns=('activity_id','commit_seq','receipt_json'),key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation_id),
+                legacy_reader=lambda: store._db.execute(
                 "SELECT activity_id,commit_seq,receipt_json "
                 "FROM graph_bundle_operations WHERE bot=? "
                 "AND persona=? AND operation_id=?", namespace.as_tuple + (operation_id,),
-            ).fetchone()
+            ).fetchone())
             if row is None:
                 return None
             data = json.loads(row[2])
@@ -22854,20 +23190,26 @@ class GraphCoordinator:
                     or data.get("work_kind", work_kind) != work_kind):
                 raise EventConflict("original model cost operation identity differs")
             committed = OriginalModelCostCommitV1(**data["original_model_cost"])
-            graph_event = store._db.execute(
+            graph_event = _producer_original_point_v3(store._db,table='graph_events',
+                columns=('1',),key_columns=('bot','persona','session','event_id'),key=(*namespace.as_tuple,row[0],operation_id),
+                legacy_reader=lambda: store._db.execute(
                 "SELECT 1 FROM graph_events WHERE bot=? AND persona=? "
                 "AND session=? AND event_id=?", namespace.as_tuple +
                 (row[0], operation_id),
-            ).fetchone()
-            atom = store._db.execute(
-                "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
+            ).fetchone())
+            atom = _producer_original_point_v3(store._db,table='graph_atoms',
+                columns=('revision','valid'),key_columns=('token',),key=(committed.cost_ref,),
+                legacy_reader=lambda: store._db.execute(
+                "SELECT revision,valid FROM graph_atoms WHERE token=? AND valid=1",
                 (committed.cost_ref,),
-            ).fetchone()
-            budget = store._db.execute(
+            ).fetchone())
+            budget = _producer_original_point_v3(store._db,table='runtime_budget_operations',
+                columns=('1',),key_columns=('bot_id','persona_id','operation_id','phase'),key=(*namespace.as_tuple,original_intent.budget_reservation_operation_id,'settle'),
+                legacy_reader=lambda: store._db.execute(
                 "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? "
                 "AND persona_id=? AND operation_id=? AND phase='settle'",
                 namespace.as_tuple + (original_intent.budget_reservation_operation_id,),
-            ).fetchone()
+            ).fetchone())
             if (committed.status != "committed"
                     or committed.operation_id != operation_id
                     or committed.call_id != original_intent.call_id
@@ -22875,24 +23217,27 @@ class GraphCoordinator:
                     or committed.quote_version != quote_version
                     or committed.terminal_receipt_digest != terminal_digest
                     or committed.commit_seq != row[1]
-                    or graph_event is None or atom is None or budget is None):
+                    or graph_event is None or atom is None or not atom[1] or budget is None):
                 raise UnavailableGuard("original cost business receipt is incomplete")
             return committed
 
-        with store._lock:
+        with store._lock,numeric_accounting_quantum_v3(self):
             committed = business_receipt_locked()
             metadata, _ = self._v2_graph_stamp(namespace)
-            attempt = store._db.execute(
+            attempt = _producer_original_point_v3(store._db,table='graph_original_model_cost_attempts_v1',
+                columns=('intent_digest','attempt_id','anchor_json','state'),key_columns=('bot','persona','call_id'),key=(*namespace.as_tuple,original_intent.call_id),
+                legacy_reader=lambda: store._db.execute(
                 "SELECT intent_digest,attempt_id,anchor_json,state FROM "
                 "graph_original_model_cost_attempts_v1 WHERE bot=? AND persona=? "
                 "AND call_id=?", namespace.as_tuple + (original_intent.call_id,),
-            ).fetchone()
+            ).fetchone())
         if committed is not None:
             if attempt is None or attempt[0] != intent_digest or attempt[3] != "committed":
                 raise UnavailableGuard("committed cost lacks original fence attempt")
             request = AccountingMaintenanceRequestV1(
                 attempt[1], original_intent, RestoreAnchor(**json.loads(attempt[2])))
             port.recover_finish(request)
+            capture_contact_accounting_operation_v3(self,request,None,committed,recovered=True)
             return replace(committed, status="duplicate")
         target = metadata.requirements
         if (original_intent.authority_id != target.authority_id
@@ -22914,7 +23259,7 @@ class GraphCoordinator:
                 # Authority failure remains HOLD rather than minting a new ID.
                 old_grant = port.begin(old_request)
                 port.finish(old_request, old_grant)
-            with store._lock:
+            with store._lock,numeric_accounting_quantum_v3(self):
                 if business_receipt_locked() is not None:
                     raise UnavailableGuard("cost committed during fence recovery; retry")
                 store._db.execute(
@@ -22923,6 +23268,7 @@ class GraphCoordinator:
                     "AND state='open'", namespace.as_tuple +
                     (original_intent.call_id, attempt[1]),
                 )
+                numeric_accounting_attempt_transition_v3(self,old_request,"closed")
 
         # current_anchor is an Authority network read. It is outside the
         # graph lock and can advance past a completed source deletion.
@@ -22932,17 +23278,19 @@ class GraphCoordinator:
             raise UnavailableGuard("accounting Authority anchor differs from graph history")
         attempt_id = "model-cost-fence-" + secrets.token_hex(24)
         request = AccountingMaintenanceRequestV1(attempt_id, original_intent, anchor)
-        with store._lock:
+        with store._lock,numeric_accounting_quantum_v3(self):
             db = store._db
             db.execute("BEGIN IMMEDIATE")
             try:
                 if business_receipt_locked() is not None or self._v2_graph_stamp(namespace)[0] != metadata:
                     raise StaleRead("original cost graph changed before accounting fence")
-                row = db.execute(
+                row = _producer_original_point_v3(store._db,table='graph_original_model_cost_attempts_v1',
+                columns=('state',),key_columns=('bot','persona','call_id'),key=(*namespace.as_tuple,original_intent.call_id),
+                legacy_reader=lambda: db.execute(
                     "SELECT state FROM graph_original_model_cost_attempts_v1 "
                     "WHERE bot=? AND persona=? AND call_id=?",
                     namespace.as_tuple + (original_intent.call_id,),
-                ).fetchone()
+                ).fetchone())
                 if row is not None and row[0] != "closed":
                     raise UnavailableGuard("original cost fence attempt remains open")
                 if attempt is not None and attempt[0] != intent_digest:
@@ -22957,9 +23305,11 @@ class GraphCoordinator:
                     (original_intent.call_id, intent_digest, attempt_id,
                      canonical_json(asdict(anchor))),
                 )
+                numeric_accounting_attempt_transition_v3(self,request,"open")
                 db.commit()
             except BaseException:
                 db.rollback()
+                numeric_accounting_rollback_v3(self)
                 raise
         grant = port.begin(request)
         if type(grant) is not AccountingMaintenanceGrantV1 or (
@@ -22972,10 +23322,11 @@ class GraphCoordinator:
                 or grant.permit.pinned_anchor != anchor):
             raise UnavailableGuard("accounting grant differs from original Authority fact")
         port.validate(request, grant)
+        bind_numeric_accounting_grant_v3(self,request,grant)
 
         result = None
         try:
-            with store._lock:
+            with store._lock,numeric_accounting_quantum_v3(self):
                 db = store._db
                 db.execute("BEGIN IMMEDIATE")
                 try:
@@ -22983,11 +23334,13 @@ class GraphCoordinator:
                     if current != metadata or not self._accounting_anchor_covers(
                             current.requirements, anchor):
                         raise StaleRead("accounting graph stamp changed")
-                    row = db.execute(
+                    row = _producer_original_point_v3(store._db,table='graph_original_model_cost_attempts_v1',
+                columns=('attempt_id','state'),key_columns=('bot','persona','call_id'),key=(*namespace.as_tuple,original_intent.call_id),
+                legacy_reader=lambda: db.execute(
                         "SELECT attempt_id,state FROM graph_original_model_cost_attempts_v1 "
                         "WHERE bot=? AND persona=? AND call_id=?",
                         namespace.as_tuple + (original_intent.call_id,),
-                    ).fetchone()
+                    ).fetchone())
                     if row != (attempt_id, "open") or business_receipt_locked() is not None:
                         raise StaleRead("original cost business operation changed")
                     plan = prepare_original_model_cost_plan(
@@ -23013,10 +23366,12 @@ class GraphCoordinator:
                         "host", "d11", "accounting:" + attempt_id,
                         namespace, ("activity",), "cost_accounting", ("internal",),
                         "original-model-cost-v1", target.activation_generation)
-                    epochs = db.execute(
+                    epochs = _producer_original_point_v3(store._db,table='graph_authority_epochs',
+                columns=('access_epoch','delete_epoch'),key_columns=('bot','persona'),key=namespace.as_tuple,
+                legacy_reader=lambda: db.execute(
                         "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
                         "WHERE bot=? AND persona=?", namespace.as_tuple,
-                    ).fetchone() or (0, 0)
+                    ).fetchone()) or (0, 0)
                     envelope = CommandEnvelope(
                         RUNTIME_SCHEMA, identity, authority,
                         VersionGuard((GraphVersion(write.key, 0),), (), *epochs,
@@ -23053,9 +23408,12 @@ class GraphCoordinator:
                         revocation_epoch=anchor.revocation_epoch)
                     store.cas_graph_recovery_metadata(
                         current, replacement, _capability=self.__graph_capability)
-                    seq_row = db.execute(
+                    numeric_accounting_graph_cas_v3(self,graph_receipt,candidate)
+                    seq_row = _producer_original_point_v3(store._db,table='graph_bundle_sequence',
+                columns=('last_seq',),key_columns=('bot','persona'),key=namespace.as_tuple,
+                legacy_reader=lambda: db.execute(
                         "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?",
-                        namespace.as_tuple).fetchone()
+                        namespace.as_tuple).fetchone())
                     seq = (seq_row[0] if seq_row else 0) + 1
                     db.execute(
                         "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
@@ -23086,27 +23444,33 @@ class GraphCoordinator:
                         "SET state='committed' WHERE bot=? AND persona=? "
                         "AND call_id=? AND attempt_id=?", namespace.as_tuple +
                         (original_intent.call_id, attempt_id))
+                    numeric_accounting_cost_receipt_v3(self,result,receipt_data)
+                    numeric_accounting_attempt_transition_v3(self,request,"committed")
                     db.commit()
                 except BaseException:
                     db.rollback()
+                    numeric_accounting_rollback_v3(self)
                     raise
         except BaseException:
             # The business transaction rolled back. Closing this *attempt*
             # leaves the fixed business operation and reservation untouched.
-            with store._lock:
+            with store._lock,numeric_accounting_quantum_v3(self):
                 committed = business_receipt_locked()
             if committed is not None:
                 port.recover_finish(request)
+                capture_contact_accounting_operation_v3(self,request,grant,committed,recovered=True)
                 return replace(committed, status="duplicate")
             port.finish(request, grant)
-            with store._lock:
+            with store._lock,numeric_accounting_quantum_v3(self):
                 store._db.execute(
                     "UPDATE graph_original_model_cost_attempts_v1 SET state='closed' "
                     "WHERE bot=? AND persona=? AND call_id=? AND attempt_id=? "
                     "AND state='open'", namespace.as_tuple +
                     (original_intent.call_id, attempt_id))
+                numeric_accounting_attempt_transition_v3(self,request,"closed")
             raise
         port.finish(request, grant)
+        capture_contact_accounting_operation_v3(self,request,grant,result)
         return result
 
     def _qualified_first_ingress_acquire_return(
@@ -31888,7 +32252,17 @@ class GraphCoordinator:
             from .runtime.contact_p2_qualification_v1 import (
                 ContactP2GraphProofV1, contact_p2_graph_proof_write_v1,
             )
-            if (type(contact_p2_proof) is not ContactP2GraphProofV1
+            from .runtime.contact_continuation_p2_v1 import (ContactContinuationP2GraphProofV1,contact_continuation_p2_graph_proof_write_v1)
+            if type(contact_p2_proof)is ContactContinuationP2GraphProofV1:
+                if not 1<=claimed_receipt.pending.binding.origin.segment_index<claimed_receipt.pending.binding.origin.segment_count<=3:
+                    raise UnavailableGuard("Contact continuation P2 proof has another actual later-segment binding")
+                contact_p2_graph_proof_write_v1=contact_continuation_p2_graph_proof_write_v1
+            elif type(contact_p2_proof)is ContactP2GraphProofV1:
+                if claimed_receipt.pending.binding.origin.segment_index!=0:
+                    raise UnavailableGuard("First Contact P2 proof cannot become a later-segment carrier")
+            else:
+                raise UnavailableGuard("Unregistered Contact P2 proof type")
+            if ((contact_p2_proof.namespace!=namespace)
                     or (contact_p2_proof.namespace, contact_p2_proof.operation_id,
                         contact_p2_proof.effect_id, contact_p2_proof.activity_id,
                         contact_p2_proof.admission_ref, contact_p2_proof.context_digest,
@@ -36951,7 +37325,7 @@ class GraphCoordinator:
             assembly.package_root, policy.manifest_digest,
             available_cpu_features=assembly.available_cpu_features,
         )
-        if (not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}
+        if (not package.verified or package.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}
                 or package.manifest_digest != policy.manifest_digest):
             raise UnavailableGuard("formal D04 installed package unavailable; HOLD")
         selected_output_policy = load_installed_d04_output_policy_v1(
@@ -37960,6 +38334,34 @@ class GraphCoordinator:
         Its 72-hour check holds at the paired clock sample; D11 must recheck
         freshness before any later use or external dispatch.
         """
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import (d13_paid_current_reader_v3,
+            prepare_d13_paid_original_read_v3, observe_d13_paid_owner_guard_v3)
+        if runtime_storage_v3(self.__store._db) is not None:
+            prepared = d13_paid_current_reader_v3(self.__store._db)
+            if prepared is None:
+                if _worker_scope is not None or _schedule_scope is not None:
+                    raise UnavailableGuard("D13 selected window needs its actual current Source READ Work")
+                return prepare_d13_paid_original_read_v3(self,authority,lease,job_id=None,
+                    method="read_current_d13_conversation_window_v1",
+                    args={"scene_ref":scene_ref,"max_slots":max_slots,"before_sequence":before_sequence})
+            if (prepared.authority != authority or prepared.lease is not lease
+                    or prepared.scene_ref != scene_ref or prepared.current_window is None
+                    or max_slots != prepared.args.get("max_slots",prepared.window_policy.max_slots)
+                    or before_sequence != prepared.args.get("before_sequence")):
+                raise UnavailableGuard("D13 current window facts crossed their actual private caller")
+            if _worker_scope is not None and _schedule_scope is not None:
+                raise UnavailableGuard("D13 current window cannot mix original recovery scopes")
+            scope = _worker_scope or _schedule_scope
+            if scope is not None:
+                if (scope.operation != "write" or scope.namespace != authority.namespace
+                        or scope.permit.holder != self.__holder or scope.generation != authority.activation_generation
+                        or self.__content_fence_v2.validate_fence(scope) != scope.permit
+                        or (self._v2_graph_stamp(authority.namespace)[0].graph_revision != scope.graph_revision
+                            or self._v2_graph_stamp(authority.namespace)[1] != scope.graph_epoch)
+                        or observe_d13_paid_owner_guard_v3(self,authority,scope).authorization_head != prepared.owner_guard_head):
+                    raise UnavailableGuard("D13 current Source window lost its exact original recovery WRITE")
+            return prepared.current_window
         from .authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
         from .host.authority_profile import AdminIngressClockPolicy
         from .host.v2_fence_port import VerifiedIngressClockV2
@@ -38778,6 +39180,11 @@ class GraphCoordinator:
     def prepare_d13_paid_call_v1(self, authority, lease, *, job_id,
                                  timeout_seconds, privacy_tier, lease_seconds=300):
         """Acquire and seal the original worker, or return recovery-only identity."""
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import d13_paid_current_reader_v3, prepare_d13_paid_original_read_v3
+        if runtime_storage_v3(self.__store._db) is not None and d13_paid_current_reader_v3(self.__store._db) is None:
+            return prepare_d13_paid_original_read_v3(self,authority,lease,
+                job_id=job_id,method='prepare_d13_paid_call_v1',args={"job_id":job_id,"timeout_seconds":timeout_seconds,"privacy_tier":privacy_tier,"lease_seconds":lease_seconds})
         from .runtime.d13_paid_product_v1 import prepare_d13_paid_call_graph_v1
         return prepare_d13_paid_call_graph_v1(
             self, authority, lease, job_id=job_id, timeout_seconds=timeout_seconds,
@@ -38785,17 +39192,32 @@ class GraphCoordinator:
 
     def record_d13_paid_result_read_v1(self, authority, lease, *, job_id, intent, read):
         """Authenticate original terminal and persist its read before settlement."""
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import d13_paid_current_reader_v3, prepare_d13_paid_original_read_v3
+        if runtime_storage_v3(self.__store._db) is not None and d13_paid_current_reader_v3(self.__store._db) is None:
+            return prepare_d13_paid_original_read_v3(self,authority,lease,
+                job_id=job_id,method='record_d13_paid_result_read_v1',args={"job_id":job_id,"intent":intent,"read":read})
         from .runtime.d13_paid_product_v1 import record_d13_paid_read_graph_v1
         return record_d13_paid_read_graph_v1(
             self, authority, lease, job_id=job_id, intent=intent, read=read)
 
     def settle_d13_paid_precompression_v1(self, authority, lease, *, job_id):
         """Commit the original paid cost once using its saved Authority evidence."""
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import d13_paid_current_reader_v3, prepare_d13_paid_original_read_v3
+        if runtime_storage_v3(self.__store._db) is not None and d13_paid_current_reader_v3(self.__store._db) is None:
+            return prepare_d13_paid_original_read_v3(self,authority,lease,
+                job_id=job_id,method='settle_d13_paid_precompression_v1',args={"job_id":job_id})
         from .runtime.d13_paid_product_v1 import settle_d13_paid_graph_v1
         return settle_d13_paid_graph_v1(self, authority, lease, job_id=job_id)
 
     def complete_d13_paid_precompression_v1(self, authority, lease, *, job_id, selected_main):
         """Recheck current source/model and atomically complete job plus standby."""
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import d13_paid_current_reader_v3, prepare_d13_paid_original_read_v3
+        if runtime_storage_v3(self.__store._db) is not None and d13_paid_current_reader_v3(self.__store._db) is None:
+            return prepare_d13_paid_original_read_v3(self,authority,lease,
+                job_id=job_id,method='complete_d13_paid_precompression_v1',args={"job_id":job_id,"selected_main":selected_main})
         from .runtime.d13_paid_product_v1 import complete_d13_paid_graph_v1
         from .runtime.d13_derived_product_v6 import complete_d13_paid_derived_graph_v6
         from .host.model_workflows_v6 import AdminModelWorkflowsV6
@@ -38807,7 +39229,8 @@ class GraphCoordinator:
             and bundle.model_workflows.natural_generation.template_version == V6_TEMPLATE)
         from .host.model_workflows_v7 import AdminModelWorkflowsV7
         from .model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
-        actual_v7=(bundle is not None and type(bundle.model_workflows) is AdminModelWorkflowsV7
+        from .host.model_workflows_v8 import AdminModelWorkflowsV8
+        actual_v7=(bundle is not None and type(bundle.model_workflows) in {AdminModelWorkflowsV7,AdminModelWorkflowsV8}
             and bundle.model_workflows.natural_generation is not None
             and bundle.model_workflows.natural_generation.template_version==V7_TEMPLATE)
         # The persisted derived metadata/payload product has the same V1 contract.
@@ -38823,8 +39246,28 @@ class GraphCoordinator:
         return retire_due_d13_derived_graph_v6(self, authority, lease,
             block_ref=block_ref, expected_revision=expected_revision)
 
+    def read_current_d13_completed_paid_block_v3(self, authority, lease, *, job_id):
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import d13_paid_current_reader_v3,prepare_d13_paid_original_read_v3
+        if runtime_storage_v3(self.__store._db) is None:
+            raise UnavailableGuard("D13 completed current body requires its selected Source READ Work")
+        reader=d13_paid_current_reader_v3(self.__store._db)
+        if reader is None:
+            return prepare_d13_paid_original_read_v3(self,authority,lease,job_id=job_id,
+                method="read_current_d13_completed_paid_block_v3",args={"job_id":job_id})
+        if (reader.method!="read_current_d13_completed_paid_block_v3" or reader.authority!=authority
+                or reader.lease is not lease or reader.job_id!=job_id or not reader.complete
+                or reader.completed_read is None or reader.completed_read.value is None):
+            raise UnavailableGuard("D13 completed result crossed its actual qualified exact-job caller")
+        return reader.completed_read.value
+
     def recover_d13_paid_precompression_v1(self, authority, lease, *, job_id):
         """Return only durable original recovery actions; never replace a call."""
+        from .runtime_storage_v3 import runtime_storage_v3
+        from .runtime.d13_paid_original_read_v3 import d13_paid_current_reader_v3, prepare_d13_paid_original_read_v3
+        if runtime_storage_v3(self.__store._db) is not None and d13_paid_current_reader_v3(self.__store._db) is None:
+            return prepare_d13_paid_original_read_v3(self,authority,lease,
+                job_id=job_id,method='recover_d13_paid_precompression_v1',args={"job_id":job_id})
         from .runtime.d13_paid_product_v1 import recover_d13_paid_graph_v1
         return recover_d13_paid_graph_v1(self, authority, lease, job_id=job_id)
 
@@ -39131,8 +39574,11 @@ class GraphCoordinator:
             )
         return budget_receipt, persisted
 
-    def _d13_worker_replay_v2(self, authority, operation_id, request_digest):
+    def _d13_worker_replay_v2(self, authority, operation_id, request_digest, *, derived_retirement=None):
         """Read an exact committed D13 worker result without requiring its old head."""
+        if derived_retirement is not None:
+            from .runtime.d13_derived_retirement_read_v3 import replay_d13_retirement_metadata_v3
+            return replay_d13_retirement_metadata_v3(self,authority,derived_retirement,operation_id,request_digest)
         from .authority_service.v2_contract import from_wire
         from .runtime.restore_anchor import RestoreAnchor
 
@@ -39272,7 +39718,7 @@ class GraphCoordinator:
         return scope
 
     def _d13_worker_write_v2(self, authority, operation_id, request_digest,
-                             commit, *, paid_owner_phase=None):
+                             commit, *, paid_owner_phase=None, derived_retirement=None):
         """Retain the original V2 write before one atomic business transaction."""
         store = self.__store
         port = self.__content_fence_v2
@@ -39284,7 +39730,10 @@ class GraphCoordinator:
             with store._lock:
                 require_committed_paid_owner_guard_link_v3(store._db,namespace=namespace,
                     business_operation_id=operation_id,request_digest=request_digest,phase=paid_owner_phase)
-        prior = self._d13_worker_replay_v2(authority, operation_id, request_digest)
+        if derived_retirement is not None:
+            from .runtime.d13_derived_retirement_read_v3 import require_d13_retirement_producer_v3
+            require_d13_retirement_producer_v3(self,authority,derived_retirement,operation_id,request_digest)
+        prior = self._d13_worker_replay_v2(authority, operation_id, request_digest,derived_retirement=derived_retirement)
         if prior is not None:
             return prior
         with store._lock:
@@ -39351,8 +39800,13 @@ class GraphCoordinator:
                     business_operation_id=operation_id,request_digest=request_digest,phase=paid_owner_phase)
                 if current_permit!=permit or owner_observation.permit!=permit:
                     raise UnavailableGuard('paid Owner original observation crossed its active write Scope; HOLD')
+            if derived_retirement is not None:
+                from .runtime.d13_derived_retirement_read_v3 import observe_d13_retirement_write_v3
+                observe_d13_retirement_write_v3(self,authority,scope,derived_retirement,operation_id,request_digest)
             clock = port.read_ingress_clock(self.__scene_clock_policy)
             trusted_upper(clock)
+            from .runtime.d13_paid_original_read_v3 import require_d13_paid_original_write_clock_v3
+            require_d13_paid_original_write_clock_v3(self,scope,clock)
         except Exception:
             port.finish_fence(
                 scope, request_id="reject:" + attempt_id,
@@ -39370,6 +39824,9 @@ class GraphCoordinator:
                 if self._v2_graph_stamp(namespace) != (metadata, epoch):
                     raise StaleRead("D13 worker graph head changed")
                 now = trusted_upper(clock)
+                if derived_retirement is not None:
+                    from .runtime.d13_derived_retirement_read_v3 import require_d13_retirement_write_in_tx_v3
+                    require_d13_retirement_write_in_tx_v3(self,db,authority,scope,derived_retirement,metadata,epoch,now)
                 result = commit(db, metadata, epoch, now)
                 db.execute(
                     "UPDATE graph_d13_worker_attempts_v2 SET receipt_json=? "
@@ -40858,7 +41315,13 @@ class GraphCoordinator:
             has_contact_v3 = any(w.key.type_name in contact_v3_kinds for w in writes)
             has_contact_v2 = any(w.key.type_name in contact_v2_kinds for w in writes)
             has_contact_batch = any(w.key.type_name == CONTACT_BATCH_SCHEMA_V1 for w in writes)
-            if has_contact_v3:
+            if (type(domain_production_issuance_v1)is _ContactFinalCommitWitnessV3
+                    and domain_production_issuance_v1.stage.material.request.segment_index>0):
+                if (has_contact_v3 or has_contact_v2 or has_contact_batch or natural_final_admission is not None or v2_write is None):
+                    raise UnavailableGuard("Contact continuation requires only its independent exact five-member GCP issuer")
+                from .runtime.contact_final_stage_v3 import require_contact_final_commit_v3
+                dispatch_candidate=require_contact_final_commit_v3(domain_production_issuance_v1,self,self.__store._db,bundle,v2_write)
+            elif has_contact_v3:
                 if (has_contact_v2 or has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
                         or natural_final_admission is not None or v2_write is None):
                     raise UnavailableGuard("Contact3 requires its exact installed final GCP witness; HOLD")
@@ -40919,6 +41382,10 @@ class GraphCoordinator:
             if not set(write.key for write in writes).issubset(read_map):
                 raise ValueError("all writes require read versions, including absent keys")
             for proposal in bundle.proposals:
+                for prospective_write in proposal.typed_writes:
+                    if prospective_write.key.type_name=='d08.contact_prospective_barrier.v1':
+                        from .runtime.contact_prospective_v1 import require_contact_prospective_barrier_write_v1
+                        require_contact_prospective_barrier_write_v1(self.__store._db,graph=self,write=prospective_write,envelope=proposal.envelope)
                 registration = self.__providers.get(proposal.domain)
                 if registration is None:
                     raise AuthorityDenied("unregistered proposal domain")
@@ -41006,6 +41473,13 @@ class GraphCoordinator:
                     require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
                     if (proposal.proposal_schema, proposal.proposal_schema_hash) != (internal_life_schema, internal_life_hash):
                         raise AuthorityDenied('internal Life proposal requires its explicit installed v2 schema')
+                elif proposal.proposal_schema == 'd08.contact-expression-plan-proposal.v3':
+                    from .domains.d08.contact_plan_v3 import PROPOSAL_SCHEMA,PROPOSAL_HASH
+                    from .runtime.contact_plan_physical_write_v3 import PreparedContactPlanPhysicalV3,require_contact_plan_commit_v3
+                    if (type(getattr(domain_production_issuance_v1,'stage',None)) is not PreparedContactPlanPhysicalV3
+                            or proposal.domain!='d08' or (proposal.proposal_schema,proposal.proposal_schema_hash)!=(PROPOSAL_SCHEMA,PROPOSAL_HASH)):
+                        raise AuthorityDenied('Contact Plan3 proposal lacks its actual physical WRITE producer')
+                    require_contact_plan_commit_v3(domain_production_issuance_v1,self,self.__store._db,bundle,v2_write)
                 elif is_contact_plan_v2:
                     from .runtime.contact_plan_adoption_v2 import require_exact_contact_plan_issuance_v2
                     require_exact_contact_plan_issuance_v2(domain_production_issuance_v1,self,bundle)
@@ -42609,6 +43083,535 @@ class GraphCoordinator:
                     _transaction_state=v2_transaction_state,
                 )
             return result[0]
+
+    def _commit_original_artifact_no_dispatch_cost_v1(self, bootstrap, namespace, original_intent,
+            *, quote_id, quote_version, work_kind):
+        from .runtime.artifact_no_dispatch_metadata_read_v1 import (
+            retain_current_original_artifact_financial_snapshot_v1,bind_artifact_no_dispatch_financial_snapshot_v1)
+        self._admin(bootstrap)
+        runtime=self.__artifact_draft_model_runtime_v1
+        with retain_current_original_artifact_financial_snapshot_v1(self,runtime=runtime,job_id=original_intent.job_id) as originals:
+            with bind_artifact_no_dispatch_financial_snapshot_v1(self,runtime=runtime,intent=original_intent,originals=originals):
+                return self._commit_original_artifact_no_dispatch_cost_with_financial_v1(bootstrap,namespace,original_intent,
+                    quote_id=quote_id,quote_version=quote_version,work_kind=work_kind)
+
+
+    def _commit_original_artifact_no_dispatch_cost_with_financial_v1(
+        self, bootstrap: object, namespace: NamespaceId, original_intent,
+        *, quote_id: str, quote_version: int, work_kind: str,
+    ):
+        """Commit one original model cost bundle, independent of D06 content.
+
+        The installed ports own mTLS credentials. Their calls happen only
+        outside GraphStore's lock; the signed quote and D11 reservation are
+        re-read in the single graph transaction. A fence attempt is durable
+        before begin, while the business operation stays fixed to call_id.
+        """
+        from .authority_service.v2_accounting_contract import (
+            ModelNoDispatchAccountingGrantV1, ModelNoDispatchAccountingRequestV1,
+        )
+        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        from .runtime.restore_anchor import RestoreAnchor
+        from .runtime.model_cost_settlement import (
+            OriginalModelNoDispatchCostCommitV1, apply_original_model_no_dispatch_budget_in_transaction_v1,
+            prepare_original_model_no_dispatch_cost_plan_v1,
+        )
+        from .runtime.d11_types import (
+            D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, validate_d11_writes,
+        )
+        from .runtime_contracts import (
+            CommandEnvelope, DependencySet, DomainProposal, OperationIdentity,
+            RUNTIME_SCHEMA,
+        )
+
+        from .runtime.first_ingress_v2 import trusted_upper
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(original_intent) is not ModelEgressIntentV1
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__accounting_maintenance_port is None
+                or self.__d02_issuer is None or self.__d11_issuer is None
+                or work_kind != "artifact_draft_v1"):
+            raise UnavailableGuard("installed original model accounting authorities required")
+        store, port = self.__store, self.__accounting_maintenance_port
+        from .runtime.artifact_no_dispatch_metadata_read_v1 import bound_artifact_no_dispatch_financial_originals_v1
+        originals=bound_artifact_no_dispatch_financial_originals_v1(self,
+            runtime=self.__artifact_draft_model_runtime_v1,intent=original_intent)
+        # The receipt is an Authority fact, never a caller-supplied cost.
+        runtime = self.__artifact_draft_model_runtime_v1
+        witness, cancellation = runtime.read_cached_no_dispatch_witness_v1(original_intent.job_id)
+        if witness.request.intent != original_intent:
+            raise UnavailableGuard("actual cached Core no-dispatch witness differs from this original")
+        witness.require_signature_v1(self.__d11_issuer._signer)
+        from .runtime.d11_artifact_draft_model_v1 import require_artifact_no_dispatch_cancellation_basis_v1
+        now = trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN")
+            try:
+                require_artifact_no_dispatch_cancellation_basis_v1(db, runtime=runtime, witness=witness, basis=cancellation, now=now)
+            finally:
+                db.rollback()
+        intent_digest = canonical_digest(asdict(original_intent))
+        witness_digest = witness.digest
+        from .runtime.model_cost_settlement import original_model_cost_operation_id_v1
+        operation_id = original_model_cost_operation_id_v1(
+            namespace, original_intent.call_id)
+
+        def business_receipt_locked():
+            row = store._db.execute(
+                "SELECT activity_id,commit_seq "
+                "FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            data=originals.cost_receipt
+            if data is None:raise UnavailableGuard("current original cost row changed after financial EOF")
+            from .runtime.issuers import _decode_quote
+            signed_quote=_decode_quote(canonical_serialize(originals.quote_wire))
+            if (data.get("original_intent_digest") != intent_digest
+                    or data.get("no_dispatch_witness_digest") != witness_digest
+                    or data.get("quote_id") != quote_id
+                    or data.get("quote_version") != quote_version
+                    or signed_quote.work_kind != work_kind
+                    or data.get("work_kind", work_kind) != work_kind):
+                raise EventConflict("original model cost operation identity differs")
+            committed = OriginalModelNoDispatchCostCommitV1(**data["original_model_no_dispatch_cost"])
+            graph_event = store._db.execute(
+                "SELECT 1 FROM graph_events WHERE bot=? AND persona=? "
+                "AND session=? AND event_id=?", namespace.as_tuple +
+                (row[0], operation_id),
+            ).fetchone()
+            atom = store._db.execute(
+                "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
+                (committed.cost_ref,),
+            ).fetchone()
+            budget = store._db.execute(
+                "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? "
+                "AND persona_id=? AND operation_id=? AND phase='settle'",
+                namespace.as_tuple + (original_intent.budget_reservation_operation_id,),
+            ).fetchone()
+            if (committed.status != "committed"
+                    or committed.operation_id != operation_id
+                    or committed.call_id != original_intent.call_id
+                    or committed.quote_id != quote_id
+                    or committed.quote_version != quote_version
+                    or committed.witness_digest != witness_digest
+                    or committed.commit_seq != row[1]
+                    or graph_event is None or atom is None or budget is None):
+                raise UnavailableGuard("original cost business receipt is incomplete")
+            return committed
+
+        with store._lock:
+            committed = business_receipt_locked()
+            metadata, _ = self._v2_graph_stamp(namespace)
+            attempt = store._db.execute(
+                "SELECT intent_digest,attempt_id,anchor_json,state FROM "
+                "graph_original_model_cost_attempts_v1 WHERE bot=? AND persona=? "
+                "AND call_id=?", namespace.as_tuple + (original_intent.call_id,),
+            ).fetchone()
+        if committed is not None:
+            if attempt is None or attempt[0] != intent_digest or attempt[3] != "committed":
+                raise UnavailableGuard("committed cost lacks original fence attempt")
+            request = ModelNoDispatchAccountingRequestV1(
+                attempt[1], witness, RestoreAnchor(**json.loads(attempt[2])))
+            port.recover_no_dispatch_finish_v1(request)
+            return replace(committed, status="duplicate")
+        target = metadata.requirements
+        if (original_intent.authority_id != target.authority_id
+                or original_intent.namespace != target.authority_namespace):
+            raise UnavailableGuard("original model call belongs to another authority")
+
+        if attempt is not None and attempt[3] == "open":
+            if attempt[0] != intent_digest:
+                raise EventConflict("original call ID reused with different intent")
+            # A prior invocation may have rolled back after begin or lost its
+            # finish reply. First prove no business receipt, then close it.
+            old_request = ModelNoDispatchAccountingRequestV1(
+                attempt[1], witness, RestoreAnchor(**json.loads(attempt[2])))
+            try:
+                port.recover_no_dispatch_finish_v1(old_request)
+            except Exception:
+                # The durable local intent may precede Authority begin. The
+                # exact same attempt ID is safe to begin or replay; any other
+                # Authority failure remains HOLD rather than minting a new ID.
+                old_grant = port.begin_no_dispatch_v1(old_request)
+                port.finish_no_dispatch_v1(old_request, old_grant)
+            with store._lock:
+                if business_receipt_locked() is not None:
+                    raise UnavailableGuard("cost committed during fence recovery; retry")
+                store._db.execute(
+                    "UPDATE graph_original_model_cost_attempts_v1 SET state='closed' "
+                    "WHERE bot=? AND persona=? AND call_id=? AND attempt_id=? "
+                    "AND state='open'", namespace.as_tuple +
+                    (original_intent.call_id, attempt[1]),
+                )
+
+        # current_anchor is an Authority network read. It is outside the
+        # graph lock and can advance past a completed source deletion.
+        anchor = self.__content_fence_v2.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._accounting_anchor_covers(target, anchor):
+            raise UnavailableGuard("accounting Authority anchor differs from graph history")
+        attempt_id = "model-cost-fence-" + secrets.token_hex(24)
+        request = ModelNoDispatchAccountingRequestV1(attempt_id, witness, anchor)
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if business_receipt_locked() is not None or self._v2_graph_stamp(namespace)[0] != metadata:
+                    raise StaleRead("original cost graph changed before accounting fence")
+                row = db.execute(
+                    "SELECT state FROM graph_original_model_cost_attempts_v1 "
+                    "WHERE bot=? AND persona=? AND call_id=?",
+                    namespace.as_tuple + (original_intent.call_id,),
+                ).fetchone()
+                if row is not None and row[0] != "closed":
+                    raise UnavailableGuard("original cost fence attempt remains open")
+                if attempt is not None and attempt[0] != intent_digest:
+                    raise EventConflict("original call ID reused with different intent")
+                db.execute(
+                    "INSERT INTO graph_original_model_cost_attempts_v1"
+                    "(bot,persona,call_id,intent_digest,attempt_id,anchor_json,state) "
+                    "VALUES(?,?,?,?,?,?,'open') ON CONFLICT(bot,persona,call_id) "
+                    "DO UPDATE SET intent_digest=excluded.intent_digest,"
+                    "attempt_id=excluded.attempt_id,anchor_json=excluded.anchor_json,"
+                    "state='open'", namespace.as_tuple +
+                    (original_intent.call_id, intent_digest, attempt_id,
+                     canonical_json(asdict(anchor))),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        grant = port.begin_no_dispatch_v1(request)
+        if type(grant) is not ModelNoDispatchAccountingGrantV1 or (
+                grant.call_id != original_intent.call_id
+                or grant.reservation_digest != original_intent.budget_reservation_digest
+                or grant.witness_digest != witness_digest
+                or grant.permit.operation_id != attempt_id
+                or grant.permit.pinned_anchor != anchor):
+            raise UnavailableGuard("accounting grant differs from original Authority fact")
+        port.validate_no_dispatch_v1(request, grant)
+
+        result = None
+        try:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    current, epoch = self._v2_graph_stamp(namespace)
+                    if current != metadata or not self._accounting_anchor_covers(
+                            current.requirements, anchor):
+                        raise StaleRead("accounting graph stamp changed")
+                    row = db.execute(
+                        "SELECT attempt_id,state FROM graph_original_model_cost_attempts_v1 "
+                        "WHERE bot=? AND persona=? AND call_id=?",
+                        namespace.as_tuple + (original_intent.call_id,),
+                    ).fetchone()
+                    if row != (attempt_id, "open") or business_receipt_locked() is not None:
+                        raise StaleRead("original cost business operation changed")
+                    require_artifact_no_dispatch_cancellation_basis_v1(db, runtime=runtime, witness=witness, basis=cancellation, now=now)
+                    plan = prepare_original_model_no_dispatch_cost_plan_v1(
+                        db, self.__d02_issuer, namespace, witness,
+                        quote_id=quote_id, quote_version=quote_version)
+                    if plan.bundle_operation_id != operation_id:
+                        raise EventConflict("original cost operation differs")
+                    application = apply_original_model_no_dispatch_budget_in_transaction_v1(
+                        db, self.__d02_issuer, plan, witness)
+                    write = application.cost_write
+                    from .runtime.d11_artifact_draft_model_v1 import stage_artifact_no_dispatch_job_v1, record_artifact_no_dispatch_after_cost_cas_v1
+                    staged_job = stage_artifact_no_dispatch_job_v1(db, runtime=runtime, witness=witness, basis=cancellation, now=now)
+                    job_write = staged_job[3]
+                    prior_job_row = db.execute("SELECT revision FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                        (job_write.key.token, *namespace.as_tuple)).fetchone()
+                    if prior_job_row is None: raise UnavailableGuard("actual C4 pre-cancellation job graph projection absent")
+                    prior_job = GraphVersion(job_write.key, prior_job_row[0])
+                    writes = (write, job_write)
+                    if not validate_d11_writes(
+                            writes, namespace, operation_id=operation_id,
+                            activity_id=plan.quote.activity_id,
+                            effect_id=plan.quote.effect_id):
+                        raise UnavailableGuard("D11 cost write is invalid")
+                    reconcile_runtime_write(db, write)
+                    reconcile_runtime_write(db, job_write)
+                    identity = OperationIdentity(
+                        plan.quote.activity_id, plan.quote.effect_id,
+                        original_intent.call_id, "accounting", operation_id,
+                        canonical_digest({"input_refs": []}))
+                    authority = AuthorityContext(
+                        "host", "d11", "accounting:" + attempt_id,
+                        namespace, ("activity",), "cost_accounting", ("internal",),
+                        "original-model-cost-v1", target.activation_generation)
+                    epochs = db.execute(
+                        "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone() or (0, 0)
+                    envelope = CommandEnvelope(
+                        RUNTIME_SCHEMA, identity, authority,
+                        VersionGuard((GraphVersion(write.key, 0), prior_job), (), *epochs,
+                                     "accounting-v1", "accounting-v1",
+                                     "accounting-v1", "accounting-v1", (), (), ()),
+                        SourceQualification((), "derived", None, time.time(),
+                                            "unknown", "ineligible", None,
+                                            "not_applicable"),
+                        (), plan.quote.parent_budget_lease_ref,
+                        plan.quote.deadline_utc, 0.0, "accounting-v1",
+                        (plan.original_operation_id,))
+                    proposal = DomainProposal(
+                        "d11", D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+                        envelope, writes, DependencySet(), (), ("cost_settlement", "job_cancellation",))
+                    bundle = DomainBundle(
+                        envelope, (proposal,), (), (), (), (write.key.token,),
+                        (), (), ())
+                    event = Event(
+                        Scope(*namespace.as_tuple, plan.quote.activity_id),
+                        operation_id, time.time(), "domain_bundle",
+                        {"bundle_digest": bundle.digest})
+                    candidate = GraphCandidate(
+                        event, (GraphVersion(write.key, 0), prior_job), writes, (epoch,))
+                    graph_receipt = GraphStore._graph_commit_in_transaction(
+                        store, candidate, _capability=self.__graph_capability)
+                    if graph_receipt.status != "committed":
+                        raise EventConflict("original cost graph event already exists")
+                    replacement = replace(
+                        current.requirements,
+                        deletion_seq=anchor.deletion_seq,
+                        deletion_digest=anchor.deletion_digest,
+                        execution_seq=anchor.execution_seq,
+                        execution_digest=anchor.execution_digest,
+                        revocation_epoch=anchor.revocation_epoch)
+                    store.cas_graph_recovery_metadata(
+                        current, replacement, _capability=self.__graph_capability)
+                    seq_row = db.execute(
+                        "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?",
+                        namespace.as_tuple).fetchone()
+                    seq = (seq_row[0] if seq_row else 0) + 1
+                    db.execute(
+                        "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
+                        "VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET "
+                        "last_seq=excluded.last_seq", namespace.as_tuple + (seq,))
+                    result = OriginalModelNoDispatchCostCommitV1(
+                        "committed", operation_id, original_intent.call_id,
+                        quote_id, quote_version, witness_digest, write.key.token,
+                        canonical_digest(asdict(application.receipt)), seq,
+                        current.graph_revision + 1, graph_receipt.epoch.revision)
+                    record_artifact_no_dispatch_after_cost_cas_v1(db, runtime=runtime, staged_job=staged_job,
+                        witness=witness, basis=cancellation, commit=result)
+                    receipt_data = {
+                        "original_model_no_dispatch_cost": asdict(result),
+                        "original_intent_digest": intent_digest,
+                        "no_dispatch_witness_digest": witness_digest,
+                        "quote_id": quote_id, "quote_version": quote_version,
+                        "work_kind": work_kind,
+                        "accounting_attempt_id": attempt_id,
+                        "no_dispatch_cancellation_basis": asdict(cancellation),
+                    }
+                    db.execute(
+                        "INSERT INTO graph_bundle_operations"
+                        "(bot,persona,operation_id,digest,activity_id,effect_id,"
+                        "commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            operation_id, bundle.digest, plan.quote.activity_id,
+                            plan.quote.effect_id, seq, canonical_json(receipt_data)))
+                    db.execute(
+                        "UPDATE graph_original_model_cost_attempts_v1 "
+                        "SET state='committed' WHERE bot=? AND persona=? "
+                        "AND call_id=? AND attempt_id=?", namespace.as_tuple +
+                        (original_intent.call_id, attempt_id))
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+        except BaseException:
+            # The business transaction rolled back. Closing this *attempt*
+            # leaves the fixed business operation and reservation untouched.
+            with store._lock:
+                committed = business_receipt_locked()
+            if committed is not None:
+                port.recover_no_dispatch_finish_v1(request)
+                return replace(committed, status="duplicate")
+            port.finish_no_dispatch_v1(request, grant)
+            with store._lock:
+                store._db.execute(
+                    "UPDATE graph_original_model_cost_attempts_v1 SET state='closed' "
+                    "WHERE bot=? AND persona=? AND call_id=? AND attempt_id=? "
+                    "AND state='open'", namespace.as_tuple +
+                    (original_intent.call_id, attempt_id))
+            raise
+        port.finish_no_dispatch_v1(request, grant)
+        wake_followup = getattr(self, "_GraphCoordinator__domain_followup_wake_v1", None)
+        if callable(wake_followup):
+            wake_followup()
+        return result
+
+    def project_current_owner_goal_cancellation_v1(self,bootstrap,installed_bundle,*,original):
+        from .host.authority_profile import AdminInstallationBundle
+        from .authority_service.owner_goal_cancellation_contract_v1 import OwnerGoalCancellationOriginalV1
+        from .authority_service.owner_goal_projection_contract_v1 import goal_projection_operation_id_v1
+        from .authority_service.v2_contract import FencePermitV2,to_wire,from_wire
+        from .runtime.owner_goal_projection_issuance_v1 import owner_goal_projection_for_fence_v1,reobserve_owner_goal_projection_v1
+        from .runtime.owner_goal_projection_v1 import TABLE,COLUMNS,validate_goal_projection_row_v1
+        from .runtime.owner_goal_projection_writer_v1 import commit_owner_goal_projection_in_transaction_v1
+        from .runtime.owner_goal_projection_receipt_read_v1 import GoalProjectionReceiptReadWorkV1
+        from .runtime.restore_anchor import RestoreAnchor
+        from .runtime_storage_v3 import begin_runtime_storage_operation_v3,bind_runtime_storage_operation_v3,finish_runtime_storage_operation_v3,runtime_storage_quantum_v3
+        self._admin(bootstrap)
+        if (type(installed_bundle) is not AdminInstallationBundle or type(original) is not OwnerGoalCancellationOriginalV1
+                or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle
+                or original.request.namespace!=installed_bundle.installation_policy.namespace):
+            raise UnavailableGuard("actual installed Goal metadata projection bundle/cause required")
+        original.require_signature_v1(self.__d11_issuer)
+        namespace=original.request.namespace;operation_id=goal_projection_operation_id_v1(original)
+        port,store=self.__content_fence_v2,self.__store
+        digest=canonical_digest(("d08.owner-goal-metadata-projection-request.v1",namespace,
+            original.request.cancel_operation_id,original.original_ref,original.digest))
+        query="SELECT request_digest,attempt_id,anchor_json,graph_revision,graph_epoch,permit_json,receipt_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?"
+        key=(*namespace.as_tuple,operation_id)
+        original_permit,original_state=port.get_fence_operation(namespace=namespace,
+            authority_namespace=original.request.authority_namespace,operation_id=operation_id)
+        if original_state=="finished":
+            return self.lookup_current_owner_goal_projection_receipt_v1(bootstrap,installed_bundle,original=original)
+        with store._lock:
+            metadata,epoch=self._v2_graph_stamp(namespace);saved=store._db.execute(query,key).fetchone()
+        if saved is not None and saved[:2]!=(digest,operation_id):
+            raise EventConflict("Goal projection original operation changed")
+        target=metadata.requirements
+        anchor=port.current_anchor(namespace=namespace,authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target,anchor):
+            raise UnavailableGuard("Goal projection requires current actual Graph/Core recovery")
+        attempt=port.observe_content_write_attempt_v1(namespace=namespace,authority_namespace=target.authority_namespace,
+            operation_id=operation_id,expected_anchor=anchor)
+        if saved is None:
+            with store._lock:
+                db=store._db;db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace)!=(metadata,epoch):raise StaleRead("Goal projection metadata changed")
+                    db.execute("INSERT INTO graph_owner_domain_attempts_v3(bot,persona,operation_id,request_digest,"
+                        "attempt_id,anchor_json,graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?)",
+                        (*key,digest,operation_id,canonical_json(asdict(anchor)),metadata.graph_revision,epoch.revision))
+                    db.commit()
+                except BaseException:db.rollback();raise
+        elif saved[2:5]!=(canonical_json(asdict(anchor)),metadata.graph_revision,epoch.revision):
+            if saved[5] is None and attempt.state=="absent" and attempt.permit is None:
+                with store._lock:
+                    store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET anchor_json=?,graph_revision=?,graph_epoch=? "
+                        "WHERE bot=? AND persona=? AND operation_id=? AND permit_json IS NULL AND receipt_json IS NULL",
+                        (canonical_json(asdict(anchor)),metadata.graph_revision,epoch.revision,*key))
+                saved=None
+            elif (attempt.state!="active" or attempt.permit is None or saved[5] is None
+                    or saved[5]!=canonical_json(to_wire(attempt.permit))
+                    or saved[2]!=canonical_json(asdict(anchor))):
+                raise UnavailableGuard("Goal projection original WRITE/stamp outcome unresolved")
+        permit,state=attempt.permit,attempt.state
+        if state=="absent" and permit is None:
+            permit=port.begin_fence(namespace=namespace,authority_namespace=target.authority_namespace,
+                holder=self.__holder,generation=target.activation_generation,operation="write",operation_id=operation_id,
+                expected_anchor=anchor,retain_on_unknown=True)
+            state="active"
+        if type(permit) is not FencePermitV2 or state!="active" or permit.operation!="write" or permit.pinned_anchor!=anchor:
+            raise UnavailableGuard("Goal projection actual WRITE is not confirmed")
+        before_epoch=epoch if saved is None or saved[5] is None else NamespaceEpoch(*namespace.as_tuple,saved[4])
+        before_revision=metadata.graph_revision if saved is None or saved[5] is None else saved[3]
+        scope=FenceScope(namespace,target.authority_namespace,target.activation_generation,"write",operation_id,permit,
+            anchor,before_epoch,before_revision)
+        if port.validate_fence(scope)!=permit:raise UnavailableGuard("Goal projection actual WRITE changed")
+        with store._lock:
+            store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? WHERE bot=? AND persona=? "
+                "AND operation_id=? AND permit_json IS NULL",(canonical_json(to_wire(permit)),*key))
+        operation=begin_runtime_storage_operation_v3(store._db,operation_id,None)
+        try:
+            with bind_runtime_storage_operation_v3(operation,store._db):
+                with owner_goal_projection_for_fence_v1(self,scope=scope,
+                        cancel_operation_id=original.request.cancel_operation_id,original_ref=original.original_ref) as issued:
+                    work=GoalProjectionReceiptReadWorkV1(issued)
+                    try:
+                        while not work.complete:
+                            reobserve_owner_goal_projection_v1(issued)
+                            with store._lock:
+                                with runtime_storage_quantum_v3(store._db) as meter:
+                                    store._db.execute("BEGIN")
+                                    try:work.advance(meter)
+                                    finally:store._db.rollback()
+                        reobserve_owner_goal_projection_v1(issued)
+                        existing=work.require_result()
+                    finally:work.close_v1()
+                    if existing is not None:
+                        receipt=existing
+                    else:
+                        reobserve_owner_goal_projection_v1(issued)
+                    if existing is None:
+                        with store._lock:
+                            db=store._db
+                            with runtime_storage_quantum_v3(db):
+                                db.execute("BEGIN IMMEDIATE")
+                                try:
+                                    receipt=commit_owner_goal_projection_in_transaction_v1(self,db,issued=issued,metadata=metadata,epoch=epoch)
+                                    db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? WHERE bot=? AND persona=? "
+                                        "AND operation_id=? AND receipt_json IS NULL",(canonical_serialize(asdict(receipt)),*key))
+                                    if db.execute("SELECT changes()").fetchone()!=(1,):raise EventConflict("Goal projection receipt raced")
+                                    db.commit()
+                                except BaseException:db.rollback();raise
+        finally:finish_runtime_storage_operation_v3(operation)
+        port.finish_fence(scope,request_id="finish:"+operation_id,request_digest="sha256:"+canonical_digest((
+            "d08.owner-goal-metadata-projection-finish.v1",operation_id,digest,permit.token)))
+        return asdict(receipt)
+
+    def lookup_current_owner_goal_projection_receipt_v1(self,bootstrap,installed_bundle,*,original):
+        from .host.authority_profile import AdminInstallationBundle
+        from .authority_service.owner_goal_cancellation_contract_v1 import OwnerGoalCancellationOriginalV1
+        from .authority_service.owner_goal_projection_contract_v1 import goal_projection_lookup_operation_id_v1
+        from .runtime.owner_goal_projection_issuance_v1 import owner_goal_projection_for_fence_v1,reobserve_owner_goal_projection_v1
+        from .runtime.owner_goal_projection_receipt_read_v1 import GoalProjectionReceiptReadWorkV1
+        from .runtime_storage_v3 import begin_runtime_storage_operation_v3,bind_runtime_storage_operation_v3,finish_runtime_storage_operation_v3,runtime_storage_quantum_v3
+        self._admin(bootstrap)
+        if (type(original) is not OwnerGoalCancellationOriginalV1 or type(installed_bundle) is not AdminInstallationBundle
+                or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle
+                or original.request.namespace!=installed_bundle.installation_policy.namespace):
+            raise UnavailableGuard("actual installed stable Goal metadata lookup required")
+        original.require_signature_v1(self.__d11_issuer)
+        ns=original.request.namespace;port,store=self.__content_fence_v2,self.__store
+        with store._lock:metadata,epoch=self._v2_graph_stamp(ns)
+        target=metadata.requirements
+        anchor=port.current_anchor(namespace=ns,authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target,anchor):raise UnavailableGuard("Goal lookup actual recovery changed")
+        operation_id=goal_projection_lookup_operation_id_v1(original)
+        permit=port.begin_fence(namespace=ns,authority_namespace=target.authority_namespace,
+            holder=self.__holder,generation=target.activation_generation,operation="read",operation_id=operation_id,
+            expected_anchor=anchor)
+        scope=FenceScope(ns,target.authority_namespace,target.activation_generation,"read",operation_id,permit,
+            anchor,epoch,metadata.graph_revision)
+        operation=work=None
+        try:
+            operation=begin_runtime_storage_operation_v3(store._db,operation_id,None)
+            with bind_runtime_storage_operation_v3(operation,store._db):
+                with owner_goal_projection_for_fence_v1(self,scope=scope,
+                        cancel_operation_id=original.request.cancel_operation_id,original_ref=original.original_ref) as issued:
+                    work=GoalProjectionReceiptReadWorkV1(issued)
+                    try:
+                        while not work.complete:
+                            reobserve_owner_goal_projection_v1(issued)
+                            with store._lock:
+                                with runtime_storage_quantum_v3(store._db) as meter:
+                                    store._db.execute("BEGIN")
+                                    try:work.advance(meter)
+                                    finally:store._db.rollback()
+                        reobserve_owner_goal_projection_v1(issued)
+                        receipt=work.require_result()
+                        if receipt is None:raise UnavailableGuard("finished Goal projection has no actual metadata receipt")
+                        return asdict(receipt)
+                    finally:work.close_v1()
+        finally:
+            try:
+                if operation is not None:finish_runtime_storage_operation_v3(operation)
+            finally:
+                port.finish_fence(scope,request_id="finish:"+operation_id,request_digest="sha256:"+canonical_digest((
+                    "d08.owner-goal-projection-lookup-finish.v1",operation_id,permit.token)))
+
+
+
 
 
 __all__ = [

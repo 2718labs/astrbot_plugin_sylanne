@@ -117,38 +117,136 @@ class InstalledSegmentedCensusV3:
                 or header[1] not in {'canonical-json.ascii.v1','canonical-json.utf8.v1','opaque-bytes.v1'}):
             raise AuthorityUnavailable('actual segmented header crossed producer/scope/codec')
         return tuple(header)
-    def _refs(self):
-        if self.role=='graph':return (('graph_atoms','value_cell_id'),('graph_history','value_cell_id'))
-        # Core's two registered large families are enabled only once their actual
-        # reference DDL is present. An old payload column cannot qualify a cell.
+    def _extent(self,cell_id,meter):
+        present=meter.read_fixed_row(self.target,'segmented_cells_v1',('cell_id',),'cell_id=?',(cell_id,))
+        if present is not None:
+            header=self._header(cell_id,meter)
+            return {'coverage':'sealed_complete','cell_id':cell_id,'segment_count':header[5],
+                'total_bytes':header[4],'payload_sha256':header[6],'ordered_segment_root':header[7],'header':header}
+        if self.role!='graph':raise AuthorityUnavailable('actual Core segment requires its complete header')
+        from ..runtime.c09_contact_plan_prefix_history_v3 import read_contact_prefix_extent_for_sweep_v3
+        extent=read_contact_prefix_extent_for_sweep_v3(self.target,self.scope,self.pair.source_original,cell_id,meter)
+        if extent is None:raise AuthorityUnavailable('headerless target segment lacks its exact registered non-executable history')
+        return extent
+    def _refs(self,meter):
+        if self.role=='graph':
+            from ..runtime.domain_production_originals_v1 import PHYSICAL_TABLE,PHYSICAL_DDL
+            from ..runtime.contact_plan_adoption_v3 import TABLE as PLAN_TABLE,DDL as PLAN_DDL
+            from ..runtime.c09_owner_source_output_mappings_v3 import TABLE as OUTPUT_TABLE,DDL as OUTPUT_DDL
+            refs=[('graph_atoms','value_cell_id'),('graph_history','value_cell_id')]
+            registered=((PHYSICAL_TABLE,PHYSICAL_DDL.replace(' IF NOT EXISTS',''),('original_payload_cell_id',)),
+                (PLAN_TABLE,PLAN_DDL,('payload_cell_id','source_selection_cell_id')),
+                (OUTPUT_TABLE,OUTPUT_DDL,('target_cell_id',)))
+            for table,ddl,columns in registered:
+                actual=meter.read_fixed_row(self.target,'sqlite_master',('sql',),'type=? AND name=?',('table',table))
+                if actual is None:continue
+                if actual!=(ddl,):raise AuthorityUnavailable('registered sealed logical family physical DDL differs')
+                refs.extend((table,column)for column in columns)
+            return tuple(refs)
         if self.role=='core':return (('authority_d13_counter_originals_v1','payload_cell_id'),
             ('authority_d13_provider_http_bindings_v1','payload_cell_id'))
         return ()
+
+    def _plan_owner(self,namespace,producing_operation_id,header,meter):
+        from ..graph_types import AtomKey
+        from ..domains.d08.contact_plan_v2 import PLAN
+        from ..runtime.domain_production_originals_v1 import reconstruct_graph_bundle_commit_receipt_v1
+        atom=AtomKey.from_token(header[2])
+        if ((atom.owner.bot,atom.owner.persona)!=namespace or atom.owner.kind!='activity' or atom.type_name!=PLAN):
+            raise AuthorityUnavailable('actual Plan3 sealed owner is not its namespace/activity/plan key')
+        bundle=meter.read_fixed_row(self.target,'graph_bundle_operations',
+            ('digest','activity_id','effect_id','commit_seq','receipt_json'),
+            'bot=? AND persona=? AND operation_id=?',(*namespace,producing_operation_id))
+        if bundle is None:raise AuthorityUnavailable('Plan3 logical cell has no actual committed producer')
+        event=meter.read_fixed_row(self.target,'graph_events',('reads','revisions','epoch_revision'),
+            'bot=? AND persona=? AND session=? AND event_id=?',(*namespace,bundle[1],producing_operation_id))
+        from ..runtime_contracts import NamespaceId
+        from ..graph_types import GraphVersion
+        receipt=reconstruct_graph_bundle_commit_receipt_v1(NamespaceId(*namespace),producing_operation_id,bundle,event)
+        history=meter.read_fixed_row(self.target,'graph_history',('valid','event_bot','event_persona','event_session','event_id'),
+            'token=? AND revision=?',(atom.token,1))
+        if (atom.owner.subject!=receipt.activity_id or GraphVersion(atom,1)not in receipt.write_versions
+                or history!=(1,*namespace,receipt.activity_id,producing_operation_id)):
+            raise AuthorityUnavailable('Plan3 erasure owner lost its exact actual positive birth member')
+        return atom.token
+
     def _logical(self,table,column,key,meter):
+        if (table,column)not in self._refs(meter):raise AuthorityUnavailable('unregistered sealed logical family/column')
         shape=read_c09_table_shape_v2(self.target,table,meter=meter)
         if column not in shape.columns:raise AuthorityUnavailable('actual segmented logical family needs its registered reference schema')
         row=meter.read_row(self.target,shape,key)
         if row is None:raise AuthorityUnavailable('actual segmented logical reference disappeared')
-        row=tuple(row);cell_id=row[shape.columns.index(column)];header=self._header(cell_id,meter)
+        row=tuple(row);data=dict(zip(shape.columns,row,strict=True))
+        from ..runtime.c09_owner_source_output_mappings_v3 import TABLE as OUTPUT_TABLE,decode_owner_source_output_mapping_row_v3,NAMES
+        output=None
+        if table==OUTPUT_TABLE:
+            output=decode_owner_source_output_mapping_row_v3(row)
+            if data['outcome']!='complete':return None
+        cell_id=data[column];header=self._header(cell_id,meter)
         if self.role=='graph':
             from ..graph_types import AtomKey
-            atom=AtomKey.from_token(key[0]);ns=tuple(json.loads(self.scope.graph_namespace))
-            if (atom.owner.bot,atom.owner.persona)!=ns or header[2]!=atom.token:
-                raise AuthorityUnavailable('actual logical reference crossed its erasure owner/namespace')
-            owner=atom.token
+            from ..runtime.domain_production_originals_v1 import PHYSICAL_TABLE
+            from ..runtime.contact_plan_adoption_v3 import TABLE as PLAN_TABLE
+            ns=tuple(json.loads(self.scope.graph_namespace))
+            if table in ('graph_atoms','graph_history'):
+                atom=AtomKey.from_token(key[0])
+                if (atom.owner.bot,atom.owner.persona)!=ns or header[2]!=atom.token:
+                    raise AuthorityUnavailable('actual logical reference crossed its erasure owner/namespace')
+                if table=='graph_atoms'and(data['bot'],data['persona'])!=ns:
+                    raise AuthorityUnavailable('actual Graph atom reference namespace differs')
+                if table=='graph_history'and(data['event_bot'],data['event_persona'])!=ns:
+                    raise AuthorityUnavailable('actual Graph history event namespace differs')
+                owner=atom.token
+            elif table==PHYSICAL_TABLE:
+                if shape.primary_key_columns!=('bot','persona','operation_id')or key[:2]!=ns:
+                    raise AuthorityUnavailable('actual Domain physical reference full PK/namespace differs')
+                if (data['domain'],data['operation_kind'])==('d06','admit_owner_material_source_v1'):
+                    from ..runtime_contracts import NamespaceId
+                    from ..memory_types import source_key
+                    from ..runtime.owner_material_source_v1 import owner_material_source_id_v1
+                    namespace=NamespaceId(*ns);owner=source_key(*ns,owner_material_source_id_v1(namespace,key[2])).token
+                elif(data['domain'],data['operation_kind'])==('d08','adopt_contact_expression_plan_v2'):
+                    owner=self._plan_owner(ns,key[2],header,meter)
+                else:raise AuthorityUnavailable('unregistered actual Domain sealed original producer')
+                if data['original_digest']!=header[6]or header[2]!=owner:
+                    raise AuthorityUnavailable('Domain sealed original digest/erasure owner differs from its actual writer')
+            elif table==PLAN_TABLE:
+                if shape.primary_key_columns!=('bot','persona','contact_id')or key[:2]!=ns:
+                    raise AuthorityUnavailable('Plan3 physical reference full PK/namespace differs')
+                owner=self._plan_owner(ns,data['producing_operation_id'],header,meter)
+                expected=(data['codec'],data['byte_count'],data['payload_sha256'])if column=='payload_cell_id'else(
+                    'canonical-json.ascii.v1',data['source_selection_bytes'],data['source_selection_sha256'])
+                if (header[1],header[4],header[6])!=expected or data['payload_digest']!=data['payload_sha256']:
+                    raise AuthorityUnavailable('Plan3 sealed payload/selection actual bytes/SHA/codec differs')
+            elif table==OUTPUT_TABLE:
+                metadata=output['prepared_metadata'];namespace=metadata['namespace']
+                if (shape.primary_key_columns!=('capture_scope_digest','prepared_digest','cell_name')
+                        or key[0]!=self.scope.scope_digest or (namespace['bot_id'],namespace['persona_id'])!=ns
+                        or key[2]not in NAMES or data['target_cell_id']!=cell_id):
+                    raise AuthorityUnavailable('Owner output sealed mapping crossed capture/prepared/name/namespace')
+                from ..runtime_contracts import NamespaceId
+                from ..memory_types import source_key
+                from ..runtime.owner_material_source_v1 import owner_material_source_id_v1
+                owner=source_key(*ns,owner_material_source_id_v1(NamespaceId(*ns),metadata['operation_id'])).token
+                expected=metadata['expected_outputs'][key[2]]
+                seal=output['target_cell_seal']
+                if (owner!=metadata['source_ref']or tuple(seal['header9'])!=header or header[2]!=owner
+                        or(header[4],header[6])!=(expected['total_bytes'],expected['payload_sha256'])):
+                    raise AuthorityUnavailable('Owner output complete mapping lost its real source owner/header/bytes')
+            else:raise AuthorityUnavailable('unknown registered segmented Graph family')
         else:
             if key[0]!=self.scope.authority_namespace:raise AuthorityUnavailable('actual Core cell crossed authority namespace')
             if table=='authority_d13_counter_originals_v1':
-                if key[2] not in {'draft','header','evidence'}:raise AuthorityUnavailable('unknown actual D13 counter phase')
-                family='d13-counter-source' if key[2]=='draft' else 'd13-counter-history'
+                if key[2]not in {'draft','header','evidence'}:raise AuthorityUnavailable('unknown actual D13 counter phase')
+                family='d13-counter-source'if key[2]=='draft'else'd13-counter-history'
             elif table=='authority_d13_provider_http_bindings_v1':
-                if key[2] not in {'expected','observed_before_send'}:raise AuthorityUnavailable('unknown actual provider HTTP phase')
+                if key[2]not in {'expected','observed_before_send'}:raise AuthorityUnavailable('unknown actual provider HTTP phase')
                 family='d13-provider-http-history'
             else:raise AuthorityUnavailable('unknown registered segmented Core family')
             owner=canonical_serialize((family,key[0],key[1]))
             if header[2]!=owner:raise AuthorityUnavailable('actual Core cell crossed its counter/call erasure owner')
         if header[1]!='canonical-json.ascii.v1':raise AuthorityUnavailable('registered logical family has another actual codec')
-        return (self.scope.scope_digest,self.role,table,canonical_digest(key),column,canonical_serialize(key),
+        return(self.scope.scope_digest,self.role,table,canonical_digest(key),column,canonical_serialize(key),
             cell_id,owner,header[1],c09_row_commitment_v2(row))
     def advance(self):
         self.require_current()
@@ -201,8 +299,8 @@ class InstalledSegmentedCensusV3:
         self.counts[0]+=1;self.after=header[0]
     def _finish_cell(self):
         if self.cell is None:return
-        header,ordinal,offset,digest,root=self.cell
-        if (ordinal,offset,digest.hexdigest(),root)!=(header[5],header[4],header[6],header[7]):
+        extent,ordinal,offset,digest,root=self.cell
+        if (ordinal,offset,digest.hexdigest(),root)!=(extent['segment_count'],extent['total_bytes'],extent['payload_sha256'],extent['ordered_segment_root']):
             raise AuthorityUnavailable('independent actual cell segment count/bytes/full SHA/root differs')
     def _segments(self,db,meter):
         after=('',-1) if self.after is None else self.after
@@ -216,20 +314,20 @@ class InstalledSegmentedCensusV3:
             self._retain_target_eof('segments',eof)
             self.cell=None;self.phase='refs';self.after=None;self.table_index=0;self.ref_table_eofs=[];return
         cell_id,ordinal,offset,payload,digest=row
-        header=self._header(cell_id,meter)
-        if self.cell is None or self.cell[0][0]!=cell_id:
+        extent=self._extent(cell_id,meter)
+        if self.cell is None or self.cell[0]['cell_id']!=cell_id:
             self._finish_cell()
-            state=(header,0,0,sha256(),canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell_id)))
+            state=(extent,0,0,sha256(),canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell_id)))
         else:state=self.cell
         if (ordinal,offset)!=(state[1],state[2]) or type(payload) is not bytes or not 1<=len(payload)<=MAX_SEGMENT_BYTES or sha256(payload).hexdigest()!=digest:
             raise AuthorityUnavailable('actual segment missing/reordered/offset/bytes/SHA differs')
         actual_sha=state[3].copy();actual_sha.update(payload)
         actual_root=canonical_digest(('sylanne3.segmented-cell-link.v1',state[4],cell_id,ordinal,offset,len(payload),digest))
         self._put(db,TABLES[1],(self.scope.scope_digest,self.role,cell_id,ordinal,offset,len(payload),digest),meter)
-        self.cell=(header,ordinal+1,offset+len(payload),actual_sha,actual_root)
+        self.cell=(extent,ordinal+1,offset+len(payload),actual_sha,actual_root)
         self.counts[1]+=1;self.after=(cell_id,ordinal)
     def _references(self,db,meter):
-        families=self._refs()
+        families=self._refs(meter)
         if self.table_index==len(families):
             eof=canonical_digest(('sylanne3.c09.segmented-target-eof.v3',self.scope.scope_digest,self.role,
                 self.pair.target_identity,'logical_refs',self.counts[2],self.ref_table_eofs))
@@ -242,7 +340,9 @@ class InstalledSegmentedCensusV3:
             self.ref_table_eofs.append((table,column,shape.schema_digest,self.after))
             self.table_index+=1;self.after=None;return
         key,_=found;row=self._logical(table,column,key,meter)
-        self._put(db,TABLES[2],row,meter);self.counts[2]+=1;self.after=key
+        if row is not None:
+            self._put(db,TABLES[2],row,meter);self.counts[2]+=1
+        self.after=key
     def _writes(self,db,meter):
         from ..runtime.c09_paged_capture_contract_v2 import C09CountOriginalV2
         shape=read_c09_table_shape_v2(self.target,'segmented_cell_writes_v1',meter=meter)
@@ -269,10 +369,15 @@ class InstalledSegmentedCensusV3:
                 self.counts=list(self.first_counts);self.phase='independent';self.stream_index=0;self.verification=None
             else:self.phase='audit';self.table_index=0
             self.after=None;return
-        header=self._header(row[0],meter)
-        if (row[1]!=self.scope.scope_digest or row[3:7]!=(header[1],self.scope.operation_id,header[2],'sealed')
-                or row[7:11]!=(header[5],header[4],header[7],header[6]) or row[12:17]!=(header[4],header[5],header[4],header[7],header[6])):
-            raise AuthorityUnavailable('actual cell write cursor lacks independent closed header/count/EOF')
+        extent=self._extent(row[0],meter)
+        if extent['coverage']=='prefix_only':
+            if tuple(row)!=extent['cursor']:
+                raise AuthorityUnavailable('non-executable Contact cursor changed original phase/prefix facts')
+        else:
+            header=extent['header']
+            if (row[1]!=self.scope.scope_digest or row[3:7]!=(header[1],self.scope.operation_id,header[2],'sealed')
+                    or row[7:11]!=(header[5],header[4],header[7],header[6]) or row[12:17]!=(header[4],header[5],header[4],header[7],header[6])):
+                raise AuthorityUnavailable('actual cell write cursor lacks independent closed header/count/EOF')
         self.write_count+=1;self.after=row[0]
         self.write_chain=canonical_digest(('sylanne3.c09.census-row.v2',identity.stream_id,self.write_count,
             self.write_chain,found[0],found[1]))
@@ -297,14 +402,60 @@ class InstalledSegmentedCensusV3:
                 raise AuthorityUnavailable('segment projection has no actual independent payload SHA')
             expected=(*row[:2],actual[0],actual[1],actual[2],len(actual[3]),actual[4])
             if tuple(row)!=expected:raise AuthorityUnavailable('segment projection differs from actual original offset/bytes/SHA')
-            self._header(actual[0],meter)
+            self._extent(actual[0],meter)
         elif index==2:
             table,key_digest,column,key_json=row[2:6];key=tuple(json.loads(key_json))
-            if (table,column) not in self._refs() or canonical_serialize(key)!=key_json or canonical_digest(key)!=key_digest:
+            if (table,column) not in self._refs(meter) or canonical_serialize(key)!=key_json or canonical_digest(key)!=key_digest:
                 raise AuthorityUnavailable('logical projection has another registered family/canonical PK')
             if tuple(row)!=self._logical(table,column,key,meter):
                 raise AuthorityUnavailable('logical ref projection differs from actual target row and header')
         else:raise AuthorityUnavailable('unknown actual segmented projection family')
+    def _sealed_locator_logical(self,locator,header,meter):
+        if type(locator)is not dict:raise AuthorityUnavailable('sealed cursor locator requires its actual closed object')
+        if locator.get('schema')=='sylanne3.c09.owner-source-output-target.v3':
+            from ..runtime.c09_owner_source_output_mappings_v3 import TABLE,COLUMNS,decode_owner_source_output_mapping_row_v3,NAMES
+            required={'schema','capture_scope_digest','prepared_digest','cell_name','original_owner_cell_id','source_cell_descriptor_digest'}
+            if (self.role!='graph'or set(locator)!=required or locator['capture_scope_digest']!=self.scope.scope_digest
+                    or locator['cell_name']not in NAMES):
+                raise AuthorityUnavailable('sealed Owner output locator crossed exact capture/prepared/name schema')
+            key=(self.scope.scope_digest,locator['prepared_digest'],locator['cell_name'])
+            row=meter.read_fixed_row(self.target,TABLE,COLUMNS,
+                'capture_scope_digest=? AND prepared_digest=? AND cell_name=?',key)
+            if row is None:raise AuthorityUnavailable('sealed Owner output cursor has no actual complete mapping')
+            original=decode_owner_source_output_mapping_row_v3(tuple(row))
+            if (original['outcome']!='complete'or row[8]!=header[0]
+                    or original['original_owner_cell_id']!=locator['original_owner_cell_id']
+                    or row[6]!=locator['source_cell_descriptor_digest']
+                    or original['target_cell_seal']['locator']!=locator
+                    or tuple(original['target_cell_seal']['header9'])!=header):
+                raise AuthorityUnavailable('sealed Owner output lost exact actual mapping/descriptor/locator/header relation')
+            return TABLE,'target_cell_id',key,locator
+        required={'role','family','primary_key','column','source_schema_digest'}
+        if not required<=set(locator)or locator['role']!=self.role:
+            raise AuthorityUnavailable('unregistered sealed cursor locator schema/role')
+        family=locator['family'];key=tuple(locator['primary_key']);logical_column=locator['column']
+        mapped={('graph_atoms','value'):'value_cell_id',('graph_history','value'):'value_cell_id',
+            ('graph_domain_production_originals_v3','original_payload_json'):'original_payload_cell_id',
+            ('graph_contact_expression_plan_originals_v3','payload_json'):'payload_cell_id',
+            ('graph_contact_expression_plan_originals_v3','source_selection_json'):'source_selection_cell_id',
+            ('authority_d13_counter_originals_v1','payload_json'):'payload_cell_id',
+            ('authority_d13_provider_http_bindings_v1','payload_json'):'payload_cell_id'}
+        column=mapped.get((family,logical_column))
+        if column is None or(family,column)not in self._refs(meter):
+            raise AuthorityUnavailable('actual closed cursor names an unregistered logical family/column')
+        source_shape=read_c09_table_shape_v2(self.pair.source,family,meter=meter)
+        base={'role':self.role,'family':family,'primary_key':key,'column':logical_column,'source_schema_digest':source_shape.schema_digest}
+        if 'producer_kind'in locator:
+            if (self.role!='graph'or family not in ('graph_atoms','graph_history')or set(locator)!=set(base)|{'producer_kind','basis_digest'}
+                    or locator['producer_kind']not in {'current_closure_erased_marker.v3','prior_erased_erased_marker.v3'}):
+                raise AuthorityUnavailable('actual closed cursor has an unregistered generated producer locator')
+            digest=locator['basis_digest']
+            if type(digest)is not str or len(digest)!=64 or any(char not in '0123456789abcdef'for char in digest):
+                raise AuthorityUnavailable('actual closed cursor generated basis commitment differs')
+            expected={**base,'producer_kind':locator['producer_kind'],'basis_digest':digest}
+        else:expected=base
+        return family,column,key,expected
+
     def _witness(self,db,index,key,row,meter):
         if index<3:self._projection_actual(index,row,meter)
         if index==0:
@@ -325,31 +476,26 @@ class InstalledSegmentedCensusV3:
                 if tail is None or tail[0]!=header[5]-1 or tail[1]+len(tail[2])!=header[4]:
                     raise AuthorityUnavailable('header lacks actual final segment count/byte EOF')
         elif index==1:
-            header=self._header(row[2],meter);relation='segment_has_header';facts=(key,c09_row_commitment_v2(header))
+            extent=self._extent(row[2],meter)
+            relation='segment_has_header' if extent['coverage']=='sealed_complete' else 'segment_has_non_executable_prefix_history'
+            facts=(key,c09_row_commitment_v2(extent['header'] if extent['coverage']=='sealed_complete' else extent['history_row']))
         elif index==2:
             header=self._header(row[6],meter);relation='ref_matches_header';facts=(key,c09_row_commitment_v2(header))
         else:
-            header=self._header(row[0],meter)
+            extent=self._extent(row[0],meter)
+            if extent['coverage']=='prefix_only':
+                if tuple(row)!=extent['cursor']:
+                    raise AuthorityUnavailable('prefix orphan audit lost its actual non-executable history cursor')
+                return {'schema':'sylanne3.c09.segmented-orphan-witness.v1',
+                    'relation':'original_cursor_has_non_executable_prefix_history',
+                    'facts':(key,c09_row_commitment_v2(extent['history_row']),c09_row_commitment_v2(tuple(row)))}
+            header=extent['header']
             if (row[1]!=self.scope.scope_digest or row[3:7]!=(header[1],self.scope.operation_id,header[2],'sealed')
                     or row[7:11]!=(header[5],header[4],header[7],header[6])
                     or row[12:17]!=(header[4],header[5],header[4],header[7],header[6])):
                 raise AuthorityUnavailable('orphan audit actual write cursor is not independently closed')
-            locator=json.loads(row[2]);family=locator['family'];source_key=tuple(locator['primary_key']);column=locator['column']
-            if (self.role=='graph' and column=='value'):column='value_cell_id'
-            elif self.role=='core' and column=='payload_json':column='payload_cell_id'
-            if (family,column) not in self._refs():raise AuthorityUnavailable('actual closed cursor names an unregistered logical family/column')
-            source_shape=read_c09_table_shape_v2(self.pair.source,family,meter=meter)
-            original_column='value' if self.role=='graph' else 'payload_json'
-            base_locator={'role':self.role,'family':family,'primary_key':source_key,'column':original_column,
-                'source_schema_digest':source_shape.schema_digest}
-            if 'producer_kind' in locator:
-                if self.role!='graph' or set(locator)!=set(base_locator)|{'producer_kind','basis_digest'} or locator['producer_kind'] not in {'current_closure_erased_marker.v3','prior_erased_erased_marker.v3'}:
-                    raise AuthorityUnavailable('actual closed cursor has an unregistered generated producer locator')
-                digest=locator['basis_digest']
-                if type(digest) is not str or len(digest)!=64 or any(char not in '0123456789abcdef' for char in digest):
-                    raise AuthorityUnavailable('actual closed cursor generated basis commitment differs')
-                expected_locator={**base_locator,'producer_kind':locator['producer_kind'],'basis_digest':digest}
-            else:expected_locator=base_locator
+            locator=json.loads(row[2])
+            family,column,source_key,expected_locator=self._sealed_locator_logical(locator,header,meter)
             if row[2]!=canonical_serialize(expected_locator):
                 raise AuthorityUnavailable('actual closed cursor locator differs from canonical source role/schema/PK')
             expected_id=canonical_digest({'schema':'sylanne3.segmented-cell-identity.v1','instance':self.instance,

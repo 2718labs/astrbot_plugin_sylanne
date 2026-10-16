@@ -141,6 +141,8 @@ def _preflight(config: AuthorityDeploymentConfig, *, composition=None) -> dict[s
         if contact_table in tables:
             from .c09_contact_policy_rows_v1 import require_contact_policy_schema_v1
             require_contact_policy_schema_v1(db)
+        from .c09_habit_policy_rows_v1 import require_habit_core_schema_v1
+        require_habit_core_schema_v1(db)
         from .installation_management_v1 import TABLES as management_tables, TRIGGERS as management_triggers
         management_schema = {**management_tables, **management_triggers}
         if set(management_tables) & tables:
@@ -530,8 +532,9 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
                     and workflows.natural_generation.template_version==V6_TEMPLATE)
                 from .d13_natural_frame_verifier_v7 import build_authority_d13_natural_frame_verifier_v7
                 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+                from ..host.model_workflows_v8 import AdminModelWorkflowsV8
                 from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
-                actual_v7=(type(workflows) is AdminModelWorkflowsV7 and workflows.natural_generation is not None
+                actual_v7=(type(workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} and workflows.natural_generation is not None
                     and workflows.natural_generation.template_version==V7_TEMPLATE)
                 history_factory=(build_authority_d13_natural_frame_verifier_v7 if actual_v7 else
                     build_authority_d13_natural_frame_verifier_v6 if actual_v6 else build_authority_d13_natural_frame_verifier_v1)
@@ -779,6 +782,58 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
     return pairings, server
 
 
+def _install_current_life_model_readers_v1(server,*,namespace,installation,storage_owner,location):
+    """Attach the existing exact Life readers to the installed selected Core graph."""
+    import hmac
+    from ..host.authority_profile import AdminInstallationBundle
+    from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
+    from ..runtime.d06_structured_experience_v1 import InstalledD06StructuredExperienceReadersV1
+    bundle=installation.installation_bundle
+    if type(bundle)is not AdminInstallationBundle:
+        raise AuthorityUnavailable('Life model readers require the actual installed bundle')
+    workflows=bundle.model_workflows
+    if workflows.version<3:return
+    if workflows.life_content is None and workflows.life_numeric is None:return
+    model=server._v2_model_egress.get(namespace)
+    worker=server._v2_worker_model_result_reads.get(namespace)
+    if (model is None or worker is None or server._clock_provider is None
+            or bundle.installation_policy.namespace!=storage_owner.namespace_id
+            or bundle.installation_policy.authority_namespace!=namespace
+            or bundle.installation_policy.installation_id!=storage_owner.installation_id
+            or model._graph_verifier._artifact_draft_bundle is not bundle
+            or model._graph_verifier._issuer is not installation.d11_issuer
+            or model._graph_verifier._path!=location._graph_db_path
+            or storage_owner.graph_path!=location._graph_db_path):
+        raise AuthorityUnavailable('Life model readers crossed the actual installed model/Owner/Graph identity')
+    key=hmac.digest(bundle.d02_signing_key,b'sylanne3.d02.body_quote_original.v1\0'
+        +bundle.installation_policy.installation_id.encode('utf-8'),'sha256')
+    readers=InstalledD06StructuredExperienceReadersV1(issuer=installation.d11_issuer,
+        resource_issuer=installation.d11_issuer.resource_issuer,body_quote_authority=D02BodyQuoteAuthority(key))
+    def trusted_upper():
+        reading=server._clock_provider()
+        return reading.utc_seconds+reading.utc_error_seconds
+    shared=dict(store=model._store,fences=server._v2_fences[namespace],graph_db_path=location._graph_db_path,
+        d11_issuer=installation.d11_issuer,installation_id=storage_owner.installation_id,
+        read_subject=worker._read_subject,holder=storage_owner.holder,trusted_now_utc=trusted_upper,
+        source_location=location)
+    if workflows.life_content is not None:
+        from .internal_life_model_graph_v2 import InstalledInternalLifeModelGraphReaderV2
+        from .internal_life_model_result_service_v2 import InstalledInternalLifeModelResultServiceV2
+        reader=InstalledInternalLifeModelGraphReaderV2(owner_storage=storage_owner,structured_readers=readers,
+            bundle=bundle,read_subject=worker._read_subject)
+        model._graph_verifier.install_internal_life_reader_v2(reader)
+        server.install_internal_life_model_result_reader_v2(namespace,
+            InstalledInternalLifeModelResultServiceV2(**shared,graph_reader=reader))
+    if workflows.life_numeric is not None:
+        from .current_life_numeric_v1 import InstalledLifeNumericModelGraphReaderV1
+        from .life_numeric_model_result_service_v1 import InstalledLifeNumericModelResultServiceV1
+        reader=InstalledLifeNumericModelGraphReaderV1(owner_storage=storage_owner,structured_readers=readers,
+            bundle=bundle,read_subject=worker._read_subject)
+        model._graph_verifier.install_life_numeric_reader_v1(reader)
+        server.install_life_numeric_model_result_reader_v1(namespace,
+            InstalledLifeNumericModelResultServiceV1(**shared,graph_reader=reader))
+
+
 def _compose_business_daemon_v3(config, lock_handle, composition):
     """Reopen an installed Authority; never initialize or replace a missing DB."""
     composition.require_current()
@@ -856,12 +911,66 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                 self_identity.install_current_source_location_v1(location, storage_owner)
             from .current_authority_graph_read_v3 import install_authority_graph_read_service_registry_v3
             install_authority_graph_read_service_registry_v3(server,namespace=namespace,source_location=location)
+            if model is not None:
+                from .owner_location_read_v3 import install_d07_model_seal_owner_observer_v3
+                install_d07_model_seal_owner_observer_v3(server, storage_owner)
             for registry in (server._d04_numeric_services_v3, getattr(server, "_d04_root_services_v3", {})):
                 numeric = registry.get(namespace)
                 if numeric is not None:
                     numeric.install_storage_owner_service_v1(storage_owner)
             offline_installation = (config.natural_model_authorities_v2 or {}).get(namespace)
             offline_bundle = None if offline_installation is None else offline_installation.installation_bundle
+            if offline_bundle is not None:
+                _install_current_life_model_readers_v1(server,namespace=namespace,installation=offline_installation,
+                    storage_owner=storage_owner,location=location)
+            if offline_bundle is not None and offline_bundle.habit_runtime_policy is not None:
+                from ..host.habit_runtime_policy_v1 import HabitRuntimePolicyV1
+                from .d10_habit_ledger_v1 import habit_signing_key_v1
+                from .d10_habit_policy_service_v1 import InstalledD10HabitPolicyServiceV1
+                from .current_habit_occurrence_v1 import InstalledCurrentHabitOccurrenceV1
+                if type(offline_bundle.habit_runtime_policy)is not HabitRuntimePolicyV1 or self_identity is None:
+                    raise AuthorityUnavailable("Habit requires its actual installed policy and current Self")
+                offline_bundle.habit_runtime_policy.require_installation_v1(offline_bundle.installation_policy)
+                def habit_trusted_now_v1():
+                    reading=config.clock_provider()
+                    return reading.utc_seconds+reading.utc_error_seconds
+                habit_policy=InstalledD10HabitPolicyServiceV1(fences=server._v2_fences[namespace],
+                    owner_tickets=server._v2_owner_tickets,owner_service=storage_owner,
+                    namespace=maintenance.namespace_id,installation_id=control.installation_id,
+                    signing_key=habit_signing_key_v1(offline_bundle),trusted_now_utc=habit_trusted_now_v1,create=True)
+                habit_current=InstalledCurrentHabitOccurrenceV1(self_identity_service=self_identity,
+                    budget_issuer=offline_installation.d11_issuer,clock_provider=config.clock_provider,
+                    installed_bundle=offline_bundle,policy_service=habit_policy,create=True)
+                server._d10_habit_policy_services_v1[(namespace,control.installation_id)]=habit_policy
+                server._current_habit_occurrence_v1[(namespace,control.installation_id)]=habit_current
+                maintenance._installed_d10_habit_policy_service_v1=habit_policy
+                maintenance._installed_current_habit_occurrence_v1=habit_current
+            if offline_bundle is not None:
+                from .current_named_joint_binding_v1 import InstalledCurrentNamedJointBindingV1
+                if self_identity is None:
+                    raise AuthorityUnavailable('Named Joint requires its actual current Self/Owner composition')
+                server._current_named_joint_binding_v1[(namespace, control.installation_id)] = InstalledCurrentNamedJointBindingV1(
+                    self_identity_service=self_identity, budget_issuer=offline_installation.d11_issuer,
+                    clock_provider=config.clock_provider, installed_bundle=offline_bundle, package_root=offline_installation.package_root)
+            if offline_bundle is not None and offline_bundle.artifact_draft is not None:
+                from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
+                model=server._v2_model_egress.get(namespace)
+                worker=server._v2_worker_model_result_reads.get(namespace)
+                if model is None or worker is None:
+                    raise AuthorityUnavailable("Artifact model reader lacks actual paired model/worker installation")
+                artifact_reader=InstalledArtifactDraftModelGraphReaderV3(owner_storage=storage_owner,bundle=offline_bundle,
+                    issuer=offline_installation.d11_issuer,model_service=model,worker_service=worker,
+                    habit_service=server._current_habit_occurrence_v1.get((namespace,control.installation_id)))
+                model._graph_verifier.install_artifact_model_reader_v3(artifact_reader)
+            from .conditioned_child_contract_v1 import ROOT_WORK_KIND as CONDITIONED_CHILD_ROOT_WORK_KIND
+            if(offline_bundle is not None and CONDITIONED_CHILD_ROOT_WORK_KIND in
+                    offline_bundle.installation_policy.root_grant.allowed_work_kinds):
+                from .current_conditioned_child_v1 import InstalledCurrentConditionedChildV1
+                if self_identity is None:
+                    raise AuthorityUnavailable('conditioned child requires its actual current Self/Owner composition')
+                server.install_current_conditioned_child_v1(namespace,InstalledCurrentConditionedChildV1(
+                    self_identity_service=self_identity,budget_issuer=offline_installation.d11_issuer,
+                    clock_provider=config.clock_provider,installed_bundle=offline_bundle))
             if (offline_bundle is not None and "d11.foreground_cycle.v1" in
                     offline_bundle.installation_policy.root_grant.allowed_work_kinds):
                 from .current_foreground_activity_v1 import InstalledCurrentForegroundActivityV1
@@ -877,7 +986,8 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                         else None))
                 server.install_current_foreground_activity_v1(namespace, foreground)
                 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-                if type(offline_bundle.model_workflows) is AdminModelWorkflowsV7:
+                from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+                if type(offline_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
                     from .d13_installed_counter_factory_v1 import install_d13_core_counter_v1
                     from ..runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
                     from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
@@ -902,6 +1012,10 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                         InstalledCurrentOwnerSourceNoteTaskV1(self_identity_service=self_identity,
                             budget_issuer=offline_installation.d11_issuer,
                             clock_provider=config.clock_provider, installed_bundle=offline_bundle))
+            if offline_bundle is not None:
+                from .current_named_joint_source_note_v1 import install_named_source_note_original_services_v1
+                install_named_source_note_original_services_v1(server._current_named_joint_binding_v1[(namespace,control.installation_id)],
+                    server._v2_foreground_activity.get(namespace),server._v2_owner_source_note_tasks.get(namespace))
             if (offline_bundle is not None and "artifact_draft_v1" in
                     offline_bundle.installation_policy.root_grant.allowed_work_kinds):
                 from ..runtime.d11_artifact_draft_model_v1 import installed_artifact_draft_workflow_v1
@@ -916,7 +1030,7 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                         installed_bundle=offline_bundle, installation_id=control.installation_id,
                         read_subject=worker._read_subject, holder=next(iter(holders)),
                         trusted_now_utc=lambda: server._clock_provider().utc_seconds,
-                        read_attempts=worker._attempts))
+                        read_attempts=worker._attempts,graph_reader=model._graph_verifier._artifact_model_reader_v3))
             if offline_bundle is not None and server._clock_provider is not None:
                 import hashlib
                 import hmac
@@ -930,7 +1044,11 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                         b"sylanne.authority.d10-contact-policy-signing.v1", hashlib.sha256).digest(),
                     trusted_now_utc=lambda: server._clock_provider().utc_seconds, create=True)
                 server._d10_contact_policy_services_v1[(namespace, control.installation_id)] = contact_service
-                server.install_contact_p2_service_v1(contact_service, location)
+                p2 = server.install_contact_p2_service_v1(contact_service, location)
+                from .contact_effect_accounting_v1 import InstalledContactEffectAccountingServiceV1
+                server._contact_effect_accounting_v1[(namespace, control.installation_id)] = (
+                    InstalledContactEffectAccountingServiceV1(p2_service=p2,
+                        accounting=server._v2_accounting[namespace], bundle=offline_bundle, create=True))
                 if offline_bundle.model_workflows.contact_generation is not None:
                     from .contact_model_result_service_v1 import InstalledContactModelResultServiceV1
                     model._graph_verifier.install_contact_policy_service_v1(contact_service)
@@ -939,7 +1057,8 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                     from ..host.model_workflows_v5 import AdminModelWorkflowsV5
                     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
                     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7):
+                    from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
                         from .contact_model_result_service_v2 import InstalledContactModelResultServiceV2 as InstalledContactModelResultServiceV1
                         install_contact_reader = server.install_contact_model_result_reader_v2
                     else:
@@ -954,6 +1073,9 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                         read_subject="mtls:sha256:" + offline_installation.observer_peer[0],
                         holder=next(iter(holders)), trusted_now_utc=contact_trusted_now,
                         source_location=location, contact_policy_service=contact_service))
+                    if namespace in server._contact_model_reads_v2:
+                        server.install_contact_prospective_observer_v1(namespace, bundle=offline_bundle)
+                        server.install_contact_continuation_observer_v1(namespace, bundle=offline_bundle)
             if (offline_bundle is not None and "d10.offline_observed_tick.v1" in
                     offline_bundle.installation_policy.root_grant.allowed_work_kinds):
                 from .d11_offline_tick_service_v1 import AuthorityD11OfflineTickServiceV1

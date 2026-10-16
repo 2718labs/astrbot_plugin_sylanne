@@ -245,8 +245,14 @@ class SelectedRuntimePhysicalReadV3:
                     self._link('writes_eof',(self.after,self.counts[2]));self.phase='refs';self.after=None;return False
                 header=_read_one(db,'SELECT '+','.join(_HEADER)+' FROM segmented_cells_v1 WHERE cell_id=?',(row[0],),meter)
                 if self.initial_qualification is not None:
-                    from .c09_source_physical_read_v3 import begin_initial_owner_source_cursor_read_v3
-                    self.pending=begin_initial_owner_source_cursor_read_v3(self.initial_qualification,row,meter=meter)
+                    locator=json.loads(row[2])
+                    if type(locator)is dict and locator.get('schema')=='d10.contact-plan-cell-locator.v3':
+                        from ..runtime.c09_contact_plan_stage_v3 import begin_frozen_contact_plan_stage_prefix_v3
+                        self.pending=begin_frozen_contact_plan_stage_prefix_v3(self.source_scope,row,meter=meter)
+                        if self.pending is None:raise AuthorityUnavailable('actual Contact prefix producer is absent')
+                    else:
+                        from .c09_source_physical_read_v3 import begin_initial_owner_source_cursor_read_v3
+                        self.pending=begin_initial_owner_source_cursor_read_v3(self.initial_qualification,row,meter=meter)
                     return False
                 if row[1] == self.basis.prepared['capture_scope_digest']:
                     if header is None and self.role=='graph':
@@ -261,6 +267,9 @@ class SelectedRuntimePhysicalReadV3:
                 elif self.role=='graph':
                     from ..runtime.owner_material_source_storage_v3 import begin_selected_owner_source_stage_read_v3
                     self.pending=begin_selected_owner_source_stage_read_v3(db,selected_basis=self.basis,cell_id=row[0],meter=meter)
+                    if self.pending is None:
+                        from ..runtime.c09_contact_plan_stage_v3 import begin_selected_contact_plan_stage_read_v3
+                        self.pending=begin_selected_contact_plan_stage_read_v3(db,selected_basis=self.basis,cell_id=row[0],meter=meter)
                     if self.pending is None:raise AuthorityUnavailable('actual extra write cursor lacks a registered prepared producer')
                     return False
                 else:raise AuthorityUnavailable('actual extra runtime write cursor has no registered producer')

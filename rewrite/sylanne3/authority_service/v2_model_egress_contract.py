@@ -474,3 +474,102 @@ __all__ = [
     "host_model_completion_to_wire_v2", "host_model_completion_from_wire_v2",
     "require_model_observation_billing_intent_v1",
 ]
+
+MODEL_NO_DISPATCH_SIGN_KIND_V1 = "authority.model-no-dispatch-witness.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelNoDispatchClosureRequestV1:
+    intent: ModelEgressIntentV1
+    installation_id: str
+    holder: str
+    expected_anchor: object
+    requested_deadline_utc: str
+    requested_cancel_cause_ref: str
+    schema: str = "sylanne3.authority.model-no-dispatch-closure.v1"
+
+    def __post_init__(self):
+        from ..runtime.restore_anchor import RestoreAnchor
+        from ..runtime.d11_offline_originals_v1 import _utc
+        if (self.schema != "sylanne3.authority.model-no-dispatch-closure.v1"
+                or type(self.intent) is not ModelEgressIntentV1
+                or type(self.expected_anchor) is not RestoreAnchor
+                or (self.expected_anchor.authority_id, self.expected_anchor.namespace) !=
+                   (self.intent.authority_id, self.intent.namespace)
+                or self.intent.acquire_operation_id is None or self.intent.binding_digest is None):
+            raise ValueError("exact original installed unsent model request required")
+        identifier(self.installation_id, "installation_id")
+        identifier(self.holder, "holder")
+        identifier(self.requested_cancel_cause_ref, "requested_cancel_cause_ref")
+        _utc(self.requested_deadline_utc)
+
+    @property
+    def identity_digest(self):
+        from dataclasses import asdict
+        from ..runtime_contracts import canonical_digest
+        return canonical_digest((self.schema, asdict(self.intent), self.installation_id,
+            self.holder, self.requested_deadline_utc, self.requested_cancel_cause_ref))
+
+
+@dataclass(frozen=True, slots=True)
+class ModelNoDispatchWitnessV1:
+    request: ModelNoDispatchClosureRequestV1
+    original_permit: object
+    namespace_epoch: int
+    prepared_row_commitment: str
+    finished_row_commitment: str
+    absence_scope_commitment: str
+    before_anchor: object
+    after_anchor: object
+    finish_request_id: str
+    finish_digest: str
+    witness_operation_id: str
+    signature: str
+    schema: str = "sylanne3.authority.model-no-dispatch-witness.v1"
+
+    def __post_init__(self):
+        from dataclasses import asdict
+        from ..runtime.restore_anchor import RestoreAnchor
+        from ..runtime_contracts import canonical_digest
+        from .v2_contract import FencePermitV2
+        from .v2_fence_store import AuthorityV2FenceStore
+        r, p = self.request, self.original_permit
+        if (self.schema != "sylanne3.authority.model-no-dispatch-witness.v1"
+                or type(r) is not ModelNoDispatchClosureRequestV1 or type(p) is not FencePermitV2
+                or type(self.before_anchor) is not RestoreAnchor or self.after_anchor != self.before_anchor
+                or self.before_anchor != r.expected_anchor or type(self.namespace_epoch) is not int or self.namespace_epoch < 1
+                or p.operation != "model_egress"
+                or (p.authority_id, p.namespace, p.subject, p.holder, p.operation_id,
+                    p.token, p.fence_epoch, p.revision, canonical_digest(asdict(p.pinned_anchor))) !=
+                   (r.intent.authority_id, r.intent.namespace, r.intent.subject, r.holder, r.intent.operation_id,
+                    r.intent.fence_token, r.intent.fence_epoch, r.intent.fence_revision, r.intent.anchor_digest)
+                or self.finish_request_id != r.intent.call_id
+                or self.finish_digest != AuthorityV2FenceStore.model_terminal_finish_digest(r.intent, p, "not_dispatched")
+                or self.witness_operation_id != "model-no-dispatch:" + r.identity_digest):
+            raise ValueError("Authority unsent witness changed its original exact fence/call")
+        for name in ("prepared_row_commitment", "finished_row_commitment", "absence_scope_commitment"):
+            _digest(getattr(self, name), name)
+        if type(self.signature) is not str or not self.signature:
+            raise ValueError("actual Authority producer signature required")
+
+    @property
+    def unsigned_wire(self):
+        from dataclasses import asdict
+        from .v2_contract import to_wire as permit_to_wire
+        from .v2_model_egress_wire import to_wire as model_to_wire
+        value = asdict(self)
+        value["request"] = model_to_wire(self.request)
+        value["original_permit"] = permit_to_wire(self.original_permit)
+        value.pop("signature")
+        return value
+
+    @property
+    def digest(self):
+        from ..runtime_contracts import canonical_digest
+        return canonical_digest(self.unsigned_wire)
+
+    def require_signature_v1(self, signer):
+        from ..runtime_contracts import canonical_serialize
+        signer.verify(MODEL_NO_DISPATCH_SIGN_KIND_V1, canonical_serialize(self.unsigned_wire), self.signature)
+        return self
+

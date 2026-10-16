@@ -10,10 +10,10 @@ from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2,
 from .d11_life_preparation_v1 import life_prepared_from_wire_v1
 from .d11_life_source_note_v1 import ARTIFACT_SCHEMA
 
-FACT_KINDS = frozenset({"accounting_prepared", "historical_accounting_gate", "historical_accounting_receipt","c4_paid","c4_phase_paid"})
-C4_KINDS=frozenset({"c4_frozen","c4_prepared","c4_request","c4_call","c4_result","c4_paid","c4_adopted"})
+FACT_KINDS = frozenset({"accounting_prepared", "historical_accounting_gate", "historical_accounting_receipt","c4_paid","c4_phase_paid","c4_no_dispatch","c4_phase_no_dispatch"})
+C4_KINDS=frozenset({"c4_frozen","c4_prepared","c4_request","c4_call","c4_result","c4_paid","c4_adopted","c4_no_dispatch"})
 C4_PHASE_KINDS = frozenset("c4_phase_" + part for part in
-    ("frozen", "prepared", "request", "call", "result", "paid", "adopted", "verified"))
+    ("frozen", "prepared", "request", "call", "result", "paid", "adopted", "verified", "no_dispatch"))
 FOREGROUND_CAUSE_KIND = "foreground_post_c02_cause"
 POSTCONDITION_KINDS = frozenset({"artifact_phase_postcondition_policy", "artifact_phase_postcondition_contract", "artifact_phase_assessment", "artifact_standing_predecision_approval", "artifact_candidate_preparation_parent"})
 
@@ -60,6 +60,10 @@ def decode_life_original_content_v1(kind, encoded):
     if kind in POSTCONDITION_KINDS:
         from .artifact_phase_postconditions_v1 import decode_artifact_phase_postcondition_original_v1
         return decode_artifact_phase_postcondition_original_v1(kind, raw)
+
+    if kind in {"c4_no_dispatch", "c4_phase_no_dispatch"}:
+        from .d11_artifact_draft_model_v1 import decode_artifact_model_no_dispatch_v1
+        return decode_artifact_model_no_dispatch_v1(raw)
     if kind in C4_PHASE_KINDS:
         from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v2
         return decode_artifact_draft_original_v2(kind, raw)
@@ -606,6 +610,10 @@ def read_original_foreground_responsibility_for_c09_v1(db,*,namespace,job,issuer
 
 def life_original_content_projection_v1(kind,raw):
     """Expose only declared embedded body schemas for C09 reference traversal."""
+    if kind in {"c4_no_dispatch", "c4_phase_no_dispatch"}:
+        from .d11_artifact_draft_model_v1 import decode_artifact_model_no_dispatch_v1
+        decode_artifact_model_no_dispatch_v1(raw)
+        return {"schema": raw["schema"], "financial_original_digest": canonical_digest(raw)}
     if kind in {"c4_request", "c4_phase_request"}:
         from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1, decode_artifact_draft_original_v2
         from .natural_reply_job_v2 import _request_from_wire
@@ -622,6 +630,12 @@ def validate_c4_life_original_row_v1(kind,*,namespace,original_ref,producing_ope
     from ..model_broker.artifact_draft_v1 import artifact_draft_model_ids_v1
     from .model_cost_settlement import original_model_cost_operation_id_v1
     if kind not in C4_KINDS:raise DomainProductionErasureHold("unregistered C4 SQL original kind")
+    if kind == "c4_no_dispatch":
+        from .d11_artifact_draft_model_v1 import decode_artifact_model_no_dispatch_v1
+        value = decode_artifact_model_no_dispatch_v1(raw)
+        if (value.namespace, value.original_ref, value.cost_commit.operation_id) != (namespace, original_ref, producing_operation_id):
+            raise DomainProductionErasureHold("no-dispatch SQL producer identity differs")
+        return value
     value=decode_artifact_draft_original_v1(kind,raw)
     if kind=="c4_paid":
         marker=value.call_id.removeprefix("artifact-draft-call:")
@@ -662,6 +676,12 @@ def validate_c4_phase_life_original_row_v2(kind, *, namespace, original_ref, pro
     from .model_cost_settlement import original_model_cost_operation_id_v1
     if kind not in C4_PHASE_KINDS:
         raise DomainProductionErasureHold("unregistered C4 phase SQL original kind")
+    if kind == "c4_phase_no_dispatch":
+        from .d11_artifact_draft_model_v1 import decode_artifact_model_no_dispatch_v1
+        value = decode_artifact_model_no_dispatch_v1(raw)
+        if (value.namespace, value.original_ref, value.cost_commit.operation_id) != (namespace, original_ref, producing_operation_id):
+            raise DomainProductionErasureHold("no-dispatch SQL producer identity differs")
+        return value
     value = decode_artifact_draft_original_v2(kind, raw)
     if kind == "c4_phase_paid":
         marker = value.call_id.removeprefix("artifact-draft-v2-call:")
@@ -1313,6 +1333,9 @@ def validate_c4_original_join_row_v2(db, *, ns, kind, ref, op, value, raw, diges
     from .natural_reply_job_v2 import _request_from_wire
     from .model_cost_settlement import original_model_cost_operation_id_v1
     originals = _LifeOriginalPointLookupV2(read_original)
+    if kind in {"c4_no_dispatch", "c4_phase_no_dispatch"}:
+        validate_c4_no_dispatch_original_joins_v1(db, namespace=ns, original_ref=ref, producing_operation_id=op, raw=raw)
+        return None
     if kind not in C4_KINDS:
         return None
     validate_c4_life_original_row_v1(kind, namespace=ns, original_ref=ref, producing_operation_id=op, raw=raw)
@@ -1391,6 +1414,9 @@ def validate_c4_phase_original_join_row_v3(db, *, ns, kind, ref, op, value, raw,
     from .natural_reply_job_v2 import _request_from_wire
     from .model_cost_settlement import original_model_cost_operation_id_v1
     originals = _LifeOriginalPointLookupV2(read_original)
+    if kind in {"c4_no_dispatch", "c4_phase_no_dispatch"}:
+        validate_c4_no_dispatch_original_joins_v1(db, namespace=ns, original_ref=ref, producing_operation_id=op, raw=raw)
+        return None
     if kind not in C4_PHASE_KINDS:
         return None
     validate_c4_phase_life_original_row_v2(kind, namespace=ns, original_ref=ref, producing_operation_id=op, raw=raw)
@@ -1469,3 +1495,98 @@ def validate_c4_phase_original_join_row_v3(db, *, ns, kind, ref, op, value, raw,
         raise DomainProductionErasureHold('C4 phase result lost actual once financial terminal')
     if kind == 'c4_phase_adopted':
         _validate_c4_content_original_joins_v1(db, ns, value, prepared, frozen, paid_row, result_row, originals, phase=True)
+
+
+def validate_c4_no_dispatch_original_joins_v1(db, *, namespace, original_ref, producing_operation_id, raw, issuer=None):
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from .d11_artifact_draft_model_v1 import decode_artifact_model_no_dispatch_v1
+    from ..authority_service.v2_model_egress_contract import ModelNoDispatchWitnessV1
+    from ..authority_service.v2_model_egress_wire import from_wire
+    from .model_cost_settlement import original_model_cost_operation_id_v1
+    from .d11_types import RuntimeCostSettlement
+    from ..graph_types import AtomKey
+    value = decode_artifact_model_no_dispatch_v1(raw)
+    witness = from_wire(json.loads(value.witness_json), ModelNoDispatchWitnessV1)
+    if issuer is not None: witness.require_signature_v1(issuer._signer)
+    commit = value.cost_commit
+    if (value.namespace != namespace or value.original_ref != original_ref or commit.operation_id != producing_operation_id
+            or commit.operation_id != original_model_cost_operation_id_v1(namespace, commit.call_id)):
+        raise ValueError("C09 no-dispatch record producer identity differs")
+    cost = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1", (commit.cost_ref,)).fetchone()
+    receipt = db.execute("SELECT commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, producing_operation_id)).fetchone()
+    if cost is None or cost[0] != producing_operation_id or cost[2] != 1 or receipt is None or receipt[0] != commit.commit_seq:
+        raise ValueError("C09 no-dispatch record lacks its real cost/CAS history")
+    cost_value = RuntimeCostSettlement(**json.loads(cost[1]))
+    if (cost_value.status != "settled" or cost_value.actual != {unit: 0 for unit, _ in witness.request.intent.budget_ceiling}
+            or cost_value.unconfirmed or cost_value.lease_id != witness.request.intent.budget_lease_id
+            or cost_value.budget_receipt_digest != commit.budget_receipt_digest
+            or json.loads(receipt[1])["original_model_no_dispatch_cost"] != plain_v1(commit)):
+        raise ValueError("C09 no-dispatch record lost its original exact zero budget settlement")
+    history_rows = tuple(db.execute("SELECT token,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=?",
+        (*namespace.as_tuple, producing_operation_id)))
+    if len(history_rows) != 2:
+        raise ValueError("C09 no-dispatch original cost/job bundle has another member set")
+    job_rows = tuple((value_json,) for token, value_json in history_rows if AtomKey.from_token(token).type_name == "runtime.job")
+    if len(job_rows) != 1:
+        raise ValueError("C09 no-dispatch cost lacks its one same-CAS cancelled job")
+    from .d11_types import RuntimeJobValue
+    job_value = RuntimeJobValue(**json.loads(job_rows[0][0]))
+    if (job_value.job_id != witness.request.intent.job_id or job_value.phase != "cancelled"
+            or job_value.result_ref is not None or job_value.operation_id != witness.request.intent.budget_reservation_operation_id):
+        raise ValueError("C09 no-dispatch cancelled job lineage differs")
+    return value
+
+
+
+def require_c4_no_dispatch_cost_original_commit_v1(db, *, namespace, operation_id):
+    from .model_cost_settlement import OriginalModelNoDispatchCostCommitV1, original_model_cost_operation_id_v1
+    from .d11_types import RuntimeCostSettlement, runtime_cost_settlement_key
+    from .budget import BudgetReceipt
+    if not db.in_transaction or type(namespace) is not NamespaceId:
+        raise DomainProductionErasureHold("no-dispatch financial original needs its actual pinned namespace transaction")
+    row = db.execute("SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple, operation_id)).fetchone()
+    if row is None: raise DomainProductionErasureHold("actual no-dispatch cost CAS absent")
+    raw = _json(row[3])
+    if set(raw) != {"original_model_no_dispatch_cost", "original_intent_digest", "no_dispatch_witness_digest",
+            "quote_id", "quote_version", "work_kind", "accounting_attempt_id", "no_dispatch_cancellation_basis"} or raw["work_kind"] != "artifact_draft_v1":
+        raise DomainProductionErasureHold("no-dispatch financial receipt has another exact ABI")
+    paid = OriginalModelNoDispatchCostCommitV1(**raw["original_model_no_dispatch_cost"])
+    if (paid.schema != "sylanne.d11.original-model-no-dispatch-cost-commit.v1" or paid.status != "committed"
+            or paid.operation_id != operation_id or paid.commit_seq != row[2]
+            or operation_id != original_model_cost_operation_id_v1(namespace, paid.call_id)
+            or (paid.witness_digest, paid.quote_id, paid.quote_version) !=
+                (raw["no_dispatch_witness_digest"], raw["quote_id"], raw["quote_version"])
+            or paid.cost_ref != runtime_cost_settlement_key(*namespace.as_tuple, row[0], operation_id).token):
+        raise DomainProductionErasureHold("no-dispatch financial original identity differs")
+    event = db.execute("SELECT revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+        (*namespace.as_tuple, row[0], operation_id)).fetchone()
+    from ..graph_store import GraphStore
+    versions = () if event is None else GraphStore._version_rows(event[0])
+    if len(versions) != 2 or event[1] != paid.graph_epoch:
+        raise DomainProductionErasureHold("no-dispatch financial original lost its exact cost/job CAS")
+    cost_versions = tuple(v for v in versions if v.key.token == paid.cost_ref)
+    job_versions = tuple(v for v in versions if v.key.type_name == "runtime.job")
+    if len(cost_versions) != 1 or len(job_versions) != 1 or cost_versions[0].revision != 1:
+        raise DomainProductionErasureHold("no-dispatch cost/job member set differs")
+    history = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+        (paid.cost_ref, cost_versions[0].revision)).fetchone()
+    if history is None or history[0] != operation_id or history[2] != 1:
+        raise DomainProductionErasureHold("no-dispatch actual financial history absent")
+    cost = decode_typed_production_value_v1(_json(history[1]), RuntimeCostSettlement)
+    receipt_row = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE lease_id=? AND operation_id=? AND phase='settle'",
+        (cost.lease_id, cost.cost_operation_id)).fetchone()
+    if receipt_row is None: raise DomainProductionErasureHold("no-dispatch original settle receipt absent")
+    receipt = decode_typed_production_value_v1(_json(receipt_row[0]), BudgetReceipt)
+    if ((cost.bot_id, cost.persona_id, cost.activity_id, cost.effect_id, cost.bundle_operation_id, cost.settlement_id,
+            cost.budget_phase, cost.budget_operation_id, cost.status, cost.execution_revoked) !=
+            (*namespace.as_tuple, row[0], row[1], operation_id, operation_id, "settle", cost.cost_operation_id, "settled", True)
+            or receipt.status != "settled" or receipt.operation_id != cost.cost_operation_id or receipt.lease_id != cost.lease_id
+            or canonical_digest(_json(receipt_row[0])) != paid.budget_receipt_digest
+            or cost.budget_receipt_digest != paid.budget_receipt_digest or cost.unconfirmed or cost.prior_unknown_ref is not None
+            or not cost.actual or set(cost.actual) != set(cost.ceiling) or any(cost.actual.values())
+            or not set(cost.actual) <= {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}):
+        raise DomainProductionErasureHold("no-dispatch cost is not the exact original zero model settlement")
+    return paid
+

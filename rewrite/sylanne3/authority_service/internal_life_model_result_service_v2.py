@@ -50,27 +50,35 @@ class InstalledInternalLifeModelResultServiceV2(AuthorityV2NaturalGenerationOutp
     def _graph_read(self, request, intent, terminal, location, fact=None):
         from ..runtime.internal_life_paid_result_v2 import read_life_paid_original_v2,read_life_cost_commit_v2
         from .internal_life_model_result_contract_v2 import internal_life_result_to_wire_v2
-        with closing(sqlite3.connect(self._path.as_uri()+"?mode=ro",uri=True)) as db:
-            db.execute("PRAGMA query_only=ON");db.execute("BEGIN")
-            try:
-                self._location.require_graph_snapshot_v1(db,location,graph_db_path=self._path)
-                current=self._graph_reader.read(db,intent,self._clock(),allow_accounted_result=True)
-                p,b,f=current.prepared,current.binding,current.frozen
-                saved=read_life_paid_original_v2(db,p.namespace,self._issuer,'read_attempt',request.read_attempt_id)
-                if saved!=internal_life_result_to_wire_v2(request):
-                    raise AuthorityUnavailable('Life result lacks its actual saved W01 selector')
-                cost=read_life_cost_commit_v2(db,namespace=p.namespace,issuer=self._issuer,
-                    prepared=p,intent=intent,terminal=terminal,fact=fact)
-                expected=(p.namespace,p.installation_id,p.episode_ref,p.occurrence_digest,
-                    f.input.cause.occurrence.event.causal_operation_id,p.job_id,p.acquire_operation_id,
-                    p.prepare_operation_id,p.call_id,b.digest,p.digest,current.request.digest)
-                if (request.namespace,request.installation_id,request.episode_ref,request.occurrence_digest,
-                    request.causal_operation_id,request.job_id,request.acquire_operation_id,
-                    request.original_operation_id,request.call_id,request.binding_digest,
-                    request.prepared_digest,request.model_request_digest)!=expected:
-                    raise AuthorityUnavailable('Life result actual worker/occurrence/original binding differs')
-                return current,cost
-            finally:db.rollback()
+        from .owner_location_read_v3 import prepare_owner_location_for_life_model_result_v3
+        entry = prepare_owner_location_for_life_model_result_v3(
+            self, intent=intent, read_attempt_id=request.read_attempt_id)
+        try:
+            with closing(sqlite3.connect(self._path.as_uri()+"?mode=ro",uri=True)) as db:
+                db.execute("PRAGMA query_only=ON")
+                with entry.bind_for_read_v3(db, installed_reader=self._graph_reader, intent=intent):
+                    db.execute("BEGIN")
+                    try:
+                        self._location.require_graph_snapshot_v1(db,location,graph_db_path=self._path)
+                        current=self._graph_reader.read(db,intent,self._clock(),allow_accounted_result=True)
+                        p,b,f=current.prepared,current.binding,current.frozen
+                        saved=read_life_paid_original_v2(db,p.namespace,self._issuer,'read_attempt',request.read_attempt_id)
+                        if saved!=internal_life_result_to_wire_v2(request):
+                            raise AuthorityUnavailable('Life result lacks its actual saved W01 selector')
+                        cost=read_life_cost_commit_v2(db,namespace=p.namespace,issuer=self._issuer,
+                            prepared=p,intent=intent,terminal=terminal,fact=fact)
+                        expected=(p.namespace,p.installation_id,p.episode_ref,p.occurrence_digest,
+                            f.input.cause.occurrence.event.causal_operation_id,p.job_id,p.acquire_operation_id,
+                            p.prepare_operation_id,p.call_id,b.digest,p.digest,current.request.digest)
+                        if (request.namespace,request.installation_id,request.episode_ref,request.occurrence_digest,
+                            request.causal_operation_id,request.job_id,request.acquire_operation_id,
+                            request.original_operation_id,request.call_id,request.binding_digest,
+                            request.prepared_digest,request.model_request_digest)!=expected:
+                            raise AuthorityUnavailable('Life result actual worker/occurrence/original binding differs')
+                        return current,cost
+                    finally:db.rollback()
+        finally:
+            entry.release_v3()
 
     def prepare(self, *, credential, request):
         self._scope(request)
@@ -89,6 +97,8 @@ class InstalledInternalLifeModelResultServiceV2(AuthorityV2NaturalGenerationOutp
                 operation="read", operation_id=request.read_attempt_id, expected_anchor=anchor)
             with self._delivery_lock:
                 self._inflight_deliveries[request.read_attempt_id] = permit
+            from .owner_location_read_v3 import register_owner_location_for_life_model_result_v3
+            register_owner_location_for_life_model_result_v3(self,credential=credential,request=request,permit=permit)
             location = self._location.observe_business_for_fence_v1(credential=credential, subject=self._read_subject, permit=permit)
             before = self._graph_read(request, intent, terminal, location)
             current_intent, current_terminal, observation = self._read_original(request, anchor, content=True)
@@ -125,6 +135,8 @@ class InstalledInternalLifeModelResultServiceV2(AuthorityV2NaturalGenerationOutp
             fences.validate_fence(credential=credential, subject=self._read_subject, permit=permit)
             return InternalLifeModelDeliveryV2(result, permit)
         except BaseException:
+            from .owner_location_read_v3 import release_owner_location_for_life_model_result_invocation_v3
+            release_owner_location_for_life_model_result_invocation_v3(self,request.read_attempt_id)
             with self._delivery_lock:
                 self._inflight_deliveries.pop(request.read_attempt_id, None)
             self.recover_finish(credential=credential, request=request)
@@ -147,12 +159,16 @@ class InstalledInternalLifeModelResultServiceV2(AuthorityV2NaturalGenerationOutp
                 self._finish(credential, key, delivery.permit)
             finally:
                 self._inflight_deliveries.pop(key, None)
+                from .owner_location_read_v3 import release_owner_location_for_life_model_result_invocation_v3
+                release_owner_location_for_life_model_result_invocation_v3(self,key)
 
     def abandon_delivery(self, *, delivery):
         if type(delivery) is not InternalLifeModelDeliveryV2:
             raise AuthorityUnavailable("actual Life content delivery required")
         with self._delivery_lock:
             self._inflight_deliveries.pop(delivery.result.request.read_attempt_id, None)
+            from .owner_location_read_v3 import release_owner_location_for_life_model_result_invocation_v3
+            release_owner_location_for_life_model_result_invocation_v3(self,delivery.result.request.read_attempt_id)
 
     def recover_finish(self, *, credential, request):
         self._scope(request)

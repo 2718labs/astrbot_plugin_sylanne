@@ -1,19 +1,24 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
 import type { BackendController } from './use-backend.ts'
-import { MODEL_SLOTS, RELATIONSHIP_MODEL_SLOT, GROWTH_MODEL_SLOT, type ModelSlot } from './api/configuration.ts'
+import { MODEL_SLOTS, RELATIONSHIP_MODEL_SLOT, GROWTH_MODEL_SLOT, GENERAL_GROWTH_MODEL_SLOT, type ModelSlot } from './api/configuration.ts'
 import { useDisplayAlias } from './ui-preferences.ts'
 import { useTheme } from './theme.ts'
 import { HTTPS_REQUIRED_MESSAGE } from './api/client.ts'
 import SetupPanel from './SetupPanel.vue'
 import CreatorConfigurationPanel from './CreatorConfigurationPanel.vue'
 import OwnerProjectContextPanel from './OwnerProjectContextPanel.vue'
+import GeneralGrowthOwnerPanel from './GeneralGrowthOwnerPanel.vue'
+import SelfViewPanel from './SelfViewPanel.vue'
+import Beta1OwnerPanel from './Beta1OwnerPanel.vue'
 
 const props=defineProps<{backend:BackendController}>()
 const configuration=props.backend.configuration,state=computed(()=>configuration.state),theme=useTheme(),display=useDisplayAlias()
 const aliasDraft=ref(display.alias.value),group=ref('basic')
-const groups=[{id:'basic',label:'基本'},{id:'models',label:'模型策略'},{id:'persona',label:'角色与场景'},{id:'attention',label:'注意与表达'},{id:'memory',label:'记忆与关系'},{id:'life',label:'Life 与联系'},{id:'resources',label:'资源与安装'}]
+const groups=[{id:'basic',label:'基本'},{id:'models',label:'模型策略'},{id:'persona',label:'角色与场景'},{id:'world',label:'世界与时间'},{id:'habit',label:'习惯'},{id:'long_window',label:'长期计划'},{id:'attention',label:'注意与表达'},{id:'memory',label:'记忆与关系'},{id:'life',label:'Life 与联系'},{id:'resources',label:'资源与安装'}]
 const labels:Record<ModelSlot,string>={reply:'主回复',encode:'记忆编码',context_reply:'上下文回复',natural_generation:'自然生成',natural_review:'自然复核',appraisal:'感受评估',d07_cognition:'认知',contact_generation:'联系生成',contact_review:'联系复核',life_content:'Life 内容',life_numeric:'Life Numeric'}
+const namedAuxiliarySlots=[{slot:RELATIONSHIP_MODEL_SLOT,label:'关系认知'},{slot:GROWTH_MODEL_SLOT,label:'成长认知'},{slot:GENERAL_GROWTH_MODEL_SLOT,label:'通用成长认知'}] as const
+const installedAuxiliarySlots=computed(()=>namedAuxiliarySlots.filter(item=>state.value.data?.model_slots.some(row=>row.slot===item.slot)))
 const modelStates={selected:'已选择，尚未安装匹配',pending:'待选择或安装匹配',installed:'与已安装模型身份匹配'}
 const options=computed(()=>state.value.data?.installed_policy.provider_options??[])
 function select(slot:ModelSlot|'auxiliary',event:Event){configuration.selectModel(slot,(event.target as HTMLSelectElement).value)}
@@ -25,7 +30,7 @@ onBeforeUnmount(()=>{configuration.invalidate();props.backend.creator.invalidate
 </script>
 <template>
   <section class="configuration-panel" aria-label="完整当前配置" :aria-busy="configuration.reading.value||configuration.writing.value">
-    <header class="configuration-heading"><div><p class="configuration-code">CURRENT CONFIGURATION / 3.0</p><h3>高级配置</h3><p>本机保存目标、启动值、模型安装匹配与角色方案分别核验。显示偏好仅作用于当前浏览器。</p></div><button class="configuration-action" :disabled="!configuration.canRead.value" @click="configuration.read">{{configuration.reading.value?'正在读取实际配置…':'读取当前配置'}}</button></header>
+    <header class="configuration-heading"><div><p class="configuration-code">CURRENT CONFIGURATION / BETA1</p><h3>高级配置</h3><p>本机保存目标、启动值、模型安装匹配与角色方案分别核验。显示偏好仅作用于当前浏览器。</p></div><button class="configuration-action" :disabled="!configuration.canRead.value" @click="configuration.read">{{configuration.reading.value?'正在读取实际配置…':'读取当前配置'}}</button></header>
     <p v-if="backend.requiresHttps.value" class="configuration-message" role="status">{{HTTPS_REQUIRED_MESSAGE}}</p>
     <nav class="configuration-tabs" aria-label="设置分组"><button v-for="item in groups" :key="item.id" :aria-current="group===item.id?'page':undefined" @click="changeGroup(item.id)">{{item.label}}</button></nav>
     <p v-if="state.message" class="configuration-message" :role="['error','conflict','unknown'].includes(state.status)?'alert':'status'">{{state.message}}</p>
@@ -38,24 +43,18 @@ onBeforeUnmount(()=>{configuration.invalidate();props.backend.creator.invalidate
     </section>
     <section v-else-if="group==='models'" class="configuration-section">
       <h4>模型策略与已安装状态</h4><p>选项来自实际 SDK 已加载且启用的 chat Provider。配置保存不是模型授权；空覆盖不由前端自动补主模型。实际解析与安装匹配显示在各槽下方。</p>
-      <div class="configuration-field"><label for="configuration-auxiliary">共享辅助 Provider</label><select id="configuration-auxiliary" :value="state.draft?.model_selection.auxiliary_provider_id??''" :disabled="!configuration.canEdit.value" @change="select('auxiliary',$event)"><option value="">未单独配置辅助模型</option><option v-if="unavailable(state.draft?.model_selection.auxiliary_provider_id??'')" :value="state.draft?.model_selection.auxiliary_provider_id" disabled>当前保存但不在可用 SDK 清单：{{state.draft?.model_selection.auxiliary_provider_id}}</option><option v-for="option in options" :key="option.provider_id" :value="option.provider_id">{{option.provider_id}} · {{option.model_id}}</option></select></div>
-      <div v-for="slot in MODEL_SLOTS" :key="slot" class="configuration-model-row"><div class="configuration-field"><label :for="'configuration-slot-'+slot">{{labels[slot]}} <small>{{slot}}</small></label><select :id="'configuration-slot-'+slot" :value="selected(slot)" :disabled="!configuration.canEdit.value" @change="select(slot,$event)"><option value="">{{slot==='reply'?'未选择主模型':'未单独覆盖；以服务端实际解析为准'}}</option><option v-if="unavailable(selected(slot))" :value="selected(slot)" disabled>当前保存但不在可用 SDK 清单：{{selected(slot)}}</option><option v-for="option in options" :key="option.provider_id" :value="option.provider_id">{{option.provider_id}} · {{option.model_id}}</option></select></div><template v-for="row in state.data?.model_slots.filter(item=>item.slot===slot)??[]" :key="row.slot"><p>{{modelStates[row.state]}} · {{row.reason_code}}</p><dl><div><dt>实际观察</dt><dd>{{row.selected_provider_id??'未选择'}} / {{row.model_id??'未观察到模型'}}</dd></div><div><dt>安装绑定</dt><dd>{{row.installed?row.installed.provider_id+' / '+row.installed.model_id:'未安装该槽'}}</dd></div><div v-if="row.installed"><dt>已安装输出上限</dt><dd>{{row.installed.max_output_tokens}} tokens</dd></div></dl></template></div>
-      <div v-if="state.data && [5,6,7].includes(state.data.installed_policy.workflow_version??0)" class="configuration-model-row">
-        <h5>关系认知 <small>{{RELATIONSHIP_MODEL_SLOT}}</small></h5><p>此正式槽使用共享辅助 Provider 选择与当前安装身份匹配，没有独立覆盖键。保存模型选择后仍需正式安装匹配。</p>
-        <template v-for="row in state.data.model_slots.filter(item=>item.slot===RELATIONSHIP_MODEL_SLOT)" :key="row.slot">
+      <div class="configuration-field"><label for="configuration-auxiliary">共享辅助 Provider</label><select id="configuration-auxiliary" :value="state.draft?.model_selection.auxiliary_provider_id??''" :disabled="!configuration.canEdit.value" @change="select('auxiliary',$event)"><option value="">{{state.draft?'未单独配置辅助模型':'当前值未读取'}}</option><option v-if="unavailable(state.draft?.model_selection.auxiliary_provider_id??'')" :value="state.draft?.model_selection.auxiliary_provider_id" disabled>当前保存但不在可用 SDK 清单：{{state.draft?.model_selection.auxiliary_provider_id}}</option><option v-for="option in options" :key="option.provider_id" :value="option.provider_id">{{option.provider_id}} · {{option.model_id}}</option></select></div>
+      <div v-for="slot in MODEL_SLOTS" :key="slot" class="configuration-model-row"><div class="configuration-field"><label :for="'configuration-slot-'+slot">{{labels[slot]}} <small>{{slot}}</small></label><select :id="'configuration-slot-'+slot" :value="selected(slot)" :disabled="!configuration.canEdit.value" @change="select(slot,$event)"><option value="">{{!state.draft?'当前值未读取':slot==='reply'?'未选择主模型':'未单独覆盖；以服务端实际解析为准'}}</option><option v-if="unavailable(selected(slot))" :value="selected(slot)" disabled>当前保存但不在可用 SDK 清单：{{selected(slot)}}</option><option v-for="option in options" :key="option.provider_id" :value="option.provider_id">{{option.provider_id}} · {{option.model_id}}</option></select></div><template v-for="row in state.data?.model_slots.filter(item=>item.slot===slot)??[]" :key="row.slot"><p>{{modelStates[row.state]}} · {{row.reason_code}}</p><dl><div><dt>实际观察</dt><dd>{{row.selected_provider_id??'未选择'}} / {{row.model_id??'未观察到模型'}}</dd></div><div><dt>安装绑定</dt><dd>{{row.installed?row.installed.provider_id+' / '+row.installed.model_id:'未安装该槽'}}</dd></div><div v-if="row.installed"><dt>已安装输出上限</dt><dd>{{row.installed.max_output_tokens}} tokens</dd></div></dl></template></div>
+      <div v-for="slot in installedAuxiliarySlots" :key="slot.slot" class="configuration-model-row">
+        <h5>{{slot.label}} <small>{{slot.slot}}</small></h5><p>此正式槽使用上方共享辅助 Provider，与当前安装身份逐项匹配；没有独立覆盖键。保存选择后仍需正式安装匹配。</p>
+        <template v-for="row in state.data?.model_slots.filter(item=>item.slot===slot.slot)??[]" :key="row.slot">
           <p>{{modelStates[row.state]}} · {{row.reason_code}}</p><dl><div><dt>实际观察</dt><dd>{{row.selected_provider_id??'未选择'}} / {{row.model_id??'未观察到模型'}}</dd></div><div><dt>安装绑定</dt><dd>{{row.installed?row.installed.provider_id+' / '+row.installed.model_id:'未安装该槽'}}</dd></div><div v-if="row.installed"><dt>已安装输出上限</dt><dd>{{row.installed.max_output_tokens}} tokens</dd></div></dl>
-        </template>
-      </div>
-      <div v-if="state.data && [6,7].includes(state.data.installed_policy.workflow_version??0)" class="configuration-model-row">
-        <h5>成长认知 <small>{{GROWTH_MODEL_SLOT}}</small></h5><p>此正式槽沿用共享辅助 Provider 与当前安装身份，没有独立覆盖键；观察到模型不代表已经具备成长生产权限。</p>
-        <template v-for="row in state.data.model_slots.filter(item=>item.slot===GROWTH_MODEL_SLOT)" :key="row.slot">
-          <p>{{modelStates[row.state]}} · {{row.reason_code}}</p><dl><div><dt>实际观察</dt><dd>{{row.selected_provider_id??'未选择'}} / {{row.model_id??'未观察到模型'}}</dd></div>
-          <div><dt>安装绑定</dt><dd>{{row.installed?row.installed.provider_id+' / '+row.installed.model_id:'未安装该槽'}}</dd></div><div v-if="row.installed"><dt>已安装输出上限</dt><dd>{{row.installed.max_output_tokens}} tokens</dd></div></dl>
         </template>
       </div>
     </section>
     <section v-else-if="group==='resources'" class="configuration-section"><h4>资源、安装与启动许可</h4><dl v-if="state.data" class="configuration-resource-facts"><div><dt>当前安装</dt><dd>{{state.data.installed_policy.installation_id??'未观察到安装'}}</dd></div><div><dt>已安装档案</dt><dd>{{state.data.installed_policy.profile_id??'未观察到注册档案'}}</dd></div><div><dt>Workflow 版本</dt><dd>{{state.data.installed_policy.workflow_version??'未安装模型工作流'}}</dd></div><div><dt>已配置模型槽</dt><dd>{{state.data.installed_policy.configured_model_slots.join('、')||'无已安装槽'}}</dd></div></dl><p>安装限制只读，不能在本页增加 budget、延长 grant、伪造配对或解除 HOLD。Authority enabled 的独立管理操作见下方真实授权设置。</p><SetupPanel :backend="backend" /></section>
-    <section v-else class="configuration-section"><h4>{{groups.find(item=>item.id===group)?.label}}</h4><p>领域配置通过当前 Owner 的方案草稿保存与编译/预览/采用链路，草稿不等于已采纳运行值。</p><CreatorConfigurationPanel :backend="backend" :group="group" /><OwnerProjectContextPanel v-if="group==='life'" :backend="backend"/><ul class="configuration-gaps"><li v-for="gap in gaps[group]??[]" :key="gap">{{gap}}</li></ul></section>
+    <section v-else-if="group==='world'||group==='habit'||group==='long_window'" class="configuration-section"><Beta1OwnerPanel :backend="backend" :domain="group as 'world'|'habit'|'long_window'"/></section>
+    <section v-else class="configuration-section"><h4>{{groups.find(item=>item.id===group)?.label}}</h4><p>领域配置通过当前 Owner 的方案草稿保存与编译/预览/采用链路，草稿不等于已采纳运行值。</p><CreatorConfigurationPanel :backend="backend" :group="group" /><OwnerProjectContextPanel v-if="group==='life'" :backend="backend"/><SelfViewPanel v-if="group==='persona'" :backend="backend"/><Beta1OwnerPanel v-if="group==='persona'" :backend="backend" domain="self"/><GeneralGrowthOwnerPanel v-if="group==='persona'" :backend="backend"/><ul class="configuration-gaps"><li v-for="gap in gaps[group]??[]" :key="gap">{{gap}}</li></ul></section>
     <footer class="configuration-save"><div><p>仅保存本机四项真实配置及模型选择，{{state.data?.apply_semantics??'需先读取'}}。未保存领域方案或执行模型。</p><p v-if="configuration.dirty.value">存在未保存本机配置修改。</p><p v-if="state.operationId">当前操作：{{state.operationId}}</p></div><div><button class="configuration-action" :disabled="!configuration.canEdit.value||!configuration.dirty.value" @click="configuration.resetDraft">撤销本地草稿</button><button class="configuration-action" :disabled="!configuration.canSave.value" @click="configuration.save">{{state.status==='verifying'?'正在独立回读…':configuration.writing.value?'正在保存…':'保存本机配置并回读'}}</button></div></footer>
   </section>
 </template>

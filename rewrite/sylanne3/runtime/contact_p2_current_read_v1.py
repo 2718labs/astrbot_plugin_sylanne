@@ -231,6 +231,9 @@ def current_contact_p2_read_v1(**actual):
 
 
 def require_current_contact_p2_read_v1(value, db):
+    from .contact_continuation_p2_v1 import ContactContinuationP2CurrentReadV1,require_current_contact_continuation_p2_read_v1
+    if type(value)is ContactContinuationP2CurrentReadV1:
+        return require_current_contact_continuation_p2_read_v1(value,db)
     if type(value) is not ContactP2CurrentReadV1:
         raise ValueError('actual independent Contact P2 current SQL reader required')
     value.check(db)

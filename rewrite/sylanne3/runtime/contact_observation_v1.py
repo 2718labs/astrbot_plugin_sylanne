@@ -4,6 +4,7 @@ This advances only the original quota/job/outbox observation facts and the
 recovery stamp. Platform ACK is a handoff, not delivery; no fee or usage is
 invented and the original message budget reservation remains unsettled.
 """
+from ..runtime_storage_v3 import read_graph_row_v3,read_graph_rows_v3
 from dataclasses import asdict, dataclass, replace
 import json
 
@@ -80,13 +81,27 @@ def consume_current_contact_observation_v1(graph, installed, *, operation_id, ef
     from ..graph_coordinator import namespace_ref
     grant=installed.port.installation_grant
     ns=installed.route_port._namespace
-    qualified=installed.port.read_current_contact_observation_for_projection_v1(namespace=ns,
-        authority_namespace=namespace_ref(ns),installation_id=grant.installation_id,
-        holder=grant.administrator_holder,effect_id=effect_id)
-    if type(qualified) is not ContactObservationProjectionReadV1:
-        raise ValueError('Contact observation independently qualified current Core read is absent')
+    from .contact_continuation_v1 import read_installed_contact_observation_locator_v1
+    from ..authority_service.contact_continuation_contract_v1 import (ContactContinuationObservationV1,ContactContinuationObservationProjectionReadV1,contact_continuation_from_wire_v1)
+    segment_original=read_installed_contact_observation_locator_v1(graph,installed,operation_id)
+    if segment_original is not None and segment_original.segment_index>0:
+        from ..host.contact_continuation_port_v1 import install_contact_continuation_port_v1
+        observed=contact_continuation_from_wire_v1(segment_original.core_observation,ContactContinuationObservationV1)
+        assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+        qualified=install_contact_continuation_port_v1(installed.port,assembly.admin_bundle).read_current_contact_continuation_observation_for_projection_v1(
+            namespace=ns,authority_namespace=namespace_ref(ns),installation_id=grant.installation_id,holder=grant.administrator_holder,
+            effect_id=effect_id,selector=observed.selector)
+        if type(qualified)is not ContactContinuationObservationProjectionReadV1 or qualified.continuation!=observed:
+            raise ValueError('Contact continuation lost its independent actual typed Core projection')
+    else:
+        qualified=installed.port.read_current_contact_observation_for_projection_v1(namespace=ns,
+            authority_namespace=namespace_ref(ns),installation_id=grant.installation_id,holder=grant.administrator_holder,effect_id=effect_id)
+        if type(qualified)is not ContactObservationProjectionReadV1:
+            raise ValueError('First Contact observation current independently qualified Core read is absent')
     receipt=qualified.observed_receipt;permit=qualified.observed_permit
-    observation=receipt.pending.platform_observation;binding=receipt.pending.binding
+    observation=receipt.pending.platform_observation;binding=observation.binding
+    if binding != receipt.pending.claimed_receipt.pending.binding:
+        raise ValueError("Contact observed original binding differs from its actual claim")
     if (binding.operation_id!=operation_id or binding.origin.effect_id!=effect_id
             or qualified.namespace!=ns or qualified.installation_id!=grant.installation_id
             or binding.origin.proactive_contact is not True):
@@ -124,7 +139,7 @@ def consume_current_contact_observation_v1(graph, installed, *, operation_id, ef
                 raise ValueError('Contact observation actual Contact adoption locator is absent')
             job_key,outbox_key=AtomKey.from_token(row[1]),AtomKey.from_token(row[2])
             claim_key=dispatch_claim_key(ns,effect_id)
-            current_claim=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(claim_key.token,)).fetchone()
+            current_claim=read_graph_row_v3(db,columns=('revision', 'value', 'valid'),where='token=?',parameters=(claim_key.token,),history=False)
             if current_claim is None or current_claim[0]!=1 or current_claim[2]!=1:
                 raise ValueError('Contact observation actual P2 Graph claim is absent')
             claim=DispatchGraphClaimValueV1(**json.loads(current_claim[1]))
@@ -139,10 +154,10 @@ def consume_current_contact_observation_v1(graph, installed, *, operation_id, ef
                 authority_digest(receipt.pending.claimed_receipt),canonical_digest(json.loads(current_claim[1])),
                 authority_digest(receipt.after_anchor))
             fact_key=contact_platform_observation_key_v1(fact)
-            existing=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(fact_key.token,)).fetchone()
+            existing=read_graph_row_v3(db,columns=('revision', 'value', 'valid'),where='token=?',parameters=(fact_key.token,),history=False)
             event_id='contact-observation:'+observation.observation_id
             if existing is not None:
-                history=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(fact_key.token,)).fetchone()
+                history=read_graph_row_v3(db,columns=('event_id', 'value', 'valid'),where='token=? AND revision=1',parameters=(fact_key.token,),history=True)
                 if (existing!=(1,canonical_serialize(asdict(fact)),1)
                         or history!=(event_id,canonical_serialize(asdict(fact)),1)):
                     raise ValueError('Contact observation replay lacks its exact committed fact')
@@ -151,11 +166,13 @@ def consume_current_contact_observation_v1(graph, installed, *, operation_id, ef
                 if qualified.fence_state!='active':
                     raise ValueError('Finished Contact observation permit cannot write a new projection')
                 own_key=contact_claim_key_v2(ns,command.footprint.contact_id)
-                own_row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(own_key.token,)).fetchone()
-                if own_row is None or own_row[0]!=1 or own_row[2]!=1:
+                own_row=read_graph_row_v3(db,columns=('revision', 'value', 'valid'),where='token=?',parameters=(own_key.token,),history=False)
+                if own_row is None or own_row[0]<1 or own_row[2]!=1:
                     raise ValueError('Contact observation original quota claim is absent/invalidated')
                 own=decode_contact_claim_v2(json.loads(own_row[1]))
-                if (own.segment_effects!=(effect_id,) or own.status!='claimed' or own.observations
+                if (len(own.segment_effects)!=command.segment_count or own.segment_effects[command.segment_index]!=effect_id
+                        or own.status in {'released','pending_confirmation'}
+                        or dict(own.observations)!={prior:'accepted'for prior in own.segment_effects[:command.segment_index]}
                         or own.communication_action_id!=command.footprint.communication_action):
                     raise ValueError('Contact observation cannot change another quota or predecessor')
                 next_own=own.observe(effect_id,observation.outcome)
@@ -165,7 +182,7 @@ def consume_current_contact_observation_v1(graph, installed, *, operation_id, ef
                 if (job.phase!='waiting' or job.cancel_epoch!=0 or job.fence!=0
                         or job.operation_id!=operation_id or job.effect_id!=effect_id):
                     raise ValueError('Contact observation original waiting job changed')
-                outbox_row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(outbox_key.token,)).fetchone()
+                outbox_row=read_graph_row_v3(db,columns=('revision', 'value', 'valid'),where='token=?',parameters=(outbox_key.token,),history=False)
                 if outbox_row is None or outbox_row[2]!=1:
                     raise ValueError('Contact observation original outbox is absent')
                 outbox=RuntimeOutboxValue(**json.loads(outbox_row[1]))

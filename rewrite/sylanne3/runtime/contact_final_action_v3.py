@@ -39,7 +39,7 @@ class ContactActionStageV3:
 
 
 def prepare_contact_action_stage_v3(*, envelope, content, index, current_checks, route, quote, grant,
-        now_utc, parent_goal=None, parent_grant_ref=None, parent_grant_digest=None):
+        now_utc, parent_goal=None, parent_grant_ref=None, parent_grant_digest=None, fixed_birth_goal=None):
     """Produce graph material, leaving provider qualification and admission to W01."""
     if (type(envelope) is not CommandEnvelope or type(content) is not ContactReviewedContentV2
             or type(current_checks) is not CurrentContactCheckVersionsV1
@@ -90,7 +90,19 @@ def prepare_contact_action_stage_v3(*, envelope, content, index, current_checks,
         predicate = GoalPredicate("communicated", "d11.delivery", (),
             float(envelope.source_qualification.learned_at), float(content.valid_until))
         goal = Goal(ids["goal"], 1, "active", predicate, tuple(source_refs), (), None, (), ())
+        if fixed_birth_goal is not None:
+            if (type(fixed_birth_goal)is not Goal or fixed_birth_goal.goal_id!=goal.goal_id
+                    or fixed_birth_goal.revision!=goal.revision or fixed_birth_goal.state!=goal.state
+                    or fixed_birth_goal.source_refs!=goal.source_refs
+                    or fixed_birth_goal.satisfaction_predicate.kind!=predicate.kind
+                    or fixed_birth_goal.satisfaction_predicate.observation_provider!=predicate.observation_provider
+                    or fixed_birth_goal.satisfaction_predicate.parameters!=predicate.parameters
+                    or fixed_birth_goal.satisfaction_predicate.valid_until!=predicate.valid_until
+                    or fixed_birth_goal.satisfaction_predicate.valid_from>now_utc):
+                raise ValueError("Contact prospective fixed birth Goal differs from its current semantic/Source scope")
+            goal=fixed_birth_goal;predicate=goal.satisfaction_predicate
     else:
+        if fixed_birth_goal is not None:raise ValueError("Contact later segment must use the actual adopted parent Goal")
         if (type(parent_goal) is not Goal or parent_goal.goal_id != ids["goal"]
                 or parent_goal.state != "active"):
             raise ValueError("later contact segments require the original active goal")

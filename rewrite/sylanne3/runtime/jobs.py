@@ -245,6 +245,44 @@ _JOB_SELECT = (
 
 def get_job(db, job_id: str) -> PersistentJob:
     _identifier(job_id, "job_id")
+    from .artifact_host_dispatch_source_v3 import read_bound_artifact_host_dispatch_job_v3
+    artifact,job=read_bound_artifact_host_dispatch_job_v3(db,job_id)
+    if artifact:return job
+    from ..authority_service.named_joint_binding_body_v1 import named_joint_core_point_v1
+    named,row=named_joint_core_point_v1(db,table='runtime_jobs',
+        columns=('job_id','operation_id','activity_id','effect_id','bot_id','persona_id','snapshot_ref','phase','work_kind',
+            'continuation_json','wake_condition_json','deadline_utc','budget_ref','resource_ref','operator_versions_json',
+            'lease_holder','lease_expires_utc','fence','cancel_epoch','usage_json','result_ref'),key_columns=('job_id',),key=(job_id,))
+    if named:return _job_from_row(row)
+    from .d07_source_preparation_members_v3 import read_bound_d07_source_preparation_job_v3
+    handled,job=read_bound_d07_source_preparation_job_v3(db,job_id)
+    if handled:return job
+    from .current_habit_source_read_v3 import read_bound_current_habit_job_v3
+    habit,job=read_bound_current_habit_job_v3(db,job_id)
+    if habit:return job
+    from .current_owner_job_cancel_v3 import read_bound_current_cancel_job_v3
+    cancel_bound,job=read_bound_current_cancel_job_v3(db,job_id)
+    if cancel_bound:return job
+    from .d13_completed_paid_read_v3 import read_bound_d13_completed_job_v3
+    completed,job=read_bound_d13_completed_job_v3(db,job_id)
+    if completed:return job
+    from .current_life_numeric_read_v3 import read_bound_numeric_host_job_v3
+    numeric,job=read_bound_numeric_host_job_v3(db,job_id)
+    if numeric:return job
+    from .contact_host_stage_work_v3 import contact_host_original_point_v3
+    host,row = contact_host_original_point_v3(db,table='runtime_jobs',
+        columns=('job_id','operation_id','activity_id','effect_id','bot_id','persona_id','snapshot_ref','phase','work_kind',
+            'continuation_json','wake_condition_json','deadline_utc','budget_ref','resource_ref','operator_versions_json',
+            'lease_holder','lease_expires_utc','fence','cancel_epoch','usage_json','result_ref'),key_columns=('job_id',),key=(job_id,))
+    if host:
+        from .contact_host_source_v3 import contact_host_work_for_db_v3
+        work = contact_host_work_for_db_v3(db)
+        job = _job_from_row(row)
+        locators = tuple(reader for reader in (getattr(work,'generation_metadata',None),work.prepared_locator) if reader is not None)
+        if (job.bot_id,job.persona_id)!=work.namespace.as_tuple or not any(
+                reader.values is not None and reader.ids['job']==job.job_id and reader.model_phase==job.work_kind for reader in locators):
+            raise JobConflict('Contact Host job crossed its exact installed Plan/phase metadata')
+        return job
     from ..authority_service.current_authority_graph_read_v3 import read_bound_authority_job_v3
     bound,job=read_bound_authority_job_v3(db,job_id=job_id)
     if not bound:
@@ -291,6 +329,9 @@ def _save_job(db, job: PersistentJob) -> None:
 
 def _prior_operation(db, job: PersistentJob, operation_id: str,
                      phase: str, digest: str) -> PersistentJob | None:
+    from .current_owner_job_cancel_v3 import read_bound_current_cancel_prior_v3
+    handled,prior=read_bound_current_cancel_prior_v3(db,job,operation_id,phase,digest)
+    if handled:return prior
     row = db.execute(
         "SELECT digest,job_id,job_json FROM runtime_job_operations WHERE bot_id=? "
         "AND persona_id=? AND operation_id=? AND phase=?",
@@ -473,6 +514,8 @@ def cancel_job(db, job_id: str, operation_id: str, digest: str) -> PersistentJob
                           wake_condition=None)
     _save_job(db, updated)
     _record_operation(db, updated, operation_id, "cancel", digest)
+    from .current_owner_job_cancel_v3 import record_current_cancel_job_v3
+    record_current_cancel_job_v3(db,updated)
     return updated
 
 

@@ -17,6 +17,7 @@ from ..runtime_contracts import (
     QueryEpoch, SourceQualification, VersionGuard, VersionedRef,
 )
 from .v2_model_egress_contract import (
+    ModelNoDispatchClosureRequestV1, ModelNoDispatchWitnessV1,
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
     ModelEgressObservationV1, model_observation_to_wire_v1, model_observation_from_wire_v1,
@@ -45,7 +46,13 @@ def _plain(value):
 
 
 def to_wire(value):
-    if type(value) not in {ModelEgressDraftV1, ModelEgressIntentV1,
+    if type(value) is ModelNoDispatchWitnessV1:
+        from .v2_contract import to_wire as permit_to_wire
+        result = _plain(value)
+        result["original_permit"] = permit_to_wire(value.original_permit)
+        json.dumps(result, allow_nan=False)
+        return result
+    if type(value) not in {ModelNoDispatchClosureRequestV1, ModelEgressDraftV1, ModelEgressIntentV1,
                            ModelEgressRecoveryV1, ModelCallRequest,
                            ModelAdmissionV2, HostObservedModelCompletionV2,
                            ModelTerminalReceiptV2, ModelEgressObservationV1}:
@@ -112,6 +119,27 @@ def command_envelope_from_wire_v2(value):
 
 
 def from_wire(value, kind):
+    if kind is ModelNoDispatchClosureRequestV1:
+        from ..runtime.restore_anchor import RestoreAnchor
+        shaped = _shape(value, kind)
+        shaped["intent"] = from_wire(shaped["intent"], ModelEgressIntentV1)
+        shaped["expected_anchor"] = RestoreAnchor(**_shape(shaped["expected_anchor"], RestoreAnchor))
+        result = kind(**shaped)
+        if _plain(result) != value: raise ValueError("noncanonical exact no-dispatch closure wire")
+        return result
+    if kind is ModelNoDispatchWitnessV1:
+        from ..runtime.restore_anchor import RestoreAnchor
+        from .v2_contract import from_wire as permit_from_wire, FencePermitV2
+        shaped = _shape(value, kind)
+        shaped["request"] = from_wire(shaped["request"], ModelNoDispatchClosureRequestV1)
+        shaped["original_permit"] = permit_from_wire(shaped["original_permit"])
+        if type(shaped["original_permit"]) is not FencePermitV2:
+            raise ValueError("no-dispatch original permit wire differs")
+        for name in ("before_anchor", "after_anchor"):
+            shaped[name] = RestoreAnchor(**_shape(shaped[name], RestoreAnchor))
+        result = kind(**shaped)
+        if to_wire(result) != value: raise ValueError("noncanonical Authority no-dispatch witness wire")
+        return result
     if kind in {ModelEgressDraftV1, ModelEgressIntentV1}:
         shaped = _shape(value, kind)
         shaped["source_refs"] = tuple(_list(shaped["source_refs"]))

@@ -311,13 +311,14 @@ class AuthorityV2MigrationService:
                     snapshot.requirements, status.current_anchor, plan)):
             raise AuthorityUnavailable("source snapshot identity or watermark differs")
         self._verify_pairing(credential, subject, plan, "revoke")
-        if self._source_verifier is None:
-            raise AuthorityUnavailable("trusted source graph snapshot verifier unavailable")
+        from .installed_migration_graph_proofs import InstalledSourceGraphProofV1
+        if type(self._source_verifier) is not InstalledSourceGraphProofV1:
+            raise AuthorityUnavailable("trusted installed source graph snapshot verifier unavailable")
         try:
-            verified = self._source_verifier(snapshot, plan, permit)
+            verified = self._source_verifier.verify_snapshot_certificate_members_v1(snapshot, plan, permit)
         except Exception as exc:
             raise AuthorityUnavailable("source graph snapshot verification failed") from exc
-        if verified is not True:
+        if verified is None:
             raise AuthorityUnavailable("source graph snapshot not verified")
         with self.fences._frozen() as (db, deletion_head, execution_head, _):
             status, replay = self._lookup_locked(
@@ -350,6 +351,9 @@ class AuthorityV2MigrationService:
             self.store.advance_locked(
                 db, transfer_id=permit.transfer_id, old_phase="begun",
                 receipt=receipt, source_snapshot=snapshot)
+            from .migration_snapshot_certificate_members_v1 import persist_snapshot_certificate_members_in_tx_v1
+            persist_snapshot_certificate_members_in_tx_v1(
+                self.core, db, verified, self._source_verifier, snapshot, plan, permit)
             self.core._event(db, self.namespace, "v2_source_revoked",
                              after.activation_generation,
                              (permit.transfer_id, request_id, digest))
@@ -510,6 +514,10 @@ class AuthorityV2MigrationService:
                     db, transfer_id=permit.transfer_id,
                     old_phase="target_prepared", receipt=receipt,
                     target_recovery=recovery)
+                if held.certificate_member_set_digest is not None:
+                    from .migration_snapshot_certificate_members_v1 import persist_activation_certificate_members_in_tx_v1
+                    persist_activation_certificate_members_in_tx_v1(
+                        self.core, db, status, held, permit, recovery, receipt)
                 self.core._event(db, self.namespace, "v2_target_activated",
                                  after.activation_generation,
                                  (permit.transfer_id, request_id, digest))

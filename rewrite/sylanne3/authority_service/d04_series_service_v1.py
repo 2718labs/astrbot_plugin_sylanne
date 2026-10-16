@@ -63,55 +63,11 @@ class AuthorityD04SeriesServiceV1:
             if owned:
                 db.close()
 
-    def _owner_observation(self, permit, binding, original_binding):
-        target = self.numeric.target_owner_service
-        storage = self.numeric.storage_owner_service if target is None else None
-        service = target or storage
-        if service is None:
-            return self.numeric._owner_observation(permit, original_binding)
-        with self.numeric._frozen() as (db, deletion, execution):
-            anchor, holder = self.numeric._current_anchor_locked(db, deletion, execution, action="accounting")
-            self.bridge.fences.validate_fence_locked(db, permit, subject=permit.subject, current_anchor=anchor)
-            _, claim, _, first, last = read_series_rows_locked_v1(self.bridge.journal, binding)
-            head = (self.numeric.owner_tickets.current_migration_head_in_tx(db, authority_namespace=self.bridge.namespace)
-                if target is not None else storage._head_in_tx(db))
-            if head is None or (target is not None and head.state != "active") or holder != service.holder:
-                raise AuthorityUnavailable("series current storage Owner/holder changed")
-            history = None if target is None else target._current_transfer(db, generation=anchor.activation_generation)
-            if claim is None:
-                before = anchor
-            else:
-                self._claim(binding, claim)
-                stored = self.bridge.fences._row(db, gate_id(binding, "claim"))
-                before = self.bridge.fences._permit(stored).pinned_anchor
-        metadata, _ = self.numeric._read_graph_requirements_only()
-        location_anchor = anchor
-        if (metadata["execution_seq"], metadata["execution_digest"]) != (anchor.execution_seq, anchor.execution_digest):
-            tail = last or first
-            if (claim is None or tail is None or not self.numeric._same_location_epoch(before, anchor)
-                    or (metadata["execution_seq"], metadata["execution_digest"]) != (before.execution_seq, before.execution_digest)
-                    or first[0] != before.execution_seq + 1
-                    or last is not None and (last[0] != first[0] + 1 or last[5] != first[6])
-                    or (anchor.execution_seq, anchor.execution_digest) != (tail[0], tail[6])):
-                raise AuthorityUnavailable("series Owner cannot bridge another execution")
-            location_anchor = before
-        location = (target._read_graph(history=history, owner_head=head, anchor=location_anchor)
-            if target is not None else storage._read_graph(owner_head=head, anchor=location_anchor))
-        with self.numeric._frozen() as (db, deletion, execution):
-            current, _ = self.numeric._current_anchor_locked(db, deletion, execution, action="accounting")
-            self.bridge.fences.validate_fence_locked(db, permit, subject=permit.subject, current_anchor=current)
-            current_head = (self.numeric.owner_tickets.current_migration_head_in_tx(db, authority_namespace=self.bridge.namespace)
-                if target is not None else storage._head_in_tx(db))
-            if current != anchor or current_head != head:
-                raise AuthorityUnavailable("series Owner changed after actual location read")
-            if target is not None:
-                graph_metadata, revision, grant_digest, imported, continuation = location
-                return target._current_background_identity_for_verified_location_in_tx_v1(db, head=head, history=history,
-                    metadata=graph_metadata, revision=revision, grant_digest=grant_digest, imported=imported,
-                    continuation=continuation, anchor=current)
-            storage._background_identity_in_tx(db, head)
-            from .d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-            return D12CurrentOwnerAuthorityV1(head.guard, None, location[2])
+    def _owner_observation(self,permit,binding,original_binding):
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            from .owner_location_read_v3 import prepare_owner_location_for_series_v3
+            return prepare_owner_location_for_series_v3(self,permit=permit,binding=binding,original_binding=original_binding)
 
     def _read(self, binding, *, phase, erased_body=False):
         from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
@@ -274,65 +230,69 @@ class AuthorityD04SeriesServiceV1:
         return row
 
     def claim(self, binding, executor_incarnation):
-        self._binding(binding)
-        identifier(executor_incarnation, "executor_incarnation")
-        self.bridge.core._require(self.numeric.credential, "execution", self.bridge.namespace)
-        old, terminal = self.inspect(binding)
-        if old is not None:
-            raise AuthorityUnavailable("series chunk execution already consumed; HOLD/inspect")
-        with self.numeric._frozen() as (db, deletion, head):
-            anchor, holder = self.numeric._current_anchor_locked(db, deletion, head)
-            permit = self.bridge.fences.begin_fence_locked(db,
-                subject=self._subject + ":claim:" + canonical_digest((binding.digest, executor_incarnation)),
-                holder=holder, operation="write", current_anchor=anchor, operation_id=gate_id(binding, "claim"))
-        prepared, metadata = self._read(binding, phase="claim")
-        # Root's accepting Owner selectors retain their original operation.
-        from ..runtime.d04_series_store_v1 import read_d04_series_root_v1
-        db = sqlite3.connect(self.graph_path.as_uri() + "?mode=ro", uri=True)
-        try:
-            root = read_d04_series_root_v1(db, self.namespace, binding.root_ref)
-        finally:
-            db.close()
-        owner = self._owner_observation(permit, binding, root.prepared.binding)
-        claim = D04SeriesClaimV1(binding.digest, binding.numeric.execution_id, mutation_id(binding, "claim"),
-            head.seq + 1, self.installation_id, executor_incarnation, "pending")
-        claim = replace(claim, signature=self.numeric._sign(claim))
-        self._append(binding, permit, claim, None, metadata, owner=owner)
-        return claim
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding)
+            identifier(executor_incarnation, "executor_incarnation")
+            self.bridge.core._require(self.numeric.credential, "execution", self.bridge.namespace)
+            old, terminal = self.inspect(binding)
+            if old is not None:
+                raise AuthorityUnavailable("series chunk execution already consumed; HOLD/inspect")
+            with self.numeric._frozen() as (db, deletion, head):
+                anchor, holder = self.numeric._current_anchor_locked(db, deletion, head)
+                permit = self.bridge.fences.begin_fence_locked(db,
+                    subject=self._subject + ":claim:" + canonical_digest((binding.digest, executor_incarnation)),
+                    holder=holder, operation="write", current_anchor=anchor, operation_id=gate_id(binding, "claim"))
+            prepared, metadata = self._read(binding, phase="claim")
+            # Root's accepting Owner selectors retain their original operation.
+            from ..runtime.d04_series_store_v1 import read_d04_series_root_v1
+            db = sqlite3.connect(self.graph_path.as_uri() + "?mode=ro", uri=True)
+            try:
+                root = read_d04_series_root_v1(db, self.namespace, binding.root_ref)
+            finally:
+                db.close()
+            owner = self._owner_observation(permit, binding, root.prepared.binding)
+            claim = D04SeriesClaimV1(binding.digest, binding.numeric.execution_id, mutation_id(binding, "claim"),
+                head.seq + 1, self.installation_id, executor_incarnation, "pending")
+            claim = replace(claim, signature=self.numeric._sign(claim))
+            self._append(binding, permit, claim, None, metadata, owner=owner)
+            return claim
 
     def gate(self, binding, phase):
-        self._binding(binding)
-        claim, terminal = self.inspect(binding)
-        if claim is None or phase in {"settlement", "restore"} and terminal is None:
-            raise AuthorityUnavailable("series unknown execution cannot settle or resume")
-        _, metadata = self._read(binding, phase="accounting")
-        with self.numeric._frozen() as (db, deletion, head):
-            anchor, holder = self.numeric._current_anchor_locked(db, deletion, head,
-                action="business" if phase == "restore" else "accounting")
-            permit = self.bridge.fences.begin_fence_locked(db, subject=self._subject, holder=holder,
-                operation="write" if phase == "restore" else "accounting", current_anchor=anchor,
-                operation_id=gate_id(binding, phase), command_digest=(None if phase == "restore" else
-                    "sha256:" + canonical_digest((binding.digest, phase))))
-        retain = False
-        if phase in {"measurement", "restore"}:
-            try:
-                root = self._content_current(binding)
-                owner = self._owner_observation(permit, binding, root.prepared.binding)
-                with self.numeric._frozen() as (db, deletion, head):
-                    anchor, _ = self.numeric._current_anchor_locked(db, deletion, head, action="accounting")
-                    self.bridge.fences.validate_fence_locked(db, permit, subject=self._subject, current_anchor=anchor)
-                    self.numeric._require_owner_locked(db, root.prepared.binding, owner)
-                retain = True
-            except (AuthorityUnavailable, ValueError):
-                if phase == "restore":
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            self._binding(binding)
+            claim, terminal = self.inspect(binding)
+            if claim is None or phase in {"settlement", "restore"} and terminal is None:
+                raise AuthorityUnavailable("series unknown execution cannot settle or resume")
+            _, metadata = self._read(binding, phase="accounting")
+            with self.numeric._frozen() as (db, deletion, head):
+                anchor, holder = self.numeric._current_anchor_locked(db, deletion, head,
+                    action="business" if phase == "restore" else "accounting")
+                permit = self.bridge.fences.begin_fence_locked(db, subject=self._subject, holder=holder,
+                    operation="write" if phase == "restore" else "accounting", current_anchor=anchor,
+                    operation_id=gate_id(binding, phase), command_digest=(None if phase == "restore" else
+                        "sha256:" + canonical_digest((binding.digest, phase))))
+            retain = False
+            if phase in {"measurement", "restore"}:
+                try:
+                    root = self._content_current(binding)
+                    owner = self._owner_observation(permit, binding, root.prepared.binding)
                     with self.numeric._frozen() as (db, deletion, head):
                         anchor, _ = self.numeric._current_anchor_locked(db, deletion, head, action="accounting")
-                        self.bridge.fences.finish_fence_locked(db, permit, subject=self._subject, current_anchor=anchor,
-                            request_id=permit.operation_id + ":uncommitted",
-                            request_digest="sha256:" + canonical_digest((binding.digest, "restore-admission-denied")))
-                    raise
-        gate = D04SeriesGateV1(binding, phase, permit, metadata[0], metadata[1], binding.root_digest, retain, "pending")
-        return replace(gate, signature=self.numeric._sign(gate))
+                        self.bridge.fences.validate_fence_locked(db, permit, subject=self._subject, current_anchor=anchor)
+                        self.numeric._require_owner_locked(db, root.prepared.binding, owner)
+                    retain = True
+                except (AuthorityUnavailable, ValueError):
+                    if phase == "restore":
+                        with self.numeric._frozen() as (db, deletion, head):
+                            anchor, _ = self.numeric._current_anchor_locked(db, deletion, head, action="accounting")
+                            self.bridge.fences.finish_fence_locked(db, permit, subject=self._subject, current_anchor=anchor,
+                                request_id=permit.operation_id + ":uncommitted",
+                                request_digest="sha256:" + canonical_digest((binding.digest, "restore-admission-denied")))
+                        raise
+            gate = D04SeriesGateV1(binding, phase, permit, metadata[0], metadata[1], binding.root_digest, retain, "pending")
+            return replace(gate, signature=self.numeric._sign(gate))
 
     def validate_gate(self, gate):
         self._binding(gate.binding)
@@ -421,205 +381,209 @@ class AuthorityD04SeriesServiceV1:
         return True
 
     def restore_bytes(self, binding):
-        from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
-        from ..runtime.d04_series_codec_v1 import _decode_series_chunk_for_final_verifier_v1
-        import secrets
-        self._binding(binding)
-        claim, terminal = self.inspect(binding)
-        if terminal is None or terminal.measurement.status != "chunk_completed":
-            raise AuthorityUnavailable("series restore requires actual completed terminal; no FFI replay")
-        with self.numeric._frozen() as (db, deletion, head):
-            anchor, holder = self.numeric._current_anchor_locked(db, deletion, head, action="recovery")
-            source = self.bridge.fences._permit(self.bridge.fences._row(db, gate_id(binding, "claim")))
-            if not self.numeric._same_location_epoch(source.pinned_anchor, anchor):
-                raise AuthorityUnavailable("series restore crossed deletion/storage lineage")
-            permit = self.bridge.fences.begin_fence_locked(db, subject=self._subject, holder=holder,
-                operation="read", current_anchor=anchor,
-                operation_id="d04-series-restore:" + binding.digest + ":" + secrets.token_hex(8))
-        try:
-            db = sqlite3.connect(self.graph_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
+            from ..runtime.d04_series_codec_v1 import _decode_series_chunk_for_final_verifier_v1
+            import secrets
+            self._binding(binding)
+            claim, terminal = self.inspect(binding)
+            if terminal is None or terminal.measurement.status != "chunk_completed":
+                raise AuthorityUnavailable("series restore requires actual completed terminal; no FFI replay")
+            with self.numeric._frozen() as (db, deletion, head):
+                anchor, holder = self.numeric._current_anchor_locked(db, deletion, head, action="recovery")
+                source = self.bridge.fences._permit(self.bridge.fences._row(db, gate_id(binding, "claim")))
+                if not self.numeric._same_location_epoch(source.pinned_anchor, anchor):
+                    raise AuthorityUnavailable("series restore crossed deletion/storage lineage")
+                permit = self.bridge.fences.begin_fence_locked(db, subject=self._subject, holder=holder,
+                    operation="read", current_anchor=anchor,
+                    operation_id="d04-series-restore:" + binding.digest + ":" + secrets.token_hex(8))
             try:
-                db.execute("BEGIN")
-                root = self._content_current(binding, db=db)
-                raw = read_d04_original_v3(db, self.namespace, "series_chunk_math", binding.numeric.operation_id)
-                measured = read_d04_original_v3(db, self.namespace, "series_chunk_measurement", binding.numeric.operation_id)
-                metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
-                    self.namespace.as_tuple).fetchone()
-                chunk = None if raw is None else _decode_series_chunk_for_final_verifier_v1(raw[0])
-                from ..runtime.d04_series_initial_original_v1 import require_d04_series_initial_original_v1
-                from ..native_runtime.d04_series_math_v1 import verify_d04_series_chunk_math_v1
-                require_d04_series_initial_original_v1(db, root)
-                if chunk is not None:
-                    verify_d04_series_chunk_math_v1(root.frozen, chunk, root_digest=root.digest)
-                    if chunk.invariant_domain is not None:
-                        from ..native_runtime.d04_invariant_domain_v1 import require_installed_d04_invariant_verifier_v1
-                        require_installed_d04_invariant_verifier_v1(chunk.invariant_domain, binding.numeric.native_manifest_sha256)
-                if (raw is None or chunk is None or measured is None or metadata is None
-                        or measured[0]["claim"] != to_wire(claim) or measured[0]["measurement"] != to_wire(terminal.measurement)
-                        or measured[0]["artifact_payload_digest"] != raw[1]
-                        or chunk.digest != terminal.measurement.chunk_math_digest
-                        or canonical_digest(chunk.endpoints) != terminal.measurement.endpoint_digest
-                        or not self.numeric._graph_location_matches(json.loads(metadata[0]), anchor)):
-                    raise AuthorityUnavailable("series native restore original/current location differs")
-                packet = canonical_serialize({"terminal": to_wire(terminal), "math": raw[0]}).encode()
+                db = sqlite3.connect(self.graph_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+                try:
+                    db.execute("BEGIN")
+                    root = self._content_current(binding, db=db)
+                    raw = read_d04_original_v3(db, self.namespace, "series_chunk_math", binding.numeric.operation_id)
+                    measured = read_d04_original_v3(db, self.namespace, "series_chunk_measurement", binding.numeric.operation_id)
+                    metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
+                        self.namespace.as_tuple).fetchone()
+                    chunk = None if raw is None else _decode_series_chunk_for_final_verifier_v1(raw[0])
+                    from ..runtime.d04_series_initial_original_v1 import require_d04_series_initial_original_v1
+                    from ..native_runtime.d04_series_math_v1 import verify_d04_series_chunk_math_v1
+                    require_d04_series_initial_original_v1(db, root)
+                    if chunk is not None:
+                        verify_d04_series_chunk_math_v1(root.frozen, chunk, root_digest=root.digest)
+                        if chunk.invariant_domain is not None:
+                            from ..native_runtime.d04_invariant_domain_v1 import require_installed_d04_invariant_verifier_v1
+                            require_installed_d04_invariant_verifier_v1(chunk.invariant_domain, binding.numeric.native_manifest_sha256)
+                    if (raw is None or chunk is None or measured is None or metadata is None
+                            or measured[0]["claim"] != to_wire(claim) or measured[0]["measurement"] != to_wire(terminal.measurement)
+                            or measured[0]["artifact_payload_digest"] != raw[1]
+                            or chunk.digest != terminal.measurement.chunk_math_digest
+                            or canonical_digest(chunk.endpoints) != terminal.measurement.endpoint_digest
+                            or not self.numeric._graph_location_matches(json.loads(metadata[0]), anchor)):
+                        raise AuthorityUnavailable("series native restore original/current location differs")
+                    packet = canonical_serialize({"terminal": to_wire(terminal), "math": raw[0]}).encode()
+                finally:
+                    db.close()
+                owner = self._owner_observation(permit, binding, root.prepared.binding)
+                with self.numeric._frozen() as (db, deletion, head):
+                    current, _ = self.numeric._current_anchor_locked(db, deletion, head, action="recovery")
+                    self.bridge.fences.validate_fence_locked(db, permit, subject=self._subject, current_anchor=current)
+                    self.numeric._require_owner_locked(db, root.prepared.binding, owner)
+                return packet
             finally:
-                db.close()
-            owner = self._owner_observation(permit, binding, root.prepared.binding)
-            with self.numeric._frozen() as (db, deletion, head):
-                current, _ = self.numeric._current_anchor_locked(db, deletion, head, action="recovery")
-                self.bridge.fences.validate_fence_locked(db, permit, subject=self._subject, current_anchor=current)
-                self.numeric._require_owner_locked(db, root.prepared.binding, owner)
-            return packet
-        finally:
-            with self.numeric._frozen() as (db, deletion, head):
-                current, _ = self.numeric._current_anchor_locked(db, deletion, head, action="recovery")
-                self.bridge.fences.finish_fence_locked(db, permit, subject=self._subject, current_anchor=current,
-                    request_id=permit.operation_id + ":closed",
-                    request_digest="sha256:" + canonical_digest((binding.digest, "restore-read", permit.operation_id)))
+                with self.numeric._frozen() as (db, deletion, head):
+                    current, _ = self.numeric._current_anchor_locked(db, deletion, head, action="recovery")
+                    self.bridge.fences.finish_fence_locked(db, permit, subject=self._subject, current_anchor=current,
+                        request_id=permit.operation_id + ":closed",
+                        request_digest="sha256:" + canonical_digest((binding.digest, "restore-read", permit.operation_id)))
 
     def restore_prefix_manifest(self, binding):
         """Authenticate the entire bounded prefix in one current read fence."""
-        import hashlib
-        import secrets
-        from .d04_series_journal_v1 import decode_series_row_v1
-        from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
-        from ..runtime.d04_series_store_v1 import read_d04_series_chunk_prepared_v1
-        from ..runtime.d04_series_execution_v1 import chunk_operation_v1
-        from ..runtime.d04_series_codec_v1 import _decode_series_chunk_for_final_verifier_v1
-        from ..runtime.d04_series_initial_original_v1 import (
-            require_d04_series_initial_original_v1, d04_series_original_read_scope_v1)
-        from ..runtime.d04_series_prefix_manifest_v1 import D04SeriesPrefixPacketV1, D04SeriesPrefixManifestV1
-        from ..native_runtime.d04_series_math_v1 import verify_d04_series_chunk_math_v1
-        from ..native_runtime.d04_invariant_domain_v1 import require_installed_d04_invariant_verifier_v1
-        self._binding(binding)
-        _, last_terminal = self.inspect(binding)
-        if last_terminal is None or last_terminal.measurement.status != "chunk_completed":
-            raise AuthorityUnavailable("series prefix restore requires a genuine final terminal")
-        with self.numeric._frozen() as (core_db, deletion, head):
-            anchor, holder = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
-            source = self.bridge.fences._permit(self.bridge.fences._row(core_db, gate_id(binding, "claim")))
-            if not self.numeric._same_location_epoch(source.pinned_anchor, anchor):
-                raise AuthorityUnavailable("series prefix restore crossed deletion/storage lineage")
-            permit = self.bridge.fences.begin_fence_locked(core_db, subject=self._subject, holder=holder,
-                operation="read", current_anchor=anchor,
-                operation_id="d04-series-prefix-restore:" + binding.digest + ":" + secrets.token_hex(8))
-        try:
-            db = sqlite3.connect(self.graph_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        from .owner_location_read_v3 import _owner_location_service_invocation_v3
+        with _owner_location_service_invocation_v3(self):
+            import hashlib
+            import secrets
+            from .d04_series_journal_v1 import decode_series_row_v1
+            from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
+            from ..runtime.d04_series_store_v1 import read_d04_series_chunk_prepared_v1
+            from ..runtime.d04_series_execution_v1 import chunk_operation_v1
+            from ..runtime.d04_series_codec_v1 import _decode_series_chunk_for_final_verifier_v1
+            from ..runtime.d04_series_initial_original_v1 import (
+                require_d04_series_initial_original_v1, d04_series_original_read_scope_v1)
+            from ..runtime.d04_series_prefix_manifest_v1 import D04SeriesPrefixPacketV1, D04SeriesPrefixManifestV1
+            from ..native_runtime.d04_series_math_v1 import verify_d04_series_chunk_math_v1
+            from ..native_runtime.d04_invariant_domain_v1 import require_installed_d04_invariant_verifier_v1
+            self._binding(binding)
+            _, last_terminal = self.inspect(binding)
+            if last_terminal is None or last_terminal.measurement.status != "chunk_completed":
+                raise AuthorityUnavailable("series prefix restore requires a genuine final terminal")
+            with self.numeric._frozen() as (core_db, deletion, head):
+                anchor, holder = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
+                source = self.bridge.fences._permit(self.bridge.fences._row(core_db, gate_id(binding, "claim")))
+                if not self.numeric._same_location_epoch(source.pinned_anchor, anchor):
+                    raise AuthorityUnavailable("series prefix restore crossed deletion/storage lineage")
+                permit = self.bridge.fences.begin_fence_locked(core_db, subject=self._subject, holder=holder,
+                    operation="read", current_anchor=anchor,
+                    operation_id="d04-series-prefix-restore:" + binding.digest + ":" + secrets.token_hex(8))
             try:
-                db.execute("BEGIN")
-                with d04_series_original_read_scope_v1(db):
-                    root = self._content_current(binding, db=db)
-                    if (binding.plan_digest != root.frozen.plan.digest
-                            or binding.end_step_index != root.frozen.plan.total_step_count):
-                        raise AuthorityUnavailable("series manifest binding is not the actual final planned chunk")
-                    require_d04_series_initial_original_v1(db, root)
-                    prepared_prefix = []
-                    start = 0
-                    while start < root.frozen.plan.total_step_count:
-                        saved = read_d04_series_chunk_prepared_v1(db, self.namespace, chunk_operation_v1(root, start))
-                        end = start + len(root.frozen.plan.chunk(start))
-                        if (saved is None or (saved[0].root_ref, saved[0].root_digest, saved[0].plan_digest,
-                                saved[0].start_step_index, saved[0].end_step_index) !=
-                                (root.root_ref, root.digest, root.frozen.plan.digest, start, end)):
-                            raise AuthorityUnavailable("series manifest lacks its exact complete prepared prefix")
-                        current_binding, prepared, _ = saved
-                        self._binding(current_binding)
-                        quote = self.numeric.resource_issuer.original_signed_quote(db,
-                            current_binding.numeric.quote_id, current_binding.numeric.quote_version)
-                        reserve = db.execute("SELECT receipt_json,digest FROM runtime_budget_operations "
-                            "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-                            (*self.namespace.as_tuple, current_binding.numeric.reservation_operation_id)).fetchone()
-                        if (canonical_digest(quote) != current_binding.numeric.quote_digest
-                                or dict(quote.ceiling) != {"cpu_ms": current_binding.numeric.cpu_ceiling_ms}
-                                or reserve != (prepared["reserve_receipt_json"], current_binding.numeric.reservation_digest)):
-                            raise AuthorityUnavailable("series prefix actual signed quote/reservation differs")
-                        prepared_prefix.append(current_binding)
-                        start = end
-                    if prepared_prefix[-1] != binding:
-                        raise AuthorityUnavailable("series manifest final prepared binding differs")
-                    # One frozen actual mixed chain supplies all originals. The
-                    # complete scanner authenticates other families before we
-                    # select this root's exact once identities.
-                    originals = []
-                    with self.numeric._frozen() as (core_db, deletion, head):
-                        current, _ = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
-                        self.bridge.fences.validate_fence_locked(core_db, permit, subject=self._subject, current_anchor=current)
-                        if current != anchor:
-                            raise AuthorityUnavailable("series prefix recovery anchor changed")
-                        actual_head, rows = self.bridge.journal._scan_locked()
-                        if actual_head != head:
-                            raise AuthorityUnavailable("series prefix mixed execution head changed")
-                        identities = {row[1]: row for row in rows}
-                        for current_binding in prepared_prefix:
-                            first = identities.get(mutation_id(current_binding, "claim"))
-                            last = identities.get(mutation_id(current_binding, "terminal"))
-                            if first is None or last is None:
-                                raise AuthorityUnavailable("series prefix actual claim/terminal original absent")
-                            observed, claim, empty = decode_series_row_v1(self.bridge.journal, first)
-                            terminal_binding, terminal_claim, measured = decode_series_row_v1(self.bridge.journal, last)
-                            self._claim(current_binding, claim)
-                            source = self.bridge.fences._permit(self.bridge.fences._row(core_db, gate_id(current_binding, "claim")))
-                            if (observed != current_binding or terminal_binding != current_binding or terminal_claim != claim
-                                    or empty is not None or measured is None
-                                    or not self.numeric._same_location_epoch(source.pinned_anchor, anchor)):
-                                raise AuthorityUnavailable("series prefix actual once claim/terminal lineage differs")
-                            self._reconcile(core_db, current_binding, last, head)
-                            self._reconcile(core_db, current_binding, first, head)
-                            terminal = D04SeriesTerminalV1(current_binding, claim, measured,
-                                mutation_id(current_binding, "terminal"), last[0], last[6].removeprefix("sha256:"), "pending")
-                            originals.append(replace(terminal, signature=self.numeric._sign(terminal)))
-                    packets = []
-                    previous = None
-                    for current_binding, terminal in zip(prepared_prefix, originals):
-                        raw = read_d04_original_v3(db, self.namespace, "series_chunk_math", current_binding.numeric.operation_id)
-                        measured = read_d04_original_v3(db, self.namespace, "series_chunk_measurement", current_binding.numeric.operation_id)
-                        if (raw is None or measured is None or measured[0]["claim"] != to_wire(terminal.claim)
-                                or measured[0]["measurement"] != to_wire(terminal.measurement)
-                                or measured[0]["artifact_payload_digest"] != raw[1]
-                                or terminal.measurement.status != "chunk_completed"
-                                or terminal.measurement.actual_cpu_ms > current_binding.numeric.cpu_ceiling_ms):
-                            raise AuthorityUnavailable("series prefix measured packet/terminal differs")
-                        chunk = _decode_series_chunk_for_final_verifier_v1(raw[0])
-                        verify_d04_series_chunk_math_v1(root.frozen, chunk, root_digest=root.digest, predecessor=previous)
-                        if chunk.invariant_domain is not None:
-                            require_installed_d04_invariant_verifier_v1(chunk.invariant_domain, current_binding.numeric.native_manifest_sha256)
-                        native = chunk.full.production_binding
-                        if ((chunk.root_digest, chunk.plan_digest, chunk.start_step_index,
-                                chunk.end_step_index, chunk.predecessor_digest) != (current_binding.root_digest,
-                                current_binding.plan_digest, current_binding.start_step_index,
-                                current_binding.end_step_index, current_binding.predecessor_digest)
-                                or chunk.digest != terminal.measurement.chunk_math_digest
-                                or canonical_digest(chunk.endpoints) != terminal.measurement.endpoint_digest
-                                or native.manifest_sha256 != current_binding.numeric.native_manifest_sha256
-                                or native.native_sha256 != current_binding.numeric.native_sha256 or native.abi_version != 2):
-                            raise AuthorityUnavailable("series prefix exact native/output commitments differ")
-                        packet = canonical_serialize({"terminal": to_wire(terminal), "math": raw[0]}).encode("utf-8")
-                        packets.append(D04SeriesPrefixPacketV1(terminal, hashlib.sha256(packet).hexdigest(), len(packet)))
-                        previous = chunk
-                    metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
-                        "WHERE bot=? AND persona=?", self.namespace.as_tuple).fetchone()
-                    if (originals[-1] != last_terminal or metadata is None
-                            or not self.numeric._graph_location_matches(json.loads(metadata[0]), anchor)
-                            or self._content_current(binding, db=db) != root):
-                        raise AuthorityUnavailable("series prefix current source/location changed")
-                    manifest = D04SeriesPrefixManifestV1(root.root_ref, root.digest, root.frozen.plan.digest,
-                        root.frozen.plan.total_step_count, root.frozen.plan.chunk_step_limit, len(packets), tuple(packets))
+                db = sqlite3.connect(self.graph_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+                try:
+                    db.execute("BEGIN")
+                    with d04_series_original_read_scope_v1(db):
+                        root = self._content_current(binding, db=db)
+                        if (binding.plan_digest != root.frozen.plan.digest
+                                or binding.end_step_index != root.frozen.plan.total_step_count):
+                            raise AuthorityUnavailable("series manifest binding is not the actual final planned chunk")
+                        require_d04_series_initial_original_v1(db, root)
+                        prepared_prefix = []
+                        start = 0
+                        while start < root.frozen.plan.total_step_count:
+                            saved = read_d04_series_chunk_prepared_v1(db, self.namespace, chunk_operation_v1(root, start))
+                            end = start + len(root.frozen.plan.chunk(start))
+                            if (saved is None or (saved[0].root_ref, saved[0].root_digest, saved[0].plan_digest,
+                                    saved[0].start_step_index, saved[0].end_step_index) !=
+                                    (root.root_ref, root.digest, root.frozen.plan.digest, start, end)):
+                                raise AuthorityUnavailable("series manifest lacks its exact complete prepared prefix")
+                            current_binding, prepared, _ = saved
+                            self._binding(current_binding)
+                            quote = self.numeric.resource_issuer.original_signed_quote(db,
+                                current_binding.numeric.quote_id, current_binding.numeric.quote_version)
+                            reserve = db.execute("SELECT receipt_json,digest FROM runtime_budget_operations "
+                                "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+                                (*self.namespace.as_tuple, current_binding.numeric.reservation_operation_id)).fetchone()
+                            if (canonical_digest(quote) != current_binding.numeric.quote_digest
+                                    or dict(quote.ceiling) != {"cpu_ms": current_binding.numeric.cpu_ceiling_ms}
+                                    or reserve != (prepared["reserve_receipt_json"], current_binding.numeric.reservation_digest)):
+                                raise AuthorityUnavailable("series prefix actual signed quote/reservation differs")
+                            prepared_prefix.append(current_binding)
+                            start = end
+                        if prepared_prefix[-1] != binding:
+                            raise AuthorityUnavailable("series manifest final prepared binding differs")
+                        # One frozen actual mixed chain supplies all originals. The
+                        # complete scanner authenticates other families before we
+                        # select this root's exact once identities.
+                        originals = []
+                        with self.numeric._frozen() as (core_db, deletion, head):
+                            current, _ = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
+                            self.bridge.fences.validate_fence_locked(core_db, permit, subject=self._subject, current_anchor=current)
+                            if current != anchor:
+                                raise AuthorityUnavailable("series prefix recovery anchor changed")
+                            actual_head, rows = self.bridge.journal._scan_locked()
+                            if actual_head != head:
+                                raise AuthorityUnavailable("series prefix mixed execution head changed")
+                            identities = {row[1]: row for row in rows}
+                            for current_binding in prepared_prefix:
+                                first = identities.get(mutation_id(current_binding, "claim"))
+                                last = identities.get(mutation_id(current_binding, "terminal"))
+                                if first is None or last is None:
+                                    raise AuthorityUnavailable("series prefix actual claim/terminal original absent")
+                                observed, claim, empty = decode_series_row_v1(self.bridge.journal, first)
+                                terminal_binding, terminal_claim, measured = decode_series_row_v1(self.bridge.journal, last)
+                                self._claim(current_binding, claim)
+                                source = self.bridge.fences._permit(self.bridge.fences._row(core_db, gate_id(current_binding, "claim")))
+                                if (observed != current_binding or terminal_binding != current_binding or terminal_claim != claim
+                                        or empty is not None or measured is None
+                                        or not self.numeric._same_location_epoch(source.pinned_anchor, anchor)):
+                                    raise AuthorityUnavailable("series prefix actual once claim/terminal lineage differs")
+                                self._reconcile(core_db, current_binding, last, head)
+                                self._reconcile(core_db, current_binding, first, head)
+                                terminal = D04SeriesTerminalV1(current_binding, claim, measured,
+                                    mutation_id(current_binding, "terminal"), last[0], last[6].removeprefix("sha256:"), "pending")
+                                originals.append(replace(terminal, signature=self.numeric._sign(terminal)))
+                        packets = []
+                        previous = None
+                        for current_binding, terminal in zip(prepared_prefix, originals):
+                            raw = read_d04_original_v3(db, self.namespace, "series_chunk_math", current_binding.numeric.operation_id)
+                            measured = read_d04_original_v3(db, self.namespace, "series_chunk_measurement", current_binding.numeric.operation_id)
+                            if (raw is None or measured is None or measured[0]["claim"] != to_wire(terminal.claim)
+                                    or measured[0]["measurement"] != to_wire(terminal.measurement)
+                                    or measured[0]["artifact_payload_digest"] != raw[1]
+                                    or terminal.measurement.status != "chunk_completed"
+                                    or terminal.measurement.actual_cpu_ms > current_binding.numeric.cpu_ceiling_ms):
+                                raise AuthorityUnavailable("series prefix measured packet/terminal differs")
+                            chunk = _decode_series_chunk_for_final_verifier_v1(raw[0])
+                            verify_d04_series_chunk_math_v1(root.frozen, chunk, root_digest=root.digest, predecessor=previous)
+                            if chunk.invariant_domain is not None:
+                                require_installed_d04_invariant_verifier_v1(chunk.invariant_domain, current_binding.numeric.native_manifest_sha256)
+                            native = chunk.full.production_binding
+                            if ((chunk.root_digest, chunk.plan_digest, chunk.start_step_index,
+                                    chunk.end_step_index, chunk.predecessor_digest) != (current_binding.root_digest,
+                                    current_binding.plan_digest, current_binding.start_step_index,
+                                    current_binding.end_step_index, current_binding.predecessor_digest)
+                                    or chunk.digest != terminal.measurement.chunk_math_digest
+                                    or canonical_digest(chunk.endpoints) != terminal.measurement.endpoint_digest
+                                    or native.manifest_sha256 != current_binding.numeric.native_manifest_sha256
+                                    or native.native_sha256 != current_binding.numeric.native_sha256 or native.abi_version != 2):
+                                raise AuthorityUnavailable("series prefix exact native/output commitments differ")
+                            packet = canonical_serialize({"terminal": to_wire(terminal), "math": raw[0]}).encode("utf-8")
+                            packets.append(D04SeriesPrefixPacketV1(terminal, hashlib.sha256(packet).hexdigest(), len(packet)))
+                            previous = chunk
+                        metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
+                            "WHERE bot=? AND persona=?", self.namespace.as_tuple).fetchone()
+                        if (originals[-1] != last_terminal or metadata is None
+                                or not self.numeric._graph_location_matches(json.loads(metadata[0]), anchor)
+                                or self._content_current(binding, db=db) != root):
+                            raise AuthorityUnavailable("series prefix current source/location changed")
+                        manifest = D04SeriesPrefixManifestV1(root.root_ref, root.digest, root.frozen.plan.digest,
+                            root.frozen.plan.total_step_count, root.frozen.plan.chunk_step_limit, len(packets), tuple(packets))
+                finally:
+                    db.close()
+                owner = self._owner_observation(permit, binding, root.prepared.binding)
+                with self.numeric._frozen() as (core_db, deletion, head):
+                    current, _ = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
+                    self.bridge.fences.validate_fence_locked(core_db, permit, subject=self._subject, current_anchor=current)
+                    if current != anchor:
+                        raise AuthorityUnavailable("series prefix anchor changed after actual Source/Owner read")
+                    self.numeric._require_owner_locked(core_db, root.prepared.binding, owner)
+                return manifest
             finally:
-                db.close()
-            owner = self._owner_observation(permit, binding, root.prepared.binding)
-            with self.numeric._frozen() as (core_db, deletion, head):
-                current, _ = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
-                self.bridge.fences.validate_fence_locked(core_db, permit, subject=self._subject, current_anchor=current)
-                if current != anchor:
-                    raise AuthorityUnavailable("series prefix anchor changed after actual Source/Owner read")
-                self.numeric._require_owner_locked(core_db, root.prepared.binding, owner)
-            return manifest
-        finally:
-            with self.numeric._frozen() as (core_db, deletion, head):
-                current, _ = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
-                self.bridge.fences.finish_fence_locked(core_db, permit, subject=self._subject, current_anchor=current,
-                    request_id=permit.operation_id + ":closed",
-                    request_digest="sha256:" + canonical_digest((binding.digest, "prefix-restore-read", permit.operation_id)))
+                with self.numeric._frozen() as (core_db, deletion, head):
+                    current, _ = self.numeric._current_anchor_locked(core_db, deletion, head, action="recovery")
+                    self.bridge.fences.finish_fence_locked(core_db, permit, subject=self._subject, current_anchor=current,
+                        request_id=permit.operation_id + ":closed",
+                        request_digest="sha256:" + canonical_digest((binding.digest, "prefix-restore-read", permit.operation_id)))
 
     def verify_series_journal_row_v1(self, journal, row):
         from .d04_series_journal_v1 import decode_series_row_v1

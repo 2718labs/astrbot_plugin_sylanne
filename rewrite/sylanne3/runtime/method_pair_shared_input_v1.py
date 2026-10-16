@@ -165,15 +165,12 @@ def require_current_method_pair_shared_input_v1(db, *, read, experiment_ref, goa
 
 def method_pair_read_inputs_v1(db, *, namespace, goal_ref):
     """Bounded locators only; the current reader authenticates every used input."""
-    import json
     from ..domains.d01.method_learning_v1 import EXPERIMENT_TYPE
-    rows = db.execute('SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? AND valid=1 ORDER BY token LIMIT 129',
-        (*namespace.as_tuple, EXPERIMENT_TYPE)).fetchall()
-    if len(rows) > 128:
-        raise MissingProductionOriginalV1('bounded_complete_method_pair_inventory')
+    from .domain_background_read_v3 import background_inventory_v3
+    rows = background_inventory_v3(db, namespace, EXPERIMENT_TYPE, valid_only=True)
     keys, roots, originals, matches = [], [], [], []
-    for ref, encoded in rows:
-        raw = json.loads(encoded)
+    for atom in rows:
+        ref, raw = atom.key.token, atom.value
         if goal_ref not in (raw['treatment_goal_ref'], raw['baseline_goal_ref']):
             continue
         saved = read_method_pair_shared_input_original_v1(db, namespace=namespace, experiment_ref=ref)

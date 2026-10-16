@@ -28,8 +28,11 @@ def require_life_body_quote_v1(db, *, prepared, issuer, resource_issuer, body_qu
         raise ValueError("Life Body quote/component differs from real execution identity")
     from .domain_production_read_plans_v1 import _committed
     _committed(db,b.namespace,contract.body_prepare_operation_id)
-    history=db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND event_id=?",
-        (contract.reservation_ref,contract.body_prepare_operation_id)).fetchall()
+    from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_by_event_v3
+    handled,history=read_bound_native_numeric_history_by_event_v3(db,contract.reservation_ref,contract.body_prepare_operation_id)
+    if not handled:
+        history=db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND event_id=?",
+            (contract.reservation_ref,contract.body_prepare_operation_id)).fetchall()
     if len(history)!=1 or history[0][2]!=1:
         raise MissingProductionOriginalV1("actual_life_body_prepare_reservation_history")
     from ..domains.d02 import _reservation

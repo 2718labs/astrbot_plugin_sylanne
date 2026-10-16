@@ -1,4 +1,5 @@
 """Pinned current contact inputs and actual prepared/call/budget originals."""
+from ..runtime.contact_original_read_v3 import contact_original_point_v3
 from dataclasses import replace
 from datetime import datetime
 import json
@@ -16,7 +17,12 @@ from ..runtime.d11_types import job_graph_write
 from .v2_model_egress_wire import to_wire
 
 
-def require_contact_policy_current_v2(service, plan):
+def require_contact_policy_current_v2(service, plan, *, db=None):
+    if db is not None:
+        from .contact_model_work_v3 import require_contact_policy_observation_for_plan_v3
+        observed = require_contact_policy_observation_for_plan_v3(db,service,plan)
+        if observed is not None:
+            return observed
     from .d10_contact_policy_service_v1 import InstalledD10ContactPolicyServiceV1
     if type(service) is not InstalledD10ContactPolicyServiceV1 or service.namespace != plan.namespace:
         raise ValueError("actual installed Core contact-policy reader required")
@@ -54,23 +60,33 @@ def require_contact_scope_current_v2(db, plan, expression, *, now):
             or not db.in_transaction or not now < min(plan.valid_until_utc, expression.valid_until_utc)):
         raise ValueError("contact current read requires one live pinned SQLite transaction")
     ns = plan.namespace
+    from .contact_background_graph_v3 import require_contact_source_db_v3
+    authority_work = require_contact_source_db_v3(db)
     atoms = []
     for version in plan.qualified_read_versions:
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-            (version.key.token, *ns.as_tuple)).fetchone()
+        row = contact_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token', 'bot', 'persona'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))((version.key.token, *ns.as_tuple)),legacy_reader=lambda: db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+            (version.key.token, *ns.as_tuple)).fetchone())
         if version.revision == 0:
             if row is not None:
                 raise ValueError("contact absent source/correction dependency appeared")
-            atoms.append(GraphAtom(version.key, 0, {}, False))
+            if authority_work is None:
+                atoms.append(GraphAtom(version.key, 0, {}, False))
         else:
             if row is None or (row[0], row[2]) != (version.revision, 1):
                 raise ValueError("contact Source, route or policy dependency changed")
-            atoms.append(GraphAtom(version.key, row[0], json.loads(row[1]), True))
+            if authority_work is None:
+                atoms.append(GraphAtom(version.key, row[0], json.loads(row[1]), True))
     epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", ns.as_tuple).fetchone()
     barriers = db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?", ns.as_tuple).fetchone()
     if epoch is None or barriers is None:
         raise ValueError("contact current Graph epoch unavailable")
-    snapshot = GraphSnapshot(tuple(atoms), (NamespaceEpoch(*ns.as_tuple, epoch[0]),))
+    snapshot = authority_work.projection if authority_work is not None else GraphSnapshot(tuple(atoms), (NamespaceEpoch(*ns.as_tuple, epoch[0]),))
+    from .current_authority_graph_read_v3 import authority_source_expression_kwargs_v3
+    from ..runtime.contact_host_source_v3 import contact_host_expression_kwargs_v3
+    from ..runtime.contact_domain_source_v3 import contact_domain_expression_kwargs_v3
+    source_kwargs = contact_domain_expression_kwargs_v3(db) or contact_host_expression_kwargs_v3(db)
+    if source_kwargs is None:
+        source_kwargs = authority_source_expression_kwargs_v3(db,ns) if authority_work is not None else {}
     if (canonical_digest(expression.units) != plan.qualified_units_digest
             or expression.namespace != ns or expression.audience_id != plan.audience_id
             or not expression.units or expression.promise_grants):
@@ -82,7 +98,8 @@ def require_contact_scope_current_v2(db, plan, expression, *, now):
             raise ValueError("contact expression unit lacks its installed D06 qualification")
         candidate = prepare_qualified_expression_unit(snapshot, namespace=ns,
             request=QualifiedExpressionRequest(plan.source_ref.ref, unit.d06_claim_kind, SourceTextSpan(*unit.evidence_span)),
-            audiences=(plan.audience_id,), access_epoch=barriers[0], deletion_epoch=barriers[1], valid_until=unit.expires_at_utc)
+            audiences=(plan.audience_id,), access_epoch=barriers[0], deletion_epoch=barriers[1], valid_until=unit.expires_at_utc,
+            **source_kwargs)
         expected = {"qualified_text": candidate.source_excerpt, "qualification_digest": candidate.qualification_digest,
             "speaker_id": candidate.speaker_id, "occurred_at": candidate.occurred_at, "learned_at": candidate.learned_at,
             "source_kind": candidate.source_kind, "assertion_status": candidate.assertion_status,
@@ -118,7 +135,7 @@ def read_current_contact_model_graph_v2(db, intent, issuer, now, *, allow_unseal
     plan, expression, raw, plan_digest = read_adopted_contact_plan_v2(db, namespace=ns, contact_id=prepared.contact_id, issuer=issuer)
     require_contact_inventory_current_v2(db, ns, raw)
     require_contact_scope_current_v2(db, plan, expression, now=now)
-    require_contact_policy_current_v2(contact_policy_service, plan)
+    require_contact_policy_current_v2(contact_policy_service, plan, db=db)
     prepared_commit, _ = require_contact_original_v2(db, issuer, ns, "prepare_commit", job.job_id)
     from ..runtime.d04_root_original_store_v1 import _receipt
     actual_prepare_receipt = _receipt(db, ns, prepared.prepare_operation_id)
@@ -133,17 +150,60 @@ def read_current_contact_model_graph_v2(db, intent, issuer, now, *, allow_unseal
             or prepared.phase != job.work_kind or intent.binding_digest != prepared.digest
             or intent.operation_id != prepared.acquire_operation_id or intent.acquire_operation_id != prepared.acquire_operation_id
             or intent.call_id != prepared.call_id or intent.request_digest != request.digest
-            or job.operation_id != prepared.prepare_operation_id or job.phase != "running"
-            or job.cancel_epoch != plan.cancellation_epoch or job.lease_holder != intent.subject or job.fence != intent.worker_fence
-            or job.result_ref is not None or job.lease_expires_utc is None
-            or now >= min(datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
-                          datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp())):
+            or job.operation_id != prepared.prepare_operation_id
+            or job.cancel_epoch != plan.cancellation_epoch or job.fence != intent.worker_fence
+            or (allow_accounted_result and (job.phase not in {"running","completed"}
+                or job.result_ref != (prepared.call_id if job.phase == "completed" else None)))
+            or (not allow_accounted_result and (job.phase != "running" or job.lease_holder != intent.subject
+                or job.result_ref is not None or job.lease_expires_utc is None
+                or now >= min(datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
+                    datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp())))):
         raise ValueError("contact current actual prepared job/call/worker differs")
+    parent = issuer.current_budget_grant(db,plan.parent_budget_lease_id)
+    budget = get_budget_lease(db,parent.lease_id)
+    if (parent.version != plan.budget_grant_version or canonical_digest(parent) != plan.budget_grant_digest
+            or parent.lease_id != intent.budget_lease_id or budget.state != "active"
+            or prepared.phase not in parent.allowed_work_kinds or now >= parent.valid_until_utc):
+        raise ValueError("Contact actual current original finite parent grant changed")
+    acquire, _ = require_contact_original_v2(db,issuer,ns,"stage_receipt",prepared.acquire_operation_id)
+    attempt, _ = require_contact_original_v2(db,issuer,ns,"stage_attempt",prepared.acquire_operation_id)
+    acquire_permit, _ = require_contact_original_v2(db,issuer,ns,"stage_permit",prepared.acquire_operation_id)
+    acquire_operation = contact_original_point_v3(db,table="graph_bundle_operations",
+        columns=("receipt_json",),key_columns=("bot","persona","operation_id"),
+        key=(*ns.as_tuple,prepared.acquire_operation_id),legacy_reader=lambda: db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+            (*ns.as_tuple,prepared.acquire_operation_id)).fetchone())
+    if (acquire_operation is None or acquire["prepared_digest"] != prepared.digest
+            or acquire["operation_id"] != prepared.acquire_operation_id or acquire["attempt_id"] != attempt["attempt_id"]
+            or attempt["job_id"] != job.job_id or attempt["phase"] != "acquire"
+            or attempt["prepared_digest"] != prepared.digest
+            or acquire["result"] != {"status":"acquired","job_id":job.job_id,"request_digest":request.digest}
+            or acquire_permit["attempt_id"] != attempt["attempt_id"]
+            or acquire_permit["permit"]["operation_id"] != prepared.acquire_operation_id
+            or acquire_permit["permit"]["operation"] != "write"):
+        raise ValueError("Contact actual once acquire COMMIT / attempt / original permit differs")
+    event = contact_original_point_v3(db,table='graph_events',columns=('reads','revisions','invalidated','epoch_revision'),
+        key_columns=('bot','persona','session','event_id'),key=(*ns.as_tuple,prepared.activity_id,prepared.acquire_operation_id),
+        legacy_reader=lambda: db.execute('SELECT reads,revisions,invalidated,epoch_revision FROM graph_events '
+            'WHERE bot=? AND persona=? AND session=? AND event_id=?',
+            (*ns.as_tuple,prepared.activity_id,prepared.acquire_operation_id)).fetchone())
+    from ..graph_types import GraphReceipt
+    if event is None:
+        raise ValueError('Contact actual once acquired Graph event absent')
+    actual_acquire = GraphReceipt('committed',
+        tuple(GraphVersion(AtomKey.from_token(token),revision) for token,revision in json.loads(event[1])),
+        tuple(GraphVersion(AtomKey.from_token(token),revision) for token,revision in json.loads(event[2])),
+        NamespaceEpoch(*ns.as_tuple,event[3]))
+    actual_acquire_row = json.loads(acquire_operation[0])
+    if (actual_acquire_row['status'] != 'committed' or actual_acquire_row['graph_receipt_digest'] != canonical_digest(actual_acquire)
+            or event[3] != attempt['graph_epoch'] + 1
+            or not any(version.key == job_graph_write(job).key for version in actual_acquire.write_versions)):
+        raise ValueError('Contact actual acquire job write / current immutable COMMIT receipt differs')
     quote = issuer.resource_issuer.original_signed_quote(db, prepared.quote_id, prepared.quote_version)
-    reserved = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
-        (plan.parent_budget_lease_id, prepared.prepare_operation_id)).fetchone()
-    reserve_operation = db.execute("SELECT digest FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-        (*ns.as_tuple, prepared.prepare_operation_id)).fetchone()
+    reserved = contact_original_point_v3(db,table='runtime_budget_reservations',columns=('digest', 'ceiling_json', 'state'),key_columns=('lease_id', 'operation_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1]))((plan.parent_budget_lease_id, prepared.prepare_operation_id)),legacy_reader=lambda: db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+        (plan.parent_budget_lease_id, prepared.prepare_operation_id)).fetchone())
+    reserve_operation = contact_original_point_v3(db,table='runtime_budget_operations',columns=('digest',),key_columns=('bot_id', 'persona_id', 'operation_id', 'phase'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2],'reserve'))((*ns.as_tuple, prepared.prepare_operation_id)),legacy_reader=lambda: db.execute("SELECT digest FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+        (*ns.as_tuple, prepared.prepare_operation_id)).fetchone())
     if (canonical_digest(quote) != prepared.quote_digest or quote.work_kind != prepared.phase
             or quote.operation_id != prepared.prepare_operation_id or reserve_operation != (prepared.reservation_digest,)
             or reserved is None or reserved[0] != prepared.reservation_digest or json.loads(reserved[1]) != dict(quote.ceiling)
@@ -175,7 +235,7 @@ def read_current_contact_model_graph_v2(db, intent, issuer, now, *, allow_unseal
             or (intent.access_epoch, intent.delete_epoch, intent.authority_activation_generation) !=
                (guard.access_epoch, guard.delete_epoch, request.envelope.authority.activation_generation)):
         raise ValueError("contact call changed its exact Source/access and actual request anchor")
-    job_atom = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone()
+    job_atom = contact_original_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((job_graph_write(job).key.token,)),legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone())
     if job_atom is None or job_atom[1] != 1 or json.loads(job_atom[0]) != job_graph_write(job).value:
         raise ValueError("contact actual running job projection changed")
     if prepared.phase == "contact_review":

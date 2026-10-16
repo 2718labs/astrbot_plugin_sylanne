@@ -5,6 +5,7 @@ import sqlite3
 from weakref import WeakSet
 from .contract import AuthorityUnavailable
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from ..model_broker.natural_reply import NaturalReplyInstallationV2
 from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,TEMPLATE_VERSION
 from ..runtime.d13_natural_installed_ports_v7 import build_current_natural_d13_ports_v7
@@ -90,7 +91,7 @@ def begin_authority_same_batch_continuation_v7(work, *, frozen, parent_original_
 class InstalledAuthorityD13NaturalFrameVerifierV7(InstalledAuthorityD13NaturalFrameVerifierV1):
     def __init__(self,*,bundle,d11_issuer,authority_store):
         super().__init__(bundle=bundle,d11_issuer=d11_issuer,authority_store=authority_store)
-        if (type(bundle.model_workflows) is not AdminModelWorkflowsV7 or bundle.model_workflows.natural_generation is None
+        if (type(bundle.model_workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} or bundle.model_workflows.natural_generation is None
                 or bundle.model_workflows.natural_generation.template_version!=TEMPLATE_VERSION):
             raise ValueError('Authority v7 reader requires its actual new installed workflow/template')
 

@@ -64,6 +64,10 @@ class InstalledD07ExecutionServiceV1:
         self._accounting_grants = {}
         self._closed_accounting_requests = {}
         self._discovery_cursor = ""
+        self._reflection_discovery_cursor = ""
+        self._reflection_discovery_active = False
+        self._reflection_rescan_requested = False
+        self._last_reflection_status = None
         self._adapters = {}
 
     def wake_committed_job_v1(self, job_id):
@@ -131,7 +135,54 @@ class InstalledD07ExecutionServiceV1:
         for ref in refs:
             if ref not in self._wake_seen:
                 self.wake_committed_job_v1(ref)
+        await self.resume_pending_reflections_v3()
         return refs
+
+    async def resume_pending_reflections_v3(self):
+        if self.worker is None or self._closed or self.owner_loop is not asyncio.get_running_loop():
+            return ()
+        if self._reflection_discovery_active:
+            self._reflection_rescan_requested = True
+            return ()
+        from .d07_execution_v1 import TABLE
+        from .d07_graph_stages_v1 import prepare_current_d07_reflection_continuation_v3
+        self._reflection_discovery_active = True
+        self._reflection_discovery_cursor = ""
+        results = deque(maxlen=16)
+        try:
+            while not self._closed:
+                def discover(graph):
+                    with self._store._lock:
+                        return tuple(row[0] for row in self._db.execute(
+                            "SELECT original_ref FROM " + TABLE + " WHERE bot=? AND persona=? "
+                            "AND kind='reflection_continuation' AND original_ref>? ORDER BY original_ref LIMIT 17",
+                            (*self.bundle.installation_policy.namespace.as_tuple, self._reflection_discovery_cursor)))
+                rows = await self.worker.call(discover)
+                for ref in rows[:16]:
+                    if self._closed:
+                        break
+                    try:
+                        result = await self.worker.call(lambda graph, selected=ref:
+                            prepare_current_d07_reflection_continuation_v3(graph, self.bootstrap, self.bundle,
+                                continuation_ref=selected))
+                        self._last_reflection_status = (ref, result["status"])
+                        results.append(result)
+                        if result["status"] == "prepared" and result["job_id"] not in self._wake_seen:
+                            self.wake_committed_job_v1(result["job_id"])
+                    except (ValueError, RuntimeError) as exc:
+                        self._last_reflection_status = (ref, "waiting_for_current_original", type(exc).__name__)
+                if len(rows) > 16:
+                    self._reflection_discovery_cursor = rows[15]
+                elif self._reflection_rescan_requested:
+                    self._reflection_rescan_requested = False
+                    self._reflection_discovery_cursor = ""
+                else:
+                    break
+                await asyncio.sleep(0)
+            return tuple(results)
+        finally:
+            self._reflection_discovery_active = False
+            self._reflection_discovery_cursor = ""
 
     async def _recover_local_observation_v1(self, intent, anchor, job_id):
         """Report a retained original response, never invoke a provider again."""
@@ -261,17 +312,26 @@ class InstalledD07ExecutionServiceV1:
         from .d01_production_operations_v1 import MissingProductionOriginalV1
         from .d07_execution_v1 import D07RelationshipPreparedV2, D07RelationshipSemanticQuestionV2
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2, D07MethodGrowthSemanticQuestionV2
+        from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+        from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        if type(original)in {D07GeneralGrowthQuestionV1,D07GeneralGrowthPreparedV1}:
+            from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+            if type(self.bundle.model_workflows)is not AdminModelWorkflowsV8 or self.bundle.model_workflows.general_growth_cognition is None:
+                raise MissingProductionOriginalV1("explicit_installed_general_growth_cognition_workflow_v8")
+            return self.bundle.model_workflows.general_growth_cognition
         if type(original) in {D07MethodGrowthPreparedV2, D07MethodGrowthSemanticQuestionV2}:
             from ..host.model_workflows_v6 import AdminModelWorkflowsV6
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV6,AdminModelWorkflowsV7} or self.bundle.model_workflows.growth_cognition is None:
+            from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8} or self.bundle.model_workflows.growth_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_named_growth_C3_workflow_v6")
             return self.bundle.model_workflows.growth_cognition
         if type(original) in {D07RelationshipPreparedV2, D07RelationshipSemanticQuestionV2}:
             from ..host.model_workflows_v5 import AdminModelWorkflowsV5
             from ..host.model_workflows_v6 import AdminModelWorkflowsV6
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7} or self.bundle.model_workflows.d07_relationship_cognition is None:
+            from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7,AdminModelWorkflowsV8} or self.bundle.model_workflows.d07_relationship_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_named_relationship_C3_workflow_v5")
             return self.bundle.model_workflows.d07_relationship_cognition
         workflows = self.bundle.model_workflows
@@ -298,6 +358,16 @@ class InstalledD07ExecutionServiceV1:
             question = read_current_d07_semantic_question_v1(db, self.d11_issuer, namespace,
                 stage.request.trigger_original_ref)
             if question is not None:
+                if stage.request.trigger_original_ref.startswith("joint-external-question:"):
+                    from .joint_external_observation_v1 import require_current_joint_semantic_basis_v1
+                    basis = require_current_joint_semantic_basis_v1(db, frame=frame,
+                        question_ref=stage.request.trigger_original_ref, issuer=self.d11_issuer)
+                    if set(stage.provenance["tickets"][next(i for i, ticket in enumerate(stage.provenance["tickets"])
+                            if ticket.ticket_id == stage.provenance["choice"].ticket_id)].source_refs) != set(basis.source_refs):
+                        raise ValueError("Joint cognition changed its actual fair C02 chosen Sources")
+                    envelope = replace(frame.envelope, deadline_utc=min(frame.envelope.deadline_utc, basis.original_deadline_utc))
+                    frame = replace(frame, envelope=envelope)
+                    stage = replace(stage, envelope=envelope, proposal=replace(stage.proposal, envelope=envelope))
                 target = resolve_current_d07_semantic_target_v1(db, self.d11_issuer, frame, question)
                 stage = replace(stage, provenance={**stage.provenance, "semantic_question": question, "semantic_target": target})
             from .d07_reflection_execution_v1 import read_actual_d07_reflection_request_v1
@@ -331,6 +401,13 @@ class InstalledD07ExecutionServiceV1:
             raise MissingProductionOriginalV1("explicit_owner_role_clock_installation")
         mapping = read_current_role_clock_installation_v1(reader, db, namespace)
         policy_id, policy_version = self._current_body_policy(db, namespace)
+        from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+        if type(stage.provenance.get("semantic_question"))is D07GeneralGrowthQuestionV1:
+            from .d07_general_growth_execution_v1 import prepare_general_growth_execution_in_transaction_v1
+            return prepare_general_growth_execution_in_transaction_v1(db,frame=frame,stage=stage,workflow=workflow,
+                installation_id=self.bundle.installation_policy.installation_id,d11_issuer=self.d11_issuer,
+                resource_issuer=self.resource_issuer,body_authority=self.body_authority,clock_mapping=mapping,
+                body_policy_id=policy_id,body_policy_version=policy_version)
         return prepare_d07_execution_in_transaction_v1(db, frame=frame, stage=stage, workflow=workflow,
             installation_id=self.bundle.installation_policy.installation_id, d11_issuer=self.d11_issuer,
             resource_issuer=self.resource_issuer, body_authority=self.body_authority, clock_mapping=mapping,

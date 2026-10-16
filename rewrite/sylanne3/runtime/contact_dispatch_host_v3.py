@@ -30,72 +30,12 @@ class InstalledContactFinalClaimWriterV3:
         raise ValueError('Contact final claim requires the prepared writer issued after its actual claimed receipt')
 
     def require_current_entry(self, graph, authority, lease, original):
-        from ..authority_service.d10_contact_policy_service_v1 import D10ContactPolicyOriginalV1
-        from ..domains.d10 import decode_contact_policy
-        from ..graph_coordinator import UnavailableGuard
-        from .contact_p2_birth_v1 import read_contact_p2_birth_v1
-        from .contact_batch_current_v3 import require_current_contact_batch_v3
-        from .c04_authority_port_v3 import InstalledC04AuthorityPortV3
-        from .first_ingress_v2 import trusted_upper
-        if _INSTALLED.get(id(self)) is not self or graph is not self.graph:
-            raise ValueError('Contact writer crossed its actual installed coordinator')
-        graph._authorize(lease,authority,frozenset({'d08','d09','d10','d11'}))
-        store=graph._GraphCoordinator__store
-        now=trusted_upper(self.port.read_ingress_clock(self.clock_policy))
-        with store._lock:
-            db=store._db;db.execute('BEGIN')
-            try:
-                birth=read_contact_p2_birth_v1(db,namespace=authority.namespace,operation_id=original.operation_id)
-                if birth.request!=original.request or birth.admission!=original.admission:
-                    raise ValueError('Contact preflight actual immutable original differs')
-                birth.admission.admission.require_current(now)
-                policy_id=birth.qualification.owner_policy.policy.policy_id
-            finally:db.rollback()
-        current=[None]
-        c04=graph._GraphCoordinator__c04_authority_port_v3
-        if type(c04) is not InstalledC04AuthorityPortV3:
-            raise ValueError('Contact preflight actual installed current policy reader is absent')
-        def observe(scope):
-            value=c04.contact_policy(scope.permit,'read_current',policy_id=policy_id)
-            current[0]=value
-            return value
-        def read():
-            db=store._db;db.execute('BEGIN')
-            try:
-                actual=read_contact_p2_birth_v1(db,namespace=authority.namespace,operation_id=original.operation_id)
-                actual.admission.admission.require_current(now)
-                policy=current[0]
-                if type(policy) is not D10ContactPolicyOriginalV1:
-                    raise UnavailableGuard('Contact current signed Owner policy is unavailable or revoked')
-                if not policy.policy.consent:
-                    raise UnavailableGuard('Contact current signed Owner consent is withdrawn')
-                if policy.policy.quiet:
-                    raise UnavailableGuard('Contact current signed quiet mode forbids proactive contact')
-                batch,proof,_=require_current_contact_batch_v3(db,namespace=authority.namespace,
-                    batch_ref=actual.batch_ref,operation_id=actual.request.operation_id,
-                    generation=actual.request.activation_generation,graph_incarnation=actual.admission.admission.graph_incarnation)
-                if (type(policy) is not D10ContactPolicyOriginalV1
-                        or policy.original_ref!=proof.qualification.check_versions.owner_policy_ref
-                        or policy.digest!=proof.qualification.check_versions.owner_policy_digest
-                        or batch.content.audience_id!=actual.qualification.audience
-                        or not now<batch.content.valid_until):
-                    raise ValueError('Contact preflight current signed policy/current Source whole scope differs')
-                rows=db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? "
-                    "AND type_name='d10.contact_policy.v1' AND valid=1 AND json_extract(value,'$.approval_ref')=? LIMIT 2",
-                    (*authority.namespace.as_tuple,policy.original_ref)).fetchall()
-                if len(rows)!=1 or decode_contact_policy(json.loads(rows[0][0]),authority.namespace)!=policy.policy:
-                    raise ValueError('Contact preflight current adopted policy differs from actual Core')
-                from .jobs import get_job
-                job=get_job(db,AtomKey.from_token(actual.job_ref).name)
-                outbox=db.execute('SELECT phase FROM graph_bundle_outbox WHERE bot=? AND persona=? AND outbox_ref=?',
-                    (*authority.namespace.as_tuple,actual.outbox_ref)).fetchone()
-                if (job.phase!='waiting' or job.cancel_epoch!=0 or job.fence!=0
-                        or job.operation_id!=actual.request.operation_id or job.effect_id!=actual.request.effect_id
-                        or outbox!=('pending',)):
-                    raise ValueError('Contact preflight current unconsumed job/outbox or cancellation differs')
-                return actual.admission
-            finally:db.rollback()
-        return graph._read_v2(authority,read,fence_observer=observe)
+        from ..host.contact_dispatch_driver_v3 import OriginalContactDispatchV3
+        from .contact_dispatch_host_read_v1 import prepare_contact_dispatch_text_work_v1
+        if (_INSTALLED.get(id(self))is not self or self.graph is not graph
+                or type(original)is not OriginalContactDispatchV3 or original.namespace!=authority.namespace):
+            raise ValueError('Contact preflight requires its actual installed original and current Source/Owner Work')
+        return prepare_contact_dispatch_text_work_v1(self,graph,authority,lease,original.request,original=original)
 
     def recover_observation_metadata(self, graph, operation_id):
         from ..graph_coordinator import namespace_ref
@@ -182,6 +122,9 @@ def _identity_locked(graph, namespace, operation_id):
     if issued is None:
         raise ValueError("actual Contact3 dispatch command is absent")
     receipt, request = issued
+    if request.segment_index>0:
+        from .contact_continuation_p2_v1 import read_contact_continuation_host_identity_v1
+        return read_contact_continuation_host_identity_v1(graph,namespace,operation_id,original,result,issued)
     operation = original['receipt']
     if (operation.outbox_refs != (proof['outbox_ref'],)
             or receipt.receipt_digest != proof['admission_receipt_digest']
@@ -205,57 +148,15 @@ def _identity_locked(graph, namespace, operation_id):
 
 
 def read_committed_contact_dispatch_v3(graph, authority, lease, operation_id):
-    if type(operation_id) is not str or not operation_id:
-        raise ValueError("actual Contact operation ID required")
-    graph._authorize(lease, authority, frozenset({'d08', 'd09', 'd10', 'd11'}))
-    store = graph._GraphCoordinator__store
-    if not isinstance(store, ProductionGraphStore) or graph._GraphCoordinator__content_fence_v2 is None:
-        raise RuntimeError("installed Contact current read fence unavailable")
-    def read():
-        db = store._db
-        db.execute('BEGIN')
-        try:
-            return _identity_locked(graph, authority.namespace, operation_id)[0]
-        finally:
-            db.rollback()
-    return graph._read_v2(authority, read)
+    from .contact_dispatch_host_read_v1 import prepare_contact_dispatch_identity_work_v3
+    return prepare_contact_dispatch_identity_work_v3(graph,authority,lease,operation_id)
 
 
 def get_contact_dispatch_text_segment_v3(graph, authority, lease, request):
-    from ..host.astrbot_dispatch import ResolvedTextPayload
-    from .contact_batch_current_v3 import require_current_contact_batch_v3
-    from .first_ingress_v2 import trusted_upper
-    graph._authorize(lease, authority, frozenset({'d08', 'd09', 'd10', 'd11'}))
-    port, store = graph._GraphCoordinator__content_fence_v2, graph._GraphCoordinator__store
-    if not isinstance(store, ProductionGraphStore) or port is None:
-        raise RuntimeError("installed Contact current content fence unavailable")
-    now = trusted_upper(port.read_ingress_clock(graph._GraphCoordinator__dispatch_clock_policy))
-    def read():
-        db = store._db
-        db.execute('BEGIN')
-        try:
-            original, _ = _identity_locked(graph, authority.namespace, request.operation_id)
-            if request != original.request or request.segment_index != 0 or request.segment_count != 1:
-                raise ValueError("Contact single original command differs; whole batch HOLD")
-            from .contact_p2_birth_v1 import read_contact_p2_birth_v1
-            birth=read_contact_p2_birth_v1(db,namespace=authority.namespace,operation_id=request.operation_id)
-            if birth.request!=request or birth.admission!=original.admission:
-                raise ValueError('Contact current text original birth identity differs')
-            original.admission.admission.require_current(now)
-            batch, _, _ = require_current_contact_batch_v3(db, namespace=authority.namespace,
-                batch_ref=original.batch_ref, operation_id=original.operation_id,
-                generation=request.activation_generation,
-                graph_incarnation=original.admission.admission.graph_incarnation)
-            if len(batch.content.segments) != 1 or now >= batch.content.valid_until:
-                raise ValueError("Contact whole batch scope/deadline differs")
-            segment = batch.content.segments[0].segment
-            account = json.loads(original.admission.admission.account_ref)
-            destination = json.loads(original.admission.admission.destination_ref)
-            return ResolvedTextPayload(segment.body.encode('utf-8'), (), segment.claim_uses,
-                request.namespace, *account, *destination, batch.content.scene_id)
-        finally:
-            db.rollback()
-    return graph._read_v2(authority, read)
+    from .contact_dispatch_host_read_v1 import prepare_contact_dispatch_text_work_v1
+    installed=tuple(value for value in _INSTALLED.values()if value.graph is graph and value.route_port._namespace==authority.namespace)
+    if len(installed)!=1:raise ValueError('Contact text requires its single actual installed private dispatch producer')
+    return prepare_contact_dispatch_text_work_v1(installed[0],graph,authority,lease,request)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +200,11 @@ def require_prepared_contact_p2_writer_v1(value):
 
 def commit_contact_dispatch_final_claim_v3(graph, context, binding, claimed, witness,
         authority_snapshot, contact_policy_witness, *, prepared, expected_receipt=None):
+    from ..authority_service.contact_continuation_p2_contract_v1 import ContactContinuationP2PolicyCapsuleV1
+    if type(contact_policy_witness)is ContactContinuationP2PolicyCapsuleV1:
+        from .contact_continuation_p2_v1 import commit_contact_continuation_dispatch_final_claim_v1
+        return commit_contact_continuation_dispatch_final_claim_v1(graph,context,binding,claimed,witness,authority_snapshot,
+            contact_policy_witness,prepared=prepared,expected_receipt=expected_receipt)
     from dataclasses import asdict
     from ..authority_service.contact_p2_contract_v1 import require_exact_contact_p2_policy_capsule_v1
     from ..authority_service.reverse_handoff import require_exact_reverse_handoff_identity, require_exact_authority_snapshot

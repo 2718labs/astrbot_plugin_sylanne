@@ -33,6 +33,10 @@ def historical_graph_proof_ddls_v2():
 
 def _scope_for_row(source,shape,row,meter):
     data=dict(zip(shape.columns,row,strict=True))
+    if shape.table=='c09_contact_plan_prefix_history_v3':
+        from .c09_contact_plan_prefix_history_v3 import decode_contact_prefix_history_row_v3
+        decode_contact_prefix_history_row_v3(tuple(row))
+        return data['capture_scope_digest']
     if 'scope_digest' in data:return data['scope_digest']
     if 'stream_id' not in data:raise C09PagedCaptureHold('historical structural row lacks its registered scope linkage')
     parent=meter.read_fixed_row(source,'c09_capture_streams_v2',('scope_digest',),'stream_id=?',(data['stream_id'],))
@@ -168,6 +172,13 @@ def classify_historical_graph_proof_row_v2(session,pair,shape,key,row,*,meter,re
         from .c09_historical_logical_source_v3 import require_historical_logical_source_descriptor_row_v3
         locator=require_historical_logical_source_descriptor_row_v3(session,pair,anchor,shape,key,row,meter=meter)
         _require_independent_stream(session,pair,locator,require_complete_stream)
+        return 'preserved_exact'
+    if shape.table=='c09_contact_plan_prefix_history_v3':
+        from .c09_contact_plan_prefix_history_v3 import decode_contact_prefix_history_row_v3
+        decode_contact_prefix_history_row_v3(tuple(row))
+        locator=_nested_locator_for_family(pair.source,anchor,anchor.certificate.candidate.target_directory,shape.table,meter)
+        _require_independent_stream(session,pair,locator,require_complete_stream)
+        _require_exact_structural_member(pair.source,locator,key,row,meter)
         return 'preserved_exact'
     if shape.table in {'c09_closure_members_v2','c09_closure_edges_v2'}:
         outer=anchor.certificate.candidate.closure
@@ -362,6 +373,8 @@ def read_historical_graph_proof_row_locator_v2(session,pair,shape,row,*,meter):
         return _require_signed_locator(pair.source,anchor,identity,meter)
     if shape.table in {'c09_graph_dispositions_v2','c09_graph_dispositions_v3'}:
         return _nested_locator_for_family(pair.source,anchor,anchor.certificate.candidate.disposition_directory,data['table_name'],meter)
+    if shape.table=='c09_contact_plan_prefix_history_v3':
+        return _nested_locator_for_family(pair.source,anchor,anchor.certificate.candidate.target_directory,shape.table,meter)
     if shape.table in {'c09_closure_members_v2','c09_closure_edges_v2'}:
         return _nested_locator_for_family(pair.source,anchor,anchor.certificate.candidate.closure,shape.table,meter)
     for field in ('schema_catalogue','disposition_directory','closure','tombstones','target_directory','generated_directory'):

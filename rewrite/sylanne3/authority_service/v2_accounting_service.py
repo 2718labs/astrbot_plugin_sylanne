@@ -201,4 +201,108 @@ class AuthorityV2AccountingMaintenanceService:
                 request_id=finish_id, request_digest=finish_digest)
 
 
+    def _no_dispatch_original_locked_v1(self, db, request, model_service):
+        from .v2_model_egress_service import AuthorityV2ModelEgressService
+        from .v2_model_egress_store import read_model_no_dispatch_witness_locked_v1
+        from .v2_accounting_contract import ModelNoDispatchAccountingRequestV1
+        if (type(request) is not ModelNoDispatchAccountingRequestV1
+                or type(model_service) is not AuthorityV2ModelEgressService
+                or model_service._store is not self._store or model_service._fences is not self._fences
+                or model_service._graph_verifier is None):
+            raise AuthorityUnavailable("actual same Core unsent model/accounting composition required")
+        witness = read_model_no_dispatch_witness_locked_v1(self._store, db,
+            request=request.witness.request, signer=model_service._graph_verifier._issuer._signer)
+        if witness != request.witness:
+            raise AuthorityUnavailable("no-dispatch accounting lacks its exact saved Authority witness")
+        intent = request.intent
+        record = self._store.read_locked(db, intent)
+        row = self._fences.fences._row(db, intent.operation_id)
+        if (record.state != "prepared" or record.observation_digest is not None
+                or row is None or self._fences.fences._permit(row) != witness.original_permit
+                or (row[6], row[8], row[9], row[10]) != ("finished", intent.call_id, witness.finish_digest, None)
+                or not self._store.is_fence_bound_locked(db, intent)
+                or db.execute("SELECT 1 FROM authority_model_admissions_v2 WHERE call_id=?", (intent.call_id,)).fetchone() is not None
+                or db.execute("SELECT 1 FROM authority_model_egress_observation_status_v1 WHERE call_id=?", (intent.call_id,)).fetchone() is not None):
+            raise AuthorityUnavailable("original model is admitted/dispatched/unknown; zero accounting denied")
+        return "sha256:" + canonical_digest((request.schema, request.operation_id,
+            asdict(intent), witness.digest, intent.budget_reservation_digest, intent.budget_ceiling, "zero_model_actual_only"))
+
+    def _require_no_dispatch_accounting_v1(self, credential, request):
+        from .v2_accounting_contract import ModelNoDispatchAccountingRequestV1
+        if (type(request) is not ModelNoDispatchAccountingRequestV1
+                or request.intent.namespace != self._fences.namespace or request.intent.subject != self._subject
+                or request.witness.request.holder != self._holder):
+            raise AuthorityUnavailable("original installed no-dispatch accounting subject/holder required")
+        self._fences.core._require(credential, "accounting", self._fences.namespace, self._holder)
+
+    def begin_no_dispatch_v1(self, *, credential, request, model_service):
+        from .v2_accounting_contract import ModelNoDispatchAccountingGrantV1
+        self._require_no_dispatch_accounting_v1(credential, request)
+        with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
+            anchor = self._fences._current_locked(db, deletion_head, execution_head, holder=self._holder,
+                generation=request.expected_anchor.activation_generation)
+            if anchor != request.expected_anchor: raise AuthorityUnavailable("unsent accounting anchor changed")
+            binding = self._no_dispatch_original_locked_v1(db, request, model_service)
+            permit = self._fences.fences.begin_fence_locked(db, subject=self._subject, holder=self._holder,
+                operation="accounting", current_anchor=anchor, operation_id=request.operation_id, command_digest=binding)
+            return ModelNoDispatchAccountingGrantV1(permit, request.intent.call_id,
+                request.intent.budget_reservation_digest, request.witness.digest)
+
+    def validate_no_dispatch_v1(self, *, credential, request, grant, model_service):
+        from .v2_accounting_contract import ModelNoDispatchAccountingGrantV1
+        self._require_no_dispatch_accounting_v1(credential, request)
+        if type(grant) is not ModelNoDispatchAccountingGrantV1:
+            raise AuthorityUnavailable("actual typed no-dispatch accounting grant required")
+        with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
+            anchor = self._fences._current_locked(db, deletion_head, execution_head, holder=self._holder,
+                generation=request.expected_anchor.activation_generation)
+            if anchor != request.expected_anchor: raise AuthorityUnavailable("unsent accounting anchor changed")
+            binding = self._no_dispatch_original_locked_v1(db, request, model_service)
+            if (grant != ModelNoDispatchAccountingGrantV1(grant.permit, request.intent.call_id,
+                    request.intent.budget_reservation_digest, request.witness.digest)
+                    or grant.permit.operation_id != request.operation_id or grant.permit.command_digest != binding):
+                raise AuthorityUnavailable("unsent accounting grant differs from its actual original")
+            self._fences.fences.validate_fence_locked(db, grant.permit, subject=self._subject, current_anchor=anchor)
+
+    @staticmethod
+    def _no_dispatch_finish_identity_v1(request, permit):
+        return ("no-dispatch-accounting-finish:" + canonical_digest((request.operation_id, permit.token)),
+            "sha256:" + canonical_digest(("finish_no_dispatch_accounting_v1", asdict(request), permit.token)))
+
+    def finish_no_dispatch_v1(self, *, credential, request, grant, model_service):
+        self.validate_no_dispatch_v1(credential=credential, request=request, grant=grant, model_service=model_service)
+        with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
+            anchor = self._fences._current_locked(db, deletion_head, execution_head, holder=self._holder,
+                generation=request.expected_anchor.activation_generation)
+            if anchor != request.expected_anchor: raise AuthorityUnavailable("unsent accounting finish anchor changed")
+            if self._no_dispatch_original_locked_v1(db, request, model_service) != grant.permit.command_digest:
+                raise AuthorityUnavailable("unsent accounting proof changed")
+            identity = self._no_dispatch_finish_identity_v1(request, grant.permit)
+            self._fences.fences.finish_fence_locked(db, grant.permit, subject=self._subject,
+                current_anchor=anchor, request_id=identity[0], request_digest=identity[1])
+
+    def recover_no_dispatch_finish_v1(self, *, credential, request, model_service):
+        from .v2_accounting_contract import ModelNoDispatchAccountingGrantV1
+        self._require_no_dispatch_accounting_v1(credential, request)
+        permit, state, pending = self._fences.fences.get_operation(request.operation_id,
+            subject=self._subject, namespace=self._fences.namespace)
+        if permit.operation != "accounting" or pending is not None or permit.pinned_anchor != request.expected_anchor:
+            raise AuthorityUnavailable("unsent accounting recovery exact identity differs")
+        finish = self._no_dispatch_finish_identity_v1(request, permit)
+        if state == "finished":
+            with self._fences.core._tx() as db:
+                self._no_dispatch_original_locked_v1(db, request, model_service)
+                row = self._fences.fences._row(db, request.operation_id)
+                if row is None or row[8:10] != finish: raise AuthorityUnavailable("unsent accounting finish receipt differs")
+            return
+        if state != "active": raise AuthorityUnavailable("unsent accounting fence recovery unavailable")
+        grant = ModelNoDispatchAccountingGrantV1(permit, request.intent.call_id,
+            request.intent.budget_reservation_digest, request.witness.digest)
+        self.finish_no_dispatch_v1(credential=credential, request=request, grant=grant, model_service=model_service)
+
+
+
 __all__ = ("AuthorityV2AccountingMaintenanceService",)

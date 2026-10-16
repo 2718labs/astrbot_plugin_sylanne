@@ -149,6 +149,11 @@ def read_plan_life_numeric_context_v1(db, *, namespace, activity_id, operation_k
         tuple(dict.fromkeys((*roots, *before_roots))), (*originals, *before_originals, request.causal_operation_id))
 
 
+def require_life_numeric_occurrence_time_v3(now, *, occurrence_completed_at, source_recorded_at):
+    if occurrence_completed_at > now or source_recorded_at > now:
+        raise ValueError('Life context cannot precede its actual occurrence')
+
+
 def _derive(db, frame, request, installed_readers):
     read = CurrentDomainReadV1(frame); read.check(db)
     locator = EncodeInternalLifeRequestV1(request.episode_ref, request.causal_operation_id)
@@ -163,8 +168,8 @@ def _derive(db, frame, request, installed_readers):
     perspective_atom = read.head(db, event.perspective_ref, required=True)
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     perspective = decode_typed_production_value_v1(perspective_atom.value, SelfPerspective)
-    if activity.completed_at > frame.now_utc or source.recorded_at > frame.now_utc:
-        raise ValueError('Life context cannot precede its actual occurrence')
+    require_life_numeric_occurrence_time_v3(frame.now_utc,occurrence_completed_at=activity.completed_at,
+        source_recorded_at=source.recorded_at)
     ids = life_numeric_context_ids_v1(event.namespace, request.episode_ref)
     keys = life_numeric_context_keys_v1(event.namespace, request.episode_ref, activity.activity_id)
     world = WorldEvent(ids['event'], 'd10_internal_life_step_completed',
@@ -325,7 +330,10 @@ def read_current_life_numeric_context_v1(db, *, frame, request, installed_reader
     read = CurrentDomainReadV1(frame)
     for write in _writes(original):
         atom = read.head(db, write.key, required=True)
-        history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (write.key.token,)).fetchone()
+        from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
+        handled,history=read_bound_native_numeric_history_v3(db,write.key.token,1,('value', 'valid', 'event_id'))
+        if not handled:
+            history = db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1', (write.key.token,)).fetchone()
         if (atom.revision != 1 or atom.value != write.value
                 or GraphVersion(write.key, 1) not in actual.write_versions
                 or history != (canonical_serialize(write.value), 1, original.operation_id)):

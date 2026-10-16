@@ -499,8 +499,11 @@ class InstalledPersonalCandidateReadersV1:
         self.resource_issuer = graph._GraphCoordinator__d02_issuer
         self.need_qualification_reader = (InstalledCurrentPersonalNeedReaderV1(_INSTALLED, self)
             if need_qualification_reader is None else need_qualification_reader)
-        self.candidate_eligibility_reader = candidate_eligibility_reader
-        self.phase_price_reader = phase_price_reader
+        from .personal_candidate_eligibility_v1 import install_current_personal_eligibility_reader_v1
+        self.candidate_eligibility_reader = (install_current_personal_eligibility_reader_v1(self)
+            if candidate_eligibility_reader is None else candidate_eligibility_reader)
+        from .personal_candidate_eligibility_v1 import InstalledCurrentSourceNotePriceReaderV1
+        self.phase_price_reader = InstalledCurrentSourceNotePriceReaderV1(self) if phase_price_reader is None else phase_price_reader
 
     def current(self):
         self.graph._admin(self.bootstrap)
@@ -1176,6 +1179,13 @@ def actual_personal_phase_price_ceiling_v1(price, phase_kind):
 
 
 def _assemble(db, *, frame, request, readers, preparation_operation_id=None, _phase_transition=None, _count_freeze=None, _count_replay_preparation=None):
+    from .personal_candidate_eligibility_v1 import bind_actual_personal_candidate_request_v1
+    with bind_actual_personal_candidate_request_v1(readers, request, frame):
+        return _assemble_current_v1(db, frame=frame, request=request, readers=readers,
+            preparation_operation_id=preparation_operation_id, _phase_transition=_phase_transition,
+            _count_freeze=_count_freeze, _count_replay_preparation=_count_replay_preparation)
+
+def _assemble_current_v1(db, *, frame, request, readers, preparation_operation_id=None, _phase_transition=None, _count_freeze=None, _count_replay_preparation=None):
     read = (CurrentDomainReadV1(frame) if _phase_transition is None else
         _PhasePersonalCandidateReadV1(frame, db=db, readers=readers, transition=_phase_transition))
     read.check(db)
@@ -1267,8 +1277,7 @@ def _assemble(db, *, frame, request, readers, preparation_operation_id=None, _ph
             status = "WAIT_ORIGINAL_EFFECT"
         elif node.carried_forward_verified or binding.candidate_ref in values["rejected"]:
             status = "REJECTED"
-        if "NUMERIC_DISCRIMINATOR_UNRESOLVED" in values["reasons"].get(binding.candidate_ref, ()):
-            eligibility = replace(eligibility, numeric_discriminator_unresolved=True)
+        # The installed exact prospective recipe producer owns the numeric discriminator contract.
         encoded, prospective_digest = prospective_personal_candidate_input_v1(db, read, request=request,
             binding=binding, plan_atom=plan_atom, goal_atom=goal_atom, need=need, deadline=deadline, installed_readers=readers)
         future = prospective_personal_future_identity_v1(frame.envelope.authority.namespace, request, binding, plan_atom,
@@ -1405,7 +1414,11 @@ def _require_current_personal_candidates_v1(db, *, frame, preparation_operation_
             or (prepared.owner_grant_ref, prepared.owner_grant_revision, prepared.owner_grant_digest) != (guard.grant_ref, guard.grant_revision, guard.grant_digest)
             or (prepared.access_epoch, prepared.delete_epoch) != (frame.envelope.version_guard.access_epoch, frame.envelope.version_guard.delete_epoch)):
         raise MissingProductionOriginalV1("current_prepared_candidate_owner_source_generations")
+    from .personal_candidate_eligibility_v1 import require_actual_owner_candidate_carrier_v1
+    owner_carrier = require_actual_owner_candidate_carrier_v1(db, frame=frame, request=request, prepared=prepared, readers=readers)
     for version in prepared.read_versions:
+        if owner_carrier is not None and version.key == owner_carrier[0]:
+            continue  # The exact complete same-task W01 progress was authenticated above.
         if for_selected_decision and version.key.token == prepared.future_decision_ref and version.revision == 0:
             decision = read.head(db, version.key, required=True)
             history = db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=?", (decision.key.token, decision.revision)).fetchone()
@@ -1419,6 +1432,9 @@ def _require_current_personal_candidates_v1(db, *, frame, preparation_operation_
     current, quotes = _assemble(db, frame=frame, request=request, readers=readers,
         preparation_operation_id=prepared.preparation_operation_id, _phase_transition=_phase_transition,
         _count_replay_preparation=prepared)
+    if owner_carrier is not None:
+        from .personal_candidate_eligibility_v1 import normalize_actual_owner_candidate_set_v1
+        current = normalize_actual_owner_candidate_set_v1(current,prepared,owner_carrier)
     comparable = replace(current, read_versions=prepared.read_versions, query_coverage=prepared.query_coverage)
     if comparable != prepared:
         raise MissingProductionOriginalV1("current_exact_personal_candidate_preparation")
@@ -1499,7 +1515,28 @@ def _read_selected_personal_adapter_v1(db, *, frame, request, installed_readers,
     return prepared, matches[0], original
 
 
-def read_plan_personal_candidates_v1(db, *, namespace, activity_id, request, operation_id=None, installed_readers=None):
+def personal_candidate_evidence_read_plan_v3(*, read_versions, query_coverage,
+        future_decision_ref, preparation_original_digest, evidences):
+    """Compose existing evidence locators; no graph/body read or permission is issued.
+
+    Both the real Body recipe and the private whole-EOF metadata preplan use this
+    exact all-candidate expansion. A selected candidate alone is insufficient.
+    """
+    keys = [version.key for version in read_versions]
+    keys.append(AtomKey.from_token(future_decision_ref))
+    types = [page.type_id for page in query_coverage]
+    originals = ["d08-current:" + preparation_original_digest[:48]]
+    roots = []
+    for original, versions, coverage in evidences:
+        originals.append(original.original_ref)
+        keys.extend(version.key for version in (*versions, *original.read_versions))
+        types.extend(page.type_id for page in coverage)
+        roots.extend(version.key.token for version in (*versions, *original.read_versions)
+            if version.key.type_name == "memory.source")
+    return production_read_plan_v1(types, keys, roots, originals)
+
+
+def read_plan_personal_candidates_v1(db, *, namespace, activity_id, request, operation_id=None, installed_readers=None, include_eligibility=True):
     types = ["d01.persona_activation.v1", "d01.persona_plan.v1", "d07.current_interpretation.v1"]
     keys, roots, originals = [owner_grant_key(*namespace.as_tuple)], [], []
     from .d01_method_learning_v1 import method_trial_read_inputs_v1
@@ -1518,22 +1555,18 @@ def read_plan_personal_candidates_v1(db, *, namespace, activity_id, request, ope
         register_adopted_personal_candidate_preferences_v3(db, namespace=namespace,
             operation_id=request.prepared_candidates_operation_id, original=original,
             decoded_request=prepare, prepared_set=prepared)
-        keys.extend(version.key for version in prepared.read_versions)
-        keys.append(AtomKey.from_token(prepared.future_decision_ref))
-        types.extend(page.type_id for page in prepared.query_coverage)
-        originals.append("d08-current:" + original["original_digest"][:48])
+        preparation_original_digest = original["original_digest"]
         evidences = [(prepared.need.original, prepared.need.read_versions, prepared.need.query_coverage)]
         for candidate in prepared.candidates:
             for evidence in candidate.eligibility.originals:
                 evidences.append((evidence, candidate.eligibility.read_versions, candidate.eligibility.query_coverage))
             if candidate.price is not None:
                 evidences.append((candidate.price.original, candidate.price.read_versions, candidate.price.query_coverage))
-        for original, versions, coverage in evidences:
-            originals.append(original.original_ref)
-            keys.extend(version.key for version in (*versions, *original.read_versions))
-            types.extend(page.type_id for page in coverage)
-            roots.extend(version.key.token for version in (*versions, *original.read_versions)
-                if version.key.type_name == "memory.source")
+        evidence_plan = personal_candidate_evidence_read_plan_v3(read_versions=prepared.read_versions,
+            query_coverage=prepared.query_coverage, future_decision_ref=prepared.future_decision_ref,
+            preparation_original_digest=preparation_original_digest, evidences=evidences)
+        types.extend(evidence_plan.fixed_type_ids); keys.extend(evidence_plan.exact_keys)
+        roots.extend(evidence_plan.source_roots); originals.extend(evidence_plan.required_original_refs)
     else:
         raise TypeError("unregistered personal candidate read recipe")
     keys.extend(AtomKey.from_token(ref) for ref in (prepare.plan_ref, prepare.goal_ref))
@@ -1658,10 +1691,12 @@ def read_plan_personal_candidates_v1(db, *, namespace, activity_id, request, ope
             request=prepare, installed_readers=readers)
         types.extend(extent_reads.fixed_type_ids); keys.extend(extent_reads.exact_keys)
         roots.extend(extent_reads.source_roots); originals.extend(extent_reads.required_original_refs)
+    if installed_readers is not None:
+        readers = _readers(installed_readers)
         # Root's exact installed original readers expand their own known typed
         # proof scopes, never a callback selected by public request payload.
         from .domain_production_contracts_v1 import ProductionReadPlanV1
-        for hook in (readers.need_qualification_reader, readers.candidate_eligibility_reader, readers.phase_price_reader):
+        for hook in (readers.need_qualification_reader, readers.candidate_eligibility_reader if include_eligibility else None, readers.phase_price_reader):
             expand = getattr(hook, "read_plan_inputs_v1", None)
             if expand is None:
                 continue
@@ -2010,7 +2045,11 @@ def _read_plan_completed_phase_action_transition_v1(db, *, namespace, phase_sele
         *artifact_phase_action_keys_v2(phase_selector)]
     originals = [ids[name] for name in ("job", "frozen", "request", "call", "paid", "result", "adopt")]
     operations = [p.operation_id, p.acquire_operation_id, ids["adopt"], file_ids["action_operation"], "d02-life-body:" + file_ids["action_operation"]]
-    cycle_rows = db.execute("SELECT event_id FROM graph_history WHERE token=? AND valid=1 ORDER BY revision LIMIT 129",
+    from .artifact_borrowed_source_v3 import artifact_borrowed_recipe_index_v3
+    artifact,events=artifact_borrowed_recipe_index_v3(db,namespace=namespace,family="history_index",
+        kind="valid_cycle_events",ref=phase_selector.task.cycle_job_ref)
+    cycle_rows=tuple((event,)for event in events)if artifact else db.execute(
+        "SELECT event_id FROM graph_history WHERE token=? AND valid=1 ORDER BY revision LIMIT 129",
         (phase_selector.task.cycle_job_ref,)).fetchall()
     if len(cycle_rows) > 128:
         raise MissingProductionOriginalV1("bounded_actual_completed_phase_cycle_history")
@@ -2038,8 +2077,11 @@ def _read_plan_completed_phase_action_transition_v1(db, *, namespace, phase_sele
         originals.append("life-body:" + body_op)
         keys.extend(_refs(namespace, p.activity_id, body_op))
     from .d11_life_preparation_v1 import TABLE, read_prepared_life_by_ref_v1
-    life_rows=db.execute("SELECT original_ref FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='prepared' "
-        "AND json_extract(payload_json,'$.binding.operation_id')=? LIMIT 2",(*namespace.as_tuple,file_ids['action_operation'])).fetchall()
+    artifact,prepared_index=artifact_borrowed_recipe_index_v3(db,namespace=namespace,family="life_index",
+        kind="prepared_by_action",ref=file_ids["action_operation"])
+    life_rows=tuple((ref,)for ref,_ in prepared_index)if artifact else db.execute(
+        "SELECT original_ref FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='prepared' "
+        "AND json_extract(payload_json,'$.binding.operation_id')=? LIMIT 2",(*namespace.as_tuple,file_ids["action_operation"])).fetchall()
     if len(life_rows)>1:raise ValueError("phase read plan has conflicting actual Life preparations")
     if life_rows:
         life=read_prepared_life_by_ref_v1(db,namespace=namespace,prepared_original_ref=life_rows[0][0],issuer=readers.issuer)
@@ -2071,6 +2113,7 @@ def _read_plan_completed_phase_action_transition_v1(db, *, namespace, phase_sele
 
 def readonly_current_completed_artifact_phase_facts_v1(db, *, namespace, selector, issuer, now_utc,
         owner_guard=None, installed_bundle=None):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     """Actual SQLite facts only. This return value never authorizes execution."""
     from ..model_broker.artifact_draft_v1 import artifact_draft_model_ids_v2, artifact_draft_file_ids_v2
     from .d11_artifact_draft_model_v1 import _read_artifact_phase_selected_originals_v2, read_artifact_draft_prepared_v2, read_artifact_draft_frozen_v2
@@ -2104,7 +2147,7 @@ def readonly_current_completed_artifact_phase_facts_v1(db, *, namespace, selecto
         raise MissingProductionOriginalV1("same_current_completed_SQL_phase_installed_package")
     allowed, producers = [], []
     def current(key):
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?", (key.token, *namespace.as_tuple)).fetchone()
+        row = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=key.token)
         if row is None:
             return GraphAtom(key, 0, {}, False)
         return GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
@@ -2115,7 +2158,7 @@ def readonly_current_completed_artifact_phase_facts_v1(db, *, namespace, selecto
         producers.append((op, value["original_digest"]))
         return value
     def history(v, expected, producer):
-        row = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (v.key.token, v.revision)).fetchone()
+        row = artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=v.key.token,revision=v.revision)
         if row != (producer, canonical_serialize(expected), 1):
             raise MissingProductionOriginalV1("actual_completed_SQL_phase_history_member")
     def append_delta(key, old, after, expected, producer):
@@ -2211,7 +2254,7 @@ def readonly_current_completed_artifact_phase_facts_v1(db, *, namespace, selecto
             quote=issuer.resource_issuer.original_signed_quote(db,b.resource_quote_ref,b.resource_quote_version)
             if canonical_digest(quote)!=b.resource_quote_digest or quote.operation_id!=body_op or now_utc>=quote.valid_until_utc:
                 raise MissingProductionOriginalV1("current_SQL_completed_phase_Body_quote")
-            h=db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",(key.token,v1.revision)).fetchone()
+            h=artifact_model_graph_point_v3(db,('value', 'valid'),token=key.token,revision=v1.revision)
             if h is None or h[1]!=1 or canonical_digest(json.loads(h[0]))!=b.reservation_digest:
                 raise ValueError("SQL completed phase original Body reservation changed")
             history(v1,json.loads(h[0]),body_op)
@@ -2234,6 +2277,7 @@ def readonly_current_completed_artifact_phase_facts_v1(db, *, namespace, selecto
 
 def _completed_phase_file_successor_facts_v1(db, *, namespace, selector, adoption, issuer, now_utc,
         owner_guard=None, installed_bundle=None):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     """Authenticate exact installed file predecessors; return facts, never a grant."""
     from .d11_life_preparation_v1 import TABLE, _read, read_prepared_life_by_ref_v1
     from .d11_artifact_draft_content_v1 import _read_actual_phase_file_v2
@@ -2267,13 +2311,13 @@ def _completed_phase_file_successor_facts_v1(db, *, namespace, selector, adoptio
     if installed_bundle is not None and (b.installation_id,b.manifest_digest)!=(
             installed_bundle.installation_policy.installation_id,installed_bundle.installation_policy.manifest_digest):
         raise ValueError('completed file facts crossed installed package')
-    owner=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(b.owner_grant_ref,)).fetchone()
+    owner=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=b.owner_grant_ref)
     if owner is None or (owner[0],canonical_digest(json.loads(owner[1])),owner[2])!=(b.owner_grant_revision,b.owner_grant_digest,1):
         raise ValueError('completed file current Owner original changed')
     from .d11_life_fact_provenance_v1 import life_current_fact_reads_v1
     from .d11_life_preparation_v1 import life_read_matches_v1
     for frozen in life_current_fact_reads_v1(prepared):
-        row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(frozen.ref,)).fetchone()
+        row=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=frozen.ref)
         if not life_read_matches_v1(frozen,row):raise ValueError('completed file current Source/Actor/permission ancestor changed')
     origin=read_adopted_domain_operation_v1(db,namespace,b.prepare_operation_id)
     if origin is None or (origin['domain'],origin['operation_kind'])!=('d10','prepare_life'):
@@ -2282,15 +2326,15 @@ def _completed_phase_file_successor_facts_v1(db, *, namespace, selector, adoptio
     v0,v1=_phase_cas_versions_v1(origin,job_key)
     if v0.revision!=0 or v1.revision!=prepared.job_projection_revision or {v.key for v in origin['receipt'].write_versions}!={job_key}:
         raise ValueError('samephase Life prepare has foreign members or predecessor')
-    history=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',(job_key.token,v1.revision)).fetchone()
+    history=artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=job_key.token,revision=v1.revision)
     if history!=(b.prepare_operation_id,prepared.job_projection_json,1):raise ValueError('samephase Life prepare lacks actual historical job')
     deltas=[];producers=[(b.prepare_operation_id,origin['original_digest'])]
     def member(before,after,expected,producer):
         key=after.key
         if key.owner.bot!=namespace.bot_id or key.owner.persona!=namespace.persona_id:
             raise ValueError('samephase file member namespace changed')
-        historical=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',(key.token,after.revision)).fetchone()
-        current=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
+        historical=artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=key.token,revision=after.revision)
+        current=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=key.token)
         if historical!=(producer,canonical_serialize(expected),1) or current!=(after.revision,canonical_serialize(expected),1):
             raise MissingProductionOriginalV1('exact_samephase_file_member_without_foreign_successor')
         deltas.append((before,after,canonical_digest(expected)))
@@ -2324,7 +2368,7 @@ def _completed_phase_file_successor_facts_v1(db, *, namespace, selector, adoptio
         before=read_versions.get(after.key)
         if before is None or after.revision!=before.revision+1:
             raise ValueError('samephase file member lacks precise CAS predecessor')
-        row=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(after.key.token,after.revision)).fetchone()
+        row=artifact_model_graph_point_v3(db,('value', 'valid'),token=after.key.token,revision=after.revision)
         expected=json.loads(row[0])
         if commitments.get(after.key.token)!={'ref':after.key.token,'revision':after.revision,'digest':canonical_digest(expected)}:
             raise ValueError('samephase file member lost signed commitment')
@@ -2349,7 +2393,7 @@ def _completed_phase_file_successor_facts_v1(db, *, namespace, selector, adoptio
     if canonical_digest(resource)!=contract.resource_quote_digest or resource.effect_id!=b.effect_id:
         raise ValueError('samephase file Body resource quote crossed actual effect')
     settlement=AtomKey.from_token(contract.settlement_ref)
-    settled=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(settlement.token,)).fetchone()
+    settled=artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=settlement.token)
     if settled is not None:
         if settled[0]!=1 or settled[2]!=1:raise ValueError('samephase Body settlement has foreign successor')
         recorded=db.execute('SELECT event_id FROM graph_history WHERE token=? AND revision=1',(settlement.token,)).fetchone()
@@ -2374,14 +2418,14 @@ def _completed_phase_file_successor_facts_v1(db, *, namespace, selector, adoptio
         if canonical_digest(effect_policy)!=policy[1] or policy[1]!=body_original.effect_policy_digest:
             raise ValueError('samephase Body effect changed signed policy')
         reservation_key=AtomKey.from_token(contract.reservation_ref)
-        reserved=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=1',(reservation_key.token,)).fetchone()
+        reserved=artifact_model_graph_point_v3(db,('value', 'valid'),token=reservation_key.token,revision=1)
         from ..domains.d02 import BodyState,BodyReservation
         initial=BodyReservation(**json.loads(reserved[0])) if reserved and reserved[1]==1 else None
         if initial is None or canonical_digest(json.loads(reserved[0]))!=body_original.reservation_digest:
             raise ValueError('samephase Body effect lost original reserved B member')
         state_key=BodyDomain.state_write(namespace,result.state).key
         before_state,_=_phase_cas_versions_v1(body,state_key)
-        state_row=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(state_key.token,before_state.revision)).fetchone()
+        state_row=artifact_model_graph_point_v3(db,('value', 'valid'),token=state_key.token,revision=before_state.revision)
         if state_row is None or state_row[1]!=1:raise ValueError('samephase Body effect has no actual prior state')
         prior_state=_decode_json(state_row[0],BodyState)
         if (effect_policy['profile_id'],effect_policy['component_id'],effect_policy['work_kind'])!=(

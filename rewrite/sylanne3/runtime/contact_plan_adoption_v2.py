@@ -4,6 +4,7 @@ The same-transaction original is provisional until a separate SQLite reader
 observes the committed row. Neither a public plan nor a committed-shaped
 GraphReceipt is a substitute for durable COMMIT.
 """
+from .contact_original_read_v3 import contact_original_point_v3
 from dataclasses import asdict, dataclass, replace, fields
 import json
 from contextlib import closing
@@ -70,16 +71,20 @@ def read_plan_contact_expression_v2(db,*,namespace,activity_id,operation_kind,re
     old=read_plan_contact_expression_v1(db,namespace=namespace,activity_id=activity_id,
         operation_kind='adopt_contact_expression_plan',request=legacy)
     keys=list(old.exact_keys)
+    from ..domains.d08.contact_plan_v3 import PROVENANCE as PROVENANCE3,ELIGIBILITY as ELIGIBILITY3
     # The old planner authenticates the stable contact cause/recipient. Keep
     # its complete Source/negative inventories and add every absent new member.
     for key in old.exact_keys:
         if key.type_name=='d08.contact_expression_plan.v1':
-            keys.extend(AtomKey(key.owner,kind,key.name) for kind in (PLAN,PROVENANCE,ELIGIBILITY))
+            keys.extend(AtomKey(key.owner,kind,key.name) for kind in (PLAN,PROVENANCE,ELIGIBILITY,PROVENANCE3,ELIGIBILITY3))
     return ProductionReadPlanV1(old.fixed_type_ids,tuple(sorted(set(keys),key=lambda k:k.token)),
         old.source_roots,old.required_original_refs)
 
 
 def stage_adopt_current_contact_expression_plan_in_transaction_v2(db,*,frame,request,installed_readers):
+    from .domain_background_read_v3 import _active_v3
+    if _active_v3(db) is not None:
+        raise ValueError('Contact Plan3 background adoption requires its actual retained streamed WRITE producer')
     if type(request) is not AdoptCurrentContactExpressionPlanRequestV2:
         raise TypeError('Contact Plan v2 exact request required')
     graph=installed_readers.role_clock_reader.graph
@@ -152,8 +157,8 @@ def record_contact_plan_after_cas_v2(db,*,stage,issuer,receipt):
             or {(v.key,v.revision) for v in receipt.write_versions}!={(w.key,1) for w in stage.writes}):
         raise ValueError('Contact Plan v2 requires its provisional same-transaction complete receipt')
     for write in stage.writes:
-        if db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',
-            (write.key.token,)).fetchone()!=(receipt.operation_id,canonical_serialize(write.value),1):
+        if contact_original_point_v3(db,table='graph_history',columns=('event_id', 'value', 'valid'),key_columns=('token', 'revision'),key=(lambda _contact_values: (_contact_values[0],1))((write.key.token,)),legacy_reader=lambda: db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',
+            (write.key.token,)).fetchone())!=(receipt.operation_id,canonical_serialize(write.value),1):
             raise ValueError('Contact Plan v2 original member/history was not actually written')
     payload={'schema':SIGN_KIND,'plan':plain_v1(stage.plan),'expression':plain_v1(stage.expression),
         'proof':plain_v1(stage.proof),'producing_operation_id':receipt.operation_id,
@@ -165,13 +170,16 @@ def record_contact_plan_after_cas_v2(db,*,stage,issuer,receipt):
     signature=issuer._signer.sign(SIGN_KIND,canonical_serialize((stage.plan.namespace,stage.plan.contact_id,digest)))
     install_contact_plan_original_schema_v2(db)
     row=(*stage.plan.namespace.as_tuple,stage.plan.contact_id,wire,digest,signature)
-    existing=db.execute(f'SELECT * FROM {TABLE} WHERE bot=? AND persona=? AND contact_id=?',row[:3]).fetchone()
+    existing=contact_original_point_v3(db,table='graph_contact_expression_plan_originals_v2',columns=('bot', 'persona', 'contact_id', 'payload_json', 'payload_digest', 'signature'),key_columns=('bot', 'persona', 'contact_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))(row[:3]),legacy_reader=lambda: db.execute(f'SELECT * FROM {TABLE} WHERE bot=? AND persona=? AND contact_id=?',row[:3]).fetchone())
     if existing is None:db.execute(f'INSERT INTO {TABLE} VALUES(?,?,?,?,?,?)',row)
     elif existing!=row:raise ValueError('Contact Plan v2 retry cannot replace its original')
     return digest
 
 
 def _require_durable_contact_plan_row_v2(db,row):
+    from .contact_original_read_v3 import contact_original_durable_connection_v3
+    if contact_original_durable_connection_v3(db,row):
+        return
     path=db.execute('PRAGMA database_list').fetchone()[2]
     if not path:raise ValueError('Contact Plan v2 installed durable database required')
     with closing(sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True,isolation_level=None)) as committed:
@@ -185,11 +193,18 @@ def _require_durable_contact_plan_row_v2(db,row):
 
 
 def read_adopted_contact_plan_v2(db,*,namespace,contact_id,issuer):
+    from ..authority_service.named_joint_contact_plan_v1 import read_bound_named_joint_contact_plan_v1
+    named=read_bound_named_joint_contact_plan_v1(db,namespace=namespace,contact_id=contact_id)
+    if named is not None:return named
+    from .contact_plan_adoption_v3 import TABLE as TABLE3,read_adopted_contact_plan_v3
+    found3 = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE3,)).fetchone()
+    if found3 and db.execute('SELECT 1 FROM '+TABLE3+' WHERE bot=? AND persona=? AND contact_id=?',(*namespace.as_tuple,contact_id)).fetchone():
+        return read_adopted_contact_plan_v3(db,namespace=namespace,contact_id=contact_id,issuer=issuer)
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError('Contact Plan v2 reader requires its actual current SQL snapshot')
     found=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone()
-    row=db.execute(f'SELECT * FROM {TABLE} WHERE bot=? AND persona=? AND contact_id=?',
-        (*namespace.as_tuple,contact_id)).fetchone() if found else None
+    row=contact_original_point_v3(db,table='graph_contact_expression_plan_originals_v2',columns=('bot', 'persona', 'contact_id', 'payload_json', 'payload_digest', 'signature'),key_columns=('bot', 'persona', 'contact_id'),key=(lambda _contact_values: (_contact_values[0],_contact_values[1],_contact_values[2]))((*namespace.as_tuple,contact_id)),legacy_reader=lambda: db.execute(f'SELECT * FROM {TABLE} WHERE bot=? AND persona=? AND contact_id=?',
+        (*namespace.as_tuple,contact_id)).fetchone()) if found else None
     if row is None:raise MissingProductionOriginalV1('durable_contact_plan_v2_original')
     _require_durable_contact_plan_row_v2(db,row)
     raw=json.loads(row[3])
@@ -225,21 +240,27 @@ def require_current_contact_plan_members_v2(db,*,proof,receipt):
     if {(v.key,v.revision) for v in receipt.write_versions}!={(w.key,1) for w in expected}:
         raise ValueError('Contact Plan v2 complete actual receipt members differ')
     for write in expected:
-        if db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(write.key.token,)).fetchone()!=(1,canonical_serialize(write.value),1):
+        if contact_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((write.key.token,)),legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(write.key.token,)).fetchone())!=(1,canonical_serialize(write.value),1):
             raise ValueError('Contact Plan v2 current fact/proof/eligibility invalidated or changed')
-        if db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(write.key.token,)).fetchone()!=(proof.producing_operation_id,canonical_serialize(write.value),1):
+        if contact_original_point_v3(db,table='graph_history',columns=('event_id', 'value', 'valid'),key_columns=('token', 'revision'),key=(lambda _contact_values: (_contact_values[0],1))((write.key.token,)),legacy_reader=lambda: db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1',(write.key.token,)).fetchone())!=(proof.producing_operation_id,canonical_serialize(write.value),1):
             raise ValueError('Contact Plan v2 actual historical member changed')
-        edges=tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',(write.key.token,)))
+        from .contact_original_read_v3 import contact_dependency_rows_v3
+        edges=contact_dependency_rows_v3(db,dependent_token=write.key.token)
+        if edges is None:
+            edges=tuple(db.execute('SELECT dependency_token,dependency_revision FROM graph_dependencies WHERE dependent_token=? ORDER BY dependency_token',(write.key.token,)))
         wanted={(dep.token,revisions[dep.token]) for dep in write.dependencies}
         if len(edges)!=len(wanted) or set(edges)!=wanted:raise ValueError('Contact Plan v2 actual eligibility edges changed')
     for read in proof.current_reads:
-        row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(read.ref,)).fetchone()
+        row=contact_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token',),key=(lambda _contact_values: (_contact_values[0],))((read.ref,)),legacy_reader=lambda: db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(read.ref,)).fetchone())
         if row!=((read.revision,read.value_json,int(read.valid)) if read.revision else None):
             raise ValueError('Contact Plan v2 Source/Access/Correction/Owner/plan current head drifted')
     return proof
 
 
 def require_contact_inventory_current_v2(db, namespace, raw):
+    from .contact_plan_adoption_v3 import SIGN_KIND as SIGN_KIND3,require_contact_inventory_current_v3
+    if type(raw) is dict and raw.get('schema') == SIGN_KIND3:
+        return require_contact_inventory_current_v3(db,namespace,raw)
     """Fresh bounded full provider inventory; the eligibility bit is insufficient."""
     from .contact_product_adapter_v1 import CONTACT_CURRENT_TYPES
     if not db.in_transaction or type(namespace) is not NamespaceId:
@@ -247,9 +268,12 @@ def require_contact_inventory_current_v2(db, namespace, raw):
     validate_contact_plan_original_payload_v2(raw)
     inventories = raw['current_inventories']
     for kind in CONTACT_CURRENT_TYPES:
-        rows = db.execute('SELECT token,revision,value,valid FROM graph_atoms '
-            'WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129',
-            (*namespace.as_tuple, kind)).fetchall()
+        from .contact_original_read_v3 import contact_current_inventory_v3
+        rows = contact_current_inventory_v3(db,namespace=namespace,kind=kind)
+        if rows is None:
+            rows = db.execute('SELECT token,revision,value,valid FROM graph_atoms '
+                'WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129',
+                (*namespace.as_tuple, kind)).fetchall()
         if len(rows) > 128:
             raise ValueError('Contact Plan v2 current full inventory exceeds bound; HOLD')
         observed = []
@@ -289,6 +313,9 @@ def _decode_contact_plan_inventory_atom_v2(raw,*,kind,namespace):
 
 
 def validate_contact_plan_original_payload_v2(raw):
+    from .contact_plan_adoption_v3 import SIGN_KIND as SIGN_KIND3,validate_contact_plan_original_payload_v3
+    if type(raw) is dict and raw.get('schema') == SIGN_KIND3:
+        return validate_contact_plan_original_payload_v3(raw)
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     from .contact_product_adapter_v1 import CONTACT_CURRENT_TYPES
     from ..graph_types import GraphAtom
@@ -343,13 +370,16 @@ def validate_contact_plan_history_v2(db,*,proof,actual):
     if len(epochs)!=1:raise ValueError('Contact Plan v2 historical snapshot epoch differs')
     refs=tuple(row.ref for row in proof.historical_reads)
     kinds=tuple(sorted({q.type_id for q in proof.query_coverage}))
-    rows=db.execute('WITH latest AS (SELECT h.token,MAX(h.revision) AS revision FROM graph_history h '
-        'JOIN graph_events e ON (h.event_bot,h.event_persona,h.event_session,h.event_id)='
-        '(e.bot,e.persona,e.session,e.event_id) WHERE e.bot=? AND e.persona=? AND e.epoch_revision<=? '
-        f"AND (h.token IN ({','.join('?' for _ in refs)}) OR json_extract(h.token,'$[4]') IN ({','.join('?' for _ in kinds)})) "
-        'GROUP BY h.token) SELECT h.token,h.revision,h.value,h.valid FROM latest l JOIN graph_history h '
-        'ON h.token=l.token AND h.revision=l.revision ORDER BY h.token LIMIT 1025',
-        (*ns.as_tuple,next(iter(epochs)),*refs,*kinds)).fetchall()
+    from .contact_original_read_v3 import contact_historical_inventory_v3
+    rows=contact_historical_inventory_v3(db,namespace=ns,epoch=next(iter(epochs)),refs=refs,kinds=kinds)
+    if rows is None:
+        rows=db.execute('WITH latest AS (SELECT h.token,MAX(h.revision) AS revision FROM graph_history h '
+            'JOIN graph_events e ON (h.event_bot,h.event_persona,h.event_session,h.event_id)='
+            '(e.bot,e.persona,e.session,e.event_id) WHERE e.bot=? AND e.persona=? AND e.epoch_revision<=? '
+            f"AND (h.token IN ({','.join('?' for _ in refs)}) OR json_extract(h.token,'$[4]') IN ({','.join('?' for _ in kinds)})) "
+            'GROUP BY h.token) SELECT h.token,h.revision,h.value,h.valid FROM latest l JOIN graph_history h '
+            'ON h.token=l.token AND h.revision=l.revision ORDER BY h.token LIMIT 1025',
+            (*ns.as_tuple,next(iter(epochs)),*refs,*kinds)).fetchall()
     if len(rows)>1024:raise ValueError('Contact Plan v2 historical complete inventory exceeds bound; HOLD')
     heads={ref:(revision,value,valid) for ref,revision,value,valid in rows}
     for read in proof.historical_reads:
@@ -362,8 +392,8 @@ def validate_contact_plan_history_v2(db,*,proof,actual):
     revisions={row.ref:row.revision for row in proof.current_reads}
     revisions.update({w.key.token:1 for w in expected})
     for write in expected:
-        row=db.execute('SELECT event_id,value,valid,dependencies FROM graph_history WHERE token=? AND revision=1',
-            (write.key.token,)).fetchone()
+        row=contact_original_point_v3(db,table='graph_history',columns=('event_id', 'value', 'valid', 'dependencies'),key_columns=('token', 'revision'),key=(lambda _contact_values: (_contact_values[0],1))((write.key.token,)),legacy_reader=lambda: db.execute('SELECT event_id,value,valid,dependencies FROM graph_history WHERE token=? AND revision=1',
+            (write.key.token,)).fetchone())
         if row is None or row[:3]!=(receipt.operation_id,canonical_serialize(write.value),1):
             raise ValueError('Contact Plan v2 actual historical immutable member changed')
         edges=json.loads(row[3])

@@ -190,12 +190,13 @@ def stage_adopt_current_c1_method_conditions_v1(db, *, frame, request, installed
             conclusions.append((key.token, condition, value))
         provider = D07DomainProvider()
         return stage_result_v1(frame, "d07", OPERATION, request, writes=tuple(writes),
-            provenance={"c1_original_ref": c1_task_intent_ref_v1(ns, request.c02_operation_id),
+            provenance={"conditioned_source_roots":frame.envelope.source_qualification.source_refs,"conditioned_original_deadline_utc":frame.envelope.deadline_utc,
+                "c1_original_ref": c1_task_intent_ref_v1(ns, request.c02_operation_id),
                 "c1_original_digest": canonical_digest(plain_v1(c1)), "task_scope_ref": request.task_scope_ref,
                 "task_scope_digest": canonical_digest(plain_v1(scope)), "goal_ref": request.goal_ref,
                 "goal_revision": goal.revision, "conditions": tuple(conclusions), "readiness_original_digest": readiness_digest,
                 "additional_model_calls": 0, "subjective_confidence_origin": "not_requested_by_C1_schema"},
-            receiver_events=(("d01", "method_conditions_changed"),), proposal_schema="d07.proposal.v1",
+            receiver_events=(("d01", "method_conditions_changed"),("d07","conditioned_conditions_committed_v1")), proposal_schema="d07.proposal.v1",
             proposal_hash=provider.descriptor.request_schema_hash)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d07", OPERATION, request, missing)

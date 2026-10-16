@@ -101,7 +101,11 @@ def registered_target_v1(source_hash, target_hash):
 APPEND_ONLY_SOURCES = (RegisteredCatalogueSourceV1(
     "c2d06c01dbbd6f9a7fe4e5483e061fcbffd7033bc799fb6459bd23861b79753c",
     "bd22ad6b6ceb162d3fd01390f7a2ec7f194b776ac24cf5ce96af9047bae23380",
-    "c3c832fd4ae7b3b6ca165893ad5ddc88f7610afc98a9493481ea064c3bd0536d"),)
+    "c3c832fd4ae7b3b6ca165893ad5ddc88f7610afc98a9493481ea064c3bd0536d"),
+    RegisteredCatalogueSourceV1(
+        "83c77457ddc14172d006f34e89e31bef4acb69d84596f4f70c1e35e683addabb",
+        "b4dc12b958ee503f505628d2771cf16b3ca581b8eeedf077231b2f847c7968c9",
+        "c3c832fd4ae7b3b6ca165893ad5ddc88f7610afc98a9493481ea064c3bd0536d"),)
 
 OPERATIONS = "graph_catalogue_upgrades_v1"
 BATCHES = "graph_catalogue_upgrade_batches_v1"
@@ -470,6 +474,9 @@ def _begin(db, scope, registry):
     previous = _operation(db, scope)
     if previous is not None:
         _assert_current(db, scope, registry, previous)
+        if previous[8]!='completed':
+            from .b3_managed_metadata_v1 import install_b3_managed_metadata_for_registry_v1
+            install_b3_managed_metadata_for_registry_v1(db,registry)
         return previous
     if current_catalogue_hash_v1(db) != source.catalogue_hash:
         raise ValueError("actual source catalogue is not the registered migration input")
@@ -483,6 +490,8 @@ def _begin(db, scope, registry):
     for name, identity in registered_target_v1(scope.source_catalogue_hash, registry.catalogue_hash).appended_types:
         if db.execute("SELECT 1 FROM graph_atoms WHERE type_name=? LIMIT 1", (name,)).fetchone():
             raise ValueError("pinned source already contains a newly registered type")
+    from .b3_managed_metadata_v1 import install_b3_managed_metadata_for_registry_v1
+    install_b3_managed_metadata_for_registry_v1(db,registry)
     db.execute(f"INSERT INTO {OPERATIONS} VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
                (*scope.namespace.as_tuple, scope.operation_id, scope.request_digest,
                 source.catalogue_hash, registry.catalogue_hash, source.package_zip_sha256,

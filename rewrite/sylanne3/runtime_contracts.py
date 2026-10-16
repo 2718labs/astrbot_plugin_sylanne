@@ -823,6 +823,10 @@ class DomainBundle:
     @property
     def digest(self) -> str:
         """Digest the complete immutable bundle for idempotency/conflict checks."""
+        from .runtime.contact_plan_physical_write_v3 import contact_plan_bundle_digest_v3
+        contact_digest = contact_plan_bundle_digest_v3(self)
+        if contact_digest is not None:
+            return contact_digest
         if any(write.key.type_name == "memory.source" for proposal in self.proposals for write in proposal.typed_writes):
             from .runtime.owner_material_source_storage_v3 import issued_owner_source_bundle_digest_v3
             sealed_digest = issued_owner_source_bundle_digest_v3(self)

@@ -463,6 +463,7 @@ def record_task_scope_after_commit_v1(db,*,graph,issued,frame,receipt,issuer):
 
 
 def require_task_scope_archive_v1(db,*,namespace,root,producer):
+    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
     """Passive original joins used by C09 and live responsibility reconstruction."""
     from .c09_life_originals_v1 import _read_archive_life_original_v1
     from .c1_artifact_task_intent_v1 import C1ArtifactTaskIntentOriginalV1,require_c1_task_original_history_v1
@@ -493,7 +494,7 @@ def require_task_scope_archive_v1(db,*,namespace,root,producer):
         require_artifact_phase_postcondition_history_v1(db,namespace=namespace,kind=APPROVAL_KIND_V2,
             original_ref=scope.approval_original_ref,producing_operation_id=approval_row[1],raw=approval_row[0])
         approved=read_adopted_domain_operation_v1(db,namespace,approval.registration_operation_id)
-        source_event=db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=1",(scope.source_ref,)).fetchone()
+        source_event=artifact_model_graph_point_v3(db,('event_id',),token=scope.source_ref,revision=1)
         source_op=None if source_event is None else db.execute(
             "SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
             (*namespace.as_tuple,source_event[0])).fetchone()
@@ -517,8 +518,7 @@ def require_task_scope_archive_v1(db,*,namespace,root,producer):
                 or initial["payload"]["provenance"]["artifact_task_objective"]!=obj[0]):
             raise ValueError("objective lost its initial non-resurrected task producer")
         goal=task_objective_goal_v1(objective)
-        history=db.execute("SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1",
-            (objective.goal_ref,)).fetchone()
+        history=artifact_model_graph_point_v3(db,('value', 'valid', 'event_id'),token=objective.goal_ref,revision=1)
         if history is None or history[1:]!=(1,obj[1]) or json.loads(history[0])!=plain_v1(goal):
             raise ValueError("objective was not prospectively committed with its fixed Goal")
     if type(scope) is IngressArtifactTaskScopeOriginalV3:

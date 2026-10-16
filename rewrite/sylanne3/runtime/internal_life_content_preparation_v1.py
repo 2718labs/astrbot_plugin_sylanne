@@ -128,8 +128,12 @@ def read_internal_life_prepared_v1(db, *, namespace, issuer, job_id):
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone() is None:
         return None
     require_internal_life_content_schema_v1(db)
-    row=db.execute(f"SELECT payload_json,payload_digest,signature FROM {TABLE} WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
-        (*namespace.as_tuple,job_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table=TABLE,
+        columns=('payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'), key=(*namespace.as_tuple,'prepared',job_id),
+        legacy_reader=lambda: db.execute(f"SELECT payload_json,payload_digest,signature FROM {TABLE} WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
+            (*namespace.as_tuple,job_id)).fetchone())
     if row is None: return None
     raw=json.loads(row[0]); prepared=decode_internal_life_prepared_v1(raw)
     if (canonical_serialize(raw)!=row[0] or canonical_digest(raw)!=row[1]
@@ -178,10 +182,11 @@ def prepare_internal_life_content_in_transaction_v1(db, *, frame, request, insta
     from ..host.model_workflows_v5 import AdminModelWorkflowsV5
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+    from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from ..model_broker.natural_reply import NaturalReplyInstallationV2
     read=CurrentDomainReadV1(frame);read.check(db)
     if (type(request) is not PrepareInternalLifeContentRequestV1 or type(installed_bundle) is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7)):
+            or type(installed_bundle.model_workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7, AdminModelWorkflowsV8)):
         raise TypeError('actual installed Life content request/workflow version required')
     cause=read_current_internal_life_encoding_cause_v1(db,frame=frame,
         request=EncodeInternalLifeRequestV1(request.episode_ref,request.causal_operation_id),installed_readers=installed_readers)
@@ -328,8 +333,12 @@ def read_committed_internal_life_prepared_v1(db, *, namespace, issuer, job_id):
     from .domain_production_originals_v1 import _receipt_wire, read_adopted_domain_operation_v1
     prepared=read_internal_life_prepared_v1(db,namespace=namespace,issuer=issuer,job_id=job_id)
     if prepared is None: raise ValueError('Life content actual prepared original absent')
-    row=db.execute(f"SELECT payload_json,payload_digest,signature FROM {TABLE} WHERE bot=? AND persona=? AND kind='prepare_commit' AND original_ref=?",
-        (*namespace.as_tuple,job_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    row = _producer_original_point_v3(db, table=TABLE,
+        columns=('payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'), key=(*namespace.as_tuple,'prepare_commit',job_id),
+        legacy_reader=lambda: db.execute(f"SELECT payload_json,payload_digest,signature FROM {TABLE} WHERE bot=? AND persona=? AND kind='prepare_commit' AND original_ref=?",
+            (*namespace.as_tuple,job_id)).fetchone())
     if row is None: raise ValueError('Life content preparation was never durably committed')
     raw=json.loads(row[0]);receipt=_receipt(db,namespace,prepared.prepare_operation_id)
     expected={'schema':'d06.internal-life-content-prepare-commit.v1','prepared_digest':prepared.digest,

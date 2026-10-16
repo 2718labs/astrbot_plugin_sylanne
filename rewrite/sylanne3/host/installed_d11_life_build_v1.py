@@ -62,7 +62,7 @@ def read_installed_d11_life_build_v1(package_root, manifest_digest, *, recipe_id
         build_schema = "d11.artifact-draft-installed-build.v1"
     root = Path(package_root).resolve(strict=True)
     installed = verify_installed_backend_runtime_v1(root, manifest_digest)
-    if not installed.verified or installed.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance"}:
+    if not installed.verified or installed.runtime_scope not in {"formal-alpha1", "backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}:
         raise ValueError("Life requires the actual qualified installed backend package")
     manifest = json.loads((root / "release-manifest.json").read_bytes())
     sources = {}

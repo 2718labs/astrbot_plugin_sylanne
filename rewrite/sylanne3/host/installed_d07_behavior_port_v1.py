@@ -5,6 +5,8 @@ credential-owning execution_reader is installed at host startup and reads the
 real Authority terminal before a graph transaction; it is never a command arg.
 """
 from __future__ import annotations
+from ..runtime.natural_producer_qualification_v1 import _producer_original_point_v3
+from ..runtime.domain_background_read_v3 import background_json_loads_v3,background_inventory_v3
 
 from datetime import datetime, timezone
 import json
@@ -55,9 +57,9 @@ class InstalledD07BehaviorPortV1:
             raise ValueError("D07 current source rights changed")
         atoms = []
         for original in self.frame.snapshot.atoms:
-            row = db.execute("SELECT revision,value,valid FROM graph_atoms "
-                "WHERE token=? AND bot=? AND persona=?", (original.key.token, *ns.as_tuple)).fetchone()
-            atom = GraphAtom(original.key, row[0], json.loads(row[1]), bool(row[2])) if row else GraphAtom(original.key, 0, {}, False)
+            row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token', 'bot', 'persona'),key=(original.key.token, *ns.as_tuple),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms "
+                "WHERE token=? AND bot=? AND persona=?", (original.key.token, *ns.as_tuple)).fetchone())
+            atom = GraphAtom(original.key, row[0], background_json_loads_v3(row[1]), bool(row[2])) if row else GraphAtom(original.key, 0, {}, False)
             if atom != original:
                 raise ValueError("D07 current graph head differs from original frame")
             atoms.append(atom)
@@ -194,6 +196,14 @@ class InstalledD07BehaviorPortV1:
             raise ValueError("simulation requires an active dedicated child budget lease")
         self._original(dedicated_original_ref)
         execution = self._execution(job.result_ref, db, envelope) if job and job.result_ref else None
+        from ..runtime.conditioned_self_operations_v1 import read_simulation_forecast_binding_v1
+        forecast=read_simulation_forecast_binding_v1(db,frame=self.frame,registered=registered,
+            simulation_request_ref=request.simulation_request_ref,execution=execution)
+        if forecast is not None:
+            from ..runtime.d07_current_behavior_v1 import D07SimulationInputsV2
+            return D07SimulationInputsV2(snapshot,registered,canonical_digest(registered),request.trigger_original_ref,
+                budget_ref,dedicated_original_ref,execution,forecast_plan_ref=forecast[0],forecast_plan_digest=forecast[1],
+                forecast_mode='declared_forecast')
         return D07SimulationInputsV1(snapshot, registered, canonical_digest(registered),
             request.trigger_original_ref, budget_ref, dedicated_original_ref, execution)
 
@@ -211,11 +221,11 @@ class InstalledD07BehaviorPortV1:
             key = AtomKey.from_token(ref)
             if key.type_name != "runtime.cost_settlement":
                 raise ValueError("D07 actual computation requires D11 cost settlement originals")
-            row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                (ref, *envelope.authority.namespace.as_tuple)).fetchone()
+            row = _producer_original_point_v3(db,table='graph_atoms',columns=('revision', 'value', 'valid'),key_columns=('token', 'bot', 'persona'),key=(ref, *envelope.authority.namespace.as_tuple),legacy_reader=lambda:db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                (ref, *envelope.authority.namespace.as_tuple)).fetchone())
             if row is None or row[0] < 1 or row[2] != 1:
                 raise ValueError("D07 actual cost settlement is missing")
-            value = json.loads(row[1])
+            value = background_json_loads_v3(row[1])
             next(spec for spec in graph_type_specs() if spec.name == key.type_name).validator(value)
             if value["lease_id"] != execution.parent_budget_ref or value["status"] != "settled":
                 raise ValueError("D07 actual cost settlement is unconfirmed or belongs to another budget")

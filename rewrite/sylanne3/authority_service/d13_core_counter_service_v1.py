@@ -749,7 +749,7 @@ class InstalledD13CoreCounterServiceV1:
             read_d13_counter_cpu_cost_original_v1, read_d13_counter_body_cost_original_v1)
         from ..runtime.jobs import get_job
         from ..runtime.d11_types import job_graph_write
-        from .c04_product_lifecycle_v3 import c04_terminal_proof_from_inspection_v3
+        from ..runtime.c04_product_lifecycle_v3 import c04_terminal_proof_from_inspection_v3
         proof=c04_terminal_proof_from_inspection_v3(inspection)
         if proof is None:
             raise AuthorityUnavailable('counter actual same-chain terminal proof is incomplete')

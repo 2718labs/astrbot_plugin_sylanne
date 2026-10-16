@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -303,7 +304,8 @@ class AuthorityV2OwnerSessionStore:
 
     def accept_login(self, *, transport_credential: object,
                      challenge: OwnerSessionLoginChallengeV1,
-                     signature: bytes, session_ttl_seconds: int = 3600) -> str:
+                     signature: bytes, session_ttl_seconds: int = 3600,
+                     session_expires_no_later_than_utc: str | None = None) -> str:
         if type(challenge) is not OwnerSessionLoginChallengeV1:
             raise TypeError("Owner login challenge is required")
         if type(signature) is not bytes or len(signature) != 64:
@@ -311,9 +313,18 @@ class AuthorityV2OwnerSessionStore:
         if type(session_ttl_seconds) is not int or not 1 <= session_ttl_seconds <= 86400:
             raise ValueError("Owner session TTL must be 1..86400 seconds")
         request = challenge.request
+        cap = (_time(session_expires_no_later_than_utc)
+               if session_expires_no_later_than_utc is not None else None)
         self._core._require(transport_credential, "owner_session", request.authority_namespace)
-        now = self._now()
+        now = self._now() if cap is None else None
         with self._core._tx() as db:
+            effective_ttl = session_ttl_seconds
+            if cap is not None:
+                now = self._now()
+                remaining = math.floor((cap - now).total_seconds())
+                if remaining <= 0:
+                    raise AuthorityUnavailable("Owner session original absolute deadline expired")
+                effective_ttl = min(session_ttl_seconds, 3600, remaining)
             public_key = self._current_key(db, request)
             row = db.execute(
                 "SELECT request_json,principal_epoch,boot_id,issued_at_utc,expires_at_utc,consumed_at_utc "
@@ -338,7 +349,7 @@ class AuthorityV2OwnerSessionStore:
             db.execute("INSERT INTO authority_owner_sessions_v1 VALUES(?,?,?,?,?,?,NULL)",
                        (_verifier(token), _canonical(request), self._principal_epoch(db, request),
                         self._boot_id, _stamp(now),
-                        _stamp(now + timedelta(seconds=session_ttl_seconds))))
+                        _stamp(now + timedelta(seconds=effective_ttl))))
         return token
 
     def require_current_in_tx(self, db: sqlite3.Connection, *, token: str,

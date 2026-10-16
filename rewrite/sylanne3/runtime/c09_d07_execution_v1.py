@@ -21,7 +21,8 @@ STAGE_COLUMNS = ("bot", "persona", "stage_operation_id", "job_id", "phase", "req
 ACCOUNTING_COLUMNS = ("bot", "persona", "call_id", "intent_digest", "attempt_id", "anchor_json", "state", "grant_json", "result_json")
 TIMING_TABLE = "authority_d07_model_timings_v1"
 TIMING_COLUMNS = ("call_id", "admission_id", "request_digest", "binding_digest", "started_at", "ended_at", "terminal_digest")
-BODY_KINDS = frozenset({"prepared", "prepare_commit", "request", "result", "execution", "adopted", "simulation_request", "semantic_question", "reflection_request"})
+BODY_KINDS = frozenset({"prepared", "prepare_commit", "request", "result", "execution", "adopted", "simulation_request", "semantic_question", "reflection_request","reflection_continuation","general_growth_attention_v1"})
+BODY_KINDS = BODY_KINDS | frozenset({'joint_external_semantic_basis_v1'})
 FACT_KINDS = KINDS - BODY_KINDS
 
 
@@ -92,9 +93,22 @@ def validate_d07_original_payload_v1(kind, raw):
         elif raw.get("schema") == "d07.relationship-prepared.v2":
             from .d07_execution_v1 import D07RelationshipPreparedV2
             _fields(raw, (f.name for f in fields(D07RelationshipPreparedV2)), "d07.relationship-prepared.v2")
-            prepared = decode_typed_production_value_v1(raw, D07RelationshipPreparedV2)
+            from .d07_execution_v1 import decode_native_named_d07_value_v2
+            prepared = decode_native_named_d07_value_v2(raw, D07RelationshipPreparedV2)
             thaw_d07_cognition_request_v1(_json(prepared.frozen_json))
             authority_field = "owner_authority_json"
+
+        elif raw.get("schema") == "d07.reflection-prepared.v3":
+            from .d07_execution_v1 import D07ReflectionPreparedV3
+            _fields(raw,(f.name for f in fields(D07ReflectionPreparedV3)),"d07.reflection-prepared.v3")
+            prepared=decode_typed_production_value_v1(raw,D07ReflectionPreparedV3)
+            thaw_d07_cognition_request_v1(_json(prepared.frozen_json))
+            authority_field="owner_authority_json"
+        elif raw.get("schema")=="d07.general-growth-prepared.v1":
+            from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+            _fields(raw,(f.name for f in fields(D07GeneralGrowthPreparedV1)),"d07.general-growth-prepared.v1")
+            prepared=decode_typed_production_value_v1(raw,D07GeneralGrowthPreparedV1)
+            authority_field="owner_authority_json"
         elif raw.get("schema") == "d07.method-growth-prepared.v2":
             from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2, method_growth_value_from_wire_v2
             _fields(raw, (f.name for f in fields(D07MethodGrowthPreparedV2)), "d07.method-growth-prepared.v2")
@@ -133,7 +147,11 @@ def validate_d07_original_payload_v1(kind, raw):
     elif kind == "request":
         from .natural_reply_job_v2 import _request_from_wire
         request = _request_from_wire(canonical_serialize(raw))
-        if request.identity.phase != "d07.cognition" or d07_cognition_messages_v1(request) is None:
+        from ..model_broker.general_growth_cognition_v1 import (TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST,
+            general_growth_cognition_messages_v1)
+        messages=(general_growth_cognition_messages_v1(request)if request.prompt_template_digest==GENERAL_TEMPLATE_DIGEST
+            else d07_cognition_messages_v1(request))
+        if request.identity.phase != "d07.cognition" or messages is None:
             raise ValueError("D07 body request is not the installed exact provider wire")
     elif kind == "call":
         from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
@@ -193,12 +211,28 @@ def validate_d07_original_payload_v1(kind, raw):
         grant = decode_typed_production_value_v1(raw["grant"], BudgetLeaseGrant)
         if not raw["parent_id"] or grant.lease_id != raw["lease_id"] or canonical_digest(grant) != raw["grant_digest"]:
             raise ValueError("D07 preserved simulation child grant original differs")
+    elif kind == "joint_external_semantic_basis_v1":
+        from .joint_external_observation_v1 import JointExternalSemanticBasisV1
+        decode_typed_production_value_v1(raw, JointExternalSemanticBasisV1)
+    elif kind == "reflection_continuation":
+        from .d07_reflection_execution_v1 import D07ReflectionContinuationOriginalV3
+        decode_typed_production_value_v1(raw,D07ReflectionContinuationOriginalV3)
+    elif kind=="general_growth_attention_v1":
+        from .d07_general_growth_attention_v1 import D07GeneralGrowthAttentionOriginalV1
+        _fields(raw,(f.name for f in fields(D07GeneralGrowthAttentionOriginalV1)),"d07.general-growth-attention.v1")
+        decode_typed_production_value_v1(raw,D07GeneralGrowthAttentionOriginalV1)
     elif kind == "semantic_question":
         from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
         from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
-        question_type = (D07MethodGrowthSemanticQuestionV2 if raw.get("schema") == "d07.method-growth-semantic-question.v2" else
+        from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+        question_type = (D07GeneralGrowthQuestionV1 if raw.get("schema")=="d07.general-growth-semantic-question.v1" else
+            D07MethodGrowthSemanticQuestionV2 if raw.get("schema") == "d07.method-growth-semantic-question.v2" else
             D07RelationshipSemanticQuestionV2 if raw.get("schema") == "d07.relationship-semantic-question.v2" else D07SemanticQuestionV1)
-        decode_typed_production_value_v1(raw, question_type)
+        if question_type in (D07SemanticQuestionV1,D07GeneralGrowthQuestionV1):
+            decode_typed_production_value_v1(raw, question_type)
+        else:
+            from .d07_execution_v1 import decode_native_named_d07_value_v2
+            decode_native_named_d07_value_v2(raw,question_type)
     elif kind == "budget_allocation":
         from .issuers import BudgetLeaseGrant
         from .budget import BudgetReceipt
@@ -331,7 +365,8 @@ def validate_d07_stage_attempt_row_v1(columns, row):
         raise ValueError("D07 fixed stage table columns differ")
     raw = dict(zip(columns, row, strict=True))
     NamespaceId(raw["bot"], raw["persona"])
-    if raw["phase"] not in {"acquire", "result_read", "complete", "adopt"}:
+    reflection_prepare=type(raw["phase"]) is str and re.fullmatch(r"reflection_prepare:[0-9a-f]{48}",raw["phase"]) is not None
+    if raw["phase"] not in {"acquire", "result_read", "complete", "adopt"} and not reflection_prepare:
         raise ValueError("D07 unregistered installed stage phase")
     from .restore_anchor import RestoreAnchor
     RestoreAnchor(**_json(raw["anchor_json"]))
@@ -346,6 +381,11 @@ def validate_d07_stage_attempt_row_v1(columns, row):
         allowed = {"status", "job_id", "phase", "reason", "attempt_id", "prepared_digest", "permit_digest", "graph_revision", "graph_epoch"}
         if receipt.get("status") == "held":
             _fields(receipt, allowed)
+        elif reflection_prepare:
+            if set(receipt) not in ({"status","original_ref"},{"status","job_id","original_ref","prepared_digest"}):
+                raise ValueError("reflection preparation receipt hides undeclared content")
+            if receipt["status"] not in {"prepared","waiting_for_fair_concern","waiting_for_original_fair_ticket"}:
+                raise ValueError("reflection preparation receipt has another actual state")
         elif raw["phase"] == "result_read":
             from ..authority_service.d07_current_execution_v1 import D07CognitionResultReadRequestV1, from_wire
             from_wire(receipt, D07CognitionResultReadRequestV1)

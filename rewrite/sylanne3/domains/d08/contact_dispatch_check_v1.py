@@ -239,6 +239,8 @@ def read_contact_dispatch_check_scope_v1(
             raise ValueError("D08 effect is shared by another action")
         if other.target_ref != intent.target_ref:
             continue
+        from ...runtime.contact_continuation_stage_v1 import is_actual_contact_prefix_action_v1
+        if is_actual_contact_prefix_action_v1(db,current_read,intent,other):continue
         complete = tuple(outcome for outcome in facts.action_outcomes
                          if (outcome.action_id, outcome.effect_id,
                              outcome.attempt_id) == (

@@ -35,6 +35,8 @@ from .c09_model_budget_original_v1 import (
 )
 from ..runtime.c09_d07_execution_v1 import TIMING_TABLE as _D07_TIMING_TABLE, validate_d07_schema_v1, validate_d07_timing_row_v1
 from .d10_contact_policy_service_v1 import TABLE as _CONTACT_POLICY_TABLE, DDL as _CONTACT_POLICY_DDL
+from .c09_habit_policy_rows_v1 import TABLES as _HABIT_CORE_TABLES
+from .contact_background_rpc_v1 import TABLE as _CONTACT_BACKGROUND_TABLE
 from .c09_contact_finish_original_v1 import TABLE as _CONTACT_FINISH_TABLE, validate_contact_finish_row_v1
 from .c09_contact_frame_authentication_v1 import (
     TABLE as _CONTACT_FRAME_AUTH_TABLE, validate_contact_frame_authentication_row_v1,
@@ -70,14 +72,18 @@ _KNOWN_CORE_TABLES = frozenset({
     "authority_graph_catalogue_upgrades_v1",
     "authority_dispatch_admission_epoch_v1",
     "authority_execution_handoff_starts_v1",
+    "authority_contact_effect_measurements_v1",
     "authority_execution_handoff_graph_receipts_v1",
     "authority_natural_final_observations_v4",
     "authority_migration_v2_meta", "authority_migration_v2_plans",
     "authority_migration_v2_receipts",
+    "authority_migration_snapshot_certificate_members_v1",
     "authority_model_egress_v1", "authority_model_egress_bindings_v1",
     "authority_model_egress_observations_v1",
     "authority_model_egress_observation_status_v1",
     "authority_model_admissions_v2", "authority_model_original_identity_v2",
+    "authority_model_no_dispatch_witnesses_v1",
+    "authority_owner_goal_cancellations_v1",
     "authority_owner_credentials_v1", "authority_owner_enrollments_v1",
     "authority_owner_proof_challenges_v1",
     "authority_owner_login_challenges_v1", "authority_owner_sessions_v1",
@@ -96,7 +102,7 @@ _KNOWN_CORE_TABLES = frozenset({
     "authority_c09_originals_archive_v1", "authority_c09_deletion_continuations_v1",
     "authority_c09_recovery_bindings_v1", "authority_c09_execution_source_seals_v4",
     "authority_c09_execution_source_pins_v4", "authority_c09_recovery_fact_frames_v4",
-}) | frozenset(_OWNER_PAIRING_SCHEMAS) | frozenset(_INSTALLER_GENESIS_TABLES) | frozenset(_PACKAGE_CORE_SCHEMAS) | {_MODEL_BUDGET_TABLE, _D07_TIMING_TABLE, _CONTACT_POLICY_TABLE, _CONTACT_FINISH_TABLE, _CONTACT_FRAME_AUTH_TABLE, _LIFE_COMPLETED_ARCHIVE_TABLE}
+}) | frozenset(_OWNER_PAIRING_SCHEMAS) | frozenset(_INSTALLER_GENESIS_TABLES) | frozenset(_PACKAGE_CORE_SCHEMAS) | {_MODEL_BUDGET_TABLE, _D07_TIMING_TABLE, _CONTACT_POLICY_TABLE, _CONTACT_BACKGROUND_TABLE, _CONTACT_FINISH_TABLE, _CONTACT_FRAME_AUTH_TABLE, _LIFE_COMPLETED_ARCHIVE_TABLE} | frozenset(_HABIT_CORE_TABLES)
 _KNOWN_DELETION_TABLES = frozenset({
     "deletion_meta", "deletion_events", "authority_deletion_v2_meta",
     "authority_deletion_v2_tail",
@@ -289,6 +295,14 @@ def _build_file(source: sqlite3.Connection, target: Path,
         validate_package_authority_schema_v2(source)
     if "authority_natural_disposition_originals_v1" in observed:
         _require_natural_disposition_original_inventory_v1(source)
+    if "authority_owner_goal_cancellations_v1" in observed:
+        from .owner_goal_cancellation_contract_v1 import (
+            GOAL_CANCEL_DDL_V1, GOAL_CANCEL_TABLE_V1, validate_goal_cancellation_core_row_v1)
+        if source.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (GOAL_CANCEL_TABLE_V1,)).fetchone() != (GOAL_CANCEL_DDL_V1,):
+            raise AuthorityUnavailable("C09 actual Goal cancellation immutable schema differs")
+        for row in _rows(source,GOAL_CANCEL_TABLE_V1):
+            validate_goal_cancellation_core_row_v1(_columns(source,GOAL_CANCEL_TABLE_V1),row)
     if "authority_graph_catalogue_upgrades_v1" in observed:
         from .graph_catalogue_upgrade_v1 import validate_catalogue_upgrade_core_schema_v1
         validate_catalogue_upgrade_core_schema_v1(source)
@@ -314,6 +328,9 @@ def _build_file(source: sqlite3.Connection, target: Path,
             _ADMISSION_DDL, _ORIGINAL_IDENTITY_DDL, _JOB_INDEX_DDL)
         schemas = dict(zip(MODEL_TABLES, (_DDL, _BINDING_DDL, _OBSERVATION_DDL, _OBSERVATION_STATUS_DDL,
             _ADMISSION_DDL, _ORIGINAL_IDENTITY_DDL)))
+        if "authority_model_no_dispatch_witnesses_v1" in observed:
+            from .v2_model_egress_store import MODEL_NO_DISPATCH_WITNESS_DDL_V1
+            schemas["authority_model_no_dispatch_witnesses_v1"] = MODEL_NO_DISPATCH_WITNESS_DDL_V1
         for table, sql in schemas.items():
             if source.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() != (sql,):
                 raise AuthorityUnavailable("C09 exact model Core schema is unavailable")
@@ -321,6 +338,15 @@ def _build_file(source: sqlite3.Connection, target: Path,
             raise AuthorityUnavailable("C09 model once-job index differs")
     if _D07_TIMING_TABLE in observed:
         validate_d07_schema_v1(source)
+    if _CONTACT_BACKGROUND_TABLE in observed:
+        from .contact_background_rpc_v1 import require_background_observation_schema_v1
+        require_background_observation_schema_v1(source)
+    if "authority_contact_effect_measurements_v1" in observed:
+        from ..runtime.c09_contact_effect_accounting_v1 import require_financial_schema_v1
+        require_financial_schema_v1(source, "authority_contact_effect_measurements_v1")
+    if set(_HABIT_CORE_TABLES)&observed:
+        from .c09_habit_policy_rows_v1 import require_habit_core_schema_v1
+        require_habit_core_schema_v1(source)
     if _CONTACT_POLICY_TABLE in observed:
         from .c09_contact_policy_rows_v1 import require_contact_policy_schema_v1
         require_contact_policy_schema_v1(source)
@@ -770,6 +796,19 @@ class _CoreTransform:
                     request.consumer_operation_id, _row_commitment(table, columns, old))
                 changes.append(_change(table, columns, old, "payload_erased_retained_facts"))
             return tuple(output), tuple(changes)
+        if table == _CONTACT_BACKGROUND_TABLE:
+            from .contact_background_rpc_v1 import validate_background_observation_row_v1
+            for row in rows:
+                validate_background_observation_row_v1(columns,row)
+            if rows:
+                raise AuthorityUnavailable('Contact background original disposal remains HOLD')
+            return rows, ()
+        if table == "authority_contact_effect_measurements_v1":
+            from ..runtime.c09_contact_effect_accounting_v1 import validate_measurement_row_v1
+            for row in rows: validate_measurement_row_v1(columns,row)
+            return rows, ()
+        if table in _HABIT_CORE_TABLES:
+            raise AuthorityUnavailable("Habit source-dependent originals require the installed paged C09 row producer")
         if table == _CONTACT_POLICY_TABLE:
             from .c09_contact_policy_rows_v1 import validate_contact_policy_core_row_v1
             for row in rows:
@@ -798,6 +837,12 @@ class _CoreTransform:
                 validate_life_archive_row_v1(columns, row)
             # Minimal retained associations are not anonymous data. No later
             # disposal is implied by recognizing their exact immutable schema.
+            return rows, ()
+        if table == "authority_owner_goal_cancellations_v1":
+            from .owner_goal_cancellation_contract_v1 import validate_goal_cancellation_core_row_v1
+            for row in rows:validate_goal_cancellation_core_row_v1(columns,row)
+            # Durable management barriers remain exact, including after Source erasure.
+            # Their presence does not authorize model data or zero settlement.
             return rows, ()
         if table in MODEL_TABLES:
             from .c09_model_budget_original_v1 import validate_model_core_row_v1

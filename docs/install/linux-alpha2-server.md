@@ -1,10 +1,28 @@
-# alpha2 服务器安装与同包复验
+# Sylanne Alpha2 / Beta1 服务器安装与同包复验
 
 目标是 Linux x86_64/glibc、AstrBot 4.28.2、Python 3.12.3。安装交付是一件可由 AstrBot 本地 ZIP 入口导入的插件包，包含 Python 运行库、已构建的独立 WebUI 和原生 `.so`，不包含虚拟环境、SDK、Rust 工具链、node_modules、工程测试、数据或凭据。服务器安装与实际运行由用户执行；源码编译、归档校验和前端构建分别按各自收据报告。
 
-当前活动源码仍在整合，最终独立快照尚未冻结。已有 candidate41 及其首次失败证据保持原件；不能覆盖该包、把其结果迁移到新包，或提前称新包为 alpha2-final。39 项整体、Contact/C09 FULL、D04 FULL 和生产 Host 独立身份保持各自验收状态。
+Beta1 候选已合入实际产品源码，包括普通 Foreground／OwnerTask、Host Borrowed、独立 Core Model、Host 派发／调用封口／结果归档及 Joint 的完整配方展开。最终工程来源、运行插件和检查范围以同次冻结清单及交付收据为准。已有快照与全部首次失败证据保留；源码接线与本地回归不代替服务器运行、39 项整体、Contact/C09 FULL、D04 FULL 或生产 Host 独立身份验收。
 
-## 安装交付与冻结输入
+## 当前 Beta1 交付合同
+
+当前产品版本为 `3.0.0-beta1`，独立快照模式为 `beta1-candidate`，运行资格范围为 `backend-beta1-server-test`。最终运行插件名为 `astrbot_plugin_sylanne-3.0.0-beta1-linux-x86_64-glibc-beta1-candidate.zip`。它必须仅包含运行组件，完整压缩大小不超过 **16,000,000 字节**；工程测试、准备工厂与取证实现另随同次冻结的工程附件交付，不上传 AstrBot。只有实际生成并核对收据的包才能列为交付件。
+
+Beta1 需绑定当次独立工程源码清单、运行源码清单、manifest 与未变 native 原件。`beta1_source_closure` 与 `beta1_python_compile` 必须依据该清单的真实收据；`beta1_server_acceptance` 保持 `not_run`，不能由构包或旧快照结果自动改成通过。源码冻结后，使用同次 `build_plugin_package.py --beta1-candidate`；不要以历史 Alpha2 模式替代。
+
+隔离导入和完整进程重启的步骤相同，实际加载版本改核 `3.0.0-beta1`。HTTP 与 HTTPS 均可使用完整工作台；保持 Dashboard、Owner、Origin、CSRF、签名和正式安装来源检查。Beta1 的 Numeric 10 个场景与 D13 完整 5 个场景由同次工程附件的固定节点入口及正式 protected Root 准备工厂提供。每个场景使用独立新 Root／setup／数据与收据，预算和绝对期限由原正式模板明确给出；不按场景数增加预算、不复活或延长旧授权。具体实例与 pins 由服务器管理员创建，本机源码交付不能预造实例收据。
+
+下面保留 Alpha2 的安装协议、历史场景和资源要求作为参考。旧版文件名、builder 模式、授权及 PASS 只属于原快照；Beta1 运行时必须采用最终交付的相同版本入口、源码／工程 pins 和 Root 模板。Contact/C09 FULL、D04 FULL、生产 Host 独立身份以及未在 Beta1 新快照执行的其他完整节点，继续逐项记录实际资格。
+
+## Beta1 新安装的显式 Root 范围
+
+服务器管理员先用同次插件内 `scripts/alpha1/install_linux.py --template --template-version 5` 生成请求模板，填入真实安装、模型、预算及 UTC 绝对截止后运行原 `--plan`。v5 新安装的计划会明确列出 `d01.conditioned_self_child.v1`；七个条件 Self 子步骤仍各自核当前 Owner、Source、真实前驱、同次 Graph 版本和独立 Core 完成回执。旧 v2–v4 模板与已有签名 Root 不会因此增加 work kind；旧安装没有该范围时，不能通过改配置字符串使其生效。
+
+v5 模板新增 `habit_runtime: false`。只有管理员为这次新安装明确选择 `true`，安装计划才列出 `habit_subscription_v1` 和真实 SourceNote 执行种类 `d10.life.source_note.v1`，并在新 profile 中生成绑定实际 namespace、installation ID、manifest、Root lease、grant ID/version/完整摘要的 `HabitRuntimePolicyV1`。该值不是签发 standing policy，也不启动 occurrence；每个安排仍须由当前 Owner 正式签发，按实际 Source、cue、取消代际、预算和原期限逐步准入。安装器保持请求中原来的预算、单次上限和截止，不修改旧 grant，也不提供旧授权刷新。
+
+在 `--plan` 输出中核对 `added_work_kinds`、`habit_runtime`、`root_budget_limits` 和 `root_budget_max_ceiling`，再按原新安装流程执行。包体、manifest 和请求 pins 必须属于同一个最终 Beta1 快照；本段只说明已接入源码的安装选项，服务器运行结果仍为 `NOT_RUN`。
+
+## Alpha2 安装交付与冻结输入（历史协议参考）
 
 日常安装只上传 `astrbot_plugin_sylanne-3.0.0-alpha2-linux-x86_64-glibc-alpha2-candidate.zip`。按此包新生成的交付收据核对完整 ZIP SHA256 与包内 `release-manifest.json` SHA256。服务器复验另外使用同次冻结的 `current-source.zip`、`source-manifest.json` 与其外部 SHA256；它们是测试来源，不上传到插件管理器。
 
@@ -243,4 +261,4 @@ rewrite/host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_a06_actual_in
 
 在既有完整 D13／256 槽节点的 fresh fixture 中，同时核对以下实际原件：大于单片容量的 draft 确有多个有序 segment；原 Core PK 指向该 cell，origin 的 namespace／phase／source-location 与原件相符；完整 hash、字节数、segment count/root 和双 EOF 一致；相同操作的 prior 回放读取实际原件而不替换它。取消、失效授权、错误身份、改动 PK／origin／segment、提交失败时应拒绝，provider 与计费变化分别按原节点断言。失败立即保存首次日志、数据库及附属文件；不要循环重跑、改 TTL 或直接修账。这些情况目前没有服务器 PASS。
 
-服务器安装后，手动确认插件真实版本、完整进程重启、`0.0.0.0:2718` 实际监听与宿主映射、HTTPS 证书、Dashboard 登录、Owner 解锁、配置写入/读回、十三项模块许可和两层 enabled 状态，再检查原 logo/GLB、键盘焦点、主题与退出。首次完整 Authority/Host 初始化、普通 SDK 消息、暂停/恢复、冷重启与 C09 原件分别保存；安装或UI可访问不代替这些业务验收。
+服务器安装后，手动确认插件真实版本、完整进程重启、`0.0.0.0:2718` 实际监听与宿主映射、所选 HTTP／HTTPS 协议（选择 HTTPS 时核对实际证书）、Dashboard 登录、Owner 解锁、配置写入/读回、十三项模块许可和两层 enabled 状态，再检查原 logo/GLB、键盘焦点、主题与退出。首次完整 Authority/Host 初始化、普通 SDK 消息、暂停/恢复、冷重启与 C09 原件分别保存；安装或UI可访问不代替这些业务验收。

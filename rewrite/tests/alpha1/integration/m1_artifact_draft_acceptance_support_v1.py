@@ -139,7 +139,11 @@ def load_m1_phase_fixture_installation_v2(setup_file):
     if initial.get("method_measurement_policy") is not None:
         ordinary["method_measurement_policy"] = "_method_measurement_policy_from_payload_v1"
     bundle = profile.AdminInstallationBundle(tls, policy, d11_key, d02_key,
-        **{name: getattr(profile, parser)(initial) for name, parser in ordinary.items()})
+        **{name: getattr(profile, parser)(initial) for name, parser in ordinary.items()},
+        d13_paid_precompression=profile._d13_paid_precompression_from_payload(initial,policy),
+        d04_semantic_drive=profile._d04_semantic_drive_from_payload(initial,policy),
+        d04_joint_numeric=profile._d04_joint_numeric_from_payload(initial,policy),
+        life_d04_before_capture_policy=profile._life_d04_before_capture_policy_from_payload_v1(initial,policy))
     with opened_installed_file_v1(paths["billing_signing_key"], private=True, allowed_gid=os.getegid()) as descriptor:
         key = Ed25519PrivateKey.from_private_bytes(profile._read_fd_bounded(descriptor, 32))
     for name in ("server_certificate", "server_private_key", "administrator_certificate", "administrator_private_key"):
@@ -1455,7 +1459,8 @@ def assert_original_file_witness_v1(root, prepared, terminal):
 
 def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         setup_root, recall_payload, runner_user="ubuntu", relationship_cognition=False, method_measurement=False, method_dependency=False, growth_cognition=False,
-        source_note_initial=False,paired_method_targets=False,completed_life_content=False,sdk_root=None):
+        source_note_initial=False,paired_method_targets=False,completed_life_content=False,sdk_root=None,
+        beta1_node_template=None,beta1_profile_policies=None):
     import ast, hashlib, json, os, pwd, socket, sys, time
     from dataclasses import replace
     from pathlib import Path
@@ -1521,7 +1526,18 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
     assert Path(profile.__file__).resolve().is_relative_to(package)
     manifest_bytes = (package / "release-manifest.json").read_bytes()
     manifest = json.loads(manifest_bytes)
-    assert manifest["backend_qualification"]["runtime_scope"] == "backend-local-alpha2-acceptance"
+    if beta1_node_template is None:
+        assert beta1_profile_policies is None
+        assert manifest["backend_qualification"]["runtime_scope"]=="backend-local-alpha2-acceptance"
+    else:
+        if type(beta1_node_template)is not Beta1ProtectedNodeTemplateV3 or type(beta1_profile_policies)is not dict:
+            raise ValueError("typed Root Beta1 original node template required")
+        if (manifest["package_version"],manifest["build_mode"],manifest["backend_qualification"]["runtime_scope"])!=(
+                "3.0.0-beta1","beta1-candidate","backend-beta1-server-test"):
+            raise ValueError("Root Beta1 setup requires its actual Beta1 manifest scope")
+        if beta1_node_template.setup_root!=root:
+            raise ValueError("original Root node template changed its fresh setup path")
+
     manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
     catalogue = json.loads((package / "resources/catalogue/current.json").read_bytes())
     scheme = json.loads((package / "resources/catalogue/d04-affect-scheme.json").read_bytes())
@@ -1585,7 +1601,9 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         os.chown(path, ordinary.pw_uid, ordinary.pw_gid)
         path.chmod(0o600)
     prepared_at = time.time()
-    valid_until = prepared_at + 3600
+    valid_until=(prepared_at+3600 if beta1_node_template is None else
+        beta1_node_template.original_budget.absolute_valid_until_utc)
+    if valid_until<=prepared_at:raise ValueError("original Root setup deadline already ended; HOLD_PREPARATION")
     namespace = astrbot_namespace("platform-1", "10001", "persona-reply")
     authority_namespace = namespace_ref(namespace)
     installation_id = "installation-reply"
@@ -1730,6 +1748,12 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
     policy["root_grant"].update(grant_id="grant-reply", bot_id=namespace.bot_id, persona_id=namespace.persona_id,
         lease_id=lease_id, max_ceiling={"cpu_ms":100,"thread_cpu_ms":61000,**model_max},
         allowed_work_kinds=list(dict.fromkeys(kinds)), valid_until_utc=valid_until, policy_ref="d11-policy")
+    if beta1_node_template is not None:
+        budget=beta1_node_template.original_budget
+        policy["root_lease"].update(currency=budget.currency,limits=dict(budget.limits))
+        policy["root_grant"].update(currency=budget.currency,max_ceiling=dict(budget.max_ceiling),
+            allowed_work_kinds=list(budget.allowed_work_kinds),valid_until_utc=budget.absolute_valid_until_utc)
+        model_limits=dict(budget.limits);model_max=dict(budget.max_ceiling)
     payload.update(model_workflows=workflows, foreground=plain_v1(initial.foreground),
         artifact_draft=artifact, private_reply_dispatch=plain_v1(initial.private_reply_dispatch),
         provider_billing_policy_v1=plain_v1(initial.provider_billing_policy))
@@ -1793,13 +1817,34 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
     payload["artifact_phase_fixture_observer"] = {
         "schema":"sylanne.artifact-phase-fixture-observer-installation.v1","source_scope":"LOCAL_FIXTURE",
         "observer_id":observer_id,"observer_version":1,"asset_ref":str(observer),"asset_sha256":observer_digest}
+    if beta1_node_template is not None:
+        payload.update(beta1_profile_policies)
+        payload["life_d04_before_capture_policy"]=dict(namespace=plain_v1(namespace),
+            installation_id=installation_id,manifest_digest=manifest_digest,
+            root_operation_id=beta1_node_template.before_root_uuid)if beta1_node_template.fixture_kind=="numeric"else None
+        if payload["life_d04_before_capture_policy"]is None:payload.pop("life_d04_before_capture_policy")
+        # Invoke the original pure installation/policy parsers before any business issuance.
+        installed_policy=profile._policy_from_payload(payload)
+        _validate_beta1_profile_policy_sections_v3(payload,installed_policy)
+        if (installed_policy.root_lease.currency!=budget.currency
+                or dict(installed_policy.root_lease.limits)!=dict(budget.limits)
+                or installed_policy.root_grant.currency!=budget.currency
+                or dict(installed_policy.root_grant.max_ceiling)!=dict(budget.max_ceiling)
+                or installed_policy.root_grant.allowed_work_kinds!=budget.allowed_work_kinds
+                or installed_policy.root_grant.valid_until_utc!=budget.absolute_valid_until_utc
+                or installed_policy.root_grant.grant_id!=beta1_node_template.root_grant_id
+                or installed_policy.root_lease.lease_id!=beta1_node_template.root_lease_id):
+            raise ValueError("post-create actual Root policy changed the original template; HOLD_PREPARATION")
+        if any(canonical_serialize(payload[name])!=canonical_serialize(value)
+                for name,value in beta1_profile_policies.items()):
+            raise ValueError("post-create original Beta1 policy template commitment changed")
     profile_digest = protected(directory/"profile.json",canonical_serialize(payload).encode("utf-8"))
     setup = {"schema":"sylanne.artifact-phase-fixture-setup.v2","profile_id":"reply",
         "profile_root":str(profiles),"package_root":str(package),"data_dir":str(business),
         "authority_store":str(authority_store),"server_certificate":str(directory/"server.pem"),
         "server_private_key":str(directory/"server.key"),"administrator_certificate":str(directory/"second.pem"),
         "administrator_private_key":str(directory/"second.key"),"billing_signing_key":str(billing_key)}
-    if completed_life_content:
+    if completed_life_content or beta1_node_template is not None:
         component_key=root/"c04-component.key"
         protected(component_key,os.urandom(32),mode=0o640)
         setup["schema"]="sylanne.artifact-phase-fixture-setup.v3"
@@ -1838,6 +1883,38 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         setup["c09_installation_assets"]=str(assets_path);setup["c09_sdk_peer_cohort"]=str(cohort_path)
     descriptor = root/"setup.json"
     setup_digest = protected(descriptor,canonical_serialize(setup).encode("utf-8"))
+    if beta1_node_template is not None:
+        # Actual Authority/TLS/key binding validation follows creation; it issues no fixture qualification.
+        with profile._opened_profile(directory,"Linux",signing_key=True) as files:
+            bound_payload=profile._read_profile_json(files["profile.json"])
+            bound_policy=profile._policy_from_payload(bound_payload)
+            sections=_validate_beta1_profile_policy_sections_v3(bound_payload,bound_policy)
+            tls=profile._profile_from_payload("reply",directory,bound_payload,
+                profile._prepared_ssl_context(files,"Linux"))
+            d11_key=profile._checked_signing_key(profile._read_fd_bounded(files["d11-signing.key"],32),"D11")
+            d02_key=profile._checked_signing_key(profile._read_fd_bounded(files["d02-signing.key"],32),"D02")
+        bound_bundle=profile.AdminInstallationBundle(tls,bound_policy,d11_key,d02_key,
+            **sections,ingress_clock=profile._ingress_clock_from_payload(bound_payload),
+            provider_billing_policy_v1=profile._provider_billing_policy_from_payload_v1(bound_payload),
+            method_measurement_policy=profile._method_measurement_policy_from_payload_v1(bound_payload),
+            life_d04_before_capture_policy=profile._life_d04_before_capture_policy_from_payload_v1(bound_payload,bound_policy))
+        if bound_policy!=installed_policy or tls.expected_authority_id!=authority_id:
+            raise ValueError("post-create complete profile changed its actual Authority/Root binding")
+        if any(canonical_serialize(bound_payload[name])!=canonical_serialize(value)
+                for name,value in beta1_profile_policies.items()):
+            raise ValueError("post-create protected profile changed an original policy commitment")
+        from sylanne3.model_broker.artifact_phase_count_v1 import artifact_phase_counter_policy_from_payload_v1
+        bound_counter=artifact_phase_counter_policy_from_payload_v1(bound_payload["artifact_phase_counter"],allow_local_fixture=True)
+        if bound_counter!=counter:raise ValueError("post-create protected counter commitment changed")
+        phase=bound_bundle.artifact_draft.phase_model_workflow
+        if (counter.namespace,counter.installation_id,counter.manifest_digest,counter.profile_id,
+                counter.provider_id,counter.model_id,counter.provider_config_digest,counter.template_version)!=(
+                bound_policy.namespace,bound_policy.installation_id,bound_policy.manifest_digest,tls.profile_id,
+                phase.provider_id,phase.model_id,phase.provider_config_digest,phase.template_version):
+            raise ValueError("post-create counter metadata differs from the actual installed phase")
+        if bound_bundle.provider_billing_policy_v1.provider_ed25519_public_key_hex!=initial.simulated_provider_key.public_key().public_bytes(
+                serialization.Encoding.Raw,serialization.PublicFormat.Raw).hex():
+            raise ValueError("post-create provider billing key differs from the actual protected producer")
     return {"setup_file":str(descriptor),"setup_sha256":setup_digest,"profile_sha256":profile_digest,
         "manifest_sha256":manifest_digest,"namespace":plain_v1(namespace),"authority_id":authority_id,
         "model_limits":model_limits,"model_max_ceiling":model_max,
@@ -1846,3 +1923,282 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         "relationship_cognition_initial_v5":relationship_cognition,
         "relationship_initial_quote":None if not relationship_cognition else dict(sample),
         "ingress_recall_original_quote":dict(c3["quote_ceiling"])}
+
+
+
+@dataclass(frozen=True,slots=True)
+class Beta1OriginalRootBudgetTemplateV3:
+    """Root's original initial policy inputs; this object issues no authority."""
+    currency:str
+    limits:tuple
+    max_ceiling:tuple
+    allowed_work_kinds:tuple
+    absolute_valid_until_utc:float
+
+    def __post_init__(self):
+        import math
+        if (type(self.currency)is not str or not self.currency
+                or type(self.limits)is not tuple or type(self.max_ceiling)is not tuple
+                or type(self.allowed_work_kinds)is not tuple or not self.allowed_work_kinds
+                or len(set(self.allowed_work_kinds))!=len(self.allowed_work_kinds)
+                or any(type(v)is not str or not v for v in self.allowed_work_kinds)
+                or type(self.absolute_valid_until_utc)not in(int,float)
+                or not math.isfinite(self.absolute_valid_until_utc)):
+            raise ValueError("exact original Root budget template required")
+        for values in (self.limits,self.max_ceiling):
+            if (tuple(sorted(values))!=values or len(dict(values))!=len(values)
+                    or any(type(k)is not str or not k or type(v)is not int or v<=0 for k,v in values)):
+                raise ValueError("original Root budget dimensions must be exact positive ordered integers")
+        if any(value>dict(self.limits).get(name,0)for name,value in self.max_ceiling):
+            raise ValueError("original Root quote ceiling exceeds its original total budget")
+
+
+@dataclass(frozen=True,slots=True)
+class Beta1ProtectedNodeTemplateV3:
+    fixture_kind:str
+    node:str
+    scenario:str
+    setup_root:Path
+    before_root_uuid:str
+    original_budget:Beta1OriginalRootBudgetTemplateV3
+    profile_policies:dict
+    namespace:object
+    installation_id:str
+    root_lease_id:str
+    root_grant_id:str
+    root_grant_version:int
+
+    def __post_init__(self):
+        from uuid import UUID
+        from sylanne3.runtime_contracts import NamespaceId
+        if (type(self.namespace)is not NamespaceId
+                or any(type(v)is not str or not v for v in (self.installation_id,self.root_lease_id,self.root_grant_id))
+                or type(self.root_grant_version)is not int or self.root_grant_version!=1
+                or not isinstance(self.setup_root,Path) or not self.setup_root.is_absolute()
+                or type(self.original_budget)is not Beta1OriginalRootBudgetTemplateV3
+                or type(self.profile_policies)is not dict
+                or str(UUID(self.before_root_uuid))!=self.before_root_uuid or UUID(self.before_root_uuid).version!=4):
+            raise ValueError("exact fresh Root node template/path/UUID required")
+
+
+
+@dataclass(frozen=True,slots=True)
+class _Beta1RootGrantTemplateContextV3:
+    grant_id:str
+    version:int
+    allowed_work_kinds:tuple
+    max_ceiling:object
+
+
+@dataclass(frozen=True,slots=True)
+class _Beta1RootLeaseTemplateContextV3:
+    lease_id:str
+    limits:object
+
+
+@dataclass(frozen=True,slots=True)
+class _Beta1PolicyTemplateContextV3:
+    namespace:object
+    installation_id:str
+    root_grant:_Beta1RootGrantTemplateContextV3
+    root_lease:_Beta1RootLeaseTemplateContextV3
+
+def _validate_beta1_original_node_template_v3(template,*,expected,now_utc,suite_root):
+    from sylanne3.host import authority_profile as profile
+    from sylanne3.domains.d01.production_operations_v1 import plain_v1
+    from sylanne3.runtime_contracts import canonical_serialize
+    family,node,scenario=expected
+    if type(template)is not Beta1ProtectedNodeTemplateV3 or (template.fixture_kind,template.node,template.scenario)!=expected:
+        raise ValueError("Root Beta1 node selection differs from the fixed full15 order")
+    if template.original_budget.absolute_valid_until_utc<=now_utc:
+        raise ValueError("original Root absolute deadline is already expired; HOLD_PREPARATION")
+    from sylanne3.host.identity import astrbot_namespace
+    if (template.namespace!=astrbot_namespace("platform-1","10001","persona-reply")
+            or template.installation_id!="installation-reply"or template.root_lease_id!="lease-"+template.namespace.persona_id
+            or template.root_grant_id!="grant-reply"):
+        raise ValueError("original template identity differs from the actual permanent Owner fixture")
+    root=template.setup_root
+    if root.exists():
+        raise ValueError("Root Beta1 setup must be fresh; existing original is preserved")
+    if root.parent!=suite_root:
+        raise ValueError("fixed node setup must be a direct child of the fresh suite")
+    for path in (suite_root.parent,*suite_root.parent.parents):
+        info=path.lstat()
+        if not path.is_dir()or path.is_symlink()or info.st_uid!=0 or info.st_mode&0o022:
+            raise ValueError("fresh Beta1 setup ancestry is not Root protected")
+    allowed={"model_workflows","d04_semantic_drive","d04_joint_numeric","d13_paid_precompression",
+        "d13_wire_policy","d13_wire_counter","foreground","artifact_draft","d06_recall","private_reply_dispatch",
+        "d06_private_reply_source","ingress_encoding","d03_arrival","d03_self_identity_projection",
+        "d04_encoding_baseline","d06_first_ingress_c02","d07_attention"}
+    policies=json.loads(canonical_serialize(template.profile_policies))
+    if not {"model_workflows","foreground","artifact_draft"}<=set(policies)or set(policies)-allowed:
+        raise ValueError("fixed Beta1 policy template has missing workflow or unknown policy sections")
+    workflows=profile._model_workflows_from_payload({"schema":2,**policies})
+    if family=="numeric":
+        if workflows.version<3 or workflows.life_numeric is None:
+            raise ValueError("original Numeric workflow template is missing; HOLD_PREPARATION")
+        if scenario=="numeric-positive"or scenario.startswith("numeric-authorization-"):
+            if any(name not in policies for name in("d04_semantic_drive","d04_joint_numeric")):
+                raise ValueError("original semantic/native policies missing for the fixed Numeric node")
+        if scenario=="numeric-authorization-reservation"and workflows.life_content is None:
+            raise ValueError("original normal Content donor workflow missing; HOLD_PREPARATION")
+        if scenario=="numeric-authorization-lease":
+            if workflows.version<4 or any(getattr(workflows,name,None)is None for name in("natural_generation","natural_review")):
+                raise ValueError("original normal Foreground donor workflows missing; HOLD_PREPARATION")
+    elif "d13_paid_precompression"not in policies:
+        raise ValueError("original paid D13 policy template missing; HOLD_PREPARATION")
+    budget=template.original_budget
+    maximum=dict(budget.max_ceiling);total=dict(budget.limits);kinds=set(budget.allowed_work_kinds)
+    for name,workflow in plain_v1(workflows).items():
+        if name=="version"or workflow is None:continue
+        if type(workflow)is not dict or "work_kind"not in workflow:continue
+        if workflow["work_kind"]not in kinds or any(
+                amount>maximum.get(dimension,0)or amount>total.get(dimension,0)
+                for dimension,amount in workflow["quote_ceiling"].items()):
+            raise ValueError("original Root kind/quote budget does not cover "+name+"; HOLD_PREPARATION")
+    from types import MappingProxyType
+    context=_Beta1PolicyTemplateContextV3(template.namespace,template.installation_id,
+        _Beta1RootGrantTemplateContextV3(template.root_grant_id,template.root_grant_version,
+            budget.allowed_work_kinds,MappingProxyType(maximum)),
+        _Beta1RootLeaseTemplateContextV3(template.root_lease_id,MappingProxyType(total)))
+    # Pure source input validation. Returned values never become installed/qualified or runtime authority.
+    checked_payload={"schema":2,**policies}
+    _validate_beta1_profile_policy_sections_v3(checked_payload,context)
+    return policies
+
+
+def prepare_protected_beta1_fixture_suite_v3(*,installed_root,frozen_rewrite_root,setup_root,
+        sdk_root,recall_payload,runner_user,suite_id,package_archive,package_sha256,manifest_sha256,
+        engineering_inventory_sha256,node_templates,expected_runtime_scope):
+    """SOURCE-only Root entry; execution creates fifteen independent original setups."""
+    import os,stat,time
+    from uuid import UUID
+    from sylanne3.runtime_contracts import canonical_serialize
+    if os.geteuid()!=0 or str(UUID(suite_id))!=suite_id or UUID(suite_id).version!=4:
+        raise ValueError("Root and one fresh fixed Beta1 suite UUID required")
+    package=Path(installed_root).resolve(strict=True)
+    engineering=Path(frozen_rewrite_root).resolve(strict=True)
+    root=Path(setup_root)
+    if not root.is_absolute()or root.exists():
+        raise ValueError("fresh protected full15 suite directory required")
+    manifest_raw=(package/"release-manifest.json").read_bytes()
+    manifest=json.loads(manifest_raw)
+    qualification=manifest["backend_qualification"]
+    if expected_runtime_scope!="backend-beta1-server-test":
+        raise ValueError("only the exact Beta1 setup SOURCE scope is supported")
+    if (hashlib.sha256(manifest_raw).hexdigest()!=manifest_sha256
+            or hashlib.sha256(Path(package_archive).read_bytes()).hexdigest()!=package_sha256
+            or (manifest["package_version"],manifest["build_mode"],qualification["runtime_scope"])!=
+                ("3.0.0-beta1","beta1-candidate","backend-beta1-server-test")):
+        raise ValueError("exact runtime-only Beta1 package/manifest scope required")
+    inventory_path=engineering.parent.parent/"frozen-engineering-inventory.json"
+    inventory=json.loads(inventory_path.read_bytes())
+    inventory_digest=hashlib.sha256(json.dumps(inventory["files"],sort_keys=True,separators=(",",":"),
+        ensure_ascii=True,allow_nan=False).encode()).hexdigest()
+    if inventory["schema"]!="sylanne.engineering-source-inventory.v1"or inventory["sha256"]!=inventory_digest or inventory_digest!=engineering_inventory_sha256:
+        raise ValueError("actual frozen Root engineering source inventory differs")
+    for row in inventory["files"]:
+        path=engineering.parent/row["path"]
+        data=path.read_bytes()
+        if path.is_symlink()or hashlib.sha256(data).hexdigest()!=row["sha256"]or len(data)!=row["bytes"]:
+            raise ValueError("frozen Root engineering source differs before setup")
+    for path in (inventory_path,*inventory_path.parents,root.parent,*root.parent.parents):
+        info=path.lstat()
+        if path.is_symlink()or info.st_uid!=0 or info.st_mode&0o022:
+            raise ValueError("Root full15/inventory ancestry differs")
+    import sys
+    sys.path.append(str(engineering/"host_tests/alpha1"))
+    from c09_root_phase_harness_v3 import _BETA1_NUMERIC_SCENARIOS,_BETA1_D13_SCENARIOS
+    from owned_resource_profile_v1 import FIXTURE_NODES
+    expected=tuple(zip(("numeric",)*10+("d13_full",)*5,
+        (*FIXTURE_NODES["numeric"],*FIXTURE_NODES["d13_full"]),
+        (*_BETA1_NUMERIC_SCENARIOS,*_BETA1_D13_SCENARIOS),strict=True))
+    if type(node_templates)is not tuple or len(node_templates)!=15:
+        raise ValueError("all fifteen original Root node templates required before creating any setup")
+    # Validate the complete input family before creating a single Authority or credential.
+    policies=tuple(_validate_beta1_original_node_template_v3(item,expected=selected,now_utc=time.time(),suite_root=root)
+        for item,selected in zip(node_templates,expected,strict=True))
+    if (len({item.setup_root for item in node_templates})!=15
+            or len({item.before_root_uuid for item in node_templates})!=15
+            or any(item.setup_root.parent!=root for item in node_templates)):
+        raise ValueError("all15 setup roots and original Root UUIDs must be distinct direct children")
+    root.mkdir(mode=0o750);os.chown(root,0,1000);root.chmod(0o750)
+    nodes=[];created=[]
+    for template,policy in zip(node_templates,policies,strict=True):
+        produced=prepare_protected_phase_fixture_v2(installed_root=package,frozen_rewrite_root=engineering,
+            setup_root=template.setup_root,sdk_root=sdk_root,recall_payload=recall_payload,runner_user=runner_user,
+            source_note_initial=template.fixture_kind=="numeric",completed_life_content=template.fixture_kind=="numeric",
+            beta1_node_template=template,beta1_profile_policies=policy)
+        created.append(produced)
+        nodes.append(dict(fixture_kind=template.fixture_kind,node=template.node,scenario=template.scenario,
+            setup_file=produced["setup_file"],setup_sha256=produced["setup_sha256"]))
+    if len({v["setup_file"]for v in nodes})!=15 or len({v["setup_sha256"]for v in nodes})!=15 or len({v["authority_id"]for v in created})!=15:
+        raise ValueError("actual full15 independently created original descriptors are not unique")
+    descriptor=dict(schema="sylanne.beta1.protected-fixture-suite.v3",fixture_kind="beta1_full_15",
+        package_sha256=package_sha256,manifest_sha256=manifest_sha256,nodes=nodes)
+    data=canonical_serialize(descriptor).encode("utf8");path=root/"suite.json"
+    with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o640),"wb")as stream:
+        os.fchown(stream.fileno(),0,1000);os.fchmod(stream.fileno(),0o640)
+        stream.write(data);stream.flush();os.fsync(stream.fileno())
+    return dict(schema="sylanne.beta1.protected-fixture-preparation.v3",suite_id=suite_id,
+        suite_file=str(path),suite_sha256=hashlib.sha256(data).hexdigest(),
+        descriptor_count=15,node_observation_status="NOT_RUN",nodes=nodes,
+        original_root_templates=tuple(dict(node=v.node,before_root_uuid=v.before_root_uuid,
+            original_absolute_valid_until_utc=v.original_budget.absolute_valid_until_utc,
+            original_limits=dict(v.original_budget.limits),original_max_ceiling=dict(v.original_budget.max_ceiling),
+            original_allowed_work_kinds=v.original_budget.allowed_work_kinds)for v in node_templates))
+
+
+def _validate_beta1_profile_policy_sections_v3(payload,context):
+    """Use every original pure parser; return only unregistered configuration values."""
+    from sylanne3.host import authority_profile as profile
+    from sylanne3.model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
+    simple={
+        "model_workflows":profile._model_workflows_from_payload,
+        "d13_wire_counter":profile._d13_wire_counter_from_payload,
+        "d06_recall":profile._d06_recall_from_payload,
+        "private_reply_dispatch":profile._private_reply_dispatch_from_payload,
+        "d06_private_reply_source":profile._d06_private_reply_source_from_payload,
+        "ingress_encoding":profile._ingress_encoding_from_payload,
+        "d03_arrival":profile._d03_arrival_from_payload,
+        "d03_self_identity_projection":profile._d03_projection_from_payload,
+        "d04_encoding_baseline":profile._d04_baseline_from_payload,
+        "d06_first_ingress_c02":profile._d06_c02_from_payload,
+        "d07_attention":profile._d07_attention_from_payload,
+    }
+    bound={
+        "d04_semantic_drive":profile._d04_semantic_drive_from_payload,
+        "d04_joint_numeric":profile._d04_joint_numeric_from_payload,
+        "d13_paid_precompression":profile._d13_paid_precompression_from_payload,
+        "d13_wire_policy":profile._d13_wire_policy_from_payload,
+        "foreground":profile._foreground_for_policy_from_payload_v1,
+        "artifact_draft":profile._artifact_draft_for_policy_from_payload_v1,
+    }
+    values={name:parser(payload)for name,parser in simple.items()if name in payload}
+    values.update({name:parser(payload,context)for name,parser in bound.items()if name in payload})
+    workflows=values["model_workflows"]
+    if values.get("d06_recall")is not None:
+        workflow=workflows.d07_cognition
+        if (type(values.get("foreground"))is not profile.AdminForegroundPolicyV1
+                or type(workflow)is not profile.AdminModelWorkflowV2
+                or(workflow.work_kind,workflow.purpose,workflow.template_version)!=
+                    ("d07.cognition","proposal",RECALL_TEMPLATE_VERSION_V1)):
+            raise ValueError("original recall/foreground/C3 workflow relationship differs")
+    artifact=values.get("artifact_draft")
+    if artifact is not None:
+        phase=artifact.phase_model_workflow
+        if any(amount>context.root_grant.max_ceiling.get(name,0)
+                or amount>context.root_lease.limits.get(name,0)for name,amount in phase.quote_ceiling.items()):
+            raise ValueError("original phase workflow exceeds Root quote/total budget")
+    from sylanne3.model_broker.artifact_phase_count_v1 import FIXTURE_PROVIDER,FIXTURE_MODEL
+    configuration={"id":FIXTURE_PROVIDER,"type":"openai_chat_completion","model":FIXTURE_MODEL}
+    expected_model=(FIXTURE_PROVIDER,FIXTURE_MODEL,canonical_digest(configuration))
+    required=(workflows.encode,workflows.d07_cognition,workflows.artifact_draft,
+        workflows.natural_generation,workflows.natural_review,
+        None if artifact is None else artifact.phase_model_workflow)
+    if values.get("d06_recall")is None or any(workflow is None or
+            (workflow.provider_id,workflow.model_id,workflow.provider_config_digest)!=expected_model
+            for workflow in required):
+        raise ValueError("original protected fixture routing differs from its actual paired model/counter")
+    return values
+
