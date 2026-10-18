@@ -17,6 +17,7 @@ from ...runtime_contracts import (
     VersionedRef,
     schema_hash,
     canonical_serialize,
+    canonical_digest,
 )
 from ..d08.execution import ActionIntent, ActionSchema
 
@@ -315,7 +316,7 @@ class MigrationBatchV2:
 
 
 def _migration_source_qualification_v2(snapshot, namespace, source_refs):
-    """Current metadata eligibility over the supplied fenced owner/source closure."""
+    """Fixed catalogue-maintenance audit eligibility; Owner action is a separate gate."""
     from ...memory_types import SourceRecord, access_key, source_key, validate_access
     from ..d06 import source_correction_head_key
     checked, dependencies, pending = set(), [], list(source_refs)
@@ -344,7 +345,7 @@ def _migration_source_qualification_v2(snapshot, namespace, source_refs):
         if (source.source_id != key.owner.subject or access_atom.value["source_id"] != source.source_id
                 or access_atom.value["status"] != "active"
                 or "owner" not in source.audiences or "owner" not in access_atom.value["audiences"]
-                or "workbench_user_action" not in source.purposes or "workbench_user_action" not in access_atom.value["purposes"]
+                or "audit" not in source.purposes or "audit" not in access_atom.value["purposes"]
                 or correction_atom.revision != 0):
             qualified = False
         pending.extend(source_key(*namespace.as_tuple, parent).token for parent in source.parent_source_ids)

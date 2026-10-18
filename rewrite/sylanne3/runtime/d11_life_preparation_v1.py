@@ -126,10 +126,14 @@ def life_read_digest_v1(row):
 
 
 def life_read_matches_v1(row, actual):
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_digest_v3,background_json_matches_v3
+    from .domain_production_erasure_v1 import _json
     if type(row) is DraftReadCommitmentV1:
-        return (actual is not None and (actual[0], canonical_digest(json.loads(actual[1])), bool(actual[2])) ==
-            (row.revision, row.value_digest, row.valid))
-    return actual == (row.revision, row.value_json, int(row.valid)) or row.revision == 0 and actual is None
+        return (actual is not None and (actual[0],background_json_digest_v3(actual[1],background_json_loads_v3(actual[1])),bool(actual[2])) ==
+            (row.revision,row.value_digest,row.valid))
+    if actual is None:return row.revision==0
+    return (len(actual)==3 and actual[0]==row.revision and actual[2]==int(row.valid)
+        and background_json_matches_v3(actual[1],_json(row.value_json)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,8 +246,9 @@ def _record(db, *, issuer, namespace, kind, ref, operation_id, value):
 
 
 def _read_signed_life_payload_v1(db, *, issuer, namespace, kind, ref):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .natural_producer_qualification_v1 import _producer_original_point_v3
-    row = _producer_original_point_v3(db, table='graph_d11_life_originals_v1', columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'), key_columns=('bot', 'persona', 'kind', 'original_ref'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))((*namespace.as_tuple, kind, ref)), legacy_reader=lambda: db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
+    row = _producer_original_point_v3(db, table='graph_d11_life_originals_v1', columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'), key_columns=('bot', 'persona', 'kind', 'original_ref'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))((*namespace.as_tuple, kind, ref)), legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
         " WHERE bot=? AND persona=? AND kind=? AND original_ref=?", (*namespace.as_tuple, kind, ref)).fetchone())
     if row is None:
         return None
@@ -731,6 +736,7 @@ def record_life_preparation_after_cas_v1(db, *, issuer, preparation, graph_recei
 
 
 def read_current_prepared_life_v1(db, *, binding, issuer, resource_issuer, now_utc, for_execution=True):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if not db.in_transaction or type(binding) not in LIFE_BINDING_TYPES:
         raise ValueError("Life current preparation requires actual pinned SQL")
     p = read_prepared_life_v1(db, binding=binding, issuer=issuer)
@@ -739,12 +745,12 @@ def read_current_prepared_life_v1(db, *, binding, issuer, resource_issuer, now_u
     if for_execution:
         from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
         require_joint_bound_action_gate_v1(db, namespace=binding.namespace, action_ref=p.plan.action_intent.ref, issuer=issuer)
-        metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
-        epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
+        metadata = _artifact_receipt_sql_v1(db,"SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
+        epoch = _artifact_receipt_sql_v1(db,"SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
         if metadata != (p.requirements_json, p.graph_revision) or epoch != (p.graph_epoch,):
             raise ValueError("Life first claim Graph stamp changed")
     for frozen in p.read_rows:
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (frozen.ref,)).fetchone()
+        row = _artifact_receipt_sql_v1(db,"SELECT revision,value,valid FROM graph_atoms WHERE token=?", (frozen.ref,)).fetchone()
         if not life_read_matches_v1(frozen, row):
             from .d10_habit_v1 import require_habit_life_input_own_delta_v1
             if not require_habit_life_input_own_delta_v1(db,prepared=p,frozen=frozen,actual=row,issuer=issuer):
@@ -756,9 +762,15 @@ def read_current_prepared_life_v1(db, *, binding, issuer, resource_issuer, now_u
     _verify_life_current_budget_v1(db,p,issuer,resource_issuer,now_utc,for_execution=for_execution)
     job = get_job(db, binding.job_id)
     _verify_life_running_job_v1(p,job)
-    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone()
-    history = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",(job_graph_write(job).key.token,p.job_projection_revision)).fetchone()
-    if row != (p.job_projection_revision,p.job_projection_json,1) or history != (p.prepare_operation_id,p.job_projection_json,1) or canonical_serialize(job_graph_write(job).value) != p.job_projection_json:
+    row = _artifact_receipt_sql_v1(db,"SELECT revision,value,valid FROM graph_atoms WHERE token=?", (job_graph_write(job).key.token,)).fetchone()
+    history = _artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",(job_graph_write(job).key.token,p.job_projection_revision)).fetchone()
+    from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3
+    projection=background_json_loads_v3(p.job_projection_json)
+    if (row is None or row[0]!=p.job_projection_revision or row[2]!=1
+            or not background_json_matches_v3(row[1],projection)
+            or history is None or (history[0],history[2])!=(p.prepare_operation_id,1)
+            or not background_json_matches_v3(history[1],projection)
+            or canonical_serialize(job_graph_write(job).value)!=p.job_projection_json):
         raise ValueError("Life acquired job is not its actual prepare-CAS member")
     if for_execution and (job.phase, job.lease_holder, job.fence, job.cancel_epoch, job.lease_expires_utc) != (
             "running", binding.job_holder, binding.job_fence, 0, binding.job_lease_expires_utc):

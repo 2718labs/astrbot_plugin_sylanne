@@ -9,6 +9,7 @@ from .model_workflows_v5 import AdminModelWorkflowsV5
 from .model_workflows_v6 import AdminModelWorkflowsV6
 from .model_workflows_v7 import AdminModelWorkflowsV7
 from .model_workflows_v8 import AdminModelWorkflowsV8
+from .model_workflows_v9 import AdminModelWorkflowsV9
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
 from weakref import WeakSet
@@ -359,7 +360,7 @@ class V2FencePort:
                    != grant.installation_id
                 or bundle.installation_policy.manifest_digest
                    != grant.manifest_digest
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)

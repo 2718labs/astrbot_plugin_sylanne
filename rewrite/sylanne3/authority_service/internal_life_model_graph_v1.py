@@ -39,6 +39,7 @@ from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+from ..host.model_workflows_v9 import AdminModelWorkflowsV9
 from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
 from .v2_model_egress_contract import ModelEgressIntentV1
 
@@ -126,7 +127,7 @@ class InstalledInternalLifeModelGraphReaderV1:
     def __init__(self, *, owner_storage, structured_readers, workflows):
         if (type(owner_storage) is not InstalledD12OwnerStorageAdmissionServiceV1
                 or type(structured_readers) is not InstalledD06StructuredExperienceReadersV1
-                or type(workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7, AdminModelWorkflowsV8) or workflows.life_content is None
+                or type(workflows) not in (AdminModelWorkflowsV3,AdminModelWorkflowsV4,AdminModelWorkflowsV5,AdminModelWorkflowsV6,AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9) or workflows.life_content is None
                 or structured_readers.resource_issuer is not structured_readers.issuer.resource_issuer):
             raise TypeError('actual installed Life Owner/original readers and workflow required')
         self.owner_storage, self.readers, self.workflows = owner_storage, structured_readers, workflows

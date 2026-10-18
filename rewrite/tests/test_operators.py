@@ -4,8 +4,8 @@ import unittest
 
 from sylanne3.contracts import Scope
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, Owner
-from sylanne3.operators import OperatorSpec, compile_operators
-from sylanne3.scheduler import BoundedScheduler
+from rewrite.host_tests.legacy_fixture_v1.operators import OperatorSpec, compile_operators
+from rewrite.host_tests.legacy_fixture_v1.scheduler import BoundedScheduler
 
 
 OWNER = Owner("persona", "bot", "persona")

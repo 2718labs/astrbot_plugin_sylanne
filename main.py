@@ -829,6 +829,37 @@ else:
                 await self._prepare_new_post_c02_natural_v2(runtime,installation,item["c02_operation_id"],
                     source_ref=item["source_ref"],new_ingress=True)
 
+        async def _continue_artifact_completion_receipt_v1(self,runtime,installation,artifact,*,c02_operation_id,source_ref):
+            if artifact.get('status') not in {'artifact_method_settled','artifact_method_settlement_history'}:
+                logger.info('Sylanne Artifact original remains HOLD: %s',artifact.get('status'))
+                return
+            history=await runtime._worker.call(lambda graph:graph.read_current_completed_artifact_method_v2(
+                runtime._v2_bootstrap,installation.admin_bundle,c02_operation_id=c02_operation_id,source_ref=source_ref))
+            if history is not None and history['history_state']=='partial':
+                await self._arm_registered_artifact_task_wait_v1(runtime,installation,c02_operation_id,
+                    parent_task=asyncio.current_task())
+                logger.info('Sylanne Artifact actual partial milestone awaits its registered continuation; completion receipt HOLD')
+                return
+            outcome=await runtime.run_installed_artifact_completion_receipt_v1(installation,
+                c02_operation_id=c02_operation_id,source_ref=source_ref,context=self.context,
+                server=self._final_handoff_server,listener=self._final_handoff_listener,candidates=self._scene_candidates)
+            logger.info('Sylanne Artifact receipt original: %s; %s',outcome.status,outcome.reason)
+
+        async def _restore_pending_artifact_receipts_v1(self):
+            runtime,installation=self._runtime,self._v2_installation
+            if (runtime is None or installation is None or installation.admin_bundle.artifact_phase_observer is None
+                    or not self._natural_reply_ready_v2(runtime,installation)):
+                return
+            cursor=None
+            while not self._encoding_stopping:
+                page=await runtime._worker.call(lambda graph:graph.discover_pending_artifact_receipt_cycles_v1(
+                    runtime._v2_bootstrap,installation.admin_bundle,after_job_id=cursor,limit=32))
+                for item in page['items']:
+                    await self._prepare_new_post_c02_natural_v2(runtime,installation,item['c02_operation_id'],source_ref=item['source_ref'])
+                cursor=page['next_after']
+                if cursor is None:return
+                await asyncio.sleep(0)
+
         async def _prepare_new_post_c02_natural_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             c02_operation_id: str, *, source_ref: str | None = None,
@@ -888,6 +919,10 @@ else:
                 if foreground.get("mode") == "draft":
                     artifact = await runtime.run_post_c02_artifact_draft_v1(installation,
                         c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=True)
+                    if installation.admin_bundle.artifact_phase_observer is not None:
+                        await self._continue_artifact_completion_receipt_v1(runtime,installation,artifact,
+                            c02_operation_id=c02_operation_id,source_ref=source_ref)
+                        return
                     if artifact.get("status")=="artifact_completed_verified":
                         await self._arm_registered_artifact_task_wait_v1(runtime,installation,c02_operation_id,
                             parent_task=asyncio.current_task())
@@ -917,11 +952,17 @@ else:
                             if mode["mode"] == "draft":
                                 artifact = await runtime.run_post_c02_artifact_draft_v1(installation,
                                     c02_operation_id=c02_operation_id, source_ref=source_ref)
+                                if installation.admin_bundle.artifact_phase_observer is not None:
+                                    await self._continue_artifact_completion_receipt_v1(runtime,installation,artifact,
+                                        c02_operation_id=c02_operation_id,source_ref=source_ref)
+                                    return
                                 logger.info("Sylanne 3 artifact original resume: %s", artifact.get("status"))
                         except asyncio.CancelledError:
                             raise
                         except Exception:
                             logger.exception("Sylanne 3 artifact original resume remains pending")
+                            if installation.admin_bundle.artifact_phase_observer is not None:
+                                return
                 saved = await runtime.read_installed_natural_stage_preparation_v2(
                     c02_operation_id, "generation")
                 if type(saved) is SavedNaturalPreparationV2:
@@ -1566,6 +1607,7 @@ else:
                 await self._restore_original_ingress_recalls_v1()
             if not self._encoding_stopping:
                 await self._restore_registered_artifact_task_waits_v1()
+                await self._restore_pending_artifact_receipts_v1()
             if not self._encoding_stopping:
                 await self._restore_owner_source_note_tasks_v1()
             if not self._encoding_stopping:

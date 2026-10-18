@@ -371,3 +371,133 @@ class FiniteSdkM1ModelFixtureV1:
         if self._crossday:self.calls[-1]=record
         else:self.calls.append(record)
         return httpx.Response(200, json=response, request=request)
+
+
+class ArtifactV3MockModelFixtureV1(FiniteSdkM1ModelFixtureV1):
+    """Actual MockTransport responses for one fresh V9 episode; no runtime authority."""
+    def __init__(self, config):
+        if __package__:
+            from .artifact_phase_counter_fixture_v1 import MOCK_V3_PROVIDER, MOCK_V3_MODEL
+        else:
+            from artifact_phase_counter_fixture_v1 import MOCK_V3_PROVIDER, MOCK_V3_MODEL
+        fields = {"schema", "provider_id", "model_id", "provider_config_digest", "billing_private_key_hex",
+            "filename", "max_episode_calls", "max_auxiliary_calls", "max_total_calls", "episodes",
+            "sample_text", "full_text", "unknown_observation"}
+        if (type(config) is not dict or set(config) != fields
+                or config["schema"] != "sylanne.sdk-artifact-v3-mock-model.v1"
+                or (config["provider_id"], config["model_id"]) != (MOCK_V3_PROVIDER, MOCK_V3_MODEL)
+                or (config["max_episode_calls"], config["max_auxiliary_calls"], config["max_total_calls"]) != (6, 0, 6)
+                or len(config["episodes"]) != 1 or type(config["unknown_observation"]) is not bool):
+            raise ValueError("explicit one-episode Artifact V3 Mock model contract required")
+        self._config = config
+        self._key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(config["billing_private_key_hex"]))
+        self._source_episodes = {}
+        self._ordinary = self._crossday = self._d13_256 = self._d13_v7 = False
+        self.calls = []
+        self.first_failure = None
+        self._expected = ("encode", "appraisal", "tone_sample", "observe:sample_check", "full", "observe:check")
+
+    def _candidate(self, messages, bundle):
+        data = json.loads(messages[-1]["content"])
+        episode = self._config["episodes"][0]
+        if data["schema"] == encoding._DEPENDENCY_INPUT_SCHEMA:
+            text = data["source"]["text"]
+            if text != episode["task_text"]:
+                raise ValueError("Mock C1 did not receive its actual frozen task")
+            support = [{"start": 0, "end": len(text)}]
+            conditions = (("structure_explicit", "true"), ("materials_complete", "true"), ("long_draft", "true"),
+                ("short_draft", "false"), ("tone_multiple_legal_readings", "true"),
+                ("local_sample_permitted", "true"), ("immediate_full_draft", "false"))
+            return 0, "encode", {"schema": encoding._DEPENDENCY_OUTPUT_SCHEMA, "event_summary": text,
+                "quoted_details": [{"quote": text, "salience": 1.0}], "possible_meanings": [], "possible_feelings": [],
+                "task_intent": {"kind": "draft_then_corrected_revision", "filename": self._config["filename"], "source_quote": text},
+                "method_context_candidate": {"intent_kind": "draft_then_corrected_revision", "task_source_quote": text,
+                    "conditions": [{"condition_id": name, "proposed_value": value, "support_spans": support,
+                        "counter_spans": [], "meaningful_unknowns": []} for name, value in conditions]},
+                "historical_dependency_candidate": {"intent_kind": "draft_then_corrected_revision", "task_source_quote": text,
+                    "mode": "current_task_only", "support_spans": support, "counter_spans": [], "meaningful_unknowns": []}}
+        if data["schema"] == appraisal.INPUT_SCHEMA:
+            return super()._candidate(messages, bundle)
+        if data["schema"] == artifact.INPUT_SCHEMA_V2:
+            frozen = data["input"]
+            phase = frozen["selector"]["phase_kind"]
+            if phase not in {"tone_sample", "full"} or frozen["target"]["filename"] != self._config["filename"]:
+                raise ValueError("Mock C4 changed actual installed phase/filename")
+            return 0, phase, {"schema": artifact.OUTPUT_SCHEMA_V2, "input_digest": data["input_digest"],
+                "draft_text": self._config["sample_text"] if phase == "tone_sample" else self._config["full_text"],
+                "source_refs": [s["ref"] for s in frozen["sources"]], "needs_clarification": False, "gaps": []}
+        if data["schema"] == cognition.INPUT_SCHEMA:
+            if not data["question_key"].startswith("artifact.phase.observation:") or data["work_kind"] != "concern":
+                raise ValueError("Mock C3 is not the actual independent Artifact question")
+            target = json.loads(data["target_original_json"])
+            target_text = target.get("text")
+            phase = "sample_check" if target_text == self._config["sample_text"] else "check" if target_text == self._config["full_text"] else None
+            if phase is None:
+                raise ValueError("Mock independent observation lacks actual generated target content")
+            unknown = self._config["unknown_observation"]
+            refs = [s["source_ref"]["ref"] for s in data["sources"]]
+            return 0, "observe:" + phase, {"schema": cognition.OUTPUT_SCHEMA,
+                "input_digest": data["input_digest"], "question_key": data["question_key"], "work_kind": "concern",
+                "resolved_slots": [], "discriminating_refs": [], "predictions": [],
+                "findings": [{"proposition": "condition_satisfied", "source_refs": refs,
+                    "qualification": "unknown" if unknown else "subjective",
+                    "stance": "suspend" if unknown else "support", "subjective_conviction": 0.0 if unknown else 0.5,
+                    "evidence_status": "insufficient" if unknown else "supported"}],
+                "unknowns": ["Mock observer deliberately cannot determine this condition"] if unknown else [],
+                "stop_reason": "wait_for_new_information" if unknown else "bounded_segment_complete"}
+        raise ValueError("Artifact V3 Mock rejects C5/C6, recall and every unregistered call")
+
+    def respond(self, request, *, installed_bundle):
+        if __package__:
+            from .artifact_phase_counter_fixture_v1 import mock_v3_input_tokens
+        else:
+            from artifact_phase_counter_fixture_v1 import mock_v3_input_tokens
+        from sylanne3.host.model_workflows_v9 import AdminModelWorkflowsV9
+        if self.first_failure is not None:
+            raise RuntimeError("first Mock failure retained; automatic replay prohibited")
+        try:
+            if type(installed_bundle) is not AdminInstallationBundle or type(installed_bundle.model_workflows) is not AdminModelWorkflowsV9:
+                raise ValueError("Mock provider requires the real installed V9 bundle")
+            policy = installed_bundle.provider_billing_policy_v1
+            public = self._key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+            if (policy is None or policy.evidence_kind != "fixture_simulated_charge"
+                    or policy.provider_ed25519_public_key_hex != public
+                    or (policy.provider_id, policy.model_id, policy.provider_config_digest) !=
+                       (self._config["provider_id"], self._config["model_id"], self._config["provider_config_digest"])):
+                raise ValueError("Mock billing identity is not the explicit installed test contract")
+            raw = json.loads(request.content)
+            metadata = raw["metadata"]
+            if (raw["model"] != policy.model_id or metadata["sylanne_billing_contract"] != policy.contract_digest
+                    or any(c["call_id"] == metadata["sylanne_call_id"] for c in self.calls)):
+                raise ValueError("Mock actual request/billing identity changed or replayed")
+            _, phase, output = self._candidate(raw["messages"], installed_bundle)
+            if len(self.calls) >= 6 or phase != self._expected[len(self.calls)]:
+                raise ValueError("Mock episode exceeded or changed its exact C1C2+2C4+2C3 sequence")
+            content = canonical_serialize(output)
+            prompt_tokens = mock_v3_input_tokens(raw["messages"])
+            completion_tokens = max(1, (len(content.encode()) + 7) // 8)
+            if completion_tokens > raw["max_completion_tokens"]:
+                raise ValueError("Mock output exceeds the actual original quote")
+            call_ref = "mock-artifact-v3:" + canonical_digest(metadata)[:40]
+            bill = ProviderBillingReceiptV1(policy.contract_digest, "fixture_simulated_charge",
+                policy.installation_id, policy.manifest_digest, policy.provider_id, policy.model_id,
+                policy.provider_config_digest, metadata["sylanne_call_id"], metadata["sylanne_request_digest"],
+                call_ref, call_ref + ":zero-charge", prompt_tokens, completion_tokens, 0, 0, "0"*128)
+            bill = replace(bill, signature_hex=self._key.sign(provider_billing_receipt_signing_bytes_v1(bill)).hex())
+            if phase == "encode":
+                src = json.loads(raw["messages"][-1]["content"])["source"]
+                self._source_episodes[source_key(*installed_bundle.installation_policy.namespace.as_tuple, src["source_id"]).token] = 0
+            self.calls.append({"call_id": bill.call_id, "request_digest": bill.request_digest, "phase": phase,
+                "http_request_sha256": hashlib.sha256(request.content).hexdigest(), "output_digest": canonical_digest(output),
+                "input_tokens": prompt_tokens, "output_tokens": completion_tokens, "fixture_charge_microusd": 0,
+                "installation_id": policy.installation_id, "manifest_digest": policy.manifest_digest})
+            return httpx.Response(200, request=request, json={"id": call_ref, "object": "chat.completion", "created": 0,
+                "model": policy.model_id, "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": content}}],
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens, "prompt_tokens_details": {"cached_tokens": 0}},
+                EXTENSION_KEY: bill.to_wire()})
+        except BaseException as exc:
+            self.first_failure = {"type": type(exc).__name__, "stage": "MockTransport", "call_index": len(self.calls),
+                "http_request_sha256": hashlib.sha256(request.content).hexdigest()}
+            raise

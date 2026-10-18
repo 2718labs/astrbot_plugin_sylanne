@@ -149,6 +149,12 @@ class OwnerReplyControlPageV1:
 
 def _read_owner_reply_control_targets_v1(db, namespace, cursor):
     """Page current work first, using its immutable create commit sequence."""
+    from .model_reply_scope_observation_v3 import model_reply_scope_rows_v3
+    from .owner_stop_reply_metadata_v1 import active_owner_stop_reply_metadata_read_v1
+    owner=active_owner_stop_reply_metadata_read_v1(db)
+    if owner is not None:
+        return model_reply_scope_rows_v3(db,kind="owner_control_targets",parameters=(cursor,),
+            legacy_reader=lambda:None)
     after = None
     if cursor is not None:
         if type(cursor) is not str or not 1 <= len(cursor) <= 256:
@@ -367,7 +373,7 @@ class _ActualReplyCycleScopeV1:
 
 
 class InstalledOwnerStopReplyServiceV1:
-    def __init__(self, *, status_service, control, issuer):
+    def __init__(self, *, status_service, control, issuer, bundle=None):
         if (type(status_service) is not InstalledD12OperationStatusServiceV1
                 or type(control) is not C09StorageControlV1 or type(issuer) is not D11BudgetJobIssuer
                 or getattr(status_service.core, "_c09_storage_reader_v1", None) is not control
@@ -377,6 +383,7 @@ class InstalledOwnerStopReplyServiceV1:
         self.core, self.fences = status_service.core, status_service.fences
         self.namespace, self.namespace_id = status_service.namespace, status_service.namespace_id
         self.installation_id = status_service.installation_id
+        self.bundle = bundle
         self._seal = object()
         self._scopes = {}
 
@@ -404,6 +411,10 @@ class InstalledOwnerStopReplyServiceV1:
         return context, storage, graph
 
     def _metadata(self, request, *, session_request=None):
+        from .owner_stop_reply_metadata_v1 import active_owner_stop_reply_service_metadata_v1
+        prepared=active_owner_stop_reply_service_metadata_v1(self,request=request,session_request=session_request)
+        if prepared is not None:
+            return prepared.metadata_value
         from ..runtime.owner_stop_reply_v1 import read_plan_owner_stop_reply_v1
         from .model_reply_scope_observation_v3 import (
             _active_observation_v3, model_reply_scope_point_v3)
@@ -475,6 +486,12 @@ class InstalledOwnerStopReplyServiceV1:
         return None
 
     def submit_owner_stop_reply_v1(self, *, credential, subject, request, actor, session_token, session_request):
+        with self._prepare_owner_stop_metadata_v1(credential=credential,subject=subject,mode='submit',
+                request=request,actor=actor,session_token=session_token,session_request=session_request):
+            return self._submit_owner_stop_reply_with_metadata_v1(credential=credential,subject=subject,
+                request=request,actor=actor,session_token=session_token,session_request=session_request)
+
+    def _submit_owner_stop_reply_with_metadata_v1(self, *, credential, subject, request, actor, session_token, session_request):
         from .mtls_server import MtlsPeerCredential
         if type(credential) is not MtlsPeerCredential or subject != "mtls:sha256:" + credential.certificate_sha256:
             raise AuthorityUnavailable("StopReply requires its protected actual mTLS caller identity")
@@ -488,7 +505,7 @@ class InstalledOwnerStopReplyServiceV1:
         with self.fences._frozen() as (db, deletion, execution, _):
             current_guard = self._auth(db, actor=actor, session_token=session_token, session_request=session_request)
             anchor = self.fences._current_locked(db, deletion, execution, require_clear=False, require_no_pending=False)
-            context.require_current("business")
+            self._require_metadata_storage_current_v1(context)
             if (current_guard != guard or anchor.activation_generation != generation
                     or tuple(db.execute("SELECT * FROM authority_v2_fences WHERE namespace=? AND state='active'", (self.namespace,))) != active):
                 raise AuthorityUnavailable("StopReply Owner/activation/active original changed during observation")
@@ -537,8 +554,14 @@ class InstalledOwnerStopReplyServiceV1:
             return original
 
     def read_owner_stop_reply_status_v1(self, *, credential, actor, session_token, session_request, original_ref):
+        with self.prepare_owner_stop_status_metadata_v1(credential=credential,actor=actor,
+                session_token=session_token,session_request=session_request,original_ref=original_ref):
+            return self._read_owner_stop_reply_status_with_metadata_v1(credential=credential,actor=actor,
+                session_token=session_token,session_request=session_request,original_ref=original_ref)
+
+    def _read_owner_stop_reply_status_with_metadata_v1(self, *, credential, actor, session_token, session_request, original_ref):
         self.core._require(credential, "d12_operation_status", self.namespace)
-        with self.core._tx() as db:
+        with self.fences._frozen() as (db,_deletion,_execution,_history):
             row = db.execute("SELECT * FROM authority_d12_operation_originals_v1 WHERE authority_namespace=? AND original_ref=?",
                 (self.namespace, original_ref)).fetchone()
             if row is None:
@@ -565,13 +588,17 @@ class InstalledOwnerStopReplyServiceV1:
         return session, guard
 
     def read_owner_stop_reply_projection_v1(self, *, credential, original_ref):
+        with self._prepare_owner_stop_cause_metadata_v1(credential=credential,original_ref=original_ref):
+            return self._read_owner_stop_projection_with_metadata_v1(credential=credential,original_ref=original_ref)
+
+    def _read_owner_stop_projection_with_metadata_v1(self, *, credential, original_ref):
         """Protected Host metadata read; the DTO is not an Owner write lease.
 
         The consumer additionally binds its fixed cancellation witness to a real
         current write fence. No browser bearer is stored or renewed here.
         """
         self.core._require(credential, "d12_operation_status", self.namespace)
-        with self.core._tx() as db:
+        with self.fences._frozen() as (db,_deletion,_execution,_history):
             row = db.execute("SELECT * FROM authority_d12_operation_originals_v1 WHERE authority_namespace=? AND original_ref=?",
                 (self.namespace, original_ref)).fetchone()
             if row is None:
@@ -587,9 +614,9 @@ class InstalledOwnerStopReplyServiceV1:
                 raise AuthorityUnavailable("StopReply projection requires the initial immutable intent")
             session, guard = self._projection_owner_in_tx_v1(db, accepted)
         context, _, metadata, grant, generation = self._metadata(request, session_request=session)
-        with self.core._tx() as db:
+        with self.fences._frozen() as (db,_deletion,_execution,_history):
             again, current_guard = self._projection_owner_in_tx_v1(db, accepted)
-            context.require_current("business")
+            self._require_metadata_storage_current_v1(context)
             if (again != session or current_guard != guard or generation != original.activation_generation
                     or self.core._row(db, self.namespace)[1] != generation
                     or grant != (original.owner_grant_ref, original.owner_grant_revision, original.owner_grant_digest)
@@ -598,6 +625,12 @@ class InstalledOwnerStopReplyServiceV1:
         return request, original
 
     def observe_owner_stop_reply_projection_v1(self, *, credential, subject, permit, original_ref):
+        with self._prepare_owner_stop_cause_metadata_v1(credential=credential,subject=subject,
+                permit=permit,original_ref=original_ref):
+            return self._observe_owner_stop_projection_with_metadata_v1(credential=credential,
+                subject=subject,permit=permit,original_ref=original_ref)
+
+    def _observe_owner_stop_projection_with_metadata_v1(self, *, credential, subject, permit, original_ref):
         """Observe only the fixed metadata projection under a real write fence.
 
         Graph/C09 file observations finish before the final frozen Core section.
@@ -628,40 +661,31 @@ class InstalledOwnerStopReplyServiceV1:
                     or permit.generation != initial.activation_generation):
                 raise AuthorityUnavailable("StopReply projection permit does not bind the exact initial intent")
             session, guard = self._projection_owner_in_tx_v1(db, accepted_row)
-        context, storage, member = self._storage()
-        with closing(sqlite3.connect(Path(storage["graph_path"]).as_uri() + "?mode=ro", uri=True)) as graph:
-            graph.execute("PRAGMA query_only=ON")
-            graph.execute("BEGIN")
-            metadata = read_plan_owner_stop_reply_v1(graph, namespace=self.namespace_id,
-                request=request, issuer=self.issuer)
-            recovery = GraphStore._decode_recovery(graph.execute("SELECT schema,requirements_json,graph_revision "
-                "FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", self.namespace_id.as_tuple).fetchone(), self.namespace_id)
-            if recovery is None or asdict(metadata.identity) != plan["scope"]:
-                raise AuthorityUnavailable("StopReply projection actual selected Graph/create stamp differs")
-            requirements = recovery.requirements
-            anchor = permit.pinned_anchor
-            if ((requirements.authority_id, requirements.authority_namespace, requirements.activation_generation,
-                    requirements.deletion_journal_id, requirements.deletion_seq, requirements.deletion_digest,
-                    requirements.execution_journal_id, requirements.execution_seq, requirements.execution_digest,
-                    requirements.revocation_epoch, requirements.graph_incarnation)
-                    != (anchor.authority_id, anchor.namespace, anchor.activation_generation,
-                        anchor.deletion_journal_id, anchor.deletion_seq, anchor.deletion_digest,
-                        anchor.execution_journal_id, anchor.execution_seq, anchor.execution_digest,
-                        anchor.revocation_epoch, storage["graph_incarnation"])):
-                raise AuthorityUnavailable("StopReply projection Graph requires actual current recovery before a metadata write")
-            grant = self._owner_grant_v1(graph, session)
-            if grant != (initial.owner_grant_ref, initial.owner_grant_revision, initial.owner_grant_digest):
-                raise AuthorityUnavailable("StopReply projection actual current Owner grant changed")
-            versions = [GraphVersion(AtomKey.from_token(grant[0]), grant[1])]
-            for job in metadata.jobs:
-                projection = job_graph_write(job)
-                atom = graph.execute("SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
-                    (*self.namespace_id.as_tuple, projection.key.token)).fetchone()
-                if atom is None or atom[1:] != (canonical_serialize(projection.value), 1):
-                    raise AuthorityUnavailable("StopReply projection actual job SQL/Graph metadata differs")
-                versions.append(GraphVersion(projection.key, atom[0]))
+        from .owner_stop_reply_metadata_v1 import active_owner_stop_reply_service_metadata_v1
+        prepared=active_owner_stop_reply_service_metadata_v1(self,request=request,session_request=session)
+        if prepared is None:
+            raise AuthorityUnavailable("StopReply WRITE observation requires outside-Core metadata EOF")
+        context,storage,metadata,grant,_=prepared.metadata_value
+        member=context.manifest['members']
+        member=next(value for value in member if value['role']=='graph')
+        requirements=prepared.requirements
+        versions=list(prepared.versions)
+        if asdict(metadata.identity)!=plan["scope"]:
+            raise AuthorityUnavailable("StopReply projection changed its actual historical scope")
+        anchor=permit.pinned_anchor
+        if ((requirements.authority_id, requirements.authority_namespace, requirements.activation_generation,
+                requirements.deletion_journal_id, requirements.deletion_seq, requirements.deletion_digest,
+                requirements.execution_journal_id, requirements.execution_seq, requirements.execution_digest,
+                requirements.revocation_epoch, requirements.graph_incarnation)
+                != (anchor.authority_id, anchor.namespace, anchor.activation_generation,
+                    anchor.deletion_journal_id, anchor.deletion_seq, anchor.deletion_digest,
+                    anchor.execution_journal_id, anchor.execution_seq, anchor.execution_digest,
+                    anchor.revocation_epoch, storage["graph_incarnation"])):
+            raise AuthorityUnavailable("StopReply projection Graph requires actual current recovery before a metadata write")
+        if grant!=(initial.owner_grant_ref,initial.owner_grant_revision,initial.owner_grant_digest):
+            raise AuthorityUnavailable("StopReply projection actual current Owner grant changed")
         self.control.verify_member_v1(member, prepared=False)
-        context.require_current("business")
+        self._require_metadata_storage_current_v1(context)
         with self.fences._frozen() as (db, deletion, execution, _):
             actual_anchor = self.fences._current_locked(db, deletion, execution,
                 holder=permit.holder, generation=permit.generation)
@@ -703,20 +727,19 @@ class InstalledOwnerStopReplyServiceV1:
         validate_owner_stop_reply_core_row_v1(source_row)
         plan = json.loads(source_row[7])
         request = owner_stop_reply_request_from_wire_v1(plan["request"])
-        from .v2_owner_session import from_wire
-        source_session = from_wire({"kind": "owner_session_login_request_v1", **json.loads(source_row[5])})
-        _, storage, metadata, _, _ = self._metadata(request, session_request=source_session)
-        if asdict(metadata.identity) != plan["scope"]:
+        from .owner_stop_reply_metadata_v1 import active_owner_stop_reply_service_metadata_v1
+        prepared=active_owner_stop_reply_service_metadata_v1(self,request=request)
+        if prepared is None:
+            raise AuthorityUnavailable("StopReply status must prepare its actual metadata outside Core SQL")
+        _,storage,metadata,_,_=prepared.metadata_value
+        if asdict(metadata.identity)!=plan["scope"]:
             raise AuthorityUnavailable("StopReply status target create identity changed")
-        cycle = metadata.jobs[0]
-        if cycle.cancel_epoch < original.result.effective_version:
+        cycle=metadata.jobs[0]
+        if cycle.cancel_epoch<original.result.effective_version:
             return original
-        from ..runtime.owner_stop_reply_v1 import read_original_owner_stop_reply_projection_v1
-        accepted_row = self._scope_row(db, metadata.identity)
-        accepted = decode_original(json.loads(accepted_row[3]))
-        with closing(sqlite3.connect(Path(storage["graph_path"]).as_uri() + "?mode=ro", uri=True)) as graph:
-            graph.execute("BEGIN")
-            projection_ref = read_original_owner_stop_reply_projection_v1(graph, namespace=self.namespace_id, original=accepted)
+        accepted_row=self._scope_row(db,metadata.identity)
+        accepted=decode_original(json.loads(accepted_row[3]))
+        projection_ref=prepared.projection_ref
         if projection_ref is None:
             return accepted
         confirmed = not metadata.pending_effect_refs and all(job.phase in {"completed", "failed", "cancelled"}
@@ -820,46 +843,149 @@ class InstalledOwnerStopReplyServiceV1:
             raise AuthorityUnavailable("C09 reply retirement actual source tuple differs; HOLD")
         raise AuthorityUnavailable("Owner reply cycle was retired by actual C09; new work is denied")
 
-    def list_owner_reply_controls_v1(self, *, credential, actor, session_token, session_request, cursor=None, subject=None):
-        self.core._require(credential, "d12_operation_status", self.namespace)
-        with self.core._tx() as db:
-            guard = self._auth(db, actor=actor, session_token=session_token, session_request=session_request)
-        context, storage, _ = self._storage()
-        with closing(sqlite3.connect(Path(storage["graph_path"]).as_uri() + "?mode=ro", uri=True)) as graph:
-            graph.execute("BEGIN")
-            self._owner_grant_v1(graph, session_request)
-            targets, next_cursor = _read_owner_reply_control_targets_v1(graph, self.namespace_id, cursor)
-        from ..runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1, foreground_cycle_ids_v1
+    def list_owner_reply_controls_v1(self,*,credential,actor,session_token,session_request,cursor=None,subject=None):
+        from ..runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1,foreground_cycle_ids_v1
         from ..runtime.d11_types import runtime_job_key
         from uuid import uuid4
-        result = []
-        for _, encoded in targets:
-            c02 = foreground_cycle_from_wire_v1(json.loads(encoded)).c02_operation_id
-            activity, job = foreground_cycle_ids_v1(self.namespace_id, c02)
-            request = OwnerStopReplyRequestV1(self.namespace_id, self.installation_id, str(uuid4()),
-                runtime_job_key(*self.namespace_id.as_tuple, activity, job).token, c02, 0)
-            _, _, metadata, _, _ = self._metadata(request, session_request=session_request)
-            with self.core._tx() as db:
-                current = self._auth(db, actor=actor, session_token=session_token, session_request=session_request)
-                if current != guard:
-                    raise AuthorityUnavailable("StopReply Owner changed during metadata listing")
-                row = self._scope_row(db, metadata.identity)
-                original = None if row is None else self.status_service._authenticate_original_row_in_tx(db, row,
-                    actor=actor, token=session_token, request=session_request)
-                if original is not None:
-                    projected = self.read_status_original_in_tx_v1(db, source_row=row, original=original)
-                    original = self.status_service.persist_derived_original_in_tx_v1(db, source_row=row, original=projected)
-            projection=self.natural_disposition_maintenance.project_owner_metadata_v1(credential=credential,subject=subject,parent_original_id=c02)
-            result.append(OwnerReplyControlMetadataV2(self.namespace_id, self.installation_id, request.cycle_job_ref,
-                c02, metadata.expected_cancel_generation, metadata.jobs[0].phase,
-                None if original is None else original.original_ref, None if original is None else original.state,
-                natural_batch=projection.to_wire()))
-        with self.core._tx() as db:
-            current = self._auth(db, actor=actor, session_token=session_token, session_request=session_request)
-            if current != guard:
-                raise AuthorityUnavailable("StopReply Owner changed before metadata disclosure")
-            context.require_current("business")
-        return OwnerReplyControlPageV1(tuple(result), next_cursor)
+        actual_subject=subject or "mtls:sha256:"+credential.certificate_sha256
+        with self._prepare_owner_stop_metadata_v1(credential=credential,subject=actual_subject,
+                mode="list",actor=actor,session_token=session_token,session_request=session_request,cursor=cursor)as page:
+            targets,next_cursor=page.result
+            result=[]
+            for _,encoded in targets:
+                continuation=foreground_cycle_from_wire_v1(encoded if type(encoded)is dict else json.loads(encoded))
+                c02=continuation.c02_operation_id
+                activity,job=foreground_cycle_ids_v1(self.namespace_id,c02)
+                request=OwnerStopReplyRequestV1(self.namespace_id,self.installation_id,str(uuid4()),
+                    runtime_job_key(*self.namespace_id.as_tuple,activity,job).token,c02,0)
+                with self._prepare_owner_stop_metadata_v1(credential=credential,subject=actual_subject,
+                        mode="list_target",request=request,actor=actor,session_token=session_token,
+                        session_request=session_request)as prepared:
+                    context,_,metadata,_,_=prepared.result.metadata_value
+                    with self.fences._frozen()as(db,deletion,execution,_):
+                        self._auth(db,actor=actor,session_token=session_token,session_request=session_request)
+                        self._require_metadata_storage_current_v1(context)
+                        row=self._scope_row(db,metadata.identity)
+                        original=None if row is None else self.status_service._authenticate_original_row_in_tx(
+                            db,row,actor=actor,token=session_token,request=session_request)
+                    if original is not None:
+                        with self.prepare_owner_stop_status_metadata_v1(credential=credential,actor=actor,
+                                session_token=session_token,session_request=session_request,
+                                original_ref=original.original_ref):
+                            with self.fences._frozen()as(db,deletion,execution,_):
+                                current=self.status_service._authenticate_original_row_in_tx(db,row,
+                                    actor=actor,token=session_token,request=session_request)
+                                projected=self.read_status_original_in_tx_v1(db,source_row=row,original=current)
+                                original=self.status_service.persist_derived_original_in_tx_v1(
+                                    db,source_row=row,original=projected)
+                    natural=None
+                    if not prepared.result.artifact_mode:
+                        natural=self.natural_disposition_maintenance.project_owner_metadata_v1(
+                            credential=credential,subject=subject,parent_original_id=c02).to_wire()
+                    result.append(OwnerReplyControlMetadataV2(self.namespace_id,self.installation_id,
+                        request.cycle_job_ref,c02,metadata.expected_cancel_generation,metadata.jobs[0].phase,
+                        None if original is None else original.original_ref,
+                        None if original is None else original.state,natural_batch=natural))
+            page.invocation.require_current_v1(phase="after")
+            return OwnerReplyControlPageV1(tuple(result),next_cursor)
+
+
+    def _prepare_owner_stop_metadata_v1(self,*,credential,subject,mode,request=None,cursor=None,
+            actor=None,session_token=None,session_request=None,source_row=None,accepted_row=None,permit=None):
+        from .owner_stop_reply_metadata_v1 import prepare_owner_stop_reply_metadata_v1
+        def read(db):
+            from .owner_stop_reply_metadata_v1 import (
+                active_owner_stop_reply_metadata_read_v1,OwnerStopReplyMetadataResultV1)
+            from ..runtime.owner_stop_reply_v1 import (
+                read_plan_owner_stop_reply_v1,read_original_owner_stop_reply_projection_v1)
+            from ..runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+            from ..runtime.artifact_receipt_allocation_v3 import (
+                decode_foreground_reply_allocation_v3,ForegroundArtifactReceiptAllocationV3)
+            from .model_reply_scope_observation_v3 import model_reply_scope_point_v3
+            from ..runtime.domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3
+            from ..runtime.d11_types import job_graph_write
+            reader=active_owner_stop_reply_metadata_read_v1(db)
+            if reader is None or reader.invocation.service is not self:
+                raise AuthorityUnavailable("StopReply requires its actual originating Owner Work")
+            if mode=="list":
+                return _read_owner_reply_control_targets_v1(db,self.namespace_id,cursor)
+            metadata=read_plan_owner_stop_reply_v1(db,namespace=self.namespace_id,request=request,issuer=self.issuer)
+            grant=self._owner_grant_v1(db,reader.invocation.session_request)
+            requirements=reader.facts.metadata.requirements
+            versions=[GraphVersion(AtomKey.from_token(grant[0]),grant[1])]
+            for job in metadata.jobs:
+                projection=job_graph_write(job)
+                atom=model_reply_scope_point_v3(db,table='graph_atoms',columns=('revision','value','valid'),
+                    key_columns=('token',),key=(projection.key.token,),legacy_reader=lambda:None)
+                if atom is None or atom[2]!=1 or not background_json_matches_v3(atom[1],projection.value):
+                    raise AuthorityUnavailable("StopReply metadata job differs from its real Graph projection")
+                versions.append(GraphVersion(projection.key,atom[0]))
+            projection_ref=None
+            if accepted_row is not None:
+                original=decode_original(json.loads(accepted_row[3]))
+                projection_ref=read_original_owner_stop_reply_projection_v1(db,namespace=self.namespace_id,original=original)
+            create=read_adopted_domain_operation_v1(db,self.namespace_id,metadata.jobs[0].operation_id)
+            allocation_raw=create['payload']['provenance'].get('reply_allocation')
+            allocation=None if allocation_raw is None else decode_foreground_reply_allocation_v3(allocation_raw)
+            return OwnerStopReplyMetadataResultV1(
+                (reader.invocation.storage_context,reader.invocation.storage,metadata,grant,
+                    requirements.activation_generation),projection_ref,tuple(versions),requirements,
+                type(allocation)is ForegroundArtifactReceiptAllocationV3)
+        return prepare_owner_stop_reply_metadata_v1(self,credential=credential,subject=subject,actor=actor,
+            session_token=session_token,session_request=session_request,mode=mode,request=request,cursor=cursor,
+            source_row=source_row,permit=permit,callback=read)
+
+    def prepare_owner_stop_status_metadata_v1(self,*,credential,actor,session_token,session_request,original_ref):
+        """Prepare before D12/Owner status takes its final frozen Core snapshot."""
+        self.core._require(credential,'d12_operation_status',self.namespace)
+        with self.core._tx()as db:
+            row=db.execute("SELECT * FROM authority_d12_operation_originals_v1 "
+                "WHERE authority_namespace=? AND original_ref=?",(self.namespace,original_ref)).fetchone()
+            if row is None:
+                raise AuthorityUnavailable("exact StopReply status original is absent")
+            validate_owner_stop_reply_core_row_v1(row)
+            self.status_service._authenticate_original_row_in_tx(db,row,actor=actor,
+                token=session_token,request=session_request)
+            plan=json.loads(row[7])
+            request=owner_stop_reply_request_from_wire_v1(plan['request'])
+            accepted=self._scope_row(db,self._identity_from_plan_v1(plan))
+            if accepted is None:
+                raise AuthorityUnavailable("StopReply status lost its accepted original")
+        return self._prepare_owner_stop_metadata_v1(credential=credential,
+            subject="mtls:sha256:"+credential.certificate_sha256,mode='status',request=request,
+            actor=actor,session_token=session_token,session_request=session_request,
+            source_row=row,accepted_row=accepted)
+
+    def _require_metadata_storage_current_v1(self,context):
+        if self.core._db.in_transaction:
+            from .owner_stop_reply_metadata_v1 import _SERVICE_SEAL,active_owner_stop_reply_service_metadata_v1
+            seal=_SERVICE_SEAL.get()
+            if seal is not None and seal.invocation.service is self:
+                active_owner_stop_reply_service_metadata_v1(self,request=seal.invocation.request)
+            self._require_projection_pointer_in_tx_v1(self.core._db,context)
+        else:context.require_current("business")
+
+
+    def _prepare_owner_stop_cause_metadata_v1(self,*,credential,original_ref,permit=None,subject=None):
+        self.core._require(credential,'d12_operation_status',self.namespace)
+        with self.core._tx()as db:
+            row=db.execute("SELECT * FROM authority_d12_operation_originals_v1 "
+                "WHERE authority_namespace=? AND original_ref=?",(self.namespace,original_ref)).fetchone()
+            if row is None:raise AuthorityUnavailable("actual accepted StopReply cause is absent")
+            validate_owner_stop_reply_core_row_v1(row)
+            plan=json.loads(row[7])
+            request=owner_stop_reply_request_from_wire_v1(plan['request'])
+            accepted=self._scope_row(db,self._identity_from_plan_v1(plan))
+            if accepted is None:
+                raise AuthorityUnavailable("StopReply cause lost its immutable initial intent")
+            original=decode_original(json.loads(accepted[3]))
+            if original.state!='cancel_requested':
+                raise AuthorityUnavailable("StopReply metadata requires its accepted initial intent")
+            self._projection_owner_in_tx_v1(db,accepted)
+        return self._prepare_owner_stop_metadata_v1(credential=credential,
+            subject=subject or "mtls:sha256:"+credential.certificate_sha256,
+            mode='cause_read'if permit is None else'projection',
+            request=request,source_row=accepted,accepted_row=accepted,permit=permit)
 
 
 def read_original_parent_reply_stop_v1(core_db, *, actual_cycle_identity):

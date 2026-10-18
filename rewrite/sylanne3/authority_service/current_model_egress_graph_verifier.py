@@ -20,6 +20,7 @@ from pathlib import Path
 import sqlite3
 from typing import Callable
 
+from .contract import AuthorityUnavailable
 from .v2_contract import FencePermitV2, from_wire
 from .v2_model_egress_contract import ModelEgressIntentV1, ModelEgressDraftV1
 from .current_d04_baseline_graph_proof import committed_baseline_current
@@ -154,6 +155,7 @@ class PinnedCurrentModelEgressGraphVerifier:
         from ..host.model_workflows_v6 import AdminModelWorkflowsV6
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+        from ..host.model_workflows_v9 import AdminModelWorkflowsV9
         from ..runtime.d07_execution_v1 import (D07PreparedExecutionV1,D07RelationshipPreparedV2,
             D07IngressRecallPreparedV1,D07ReflectionPreparedV3)
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
@@ -163,20 +165,28 @@ class PinnedCurrentModelEgressGraphVerifier:
         from .contract import AuthorityUnavailable
         bundle=self._artifact_draft_bundle
         if (bundle is None or type(bundle.model_workflows)not in {AdminModelWorkflowsV5,AdminModelWorkflowsV6,
-                AdminModelWorkflowsV7,AdminModelWorkflowsV8}or type(request)is not ModelCallRequest
+                AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}or type(request)is not ModelCallRequest
                 or type(source_material)is not PreparedD07AuthoritySourceMaterialV3):
             raise AuthorityUnavailable("named D07 workflow requires its actual retained qualified Source material")
         work=source_material.work
         if (work.controller.verifier is not self or work.request is not intent or source_material.reader.bundle is not bundle
                 or source_material.reader.model_source_phase!="model_policy"):
             raise AuthorityUnavailable("named D07 policy crossed its actual verifier/intent/installed Source Work")
+        from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         prepared,job,frozen,actual_request,basis=source_material.require_for_observer_v3(work)
         if type(prepared)is D07RelationshipPreparedV2:
             workflow=bundle.model_workflows.d07_relationship_cognition
         elif type(prepared)is D07MethodGrowthPreparedV2 and type(bundle.model_workflows)in{
-                AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8}:
+                AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
             workflow=bundle.model_workflows.growth_cognition
-        elif type(prepared)is D07GeneralGrowthPreparedV1 and type(bundle.model_workflows)is AdminModelWorkflowsV8:
+        elif type(prepared)is D07ArtifactObservationPreparedV3:
+            from ..host.model_workflows_v9 import is_installed_artifact_observation_cognition_slot_v1
+            workflow=bundle.model_workflows.artifact_observation_cognition if type(bundle.model_workflows)is AdminModelWorkflowsV9 else None
+            if not is_installed_artifact_observation_cognition_slot_v1(bundle,workflow):
+                raise AuthorityUnavailable("Artifact observation lost its exact installed V9 workflow slot")
+            if basis.kind!="artifact_observation_self":
+                raise AuthorityUnavailable("Artifact workflow requires its dedicated actual qualified parentage")
+        elif type(prepared)is D07GeneralGrowthPreparedV1 and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9):
             workflow=bundle.model_workflows.general_growth_cognition
         elif type(prepared)in {D07PreparedExecutionV1,D07IngressRecallPreparedV1,D07ReflectionPreparedV3}:
             workflow=bundle.model_workflows.d07_cognition
@@ -212,13 +222,14 @@ class PinnedCurrentModelEgressGraphVerifier:
                     from .model_reply_parentage_v3 import require_d07_parentage_v3
                     relationship_prepared = require_d07_parentage_v3(db,intent=intent,issuer=self._issuer)
                     if relationship_prepared is None or relationship_prepared.schema not in {
-                            "d07.relationship-prepared.v2","d07.method-growth-prepared.v2"}:
+                            "d07.relationship-prepared.v2","d07.method-growth-prepared.v2","d07.artifact-observation-prepared.v3"}:
                         return None
                 else:
                     from ..runtime.d07_execution_v1 import D07RelationshipPreparedV2, read_prepared_d07_execution_v1
                     from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
                     relationship_prepared = read_prepared_d07_execution_v1(db, self._issuer, namespace, intent.job_id)
-                    if type(relationship_prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2}:
+                    from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+                    if type(relationship_prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2,D07ArtifactObservationPreparedV3}:
                         return None
                     if relationship_prepared.call_id != intent.call_id or relationship_prepared.digest != intent.binding_digest:
                         raise AuthorityUnavailable("model barrier Relationship C3 signed identity differs")
@@ -340,7 +351,7 @@ class PinnedCurrentModelEgressGraphVerifier:
                 classified=observation.evaluate_v3(
                     lambda db:require_d07_parentage_v3(db,intent=intent,issuer=self._issuer))
                 if classified is None or classified.schema not in {
-                        "d07.relationship-prepared.v2","d07.method-growth-prepared.v2"}:
+                        "d07.relationship-prepared.v2","d07.method-growth-prepared.v2","d07.artifact-observation-prepared.v3"}:
                     return None
             if not configured:
                 raise AuthorityUnavailable("auxiliary model has no actual installed foreground reply scope")

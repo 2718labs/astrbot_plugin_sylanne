@@ -12,6 +12,7 @@ from dataclasses import asdict,replace
 
 import json,sqlite3
 
+from ..graph_types import AtomKey
 from ..runtime_contracts import canonical_digest,canonical_serialize
 
 from ..model_broker.natural_reply_history_v7 import FrozenNaturalReplyRequestV7,freeze_natural_reply_request_v7,TEMPLATE_DIGEST

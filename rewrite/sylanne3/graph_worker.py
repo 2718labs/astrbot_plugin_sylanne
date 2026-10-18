@@ -20,7 +20,7 @@ _WINDOW_END = object()
 _WORK_ISSUER_V3 = object()
 _RESULT_ISSUER_V3 = object()
 _STORAGE_INVOCATION_V3 = ContextVar("sylanne_graph_storage_invocation_v3", default=None)
-_STORAGE_KINDS_V3 = frozenset({"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3", "current_life_numeric_model_seal_v3", "current_owner_job_cancel_v3", "source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "current_graph_full_read_v3", "d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3", "current_method_learning_read_v3", "current_life_numeric_read_v3", "domain_background_read_v3", "contact_host_stage_read_v3", "contact_cost_metadata_v3", "contact_effect_accounting_v1", "host_beta1_fixture_evidence_read"})
+_STORAGE_KINDS_V3 = frozenset({"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3", "current_life_numeric_model_seal_v3", "current_owner_job_cancel_v3", "source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "current_graph_full_read_v3", "d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3", "current_method_learning_read_v3", "current_life_numeric_read_v3", "domain_background_read_v3", "contact_host_stage_read_v3", "contact_cost_metadata_v3", "contact_effect_accounting_v1"})
 
 
 def _clear_storage_error_frames_v3(error):
@@ -181,9 +181,9 @@ class GraphStorageWorkV3:
             from .runtime.d07_source_dispatch_read_v3 import _D07DispatchHandoffV3,finish_d07_dispatch_handoff_v3
             if type(value)is _D07DispatchHandoffV3:
                 return finish_d07_dispatch_handoff_v3(value,self)
-        storage_payload = self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3","current_life_numeric_model_seal_v3","current_owner_job_cancel_v3","owner_material_source_write_v3","dispatch_inventory_prepare_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "host_beta1_fixture_evidence_read"}
+        storage_payload = self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3","current_life_numeric_model_seal_v3","current_owner_job_cancel_v3","owner_material_source_write_v3","dispatch_inventory_prepare_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3"}
         release_payload = (value.release_payload_v3
-            if self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_paid_write_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "host_beta1_fixture_evidence_read"} and error is None else None)
+            if self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_paid_write_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3"} and error is None else None)
         if storage_payload and error is not None:_clear_storage_error_frames_v3(error)
         try:
             if self.kind == "current_graph_full_read_v3":
@@ -623,143 +623,3 @@ class GraphWorker:
 __all__ = ("GraphWorker", "GraphStorageWorkV3", "GraphStorageStepV3",
     "GraphStorageContinuationRequiredV3", "OwnedGraphStorageResultV3",
     "require_graph_storage_work_admission_v3", "create_graph_storage_work_v3")
-
-
-# A single engineering provider is bound to an actual protected fixture process.
-# Ordinary runtime installations have no registration and cannot activate it.
-from weakref import WeakKeyDictionary as _Beta1ProviderRegistryV3
-_BETA1_ENGINEERING_METADATA_PROVIDERS_V3 = _Beta1ProviderRegistryV3()
-_BETA1_ENGINEERING_METADATA_MODULE_V3 = "beta1_fixture_evidence_read_v3"
-_BETA1_ENGINEERING_METADATA_PATH_V3 = "rewrite/tests/alpha1/integration/beta1_fixture_evidence_read_v3.py"
-
-
-def _beta1_engineering_fixture_components_v3(graph,worker):
-    from .authority_service.contract import AuthorityUnavailable
-    from .host.authority_profile import (require_artifact_phase_fixture_qualification_v1,
-        _require_beta1_fixture_bundle_identity_v3)
-    from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
-    runtime=graph._GraphCoordinator__artifact_draft_model_runtime_v1
-    if type(runtime)is not InstalledArtifactDraftModelRuntimeV1 or type(worker)is not GraphWorker or worker._closed:
-        raise AuthorityUnavailable("protected Beta1 engineering metadata provider is unavailable")
-    qualification=require_artifact_phase_fixture_qualification_v1(runtime.bundle,client_grant=runtime.client_grant)
-    _require_beta1_fixture_bundle_identity_v3(qualification)
-    if (qualification.graph is not graph or qualification.worker is not worker
-            or qualification.model_runtime is not runtime or runtime.worker is not worker):
-        raise AuthorityUnavailable("Beta1 engineering metadata changed actual fixture components")
-    return qualification
-
-
-def _register_beta1_engineering_metadata_provider_v3(graph,worker,*,engineering_root,
-        engineering_inventory_sha256,guard_sha256):
-    import hashlib,importlib,json,os,stat,sys
-    import importlib.util
-    from pathlib import Path
-    from .authority_service.contract import AuthorityUnavailable
-    require_graph_storage_work_admission_v3(graph)
-    qualification=_beta1_engineering_fixture_components_v3(graph,worker)
-    root=Path(engineering_root).resolve(strict=True)
-    if root!=Path(os.environ["SYLANNE_C09_TEST_ROOT"]).resolve(strict=True):
-        raise AuthorityUnavailable("engineering metadata is outside the Root-approved frozen tree")
-    inventory_path=root.parent/"frozen-engineering-inventory.json"
-    origin=root/_BETA1_ENGINEERING_METADATA_PATH_V3
-    guard=sys.modules.get("sitecustomize")
-    guard_path=Path(os.environ["SYLANNE_C09_IMPORT_EVIDENCE"]).resolve(strict=True)/"sitecustomize.py"
-    for target in (inventory_path,origin,guard_path):
-        for entry in (target,*target.parents):
-            info=entry.lstat()
-            if entry.is_symlink()or info.st_uid!=0 or info.st_mode&0o022:
-                raise AuthorityUnavailable("engineering metadata source/guard is not Root protected")
-        if not stat.S_ISREG(target.stat().st_mode):
-            raise AuthorityUnavailable("engineering metadata source/guard is not an actual file")
-    inventory=json.loads(inventory_path.read_bytes())
-    digest=hashlib.sha256(json.dumps(inventory["files"],sort_keys=True,separators=(",",":"),
-        ensure_ascii=True,allow_nan=False).encode()).hexdigest()
-    if (inventory["schema"]!="sylanne.engineering-source-inventory.v1"
-            or inventory["sha256"]!=digest or digest!=engineering_inventory_sha256
-            or digest!=os.environ["SYLANNE_C09_ENGINEERING_INVENTORY_SHA256"]
-            or guard is None or Path(guard.__file__).resolve(strict=True)!=guard_path
-            or hashlib.sha256(guard_path.read_bytes()).hexdigest()!=guard_sha256
-            or guard_sha256!=os.environ["SYLANNE_C09_GUARD_SHA256"]):
-        raise AuthorityUnavailable("Root engineering inventory/loaded guard identity differs")
-    pins=[row for row in inventory["files"]if row["path"]==_BETA1_ENGINEERING_METADATA_PATH_V3]
-    source=origin.read_bytes()
-    if (len(pins)!=1 or pins[0]["sha256"]!=hashlib.sha256(source).hexdigest()
-            or pins[0]["bytes"]!=len(source)):
-        raise AuthorityUnavailable("fixed engineering metadata provider source differs")
-    existing=sys.modules.get(_BETA1_ENGINEERING_METADATA_MODULE_V3)
-    if existing is not None and Path(existing.__file__).resolve(strict=True)!=origin:
-        raise AuthorityUnavailable("fixed engineering provider already loaded from another origin")
-    spec=importlib.util.find_spec(_BETA1_ENGINEERING_METADATA_MODULE_V3)
-    if spec is None or Path(spec.origin).resolve(strict=True)!=origin:
-        raise AuthorityUnavailable("fixed engineering provider import origin differs before loading")
-    module=importlib.import_module(_BETA1_ENGINEERING_METADATA_MODULE_V3)
-    symbols=(module._Beta1FixtureEvidenceReadV3,module.prepare_current_beta1_fixture_evidence_read_v3,
-        module.advance_current_beta1_fixture_evidence_read_v3,module.finish_current_beta1_fixture_evidence_read_v3)
-    if (Path(module.__file__).resolve(strict=True)!=origin
-            or any(symbol.__module__!=_BETA1_ENGINEERING_METADATA_MODULE_V3 for symbol in symbols)
-            or any(Path(symbol.__code__.co_filename).resolve(strict=True)!=origin for symbol in symbols[1:])):
-        raise AuthorityUnavailable("loaded fixed engineering metadata provider identity differs")
-    record=(worker,qualification,module,origin,symbols,tuple(v.__code__ for v in symbols[1:]),digest,guard_sha256)
-    previous=_BETA1_ENGINEERING_METADATA_PROVIDERS_V3.get(graph)
-    if previous is not None and previous!=record:
-        raise AuthorityUnavailable("this Graph already has another engineering metadata provider")
-    _BETA1_ENGINEERING_METADATA_PROVIDERS_V3[graph]=record
-    return None
-
-
-def _require_beta1_engineering_metadata_provider_v3(graph,*,cleanup_only=False):
-    import sys
-    from pathlib import Path
-    from .authority_service.contract import AuthorityUnavailable
-    record=_BETA1_ENGINEERING_METADATA_PROVIDERS_V3.get(graph)
-    if record is None:
-        raise AuthorityUnavailable("Beta1 engineering metadata provider is not registered")
-    worker,qualification,module,origin,symbols,codes,_,_=record
-    if ((not cleanup_only and _beta1_engineering_fixture_components_v3(graph,worker)is not qualification)
-            or sys.modules.get(_BETA1_ENGINEERING_METADATA_MODULE_V3)is not module
-            or Path(module.__file__).resolve(strict=True)!=origin
-            or (module._Beta1FixtureEvidenceReadV3,module.prepare_current_beta1_fixture_evidence_read_v3,
-                module.advance_current_beta1_fixture_evidence_read_v3,module.finish_current_beta1_fixture_evidence_read_v3)!=symbols
-            or tuple(v.__code__ for v in symbols[1:])!=codes):
-        raise AuthorityUnavailable("registered engineering metadata provider identity changed")
-    return module
-
-
-def _unregister_beta1_engineering_metadata_provider_v3(graph,worker):
-    record=_BETA1_ENGINEERING_METADATA_PROVIDERS_V3.get(graph)
-    if record is not None:
-        if record[0]is not worker:
-            raise ValueError("engineering metadata unregister changed its actual worker")
-        _BETA1_ENGINEERING_METADATA_PROVIDERS_V3.pop(graph)
-
-
-def _advance_beta1_engineering_metadata_work_v3(graph,work):
-    from .authority_service.contract import AuthorityUnavailable
-    module=_require_beta1_engineering_metadata_provider_v3(graph)
-    if work.kind!="host_beta1_fixture_evidence_read"or type(work.state)is not module._Beta1FixtureEvidenceReadV3:
-        raise AuthorityUnavailable("unregistered engineering metadata Work type")
-    return module.advance_current_beta1_fixture_evidence_read_v3(graph,work)
-
-
-def _finish_beta1_engineering_metadata_work_v3(graph,work,error):
-    from .authority_service.contract import AuthorityUnavailable
-    def cleanup(original):
-        module=_require_beta1_engineering_metadata_provider_v3(graph,cleanup_only=True)
-        state=work.state
-        if (work.kind!="host_beta1_fixture_evidence_read"or type(state)is not module._Beta1FixtureEvidenceReadV3
-                or state.work is not work or state.graph is not graph or state.operation is not work.operation
-                or module._READERS.get(state)!=state.identity_v3()or state.read_scope is not state.fence.scope):
-            raise AuthorityUnavailable("engineering metadata cleanup changed original Work/fence")
-        return module.finish_current_beta1_fixture_evidence_read_v3(graph,work,original)
-    if error is not None:
-        try:return cleanup(error)
-        except BaseException as failure:
-            raise BaseExceptionGroup("engineering metadata original failure and cleanup failure",[error,failure])
-    try:
-        _require_beta1_engineering_metadata_provider_v3(graph)
-    except BaseException as failure:
-        try:cleanup(failure)
-        except BaseException as cleanup_failure:
-            raise BaseExceptionGroup("engineering metadata final qualification and cleanup failure",[failure,cleanup_failure])
-        raise
-    return cleanup(None)

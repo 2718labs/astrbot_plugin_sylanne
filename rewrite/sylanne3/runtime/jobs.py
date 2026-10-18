@@ -244,6 +244,7 @@ _JOB_SELECT = (
 
 
 def get_job(db, job_id: str) -> PersistentJob:
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     _identifier(job_id, "job_id")
     from .artifact_host_dispatch_source_v3 import read_bound_artifact_host_dispatch_job_v3
     artifact,job=read_bound_artifact_host_dispatch_job_v3(db,job_id)
@@ -291,12 +292,12 @@ def get_job(db, job_id: str) -> PersistentJob:
             columns=('job_id','operation_id','activity_id','effect_id','bot_id','persona_id','snapshot_ref','phase','work_kind',
                 'continuation_json','wake_condition_json','deadline_utc','budget_ref','resource_ref','operator_versions_json',
                 'lease_holder','lease_expires_utc','fence','cancel_epoch','usage_json','result_ref'),
-            key_columns=('job_id',),key=(job_id,),legacy_reader=lambda:db.execute(_JOB_SELECT,(job_id,)).fetchone())
+            key_columns=('job_id',),key=(job_id,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,_JOB_SELECT,(job_id,)).fetchone())
         job=_job_from_row(row)
     from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
     def family(lease_id,columns):
         return model_reply_scope_point_v3(db,table='runtime_budget_leases',columns=columns,
-            key_columns=('lease_id',),key=(lease_id,),legacy_reader=lambda:db.execute(
+            key_columns=('lease_id',),key=(lease_id,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,
                 'SELECT '+','.join(columns)+' FROM runtime_budget_leases WHERE lease_id=?',(lease_id,)).fetchone())
     if job.work_kind == "d11.foreground_cycle.v1" and job.continuation.get("schema") == "d11.owner-source-note-task-continuation.v2":
         root = family(job.budget_ref,('bot_id','persona_id'))

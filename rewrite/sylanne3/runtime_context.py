@@ -9,6 +9,7 @@ from .host.model_workflows_v5 import AdminModelWorkflowsV5
 from .host.model_workflows_v6 import AdminModelWorkflowsV6
 from .host.model_workflows_v7 import AdminModelWorkflowsV7
 from .host.model_workflows_v8 import AdminModelWorkflowsV8
+from .host.model_workflows_v9 import AdminModelWorkflowsV9
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -667,7 +668,7 @@ class RuntimeContext:
                         grant=client_grant, owner_loop=loop)
                     workflows = bundle.model_workflows
                     if (bundle.installation_policy == policy
-                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                             and type(workflows.natural_generation)
                             is AdminModelWorkflowV2
                             and type(workflows.natural_review)
@@ -830,7 +831,7 @@ class RuntimeContext:
                 body_quote_authority = _installed_body_quote_authority_v1(installation)
                 c04_cpu_quote_authority = _installed_c04_cpu_quote_authority_v1(installation)
                 counter_cpu_quote_authority = None
-                if type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
+                if type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
                     from .runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
                     counter_cpu_quote_authority = D13CounterCpuQuotePolicyAuthorityV1(hmac.digest(
                         installation.d11_signing_key,
@@ -864,7 +865,7 @@ class RuntimeContext:
                 workflows = (bundle.model_workflows
                              if type(bundle) is AdminInstallationBundle else None)
                 workflow = (workflows.encode
-                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8) else None)
+                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9) else None)
                 if (type(workflow) is AdminModelWorkflowV2
                         and bundle.installation_policy == policy
                         and bundle.ingress_encoding == installation.ingress_encoding
@@ -979,7 +980,7 @@ class RuntimeContext:
                 from .runtime.contact_effect_accounting_v1 import install_contact_effect_runtime_v1
                 install_contact_effect_runtime_v1(coordinator, bootstrap, bundle, port)
                 if bundle.model_workflows.contact_generation is not None:
-                    if type(bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+                    if type(bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
                         coordinator.install_contact_model_runtime_v2(bootstrap, bundle)
                     else:
                         coordinator.install_contact_model_runtime_v1(bootstrap, bundle)
@@ -990,7 +991,7 @@ class RuntimeContext:
                 selection = self._model_selection_port
                 if (type(selection) is InstalledModelCapabilityPort
                         and type(bundle) is AdminInstallationBundle
-                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                         and selection._installation_bundle is bundle
                         and selection._installed_namespace == policy.namespace
                         and selection._host_loop is natural_owner_loop
@@ -1086,13 +1087,13 @@ class RuntimeContext:
             self._v2_authority_client = natural_authority_client
             self._v2_authority_client_grant = natural_client_grant
             self._v2_authority_loop = natural_owner_loop
-            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                     and (bundle.model_workflows.d07_cognition is not None
-                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                              and bundle.model_workflows.d07_relationship_cognition is not None)
-                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                         or (type(bundle.model_workflows) in (AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                              and bundle.model_workflows.growth_cognition is not None)
-                          or (type(bundle.model_workflows) is AdminModelWorkflowsV8
+                          or (type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                               and bundle.model_workflows.general_growth_cognition is not None))
                     and type(natural_authority_client) is AuthorityClient
                     and natural_owner_loop is asyncio.get_running_loop()):
@@ -1108,7 +1109,7 @@ class RuntimeContext:
                     graph._GraphCoordinator__body_quote_authority = service.body_authority
                     return service
                 self._v2_d07_execution_service = await self._worker.call(install_d07)
-            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                     and bundle.artifact_draft is not None and bundle.foreground is not None
                     and type(natural_authority_client) is AuthorityClient
                     and type(natural_client_grant) is InstallationGrantV2
@@ -2830,7 +2831,7 @@ class RuntimeContext:
         if (type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy != policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or type(bundle.model_workflows.reply) is not AdminModelWorkflowV2):
             return None
         main = bundle.model_workflows.reply
@@ -3420,7 +3421,7 @@ class RuntimeContext:
                 or server.profile.namespace != policy.authority_namespace
                 or server.profile.installation_id != grant.installation_id
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3554,6 +3555,59 @@ class RuntimeContext:
                 if self._artifact_draft_rescan_requested_v1 and not self._artifact_draft_stopping_v1:
                     asyncio.get_running_loop().call_soon(self.resume_pending_artifact_drafts_v1, installation)
         self._artifact_draft_resume_task_v1 = asyncio.create_task(resume())
+
+    async def run_installed_artifact_completion_receipt_v1(self,installation,*,c02_operation_id,source_ref,context,server,listener,candidates):
+        """Continue the message-only Artifact allocation through the real P2 sender."""
+        from .host.artifact_receipt_dispatch_driver_v1 import ArtifactReceiptDispatchDriverV1,InstalledArtifactReceiptContinuationV1
+        from .host.private_reply_dispatch_driver import PrivateReplyDispatchResultV1
+        from .host.installed_dispatch_route import InstalledDispatchRoutePort
+        from .runtime.artifact_completion_receipt_v1 import ArtifactCompletionReceiptOriginalV1
+        if (not self.natural_reply_product_ready_v2(installation,server=server,listener=listener,
+                candidates=candidates,context=context) or installation.admin_bundle.artifact_phase_observer is None):
+            return PrivateReplyDispatchResultV1('hold','actual installed Artifact receipt P2 path unavailable')
+        worker,bootstrap,port=self._worker,self._v2_bootstrap,self._v2_port
+        bundle,policy,grant=installation.admin_bundle,installation.installation_policy,installation.installation_grant
+        source=await worker.call(lambda graph:graph.prepare_current_artifact_completion_source_v1(bootstrap,bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref))
+        if source['status']!='artifact_completion_source_current':
+            return PrivateReplyDispatchResultV1('hold','actual satisfied Artifact completion Source not committed')
+        receipt=source['receipt_original']
+        if type(receipt) is not ArtifactCompletionReceiptOriginalV1:
+            raise TypeError('Artifact dispatch requires its real typed D06 completion original')
+        host_loop=asyncio.get_running_loop()
+        def install_original(graph):
+            anchor=port.current_anchor(namespace=policy.namespace,authority_namespace=policy.authority_namespace)
+            lease,capability=graph.grant(bootstrap,actor=grant.administrator_holder,issuer_domain='d11',
+                namespace=policy.namespace,domains=('d08','d09','d11'),activation_generation=anchor.activation_generation,
+                operation_id=receipt.message_operation_id)
+            try:
+                authority=AuthorityContext(grant.administrator_holder,'d11',capability,policy.namespace,
+                    ('activity',),'expression',('internal',),policy.root_grant.policy_ref,anchor.activation_generation)
+                route=InstalledDispatchRoutePort(context=context,host_loop=host_loop,candidates=candidates,
+                    coordinator=graph,authority=authority,lease=lease,policy=policy,grant=grant)
+                writer=graph.register_dispatch_final_claim_writer_v1(bootstrap,route_port=route,
+                    issuer_id=self._final_claim_writer.issuer_id)
+                return authority,lease,writer
+            except BaseException:
+                graph.release_authority_lease(bootstrap,lease)
+                raise
+        authority,lease,writer=await worker.call(install_original)
+        try:
+            continuation=InstalledArtifactReceiptContinuationV1(worker=worker,authority=authority,lease=lease,
+                local_module_admission=self.local_module_admission,fence_port=port,policy=policy,grant=grant,
+                server=server,claim_writer=writer,context=context,candidates=candidates,
+                clock_policy=bundle.ingress_clock,adapter_ref='astrbot:onebot:call_action')
+            driver=ArtifactReceiptDispatchDriverV1(worker,bootstrap,bundle,continuation)
+            result=await driver.dispatch(c02_operation_id=c02_operation_id,source_ref=source_ref)
+            if result.original is not None and result.status in {'accepted','delivered','observed'}:
+                adoption=await worker.call(lambda graph:graph.record_artifact_receipt_outbound_observation_v1(
+                    bootstrap,policy.namespace,result.original.operation_id))
+                if adoption.get('observation_outcome')=='delivered':
+                    await worker.call(lambda graph:graph.finish_current_artifact_receipt_cycle_v1(bootstrap,bundle,
+                        c02_operation_id=c02_operation_id,source_ref=source_ref))
+            return result
+        finally:
+            await worker.call(lambda graph:graph.release_authority_lease(bootstrap,lease))
 
     async def run_post_c02_artifact_draft_v1(self, installation, *, c02_operation_id, source_ref, fresh_cause_hint=False):
         if self._artifact_draft_stopping_v1:
@@ -3937,7 +3991,7 @@ class RuntimeContext:
                 or type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -4265,7 +4319,7 @@ class RuntimeContext:
         if (type(policy) is not AdminInstallationPolicy
                 or type(grant) is not InstallationGrantV2
                 or type(bundle) is not AdminInstallationBundle
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or type(bundle.model_workflows.natural_review)
                    is not AdminModelWorkflowV2
                 or generation_saved.seal.namespace != policy.namespace

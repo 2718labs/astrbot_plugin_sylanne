@@ -1,7 +1,7 @@
 """Closed artifact-phase count contracts and the shared Chat Completions body.
 
-These values confer no model, source, budget or egress authority. LOCAL_FIXTURE
-is a separate finite model and cannot be selected by a production profile.
+These values confer no model, source, budget or egress authority. Only the
+actual installed provider and its protected counter identity are accepted.
 """
 from __future__ import annotations
 
@@ -20,11 +20,7 @@ SIGNING_DOMAIN = (EVIDENCE_SCHEMA + "\0").encode()
 FIXTURE_PROVIDER = "sylanne.local.phase-counter-fixture.v1"
 FIXTURE_MODEL = "finite-ascii-char-v1"
 FIXTURE_RULE_ID = "sylanne.fixture.ascii-char-chat.two-message.v1"
-FIXTURE_RULE = {"schema": FIXTURE_RULE_ID, "characters": "ASCII U+0009,U+000A,U+000D,U+0020..U+007E",
-    "character_tokens": 1, "message_overhead_tokens": 3, "assistant_priming_tokens": 3,
-    "roles": ["system", "user"], "metadata_is_input": False,
-    "model": FIXTURE_MODEL, "model_revision": "1"}
-FIXTURE_RULE_DIGEST = canonical_digest(FIXTURE_RULE)
+# Historical fixture identity is retained only to reject production impersonation.
 
 
 def _text(value, label):
@@ -74,7 +70,7 @@ class ArtifactPhaseCountPolicyV1:
     schema: str = POLICY_SCHEMA
 
     def __post_init__(self):
-        if (self.schema != POLICY_SCHEMA or self.source_scope not in {"production", "LOCAL_FIXTURE"}
+        if (self.schema != POLICY_SCHEMA or self.source_scope != "production"
                 or type(self.namespace) is not NamespaceId or self.template_version != TEMPLATE_VERSION_V2):
             raise ValueError("closed installed phase counter identity required")
         for name in ("installation_id", "profile_id", "provider_id", "model_id", "model_revision",
@@ -89,11 +85,7 @@ class ArtifactPhaseCountPolicyV1:
         for path in (self.executable, self.tokenizer_path, self.applicability_path):
             if not path.startswith("/") or any(part in {".", ".."} for part in path.split("/")):
                 raise ValueError("phase counter assets require exact installed absolute Linux paths")
-        fixture = (self.provider_id, self.model_id, self.model_revision, self.encoding_rule_id,
-            self.encoding_rule_sha256) == (FIXTURE_PROVIDER, FIXTURE_MODEL, "1", FIXTURE_RULE_ID, FIXTURE_RULE_DIGEST)
-        if self.source_scope == "LOCAL_FIXTURE" and not fixture:
-            raise ValueError("local fixture counter cannot impersonate another model or encoding")
-        if self.source_scope == "production" and (self.provider_id == FIXTURE_PROVIDER
+        if (self.provider_id == FIXTURE_PROVIDER
                 or self.model_id == FIXTURE_MODEL or self.encoding_rule_id == FIXTURE_RULE_ID):
             raise ValueError("production phase counting rejects the finite fixture identity")
 
@@ -102,15 +94,13 @@ class ArtifactPhaseCountPolicyV1:
         return canonical_digest(self)
 
 
-def artifact_phase_counter_policy_from_payload_v1(value, *, allow_local_fixture=False):
+def artifact_phase_counter_policy_from_payload_v1(value):
     """Only the authenticated profile loader may call this parser."""
     if value is None:
         return None
     if type(value) is not dict or set(value) != {f.name for f in fields(ArtifactPhaseCountPolicyV1)}:
         raise ValueError("installed phase counter policy fields differ")
     policy = ArtifactPhaseCountPolicyV1(**{**value, "namespace": NamespaceId(**value["namespace"])})
-    if policy.source_scope == "LOCAL_FIXTURE" and not allow_local_fixture:
-        raise ValueError("production profile cannot enable a LOCAL_FIXTURE phase counter")
     return policy
 
 
@@ -246,7 +236,7 @@ class ArtifactPhaseCountEvidenceV1:
     schema: str = EVIDENCE_SCHEMA
 
     def __post_init__(self):
-        if (self.schema != EVIDENCE_SCHEMA or self.source_scope not in {"production", "LOCAL_FIXTURE"}
+        if (self.schema != EVIDENCE_SCHEMA or self.source_scope != "production"
                 or self.input_kind not in {"prospective", "actual"}
                 or self.token_evidence not in {"exact_model_input", "bounded_model_input"}):
             raise ValueError("phase count evidence scope, kind or model-input proof differs")
@@ -277,11 +267,9 @@ def artifact_phase_count_evidence_from_wire_v1(raw):
     return ArtifactPhaseCountEvidenceV1(**raw)
 
 
-def require_phase_count_request_policy_v1(policy, request, *, allow_local_fixture=False):
+def require_phase_count_request_policy_v1(policy, request):
     if type(policy) is not ArtifactPhaseCountPolicyV1 or type(request) is not ArtifactPhaseCountRequestV1:
         raise TypeError("exact installed phase counter policy and frozen request required")
-    if policy.source_scope == "LOCAL_FIXTURE" and not allow_local_fixture:
-        raise ValueError("production phase counter rejects LOCAL_FIXTURE evidence")
     if (request.policy_digest, request.namespace, request.installation_id, request.manifest_digest,
             request.profile_id, request.provider_id, request.model_id, request.model_revision,
             request.provider_config_digest, request.template_version) != (policy.digest, policy.namespace,
@@ -289,24 +277,6 @@ def require_phase_count_request_policy_v1(policy, request, *, allow_local_fixtur
             policy.model_id, policy.model_revision, policy.provider_config_digest, policy.template_version):
         raise ValueError("phase counter request selected another installed identity")
 
-
-def fixture_model_input_count_v1(policy, request):
-    """Finite ASCII character vocabulary and explicit two-message framing only.
-
-    This is the fixture model's definition, not a proxy for any SDK model.
-    JSON fields/metadata are commitments; only message contents enter the model.
-    """
-    require_phase_count_request_policy_v1(policy, request, allow_local_fixture=True)
-    if policy.source_scope != "LOCAL_FIXTURE":
-        raise ValueError("finite fixture tokenizer cannot count a production model")
-    messages = json.loads(request.provider_request_json)["messages"]
-    count = FIXTURE_RULE["assistant_priming_tokens"]
-    for message in messages:
-        text = message["content"]
-        if any(ord(character) not in (9, 10, 13) and not 32 <= ord(character) <= 126 for character in text):
-            raise ValueError("fixture model input contains a character outside its finite vocabulary")
-        count += len(text) + FIXTURE_RULE["message_overhead_tokens"]
-    return count
 
 def artifact_phase_prospective_provider_request_v1(*, model_id, prospective_input_json, max_output_tokens):
     """Hypothetical quotation material; never an actual adopted model request."""

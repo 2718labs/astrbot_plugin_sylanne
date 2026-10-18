@@ -69,6 +69,8 @@ class InstalledD07ExecutionServiceV1:
         self._reflection_rescan_requested = False
         self._last_reflection_status = None
         self._adapters = {}
+        from weakref import WeakValueDictionary
+        self._job_execution_locks_v3 = WeakValueDictionary()
 
     def wake_committed_job_v1(self, job_id):
         """Wake only a durable operation; scheduling carries no execution authority."""
@@ -310,20 +312,28 @@ class InstalledD07ExecutionServiceV1:
 
     def _configured(self, original=None):
         from .d01_production_operations_v1 import MissingProductionOriginalV1
+        from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+        from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+        if type(original)in {ArtifactPhaseObservationQuestionV1,D07ArtifactObservationPreparedV3}:
+            from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+            require_current_artifact_phase_observer_v2(self.bundle)
+            return self.bundle.model_workflows.artifact_observation_cognition
         from .d07_execution_v1 import D07RelationshipPreparedV2, D07RelationshipSemanticQuestionV2
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2, D07MethodGrowthSemanticQuestionV2
         from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
         if type(original)in {D07GeneralGrowthQuestionV1,D07GeneralGrowthPreparedV1}:
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
-            if type(self.bundle.model_workflows)is not AdminModelWorkflowsV8 or self.bundle.model_workflows.general_growth_cognition is None:
+            from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+            if type(self.bundle.model_workflows) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9) or self.bundle.model_workflows.general_growth_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_general_growth_cognition_workflow_v8")
             return self.bundle.model_workflows.general_growth_cognition
         if type(original) in {D07MethodGrowthPreparedV2, D07MethodGrowthSemanticQuestionV2}:
             from ..host.model_workflows_v6 import AdminModelWorkflowsV6
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
-            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8} or self.bundle.model_workflows.growth_cognition is None:
+            from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9} or self.bundle.model_workflows.growth_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_named_growth_C3_workflow_v6")
             return self.bundle.model_workflows.growth_cognition
         if type(original) in {D07RelationshipPreparedV2, D07RelationshipSemanticQuestionV2}:
@@ -331,7 +341,8 @@ class InstalledD07ExecutionServiceV1:
             from ..host.model_workflows_v6 import AdminModelWorkflowsV6
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
-            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7,AdminModelWorkflowsV8} or self.bundle.model_workflows.d07_relationship_cognition is None:
+            from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9} or self.bundle.model_workflows.d07_relationship_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_named_relationship_C3_workflow_v5")
             return self.bundle.model_workflows.d07_relationship_cognition
         workflows = self.bundle.model_workflows
@@ -368,6 +379,17 @@ class InstalledD07ExecutionServiceV1:
                     envelope = replace(frame.envelope, deadline_utc=min(frame.envelope.deadline_utc, basis.original_deadline_utc))
                     frame = replace(frame, envelope=envelope)
                     stage = replace(stage, envelope=envelope, proposal=replace(stage.proposal, envelope=envelope))
+                from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+                if type(question)is ArtifactPhaseObservationQuestionV1:
+                    from .artifact_phase_observation_execution_v1 import current_artifact_observation_basis_for_d07_v1
+                    basis=current_artifact_observation_basis_for_d07_v1(self,db,frame,question)
+                    choice=stage.provenance['choice']
+                    if choice.ticket_id!=basis.ids['ticket']:
+                        raise ValueError('Artifact observation cannot replace the actual fair chosen ticket')
+                    envelope=replace(frame.envelope,deadline_utc=min(frame.envelope.deadline_utc,basis.original_deadline_utc))
+                    frame=replace(frame,envelope=envelope)
+                    stage=replace(stage,envelope=envelope,proposal=replace(stage.proposal,envelope=envelope),
+                        provenance={**stage.provenance,'artifact_observation_basis':basis})
                 target = resolve_current_d07_semantic_target_v1(db, self.d11_issuer, frame, question)
                 stage = replace(stage, provenance={**stage.provenance, "semantic_question": question, "semantic_target": target})
             from .d07_reflection_execution_v1 import read_actual_d07_reflection_request_v1
@@ -474,6 +496,16 @@ class InstalledD07ExecutionServiceV1:
         return await self.worker.call(run)
 
     async def execute_current_d07_job_v1(self, job):
+        """Serialize actual calls for the same durable job across driver and outbox wakes."""
+        if self.owner_loop is not None and self.owner_loop is not asyncio.get_running_loop():
+            raise RuntimeError('D07 actual model executor must run on the owning AstrBot loop')
+        lock=self._job_execution_locks_v3.get(job.job_id)
+        if lock is None:
+            lock=asyncio.Lock();self._job_execution_locks_v3[job.job_id]=lock
+        async with lock:
+            return await self._execute_current_d07_job_once_v3(job)
+
+    async def _execute_current_d07_job_once_v3(self, job):
         """One invocation consumes at most the original Authority start right."""
         from ..host.v2_installation import V2InstallationAssembly
         from ..host.authority_client import AuthorityClient
@@ -533,7 +565,9 @@ class InstalledD07ExecutionServiceV1:
                 from .d07_ingress_recall_acquisition_v1 import ACQUIRE_OPERATION
                 await self._run_ingress_recall_operation_v1(job.job_id, ACQUIRE_OPERATION)
         else:
-            await self.worker.call(lambda graph: graph.acquire_current_d07_execution_v1(self.bootstrap, bundle, **graph_args))
+            acquired = await self.worker.call(lambda graph: graph.acquire_current_d07_execution_v1(self.bootstrap, bundle, **graph_args))
+            if acquired["status"] != "acquired":
+                return acquired
         read = await self.worker.call(lambda graph: graph.read_acquired_current_d07_execution_v1(self.bootstrap, bundle, **graph_args))
         if isinstance(read, dict):
             return read

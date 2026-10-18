@@ -8,7 +8,7 @@ from sylanne3.graph_types import (
     AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry, TypeSpec,
 )
 from sylanne3.graph_store import GraphStore
-from sylanne3.operators import OperatorSpec, compile_operators
+from rewrite.host_tests.legacy_fixture_v1.operators import OperatorSpec, compile_operators
 
 
 class GraphCausalityTests(unittest.TestCase):

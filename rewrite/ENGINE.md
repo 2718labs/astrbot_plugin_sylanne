@@ -1,3 +1,5 @@
+> Legacy fixture reference: these examples are engineering-only and are not included in the AstrBot runtime package. Run module commands from the repository root with `rewrite` on PYTHONPATH.
+
 # Engine first vertical slice
 
 This is a bounded, uncalibrated semantic fixture, not natural-language interpretation or a deployed personality system. The only modeled state is a two-component reaction per exact `(bot, persona, session)` scope. No real messages are sent by `RecordingTransport` or the demo.
@@ -32,4 +34,4 @@ Transport return means delivered in that adapter's contract; `DeliveryFailed` is
 
 All engine SQLite calls run via `asyncio.to_thread`. Python semantic replay orchestration is bounded; numerical refinement runs through the owned scheduler. No legacy imports, platform adapters, free-form LLM parser, automatic UI integration, or generic personality updates are implemented.
 
-Run from `rewrite` with the compiled native library available: `python -m sylanne3.demo`.
+Run from `rewrite` with the compiled native library available: `python -m rewrite.host_tests.legacy_fixture_v1.demo`.

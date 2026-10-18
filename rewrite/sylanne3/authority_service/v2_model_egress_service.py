@@ -15,6 +15,7 @@ from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+from ..host.model_workflows_v9 import AdminModelWorkflowsV9
 from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.first_ingress_encoding import (
@@ -40,7 +41,7 @@ class AuthorityV2ModelEgressService:
                  fences: AuthorityV2FenceService | None = None, *,
                  graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
                  admin_model_policy: (AdminIngressModelPolicy | AdminModelWorkflowsV2 |
-                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | None) = None,
+                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | None) = None,
                  source_location=None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
@@ -52,7 +53,7 @@ class AuthorityV2ModelEgressService:
                 and type(graph_verifier) is not PinnedCurrentModelEgressGraphVerifier):
             raise TypeError("administrator-pinned model egress graph verifier required")
         if (admin_model_policy is not None
-                and type(admin_model_policy) not in (AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)):
+                and type(admin_model_policy) not in (AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)):
             raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
@@ -87,7 +88,7 @@ class AuthorityV2ModelEgressService:
         from .d13_core_counter_service_v1 import InstalledD13CoreCounterServiceV1
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         if (type(counter) is not InstalledD13CoreCounterServiceV1
-                or type(self._admin_model_policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
+                or type(self._admin_model_policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
                 or counter.core._db is not self._store._db or counter.fences is not self._fences
                 or self._d13_provider_http_counter_v1 is not None):
             raise AuthorityUnavailable('provider HTTP counter must be the exact installed model/Core instance')
@@ -160,7 +161,7 @@ class AuthorityV2ModelEgressService:
             TEMPLATE_DIGEST, TEMPLATE_VERSION, WORK_KIND, artifact_draft_from_wire_v1,
             artifact_draft_model_ids_v1, artifact_draft_provider_messages_v1)
         verifier = self._graph_verifier
-        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
             return False
         bundle = verifier._artifact_draft_bundle
         if (type(bundle) is not AdminInstallationBundle
@@ -219,7 +220,7 @@ class AuthorityV2ModelEgressService:
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, require_paired_phase_frozen_target_v4
         verifier = self._graph_verifier
-        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
             return False
         bundle = verifier._artifact_draft_bundle
         if (type(bundle) is not AdminInstallationBundle or bundle.model_workflows is not self._admin_model_policy
@@ -280,7 +281,7 @@ class AuthorityV2ModelEgressService:
                 return self._artifact_draft_admin_matches_v2(intent, request)
             return self._artifact_draft_admin_matches_v1(intent, request)
         authority = request.envelope.authority
-        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
             if request.identity.phase == "d13.precompress":
                 from ..model_broker.d13_precompression import (
                     TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
@@ -316,7 +317,7 @@ class AuthorityV2ModelEgressService:
                 )
             if authority.purpose=="consolidation" and request.identity.phase=="d07.cognition":
                 from ..model_broker.general_growth_cognition_v1 import TEMPLATE_VERSION as GENERAL_VERSION,TEMPLATE_DIGEST as GENERAL_DIGEST
-                if type(policy)is not AdminModelWorkflowsV8 or request.prompt_template_digest!=GENERAL_DIGEST:
+                if type(policy) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9) or request.prompt_template_digest!=GENERAL_DIGEST:
                     return False
                 verifier=self._graph_verifier
                 if verifier is None:return False
@@ -357,7 +358,7 @@ class AuthorityV2ModelEgressService:
                         TEMPLATE_VERSION, TEMPLATE_DIGEST = V6_TEMPLATE_VERSION, V6_TEMPLATE_DIGEST
                     from ..model_broker.natural_reply_history_v7 import TEMPLATE_DIGEST as V7_TEMPLATE_DIGEST,TEMPLATE_VERSION as V7_TEMPLATE_VERSION
                     if request.prompt_template_digest==V7_TEMPLATE_DIGEST:
-                        if type(policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
+                        if type(policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
                             raise AuthorityUnavailable('V7 natural wire requires its actual named installed V7 workflow')
                         TEMPLATE_VERSION,TEMPLATE_DIGEST=V7_TEMPLATE_VERSION,V7_TEMPLATE_DIGEST
                     expected = ("natural_generation", "proposal",
@@ -376,7 +377,7 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.contact_expression_v1 import (GENERATION_TEMPLATE_VERSION,
                         GENERATION_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                         REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
-                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
                         from ..model_broker.contact_expression_v2 import (
                             GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                             REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
@@ -396,13 +397,13 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.d07_cognition_v1 import D07_COGNITION_TEMPLATE_DIGESTS_V1
                     workflow = policy.d07_cognition
                     from ..model_broker.d07_cognition_v1 import TEMPLATE_DIGEST
-                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8} and request.prompt_template_digest == TEMPLATE_DIGEST:
+                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and request.prompt_template_digest == TEMPLATE_DIGEST:
                         verifier = self._graph_verifier
                         if verifier is None:
                             return False
                         workflow = verifier.read_current_named_d07_model_workflow_v3(intent, request,source_material=d07_source_material)
                         installed_named = (policy.d07_cognition,policy.d07_relationship_cognition,)
-                        if type(policy)in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8}:
+                        if type(policy)in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
                             installed_named += (policy.growth_cognition,)
                         if workflow is None or not any(workflow is named for named in installed_named):
                             return False
@@ -419,13 +420,13 @@ class AuthorityV2ModelEgressService:
             else:
                 if request.identity.phase == "internal_life_content_v2":
                     from ..model_broker.internal_life_content_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
                         return False
                     workflow = policy.life_content
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
                 elif request.identity.phase == "internal_life_numeric_v1":
                     from ..model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
                         return False
                     workflow = policy.life_numeric
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
@@ -1215,7 +1216,7 @@ class AuthorityV2ModelEgressService:
             saved, report_digest, receipt = self._store.read_admission_locked(db, intent)
             if saved != admission:
                 raise AuthorityUnavailable("original model admission differs")
-            if type(self._admin_model_policy) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} and intent.job_id.startswith('natural-generation-job:'):
+            if type(self._admin_model_policy) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and intent.job_id.startswith('natural-generation-job:'):
                 if self._d13_provider_http_counter_v1 is None:
                     raise AuthorityUnavailable('V7 completion requires actual installed HTTP original verifier')
                 from .d13_provider_http_admission_v1 import require_recorded_provider_http_binding_v1

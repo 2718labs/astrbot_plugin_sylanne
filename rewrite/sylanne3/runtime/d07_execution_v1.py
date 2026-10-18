@@ -678,6 +678,10 @@ def read_current_d07_semantic_question_v1(db, issuer, namespace, ref):
     if row is None:
         return None
     raw = row[0]
+    if raw.get("schema")=="d07.artifact-phase-observation-question.v1":
+        from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        return decode_typed_production_value_v1(raw,ArtifactPhaseObservationQuestionV1)
     raw = {**raw, "target_ref": VersionedRef(**raw["target_ref"]), "source_refs": tuple(raw["source_refs"])}
     if raw.get("schema") == "d07.relationship-semantic-question.v2":
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
@@ -721,6 +725,10 @@ def read_prepared_d07_execution_v1(db, issuer, namespace, job_id):
     elif raw.get("schema") == "d07.reflection-prepared.v3":
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
         value = decode_typed_production_value_v1(row[0], D07ReflectionPreparedV3)
+        thaw_d07_cognition_request_v1(background_json_loads_v3(value.frozen_json))
+    elif raw.get("schema")=="d07.artifact-observation-prepared.v3":
+        from .artifact_phase_observation_execution_v1 import artifact_observation_prepared_from_wire_v3
+        value=artifact_observation_prepared_from_wire_v3(row[0])
         thaw_d07_cognition_request_v1(background_json_loads_v3(value.frozen_json))
     elif raw.get("schema") == "d07.general-growth-prepared.v1":
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
@@ -768,7 +776,8 @@ def require_current_d07_content_reads_v1(db, prepared, *, issuer=None):
             if actual.original_digest != external["digest"]:
                 raise ValueError("D07 exact signed semantic target changed")
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-    named = type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2} or (
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    named = type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2,D07ArtifactObservationPreparedV3} or (
         type(prepared) is D07ReflectionPreparedV3 and prepared.cycle_ref is not None)
     if named and issuer is not None:
         from .foreground_call_plan_v1 import require_current_named_c3_cycle_v2
@@ -850,7 +859,8 @@ def freeze_current_d07_stage_v1(frame, stage, workflow, installation_id):
         semantic = stage.provenance.get("semantic_question")
         if semantic is not None:
             from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
-            if type(semantic) not in {D07SemanticQuestionV1, D07RelationshipSemanticQuestionV2, D07MethodGrowthSemanticQuestionV2} or set(semantic.source_refs) != set(ticket.source_refs):
+            from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+            if type(semantic) not in {D07SemanticQuestionV1, D07RelationshipSemanticQuestionV2, D07MethodGrowthSemanticQuestionV2, ArtifactPhaseObservationQuestionV1} or set(semantic.source_refs) != set(ticket.source_refs):
                 raise ValueError("D07 actual semantic question differs from chosen source scope")
             target = stage.provenance.get("semantic_target")
             if (type(target) is not D07SemanticTargetOriginalV1 or target.original_ref != semantic.target_ref.ref
@@ -1117,6 +1127,11 @@ def prepare_d07_execution_in_transaction_v1(db, *, frame, stage, workflow, insta
             replace(cycle.call_plan,attempts=(*cycle.call_plan.attempts,ForegroundModelAttemptV1(
                 "C3",prepared.call_id,None,prepared.operation_id,prepared.reservation_digest,lease.lease_id,
                 quote.ceiling["input_tokens"],quote.ceiling["output_tokens"],"reserved")))
+    from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+    if type(semantic)is ArtifactPhaseObservationQuestionV1:
+        from .artifact_phase_observation_execution_v1 import specialize_artifact_observation_prepared_v3
+        prepared=specialize_artifact_observation_prepared_v3(db,frame=frame,stage=stage,
+            prepared=prepared,quote=quote,issuer=d11_issuer)
     require_current_d07_content_reads_v1(db, prepared)
     updated_frame = resources.frame
     updated_envelope = updated_frame.envelope
@@ -1124,7 +1139,8 @@ def prepare_d07_execution_in_transaction_v1(db, *, frame, stage, workflow, insta
         proposal=replace(stage.proposal, envelope=updated_envelope, required_bundle_parts=("persistent_job",)),
         read_versions=resources.read_versions)
     from ..domains.d01.production_operations_v1 import plain_v1
-    payload = plain_v1(prepared) if type(prepared) is D07ReflectionPreparedV3 else asdict(prepared)
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    payload = plain_v1(prepared) if type(prepared) in {D07ReflectionPreparedV3,D07ArtifactObservationPreparedV3} else asdict(prepared)
     record_d07_original_in_transaction_v1(db, d11_issuer, ns, "prepared", job.job_id, payload)
     record_d07_original_in_transaction_v1(db, d11_issuer, ns, "accounting_prepared", job.job_id,
         {"schema": "d07.accounting-prepared.v1", "prepared_digest": prepared.digest,
@@ -1164,6 +1180,11 @@ def verify_current_d07_preparation_stage_v1(db, preparation, service):
             or preparation.writes[0].value["quote_id"] != prepared.body_quote_ref
             or preparation.writes[0].value["effect_id"] != prepared.effect_id):
         raise ValueError("D07 actual signed quote/reserve/fixed member set differs")
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3,current_artifact_observation_basis_for_d07_v1
+    if type(prepared)is D07ArtifactObservationPreparedV3:
+        basis=current_artifact_observation_basis_for_d07_v1(service,db,frame,stage.provenance['semantic_question'])
+        if basis!=stage.provenance.get('artifact_observation_basis') or basis.digest!=prepared.observation_basis_digest:
+            raise ValueError('observation preparation changed its actual current basis before CAS')
     workflow = service._configured(prepared)
     frozen = freeze_current_d07_stage_v1(frame, stage, workflow, service.bundle.installation_policy.installation_id)
     if canonical_serialize(asdict(frozen)) != prepared.frozen_json or stage.input_digest != prepared.stage_input_digest:
@@ -1175,7 +1196,7 @@ def verify_current_d07_preparation_stage_v1(db, preparation, service):
             D07ConcernInputsV1(frame.snapshot, provenance["tickets"], provenance["policy"],
                 provenance["issuance_originals"], provenance["trigger"], frame.now_utc, provenance["focus_epoch"]))
         if (checked.proposal.typed_writes != stage.proposal.typed_writes or checked.input_digest != stage.input_digest
-                or checked.provenance != {k: v for k, v in stage.provenance.items() if k not in {"semantic_question", "semantic_target"}}
+                or checked.provenance != {k: v for k, v in stage.provenance.items() if k not in {"semantic_question", "semantic_target", "artifact_observation_basis"}}
                 or checked.status != "queued"):
             raise ValueError("D07 installed pure fair choice differs from actual preparation")
         if "semantic_question" in stage.provenance and resolve_current_d07_semantic_target_v1(db, service.d11_issuer,

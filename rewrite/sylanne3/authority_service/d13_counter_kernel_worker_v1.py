@@ -28,11 +28,10 @@ from ..runtime_contracts import canonical_serialize, canonical_digest
 from .d13_core_counter_contract_v1 import ClaimedD13CounterInputV1
 from .linux_installation_security_v1 import opened_installed_file_v1
 
-MANIFEST_SCHEMA_V1='sylanne3.d13.counter-kernel-manifest.v1'
+MANIFEST_SCHEMA_V1='sylanne3.d13.counter-kernel-manifest.v2'
 INPUT_SCHEMA_V1='sylanne3.d13.counter-kernel-input.v1'
 OUTPUT_SCHEMA_V1='sylanne3.d13.counter-kernel-output.v1'
 ALGORITHM_ID_V1='d13.full_http_counter.v1'
-METRIC_ID_V1='sylanne3.local-sdk-mock.full-http-utf8-ceil4.v1'
 _INPUT_MAX=16*1024*1024
 _OUTPUT_MAX=64*1024
 _STEP_CPU_NS=1_000_000_000
@@ -124,25 +123,12 @@ def _validate_manifest_bytes_v1(raw,program_sha256,interpreter_sha256,memory_max
         raise D13CounterKernelHold('protected provider/model profile identity differs')
     if (value['serializer_fingerprint']!=profile_pins['serializer_fingerprint']
             or value['counter_policy_fingerprint']!=profile_pins['counter_policy_fingerprint']
-            or value['applicability_fingerprint']!=_local_mock_applicability(profile_pins)):
-        raise D13CounterKernelHold('protected local Mock metric descriptor fingerprint differs')
+            or value['applicability_fingerprint']!=profile_pins['applicability_fingerprint']):
+        raise D13CounterKernelHold('protected provider counter applicability fingerprint differs')
     if any(type(value[name]) is not int for name in ('max_input_bytes','max_stdout_bytes','max_stderr_bytes',
             'cpu_ms_ceiling','memory_max_bytes','pids_max')):
         raise D13CounterKernelHold('protected counter manifest limit type differs')
     return value
-
-
-def _local_mock_applicability(profile):
-    descriptor={'schema':'sylanne3.d13.counter-local-mock-applicability.v1','metric_id':METRIC_ID_V1,
-        'metric_source_sha256':profile['metric_source_sha256'],'provider_id':profile['provider_id'],
-        'model_id':profile['model_id'],'provider_config_digest':profile['provider_config_digest'],
-        'template_digest':profile['template_digest'],'serializer_fingerprint':profile['serializer_fingerprint'],
-        'tokenizer_fingerprint':profile['tokenizer_fingerprint'],'wire_policy_fingerprint':profile['wire_policy_fingerprint'],
-        'counted_bytes':'complete actual SDK HTTP request.content UTF-8 bytes',
-        'metric':'max(1,(byte_count+3)//4)',
-        'late_slot':{'path':['metadata','sylanne_request_digest'],'alphabet':'0123456789abcdef','characters':64},
-        'profile_scope':'isolated-local-sdk-mock-only','production_tokenizer_supported':False}
-    return canonical_digest(descriptor)
 
 
 def _unescape_mount(value):
@@ -556,7 +542,7 @@ class InstalledD13CounterKernelWorkerV1:
 
     def __init__(self,*,program_path,program_sha256,interpreter_path,interpreter_sha256,
                  manifest_path,manifest_sha256,delegated_cgroup_path,installation_id,memory_max_bytes,pids_max,
-                 metric_source_sha256,provider_id,model_id,provider_config_digest,template_digest,
+                 metric_id,applicability_fingerprint,metric_source_sha256,provider_id,model_id,provider_config_digest,template_digest,
                  serializer_fingerprint,tokenizer_fingerprint,wire_policy_fingerprint,counter_policy_fingerprint):
         if not sys.platform.startswith('linux'):
             raise D13CounterKernelHold('D13 kernel worker requires Linux cgroup v2')
@@ -569,7 +555,7 @@ class InstalledD13CounterKernelWorkerV1:
                 or type(pids_max) is not int or pids_max<1):
             raise D13CounterKernelHold('protected memory and pid caps required')
         self.installation_id=installation_id;self.memory_max_bytes=memory_max_bytes;self.pids_max=pids_max
-        profile_pins={'metric_id':METRIC_ID_V1,'metric_source_sha256':_sha(metric_source_sha256,'metric_source_sha256'),
+        profile_pins={'metric_id':metric_id,'applicability_fingerprint':_sha(applicability_fingerprint,'applicability_fingerprint'),'metric_source_sha256':_sha(metric_source_sha256,'metric_source_sha256'),
             'provider_id':provider_id,'model_id':model_id,'provider_config_digest':_sha(provider_config_digest,'provider_config_digest'),
             'template_digest':_sha(template_digest,'template_digest'),
             'serializer_fingerprint':_sha(serializer_fingerprint,'serializer_fingerprint'),
@@ -577,7 +563,7 @@ class InstalledD13CounterKernelWorkerV1:
             'wire_policy_fingerprint':_sha(wire_policy_fingerprint,'wire_policy_fingerprint'),
             'counter_policy_fingerprint':_sha(counter_policy_fingerprint,'counter_policy_fingerprint')}
         if any(type(profile_pins[name]) is not str or not profile_pins[name]
-                for name in ('provider_id','model_id')):
+                for name in ('metric_id','provider_id','model_id')):
             raise D13CounterKernelHold('protected provider/model profile identity required')
         self._profile_pins=MappingProxyType(profile_pins)
         self._manifest=_manifest(self.manifest_path,self.manifest_sha256,self.program_sha256,

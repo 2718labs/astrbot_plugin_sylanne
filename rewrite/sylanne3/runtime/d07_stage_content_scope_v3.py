@@ -48,7 +48,7 @@ class _HostParentColumnV3(BackgroundJSONColumnV3):
             if path[0]=="first_ingress_c02":return len(path)==1
             return path[0] in {"status","operation_id","operation_digest","activity_id","effect_id","commit_seq",
                 "read_versions","write_versions","invalidated_epochs","ledger_refs","outbox_refs",
-                "schema","phase","prepared_digest","graph_receipt_digest","method_growth_c3","relationship_c3","reflection_c3"}
+                "schema","phase","prepared_digest","graph_receipt_digest","method_growth_c3","relationship_c3","reflection_c3","artifact_observation_c3"}
         if self.mode in {"source_commitment","terminal_result"}:return not path
         if self.mode=="prepare_commit":
             if not path:return True
@@ -135,10 +135,16 @@ class _HostPreparedStreamV3(C09CanonicalJSONStreamV2):
                 else:BackgroundString.text_chars.append(chr(point))
         else:super()._append_decoded_codepoint(point)
 class _HostFrozenMetadataReadV3:
-    def __init__(self):
+    def __init__(self,column):
+        self.column=column
         from ..authority_service.d07_authority_model_source_read_v3 import _D07AuthorityFrozenMetadataReadV3
-        self.kernel=_D07AuthorityFrozenMetadataReadV3()
+        self.kernel=_D07AuthorityFrozenMetadataReadV3(self)
         self.kernel._retain_v3=self._retain_v3
+    def _reserve(self,extra=0):
+        from ..authority_service.d07_authority_model_source_read_v3 import _d07_canonical_parser_heap_bytes_v3
+        nested=self.kernel
+        self.column._reserve_v3(extra+_heap((nested.nodes,nested.scalar,nested.value))+
+            _d07_canonical_parser_heap_bytes_v3(nested.parser))
     def _retain_v3(self,path):
         if len(path)>1 and path[0]=="input" and path[1]in {"context_sources","support_sources"}:
             return len(path)<=3 or path[3]=="source_ref"
@@ -151,7 +157,7 @@ class _HostFrozenMetadataReadV3:
 class _HostPreparedLocatorColumnV3(_HostParentColumnV3):
     def __init__(self,reader,**kwargs):
         from ..authority_service.d07_authority_model_source_read_v3 import _D07AuthorityFrozenMetadataReadV3
-        self.frozen_metadata=_HostFrozenMetadataReadV3()
+        self.frozen_metadata=_HostFrozenMetadataReadV3(self)
         super().__init__(reader,**kwargs);self.parser=_HostPreparedStreamV3(self)
     def retain_path_v3(self,path):
         if not path:return True
@@ -165,8 +171,9 @@ def _host_prepared_class_v3(schema):
     from .d07_execution_v1 import D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
     from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
     types={item.__dataclass_fields__["schema"].default:item for item in
-        (D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1)}
+        (D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07ArtifactObservationPreparedV3)}
     if schema not in types:raise AuthorityUnavailable("unregistered actual Host prepared stage schema")
     return types[schema]
 
@@ -228,7 +235,7 @@ class _HostMetadataReaderV3:
                 if task is not None:
                     for leaf in task.leaves.values():
                         extra.append(tuple(getattr(leaf,name,None)for name in
-                            ("value","payload","read_versions","continuation","operator_versions","grant","metadata")))
+                            ("value","payload","read_versions","continuation","operator_versions","grant","metadata","basis","contract","policy","generation")))
             task=self.container.accounting
             if task is not None:extra.append((getattr(task,"quote",None),getattr(task,"reservation",None)))
         payload=(None if self.header is None else header_payload(self.header),
@@ -291,6 +298,7 @@ class _HostSignedParentMetadataReadV3:
             if self.metadata is None or self.expected_digest is not None and self.metadata[0]!=self.expected_digest:
                 raise AuthorityUnavailable("D07 special parent lost its actual signed original commitment")
             mode=("general_question" if self.kind=="semantic_question" and self.ref.startswith("d07-general-growth:") else self.kind) if self.kind in {"semantic_question","reflection_request","execution","prepare_commit"}else"terminal_result" if self.kind=="result" else"metadata"
+            if self.family=="life"and self.kind=="adopted_life":mode="artifact_file"
             self.column=_HostParentColumnV3(r,table=table,column="payload_json",
                 key_columns=("bot","persona","kind","original_ref"),key=(*w.namespace.as_tuple,self.kind,self.ref),mode=self.mode or mode)
             self.phase="bytes";return
@@ -511,12 +519,15 @@ class _HostHistoryParentMetadataReadV3:
                 raise AuthorityUnavailable("D07 special-parent immutable history lost actual W01 event/member")
             self.column=_HostParentColumnV3(r,table="graph_history",column="value",
                 key_columns=("token","revision"),key=(self.ref,self.revision),
-                mode="checkpoint"if AtomKey.from_token(self.ref).type_name=="d07.reflection_checkpoint.v1"else"graph_job",
+                mode="checkpoint"if AtomKey.from_token(self.ref).type_name=="d07.reflection_checkpoint.v1"else
+                    "general_ticket"if AtomKey.from_token(self.ref).type_name=="d07.attention_ticket.v1"else"graph_job",
                 cell_id=self.metadata[4],erasure_owner_ref=self.ref)
             self.phase="bytes";return
         if not self.column.advance(meter):return
         self.value=self.column.require_v3(w)
-        expected_fields=({"reflection_id","meta_depth","no_progress_count","unresolved_slots","discriminating_refs","status"}if AtomKey.from_token(self.ref).type_name=="d07.reflection_checkpoint.v1"else set(self.value))
+        from ..domains.d07 import AttentionTicket
+        expected_fields=({"schema",*(f.name for f in fields(AttentionTicket))}if AtomKey.from_token(self.ref).type_name=="d07.attention_ticket.v1"else
+            {"reflection_id","meta_depth","no_progress_count","unresolved_slots","discriminating_refs","status"}if AtomKey.from_token(self.ref).type_name=="d07.reflection_checkpoint.v1"else set(self.value))
         if AtomKey.from_token(self.ref).type_name!="memory.source" and self.column.fields_seen!=expected_fields:
             raise AuthorityUnavailable("D07 parent history metadata contains another head schema")
         from ..runtime_contracts import canonical_digest
@@ -628,6 +639,7 @@ class _HostSpecialParentMetadataReadV3:
         from .d07_execution_v1 import D07ReflectionPreparedV3,D07RelationshipPreparedV2
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         r=self.reader;w=self.work;r.require_current_v3(meter)
         if _HOST_PARENT_TASKS.get(self)!=(r,w,w.operation,w.read_scope,w.graph_stamp):
             raise AuthorityUnavailable("D07 special-parent metadata task lost original Work/retention/stamp")
@@ -677,8 +689,16 @@ class _HostSpecialParentMetadataReadV3:
             if kind is D07GeneralGrowthPreparedV1:self.phase="general"
             elif kind is D07ReflectionPreparedV3:self.phase="reflection"
             elif kind in {D07MethodGrowthPreparedV2,D07RelationshipPreparedV2}:self.phase="question"
+            elif kind is D07ArtifactObservationPreparedV3:self.phase="artifact_observation"
             else:self.phase="ordinary_job"
             return
+        if self.phase=="artifact_observation":
+            from .artifact_observation_parentage_v3 import ArtifactObservationParentMetadataReadV3
+            leaf=self._leaf_v3(("artifact-observation-parent",header.job_id),ArtifactObservationParentMetadataReadV3(self))
+            if leaf is None:return
+            self.artifact_observation=leaf.basis
+            self.cycle_ref=leaf.basis.request.selector.task.cycle_job_ref
+            self.phase="cycle";return
         if self.phase=="general":
             question=self._leaf_v3(("general-question",header.job_id),_HostSignedParentMetadataReadV3(r,
                 family="d07",kind="semantic_question",ref=raw["semantic_question_ref"],
@@ -824,6 +844,19 @@ class _HostSpecialParentMetadataReadV3:
                 source=decode_typed_production_value_v1(raw["source_head"],GraphVersion)
                 if cycle["source_ref"]!=source.key.token or job["budget_ref"]!=raw["parent_budget_lease_ref"]:
                     raise AuthorityUnavailable("D07 Method actual cue/root paying lease changed")
+            if kind is D07ArtifactObservationPreparedV3:
+                from .foreground_artifact_observation_plan_v3 import foreground_call_plan_from_wire_v3
+                from .foreground_call_plan_v1 import foreground_artifact_phase_group_identity_v2 as group
+                basis=self.artifact_observation
+                plan=foreground_call_plan_from_wire_v3(cycle["call_plan"])
+                current=plan.phase_group.selector
+                exact_phase=w.d07_selector.stage=="acquire"and self.reader.stage_job.value["phase"]=="queued"
+                if (group(current)!=group(basis.request.selector)or current.phase_index<basis.request.selector.phase_index
+                        or exact_phase and current!=basis.request.selector
+                        or cycle["source_ref"]!=basis.task_root_source_head.key.token
+                        or job["budget_ref"]!=basis.parent_budget_lease_ref
+                        or(plan.observer_policy_ref,plan.observer_policy_digest)!=(basis.observer_asset_ref,basis.observer_asset_digest)):
+                    raise AuthorityUnavailable("Host Artifact observation changed its actual V3 task/cycle/Root/policy")
             self.cycle,self.cycle_job,self.cycle_leaf=cycle,job,leaf
             self.deadlines.append(_host_parent_utc_v3(job["deadline_utc"]))
             self.phase="budget";return
@@ -836,6 +869,8 @@ class _HostSpecialParentMetadataReadV3:
             if kind is D07MethodGrowthPreparedV2 and raw["original_deadline_utc"]!=min(
                     _host_parent_utc_v3(self.cycle_job["deadline_utc"]),leaf.grant.valid_until_utc):
                 raise AuthorityUnavailable("D07 Method original deadline is not its original job/grant minimum")
+            if kind is D07ArtifactObservationPreparedV3 and canonical_digest(leaf.grant)!=self.artifact_observation.parent_grant_digest:
+                raise AuthorityUnavailable("Host Artifact observation changed its original Root grant")
             self.budget=leaf;self.deadlines.append(leaf.grant.valid_until_utc);self.phase="responsibility";return
         if self.phase=="responsibility":
             create=self._leaf_v3(("create",header.job_id),_HostAdoptedParentMetadataReadV3(r,self.cycle_job["operation_id"],"create"))
@@ -1058,7 +1093,7 @@ class _HostSpecialParentMetadataReadV3:
                 raise AuthorityUnavailable("D07 special parent exceeded its original ancestor deadline minimum")
             source_versions=tuple(sorted({(row["ref"],row["revision"])for item in self.headers for row in item.source_rows}))
             names={D07MethodGrowthPreparedV2:"method_growth_self",
-                D07ReflectionPreparedV3:"reflection",D07RelationshipPreparedV2:"relationship_self",D07GeneralGrowthPreparedV1:"general_growth_owner"}
+                D07ReflectionPreparedV3:"reflection",D07RelationshipPreparedV2:"relationship_self",D07GeneralGrowthPreparedV1:"general_growth_owner",D07ArtifactObservationPreparedV3:"artifact_observation_self"}
             self.complete=True
             self.result=_HostParentQualifiedV3(_HOST_ISSUER,self,kind=names.get(original.prepared_class,"ordinary_owner"),
                 authority=source,parent_originals=self.originals,deadline=deadline,source_versions=source_versions)
@@ -1079,15 +1114,27 @@ def _host_require_named_member_v3(reader,task,header,cycle,job,cycle_leaf,raw,*,
     from .foreground_call_plan_v1 import foreground_call_plan_from_wire_v1,foreground_call_plan_from_wire_v2,ForegroundModelAttemptV1
     from dataclasses import replace
     plan_raw=cycle["call_plan"]
-    plan=foreground_call_plan_from_wire_v2(plan_raw) if plan_raw["schema"]=="d11.foreground-call-plan.v2" else foreground_call_plan_from_wire_v1(plan_raw)
-    workflow=reader.bundle.model_workflows.d07_cognition
+    from .foreground_artifact_observation_plan_v3 import foreground_call_plan_from_wire_v3,ForegroundArtifactObservationAttemptV3
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    artifact=header.prepared_class is D07ArtifactObservationPreparedV3
+    plan=(foreground_call_plan_from_wire_v3(plan_raw)if plan_raw["schema"]=="d11.foreground-call-plan.v3"else
+        foreground_call_plan_from_wire_v2(plan_raw)if plan_raw["schema"]=="d11.foreground-call-plan.v2"else foreground_call_plan_from_wire_v1(plan_raw))
+    workflow=reader.bundle.model_workflows.artifact_observation_cognition if artifact else reader.bundle.model_workflows.d07_cognition
     matched=tuple(row for row in plan.attempts if row.call_id==raw["call_id"])
     queued=reader.stage_job.value["phase"]=="queued" and header is reader.header and reader.work.d07_selector.stage=="acquire"
     if queued:
         if matched or cycle_leaf.version!=decode_typed_production_value_v1(raw["cycle_ref"],GraphVersion).revision or cycle_leaf.digest!=raw["cycle_digest"] or canonical_digest(plan)!=raw["call_plan_digest"]:
             raise AuthorityUnavailable("Host queued C3 changed its original absent member/cycle/callplan commitment")
-        prospective=ForegroundModelAttemptV1("C3",raw["call_id"],None,raw["operation_id"],raw["reservation_digest"],
-            job["budget_ref"],workflow.quote_ceiling["input_tokens"],workflow.quote_ceiling["output_tokens"],"reserved")
+        if artifact:
+            basis=task.artifact_observation
+            prospective=ForegroundArtifactObservationAttemptV3(slot="C3",call_id=raw["call_id"],original_call_id=None,
+                reservation_operation_id=raw["operation_id"],reservation_digest=raw["reservation_digest"],
+                budget_lease_ref=job["budget_ref"],input_ceiling=workflow.quote_ceiling["input_tokens"],
+                output_ceiling=workflow.quote_ceiling["output_tokens"],state="reserved",phase_selector=basis.request.selector,
+                condition_id=basis.request.condition_id,observation_basis_ref=basis.original_ref,observation_basis_digest=basis.digest)
+        else:
+            prospective=ForegroundModelAttemptV1("C3",raw["call_id"],None,raw["operation_id"],raw["reservation_digest"],
+                job["budget_ref"],workflow.quote_ceiling["input_tokens"],workflow.quote_ceiling["output_tokens"],"reserved")
         replace(plan,attempts=(*plan.attempts,prospective))
         reader.require_remaining_reply_v3(task,plan)
         return
@@ -1097,18 +1144,71 @@ def _host_require_named_member_v3(reader,task,header,cycle,job,cycle_leaf,raw,*,
             or (member.reservation_operation_id,member.reservation_digest,member.budget_lease_ref)!=(raw["operation_id"],raw["reservation_digest"],job["budget_ref"])
             or (member.input_ceiling,member.output_ceiling)!=(workflow.quote_ceiling["input_tokens"],workflow.quote_ceiling["output_tokens"])):
         raise AuthorityUnavailable("Host original C3 changed its actual quote/reservation/root")
+    if artifact:
+        basis=task.artifact_observation
+        if (type(member)is not ForegroundArtifactObservationAttemptV3
+                or member.phase_selector!=basis.request.selector or member.condition_id!=basis.request.condition_id
+                or(member.observation_basis_ref,member.observation_basis_digest)!=(basis.original_ref,basis.digest)):
+            raise AuthorityUnavailable("Host Artifact observation borrowed another C3 member or phase")
     acquire_id="d07-acquire:"+canonical_digest((reader.work.namespace,raw["operation_id"]))[:48]
     leaf=task._leaf_v3(("host-acquire",header.job_id),_HostBundleParentMetadataReadV3(reader,acquire_id))
     if leaf is None:raise _HostMetadataNeededV3(task.pending)
-    name="reflection_c3" if reflection else "method_growth_c3" if raw["schema"]=="d07.method-growth-prepared.v2" else "relationship_c3"
+    name="artifact_observation_c3"if artifact else"reflection_c3" if reflection else "method_growth_c3" if raw["schema"]=="d07.method-growth-prepared.v2" else "relationship_c3"
     expected={"cycle_ref":decode_typed_production_value_v1(raw["cycle_ref"],GraphVersion).key.token,
         "before_cycle_digest":raw["cycle_digest"],"before_call_plan_digest":raw["call_plan_digest"],"call_id":raw["call_id"],
         ("reflection_request_digest"if reflection else"semantic_question_digest"):raw["reflection_request_digest"] if reflection else raw["semantic_question_digest"]}
+    if artifact:
+        expected.update(observation_basis_ref=raw["observation_basis_ref"],observation_basis_digest=raw["observation_basis_digest"])
     if (leaf.metadata[1:3]!=(raw["activity_id"],None)
             or leaf.value["phase"]!="execution_acquired" or leaf.value["prepared_digest"]!=header.metadata[0] or leaf.value[name]!=expected):
         raise AuthorityUnavailable("Host C3 member lacks its exact actual acquisition W01 receipt")
 
 def _host_require_remaining_reply_v3(reader,task,plan):
+    from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
+    if type(plan)is ForegroundCallPlanV3:
+        from .artifact_receipt_allocation_v3 import ForegroundArtifactReceiptAllocationV3
+        from ..host.authority_profile import AdminPrivateReplyDispatchPolicy
+        from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+        from ..domains.d01.production_operations_v1 import plain_v1
+        allocation=decode_typed_production_value_v1(task.create.payload["provenance"]["reply_allocation"],
+            ForegroundArtifactReceiptAllocationV3)
+        responsibility=task.responsibility
+        policy=reader.bundle.installation_policy
+        observer=require_current_artifact_phase_observer_v2(reader.bundle)
+        message=reader.bundle.private_reply_dispatch
+        if (plain_v1(allocation)!=task.create.payload["provenance"]["reply_allocation"]
+                or type(message)is not AdminPrivateReplyDispatchPolicy
+                or allocation.namespace!=reader.work.namespace or allocation.c02_operation_id!=task.raw["c02_operation_id"]
+                or allocation.source_ref!=responsibility.source_ref or allocation.responsibility_digest!=responsibility.digest
+                or responsibility.mode!="signed_scope_intersection_v1"or responsibility.root_registration_ref is None
+                or allocation.parent_grant_digest!=responsibility.parent_grant_digest
+                or allocation.valid_until_utc!=responsibility.deadline_utc
+                or (allocation.installation_id,allocation.manifest_digest)!=(policy.installation_id,policy.manifest_digest)
+                or (allocation.observer_policy_ref,allocation.observer_policy_digest)!=(observer.asset_ref,observer.asset_digest)
+                or (plan.observer_policy_ref,plan.observer_policy_digest)!=(allocation.observer_policy_ref,allocation.observer_policy_digest)
+                or allocation.message_policy_digest!=canonical_digest(plain_v1(message))
+                or dict(allocation.message_ceiling)!=dict(message.quote_ceiling)
+                or allocation.allowed_work_kinds!=("message",)or allocation.message_slots!=1
+                or allocation.child_lease_id!=plan.protected_reply_lease_ref
+                or allocation.parent_lease_ref!=task.cycle_job["budget_ref"]
+                or plan.parent_budget_lease_ref!=allocation.parent_lease_ref
+                or allocation.parent_lease_ref!=policy.root_lease.lease_id
+                or task.budget.grant!=policy.root_grant
+                or any(member.slot in {"C5","C6"}for member in plan.attempts)):
+            raise AuthorityUnavailable("Host V3 Artifact lost its actual one-message allocation/Root/responsibility/policy")
+        child=task._leaf_v3(("artifact-receipt-child",allocation.child_lease_id),
+            _HostParentBudgetMetadataReadV3(reader,allocation.child_lease_id))
+        if child is None:raise _HostMetadataNeededV3(task.pending)
+        creation=task._leaf_v3(("artifact-receipt-create",allocation.allocation_operation_id),
+            _HostArtifactReceiptBudgetCreationMetadataV3(reader,allocation))
+        if creation is None:raise _HostMetadataNeededV3(task.pending)
+        metadata=reader.budget_state_v3(allocation.child_lease_id)
+        if (child.grant!=allocation.child_grant()
+                or (metadata.parent_id,metadata.currency,dict(metadata.limits))!=
+                    (allocation.parent_lease_ref,allocation.currency,dict(allocation.child_limits))
+                or any(metadata.available(name)<amount for name,amount in allocation.message_ceiling)):
+            raise AuthorityUnavailable("Host independent observation consumed its protected one-message capacity")
+        return
     lease=task._leaf_v3(("protected-reply",plan.protected_reply_lease_ref),_HostParentBudgetMetadataReadV3(reader,plan.protected_reply_lease_ref))
     if lease is None:raise _HostMetadataNeededV3(task.pending)
     grant=lease.grant
@@ -1131,6 +1231,35 @@ def _host_require_remaining_reply_v3(reader,task,plan):
         raise AuthorityUnavailable("Host C3 protected child state changed original allocation")
     if any(metadata.available(dimension)<amount for dimension,amount in required.items()):
         raise AuthorityUnavailable("Host C3 cannot consume the original remaining C5/C6 obligation")
+
+class _HostArtifactReceiptBudgetCreationMetadataV3:
+    def __init__(self,reader,allocation):
+        self.reader,self.work,self.allocation=reader,reader.work,allocation
+        self.phase="identity";self.complete=False;self.column=None
+    def advance_v3(self,meter):
+        r=self.reader;w=self.work;a=self.allocation;r.require_current_v3(meter)
+        if self.phase=="identity":
+            self.metadata=_runtime_bounded_fixed_row_v3(w.db,meter,"runtime_budget_operations",
+                ("digest","lease_id"),"bot_id=? AND persona_id=? AND operation_id=? AND phase='create'",
+                (*w.namespace.as_tuple,a.allocation_operation_id))
+            if self.metadata!=(a.digest,a.child_lease_id):
+                raise AuthorityUnavailable("Host Artifact receipt lost its actual original child creation")
+            self.column=_HostParentColumnV3(r,table="runtime_budget_operations",column="receipt_json",
+                key_columns=("bot_id","persona_id","operation_id","phase"),
+                key=(*w.namespace.as_tuple,a.allocation_operation_id,"create"),mode="metadata")
+            self.phase="bytes";return
+        if not self.column.advance(meter):return
+        from .budget import BudgetReceipt
+        raw=self.column.require_v3(w)
+        if self.column.fields_seen!={f.name for f in fields(BudgetReceipt)}:
+            raise AuthorityUnavailable("Host Artifact child creation has unregistered receipt fields")
+        receipt=BudgetReceipt(**raw)
+        if ((receipt.status,receipt.operation_id,receipt.digest,receipt.lease_id,receipt.version,
+                dict(receipt.used),dict(receipt.reserved),dict(receipt.unconfirmed))!=
+                ("created",a.allocation_operation_id,a.digest,a.child_lease_id,1,{},{},{})):
+            raise AuthorityUnavailable("Host Artifact child changed its actual one-message creation receipt")
+        self.complete=True
+
 
 class _HostBudgetStateReadV3:
     def __init__(self,reader,lease_id):

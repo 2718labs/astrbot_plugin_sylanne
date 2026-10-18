@@ -18,669 +18,7 @@ import socket
 import pytest
 
 
-SDK_HOST_ENTRY_V1 = r'''from pathlib import Path
-import asyncio, ast, hashlib, json, os, signal, socket, struct, sys, time, traceback
-from importlib.metadata import version
-
-ROOT=Path('/var/lib/sylanne-b04-host')
-os.environ.update(ASTRBOT_ROOT=str(ROOT),ASTRBOT_DISABLE_METRICS='1',ASTRBOT_RELOAD='0')
-os.chdir(ROOT);sys.dont_write_bytecode=True
-sys.path.insert(0,str(ROOT))
-assert version('astrbot')=='4.28.2'
-import astrbot.core as core
-from astrbot.api.star import Context
-from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
-from astrbot.core.log import LogBroker
-from astrbot.core.umop_config_router import UmopConfigRouter
-from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
-from astrbot.core.persona_mgr import PersonaManager
-from astrbot.core.provider.manager import ProviderManager
-from astrbot.core.conversation_mgr import ConversationManager
-from astrbot.core.platform_message_history_mgr import PlatformMessageHistoryManager
-from astrbot.core.config.astrbot_config import AstrBotConfig
-from astrbot.core.star.star_manager import PluginManager
-from astrbot.dashboard.server import AstrBotDashboard
-from astrbot.dashboard.password_state import set_dashboard_password_hashes
-import httpx
-
-def private_exception(label,error):
-    sys.stderr.write(label+'\n'+''.join(traceback.format_exception(error)))
-    sys.stderr.flush();os.fsync(sys.stderr.fileno())
-
-def install_fence_observation():
-    installed=Path('/opt/sylanne/code')
-    sys.path.insert(0,str(installed))
-    from _runtime_bootstrap import load_canonical_runtime_v1
-    load_canonical_runtime_v1(installed)
-    from sylanne3.host.v2_fence_port import V2FencePort
-    from sylanne3.host.mtls_transport import MtlsAuthorityTransport
-    import inspect,threading
-    sources=sorted({Path(inspect.getsourcefile(value)) for value in
-        (V2FencePort,MtlsAuthorityTransport,MtlsAuthorityTransport._rpc)},key=str)
-    literals={node.value for source in sources for node in ast.walk(ast.parse(source.read_text()))
-        if isinstance(node,ast.Constant) and isinstance(node.value,str)}
-    rows=[];lock=threading.Lock()
-    def record(kind,method,started,error=None,timeout=None):
-        row={'kind':kind,'method':method,'started_utc':started[0],
-            'elapsed_seconds':time.monotonic()-started[1],'declared_timeout_seconds':timeout}
-        if timeout is not None:
-            row['declared_deadline_utc']=started[0]+timeout
-            row['deadline_remaining_seconds']=timeout-row['elapsed_seconds']
-        if error is not None:
-            chain=[];current=error;seen=set()
-            while current is not None and id(current) not in seen:
-                seen.add(id(current));message=str(current)
-                chain.append({'type':type(current).__name__,
-                    'static_message':message if message in literals else None,
-                    'frames':[{'file':f.filename,'line':f.lineno,'function':f.name}
-                        for f in traceback.extract_tb(current.__traceback__)]})
-                current=current.__cause__ or current.__context__
-            row['exception_chain']=chain;private_exception('B04_V2_INTERNAL_EXCEPTION '+kind+' '+method,error)
-        with lock:
-            rows.append(row)
-            path=ROOT/'data/v2-fence-observation.json'
-            path.write_text(json.dumps({'sources':[{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
-                for p in sources],'events':rows},separators=(',',':')))
-            with path.open('rb') as stream:os.fsync(stream.fileno())
-    original_submit=V2FencePort._submit
-    def submit(self,coroutine):
-        method=coroutine.cr_code.co_name;started=(time.time(),time.monotonic())
-        try:result=original_submit(self,coroutine)
-        except BaseException as error:record('fence_submit',method,started,error,self._timeout);raise
-        record('fence_submit',method,started,timeout=self._timeout);return result
-    original_rpc=MtlsAuthorityTransport._rpc
-    async def transport_rpc(self,session,profile,method,*args,**kwargs):
-        started=(time.time(),time.monotonic())
-        try:result=await original_rpc(self,session,profile,method,*args,**kwargs)
-        except BaseException as error:record('transport_rpc',method,started,error,profile.timeout_seconds);raise
-        record('transport_rpc',method,started,timeout=profile.timeout_seconds);return result
-    V2FencePort._submit=submit;MtlsAuthorityTransport._rpc=transport_rpc
-
-
-import aiohttp
-from contextlib import AsyncExitStack
-from functools import partial
-from astrbot.core.event_bus import EventBus
-from astrbot.core.platform.manager import PlatformManager
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
-from astrbot.core.star.star_handler import EventType,star_handlers_registry
-
-class LocalOneBotV11:
-    def __init__(self,adapter,self_id,token):
-        self.adapter=adapter;self.self_id=str(self_id);self.token=token
-        self.actions=[];self.sender_observations=[];self.session=None;self.ws=None;self.reader=None
-        self.m1_scenario=False;self.m1_sender_id=None
-        self.m1_boundary=None;self.m1_boundary_received=False;self.m1_boundary_release=asyncio.Event()
-
-    async def start(self):
-        assert self.adapter.host=='127.0.0.1'
-        self.session=aiohttp.ClientSession(trust_env=False)
-        headers={'X-Client-Role':'universal','X-Self-ID':self.self_id,
-            'Authorization':'Bearer '+self.token}
-        async with asyncio.timeout(10):
-            while True:
-                try:
-                    self.ws=await self.session.ws_connect(
-                        f'http://127.0.0.1:{int(self.adapter.port)}/ws',headers=headers)
-                    break
-                except aiohttp.ClientConnectorError:await asyncio.sleep(.05)
-        self.reader=asyncio.create_task(self.read_actions(),name='b04_local_onebot_peer')
-        await self.ws.send_json({'time':int(time.time()),'self_id':int(self.self_id),
-            'post_type':'meta_event','meta_event_type':'lifecycle','sub_type':'connect'})
-        login=await asyncio.wait_for(self.adapter.bot.call_action('get_login_info',self_id=self.self_id),5)
-        assert str(login['user_id'])==self.self_id
-
-    async def read_actions(self):
-        async for frame in self.ws:
-            if frame.type!=aiohttp.WSMsgType.TEXT:continue
-            action=json.loads(frame.data);self.actions.append(action['action'])
-            result=({'status':'ok','retcode':0,'data':{'user_id':int(self.self_id),'nickname':'local-fixture'}}
-                if action['action']=='get_login_info' else {'status':'failed','retcode':1404,'data':None})
-            if self.m1_scenario and action['action'] in {'send_private_msg','send_msg'}:
-                params=action['params'];target=str(params.get('user_id',''))
-                assert target==self.m1_sender_id and params.get('group_id') is None
-                assert action['action']!='send_msg' or params.get('message_type','private')=='private'
-                if len(self.sender_observations)>=8:raise RuntimeError('M1 local sender ceiling reached')
-                self.sender_observations.append({'action':action['action'],'user_id':target,
-                    'message_sha256':hashlib.sha256(json.dumps(params['message'],sort_keys=True).encode()).hexdigest()})
-                result={'status':'ok','retcode':0,'data':{'message_id':2718100+len(self.sender_observations)}}
-                if self.m1_boundary is not None and len(self.sender_observations)==2:
-                    self.m1_boundary_received=True
-                    if self.m1_boundary=='stop':
-                        await self.m1_boundary_release.wait()
-                    else:
-                        # The local receiver saw a request, but returns no acceptance ID.
-                        # The actual AstrBot sender must record UNKNOWN after its durable start.
-                        result={'status':'ok','retcode':0,'data':{}}
-            await self.ws.send_json({**result,'echo':action['echo']})
-
-    async def message(self,*,message_id,user_id,text):
-        await self.ws.send_json({'time':int(time.time()),'self_id':int(self.self_id),
-            'post_type':'message','message_type':'private','sub_type':'friend',
-            'message_id':message_id,'user_id':user_id,'sender':{'user_id':user_id,'nickname':'fixture-owner'},
-            'message':[{'type':'text','data':{'text':text}}],'raw_message':text,'font':0})
-
-    async def close(self):
-        if self.ws is not None:await self.ws.close()
-        if self.reader is not None:
-            self.reader.cancel();await asyncio.gather(self.reader,return_exceptions=True)
-        if self.session is not None:await self.session.close()
-
-async def close_listener(server):
-    server.close();await server.wait_closed()
-
-async def actual_sdk_identity(context,adapter,peer,umo):
-    from sylanne3.host.identity import astrbot_namespace
-    login=await asyncio.wait_for(adapter.bot.call_action('get_login_info',self_id=peer.self_id),5)
-    assert str(login['user_id'])==peer.self_id
-    cid=await context.conversation_manager.get_curr_conversation_id(umo)
-    assert cid is not None
-    conversation=await context.conversation_manager.get_conversation(umo,cid,create_if_not_exists=False)
-    assert conversation is not None
-    selected=await context.persona_manager.resolve_selected_persona(umo=umo,
-        conversation_persona_id=conversation.persona_id,platform_name=adapter.meta().name,
-        provider_settings=context.get_config(umo))
-    assert selected[1] is not None
-    namespace=astrbot_namespace(adapter.meta().id,peer.self_id,selected[0])
-    assert await context.conversation_manager.get_curr_conversation_id(umo)==cid
-    return {'schema':'sylanne.sdk-preinstall-identity.v1','sdk':version('astrbot'),
-        'platform_id':adapter.meta().id,'platform_name':adapter.meta().name,'self_id':peer.self_id,
-        'selected_persona_id':selected[0],'umo':umo,'conversation_id':cid,
-        'bot_id':namespace.bot_id,'persona_id':namespace.persona_id}
-
-class NativeIngressObservation:
-    # Original queue/scheduler/registered handler always own event execution.
-    def __init__(self,context,life,plugin_name,identity):
-        self.context=context;self.life=life;self.plugin_name=plugin_name;self.identity=identity
-        self.records={};self.completed={};self.events={};self.schedulers=[]
-        self.metadata=None;self.original_handler=None;self.generation=0;self.bus_task=None
-        self.original_put=life.event_queue.put_nowait
-        def observed_put(event):
-            key=str(event.message_obj.message_id)
-            if key in self.records:
-                self.records[key]['queued']+=1;self.events[key]=event
-            return self.original_put(event)
-        life.event_queue.put_nowait=observed_put
-
-    def bind_handler(self):
-        assert self.metadata is None
-        plugin=self.context.get_registered_star(self.plugin_name).star_cls
-        [metadata]=[h for h in star_handlers_registry.get_handlers_by_event_type(
-            EventType.AdapterMessageEvent,plugins_name=[self.plugin_name]) if h.handler_name=='ingress']
-        original=metadata.handler
-        assert isinstance(original,partial) and original.args[0] is plugin
-        self.generation+=1;generation=self.generation
-        async def observed_handler(event,**kwargs):
-            key=str(event.message_obj.message_id)
-            if key not in self.records:return await original(event,**kwargs)
-            record=self.records[key]
-            assert self.events[key] is event
-            record.update(handler_entered=True,handler_generation=generation,
-                event_module=type(event).__module__,event_class=type(event).__name__)
-            result=await original(event,**kwargs)
-            from sylanne3.host.astrbot import build_astrbot_ingress
-            envelope=await build_astrbot_ingress(event,self.context)
-            assert envelope.namespace.as_tuple==(self.identity['bot_id'],self.identity['persona_id'])
-            assert event.unified_msg_origin==self.identity['umo']
-            record.update(handler_returned=True,namespace={'bot_id':envelope.namespace.bot_id,
-                'persona_id':envelope.namespace.persona_id},umo=event.unified_msg_origin)
-            return result
-        self.metadata=metadata;self.original_handler=original;metadata.handler=observed_handler
-
-    def unbind_handler(self):
-        if self.metadata is not None:
-            self.metadata.handler=self.original_handler
-            self.metadata=None;self.original_handler=None
-
-    def observe_scheduler(self,scheduler):
-        original=scheduler.execute
-        async def execute(event):
-            key=str(event.message_obj.message_id)
-            if key not in self.records:return await original(event)
-            record=self.records[key]
-            assert self.events[key] is event
-            record['pipeline_entered']=True
-            try:
-                await original(event)
-                record['pipeline_returned']=True
-            finally:self.completed[key].set()
-        scheduler.execute=execute;self.schedulers.append((scheduler,original))
-
-    async def submit(self,peer,*,message_id,user_id,text):
-        assert type(message_id) is int and message_id>1
-        assert type(text) is str and 0<len(text)<=1024
-        key=str(message_id)
-        assert key not in self.records,'fixture input may not be retried'
-        self.records[key]={'message_id':key,'queued':0,'pipeline_entered':False,
-            'pipeline_returned':False,'handler_entered':False,'handler_returned':False}
-        self.completed[key]=asyncio.Event()
-        await peer.message(message_id=message_id,user_id=user_id,text=text)
-        await asyncio.wait_for(self.completed[key].wait(),30)
-        result=self.records[key]
-        assert result['queued']==1 and all(result[k] for k in (
-            'pipeline_entered','pipeline_returned','handler_entered','handler_returned'))
-        if not peer.m1_scenario:assert all(action=='get_login_info' for action in peer.actions)
-        return {**result,'scope':'native SDK identity and handler route; business completion requires separate actual originals'}
-
-    async def close(self):
-        if self.bus_task is not None:
-            self.bus_task.cancel();await asyncio.gather(self.bus_task,return_exceptions=True)
-        pending=tuple(self.life.event_bus._pending_tasks) if self.bus_task is not None else ()
-        unresolved=set()
-        try:
-            if pending:
-                _,unresolved=await asyncio.wait(pending,timeout=30)
-                for task in unresolved:task.cancel()
-                await asyncio.gather(*pending,return_exceptions=True)
-        finally:
-            self.unbind_handler()
-            self.life.event_queue.put_nowait=self.original_put
-            for scheduler,original in self.schedulers:scheduler.execute=original
-        if unresolved:raise TimeoutError('owned native pipeline did not drain before fixture cleanup')
-
-async def run():
-    settings=json.loads((ROOT/'fixture-input.json').read_text())
-    identity_only=sys.argv[1:]==['--identity-only']
-    assert identity_only or not sys.argv[1:]
-    sdk_ingress=settings.get('sdk_ingress')
-    assert not identity_only or sdk_ingress is not None
-    network_requests=[];local_model_requests=[];peer=None;observer=None;identity=None
-    ingress_lock=asyncio.Lock()
-    async with AsyncExitStack() as cleanup:
-        await core.db_helper.initialize();cleanup.push_async_callback(core.db_helper.engine.dispose)
-        await core.sp.initialize()
-        def save_counters():
-            (ROOT/'data/model-network-observation.json').write_text(json.dumps({
-                'requests':len(network_requests),'local_model_requests':len(local_model_requests),
-                'sender_calls':sum(action!='get_login_info' for action in peer.actions) if peer else 0}))
-        cleanup.callback(save_counters)
-        if settings.get('diagnostic_mode')=='first-v2-fence-only' and not identity_only:install_fence_observation()
-        cfg=core.astrbot_config
-        if sdk_ingress is not None:
-            cfg['provider_settings']['enable']=False
-            cfg['platform']=[sdk_ingress['platform']]
-        cfg['dashboard']['username']=settings['dashboard_username']
-        cfg['dashboard']['password_change_required']=False
-        set_dashboard_password_hashes(cfg,settings['dashboard_password'])
-        life=AstrBotCoreLifecycle(LogBroker(),core.db_helper);life.start_time=int(time.time())
-        life.event_queue=asyncio.Queue()
-        life.umop_config_router=UmopConfigRouter(sp=core.sp);await life.umop_config_router.initialize()
-        life.astrbot_config_mgr=AstrBotConfigManager(cfg,life.umop_config_router,core.sp)
-        await life.astrbot_config_mgr.initialize()
-        life.persona_mgr=PersonaManager(core.db_helper,life.astrbot_config_mgr);await life.persona_mgr.initialize()
-        life.provider_manager=ProviderManager(life.astrbot_config_mgr,core.db_helper,life.persona_mgr)
-        life.conversation_manager=ConversationManager(core.db_helper)
-        life.platform_message_history_manager=PlatformMessageHistoryManager(core.db_helper)
-        life.platform_manager=PlatformManager(cfg,life.event_queue) if sdk_ingress is not None else None
-        life.astrbot_updater=None
-        context=Context(life.event_queue,cfg,core.db_helper,life.provider_manager,life.platform_manager,
-            life.conversation_manager,life.platform_message_history_manager,life.persona_mgr,life.astrbot_config_mgr,None,None)
-        manager=PluginManager(context,cfg);life.star_context=context;life.plugin_manager=manager
-        if sdk_ingress is not None:
-            cleanup.push_async_callback(life.platform_manager.terminate)
-            await life.platform_manager.load_platform(sdk_ingress['platform'])
-            [adapter]=life.platform_manager.get_insts();assert type(adapter) is AiocqhttpAdapter
-            peer=LocalOneBotV11(adapter,sdk_ingress['self_id'],sdk_ingress['platform']['ws_reverse_token'])
-            peer.m1_scenario=settings.get('scenario') in ('sdk_m1_two_messages_v1','sdk_m1_first_bubble_stop_v1','sdk_m1_first_bubble_unknown_v1','sdk_ordinary_old_source_v1','sdk_ordinary_greeting_v1','sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1','sdk_a06_real_elapsed_phases_v1');peer.m1_sender_id=str(sdk_ingress['user_id'])
-            peer.m1_boundary={'sdk_m1_first_bubble_stop_v1':'stop','sdk_m1_first_bubble_unknown_v1':'unknown'}.get(settings.get('scenario'))
-            cleanup.push_async_callback(peer.close);await peer.start()
-        if identity_only:
-            candidate=Path('/opt/b04-candidate')
-            assert hashlib.sha256((candidate/'release-manifest.json').read_bytes()).hexdigest()==settings['manifest_sha256']
-            sys.path.insert(0,str(candidate))
-            from _runtime_bootstrap import load_canonical_runtime_v1
-            load_canonical_runtime_v1(candidate)
-            await life.persona_mgr.create_persona(sdk_ingress['persona_id'],'Local SDK identity fixture.',tools=[],skills=[])
-            await peer.message(message_id=1,user_id=sdk_ingress['user_id'],text='fixture identity observation')
-            event=await asyncio.wait_for(life.event_queue.get(),5)
-            assert event.get_platform_id()==adapter.meta().id and event.get_self_id()==peer.self_id
-            umo=event.unified_msg_origin
-            await life.conversation_manager.new_conversation(umo,platform_id=event.get_platform_id(),persona_id=sdk_ingress['persona_id'])
-            identity=await actual_sdk_identity(context,adapter,peer,umo)
-            assert identity['selected_persona_id']==sdk_ingress['persona_id']
-            if settings.get('scenario') in ('sdk_m1_two_messages_v1','sdk_m1_first_bubble_stop_v1','sdk_m1_first_bubble_unknown_v1','sdk_ordinary_old_source_v1','sdk_ordinary_greeting_v1','sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1','sdk_a06_real_elapsed_phases_v1'):
-                from sylanne3.host.astrbot import build_astrbot_ingress
-                observed=await build_astrbot_ingress(event,context)
-                assert observed.namespace.as_tuple==(identity['bot_id'],identity['persona_id']) and observed.visibility=='private'
-                ingress_identity={'schema':'sylanne.sdk-preinstall-ingress.v1','platform_ref':observed.platform_ref,
-                    'sender_ref':observed.sender_ref,'conversation_ref':observed.conversation_ref,'visibility':observed.visibility}
-                ingress_target=ROOT/'data/sdk-preinstall-ingress.json'
-                ingress_target.write_text(json.dumps(ingress_identity,separators=(',',':')))
-                with ingress_target.open('rb') as stream:os.fsync(stream.fileno())
-            target=ROOT/'data/sdk-preinstall-identity.json'
-            target.write_text(json.dumps(identity,separators=(',',':')))
-            with target.open('rb') as stream:os.fsync(stream.fileno())
-            assert all(action=='get_login_info' for action in peer.actions)
-            return
-        async def local_model_observer(reader,writer):
-            await reader.readline();network_requests.append('request')
-            writer.write(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
-            await writer.drain();writer.close();await writer.wait_closed()
-        model_observer=await asyncio.start_server(local_model_observer,'127.0.0.1',19661)
-        cleanup.push_async_callback(close_listener,model_observer)
-        provider=json.loads(Path(settings['provider_config_path']).read_text())
-        await life.provider_manager.load_provider(provider)
-        [model]=life.provider_manager.provider_insts
-        if sdk_ingress is not None:
-            from openai import AsyncOpenAI
-            m1_model=None
-            if settings.get('scenario') in ('sdk_m1_two_messages_v1','sdk_m1_first_bubble_stop_v1','sdk_m1_first_bubble_unknown_v1','sdk_ordinary_old_source_v1','sdk_ordinary_greeting_v1','sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1','sdk_a06_real_elapsed_phases_v1'):
-                sys.path.insert(0,'/opt/sylanne-b04-fixture')
-                from sdk_m1_model_fixture_v1 import FiniteSdkM1ModelFixtureV1
-                m1_model=FiniteSdkM1ModelFixtureV1(settings['m1_model_fixture'])
-            async def closed_model_transport(request):
-                local_model_requests.append({'method':request.method,'path':request.url.path})
-                if m1_model is None:raise RuntimeError('B04 SDK route fixture has no M1 model response script')
-                installed=instance()._v2_installation
-                if installed is None:raise RuntimeError('M1 provider cannot run before actual installed bundle')
-                return m1_model.respond(request,installed_bundle=installed.admin_bundle)
-            previous=model.client
-            model.client=AsyncOpenAI(api_key=model.chosen_api_key,base_url=provider['api_base'],
-                default_headers=model.custom_headers,timeout=model.timeout,max_retries=0,
-                http_client=httpx.AsyncClient(transport=httpx.MockTransport(closed_model_transport),trust_env=False))
-            await previous.close()
-        cleanup.push_async_callback(model.client.close)
-        name='astrbot_plugin_sylanne'
-        schema=manager._load_plugin_config_schema('/opt/sylanne/bootstrap/host/_conf_schema.json')
-        plugin_config=AstrBotConfig(str(Path(manager.plugin_config_path)/(name+'_config.json')),schema=schema)
-        plugin_config.save_config(settings['plugin_configuration'])
-        import subprocess
-        original_probe_run = subprocess.run
-        def observed_probe_run(argv, *args, **kwargs):
-            target = '/opt/sylanne/bootstrap/selection_probe.py'
-            if type(argv) is not list or target not in argv:
-                return original_probe_run(argv, *args, **kwargs)
-            observed_argv = [argv[0], '-X', 'importtime', *argv[1:]]
-            started = time.monotonic()
-            text, status, returned = '', 'first_internal_failure', None
-            try:
-                result = original_probe_run(observed_argv, *args, **kwargs)
-            except subprocess.TimeoutExpired as error:
-                text = error.stderr.decode('utf-8', errors='replace') if isinstance(error.stderr, bytes) else error.stderr or ''
-                status, returned = 'first_timeout', None
-                raise
-            except subprocess.CalledProcessError as error:
-                text = error.stderr.decode('utf-8', errors='replace') if isinstance(error.stderr, bytes) else error.stderr or ''
-                status, returned = 'first_child_failure', error.returncode
-                raise
-            else:
-                text, status, returned = result.stderr or '', 'completed', result.returncode
-                return result
-            finally:
-                rows = [line for line in text.splitlines() if line.startswith('import time:')][-256:]
-                diagnostic = {'schema': 'sylanne.b04.first-selection-probe-import.v1',
-                    'status': status, 'returncode': returned, 'elapsed_seconds': time.monotonic()-started,
-                    'declared_timeout_seconds': kwargs.get('timeout'), 'probe_mode': 'host' if '--host' in argv else 'authority',
-                    'script_sha256': hashlib.sha256(Path(target).read_bytes()).hexdigest(),
-                    'import_time_rows': rows, 'scope': 'Only actual module import names/timings; no output/config/credentials; original validation and timeout unchanged'}
-                index = len(list((ROOT/'data').glob('selection-probe-import-*.json')))
-                observed = ROOT/'data'/('selection-probe-import-'+str(index)+'.json')
-                observed.write_text(json.dumps(diagnostic,indent=2))
-                with observed.open('rb') as stream:os.fsync(stream.fileno())
-        subprocess.run = observed_probe_run
-        try:
-            success,error=await manager.load(specified_dir_name=name)
-        finally:
-            subprocess.run = original_probe_run
-        if not success:
-            sys.stderr.write('B04_SDK_LOAD_ERROR_V1 '+json.dumps({'error':error,
-                'failed_plugin':manager.failed_plugin_dict.get(name)},separators=(',',':'))+'\n')
-            sys.stderr.flush();os.fsync(sys.stderr.fileno())
-            raise RuntimeError('actual_sdk_plugin_load_failed')
-        async def terminate_current_plugin():await context.get_registered_star(name).star_cls.terminate()
-        cleanup.push_async_callback(terminate_current_plugin)
-        def require_actual_sdk_namespace(plugin, identity):
-            if plugin._installed_namespace is None:
-                observation = {'schema':'sylanne.b04.sdk-initialization-failure.v1',
-                    'runtime_stage':plugin.runtime_health.status,
-                    'reason_codes':list(plugin.runtime_health.missing_capabilities),
-                    'setup_present':plugin._setup_installation is not None,
-                    'runtime_present':plugin._runtime is not None,
-                    'installed_namespace_present':False,
-                    'observed_wall_time_ns':time.time_ns(),
-                    'observed_monotonic_ns':time.monotonic_ns()}
-                sys.stderr.write('B04_SDK_INITIALIZATION_NOT_ADMITTED '+json.dumps(observation,separators=(',',':'))+'\n')
-                sys.stderr.flush();os.fsync(sys.stderr.fileno())
-                error = RuntimeError('actual_sdk_initialization_not_admitted')
-                error.b04_initialization_observation = observation
-                raise error
-            assert plugin._installed_namespace.as_tuple==(identity['bot_id'],identity['persona_id'])
-        if sdk_ingress is not None:
-            identity=json.loads(Path(settings['sdk_identity_path']).read_text())
-            assert await actual_sdk_identity(context,adapter,peer,identity['umo'])=={k:v for k,v in identity.items() if k!='ingress_identity'}
-            require_actual_sdk_namespace(context.get_registered_star(name).star_cls,identity)
-            observer=NativeIngressObservation(context,life,name,identity)
-            cleanup.push_async_callback(observer.close);observer.bind_handler()
-            life.pipeline_scheduler_mapping=await life.load_pipeline_scheduler()
-            for scheduler in life.pipeline_scheduler_mapping.values():observer.observe_scheduler(scheduler)
-            life.event_bus=EventBus(life.event_queue,life.pipeline_scheduler_mapping,life.astrbot_config_mgr)
-            observer.bus_task=asyncio.create_task(life.event_bus.dispatch(),name='b04_native_event_bus')
-        dashboard=AstrBotDashboard(life,core.db_helper,asyncio.Event())
-        client=httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.asgi_app),base_url=settings['origin'])
-        cleanup.push_async_callback(client.aclose)
-        stopped=asyncio.Event()
-        for event in (signal.SIGTERM,signal.SIGINT):asyncio.get_running_loop().add_signal_handler(event,stopped.set)
-        def instance():return context.get_registered_star(name).star_cls
-        def health():
-            plugin=instance();runtime=plugin._runtime
-            sys.stderr.write('B04_RUNTIME_HEALTH_DETAIL '+json.dumps({'status':plugin.runtime_health.status,
-                'detail':plugin.runtime_health.detail},separators=(',',':'))+'\n')
-            sys.stderr.flush();os.fsync(sys.stderr.fileno())
-            package=sys.modules['data.plugins.'+name+'.main'].PACKAGE_ROOT
-            from sylanne3.authority_service.c09_process_identity_v1 import read_process_identity_v1
-            return dict(schema='sylanne.b04.sdk-host-health.v1',runtime_stage=plugin.runtime_health.status,
-                fixture_phase=settings['fixture_phase'],
-                reason_codes=list(plugin.runtime_health.missing_capabilities),runtime_started=runtime is not None,
-                worker_started=runtime is not None and runtime._worker is not None,
-                package_root=str(package),main_path=str(sys.modules['data.plugins.'+name+'.main'].__file__),
-                manifest_sha256=hashlib.sha256((package/'release-manifest.json').read_bytes()).hexdigest(),
-                process_id=os.getpid(),process_original=read_process_identity_v1(os.getpid()),uid=os.geteuid(),sdk=version('astrbot'),
-                provider_network_requests=len(network_requests),platform_manager_initialized=life.platform_manager is not None,
-                platform_instances=len(life.platform_manager.get_insts()) if life.platform_manager else 0,
-                sender_instances=len(life.platform_manager.get_insts()) if life.platform_manager else 0,
-                sender_calls=sum(action!='get_login_info' for action in peer.actions) if peer else 0,
-                local_model_requests=len(local_model_requests),sdk_identity=identity,
-                native_handler_generation=observer.generation if observer else 0,
-                model_fixture_calls=list(m1_model.calls) if settings.get('scenario') in ('sdk_m1_two_messages_v1','sdk_m1_first_bubble_stop_v1','sdk_m1_first_bubble_unknown_v1','sdk_ordinary_old_source_v1','sdk_ordinary_greeting_v1','sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1','sdk_a06_real_elapsed_phases_v1') else [],
-                sender_fixture_observations=list(peer.sender_observations) if peer else [],
-                natural_boundary_received=bool(peer and peer.m1_boundary_received))
-        async def rpc(reader,writer):
-            try:
-                _pid,uid,_gid=struct.unpack('3i',writer.get_extra_info('socket').getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
-                if uid!=0:raise PermissionError('fixture_controller_root_required')
-                raw=await reader.readline()
-                if len(raw)>65536:raise ValueError('fixture_request_bound')
-                request=json.loads(raw);action=request['action']
-                if action=='health' and set(request)=={'action'}:
-                    result=health()
-                elif action=='release_natural_boundary' and set(request)=={'action'}:
-                    if peer is None or peer.m1_boundary!='stop' or not peer.m1_boundary_received:
-                        raise RuntimeError('actual local Stop boundary was not reached')
-                    peer.m1_boundary_release.set();result={'released':True}
-                elif action=='natural_core_originals' and set(request)=={'action','parent_original_id'}:
-                    runtime=instance()._runtime
-                    def read(graph):
-                        from sylanne3.runtime.natural_same_batch_history_v3 import read_natural_roster_head_v1
-                        from sylanne3.authority_service.natural_disposition_maintenance_v1 import natural_disposition_original_ref_v1
-                        bundle=instance()._v2_installation
-                        ns=bundle.installation_policy.namespace;ans=bundle.installation_policy.authority_namespace
-                        with graph._GraphCoordinator__store._lock:
-                            head=read_natural_roster_head_v1(graph._GraphCoordinator__store._db,ns,request['parent_original_id'])
-                        if head is None:return None
-                        facts=[]
-                        for ref in dict.fromkeys((head[2].birth_original_ref,head[2].authority_original_ref)):
-                            prepared=runtime._v2_port.read_natural_disposition_original_v1(namespace=ns,authority_namespace=ans,original_ref=ref)
-                            kind='roster_committed' if prepared.kind=='roster_prepared' else 'maintenance_committed'
-                            cref=natural_disposition_original_ref_v1(ans,bundle.installation_policy.installation_id,head[2].parent_original_id,kind,prepared.operation_id)
-                            committed=runtime._v2_port.read_natural_disposition_original_v1(namespace=ns,authority_namespace=ans,original_ref=cref)
-                            assert committed.payload['prepared_original_digest']==prepared.digest
-                            assert committed.payload['next_payload_digest']==prepared.payload['next_payload_digest']
-                            if ref==head[2].authority_original_ref:assert prepared.payload['expected_next_value']==head[2].to_wire()
-                            facts.append({'prepared_kind':prepared.kind,'prepared_ref':prepared.original_ref,'prepared_digest':prepared.digest,
-                                'committed_kind':committed.kind,'committed_ref':committed.original_ref,'committed_digest':committed.digest})
-                        return {'roster_ref':head[0].token,'revision':head[1],'original_pairs':facts}
-                    result=await runtime._worker.call(read)
-                elif action=='http' and set(request)=={'action','method','path','headers','json'}:
-                    response=await client.request(request['method'],request['path'],headers=request['headers'],json=request['json'])
-                    # This body remains on the private socket, never an evidence log.
-                    result={'http_status':response.status_code,'json':response.json()}
-                elif action=='provision_original' and set(request)=={'action','operation_id'}:
-                    runtime=instance()._runtime
-                    original=await runtime.provision_installed_namespace(request['operation_id'])
-                    from sylanne3.graph_coordinator import NamespaceProvisionReceiptV2
-                    from sylanne3.authority_service.v2_contract import from_wire as fence_from_wire
-                    if type(original) is not NamespaceProvisionReceiptV2:
-                        raise TypeError('actual_namespace_provision_receipt_required')
-                    def completed_fence(_graph):
-                        return runtime._v2_port.get_fence_operation(namespace=original.namespace,
-                            authority_namespace=original.authority_namespace,operation_id=original.fence_attempt_id)
-                    observed,state=await runtime._worker.call(completed_fence)
-                    if observed!=fence_from_wire(original.permit_wire) or state!='finished':
-                        raise RuntimeError('actual_namespace_provision_write_fence_not_finished')
-                    from dataclasses import asdict
-                    result=asdict(original)
-                elif action=='ordinary_ingress' and set(request)=={'action','message_id','text'}:
-                    assert observer is not None
-                    async with ingress_lock:
-                        before=len(local_model_requests)
-                        result=await observer.submit(peer,message_id=request['message_id'],
-                            user_id=sdk_ingress['user_id'],text=request['text'])
-                        if settings.get('scenario') in ('sdk_m1_two_messages_v1','sdk_m1_first_bubble_stop_v1','sdk_m1_first_bubble_unknown_v1','sdk_ordinary_old_source_v1','sdk_ordinary_greeting_v1','sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1','sdk_a06_real_elapsed_phases_v1'):
-                            assert request['message_id'] in {item['message_id'] for item in settings['m1_model_fixture']['episodes']}
-                            assert 0<=len(local_model_requests)-before<=6 and len(m1_model.calls)<=settings['m1_model_fixture']['max_total_calls'] and not network_requests
-                        else:assert len(local_model_requests)==before==0 and not network_requests
-                        result.update(sdk_identity=identity,local_model_requests=len(local_model_requests),
-                            sender_calls=sum(action!='get_login_info' for action in peer.actions))
-                elif action=='d13_v6_collection_originals' and set(request)=={'action','source_ref'}:
-                    if settings.get('scenario') not in ('sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1'):raise ValueError('fixed256 SDK scenario required')
-                    from sdk_m1_fixture_contract_v1 import actual_d13_v6_collection_originals_v1
-                    plugin=instance();runtime=plugin._runtime;policy=runtime._v2_policy
-                    def read_v6_collection(graph):
-                        anchor=runtime._v2_port.current_anchor(namespace=policy.namespace,authority_namespace=policy.authority_namespace)
-                        store=graph._GraphCoordinator__store
-                        with store._lock:
-                            db=store._db;db.execute('BEGIN')
-                            try:return actual_d13_v6_collection_originals_v1(db,namespace=policy.namespace,source_ref=request['source_ref'],
-                                activation_generation=anchor.activation_generation,now_utc=time.time())
-                            finally:db.rollback()
-                    result=await runtime._worker.call(read_v6_collection)
-                elif action=='d13_v6_episode_originals' and set(request)=={'action','message_id'}:
-                    if settings.get('scenario') not in ('sdk_d13_v6_256_current_v1','sdk_d13_v7_256_current_v1'):raise ValueError('fixed256 SDK scenario required')
-                    from sdk_m1_fixture_contract_v1 import actual_d13_v6_episode_originals_v1,actual_d13_v7_episode_originals_v1
-                    episode=next(item for item in settings['m1_model_fixture']['episodes'] if item['message_id']==request['message_id'])
-                    plugin=instance();runtime=plugin._runtime
-                    def read_v6_episode(graph):
-                        store=graph._GraphCoordinator__store
-                        with store._lock:
-                            db=store._db;db.execute('BEGIN')
-                            try:
-                                if settings['scenario']=='sdk_d13_v7_256_current_v1':
-                                    return actual_d13_v7_episode_originals_v1(db,namespace=plugin._installed_namespace,
-                                        episode=episode,issuer=graph._GraphCoordinator__d11_issuer,
-                                        installed_wire_policy=plugin._setup_installation.admin_bundle.d13_wire_policy)
-                                return actual_d13_v6_episode_originals_v1(db,namespace=plugin._installed_namespace,
-                                    episode=episode,issuer=graph._GraphCoordinator__d11_issuer)
-                            finally:db.rollback()
-                    result=await runtime._worker.call(read_v6_episode)
-                elif action=='greeting_need_originals' and set(request)=={'action','message_id'}:
-                    if settings.get('scenario')!='sdk_ordinary_greeting_v1':raise ValueError('greeting fixed scenario required')
-                    from sdk_m1_fixture_contract_v1 import actual_greeting_need_original_v1
-                    episodes=[item for item in settings['m1_model_fixture']['episodes'] if item['message_id']==request['message_id']]
-                    if len(episodes)!=1:raise ValueError('unknown finite greeting SDK message')
-                    plugin=instance();runtime=plugin._runtime
-                    def read_greeting(graph):
-                        store=graph._GraphCoordinator__store
-                        with store._lock:
-                            db=store._db;db.execute('BEGIN')
-                            try:return actual_greeting_need_original_v1(db,namespace=plugin._installed_namespace,episode=episodes[0])
-                            finally:db.rollback()
-                    result=await runtime._worker.call(read_greeting)
-                elif action=='ordinary_recall_originals' and set(request)=={'action','message_id','previous_source_ref'}:
-                    if settings.get('scenario')!='sdk_ordinary_old_source_v1':raise ValueError('ordinary recall fixture scenario required')
-                    from sdk_m1_fixture_contract_v1 import actual_ordinary_episode_originals_v1
-                    episodes=[item for item in settings['m1_model_fixture']['episodes'] if item['message_id']==request['message_id']]
-                    if len(episodes)!=1:raise ValueError('unknown finite ordinary SDK message')
-                    plugin=instance();runtime=plugin._runtime
-                    def read_originals(graph):
-                        store=graph._GraphCoordinator__store
-                        with store._lock:
-                            db=store._db;db.execute('BEGIN')
-                            try:return actual_ordinary_episode_originals_v1(db,namespace=plugin._installed_namespace,
-                                episode=episodes[0],issuer=graph._GraphCoordinator__d11_issuer,
-                                previous_source_ref=request['previous_source_ref'])
-                            finally:db.rollback()
-                    result=await runtime._worker.call(read_originals)
-                elif action=='real_elapsed_originals' and set(request)=={'action','phase_index'}:
-                    if settings.get('scenario')!='sdk_a06_real_elapsed_phases_v1':raise ValueError('real elapsed phase scenario required')
-                    from sdk_m1_fixture_contract_v1 import REAL_ELAPSED_EPISODES,actual_episode_originals_v1,actual_ordinary_episode_originals_v1
-                    plugin=instance();runtime=plugin._runtime;index=request['phase_index']
-                    if type(index) is not int or not 0<=index<=2:raise ValueError('actual real elapsed phase index required')
-                    def read_phase(graph):
-                        store=graph._GraphCoordinator__store
-                        phase=actual_episode_originals_v1(graph_path=store._db.execute('PRAGMA database_list').fetchone()[2],
-                            namespace=plugin._installed_namespace,episode=REAL_ELAPSED_EPISODES[0 if index==0 else 1],
-                            expected_phase='partial' if index==0 else 'satisfied',expected_version=1 if index==0 else 2,
-                            cumulative_sender_count=4 if index==2 else None)
-                        if phase is None:return None
-                        if index in (1,2):
-                            with store._lock:
-                                db=store._db;db.execute('BEGIN')
-                                try:
-                                    recall=actual_ordinary_episode_originals_v1(db,namespace=plugin._installed_namespace,
-                                        episode=REAL_ELAPSED_EPISODES[index],issuer=graph._GraphCoordinator__d11_issuer,
-                                        previous_source_ref=settings['real_elapsed_day0_source_ref'],
-                                        required_artifact_refs=(phase['work_originals'][-1]['work']['artifact_ref'],phase['work_originals'][-1]['readback']['content_digest']) if index==2 else ())
-                                finally:db.rollback()
-                            if recall is None:return None
-                            phase={**phase,'day4_recall' if index==1 else 'day5_ordinary':recall}
-                        return phase
-                    result=await runtime._worker.call(read_phase)
-                elif action=='real_elapsed_meter' and set(request)=={'action'}:
-                    if settings.get('scenario')!='sdk_a06_real_elapsed_phases_v1':raise ValueError('real elapsed meter requires its actual schema')
-                    result={'calls':list(m1_model.calls),'max_total_calls':18,'max_episode_calls':6,'max_auxiliary_calls':2,
-                        'current_process_model_requests':len(local_model_requests),'current_process_sender_calls':sum(a!='get_login_info' for a in peer.actions),
-                        'provider_network_requests':len(network_requests)}
-                elif action=='hot_reload' and set(request)=={'action'}:
-                    async with ingress_lock:
-                        if observer is not None:
-                            assert not life.event_bus._pending_tasks and life.event_queue.empty()
-                            observer.unbind_handler()
-                        old=instance();old_runtime=old._runtime
-                        success,error=await manager.reload(name)
-                        if not success:raise RuntimeError('actual_sdk_reload_failed')
-                        if observer is not None:
-                            assert await actual_sdk_identity(context,adapter,peer,identity['umo'])==identity
-                            require_actual_sdk_namespace(instance(),identity)
-                            observer.bind_handler()
-                        result={**health(),'new_plugin_instance':instance() is not old,
-                            'old_runtime_worker_closed':old_runtime is not None and old_runtime._worker is None}
-                else:raise ValueError('closed_fixture_action_required')
-                writer.write(json.dumps({'status':'ok','result':result},separators=(',',':')).encode()+b'\n')
-            except Exception as error:
-                private_exception('B04_FIXTURE_RPC_EXCEPTION',error)
-                writer.write(json.dumps({'status':'failed','type':type(error).__name__},separators=(',',':')).encode()+b'\n')
-            finally:
-                await writer.drain();writer.close();await writer.wait_closed()
-        endpoint=Path('/run/sylanne-b04-host/fixture.sock')
-        ready=ROOT/'data/host-ready.json';ready.write_text(json.dumps(health(),separators=(',',':')))
-        with ready.open('rb') as stream:os.fsync(stream.fileno())
-        server=await asyncio.start_unix_server(rpc,path=endpoint,limit=65537)
-        cleanup.callback(endpoint.unlink,missing_ok=True)
-        cleanup.push_async_callback(close_listener,server)
-        os.chmod(endpoint,0o600)
-        await stopped.wait()
-try:
-    asyncio.run(run())
-except BaseException as error:
-    private_exception('B04_HOST_FIRST_EXCEPTION',error)
-    failure = {'type':type(error).__name__,
-        'frames':[{'file':f.filename,'line':f.lineno,'function':f.name}
-            for f in traceback.extract_tb(error.__traceback__)]}
-    if hasattr(error,'b04_initialization_observation'):
-        failure['initialization'] = error.b04_initialization_observation
-    (ROOT/'data/host-first-failure.json').write_text(json.dumps(failure))
-    raise
-'''
+SDK_HOST_ENTRY_V1 = 'from pathlib import Path\nimport asyncio, ast, hashlib, json, os, signal, socket, struct, sys, time, traceback\nfrom importlib.metadata import version\n\nROOT=Path(\'/var/lib/sylanne-b04-host\')\nos.environ.update(ASTRBOT_ROOT=str(ROOT),ASTRBOT_DISABLE_METRICS=\'1\',ASTRBOT_RELOAD=\'0\')\nos.chdir(ROOT);sys.dont_write_bytecode=True\nsys.path.insert(0,str(ROOT))\nassert version(\'astrbot\')==\'4.28.2\'\nimport astrbot.core as core\nfrom astrbot.api.star import Context\nfrom astrbot.core.core_lifecycle import AstrBotCoreLifecycle\nfrom astrbot.core.log import LogBroker\nfrom astrbot.core.umop_config_router import UmopConfigRouter\nfrom astrbot.core.astrbot_config_mgr import AstrBotConfigManager\nfrom astrbot.core.persona_mgr import PersonaManager\nfrom astrbot.core.provider.manager import ProviderManager\nfrom astrbot.core.conversation_mgr import ConversationManager\nfrom astrbot.core.platform_message_history_mgr import PlatformMessageHistoryManager\nfrom astrbot.core.config.astrbot_config import AstrBotConfig\nfrom astrbot.core.star.star_manager import PluginManager\nfrom astrbot.dashboard.server import AstrBotDashboard\nfrom astrbot.dashboard.password_state import set_dashboard_password_hashes\nimport httpx\n\ndef private_exception(label,error):\n    sys.stderr.write(label+\'\\n\'+\'\'.join(traceback.format_exception(error)))\n    sys.stderr.flush();os.fsync(sys.stderr.fileno())\n\ndef install_fence_observation():\n    installed=Path(\'/opt/sylanne/code\')\n    sys.path.insert(0,str(installed))\n    from _runtime_bootstrap import load_canonical_runtime_v1\n    load_canonical_runtime_v1(installed)\n    from sylanne3.host.v2_fence_port import V2FencePort\n    from sylanne3.host.mtls_transport import MtlsAuthorityTransport\n    import inspect,threading\n    sources=sorted({Path(inspect.getsourcefile(value)) for value in\n        (V2FencePort,MtlsAuthorityTransport,MtlsAuthorityTransport._rpc)},key=str)\n    literals={node.value for source in sources for node in ast.walk(ast.parse(source.read_text()))\n        if isinstance(node,ast.Constant) and isinstance(node.value,str)}\n    rows=[];lock=threading.Lock()\n    def record(kind,method,started,error=None,timeout=None):\n        row={\'kind\':kind,\'method\':method,\'started_utc\':started[0],\n            \'elapsed_seconds\':time.monotonic()-started[1],\'declared_timeout_seconds\':timeout}\n        if timeout is not None:\n            row[\'declared_deadline_utc\']=started[0]+timeout\n            row[\'deadline_remaining_seconds\']=timeout-row[\'elapsed_seconds\']\n        if error is not None:\n            chain=[];current=error;seen=set()\n            while current is not None and id(current) not in seen:\n                seen.add(id(current));message=str(current)\n                chain.append({\'type\':type(current).__name__,\n                    \'static_message\':message if message in literals else None,\n                    \'frames\':[{\'file\':f.filename,\'line\':f.lineno,\'function\':f.name}\n                        for f in traceback.extract_tb(current.__traceback__)]})\n                current=current.__cause__ or current.__context__\n            row[\'exception_chain\']=chain;private_exception(\'B04_V2_INTERNAL_EXCEPTION \'+kind+\' \'+method,error)\n        with lock:\n            rows.append(row)\n            path=ROOT/\'data/v2-fence-observation.json\'\n            path.write_text(json.dumps({\'sources\':[{\'path\':str(p),\'sha256\':hashlib.sha256(p.read_bytes()).hexdigest()}\n                for p in sources],\'events\':rows},separators=(\',\',\':\')))\n            with path.open(\'rb\') as stream:os.fsync(stream.fileno())\n    original_submit=V2FencePort._submit\n    def submit(self,coroutine):\n        method=coroutine.cr_code.co_name;started=(time.time(),time.monotonic())\n        try:result=original_submit(self,coroutine)\n        except BaseException as error:record(\'fence_submit\',method,started,error,self._timeout);raise\n        record(\'fence_submit\',method,started,timeout=self._timeout);return result\n    original_rpc=MtlsAuthorityTransport._rpc\n    async def transport_rpc(self,session,profile,method,*args,**kwargs):\n        started=(time.time(),time.monotonic())\n        try:result=await original_rpc(self,session,profile,method,*args,**kwargs)\n        except BaseException as error:record(\'transport_rpc\',method,started,error,profile.timeout_seconds);raise\n        record(\'transport_rpc\',method,started,timeout=profile.timeout_seconds);return result\n    V2FencePort._submit=submit;MtlsAuthorityTransport._rpc=transport_rpc\n\n\nimport aiohttp\nfrom contextlib import AsyncExitStack\nfrom functools import partial\nfrom astrbot.core.event_bus import EventBus\nfrom astrbot.core.platform.manager import PlatformManager\nfrom astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter\nfrom astrbot.core.star.star_handler import EventType,star_handlers_registry\n\nclass LocalOneBotV11:\n    def __init__(self,adapter,self_id,token):\n        self.adapter=adapter;self.self_id=str(self_id);self.token=token\n        self.actions=[];self.sender_observations=[];self.session=None;self.ws=None;self.reader=None\n        self.m1_scenario=False;self.m1_sender_id=None\n        self.m1_boundary=None;self.m1_boundary_received=False;self.m1_boundary_release=asyncio.Event()\n\n    async def start(self):\n        assert self.adapter.host==\'127.0.0.1\'\n        self.session=aiohttp.ClientSession(trust_env=False)\n        headers={\'X-Client-Role\':\'universal\',\'X-Self-ID\':self.self_id,\n            \'Authorization\':\'Bearer \'+self.token}\n        async with asyncio.timeout(10):\n            while True:\n                try:\n                    self.ws=await self.session.ws_connect(\n                        f\'http://127.0.0.1:{int(self.adapter.port)}/ws\',headers=headers)\n                    break\n                except aiohttp.ClientConnectorError:await asyncio.sleep(.05)\n        self.reader=asyncio.create_task(self.read_actions(),name=\'b04_local_onebot_peer\')\n        await self.ws.send_json({\'time\':int(time.time()),\'self_id\':int(self.self_id),\n            \'post_type\':\'meta_event\',\'meta_event_type\':\'lifecycle\',\'sub_type\':\'connect\'})\n        login=await asyncio.wait_for(self.adapter.bot.call_action(\'get_login_info\',self_id=self.self_id),5)\n        assert str(login[\'user_id\'])==self.self_id\n\n    async def read_actions(self):\n        async for frame in self.ws:\n            if frame.type!=aiohttp.WSMsgType.TEXT:continue\n            action=json.loads(frame.data);self.actions.append(action[\'action\'])\n            result=({\'status\':\'ok\',\'retcode\':0,\'data\':{\'user_id\':int(self.self_id),\'nickname\':\'local-fixture\'}}\n                if action[\'action\']==\'get_login_info\' else {\'status\':\'failed\',\'retcode\':1404,\'data\':None})\n            if self.m1_scenario and action[\'action\'] in {\'send_private_msg\',\'send_msg\'}:\n                params=action[\'params\'];target=str(params.get(\'user_id\',\'\'))\n                assert target==self.m1_sender_id and params.get(\'group_id\') is None\n                assert action[\'action\']!=\'send_msg\' or params.get(\'message_type\',\'private\')==\'private\'\n                if len(self.sender_observations)>=8:raise RuntimeError(\'M1 local sender ceiling reached\')\n                self.sender_observations.append({\'action\':action[\'action\'],\'user_id\':target,\n                    \'message_sha256\':hashlib.sha256(json.dumps(params[\'message\'],sort_keys=True).encode()).hexdigest()})\n                result={\'status\':\'ok\',\'retcode\':0,\'data\':{\'message_id\':2718100+len(self.sender_observations)}}\n                if self.m1_boundary is not None and len(self.sender_observations)==2:\n                    self.m1_boundary_received=True\n                    if self.m1_boundary==\'stop\':\n                        await self.m1_boundary_release.wait()\n                    else:\n                        # The local receiver saw a request, but returns no acceptance ID.\n                        # The actual AstrBot sender must record UNKNOWN after its durable start.\n                        result={\'status\':\'ok\',\'retcode\':0,\'data\':{}}\n            await self.ws.send_json({**result,\'echo\':action[\'echo\']})\n\n    async def message(self,*,message_id,user_id,text):\n        await self.ws.send_json({\'time\':int(time.time()),\'self_id\':int(self.self_id),\n            \'post_type\':\'message\',\'message_type\':\'private\',\'sub_type\':\'friend\',\n            \'message_id\':message_id,\'user_id\':user_id,\'sender\':{\'user_id\':user_id,\'nickname\':\'fixture-owner\'},\n            \'message\':[{\'type\':\'text\',\'data\':{\'text\':text}}],\'raw_message\':text,\'font\':0})\n\n    async def close(self):\n        if self.ws is not None:await self.ws.close()\n        if self.reader is not None:\n            self.reader.cancel();await asyncio.gather(self.reader,return_exceptions=True)\n        if self.session is not None:await self.session.close()\n\nasync def close_listener(server):\n    server.close();await server.wait_closed()\n\nasync def actual_sdk_identity(context,adapter,peer,umo):\n    from sylanne3.host.identity import astrbot_namespace\n    login=await asyncio.wait_for(adapter.bot.call_action(\'get_login_info\',self_id=peer.self_id),5)\n    assert str(login[\'user_id\'])==peer.self_id\n    cid=await context.conversation_manager.get_curr_conversation_id(umo)\n    assert cid is not None\n    conversation=await context.conversation_manager.get_conversation(umo,cid,create_if_not_exists=False)\n    assert conversation is not None\n    selected=await context.persona_manager.resolve_selected_persona(umo=umo,\n        conversation_persona_id=conversation.persona_id,platform_name=adapter.meta().name,\n        provider_settings=context.get_config(umo))\n    assert selected[1] is not None\n    namespace=astrbot_namespace(adapter.meta().id,peer.self_id,selected[0])\n    assert await context.conversation_manager.get_curr_conversation_id(umo)==cid\n    return {\'schema\':\'sylanne.sdk-preinstall-identity.v1\',\'sdk\':version(\'astrbot\'),\n        \'platform_id\':adapter.meta().id,\'platform_name\':adapter.meta().name,\'self_id\':peer.self_id,\n        \'selected_persona_id\':selected[0],\'umo\':umo,\'conversation_id\':cid,\n        \'bot_id\':namespace.bot_id,\'persona_id\':namespace.persona_id}\n\nclass NativeIngressObservation:\n    # Original queue/scheduler/registered handler always own event execution.\n    def __init__(self,context,life,plugin_name,identity):\n        self.context=context;self.life=life;self.plugin_name=plugin_name;self.identity=identity\n        self.records={};self.completed={};self.events={};self.schedulers=[]\n        self.metadata=None;self.original_handler=None;self.generation=0;self.bus_task=None\n        self.original_put=life.event_queue.put_nowait\n        def observed_put(event):\n            key=str(event.message_obj.message_id)\n            if key in self.records:\n                self.records[key][\'queued\']+=1;self.events[key]=event\n            return self.original_put(event)\n        life.event_queue.put_nowait=observed_put\n\n    def bind_handler(self):\n        assert self.metadata is None\n        plugin=self.context.get_registered_star(self.plugin_name).star_cls\n        [metadata]=[h for h in star_handlers_registry.get_handlers_by_event_type(\n            EventType.AdapterMessageEvent,plugins_name=[self.plugin_name]) if h.handler_name==\'ingress\']\n        original=metadata.handler\n        assert isinstance(original,partial) and original.args[0] is plugin\n        self.generation+=1;generation=self.generation\n        async def observed_handler(event,**kwargs):\n            key=str(event.message_obj.message_id)\n            if key not in self.records:return await original(event,**kwargs)\n            record=self.records[key]\n            assert self.events[key] is event\n            record.update(handler_entered=True,handler_generation=generation,\n                event_module=type(event).__module__,event_class=type(event).__name__)\n            result=await original(event,**kwargs)\n            from sylanne3.host.astrbot import build_astrbot_ingress\n            envelope=await build_astrbot_ingress(event,self.context)\n            assert envelope.namespace.as_tuple==(self.identity[\'bot_id\'],self.identity[\'persona_id\'])\n            assert event.unified_msg_origin==self.identity[\'umo\']\n            record.update(handler_returned=True,namespace={\'bot_id\':envelope.namespace.bot_id,\n                \'persona_id\':envelope.namespace.persona_id},umo=event.unified_msg_origin)\n            return result\n        self.metadata=metadata;self.original_handler=original;metadata.handler=observed_handler\n\n    def unbind_handler(self):\n        if self.metadata is not None:\n            self.metadata.handler=self.original_handler\n            self.metadata=None;self.original_handler=None\n\n    def observe_scheduler(self,scheduler):\n        original=scheduler.execute\n        async def execute(event):\n            key=str(event.message_obj.message_id)\n            if key not in self.records:return await original(event)\n            record=self.records[key]\n            assert self.events[key] is event\n            record[\'pipeline_entered\']=True\n            try:\n                await original(event)\n                record[\'pipeline_returned\']=True\n            finally:self.completed[key].set()\n        scheduler.execute=execute;self.schedulers.append((scheduler,original))\n\n    async def submit(self,peer,*,message_id,user_id,text):\n        assert type(message_id) is int and message_id>1\n        assert type(text) is str and 0<len(text)<=1024\n        key=str(message_id)\n        assert key not in self.records,\'fixture input may not be retried\'\n        self.records[key]={\'message_id\':key,\'queued\':0,\'pipeline_entered\':False,\n            \'pipeline_returned\':False,\'handler_entered\':False,\'handler_returned\':False}\n        self.completed[key]=asyncio.Event()\n        await peer.message(message_id=message_id,user_id=user_id,text=text)\n        await asyncio.wait_for(self.completed[key].wait(),30)\n        result=self.records[key]\n        assert result[\'queued\']==1 and all(result[k] for k in (\n            \'pipeline_entered\',\'pipeline_returned\',\'handler_entered\',\'handler_returned\'))\n        if not peer.m1_scenario:assert all(action==\'get_login_info\' for action in peer.actions)\n        return {**result,\'scope\':\'native SDK identity and handler route; business completion requires separate actual originals\'}\n\n    async def close(self):\n        if self.bus_task is not None:\n            self.bus_task.cancel();await asyncio.gather(self.bus_task,return_exceptions=True)\n        pending=tuple(self.life.event_bus._pending_tasks) if self.bus_task is not None else ()\n        unresolved=set()\n        try:\n            if pending:\n                _,unresolved=await asyncio.wait(pending,timeout=30)\n                for task in unresolved:task.cancel()\n                await asyncio.gather(*pending,return_exceptions=True)\n        finally:\n            self.unbind_handler()\n            self.life.event_queue.put_nowait=self.original_put\n            for scheduler,original in self.schedulers:scheduler.execute=original\n        if unresolved:raise TimeoutError(\'owned native pipeline did not drain before fixture cleanup\')\n\nasync def run():\n    settings=json.loads((ROOT/\'fixture-input.json\').read_text())\n    identity_only=sys.argv[1:]==[\'--identity-only\']\n    assert identity_only or not sys.argv[1:]\n    sdk_ingress=settings.get(\'sdk_ingress\')\n    assert not identity_only or sdk_ingress is not None\n    network_requests=[];local_model_requests=[];peer=None;observer=None;identity=None\n    ingress_lock=asyncio.Lock()\n    async with AsyncExitStack() as cleanup:\n        await core.db_helper.initialize();cleanup.push_async_callback(core.db_helper.engine.dispose)\n        await core.sp.initialize()\n        def save_counters():\n            (ROOT/\'data/model-network-observation.json\').write_text(json.dumps({\n                \'requests\':len(network_requests),\'local_model_requests\':len(local_model_requests),\n                \'sender_calls\':sum(action!=\'get_login_info\' for action in peer.actions) if peer else 0}))\n        cleanup.callback(save_counters)\n        if settings.get(\'diagnostic_mode\')==\'first-v2-fence-only\' and not identity_only:install_fence_observation()\n        cfg=core.astrbot_config\n        if sdk_ingress is not None:\n            cfg[\'provider_settings\'][\'enable\']=False\n            cfg[\'platform\']=[sdk_ingress[\'platform\']]\n        cfg[\'dashboard\'][\'username\']=settings[\'dashboard_username\']\n        cfg[\'dashboard\'][\'password_change_required\']=False\n        set_dashboard_password_hashes(cfg,settings[\'dashboard_password\'])\n        life=AstrBotCoreLifecycle(LogBroker(),core.db_helper);life.start_time=int(time.time())\n        life.event_queue=asyncio.Queue()\n        life.umop_config_router=UmopConfigRouter(sp=core.sp);await life.umop_config_router.initialize()\n        life.astrbot_config_mgr=AstrBotConfigManager(cfg,life.umop_config_router,core.sp)\n        await life.astrbot_config_mgr.initialize()\n        life.persona_mgr=PersonaManager(core.db_helper,life.astrbot_config_mgr);await life.persona_mgr.initialize()\n        life.provider_manager=ProviderManager(life.astrbot_config_mgr,core.db_helper,life.persona_mgr)\n        life.conversation_manager=ConversationManager(core.db_helper)\n        life.platform_message_history_manager=PlatformMessageHistoryManager(core.db_helper)\n        life.platform_manager=PlatformManager(cfg,life.event_queue) if sdk_ingress is not None else None\n        life.astrbot_updater=None\n        context=Context(life.event_queue,cfg,core.db_helper,life.provider_manager,life.platform_manager,\n            life.conversation_manager,life.platform_message_history_manager,life.persona_mgr,life.astrbot_config_mgr,None,None)\n        manager=PluginManager(context,cfg);life.star_context=context;life.plugin_manager=manager\n        if sdk_ingress is not None:\n            cleanup.push_async_callback(life.platform_manager.terminate)\n            await life.platform_manager.load_platform(sdk_ingress[\'platform\'])\n            [adapter]=life.platform_manager.get_insts();assert type(adapter) is AiocqhttpAdapter\n            peer=LocalOneBotV11(adapter,sdk_ingress[\'self_id\'],sdk_ingress[\'platform\'][\'ws_reverse_token\'])\n            peer.m1_scenario=settings.get(\'scenario\') in (\'sdk_m1_two_messages_v1\',\'sdk_m1_first_bubble_stop_v1\',\'sdk_m1_first_bubble_unknown_v1\',\'sdk_ordinary_old_source_v1\',\'sdk_ordinary_greeting_v1\',\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\',\'sdk_a06_real_elapsed_phases_v1\',\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\');peer.m1_sender_id=str(sdk_ingress[\'user_id\'])\n            peer.m1_boundary={\'sdk_m1_first_bubble_stop_v1\':\'stop\',\'sdk_m1_first_bubble_unknown_v1\':\'unknown\'}.get(settings.get(\'scenario\'))\n            cleanup.push_async_callback(peer.close);await peer.start()\n        if identity_only:\n            candidate=Path(\'/opt/b04-candidate\')\n            assert hashlib.sha256((candidate/\'release-manifest.json\').read_bytes()).hexdigest()==settings[\'manifest_sha256\']\n            sys.path.insert(0,str(candidate))\n            from _runtime_bootstrap import load_canonical_runtime_v1\n            load_canonical_runtime_v1(candidate)\n            await life.persona_mgr.create_persona(sdk_ingress[\'persona_id\'],\'Local SDK identity fixture.\',tools=[],skills=[])\n            await peer.message(message_id=1,user_id=sdk_ingress[\'user_id\'],text=\'fixture identity observation\')\n            event=await asyncio.wait_for(life.event_queue.get(),5)\n            assert event.get_platform_id()==adapter.meta().id and event.get_self_id()==peer.self_id\n            umo=event.unified_msg_origin\n            await life.conversation_manager.new_conversation(umo,platform_id=event.get_platform_id(),persona_id=sdk_ingress[\'persona_id\'])\n            identity=await actual_sdk_identity(context,adapter,peer,umo)\n            assert identity[\'selected_persona_id\']==sdk_ingress[\'persona_id\']\n            if settings.get(\'scenario\') in (\'sdk_m1_two_messages_v1\',\'sdk_m1_first_bubble_stop_v1\',\'sdk_m1_first_bubble_unknown_v1\',\'sdk_ordinary_old_source_v1\',\'sdk_ordinary_greeting_v1\',\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\',\'sdk_a06_real_elapsed_phases_v1\',\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\'):\n                from sylanne3.host.astrbot import build_astrbot_ingress\n                observed=await build_astrbot_ingress(event,context)\n                assert observed.namespace.as_tuple==(identity[\'bot_id\'],identity[\'persona_id\']) and observed.visibility==\'private\'\n                ingress_identity={\'schema\':\'sylanne.sdk-preinstall-ingress.v1\',\'platform_ref\':observed.platform_ref,\n                    \'sender_ref\':observed.sender_ref,\'conversation_ref\':observed.conversation_ref,\'visibility\':observed.visibility}\n                ingress_target=ROOT/\'data/sdk-preinstall-ingress.json\'\n                ingress_target.write_text(json.dumps(ingress_identity,separators=(\',\',\':\')))\n                with ingress_target.open(\'rb\') as stream:os.fsync(stream.fileno())\n            target=ROOT/\'data/sdk-preinstall-identity.json\'\n            target.write_text(json.dumps(identity,separators=(\',\',\':\')))\n            with target.open(\'rb\') as stream:os.fsync(stream.fileno())\n            assert all(action==\'get_login_info\' for action in peer.actions)\n            return\n        async def local_model_observer(reader,writer):\n            await reader.readline();network_requests.append(\'request\')\n            writer.write(b\'HTTP/1.1 503 Service Unavailable\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n\')\n            await writer.drain();writer.close();await writer.wait_closed()\n        model_observer=await asyncio.start_server(local_model_observer,\'127.0.0.1\',19661)\n        cleanup.push_async_callback(close_listener,model_observer)\n        provider=json.loads(Path(settings[\'provider_config_path\']).read_text())\n        await life.provider_manager.load_provider(provider)\n        [model]=life.provider_manager.provider_insts\n        if sdk_ingress is not None:\n            from openai import AsyncOpenAI\n            m1_model=None\n            if settings.get(\'scenario\') in (\'sdk_m1_two_messages_v1\',\'sdk_m1_first_bubble_stop_v1\',\'sdk_m1_first_bubble_unknown_v1\',\'sdk_ordinary_old_source_v1\',\'sdk_ordinary_greeting_v1\',\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\',\'sdk_a06_real_elapsed_phases_v1\',\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\'):\n                sys.path.insert(0,\'/opt/sylanne-b04-fixture\')\n                if settings.get(\'scenario\') in (\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\'):\n                    verified_helper_pins=settings.get(\'artifact_v3_helper_sha256\')\n                    helper_names={\'sdk_m1_model_fixture_v1.py\',\'artifact_phase_counter_fixture_v1.py\'}\n                    if type(verified_helper_pins)is not dict or set(verified_helper_pins)!=helper_names:\n                        raise ValueError(\'Root-staged exact Artifact V3 helper pins are missing\')\n                    for helper_name in helper_names:\n                        helper_path=Path(\'/opt/sylanne-b04-fixture\')/helper_name\n                        info=helper_path.lstat()\n                        if (helper_path.resolve(strict=True)!=helper_path or not helper_path.is_file()\n                                or info.st_uid!=0 or info.st_mode&0o022\n                                or hashlib.sha256(helper_path.read_bytes()).hexdigest()!=verified_helper_pins[helper_name]):\n                            raise ValueError(\'actual Root SDK helper source differs\')\n                    import sdk_m1_model_fixture_v1 as fixture_model_module\n                    import artifact_phase_counter_fixture_v1 as fixture_counter_module\n                    if (Path(fixture_model_module.__file__).resolve()!=Path(\'/opt/sylanne-b04-fixture/sdk_m1_model_fixture_v1.py\')\n                            or Path(fixture_counter_module.__file__).resolve()!=Path(\'/opt/sylanne-b04-fixture/artifact_phase_counter_fixture_v1.py\')):\n                        raise ValueError(\'Artifact V3 SDK helper import origin differs\')\n                from sdk_m1_model_fixture_v1 import FiniteSdkM1ModelFixtureV1,ArtifactV3MockModelFixtureV1\n                model_type=(ArtifactV3MockModelFixtureV1 if settings.get(\'scenario\') in\n                    (\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\') else FiniteSdkM1ModelFixtureV1)\n                m1_model=model_type(settings[\'m1_model_fixture\'])\n            async def closed_model_transport(request):\n                local_model_requests.append({\'method\':request.method,\'path\':request.url.path})\n                if m1_model is None:raise RuntimeError(\'B04 SDK route fixture has no M1 model response script\')\n                installed=instance()._v2_installation\n                if installed is None:raise RuntimeError(\'M1 provider cannot run before actual installed bundle\')\n                return m1_model.respond(request,installed_bundle=installed.admin_bundle)\n            previous=model.client\n            model.client=AsyncOpenAI(api_key=model.chosen_api_key,base_url=provider[\'api_base\'],\n                default_headers=model.custom_headers,timeout=model.timeout,max_retries=0,\n                http_client=httpx.AsyncClient(transport=httpx.MockTransport(closed_model_transport),trust_env=False))\n            await previous.close()\n        cleanup.push_async_callback(model.client.close)\n        name=\'astrbot_plugin_sylanne\'\n        schema=manager._load_plugin_config_schema(\'/opt/sylanne/bootstrap/host/_conf_schema.json\')\n        plugin_config=AstrBotConfig(str(Path(manager.plugin_config_path)/(name+\'_config.json\')),schema=schema)\n        plugin_config.save_config(settings[\'plugin_configuration\'])\n        import subprocess\n        original_probe_run = subprocess.run\n        def observed_probe_run(argv, *args, **kwargs):\n            target = \'/opt/sylanne/bootstrap/selection_probe.py\'\n            if type(argv) is not list or target not in argv:\n                return original_probe_run(argv, *args, **kwargs)\n            observed_argv = [argv[0], \'-X\', \'importtime\', *argv[1:]]\n            started = time.monotonic()\n            text, status, returned = \'\', \'first_internal_failure\', None\n            try:\n                result = original_probe_run(observed_argv, *args, **kwargs)\n            except subprocess.TimeoutExpired as error:\n                text = error.stderr.decode(\'utf-8\', errors=\'replace\') if isinstance(error.stderr, bytes) else error.stderr or \'\'\n                status, returned = \'first_timeout\', None\n                raise\n            except subprocess.CalledProcessError as error:\n                text = error.stderr.decode(\'utf-8\', errors=\'replace\') if isinstance(error.stderr, bytes) else error.stderr or \'\'\n                status, returned = \'first_child_failure\', error.returncode\n                raise\n            else:\n                text, status, returned = result.stderr or \'\', \'completed\', result.returncode\n                return result\n            finally:\n                rows = [line for line in text.splitlines() if line.startswith(\'import time:\')][-256:]\n                diagnostic = {\'schema\': \'sylanne.b04.first-selection-probe-import.v1\',\n                    \'status\': status, \'returncode\': returned, \'elapsed_seconds\': time.monotonic()-started,\n                    \'declared_timeout_seconds\': kwargs.get(\'timeout\'), \'probe_mode\': \'host\' if \'--host\' in argv else \'authority\',\n                    \'script_sha256\': hashlib.sha256(Path(target).read_bytes()).hexdigest(),\n                    \'import_time_rows\': rows, \'scope\': \'Only actual module import names/timings; no output/config/credentials; original validation and timeout unchanged\'}\n                index = len(list((ROOT/\'data\').glob(\'selection-probe-import-*.json\')))\n                observed = ROOT/\'data\'/(\'selection-probe-import-\'+str(index)+\'.json\')\n                observed.write_text(json.dumps(diagnostic,indent=2))\n                with observed.open(\'rb\') as stream:os.fsync(stream.fileno())\n        subprocess.run = observed_probe_run\n        try:\n            success,error=await manager.load(specified_dir_name=name)\n        finally:\n            subprocess.run = original_probe_run\n        if not success:\n            sys.stderr.write(\'B04_SDK_LOAD_ERROR_V1 \'+json.dumps({\'error\':error,\n                \'failed_plugin\':manager.failed_plugin_dict.get(name)},separators=(\',\',\':\'))+\'\\n\')\n            sys.stderr.flush();os.fsync(sys.stderr.fileno())\n            raise RuntimeError(\'actual_sdk_plugin_load_failed\')\n        async def terminate_current_plugin():await context.get_registered_star(name).star_cls.terminate()\n        cleanup.push_async_callback(terminate_current_plugin)\n        def require_actual_sdk_namespace(plugin, identity):\n            if plugin._installed_namespace is None:\n                observation = {\'schema\':\'sylanne.b04.sdk-initialization-failure.v1\',\n                    \'runtime_stage\':plugin.runtime_health.status,\n                    \'reason_codes\':list(plugin.runtime_health.missing_capabilities),\n                    \'setup_present\':plugin._setup_installation is not None,\n                    \'runtime_present\':plugin._runtime is not None,\n                    \'installed_namespace_present\':False,\n                    \'observed_wall_time_ns\':time.time_ns(),\n                    \'observed_monotonic_ns\':time.monotonic_ns()}\n                sys.stderr.write(\'B04_SDK_INITIALIZATION_NOT_ADMITTED \'+json.dumps(observation,separators=(\',\',\':\'))+\'\\n\')\n                sys.stderr.flush();os.fsync(sys.stderr.fileno())\n                error = RuntimeError(\'actual_sdk_initialization_not_admitted\')\n                error.b04_initialization_observation = observation\n                raise error\n            assert plugin._installed_namespace.as_tuple==(identity[\'bot_id\'],identity[\'persona_id\'])\n        if sdk_ingress is not None:\n            identity=json.loads(Path(settings[\'sdk_identity_path\']).read_text())\n            assert await actual_sdk_identity(context,adapter,peer,identity[\'umo\'])=={k:v for k,v in identity.items() if k!=\'ingress_identity\'}\n            require_actual_sdk_namespace(context.get_registered_star(name).star_cls,identity)\n            observer=NativeIngressObservation(context,life,name,identity)\n            cleanup.push_async_callback(observer.close);observer.bind_handler()\n            life.pipeline_scheduler_mapping=await life.load_pipeline_scheduler()\n            for scheduler in life.pipeline_scheduler_mapping.values():observer.observe_scheduler(scheduler)\n            life.event_bus=EventBus(life.event_queue,life.pipeline_scheduler_mapping,life.astrbot_config_mgr)\n            observer.bus_task=asyncio.create_task(life.event_bus.dispatch(),name=\'b04_native_event_bus\')\n        dashboard=AstrBotDashboard(life,core.db_helper,asyncio.Event())\n        client=httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.asgi_app),base_url=settings[\'origin\'])\n        cleanup.push_async_callback(client.aclose)\n        stopped=asyncio.Event()\n        for event in (signal.SIGTERM,signal.SIGINT):asyncio.get_running_loop().add_signal_handler(event,stopped.set)\n        def instance():return context.get_registered_star(name).star_cls\n        def health():\n            plugin=instance();runtime=plugin._runtime\n            sys.stderr.write(\'B04_RUNTIME_HEALTH_DETAIL \'+json.dumps({\'status\':plugin.runtime_health.status,\n                \'detail\':plugin.runtime_health.detail},separators=(\',\',\':\'))+\'\\n\')\n            sys.stderr.flush();os.fsync(sys.stderr.fileno())\n            package=sys.modules[\'data.plugins.\'+name+\'.main\'].PACKAGE_ROOT\n            from sylanne3.authority_service.c09_process_identity_v1 import read_process_identity_v1\n            return dict(schema=\'sylanne.b04.sdk-host-health.v1\',runtime_stage=plugin.runtime_health.status,\n                fixture_phase=settings[\'fixture_phase\'],\n                reason_codes=list(plugin.runtime_health.missing_capabilities),runtime_started=runtime is not None,\n                worker_started=runtime is not None and runtime._worker is not None,\n                package_root=str(package),main_path=str(sys.modules[\'data.plugins.\'+name+\'.main\'].__file__),\n                manifest_sha256=hashlib.sha256((package/\'release-manifest.json\').read_bytes()).hexdigest(),\n                process_id=os.getpid(),process_original=read_process_identity_v1(os.getpid()),uid=os.geteuid(),sdk=version(\'astrbot\'),\n                provider_network_requests=len(network_requests),platform_manager_initialized=life.platform_manager is not None,\n                platform_instances=len(life.platform_manager.get_insts()) if life.platform_manager else 0,\n                sender_instances=len(life.platform_manager.get_insts()) if life.platform_manager else 0,\n                sender_calls=sum(action!=\'get_login_info\' for action in peer.actions) if peer else 0,\n                local_model_requests=len(local_model_requests),sdk_identity=identity,\n                native_handler_generation=observer.generation if observer else 0,\n                model_fixture_calls=list(m1_model.calls) if settings.get(\'scenario\') in (\'sdk_m1_two_messages_v1\',\'sdk_m1_first_bubble_stop_v1\',\'sdk_m1_first_bubble_unknown_v1\',\'sdk_ordinary_old_source_v1\',\'sdk_ordinary_greeting_v1\',\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\',\'sdk_a06_real_elapsed_phases_v1\',\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\') else [],\n                sender_fixture_observations=list(peer.sender_observations) if peer else [],\n                artifact_v3_admission_probe=dict(admission_probe),\n                artifact_v3_cross_root_probe=(cross_root_probe.status() if cross_root_probe is not None else None),\n                natural_boundary_received=bool(peer and peer.m1_boundary_received),\n                model_fixture_first_failure=(getattr(m1_model,\'first_failure\',None) if settings.get(\'scenario\') in\n                    (\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\') else None))\n\n        cross_root_probe = None\n        admission_probe = {\'schema\':\'sylanne.test.artifact-v3-live-admission-probe.v1\',\n            \'state\':\'not_armed\',\'cases\':[],\'valid_forward_count\':0,\'first_failure\':None}\n\n        cancelled_job_probe={"state":"not_armed","first_failure":None}\n        cancelled_job_release=asyncio.Event()\n\n        def arm_artifact_v3_cancelled_queued_job():\n            from unittest.mock import patch\n            from sylanne3.runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1\n            runtime=instance()._runtime\n            service=runtime._v2_d07_execution_service\n            if (type(service)is not InstalledD07ExecutionServiceV1\n                    or cancelled_job_probe["state"]!="not_armed"or local_model_requests\n                    or admission_probe["state"]!="not_armed"or cross_root_probe is not None\n                    or settings.get("scenario")!="sdk_artifact_v3_tone_sample_v1"):\n                raise ValueError("cancelled queued job needs its own fresh actual installed V9 Root")\n            original=service._execute_current_d07_job_once_v3\n            cancelled_job_probe["state"]="armed"\n            async def observed(job):\n                if job.work_kind!="d07.concern"or not job.operation_id.startswith("artifact-phase-observe:"):\n                    return await original(job)\n                if cancelled_job_probe["state"]!="armed":\n                    raise RuntimeError("one original queued execution entry only")\n                try:\n                    if([item["phase"]for item in m1_model.calls]!=["encode","appraisal","tone_sample"]\n                            or len(local_model_requests)!=3 or network_requests\n                            or sum(item["fixture_charge_microusd"]for item in m1_model.calls)!=0):\n                        raise ValueError("actual three-call Mock baseline required")\n                    def actual_metadata(graph):\n                        from datetime import datetime\n                        from sylanne3.runtime.jobs import get_job\n                        from sylanne3.runtime.d07_execution_v1 import read_d07_original_v1\n                        from sylanne3.runtime.artifact_observation_parentage_v3 import artifact_observation_descriptor_from_metadata_v3\n                        store=graph._GraphCoordinator__store;ns=service.bundle.installation_policy.namespace\n                        with store._lock:\n                            db=store._db\n                            if db.in_transaction:raise RuntimeError("fixture read is outside business SQL")\n                            db.execute("BEGIN")\n                            try:\n                                current=get_job(db,job.job_id)\n                                row=read_d07_original_v1(db,service.d11_issuer,ns,"prepared",job.job_id)\n                                if row is None:raise ValueError("actual signed queued D07 prepared required")\n                                descriptor=artifact_observation_descriptor_from_metadata_v3(row[0],\n                                    namespace=ns,prepared_digest=row[1])\n                                if(current!=job or current.phase!="queued"or current.lease_holder is not None\n                                        or current.fence or current.cancel_epoch\n                                        or read_d07_original_v1(db,service.d11_issuer,ns,"call",job.job_id)is not None):\n                                    raise ValueError("queued child must have no acquire, Core intent or consumed worker claim")\n                                deadline=datetime.fromisoformat(job.deadline_utc.replace("Z","+00:00")).timestamp()\n                                if deadline-time.time()<15:raise TimeoutError("original deadline has insufficient observation margin")\n                                return {"job_id":job.job_id,"cycle_job_ref":descriptor.cycle_ref.key.token,\n                                    "c02_operation_id":descriptor.c02_operation_id,"prepared_digest":row[1],\n                                    "deadline_utc":deadline}\n                            finally:db.rollback()\n                    metadata=await runtime._worker.call(actual_metadata)\n                    cancelled_job_probe.update(metadata,state="paused_queued_before_acquire",\n                        provider_calls_before=3,fixture_charge_before_microusd=0)\n                    await asyncio.wait_for(cancelled_job_release.wait(),metadata["deadline_utc"]-time.time())\n                    if time.time()>=metadata["deadline_utc"]:raise TimeoutError("original deadline expired before acquire rejection")\n                    original_worker_call=service.worker.call\n                    async def observe_worker_call(function,*args):\n                        result=await original_worker_call(function,*args)\n                        code=getattr(function,"__code__",None)\n                        if (code is not None and Path(code.co_filename).name=="d07_installed_execution_v1.py"\n                                and "acquire_current_d07_execution_v1"in code.co_names\n                                and type(result)is dict):\n                            cancelled_job_probe["actual_acquire_result"]=result\n                            cancelled_job_probe["actual_acquire_callback"]={"file":code.co_filename,"line":code.co_firstlineno}\n                        return result\n                    try:\n                        with patch.object(service.worker,"call",new=observe_worker_call):\n                            result=await original(job)\n                    except Exception as error:\n                        frames=[]\n                        for frame in traceback.extract_tb(error.__traceback__):\n                            frames.append({"file":frame.filename,"line":frame.lineno,"function":frame.name})\n                        cancelled_job_probe.update(state="rejected_after_actual_cancel",\n                            rejection={"type":type(error).__name__,"message":str(error),"frames":frames},\n                            result=None)\n                        raise\n                    else:\n                        if type(result)is not dict or result.get("status")not in {"original_execution_hold"}:\n                            raise AssertionError("cancelled original execution did not return the actual D11 hold")\n                        cancelled_job_probe.update(state="rejected_after_actual_cancel",result=result,rejection=None)\n                        return result\n                    finally:\n                        if(time.time()>=metadata["deadline_utc"]or len(local_model_requests)!=3 or network_requests\n                                or sum(item["fixture_charge_microusd"]for item in m1_model.calls)!=0):\n                            raise AssertionError("expiry/provider/charge changed during the original cancelled acquire")\n                except BaseException as error:\n                    if cancelled_job_probe["state"]!="rejected_after_actual_cancel":\n                        cancelled_job_probe.update(state="first_failure",\n                            first_failure={"type":type(error).__name__,"message":str(error)})\n                    raise\n                finally:interception.stop()\n            interception=patch.object(service,"_execute_current_d07_job_once_v3",new=observed)\n            interception.start();cleanup.callback(interception.stop)\n            return dict(cancelled_job_probe)\n\n        def arm_artifact_v3_admission_negatives():\n            from dataclasses import asdict, replace\n            from unittest.mock import patch\n            from sylanne3.host.authority_client import AuthorityClient\n            from sylanne3.host.mtls_transport import MtlsAuthorityTransport\n            runtime=instance()._runtime\n            receipt=runtime._v2_natural_readiness_receipt\n            authority=receipt.authority_client\n            if (admission_probe[\'state\']!=\'not_armed\' or local_model_requests\n                    or type(authority) is not AuthorityClient\n                    or type(authority._transport) is not MtlsAuthorityTransport):\n                raise RuntimeError(\'live admission probe needs the unused actual installed client and mTLS\')\n            original=authority.model_admit_dispatch_once_v2\n            admission_probe[\'state\']=\'armed\'\n            async def financial_stamp():\n                def read(graph):\n                    store=graph._GraphCoordinator__store\n                    ns=receipt.policy.namespace.as_tuple\n                    with store._lock:\n                        db=store._db\n                        if db.in_transaction:raise RuntimeError(\'probe cannot read inside a business write\')\n                        leases=tuple(db.execute(\'SELECT * FROM runtime_budget_leases WHERE bot_id=? AND persona_id=? ORDER BY lease_id\',ns))\n                        reservations=tuple(db.execute(\'SELECT r.* FROM runtime_budget_reservations r JOIN runtime_budget_leases l USING(lease_id) WHERE l.bot_id=? AND l.persona_id=? ORDER BY r.lease_id,r.operation_id\',ns))\n                        operations=tuple(db.execute(\'SELECT * FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? ORDER BY operation_id,phase\',ns))\n                    return hashlib.sha256(json.dumps([leases,reservations,operations],\n                        sort_keys=True,separators=(\',\',\':\')).encode()).hexdigest()\n                return await runtime._worker.call(read)\n            async def observed_admit(bundle,grant,*,intent,expected_anchor,model_request,host_incarnation,_on_dispatch=None):\n                if model_request.identity.phase!=\'d07.cognition\':\n                    return await original(bundle,grant,intent=intent,expected_anchor=expected_anchor,\n                        model_request=model_request,host_incarnation=host_incarnation,_on_dispatch=_on_dispatch)\n                if admission_probe[\'state\']!=\'armed\':\n                    raise RuntimeError(\'the single original D07 admission probe cannot repeat\')\n                admission_probe[\'state\']=\'checking\'\n                try:\n                    if [item[\'phase\'] for item in m1_model.calls]!=[\'encode\',\'appraisal\',\'tone_sample\']:\n                        raise RuntimeError(\'probe is not immediately before the first actual Artifact D07 admission\')\n                    before_count=len(local_model_requests)\n                    before_calls=len(m1_model.calls)\n                    if before_count!=3 or sum(item[\'fixture_charge_microusd\'] for item in m1_model.calls)!=0 or network_requests:\n                        raise RuntimeError(\'first D07 does not have the authentic three-call Mock baseline\')\n                    original_record,original_permit=await authority.model_recover_fenced_v1(bundle,grant,intent=intent)\n                    if original_record.state!=\'prepared\' or original_record.intent!=intent:\n                        raise RuntimeError(\'live negatives require the untouched actual prepared Core original\')\n                    finance=await financial_stamp()\n                    async def reject(name,candidate,candidate_grant,candidate_request,expected_error,remote,field):\n                        dispatched=[]\n                        try:\n                            await original(bundle,candidate_grant,intent=candidate,expected_anchor=expected_anchor,\n                                model_request=candidate_request,host_incarnation=host_incarnation,\n                                _on_dispatch=lambda:dispatched.append(True))\n                        except RuntimeError as error:\n                            if type(error) is not RuntimeError or str(error)!=expected_error:\n                                raise AssertionError(\'unexpected admission rejection for \'+name) from error\n                        else:\n                            raise AssertionError(\'invalid admission was accepted: \'+name)\n                        if len(dispatched)!=(1 if remote else 0):\n                            raise AssertionError(\'negative was rejected at a different transport layer: \'+name)\n                        retained,permit=await authority.model_recover_fenced_v1(bundle,grant,intent=intent)\n                        if (retained!=original_record or retained.state!=\'prepared\' or permit!=original_permit\n                                or await financial_stamp()!=finance or len(local_model_requests)!=before_count\n                                or len(m1_model.calls)!=before_calls or network_requests\n                                or sum(item[\'fixture_charge_microusd\'] for item in m1_model.calls)!=0):\n                            raise AssertionError(\'negative consumed original, provider invocation or budget: \'+name)\n                        admission_probe[\'cases\'].append({\'name\':name,\'changed_field\':field,\n                            \'layer\':\'live_core_original_identity_tamper\' if remote else \'host_before_dispatch\',\n                            \'rejection\':expected_error,\'actual_mtls_dispatch_count\':len(dispatched),\n                            \'original_core_state\':retained.state,\'financial_sha256\':finance,\n                            \'provider_call_delta\':0,\'fixture_charge_delta_microusd\':0,\n                            \'original_intent_sha256\':hashlib.sha256(json.dumps(asdict(intent),sort_keys=True).encode()).hexdigest()})\n                    def different_digest(value):\n                        return (\'1\' if value[0]!=\'1\' else \'2\')+value[1:]\n                    core_cases=(\n                        (\'sealed_grant_binding\',\'binding_digest\',different_digest(intent.binding_digest)),\n                        (\'budget_lease\',\'budget_lease_id\',intent.budget_lease_id+\':foreign\'),\n                        (\'reservation_operation\',\'budget_reservation_operation_id\',intent.budget_reservation_operation_id+\':foreign\'),\n                        (\'reservation_digest\',\'budget_reservation_digest\',different_digest(intent.budget_reservation_digest)),\n                        (\'provider_config\',\'provider_config_digest\',different_digest(intent.provider_config_digest)))\n                    local_cases=(\n                        (\'installation_grant\',\'grant\',replace(grant,installation_id=grant.installation_id+\':foreign\'),\n                            \'authority model installation binding is invalid\'),\n                        (\'expired_envelope\',\'model_request\',replace(model_request,payload=dict(model_request.payload),\n                            envelope=replace(model_request.envelope,deadline_utc=time.time()-1)),\n                            \'authority model request binding is invalid\'),\n                        (\'future_envelope\',\'model_request\',replace(model_request,payload=dict(model_request.payload),\n                            envelope=replace(model_request.envelope,deadline_utc=model_request.envelope.deadline_utc+86400)),\n                            \'authority model request binding is invalid\'))\n                    for name,field,value in core_cases:\n                        changed=replace(intent,**{field:value})\n                        if [key for key in asdict(intent) if asdict(intent)[key]!=asdict(changed)[key]]!=[field]:\n                            raise AssertionError(\'one intent field must vary\')\n                        await reject(name,changed,grant,model_request,\'authority service unavailable\',True,field)\n                    for name,field,value,error in local_cases:\n                        await reject(name,intent,value if field==\'grant\' else grant,\n                            value if field==\'model_request\' else model_request,error,False,\n                            \'installation_id\' if field==\'grant\' else \'envelope.deadline_utc\')\n                    admission_probe[\'state\']=\'forwarding_original\'\n                    admission_probe[\'valid_forward_count\']+=1\n                    actual=await original(bundle,grant,intent=intent,expected_anchor=expected_anchor,\n                        model_request=model_request,host_incarnation=host_incarnation,_on_dispatch=_on_dispatch)\n                    if actual[0].state!=\'dispatch_started\' or actual[0].intent!=intent:\n                        raise RuntimeError(\'unchanged original did not receive the actual once-only Core admission\')\n                    admission_probe[\'state\']=\'original_admitted\'\n                    return actual\n                except BaseException as error:\n                    admission_probe[\'state\']=\'first_failure\'\n                    admission_probe[\'first_failure\']={\'type\':type(error).__name__,\'message\':str(error)}\n                    raise\n                finally:\n                    interception.stop()\n\n\n            interception=patch.object(authority,\'model_admit_dispatch_once_v2\',new=observed_admit)\n            interception.start()\n            cleanup.callback(interception.stop)\n            return dict(admission_probe)\n\n        def arm_artifact_v3_cross_root(role, helper_sha256):\n            nonlocal cross_root_probe\n            if (cross_root_probe is not None or admission_probe[\'state\']!=\'not_armed\'\n                    or settings.get(\'scenario\')!=\'sdk_artifact_v3_tone_sample_v1\'\n                    or settings.get(\'artifact_v3_cross_root_helper_sha256\')!=helper_sha256):\n                raise ValueError(\'explicit fresh Root A/B fixture and protected helper pin required\')\n            import importlib.util,stat\n            helper=Path(\'/opt/sylanne-b04-fixture/artifact_v3_cross_root_witness_v1.py\')\n            info=helper.lstat()\n            if (helper.resolve(strict=True)!=helper or not stat.S_ISREG(info.st_mode)\n                    or info.st_uid!=0 or info.st_mode&0o022\n                    or hashlib.sha256(helper.read_bytes()).hexdigest()!=helper_sha256):\n                raise ValueError(\'Root-staged cross-Root helper differs from its protected exact pin\')\n            spec=importlib.util.spec_from_file_location(\'artifact_v3_cross_root_witness_v1\',helper)\n            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n            runtime=instance()._runtime\n            receipt=runtime._v2_natural_readiness_receipt\n            def counts():\n                return {\'local\':len(local_model_requests),\'network\':len(network_requests),\n                    \'phases\':[item[\'phase\']for item in m1_model.calls],\n                    \'charge\':sum(item[\'fixture_charge_microusd\']for item in m1_model.calls)}\n            cross_root_probe=module.CrossRootAdmissionProbeV1(authority=receipt.authority_client,\n                runtime=runtime,bundle=receipt.bundle,grant=receipt.client_grant,\n                counts=counts,cleanup=cleanup)\n            return cross_root_probe.arm(role)\n\n        async def rpc(reader,writer):\n            try:\n                _pid,uid,_gid=struct.unpack(\'3i\',writer.get_extra_info(\'socket\').getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))\n                if uid!=0:raise PermissionError(\'fixture_controller_root_required\')\n                raw=await reader.readline()\n                if len(raw)>65536:raise ValueError(\'fixture_request_bound\')\n                request=json.loads(raw);action=request[\'action\']\n                if action==\'health\' and set(request)=={\'action\'}:\n                    result=health()\n                elif action=="artifact_v3_arm_cancelled_queued_job"and set(request)=={"action"}:\n                    result=arm_artifact_v3_cancelled_queued_job()\n                elif action=="artifact_v3_cancelled_queued_job_status"and set(request)=={"action"}:\n                    result=dict(cancelled_job_probe)\n                elif action=="artifact_v3_cancelled_queued_job_release"and set(request)=={"action"}:\n                    if cancelled_job_probe["state"]!="paused_queued_before_acquire":\n                        raise ValueError("exact queued child must be paused once")\n                    cancelled_job_release.set();result={"state":"released_once"}\n                elif action==\'artifact_v3_arm_admission_negatives\' and set(request)=={\'action\'}:\n                    if settings.get(\'scenario\')!=\'sdk_artifact_v3_tone_sample_v1\':\n                        raise ValueError(\'a separate fresh successful Artifact V3 fixture is required\')\n                    result=arm_artifact_v3_admission_negatives()\n                elif action==\'artifact_v3_cross_root_arm\' and set(request)=={\'action\',\'role\',\'helper_sha256\'}:\n                    result=arm_artifact_v3_cross_root(request[\'role\'],request[\'helper_sha256\'])\n                elif action==\'artifact_v3_cross_root_inspect\' and set(request)=={\'action\'}:\n                    if cross_root_probe is None:raise ValueError(\'cross-Root fixture is not armed\')\n                    result=await cross_root_probe.inspect()\n                elif action==\'artifact_v3_cross_root_status\' and set(request)=={\'action\'}:\n                    if cross_root_probe is None:raise ValueError(\'cross-Root fixture is not armed\')\n                    result=cross_root_probe.status()\n                elif action==\'artifact_v3_cross_root_release\' and set(request)=={\'action\',\'case\',\'witness\',\'a_snapshot\',\'b_snapshot\'}:\n                    if cross_root_probe is None:raise ValueError(\'cross-Root fixture is not armed\')\n                    result=cross_root_probe.release_case(case=request[\'case\'],witness=request[\'witness\'],\n                        a_snapshot=request[\'a_snapshot\'],b_snapshot=request[\'b_snapshot\'])\n                elif action==\'artifact_v3_checkpoint\' and set(request)=={\'action\'}:\n                    if settings.get(\'scenario\') not in (\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\'):\n                        raise ValueError(\'new isolated Artifact V3 Mock scenario required\')\n                    runtime=instance()._runtime\n                    if runtime is None or runtime._worker is None:\n                        raise RuntimeError(\'actual installed worker is unavailable\')\n                    transaction_open=await runtime._worker.call(lambda graph: graph._GraphCoordinator__store._db.in_transaction)\n                    result=health()\n                    result[\'fixture_checkpoint\']={\'event_queue_empty\':life.event_queue.empty(),\n                        \'pending_sdk_tasks\':len(life.event_bus._pending_tasks),\'worker_transaction_open\':transaction_open}\n                elif action==\'release_natural_boundary\' and set(request)=={\'action\'}:\n                    if peer is None or peer.m1_boundary!=\'stop\' or not peer.m1_boundary_received:\n                        raise RuntimeError(\'actual local Stop boundary was not reached\')\n                    peer.m1_boundary_release.set();result={\'released\':True}\n                elif action==\'natural_core_originals\' and set(request)=={\'action\',\'parent_original_id\'}:\n                    runtime=instance()._runtime\n                    def read(graph):\n                        from sylanne3.runtime.natural_same_batch_history_v3 import read_natural_roster_head_v1\n                        from sylanne3.authority_service.natural_disposition_maintenance_v1 import natural_disposition_original_ref_v1\n                        bundle=instance()._v2_installation\n                        ns=bundle.installation_policy.namespace;ans=bundle.installation_policy.authority_namespace\n                        with graph._GraphCoordinator__store._lock:\n                            head=read_natural_roster_head_v1(graph._GraphCoordinator__store._db,ns,request[\'parent_original_id\'])\n                        if head is None:return None\n                        facts=[]\n                        for ref in dict.fromkeys((head[2].birth_original_ref,head[2].authority_original_ref)):\n                            prepared=runtime._v2_port.read_natural_disposition_original_v1(namespace=ns,authority_namespace=ans,original_ref=ref)\n                            kind=\'roster_committed\' if prepared.kind==\'roster_prepared\' else \'maintenance_committed\'\n                            cref=natural_disposition_original_ref_v1(ans,bundle.installation_policy.installation_id,head[2].parent_original_id,kind,prepared.operation_id)\n                            committed=runtime._v2_port.read_natural_disposition_original_v1(namespace=ns,authority_namespace=ans,original_ref=cref)\n                            assert committed.payload[\'prepared_original_digest\']==prepared.digest\n                            assert committed.payload[\'next_payload_digest\']==prepared.payload[\'next_payload_digest\']\n                            if ref==head[2].authority_original_ref:assert prepared.payload[\'expected_next_value\']==head[2].to_wire()\n                            facts.append({\'prepared_kind\':prepared.kind,\'prepared_ref\':prepared.original_ref,\'prepared_digest\':prepared.digest,\n                                \'committed_kind\':committed.kind,\'committed_ref\':committed.original_ref,\'committed_digest\':committed.digest})\n                        return {\'roster_ref\':head[0].token,\'revision\':head[1],\'original_pairs\':facts}\n                    result=await runtime._worker.call(read)\n                elif action==\'http\' and set(request)=={\'action\',\'method\',\'path\',\'headers\',\'json\'}:\n                    response=await client.request(request[\'method\'],request[\'path\'],headers=request[\'headers\'],json=request[\'json\'])\n                    # This body remains on the private socket, never an evidence log.\n                    result={\'http_status\':response.status_code,\'json\':response.json()}\n                elif action==\'provision_original\' and set(request)=={\'action\',\'operation_id\'}:\n                    runtime=instance()._runtime\n                    original=await runtime.provision_installed_namespace(request[\'operation_id\'])\n                    from sylanne3.graph_coordinator import NamespaceProvisionReceiptV2\n                    from sylanne3.authority_service.v2_contract import from_wire as fence_from_wire\n                    if type(original) is not NamespaceProvisionReceiptV2:\n                        raise TypeError(\'actual_namespace_provision_receipt_required\')\n                    def completed_fence(_graph):\n                        return runtime._v2_port.get_fence_operation(namespace=original.namespace,\n                            authority_namespace=original.authority_namespace,operation_id=original.fence_attempt_id)\n                    observed,state=await runtime._worker.call(completed_fence)\n                    if observed!=fence_from_wire(original.permit_wire) or state!=\'finished\':\n                        raise RuntimeError(\'actual_namespace_provision_write_fence_not_finished\')\n                    from dataclasses import asdict\n                    result=asdict(original)\n                elif action==\'ordinary_ingress\' and set(request)=={\'action\',\'message_id\',\'text\'}:\n                    assert observer is not None\n                    async with ingress_lock:\n                        before=len(local_model_requests)\n                        result=await observer.submit(peer,message_id=request[\'message_id\'],\n                            user_id=sdk_ingress[\'user_id\'],text=request[\'text\'])\n                        if settings.get(\'scenario\') in (\'sdk_m1_two_messages_v1\',\'sdk_m1_first_bubble_stop_v1\',\'sdk_m1_first_bubble_unknown_v1\',\'sdk_ordinary_old_source_v1\',\'sdk_ordinary_greeting_v1\',\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\',\'sdk_a06_real_elapsed_phases_v1\',\'sdk_artifact_v3_tone_sample_v1\',\'sdk_artifact_v3_unknown_v1\'):\n                            assert request[\'message_id\'] in {item[\'message_id\'] for item in settings[\'m1_model_fixture\'][\'episodes\']}\n                            assert 0<=len(local_model_requests)-before<=6 and len(m1_model.calls)<=settings[\'m1_model_fixture\'][\'max_total_calls\'] and not network_requests\n                        else:assert len(local_model_requests)==before==0 and not network_requests\n                        result.update(sdk_identity=identity,local_model_requests=len(local_model_requests),\n                            sender_calls=sum(action!=\'get_login_info\' for action in peer.actions))\n                elif action==\'d13_v6_collection_originals\' and set(request)=={\'action\',\'source_ref\'}:\n                    if settings.get(\'scenario\') not in (\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\'):raise ValueError(\'fixed256 SDK scenario required\')\n                    from sdk_m1_fixture_contract_v1 import actual_d13_v6_collection_originals_v1\n                    plugin=instance();runtime=plugin._runtime;policy=runtime._v2_policy\n                    def read_v6_collection(graph):\n                        anchor=runtime._v2_port.current_anchor(namespace=policy.namespace,authority_namespace=policy.authority_namespace)\n                        store=graph._GraphCoordinator__store\n                        with store._lock:\n                            db=store._db;db.execute(\'BEGIN\')\n                            try:return actual_d13_v6_collection_originals_v1(db,namespace=policy.namespace,source_ref=request[\'source_ref\'],\n                                activation_generation=anchor.activation_generation,now_utc=time.time())\n                            finally:db.rollback()\n                    result=await runtime._worker.call(read_v6_collection)\n                elif action==\'d13_v6_episode_originals\' and set(request)=={\'action\',\'message_id\'}:\n                    if settings.get(\'scenario\') not in (\'sdk_d13_v6_256_current_v1\',\'sdk_d13_v7_256_current_v1\'):raise ValueError(\'fixed256 SDK scenario required\')\n                    from sdk_m1_fixture_contract_v1 import actual_d13_v6_episode_originals_v1,actual_d13_v7_episode_originals_v1\n                    episode=next(item for item in settings[\'m1_model_fixture\'][\'episodes\'] if item[\'message_id\']==request[\'message_id\'])\n                    plugin=instance();runtime=plugin._runtime\n                    def read_v6_episode(graph):\n                        store=graph._GraphCoordinator__store\n                        with store._lock:\n                            db=store._db;db.execute(\'BEGIN\')\n                            try:\n                                if settings[\'scenario\']==\'sdk_d13_v7_256_current_v1\':\n                                    return actual_d13_v7_episode_originals_v1(db,namespace=plugin._installed_namespace,\n                                        episode=episode,issuer=graph._GraphCoordinator__d11_issuer,\n                                        installed_wire_policy=plugin._setup_installation.admin_bundle.d13_wire_policy)\n                                return actual_d13_v6_episode_originals_v1(db,namespace=plugin._installed_namespace,\n                                    episode=episode,issuer=graph._GraphCoordinator__d11_issuer)\n                            finally:db.rollback()\n                    result=await runtime._worker.call(read_v6_episode)\n                elif action==\'greeting_need_originals\' and set(request)=={\'action\',\'message_id\'}:\n                    if settings.get(\'scenario\')!=\'sdk_ordinary_greeting_v1\':raise ValueError(\'greeting fixed scenario required\')\n                    from sdk_m1_fixture_contract_v1 import actual_greeting_need_original_v1\n                    episodes=[item for item in settings[\'m1_model_fixture\'][\'episodes\'] if item[\'message_id\']==request[\'message_id\']]\n                    if len(episodes)!=1:raise ValueError(\'unknown finite greeting SDK message\')\n                    plugin=instance();runtime=plugin._runtime\n                    def read_greeting(graph):\n                        store=graph._GraphCoordinator__store\n                        with store._lock:\n                            db=store._db;db.execute(\'BEGIN\')\n                            try:return actual_greeting_need_original_v1(db,namespace=plugin._installed_namespace,episode=episodes[0])\n                            finally:db.rollback()\n                    result=await runtime._worker.call(read_greeting)\n                elif action==\'ordinary_recall_originals\' and set(request)=={\'action\',\'message_id\',\'previous_source_ref\'}:\n                    if settings.get(\'scenario\')!=\'sdk_ordinary_old_source_v1\':raise ValueError(\'ordinary recall fixture scenario required\')\n                    from sdk_m1_fixture_contract_v1 import actual_ordinary_episode_originals_v1\n                    episodes=[item for item in settings[\'m1_model_fixture\'][\'episodes\'] if item[\'message_id\']==request[\'message_id\']]\n                    if len(episodes)!=1:raise ValueError(\'unknown finite ordinary SDK message\')\n                    plugin=instance();runtime=plugin._runtime\n                    def read_originals(graph):\n                        store=graph._GraphCoordinator__store\n                        with store._lock:\n                            db=store._db;db.execute(\'BEGIN\')\n                            try:return actual_ordinary_episode_originals_v1(db,namespace=plugin._installed_namespace,\n                                episode=episodes[0],issuer=graph._GraphCoordinator__d11_issuer,\n                                previous_source_ref=request[\'previous_source_ref\'])\n                            finally:db.rollback()\n                    result=await runtime._worker.call(read_originals)\n                elif action==\'real_elapsed_originals\' and set(request)=={\'action\',\'phase_index\'}:\n                    if settings.get(\'scenario\')!=\'sdk_a06_real_elapsed_phases_v1\':raise ValueError(\'real elapsed phase scenario required\')\n                    from sdk_m1_fixture_contract_v1 import REAL_ELAPSED_EPISODES,actual_episode_originals_v1,actual_ordinary_episode_originals_v1\n                    plugin=instance();runtime=plugin._runtime;index=request[\'phase_index\']\n                    if type(index) is not int or not 0<=index<=2:raise ValueError(\'actual real elapsed phase index required\')\n                    def read_phase(graph):\n                        store=graph._GraphCoordinator__store\n                        phase=actual_episode_originals_v1(graph_path=store._db.execute(\'PRAGMA database_list\').fetchone()[2],\n                            namespace=plugin._installed_namespace,episode=REAL_ELAPSED_EPISODES[0 if index==0 else 1],\n                            expected_phase=\'partial\' if index==0 else \'satisfied\',expected_version=1 if index==0 else 2,\n                            cumulative_sender_count=4 if index==2 else None)\n                        if phase is None:return None\n                        if index in (1,2):\n                            with store._lock:\n                                db=store._db;db.execute(\'BEGIN\')\n                                try:\n                                    recall=actual_ordinary_episode_originals_v1(db,namespace=plugin._installed_namespace,\n                                        episode=REAL_ELAPSED_EPISODES[index],issuer=graph._GraphCoordinator__d11_issuer,\n                                        previous_source_ref=settings[\'real_elapsed_day0_source_ref\'],\n                                        required_artifact_refs=(phase[\'work_originals\'][-1][\'work\'][\'artifact_ref\'],phase[\'work_originals\'][-1][\'readback\'][\'content_digest\']) if index==2 else ())\n                                finally:db.rollback()\n                            if recall is None:return None\n                            phase={**phase,\'day4_recall\' if index==1 else \'day5_ordinary\':recall}\n                        return phase\n                    result=await runtime._worker.call(read_phase)\n                elif action==\'real_elapsed_meter\' and set(request)=={\'action\'}:\n                    if settings.get(\'scenario\')!=\'sdk_a06_real_elapsed_phases_v1\':raise ValueError(\'real elapsed meter requires its actual schema\')\n                    result={\'calls\':list(m1_model.calls),\'max_total_calls\':18,\'max_episode_calls\':6,\'max_auxiliary_calls\':2,\n                        \'current_process_model_requests\':len(local_model_requests),\'current_process_sender_calls\':sum(a!=\'get_login_info\' for a in peer.actions),\n                        \'provider_network_requests\':len(network_requests)}\n                elif action==\'hot_reload\' and set(request)=={\'action\'}:\n                    async with ingress_lock:\n                        if observer is not None:\n                            assert not life.event_bus._pending_tasks and life.event_queue.empty()\n                            observer.unbind_handler()\n                        old=instance();old_runtime=old._runtime\n                        success,error=await manager.reload(name)\n                        if not success:raise RuntimeError(\'actual_sdk_reload_failed\')\n                        if observer is not None:\n                            assert await actual_sdk_identity(context,adapter,peer,identity[\'umo\'])==identity\n                            require_actual_sdk_namespace(instance(),identity)\n                            observer.bind_handler()\n                        result={**health(),\'new_plugin_instance\':instance() is not old,\n                            \'old_runtime_worker_closed\':old_runtime is not None and old_runtime._worker is None}\n                else:raise ValueError(\'closed_fixture_action_required\')\n                writer.write(json.dumps({\'status\':\'ok\',\'result\':result},separators=(\',\',\':\')).encode()+b\'\\n\')\n            except Exception as error:\n                private_exception(\'B04_FIXTURE_RPC_EXCEPTION\',error)\n                writer.write(json.dumps({\'status\':\'failed\',\'type\':type(error).__name__},separators=(\',\',\':\')).encode()+b\'\\n\')\n            finally:\n                await writer.drain();writer.close();await writer.wait_closed()\n        endpoint=Path(\'/run/sylanne-b04-host/fixture.sock\')\n        ready=ROOT/\'data/host-ready.json\';ready.write_text(json.dumps(health(),separators=(\',\',\':\')))\n        with ready.open(\'rb\') as stream:os.fsync(stream.fileno())\n        server=await asyncio.start_unix_server(rpc,path=endpoint,limit=65537)\n        cleanup.callback(endpoint.unlink,missing_ok=True)\n        cleanup.push_async_callback(close_listener,server)\n        os.chmod(endpoint,0o600)\n        await stopped.wait()\ntry:\n    asyncio.run(run())\nexcept BaseException as error:\n    private_exception(\'B04_HOST_FIRST_EXCEPTION\',error)\n    failure = {\'type\':type(error).__name__,\n        \'frames\':[{\'file\':f.filename,\'line\':f.lineno,\'function\':f.name}\n            for f in traceback.extract_tb(error.__traceback__)]}\n    if hasattr(error,\'b04_initialization_observation\'):\n        failure[\'initialization\'] = error.b04_initialization_observation\n    (ROOT/\'data/host-first-failure.json\').write_text(json.dumps(failure))\n    raise\n'
 
 
 def host_process_command_v3(executable, executable_sha256):
@@ -2286,3 +1624,403 @@ def test_a06_actual_installed_sdk_real_elapsed_day0_day4_day5_resume(tmp_path):
     if phase!='day5':pytest.skip('actual '+phase+' production originals saved; full A06 awaits remaining real elapsed phases')
     assert value['overall_a06']=='PASS' and value['day5_restart_readback_verified']
     assert value['day5_new_input_continuity']=='VERIFIED' and len(value['meter']['calls'])<=18
+
+
+# Pure installer-contract regressions. These do not constitute installed acceptance.
+def test_artifact_v3_request_template_is_explicit_and_preserves_approved_budget_defaults():
+    from scripts.alpha1.install_linux import request_template_v5, request_template_v6
+    old = request_template_v5()
+    new = request_template_v6()
+    assert new["schema"] == "sylanne3.linux-install-request.v6"
+    for name in ("budget_limits", "budget_max_ceiling", "budget_valid_until_utc"):
+        assert new[name] == old[name]
+    for name in ("artifact_observation_cognition", "artifact_phase_observer", "artifact_phase_counter"):
+        assert new[name] is None
+
+
+def _artifact_v3_descriptor_contract_case():
+    # Descriptors only: no claimed installed files, signatures or count evidence.
+    from scripts.alpha1.install_linux import ARTIFACT_COUNTER_INITIAL_SCHEMA
+    counter = {
+        "schema": ARTIFACT_COUNTER_INITIAL_SCHEMA, "source_scope": "production",
+        "model_revision": "explicit-mock-only-v1", "counter_policy_id": "test:mock-external-contract",
+        "counter_policy_version": 1, "executable": "/uninstalled-test/counter",
+        "program_sha256": "a"*64, "counter_public_key_hex": "b"*64,
+        "tokenizer_path": "/uninstalled-test/tokenizer", "tokenizer_sha256": "c"*64,
+        "applicability_path": "/uninstalled-test/applicability.json", "applicability_sha256": "d"*64,
+        "encoding_rule_id": "test:mock-only-external-contract", "encoding_rule_sha256": "e"*64,
+        "timeout_seconds": 60}
+    observer = {"schema": "sylanne.artifact-phase-observer-installation.v2",
+        "observer_id": "test:independent-observer", "observer_version": 1,
+        "asset_ref": "/uninstalled-test/observer.json", "asset_sha256": "f"*64}
+    return {"artifact_phase_counter": counter, "artifact_phase_observer": observer}
+
+
+def test_artifact_v3_asset_descriptor_validation_issues_no_installation():
+    from scripts.alpha1.install_linux import validate_artifact_v3_asset_descriptors_v1
+    request = _artifact_v3_descriptor_contract_case()
+    assert validate_artifact_v3_asset_descriptors_v1(request) is request
+
+
+@pytest.mark.parametrize("change", ("LOCAL_FIXTURE", "unbounded_answer", "relative_path"))
+def test_artifact_v3_asset_descriptors_reject_legacy_fixture_and_content_answers(change):
+    from scripts.alpha1.install_linux import validate_artifact_v3_asset_descriptors_v1
+    request = _artifact_v3_descriptor_contract_case()
+    if change == "LOCAL_FIXTURE":
+        request["artifact_phase_counter"]["source_scope"] = "LOCAL_FIXTURE"
+    elif change == "unbounded_answer":
+        request["artifact_phase_observer"]["expected_answer"] = True
+    else:
+        request["artifact_phase_counter"]["executable"] = "relative/counter"
+    with pytest.raises(ValueError):
+        validate_artifact_v3_asset_descriptors_v1(request)
+
+
+def test_artifact_v3_fields_cannot_upgrade_a_legacy_install_request():
+    from scripts.alpha1.install_linux import request_template_v5, check_request
+    request = request_template_v5()
+    request.update(_artifact_v3_descriptor_contract_case())
+    request["artifact_observation_cognition"] = None
+    with pytest.raises(ValueError, match="installation request fields differ"):
+        check_request(request)
+
+
+def _artifact_v3_fixture_rpc_v1(action, **values):
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(65)
+        channel.connect("/run/sylanne-b04-host/fixture.sock")
+        channel.sendall(json.dumps({"action": action, **values}, separators=(",", ":")).encode() + b"\n")
+        with channel.makefile("rb") as stream:
+            answer = json.loads(stream.readline(1048577))
+    if answer["status"] != "ok":
+        raise RuntimeError("actual SDK fixture RPC failed: " + answer["type"])
+    return answer["result"]
+
+
+def _run_artifact_v3_installed_snapshot_node_v1(*, unknown, admission_negatives=False):
+    """One real message in an independently prepared fresh Linux installation."""
+    import sqlite3
+    location = os.environ.get("SYLANNE_ARTIFACT_V3_INSTALLED_SETUP")
+    if location is None:
+        pytest.skip("requires a new Root-approved V6/V9 installed SDK Mock fixture; old LOCAL_FIXTURE is unsupported")
+    if os.name != "posix" or os.geteuid() != 0:
+        raise PermissionError("the isolated fixture Root controller must run this forensic node")
+    sys.path.insert(0, "/opt/sylanne/code")
+    from _runtime_bootstrap import load_canonical_runtime_v1
+    load_canonical_runtime_v1(Path("/opt/sylanne/code"))
+    from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+    from rewrite.tests.alpha1.integration.beta1_fixture_evidence_read_v3 import (
+        backup_artifact_v3_fixture_graph_v1, verify_artifact_v3_fixture_snapshot_v1)
+    setup = json.loads(read_installed_bytes_v1(location, limit=65536))
+    fields = {"schema", "profile_id", "installation_id", "manifest_digest", "root_grant_digest",
+        "original_deadline_utc", "approved_root_limits", "approved_root_max_ceiling", "graph_path",
+        "evidence_directory", "message_id", "task_text", "unknown_observation"}
+    if set(setup) != fields or setup["schema"] != "sylanne.test.artifact-v3-installed-snapshot-setup.v1" or setup["unknown_observation"] is not unknown:
+        raise ValueError("exact new installed Artifact V3 setup descriptor required")
+    assets = json.loads(read_installed_bytes_v1("/etc/sylanne/authority/assets.json"))
+    if Path(setup["graph_path"]) != Path(assets["graph_db"]):
+        raise ValueError("forensic source is not this fixture's actual installed business Graph")
+    diagnostic_log = os.environ.get("SYLANNE_ARTIFACT_V3_AUTHORITY_DIAGNOSTIC_LOG")
+    diagnostic_cursor = None
+    if admission_negatives:
+        if not diagnostic_log:
+            pytest.skip("requires the actual isolated Core diagnostic log; opaque RPC errors are not concrete rejection evidence")
+        from rewrite.host_tests.alpha1.artifact_v3_admission_diagnostics_v1 import capture_core_diagnostic_cursor_v1
+        diagnostic_cursor = capture_core_diagnostic_cursor_v1(diagnostic_log)
+    directory = Path(setup["evidence_directory"])
+    directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+    stage = "signed_pre_episode_baseline"
+    try:
+        before = _artifact_v3_fixture_rpc_v1("artifact_v3_checkpoint")
+        if (not before["runtime_started"] or not before["worker_started"]
+                or before["manifest_sha256"] != setup["manifest_digest"]
+                or before["provider_network_requests"] or before["local_model_requests"]
+                or before["model_fixture_first_failure"] is not None
+                or not before["fixture_checkpoint"]["event_queue_empty"]
+                or before["fixture_checkpoint"]["pending_sdk_tasks"]
+                or before["fixture_checkpoint"]["worker_transaction_open"]):
+            raise ValueError("actual SDK is not a clean installed V9 Mock baseline")
+        initial = directory / "baseline.sqlite3"
+        initial_pin = backup_artifact_v3_fixture_graph_v1(graph_path=setup["graph_path"], target=initial)
+        baseline = verify_artifact_v3_fixture_snapshot_v1(snapshot=initial, setup=setup, baseline=True)
+        if admission_negatives:
+            armed = _artifact_v3_fixture_rpc_v1("artifact_v3_arm_admission_negatives")
+            if armed["state"] != "armed" or armed["cases"] or armed["valid_forward_count"]:
+                raise ValueError("the actual unused AuthorityClient admission observer was not armed")
+        stage = "single_actual_sdk_ingress"
+        ingress = _artifact_v3_fixture_rpc_v1("ordinary_ingress", message_id=setup["message_id"], text=setup["task_text"])
+        if not all(ingress.get(name) for name in ("handler_entered", "handler_returned", "pipeline_entered", "pipeline_returned")):
+            raise ValueError("actual SDK handler/pipeline did not process the single message")
+        stage = "actual_checkpoint_and_readonly_snapshot"
+        end = min(time.monotonic() + 120, time.monotonic() + setup["original_deadline_utc"] - time.time())
+        last = None
+        serial = 0
+        while time.monotonic() < end:
+            health = _artifact_v3_fixture_rpc_v1("artifact_v3_checkpoint")
+            if (health["provider_network_requests"] or health["model_fixture_first_failure"] is not None
+                    or health["artifact_v3_admission_probe"]["first_failure"] is not None):
+                raise RuntimeError("actual provider traffic or first Mock failure observed")
+            checkpoint = health["fixture_checkpoint"]
+            if not checkpoint["event_queue_empty"] or checkpoint["pending_sdk_tasks"] or checkpoint["worker_transaction_open"]:
+                time.sleep(0.5)
+                continue
+            with sqlite3.connect(Path(setup["graph_path"]).as_uri()+"?mode=ro", uri=True) as source:
+                source.execute("PRAGMA query_only=ON")
+                marker = source.execute("SELECT COALESCE(MAX(commit_seq),0) FROM graph_bundle_operations").fetchone()[0]
+            if marker == last:
+                time.sleep(0.5)
+                continue
+            last = marker
+            serial += 1
+            snapshot = directory / ("checkpoint-" + str(serial) + ".sqlite3")
+            pin = backup_artifact_v3_fixture_graph_v1(graph_path=setup["graph_path"], target=snapshot)
+            result = verify_artifact_v3_fixture_snapshot_v1(snapshot=snapshot, setup=setup, unknown=unknown)
+            if result is None:
+                time.sleep(0.5)
+                continue
+            calls = health["model_fixture_calls"]
+            expected = 4 if unknown else 6
+            if (len(calls) != expected or len({c["call_id"] for c in calls}) != expected
+                    or {c["call_id"] for c in calls} != {c["call_id"] for c in result["calls"]}
+                    or sum(c["fixture_charge_microusd"] for c in calls) != 0
+                    or health["local_model_requests"] != expected
+                    or (unknown and health["sender_calls"] != before["sender_calls"])):
+                raise ValueError("actual Mock transport calls/costs differ from authenticated snapshot originals")
+            if admission_negatives:
+                probe = health["artifact_v3_admission_probe"]
+                expected_names = ["sealed_grant_binding", "budget_lease", "reservation_operation",
+                    "reservation_digest", "provider_config", "installation_grant", "expired_envelope", "future_envelope"]
+                if (probe["state"] != "original_admitted" or probe["valid_forward_count"] != 1
+                        or [item["name"] for item in probe["cases"]] != expected_names
+                        or [item["layer"] for item in probe["cases"]] != ["live_core_original_identity_tamper"]*5+["host_before_dispatch"]*3
+                        or any(item["provider_call_delta"] or item["fixture_charge_delta_microusd"]
+                            or item["original_core_state"] != "prepared" for item in probe["cases"])):
+                    raise ValueError("live negative admissions did not retain the original before its one valid admission")
+                from rewrite.host_tests.alpha1.artifact_v3_admission_diagnostics_v1 import require_original_intent_rejections_v1
+                probe["actual_core_diagnostics"] = require_original_intent_rejections_v1(
+                    diagnostic_log, diagnostic_cursor, count=5)
+            output = {"schema": "sylanne.test.artifact-v3-installed-snapshot-result.v1",
+                "status": "PASS", "unknown_observation": unknown, "baseline_snapshot_sha256": initial_pin,
+                "snapshot_sha256": pin, "original_deadline_utc": setup["original_deadline_utc"],
+                "baseline": baseline, "originals": result, "sdk_health": health,
+                "provider_network_requests": 0, "fixture_model_charge_microusd": 0}
+            fd = os.open(directory/"result.json", os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                json.dump(output, stream, sort_keys=True);stream.flush();os.fsync(stream.fileno())
+            return output
+        raise TimeoutError("actual Artifact V3 episode did not qualify within its original deadline")
+    except BaseException as exc:
+        failure = {"schema": "sylanne.test.artifact-v3-first-failure.v1", "stage": stage,
+            "type": type(exc).__name__, "message": str(exc), "automatic_replay": False}
+        fd = os.open(directory/"first-failure.json", os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(failure, stream, sort_keys=True);stream.flush();os.fsync(stream.fileno())
+        raise
+
+
+def test_artifact_v3_installed_sdk_fresh_root_six_calls_and_delivered_receipt():
+    _run_artifact_v3_installed_snapshot_node_v1(unknown=False)
+
+
+def test_artifact_v3_installed_sdk_unknown_observation_never_satisfies_or_sends():
+    _run_artifact_v3_installed_snapshot_node_v1(unknown=True)
+
+def test_artifact_v3_installed_sdk_live_core_binding_tamper_then_original_six_calls():
+    """A separate fresh Root: actual Core gate diagnostics and exact Host binding refusals; not valid foreign grants."""
+    _run_artifact_v3_installed_snapshot_node_v1(unknown=False, admission_negatives=True)
+
+def test_artifact_v3_installed_sdk_two_fresh_roots_actual_foreign_objects_then_one_valid_admission():
+    """Actual B originals and read-only signed snapshots; never synthetic foreign digests."""
+    if os.environ.get("SYLANNE_ARTIFACT_V3_CROSS_ROOT_SETUP") is None:
+        pytest.skip("requires explicit protected setup for two independent fresh V6/V9 installed Roots")
+    if os.name != "posix" or os.geteuid() != 0:
+        raise PermissionError("the two-Root forensic node requires the isolated Linux Root controller")
+    sys.path.insert(0, "/opt/sylanne/code")
+    from _runtime_bootstrap import load_canonical_runtime_v1
+    load_canonical_runtime_v1(Path("/opt/sylanne/code"))
+    from rewrite.host_tests.alpha1.artifact_v3_cross_root_witness_v1 import run_cross_root_node_v1
+    run_cross_root_node_v1()
+
+
+
+def _artifact_v3_owner_http_v1(session,action,namespace,inputs):
+    """Use a real already signed dashboard Owner session; never mint a test session."""
+    import urllib.parse,urllib.request
+    from uuid import uuid4
+    parsed=urllib.parse.urlsplit(session["base_url"])
+    if (parsed.scheme!="http" or parsed.hostname not in {"127.0.0.1","localhost"}
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        raise ValueError("the isolated fixture's actual local Workbench endpoint is required")
+    operation=inputs.get("operation_id",str(uuid4()))
+    payload={"schema_version":"d12.contract.v1","action":action,
+        "scope":namespace["bot_id"]+"/"+namespace["persona_id"],
+        "purpose":"workbench_user_action","audience":"owner","operation_id":operation,"input":inputs}
+    from sylanne3.workbench_api.http_transport import COMMAND_ROUTE
+    origin=parsed.scheme+"://"+parsed.netloc
+    request=urllib.request.Request(origin+"/api/v1/plugins/extensions"+COMMAND_ROUTE,
+        data=json.dumps(payload,separators=(",",":")).encode(),method="POST",
+        headers={"Content-Type":"application/json","Cookie":session["cookie"],
+            "X-CSRF-Token":session["csrf_token"],"Origin":origin})
+    with urllib.request.urlopen(request,timeout=30)as response:
+        result=json.load(response)
+    if result.get("status")!="ready":raise ValueError("actual authenticated Owner command did not become ready")
+    return result
+
+
+def _artifact_v3_cancelled_job_source_gate_v1(probe):
+    import ast
+    root=Path("/opt/sylanne/code")
+    manifest=json.loads((root/"release-manifest.json").read_bytes())
+    result=probe.get("actual_acquire_result")or probe.get("result");error=probe.get("rejection")
+    if result is not None and error is not None:
+        raise ValueError("the original runner raised after its actual acquire refusal; preserve the production failure")
+    if result is not None:
+        if result!={"status":"original_execution_hold","job_id":probe["job_id"]}:
+            raise ValueError("actual execution did not refuse the terminal child")
+        rel="rewrite/sylanne3/runtime/d07_graph_stages_v1.py"
+        message="original_execution_hold"
+    else:
+        if (error is None or error["type"]!="AuthorityUnavailable"or error["message"]not in {
+                "Host exact original cognition job/cancel metadata changed",
+                "D07 special parent current cycle/cancel/C02/activity/root budget changed"}):
+            raise ValueError("the actual local rejection did not identify the cancellation binding")
+        rel="rewrite/sylanne3/runtime/d07_stage_content_scope_v3.py";message=error["message"]
+    callback=probe.get("actual_acquire_callback")
+    if probe.get("actual_acquire_result")is not None:
+        callback_rel="rewrite/sylanne3/runtime/d07_installed_execution_v1.py"
+        callback_source=root/callback_rel
+        callback_pin=next(row for row in manifest["source_inventory"]["files"]if row["path"]==callback_rel)
+        if (Path(callback["file"]).resolve()!=callback_source.resolve()
+                or hashlib.sha256(callback_source.read_bytes()).hexdigest()!=callback_pin["sha256"]):
+            raise ValueError("actual acquire callback is not the installed original D07 worker caller")
+        calls=[node for node in ast.walk(ast.parse(callback_source.read_bytes()))if isinstance(node,ast.Lambda)
+            and node.lineno==callback["line"]and any(isinstance(item,ast.Attribute)
+                and item.attr=="acquire_current_d07_execution_v1"for item in ast.walk(node))]
+        if len(calls)!=1:raise ValueError("actual captured callback does not call the original acquire")
+    source=root/rel;encoded=source.read_bytes()
+    pin=next(row for row in manifest["source_inventory"]["files"]if row["path"]==rel)
+    if hashlib.sha256(encoded).hexdigest()!=pin["sha256"]:
+        raise ValueError("actual Host cancellation gate differs from installed source manifest")
+    tree=ast.parse(encoded);matches=[]
+    for node in ast.walk(tree):
+        if result is not None and isinstance(node,ast.Return)and isinstance(node.value,ast.Dict):
+            for key,value in zip(node.value.keys,node.value.values):
+                if isinstance(key,ast.Constant)and key.value=="status"and isinstance(value,ast.Constant)and value.value==message:
+                    matches.append(node.lineno)
+        elif result is None and isinstance(node,ast.Raise)and isinstance(node.exc,ast.Call)and node.exc.args:
+            if isinstance(node.exc.args[0],ast.Constant)and node.exc.args[0].value==message:matches.append(node.lineno)
+    if len(matches)!=1:raise ValueError("the exact installed cancellation refusal branch is not unique")
+    return {"layer":"Host/D11 terminal-job refusal","source_path":rel,"source_sha256":pin["sha256"],
+        "line":matches[0],"reason":message,"core_admission_test":False}
+
+
+
+def test_artifact_v3_installed_sdk_owner_stop_cancels_queued_d07_and_refuses_original_runner():
+    """A separate fresh Root: actual Owner StopReply and the real queued child's W01 cancellation."""
+    from concurrent.futures import ThreadPoolExecutor
+    from uuid import uuid4
+    location=os.environ.get("SYLANNE_ARTIFACT_V3_INSTALLED_SETUP")
+    session_path=os.environ.get("SYLANNE_ARTIFACT_V3_OWNER_HTTP_SESSION")
+    if location is None or session_path is None:
+        pytest.skip("requires a separate fresh V9 Root plus a real signed current Workbench Owner HTTP session")
+    if os.name!="posix"or os.geteuid()!=0:raise PermissionError("isolated fixture Root controller required")
+    sys.path.insert(0,"/opt/sylanne/code")
+    from _runtime_bootstrap import load_canonical_runtime_v1
+    load_canonical_runtime_v1(Path("/opt/sylanne/code"))
+    from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+    from rewrite.tests.alpha1.integration.beta1_fixture_evidence_read_v3 import (
+        backup_artifact_v3_fixture_graph_v1,verify_artifact_v3_fixture_snapshot_v1,
+        verify_artifact_v3_queued_cancel_snapshot_v1)
+    setup=json.loads(read_installed_bytes_v1(location,limit=65536))
+    session=json.loads(read_installed_bytes_v1(session_path,limit=16384))
+    if(set(session)!={"schema","base_url","cookie","csrf_token","installation_id","manifest_digest"}
+            or session["schema"]!="sylanne.test.actual-owner-http-session.v1"
+            or(session["installation_id"],session["manifest_digest"])!=(setup["installation_id"],setup["manifest_digest"])
+            or setup["unknown_observation"]is not False or time.time()>=setup["original_deadline_utc"]):
+        raise ValueError("actual current Owner HTTP session and separate unexpired successful V9 fixture required")
+    assets=json.loads(read_installed_bytes_v1("/etc/sylanne/authority/assets.json"))
+    if Path(setup["graph_path"])!=Path(assets["graph_db"]):
+        raise ValueError("cancel node is not bound to this isolated fixture's actual Graph")
+    directory=Path(setup["evidence_directory"]);directory.mkdir(mode=0o700,parents=False,exist_ok=False)
+    stage="fresh_signed_baseline"
+    try:
+        before_health=_artifact_v3_fixture_rpc_v1("artifact_v3_checkpoint")
+        if (before_health["local_model_requests"]or before_health["provider_network_requests"]
+                or before_health["model_fixture_first_failure"]is not None):
+            raise ValueError("cancel node cannot reuse an already exercised Root")
+        baseline=directory/"baseline.sqlite3"
+        baseline_pin=backup_artifact_v3_fixture_graph_v1(graph_path=setup["graph_path"],target=baseline)
+        verify_artifact_v3_fixture_snapshot_v1(snapshot=baseline,setup=setup,baseline=True)
+        armed=_artifact_v3_fixture_rpc_v1("artifact_v3_arm_cancelled_queued_job")
+        if armed["state"]!="armed":raise ValueError("actual asynchronous D07 runner observer did not arm")
+        stage="actual_queued_child_before_acquire"
+        with ThreadPoolExecutor(max_workers=1)as pool:
+            ingress=pool.submit(_artifact_v3_fixture_rpc_v1,"ordinary_ingress",
+                message_id=setup["message_id"],text=setup["task_text"])
+            end=min(time.monotonic()+90,time.monotonic()+setup["original_deadline_utc"]-time.time())
+            while time.monotonic()<end:
+                paused=_artifact_v3_fixture_rpc_v1("artifact_v3_cancelled_queued_job_status")
+                if paused["state"]=="first_failure":raise ValueError(paused["first_failure"])
+                if paused["state"]=="paused_queued_before_acquire":break
+                time.sleep(.1)
+            else:raise TimeoutError("actual first D07 never reached its real queued execution entry")
+            if paused["deadline_utc"]-time.time()<10:raise TimeoutError("original deadline is too close for valid cancellation")
+            prepared_snapshot=directory/"queued-before-stop.sqlite3"
+            prepared_pin=backup_artifact_v3_fixture_graph_v1(graph_path=setup["graph_path"],target=prepared_snapshot)
+            prepared=verify_artifact_v3_queued_cancel_snapshot_v1(snapshot=prepared_snapshot,setup=setup,job_id=paused["job_id"])
+            stage="real_authenticated_owner_stop_reply"
+            page=_artifact_v3_owner_http_v1(session,"read_reply_controls",prepared["namespace"],{})
+            targets=[row for row in page["items"]if row["cycle_job_ref"]==paused["cycle_job_ref"]]
+            if len(targets)!=1:raise ValueError("the signed prepared child is absent from the real Owner inventory")
+            target=targets[0];operation=str(uuid4())
+            request={"schema":"d12.owner-stop-reply-request.v1","namespace":target["namespace"],
+                "installation_id":target["installation_id"],"operation_id":operation,
+                "cycle_job_ref":target["cycle_job_ref"],"c02_operation_id":target["c02_operation_id"],
+                "expected_cancel_generation":target["cancel_generation"]}
+            control=_artifact_v3_owner_http_v1(session,"stop_reply",prepared["namespace"],request)["control"]
+            stage="actual_W01_cancelled_child_snapshot"
+            current=_artifact_v3_owner_http_v1(session,"read_reply_control_status",prepared["namespace"],
+                {"original_ref":control["original_ref"]})["control"]
+            snapshot=directory/"cancelled-child.sqlite3"
+            pin=backup_artifact_v3_fixture_graph_v1(graph_path=setup["graph_path"],target=snapshot)
+            cancelled=verify_artifact_v3_queued_cancel_snapshot_v1(snapshot=snapshot,setup=setup,
+                job_id=paused["job_id"],stop_operation_id=operation,before=prepared)
+            if time.time()>=paused["deadline_utc"]:raise TimeoutError("original deadline expired before runner release")
+            stage="same_original_runner_after_actual_cancel"
+            _artifact_v3_fixture_rpc_v1("artifact_v3_cancelled_queued_job_release")
+            while time.time()<paused["deadline_utc"]:
+                refusal=_artifact_v3_fixture_rpc_v1("artifact_v3_cancelled_queued_job_status")
+                if refusal["state"]=="first_failure":raise ValueError(refusal["first_failure"])
+                if refusal["state"]=="rejected_after_actual_cancel":break
+                time.sleep(.1)
+            else:raise TimeoutError("original runner refusal did not precede its original deadline")
+            gate=_artifact_v3_cancelled_job_source_gate_v1(refusal)
+            ingress.result(timeout=max(.001,paused["deadline_utc"]-time.time()))
+        health=_artifact_v3_fixture_rpc_v1("artifact_v3_checkpoint")
+        if(time.time()>=paused["deadline_utc"]or health["local_model_requests"]!=3
+                or health["provider_network_requests"]or len(health["model_fixture_calls"])!=3
+                or sum(row["fixture_charge_microusd"]for row in health["model_fixture_calls"])!=0
+                or health["sender_calls"]!=before_health["sender_calls"]):
+            raise ValueError("deadline/provider/cost/sender changed after actual child cancellation")
+        final_snapshot=directory/"after-refused-runner.sqlite3"
+        final_pin=backup_artifact_v3_fixture_graph_v1(graph_path=setup["graph_path"],target=final_snapshot)
+        final=verify_artifact_v3_queued_cancel_snapshot_v1(snapshot=final_snapshot,setup=setup,
+            job_id=paused["job_id"],stop_operation_id=operation,before=prepared)
+        output={"status":"PASS","scope":"actual Owner StopReply/W01 queued D07 cancellation; Host/D11 refusal only",
+            "core_admission_test":False,"baseline_snapshot_sha256":baseline_pin,
+            "queued_snapshot_sha256":prepared_pin,"cancelled_snapshot_sha256":pin,
+            "final_snapshot_sha256":final_pin,"prepared":prepared,"cancelled":cancelled,"final":final,
+            "stop_control":control,"runner_refusal":refusal,"actual_source_gate":gate,
+            "provider_call_delta":0,"fixture_charge_delta_microusd":0}
+        fd=os.open(directory/"result.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,"w")as stream:
+            json.dump(output,stream,sort_keys=True);stream.flush();os.fsync(stream.fileno())
+        return output
+    except BaseException as error:
+        failure={"status":"FAIL","stage":stage,"type":type(error).__name__,"message":str(error),"automatic_replay":False}
+        fd=os.open(directory/"first-failure.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,"w")as stream:
+            json.dump(failure,stream,sort_keys=True);stream.flush();os.fsync(stream.fileno())
+        raise

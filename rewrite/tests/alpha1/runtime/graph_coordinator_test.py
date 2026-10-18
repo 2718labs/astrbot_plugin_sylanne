@@ -16,7 +16,7 @@ from sylanne3.graph_coordinator import (
 from sylanne3.graph_coordinator import UnavailableGuard, namespace_ref
 from sylanne3.graph_coordinator import budget_operation_digest
 from sylanne3.graph_store import GraphStore, ProductionGraphStore
-from sylanne3.graph_runtime import GraphRuntime
+from rewrite.host_tests.legacy_fixture_v1.graph_runtime import GraphRuntime
 from sylanne3.graph_types import AtomKey, GraphWrite, Owner, TypeRegistry, TypeSpec
 from sylanne3.memory_types import SourceRecord, access_key, source_key, validate_access
 from sylanne3.runtime_contracts import (

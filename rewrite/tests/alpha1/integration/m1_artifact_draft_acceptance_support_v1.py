@@ -92,6 +92,7 @@ def load_m1_phase_fixture_installation_v2(setup_file):
     import sylanne3.host.authority_profile as profile
     from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
     from sylanne3.authority_service.linux_installation_security_v1 import opened_installed_file_v1
+    from rewrite.host_tests.alpha1.artifact_phase_counter_fixture_v1 import RULE as FIXTURE_RULE
     from sylanne3.model_broker.artifact_phase_count_v1 import (
         artifact_phase_counter_policy_from_payload_v1, FIXTURE_PROVIDER, FIXTURE_MODEL,
     )
@@ -1510,9 +1511,10 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
     from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
     from sylanne3.domains.d01.production_operations_v1 import plain_v1
     from sylanne3.authority_service import AuthorityServiceCore
+    from rewrite.host_tests.alpha1.artifact_phase_counter_fixture_v1 import RULE as FIXTURE_RULE
     from sylanne3.model_broker.artifact_phase_count_v1 import (
         ArtifactPhaseCountPolicyV1, FIXTURE_PROVIDER, FIXTURE_MODEL,
-        FIXTURE_RULE, FIXTURE_RULE_ID, FIXTURE_RULE_DIGEST)
+        FIXTURE_RULE_ID, FIXTURE_RULE_DIGEST)
     from sylanne3.authority_service.artifact_phase_counter_v1 import artifact_phase_applicability_wire_v1
     from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
     from sylanne3.model_broker.reply_language import REPLY_TEMPLATE_VERSION

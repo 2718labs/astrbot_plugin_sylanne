@@ -112,7 +112,8 @@ _D07_LOCATOR_FIELDS=frozenset({'schema','namespace','job_id','operation_id','wor
     'read_rows','parent_prepared_ref','parent_prepared_digest','parent_execution_ref','parent_execution_digest',
     'reflection_request_ref','reflection_request_digest','reflection_continuation_ref','reflection_continuation_digest',
     'checkpoint_ref','checkpoint_digest','ticket_id','source_refs','parent_budget_lease_ref','parent_grant_digest',
-    'original_deadline_utc','cycle_ref','cycle_digest','call_plan_digest','c02_operation_id','cancel_generation'})
+    'original_deadline_utc','cycle_ref','cycle_digest','call_plan_digest','c02_operation_id','cancel_generation',
+    'execution_id','semantic_question_ref','semantic_question_digest','observation_basis_ref','observation_basis_digest'})
 
 _FOLLOWUP_TYPES=MappingProxyType({
     'd01':('d01.persona_activation.v1','d01.persona_plan.v1','d07.current_interpretation.v1'),
@@ -207,6 +208,10 @@ def bind_background_reads_v3(owner,*,db,scope=None,current_owner=None):
 
 def _require_json_column_owner_v3(owner,*,db):
     if type(owner)is BackgroundReadWorkV3:return require_actual_background_attachment_owner_v3(owner,db=db)
+    from ..authority_service.owner_stop_reply_metadata_v1 import (
+        OwnerStopReplyMetadataReadV1,HostOwnerStopReplyMetadataReadV1,require_owner_stop_reply_metadata_column_owner_v1)
+    if type(owner)in (OwnerStopReplyMetadataReadV1,HostOwnerStopReplyMetadataReadV1):
+        return require_owner_stop_reply_metadata_column_owner_v1(owner,db=db)
     from ..authority_service.model_reply_scope_observation_v3 import require_actual_model_reply_scope_column_owner_v3
     return require_actual_model_reply_scope_column_owner_v3(owner,db=db)
 
@@ -675,6 +680,9 @@ def read_bound_d07_mutable_runtime_row_v3(db,*,table,columns,key_columns,key):
 
 
 def read_bound_background_graph_attachment_v3(db,*,table,columns,key_columns,key):
+    from .artifact_receipt_original_read_v1 import read_bound_artifact_receipt_point_v1
+    receipt_bound,receipt_row=read_bound_artifact_receipt_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if receipt_bound:return True,receipt_row
     from ..authority_service.model_reply_scope_observation_v3 import read_bound_model_reply_scope_point_v3
     observed,row=read_bound_model_reply_scope_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if observed:return True,row
@@ -1323,6 +1331,7 @@ class _BackgroundD07EntryLocatorV3:
         from .d07_execution_v1 import TABLE,SIGN_KIND,D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         from dataclasses import fields
         o=self.owner;o.require_data_current_v3(meter)
         if self.phase=='job':
@@ -1349,7 +1358,8 @@ class _BackgroundD07EntryLocatorV3:
             classes={'d07.prepared-execution.v1':D07PreparedExecutionV1,
                 'd07.relationship-prepared.v2':D07RelationshipPreparedV2,'d07.method-growth-prepared.v2':D07MethodGrowthPreparedV2,
                 'd07.reflection-prepared.v3':D07ReflectionPreparedV3,
-                'd07.general-growth-prepared.v1':D07GeneralGrowthPreparedV1}
+                'd07.general-growth-prepared.v1':D07GeneralGrowthPreparedV1,
+                'd07.artifact-observation-prepared.v3':D07ArtifactObservationPreparedV3}
             actual=classes.get(projected.get('schema'))
             if actual is None or self.column.fields_seen!={item.name for item in fields(actual)}:
                 raise AuthorityUnavailable('D07 stage parent has another registered complete prepared schema')
@@ -1358,6 +1368,9 @@ class _BackgroundD07EntryLocatorV3:
                     or (projected.get('job_id'),projected.get('operation_id'))!=self.job_metadata[:2]
                     or self.job_metadata[4]!='d07.'+projected.get('work_kind','')):
                 raise AuthorityUnavailable('D07 prepared locator crossed actual parent namespace/job/operation')
+            if actual is D07ArtifactObservationPreparedV3:
+                from .artifact_observation_parentage_v3 import artifact_observation_descriptor_from_metadata_v3
+                artifact_observation_descriptor_from_metadata_v3(projected,namespace=o.namespace,prepared_digest=self.metadata[0])
             if actual is D07ReflectionPreparedV3:
                 _require_reflection_locator_metadata_v3(o,projected)
             o.entry_metadata=(self.metadata,projected);self.complete=True
@@ -1619,6 +1632,10 @@ def _start_background_request_v3(reader,request):
 
 
 def advance_domain_background_read_v3(graph,work):
+    from ..authority_service.owner_stop_reply_metadata_v1 import (
+        HostOwnerStopReplyMetadataWorkV1,advance_host_owner_stop_reply_metadata_work_v1)
+    if type(work.state)is HostOwnerStopReplyMetadataWorkV1:
+        return advance_host_owner_stop_reply_metadata_work_v1(graph,work)
     if work.state.kind=='artifact_model_dispatch':
         from .artifact_host_dispatch_source_v3 import advance_artifact_host_dispatch_read_v3
         return advance_artifact_host_dispatch_read_v3(graph,work)
@@ -1797,6 +1814,10 @@ def advance_domain_background_read_v3(graph,work):
 
 
 def finish_domain_background_read_v3(graph,work,error):
+    from ..authority_service.owner_stop_reply_metadata_v1 import (
+        HostOwnerStopReplyMetadataWorkV1,finish_host_owner_stop_reply_metadata_work_v1)
+    if type(work.state)is HostOwnerStopReplyMetadataWorkV1:
+        return finish_host_owner_stop_reply_metadata_work_v1(graph,work,error)
     if work.state.kind=='artifact_model_dispatch':
         from .artifact_host_dispatch_source_v3 import finish_artifact_host_dispatch_read_v3
         return finish_artifact_host_dispatch_read_v3(graph,work,error)

@@ -495,6 +495,8 @@ def _qualified_amended_artifact_task_text_extent_v2(db,*,frame,request,readers,r
 
 
 def require_artifact_task_text_extent_history_v2(db,*,namespace,original_ref,producing_operation_id,raw):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d08_personal_plan_v1 import require_artifact_task_plan_revision_original_v2
     from .d08_personal_candidate_v1 import artifact_task_choice_ids_v2
     value=decode_artifact_task_text_extent_original_v1(raw);basis=value.basis
@@ -513,18 +515,18 @@ def require_artifact_task_text_extent_history_v2(db,*,namespace,original_ref,pro
             or not original['payload']['now_utc']<basis.original_deadline_utc):
         raise ValueError('amended extent lost exact closed same-task W01 registration and revision predecessor')
     from .d11_life_preparation_v1 import TABLE
-    saved=db.execute('SELECT payload_json,payload_digest FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
+    saved=_artifact_receipt_sql_v1(db,'SELECT payload_json,payload_digest FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
         (*namespace.as_tuple,KIND,basis.initial_extent_ref)).fetchone()
     if saved is None or saved[1]!=basis.initial_extent_digest:raise ValueError('amended extent lost immutable initial rule original')
-    initial=decode_artifact_task_text_extent_original_v1(json.loads(saved[0]))
+    initial=decode_artifact_task_text_extent_original_v1(background_json_loads_v3(saved[0]))
     if value.extent_mode=='inherited' and (value.full_extent,value.rule_source_head,value.rule_source_digest,value.evidence_start,value.evidence_end,
             value.evidence_text,value.rule_c1_intent_ref,value.rule_c1_intent_digest)!=(initial.full_extent,initial.task_source_head,
             initial.task_source_digest,initial.evidence_start,initial.evidence_end,initial.evidence_text,initial.c1_intent_ref,initial.c1_intent_digest):
         raise ValueError('inherited amended extent changed actual initial rule evidence')
-    source=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
+    source=_artifact_receipt_sql_v1(db,'SELECT value,valid FROM graph_history WHERE token=? AND revision=?',
         (basis.amendment_source_head.key.token,basis.amendment_source_head.revision)).fetchone()
     from ..memory_types import SourceRecord
-    if (source is None or source[1]!=1 or canonical_digest(json.loads(source[0]))!=basis.amendment_source_digest
-            or SourceRecord.from_dict(json.loads(source[0])).text[value.amendment_evidence_start:value.amendment_evidence_end]!=value.amendment_evidence_text):
+    if (source is None or source[1]!=1 or background_json_digest_v3(source[0],background_json_loads_v3(source[0]))!=basis.amendment_source_digest
+            or SourceRecord.from_dict(background_json_loads_v3(source[0])).text[value.amendment_evidence_start:value.amendment_evidence_end]!=value.amendment_evidence_text):
         raise ValueError('amended extent changed its distinct immutable new Source evidence')
     return value

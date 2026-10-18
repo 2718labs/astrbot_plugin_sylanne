@@ -1258,7 +1258,7 @@ class AuthorityRpcServer:
                 raise AuthorityUnavailable("StopReply service installation changed its actual dependencies")
             return prior
         service = InstalledOwnerStopReplyServiceV1(status_service=status_service,
-            control=control, issuer=verifier._issuer)
+            control=control, issuer=verifier._issuer, bundle=verifier._artifact_draft_bundle)
         self._owner_stop_reply_services_v1[key] = service
         from .natural_disposition_maintenance_v1 import InstalledNaturalDispositionMaintenanceServiceV1
         service.natural_disposition_maintenance = InstalledNaturalDispositionMaintenanceServiceV1(

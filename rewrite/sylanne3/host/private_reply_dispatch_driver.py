@@ -139,6 +139,10 @@ class InstalledPrivateReplyContinuationV1:
         )
         from .current_dispatch_handoff_port import InstalledCurrentDispatchHandoffPort
 
+        from .artifact_receipt_dispatch_driver_v1 import InstalledArtifactReceiptContinuationV1
+        if type(self)is InstalledPrivateReplyContinuationV1:family="private_reply"
+        elif type(self)is InstalledArtifactReceiptContinuationV1:family="artifact_receipt"
+        else:raise PrivateReplyDispatchHold("unregistered installed dispatch continuation family")
         namespace = original.namespace
         request = original.request
         authority_namespace = self._policy.authority_namespace
@@ -148,11 +152,12 @@ class InstalledPrivateReplyContinuationV1:
         # The reverse callback owns the only GraphWorker slot during start.
         # Freeze the original committed D09 text before acquiring that window;
         # W01's claim checks the same segment again in its graph transaction.
-        payload = await self._worker.call(
-            lambda graph: GraphTextPayloadResolver(
-                graph, self._authority, self._lease).resolve(request))
-        if type(payload) is not ResolvedTextPayload:
-            raise PrivateReplyDispatchHold("original D09 text is unavailable")
+        payload=None
+        if family=="private_reply":
+            payload = await self._worker.call(lambda graph: GraphTextPayloadResolver(
+                graph,self._authority,self._lease).resolve(request))
+            if type(payload)is not ResolvedTextPayload:
+                raise PrivateReplyDispatchHold("original D09 text is unavailable")
 
         clock = await asyncio.to_thread(
             self._port.read_ingress_clock, self._clock_policy)
@@ -181,7 +186,14 @@ class InstalledPrivateReplyContinuationV1:
         from ..runtime.dispatch_current_inventory_v3 import prepare_dispatch_inventory_on_worker_v3
         async with prepare_dispatch_inventory_on_worker_v3(self._worker,self._authority,self._lease,
                 binding=binding,admission=original.admission,request=request,permit=permit,
-                now_utc=now_utc,dispatch_family="private_reply") as prepared_inventory:
+                now_utc=now_utc,dispatch_family=family) as prepared_inventory:
+            if family=="artifact_receipt":
+                from ..runtime.artifact_receipt_original_read_v1 import bind_artifact_receipt_payload_v1
+                def receipt_payload(graph):
+                    with bind_artifact_receipt_payload_v1(prepared_inventory,graph,request,now_utc=now_utc):
+                        return GraphTextPayloadResolver(graph,self._authority,self._lease).resolve(request)
+                payload=await self._worker.call(receipt_payload)
+                if type(payload)is not ResolvedTextPayload:raise PrivateReplyDispatchHold("actual Artifact receipt payload is unavailable")
             prepared, _ = await asyncio.to_thread(
                 self._port.execution_prepare,
                 namespace=namespace, authority_namespace=authority_namespace,

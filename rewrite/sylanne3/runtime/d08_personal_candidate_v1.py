@@ -1,4 +1,6 @@
 """Actual W01 candidate preparation and selected adapter reads; no reserve/job/provider."""
+
+from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING
@@ -320,7 +322,7 @@ def _reconstruct_phase_preparation_transition_v1(db, *, frame, request, phase_se
     after_cont = foreground_cycle_from_wire_v1(after_cycle.continuation)
     if (before_cycle.phase != "running" or before_cycle.lease_holder != prepared.actor_ref
             or after_cycle.phase != "waiting" or after_cycle.lease_holder is not None
-            or after_cycle.cancel_epoch != before_cycle.cancel_epoch or type(after_cont.call_plan) is not ForegroundCallPlanV2
+            or after_cycle.cancel_epoch != before_cycle.cancel_epoch or type(after_cont.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}
             or after_cont.call_plan.phase_group != before_cont.call_plan.phase_group
             or after_cont.call_plan.phase_group.selector != phase_selector
             or after_cycle != replace(before_cycle, phase="waiting", continuation=plain_v1(after_cont),

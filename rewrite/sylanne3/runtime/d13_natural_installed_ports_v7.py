@@ -3,6 +3,7 @@ from ..authority_service.d13_derived_paid_block_verifier_v2 import build_install
 from ..authority_service.d13_wire_evidence_v7 import InstalledD13WireEvidencePortV7,InstalledD13WirePolicyV7
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+from ..host.model_workflows_v9 import AdminModelWorkflowsV9
 from ..model_broker.d13_precompression import D13PrecompressionInstallationV1
 from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION,FrozenNaturalReplyRequestV7
 from ..runtime_contracts import canonical_digest
@@ -14,7 +15,7 @@ from .jobs import get_job
 
 def build_current_natural_d13_ports_v7(db,*,bundle,resource_issuer,budget_issuer,c02_operation_id,plan,activation_generation,
         now_utc,original=None,authority_store=None,max_slots=256,_authority_replay=None):
-    if (not db.in_transaction or type(bundle.model_workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
+    if (not db.in_transaction or type(bundle.model_workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
             or bundle.model_workflows.natural_generation is None
             or bundle.model_workflows.natural_generation.template_version!=TEMPLATE_VERSION
             or original is not None and type(original) is not FrozenNaturalReplyRequestV7):

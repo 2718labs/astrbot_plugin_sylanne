@@ -533,9 +533,10 @@ async def run_installed_d13_paid_runtime_v1(runtime, envelope, ingress_operation
         from ..host.model_workflows_v6 import AdminModelWorkflowsV6
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+        from ..host.model_workflows_v9 import AdminModelWorkflowsV9
         from ..model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE
         from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
-        actual_v7=(type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} and bundle.model_workflows.natural_generation is not None
+        actual_v7=(type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and bundle.model_workflows.natural_generation is not None
             and bundle.model_workflows.natural_generation.template_version==V7_TEMPLATE)
         if (actual_v7 or (type(bundle.model_workflows) is AdminModelWorkflowsV6
                 and bundle.model_workflows.natural_generation is not None

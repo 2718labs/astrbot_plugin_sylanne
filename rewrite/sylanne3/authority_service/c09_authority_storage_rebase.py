@@ -1513,3 +1513,59 @@ def _require_completed_source_v1(db, original):
     if (str(path) != original.source_path or _identity(path) != original.source_identity
             or _files_sha(path) != original.source_files_sha256 or _root(db) != original.source_data_root):
         raise AuthorityUnavailable("completed C09 candidate source snapshot changed")
+
+
+def owner_stop_reply_child_carrier_keys_v3(db,namespace,cycle,job,original_ref,original_digest):
+    """Closed new Artifact carriers; the accepted signed StopReply plan pins their identities."""
+    from ..graph_types import AtomKey
+    from ..runtime_contracts import NamespaceId
+    from ..runtime.d11_types import job_graph_write
+    if (NamespaceId(job.bot_id,job.persona_id)!=namespace or job.activity_id!=cycle.activity_id
+            or type(original_digest)is not str or len(original_digest)!=64):
+        raise AuthorityUnavailable("StopReply Artifact carrier crossed its accepted cycle commitment")
+    ns=namespace.as_tuple
+    if job.work_kind=="artifact_draft_v1":
+        rows=tuple(db.execute("SELECT kind,original_ref,payload_digest FROM graph_d11_life_originals_v1 "
+            "WHERE bot=? AND persona=? AND kind IN ('c4_prepared','c4_phase_prepared') AND original_ref=?",
+            (*ns,original_ref)))
+        if len(rows)!=1 or rows[0][2]!=original_digest:
+            raise AuthorityUnavailable("StopReply C4 carrier differs from the accepted signed original")
+        if rows[0][0]=="c4_prepared":return None
+        if job.job_id!=original_ref or not job.job_id.startswith("artifact-draft-v2-job:"):
+            raise AuthorityUnavailable("StopReply phase C4 carrier has no exact deterministic child locator")
+        return (("graph_d11_life_originals_v1",("bot","persona","kind","original_ref"),
+            (*ns,"c4_phase_prepared",original_ref)),)
+    if job.work_kind=="d07.concern":
+        from ..runtime.d07_execution_v1 import d07_execution_ids_v1
+        if not job.operation_id.startswith("artifact-phase-observe:"):return None
+        ids=d07_execution_ids_v1(namespace,job.operation_id,"concern")
+        if (job.job_id,original_ref)!=(ids["job"],ids["job"]):
+            raise AuthorityUnavailable("StopReply Artifact D07 carrier changed its deterministic locator")
+        row=db.execute("SELECT payload_digest FROM graph_d07_execution_originals_v1 "
+            "WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",(*ns,original_ref)).fetchone()
+        if row!=(original_digest,):
+            raise AuthorityUnavailable("StopReply Artifact D07 carrier differs from its accepted full original")
+        return (("graph_d07_execution_originals_v1",("bot","persona","kind","original_ref"),
+            (*ns,"prepared",original_ref)),)
+    if job.work_kind=="message"and job.operation_id.startswith("artifact-receipt-message:"):
+        marker=job.operation_id.removeprefix("artifact-receipt-message:")
+        batch=AtomKey.from_token(original_ref)
+        if (len(marker)!=48 or any(c not in "0123456789abcdef"for c in marker)
+                or NamespaceId.from_key(batch)!=namespace or batch.type_name!="d09.verified_segment_batch.v1"):
+            raise AuthorityUnavailable("StopReply receipt carrier borrowed another message or natural child")
+        rows=tuple(db.execute("SELECT revision,event_id FROM graph_history WHERE token=? AND event_id=? "
+            "ORDER BY revision LIMIT 2",(original_ref,job.operation_id)))
+        if len(rows)!=1:
+            raise AuthorityUnavailable("StopReply receipt has no unique actual W01 batch birth")
+        producer="artifact-completion-source:"+marker
+        row=db.execute("SELECT domain,operation_kind FROM graph_domain_production_originals_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",(*ns,producer)).fetchone()
+        from ..runtime.artifact_completion_receipt_v1 import OPERATION
+        if row!=("d06",OPERATION):
+            raise AuthorityUnavailable("StopReply receipt lost its actual D06 producer")
+        return (
+            ("graph_domain_production_originals_v1",("bot","persona","operation_id"),(*ns,producer)),
+            ("graph_bundle_operations",("bot","persona","operation_id"),(*ns,job.operation_id)),
+            ("graph_atoms",("token",),(original_ref,)),
+            ("graph_history",("token","revision"),(original_ref,rows[0][0])))
+    return None

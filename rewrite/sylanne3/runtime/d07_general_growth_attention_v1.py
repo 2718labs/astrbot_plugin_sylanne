@@ -587,8 +587,9 @@ def stage_register_general_growth_attention_v1(db,*,frame,request,installed_read
             raise MissingProductionOriginalV1("actual_general_growth_attention_already_registered")
         lease,grant,_=_actual_general_growth_budget_ancestry_v1(db,trigger.original_parent_budget_lease_ref,installed_readers.issuer)
         from ..host.model_workflows_v8 import AdminModelWorkflowsV8,is_installed_general_growth_cognition_slot_v1
+        from ..host.model_workflows_v9 import AdminModelWorkflowsV9
         workflows=installed_readers.bundle.model_workflows
-        if type(workflows)is not AdminModelWorkflowsV8:raise MissingProductionOriginalV1("actual_installed_general_growth_workflow_v8")
+        if type(workflows) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9):raise MissingProductionOriginalV1("actual_installed_general_growth_workflow_v8")
         workflow=workflows.general_growth_cognition
         if workflow is None:raise MissingProductionOriginalV1("actual_installed_general_growth_cognition_slot")
         if not is_installed_general_growth_cognition_slot_v1(installed_readers.bundle,workflow):

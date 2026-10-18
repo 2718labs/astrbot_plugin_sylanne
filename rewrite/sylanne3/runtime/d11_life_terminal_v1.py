@@ -102,14 +102,16 @@ class LifeTerminalBundleV1:
 
 
 def read_plan_current_life_terminal_v1(db, *, namespace, activity_id, operation_kind, request):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if operation_kind != "adopt_life" or type(request) is not AdoptCurrentLifeRequestV1:
         raise TypeError("registered fixed Life terminal request required")
     keys = [owner_grant_key(*namespace.as_tuple)]
-    row = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
+    row = _artifact_receipt_sql_v1(db,"SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
         (*namespace.as_tuple, request.prepared_original_ref)).fetchone()
     if row:
         from .d11_life_preparation_v1 import life_prepared_from_wire_v1
-        p = life_prepared_from_wire_v1(json.loads(row[0]))
+        p = life_prepared_from_wire_v1(background_json_loads_v3(row[0]))
         b = p.binding
         if b.activity_id != activity_id:
             raise ValueError("Life terminal activity differs")
@@ -122,8 +124,8 @@ def read_plan_current_life_terminal_v1(db, *, namespace, activity_id, operation_
         keys.extend(life_fact_auxiliary_key_v1(fact,kind) for fact in facts for kind in (PROVENANCE_TYPE,ELIGIBILITY_TYPE))
         from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
         keys.extend(life_outcome_read_keys_v1(b,p.plan.action_intent.ref))
-        action_row = db.execute("SELECT value FROM graph_atoms WHERE token=?", (p.plan.action_intent.ref,)).fetchone()
-        action = _decode_intent(json.loads(action_row[0]))
+        action_row = _artifact_receipt_sql_v1(db,"SELECT value FROM graph_atoms WHERE token=?", (p.plan.action_intent.ref,)).fetchone()
+        action = _decode_intent(background_json_loads_v3(action_row[0]))
         keys.append(observed_action_outcome_key_v1(AtomKey.from_token(p.plan.action_intent.ref), action))
     return production_read_plan_v1((), tuple(dict.fromkeys(keys)), (), (request.prepared_original_ref,))
 
@@ -301,6 +303,8 @@ def read_adopted_life_original_v1(db, *, namespace, result_ref, issuer):
 
 def validate_adopted_life_member_history_v1(db, *, value, namespace, result_ref, producing_operation_id):
     """Read-only structural joins; callers independently authenticate signatures."""
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .natural_producer_qualification_v1 import _producer_original_point_v3
     fields = {"schema", "namespace", "result_ref", "producing_operation_id", "prepared_digest", "terminal", "source_refs", "graph_receipt_json", "write_commitments"}
     current = value.get("schema") in {"d11.adopted-life-original.v2","d11.adopted-life-original.v3", "d11.adopted-life-original.v4"}
@@ -317,7 +321,7 @@ def validate_adopted_life_member_history_v1(db, *, value, namespace, result_ref,
     receipt = _decode_json(value["graph_receipt_json"], CommitReceipt)
     if receipt.status != "committed" or receipt.operation_id != producing_operation_id or producing_operation_id != life_adoption_operation_id_v1(terminal.binding):
         raise ValueError("Life adopted original receipt differs")
-    actual = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'commit_seq'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, receipt.operation_id)), legacy_reader=lambda: db.execute("SELECT digest,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+    actual = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'commit_seq'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, receipt.operation_id)), legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT digest,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, receipt.operation_id)).fetchone())
     if actual != (receipt.operation_digest, receipt.commit_seq):
         raise ValueError("Life historical receipt differs from actual committed operation")
@@ -328,10 +332,10 @@ def validate_adopted_life_member_history_v1(db, *, value, namespace, result_ref,
         raise ValueError("Life adopted original receipt write membership differs")
     members = {}
     for row in value["write_commitments"]:
-        history = _producer_original_point_v3(db, table='graph_history', columns=('event_id', 'value', 'valid'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((row['ref'], row['revision'])), legacy_reader=lambda: db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (row["ref"], row["revision"])).fetchone())
-        if history is None or history[0] != producing_operation_id or history[2] != 1 or canonical_digest(json.loads(history[1])) != row["digest"]:
+        history = _producer_original_point_v3(db, table='graph_history', columns=('event_id', 'value', 'valid'), key_columns=('token', 'revision'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1]))((row['ref'], row['revision'])), legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (row["ref"], row["revision"])).fetchone())
+        if history is None or history[0] != producing_operation_id or history[2] != 1 or background_json_digest_v3(history[1],background_json_loads_v3(history[1])) != row["digest"]:
             raise ValueError("Life adopted original immutable member history differs")
-        members[row["ref"]] = json.loads(history[1])
+        members[row["ref"]] = background_json_loads_v3(history[1])
     if current:
         if terminal.status == "completed":
             b = terminal.binding

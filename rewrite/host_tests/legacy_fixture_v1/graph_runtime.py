@@ -3,10 +3,10 @@ import asyncio
 import contextvars
 import threading
 
-from .contracts import CapacityExceeded, Event
+from sylanne3.contracts import CapacityExceeded, Event
 from .delivery import _finish
-from .graph_types import GraphCandidate
-from .graph_store import ProductionGraphStore
+from sylanne3.graph_types import GraphCandidate
+from sylanne3.graph_store import ProductionGraphStore
 from .operators import OperatorPlan
 
 

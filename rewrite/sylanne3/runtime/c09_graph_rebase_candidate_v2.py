@@ -1863,7 +1863,14 @@ def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
         from .c09_contact_effect_accounting_v1 import verify_financial_original_join_v1
         verify_financial_original_join_v1(original, read_original=read)
     elif shape.table=='graph_d11_life_originals_v1':
-        verify_c09_life_domain_join_v2(build.pair.source,original,shape.columns,row,index=index)
+        d07_read=None
+        if original.kind=='artifact_phase_assessment' and original.payload['request']['observer_original_refs']:
+            d07_shape=read_c09_table_shape_v2(build.pair.source,D07,meter=meter)
+            d07_index=_actual_domain_index_v2(build,d07_shape,budget,meter)
+            def d07_read(namespace,kind,ref):
+                saved=d07_index.get(namespace,kind,ref)
+                return None if saved is None else (saved[1].payload,saved[1].original_commitment)
+        verify_c09_life_domain_join_v2(build.pair.source,original,shape.columns,row,index=index,read_d07_original=d07_read)
     elif shape.table==D07:verify_c09_d07_accounting_join_v2(original,read_original=read)
     elif shape.table in {CONTACT,CONTACT2}:
         def account_by_digest(digest):

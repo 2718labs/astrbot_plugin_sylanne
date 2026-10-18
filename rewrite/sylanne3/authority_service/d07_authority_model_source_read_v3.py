@@ -137,6 +137,7 @@ class _D07AuthorityPreparedHeaderReadV3:
             D07RelationshipPreparedV2,D07ReflectionPreparedV3,D07IngressRecallPreparedV1)
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         work=self.work;self.reader.require_current_v3(meter)
         if self.phase=="identity":
             self.metadata=_runtime_bounded_fixed_row_v3(work.db,meter,TABLE,
@@ -146,7 +147,7 @@ class _D07AuthorityPreparedHeaderReadV3:
                 raise AuthorityUnavailable("D07 Source header lost its exact signed prepared original")
             retained=frozenset().union(*(frozenset(item.name for item in fields(cls))for cls in (
                 D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,
-                D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1)))
+                D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07ArtifactObservationPreparedV3)))
             retained=retained-{"frozen_json","external_content_originals_json"}
             self.column=_D07AuthorityLocatorColumnV3(work,kind="prepared",original_ref=self.job_id,
                 retained_fields=retained)
@@ -160,7 +161,7 @@ class _D07AuthorityPreparedHeaderReadV3:
         raw=self.column.require_v3(work)
         classes={cls.__dataclass_fields__["schema"].default:cls for cls in (
             D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,
-            D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1)}
+            D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07ArtifactObservationPreparedV3)}
         cls=classes.get(raw.get("schema"))
         if (cls is None or self.column.fields_seen!={field.name for field in fields(cls)}
                 or raw["namespace"]!={"bot_id":work.namespace.bot_id,"persona_id":work.namespace.persona_id}
@@ -853,6 +854,7 @@ def read_current_d07_content_scope_basis_v3(db,*,issuer,prepared,request,frozen,
         read_original_d07_request_v1,read_d07_original_v1,require_current_d07_content_reads_v1)
     from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
     from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+    from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
     from ..runtime.foreground_call_plan_v1 import require_current_named_c3_cycle_v2
     if (not db.in_transaction or type(owner_acl_authority)is not AuthorityContext
             or owner_acl_authority.namespace!=prepared.namespace or owner_acl_authority.owner_scope!=("d11",)
@@ -897,6 +899,19 @@ def read_current_d07_content_scope_basis_v3(db,*,issuer,prepared,request,frozen,
         originals.append(ProductionOriginalRefV1("d07.reflection_continuation",prepared.reflection_continuation_ref,continuation[1]))
         if prepared.cycle_ref is not None:
             require_current_named_c3_cycle_v2(db,namespace=prepared.namespace,prepared=prepared,issuer=issuer)
+    elif type(prepared)is D07ArtifactObservationPreparedV3:
+        from .current_authority_graph_read_v3 import _authority_attachment_owner_v3
+        from ..runtime.artifact_observation_parentage_v3 import require_qualified_artifact_observation_basis_v3
+        work=_authority_attachment_owner_v3(db)
+        reader=None if work is None else require_current_d07_authority_namespace_recipe_v3(work)
+        if reader is None:raise AuthorityUnavailable("Artifact observation requires its actual Source Work")
+        artifact_basis=require_qualified_artifact_observation_basis_v3(reader,prepared)
+        require_current_named_c3_cycle_v2(db,namespace=prepared.namespace,prepared=prepared,issuer=issuer)
+        source=reader.metadata_qualified.require_for_v3(reader).effective_source_authority
+        kind="artifact_observation_self"
+        originals.extend((ProductionOriginalRefV1("d07.semantic_question",prepared.semantic_question_ref,
+            prepared.semantic_question_digest),ProductionOriginalRefV1("d11.life_artifact_phase_observation_basis_v1",
+            artifact_basis.original_ref,artifact_basis.digest)))
     elif type(prepared)is D07MethodGrowthPreparedV2:
         from ..runtime.d07_execution_v1 import read_current_d07_semantic_question_v1,require_current_method_growth_question_v2
         from ..runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
@@ -1022,6 +1037,17 @@ class _D07ParentMetadataColumnV3(DispatchOriginalJSONReadV3):
         if mode=="general_ticket":
             from ..domains.d07 import AttentionTicket
             return path[0]in {"schema",*(field.name for field in fields(AttentionTicket))}
+        if mode in {"artifact_goal","artifact_plan"}:
+            return path[0]in ({"goal_id","revision","state"}if mode=="artifact_goal"else
+                {"schema","plan_id","revision","goal_ref","goal_revision","state","actor_ref"})
+        if mode=="artifact_file":
+            prefixes=(("schema",),("namespace",),("result_ref",),("producing_operation_id",),
+                ("terminal","payload","status"),("terminal","payload","readback"))
+            return any(path[:len(prefix)]==prefix or prefix[:len(path)]==path for prefix in prefixes)
+        if mode=="artifact_observation_registration":
+            if path[0]in {"schema","namespace","identity","authority","request"}:return True
+            return path[0]=="provenance"and(len(path)==1 or
+                path[1]in {"artifact_observation_basis","artifact_observation_ticket"})
         if mode=="semantic_question":return path[0]!="question"
         if mode=="reflection_request":return path[0]not in {"question","unresolved_slots"}
         if mode=="execution":
@@ -1077,7 +1103,8 @@ class _D07SignedParentMetadataReadV3:
                 "bot=? AND persona=? AND kind=? AND original_ref=?",(*w.namespace.as_tuple,self.kind,self.ref))
             if self.metadata is None or self.expected_digest is not None and self.metadata[0]!=self.expected_digest:
                 raise AuthorityUnavailable("D07 special parent lost its actual signed original commitment")
-            mode=self.kind if self.kind in {"semantic_question","reflection_request","execution"}else"metadata"
+            mode=("artifact_file"if self.family=="life"and self.kind=="adopted_life"else
+                self.kind if self.kind in {"semantic_question","reflection_request","execution"}else"metadata")
             self.column=_D07ParentMetadataColumnV3(w,table=table,column="payload_json",
                 key_columns=("bot","persona","kind","original_ref"),key=(*w.namespace.as_tuple,self.kind,self.ref),mode=mode)
             self.phase="bytes";return
@@ -1314,6 +1341,7 @@ class _D07SpecialParentMetadataReadV3:
         from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1,D07ReflectionPreparedV3,D07RelationshipPreparedV2
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         r=self.reader;w=self.work;r.require_current_v3(meter)
         if _PARENT_TASKS_V3.get(self)!=(r,w,w.operation,w.scope,w.graph_stamp):
             raise AuthorityUnavailable("D07 special-parent metadata task lost original Work/retention/stamp")
@@ -1364,8 +1392,16 @@ class _D07SpecialParentMetadataReadV3:
             elif kind is D07IngressRecallPreparedV1:self.phase="need"
             elif kind in {D07MethodGrowthPreparedV2,D07RelationshipPreparedV2}:self.phase="question"
             elif kind is D07GeneralGrowthPreparedV1:self.phase="general_question"
+            elif kind is D07ArtifactObservationPreparedV3:self.phase="artifact_observation"
             else:self.phase="ordinary_job"
             return
+        if self.phase=="artifact_observation":
+            from ..runtime.artifact_observation_parentage_v3 import ArtifactObservationParentMetadataReadV3
+            leaf=self._leaf_v3(("artifact-observation-parent",header.job_id),ArtifactObservationParentMetadataReadV3(self))
+            if leaf is None:return
+            self.artifact_observation=leaf.basis
+            self.cycle_ref=leaf.basis.request.selector.task.cycle_job_ref
+            self.phase="cycle";return
         if self.phase=="general_question":
             from ..runtime.d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1,QUESTION_SCHEMA
             leaf=self._leaf_v3(("general-question",header.job_id),_D07SignedParentMetadataReadV3(r,
@@ -1470,9 +1506,10 @@ class _D07SpecialParentMetadataReadV3:
                         or canonical_digest(leaf.grant)!=self.general_attention.original_parent_grant_digest):
                     raise AuthorityUnavailable("General cognition replaced its actual original parent budget/grant")
                 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+                from ..host.model_workflows_v9 import AdminModelWorkflowsV9
                 from ..model_broker.general_growth_cognition_v1 import TEMPLATE_VERSION
                 policy=r.bundle.model_workflows
-                workflow=policy.general_growth_cognition if type(policy)is AdminModelWorkflowsV8 else None
+                workflow=policy.general_growth_cognition if type(policy) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9) else None
                 installed=header.column.frozen_metadata.value["installation"]
                 if (workflow is None or workflow.template_version!=TEMPLATE_VERSION
                         or workflow.purpose!="consolidation" or workflow.work_kind!="d07.cognition"
@@ -1588,6 +1625,14 @@ class _D07SpecialParentMetadataReadV3:
                 source=decode_typed_production_value_v1(raw["source_head"],GraphVersion)
                 if cycle["source_ref"]!=source.key.token or job["budget_ref"]!=raw["parent_budget_lease_ref"]:
                     raise AuthorityUnavailable("D07 Method actual cue/root paying lease changed")
+            if kind is D07ArtifactObservationPreparedV3:
+                from ..runtime.foreground_artifact_observation_plan_v3 import foreground_call_plan_from_wire_v3
+                basis=self.artifact_observation
+                plan=foreground_call_plan_from_wire_v3(cycle["call_plan"])
+                if (plan.phase_group.selector!=basis.request.selector or cycle["source_ref"]!=basis.task_root_source_head.key.token
+                        or job["budget_ref"]!=basis.parent_budget_lease_ref
+                        or(plan.observer_policy_ref,plan.observer_policy_digest)!=(basis.observer_asset_ref,basis.observer_asset_digest)):
+                    raise AuthorityUnavailable("Artifact observation changed its actual V3 task/cycle/Root/policy")
             self.cycle,self.cycle_job,self.cycle_leaf=cycle,job,leaf
             self.deadlines.append(_d07_parent_utc_v3(job["deadline_utc"]))
             self.phase="budget";return
@@ -1600,6 +1645,8 @@ class _D07SpecialParentMetadataReadV3:
             if kind is D07MethodGrowthPreparedV2 and raw["original_deadline_utc"]!=min(
                     _d07_parent_utc_v3(self.cycle_job["deadline_utc"]),leaf.grant.valid_until_utc):
                 raise AuthorityUnavailable("D07 Method original deadline is not its original job/grant minimum")
+            if kind is D07ArtifactObservationPreparedV3 and canonical_digest(leaf.grant)!=self.artifact_observation.parent_grant_digest:
+                raise AuthorityUnavailable("Artifact observation changed its actual original Root grant")
             self.budget=leaf;self.deadlines.append(leaf.grant.valid_until_utc);self.phase="responsibility";return
         if self.phase=="responsibility":
             create=self._leaf_v3(("create",header.job_id),_D07AdoptedParentMetadataReadV3(r,self.cycle_job["operation_id"],"create"))
@@ -1709,21 +1756,34 @@ class _D07SpecialParentMetadataReadV3:
             attempts=[item for item in self.cycle["call_plan"]["attempts"]if item["call_id"]==raw["call_id"]]
             if len(attempts)!=1:
                 raise AuthorityUnavailable("D07 parent has no unique original registered C3 call")
-            member=attempts[0];workflow=r.bundle.model_workflows.d07_cognition
+            member=attempts[0];workflow=(r.bundle.model_workflows.artifact_observation_cognition
+                if kind is D07ArtifactObservationPreparedV3 else r.bundle.model_workflows.d07_cognition)
             if (member["slot"]!="C3" or member["original_call_id"]is not None
                     or (member["reservation_operation_id"],member["reservation_digest"],member["budget_lease_ref"])!=(
                         raw["operation_id"],raw["reservation_digest"],self.cycle_job["budget_ref"])
                     or (member["input_ceiling"],member["output_ceiling"])!=(
                         workflow.quote_ceiling["input_tokens"],workflow.quote_ceiling["output_tokens"])):
                 raise AuthorityUnavailable("D07 original C3 member/reservation/quote ceilings/root budget changed")
+            if kind is D07ArtifactObservationPreparedV3:
+                from ..runtime.foreground_artifact_observation_plan_v3 import ForegroundArtifactObservationAttemptV3
+                from ..runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+                basis=self.artifact_observation
+                attempt=decode_typed_production_value_v1(member,ForegroundArtifactObservationAttemptV3)
+                if (attempt.phase_selector!=basis.request.selector or attempt.condition_id!=basis.request.condition_id
+                        or(attempt.observation_basis_ref,attempt.observation_basis_digest)!=(basis.original_ref,basis.digest)
+                        or attempt.state!="reserved"):
+                    raise AuthorityUnavailable("Artifact observation borrowed a non-dedicated C3 attempt")
             if kind is not D07IngressRecallPreparedV1:
                 acquire_id="d07-acquire:"+canonical_digest((w.namespace,raw["operation_id"]))[:48]
                 leaf=self._leaf_v3(("acquire",header.job_id),_D07BundleParentMetadataReadV3(r,acquire_id,prepared_header=header))
                 if leaf is None:return
-                name="method_growth_c3"if kind is D07MethodGrowthPreparedV2 else"relationship_c3"
+                name=("artifact_observation_c3"if kind is D07ArtifactObservationPreparedV3 else
+                    "method_growth_c3"if kind is D07MethodGrowthPreparedV2 else"relationship_c3")
                 expected={"cycle_ref":self.cycle_ref,"before_cycle_digest":raw["cycle_digest"],
                     "before_call_plan_digest":raw["call_plan_digest"],"call_id":raw["call_id"],
                     "semantic_question_digest":raw["semantic_question_digest"]}
+                if kind is D07ArtifactObservationPreparedV3:
+                    expected.update(observation_basis_ref=raw["observation_basis_ref"],observation_basis_digest=raw["observation_basis_digest"])
                 if leaf.value["phase"]!="execution_acquired" or leaf.value["prepared_digest"]!=header.metadata[0] or leaf.value[name]!=expected:
                     raise AuthorityUnavailable("D07 named C3 member has no exact original acquire W01 binding")
             self.phase="next";return
@@ -1858,7 +1918,7 @@ class _D07SpecialParentMetadataReadV3:
             source_versions=tuple(sorted({(row["ref"],row["revision"])for item in self.headers for row in item.source_rows}))
             names={D07IngressRecallPreparedV1:"ingress_recall_self",D07MethodGrowthPreparedV2:"method_growth_self",
                 D07ReflectionPreparedV3:"reflection",D07RelationshipPreparedV2:"relationship_self",
-                D07GeneralGrowthPreparedV1:"general_growth_owner"}
+                D07GeneralGrowthPreparedV1:"general_growth_owner",D07ArtifactObservationPreparedV3:"artifact_observation_self"}
             self.complete=True
             self.result=D07AuthorityParentMetadataQualifiedV3(_ISSUER,self,kind=names.get(original.prepared_class,"ordinary_owner"),
                 authority=source,parent_originals=self.originals,deadline=deadline,source_versions=source_versions)
@@ -2002,8 +2062,9 @@ class _D07BundleParentMetadataReadV3:
             from ..runtime_contracts import canonical_digest
             from ..runtime.d07_execution_v1 import D07ReflectionPreparedV3,D07RelationshipPreparedV2
             from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
+            from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
             tags={D07ReflectionPreparedV3:"reflection_c3",D07RelationshipPreparedV2:"relationship_c3",
-                D07MethodGrowthPreparedV2:"method_growth_c3"}
+                D07MethodGrowthPreparedV2:"method_growth_c3",D07ArtifactObservationPreparedV3:"artifact_observation_c3"}
             tag=tags.get(header.prepared_class)
             fields_expected={"schema","status","commit_seq","phase","prepared_digest","graph_receipt_digest"}
             if tag is not None:fields_expected.add(tag)

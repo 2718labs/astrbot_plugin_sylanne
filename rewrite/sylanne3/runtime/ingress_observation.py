@@ -46,10 +46,11 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
     proposal. The D03 provider independently checks the returned tuple against
     its current source and scene.
     """
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if type(namespace) is not NamespaceId:
         raise TypeError("ingress receipt namespace is required")
     _digest(source_ref, "source ref")
-    exists = db.execute(
+    exists = _artifact_receipt_sql_v1(db,
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='graph_first_ingress_identity_v1'").fetchone()
     if exists is None:
@@ -72,7 +73,7 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
     if not bound:
         row = point('graph_first_ingress_identity_v1',
             ('source_ref','platform_ref','conversation_ref','sender_ref','message_id','visibility','identity_json',
-                'content_fingerprint','learned_at','bundle_digest'),lambda:db.execute(
+                'content_fingerprint','learned_at','bundle_digest'),lambda:_artifact_receipt_sql_v1(db,
             "SELECT source_ref,platform_ref,conversation_ref,sender_ref,message_id,"
             "visibility,identity_json,content_fingerprint,learned_at,bundle_digest "
             "FROM graph_first_ingress_identity_v1 WHERE bot=? AND persona=? "
@@ -97,16 +98,16 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
         )
     except (TypeError, ValueError, KeyError):
         valid = False
-    observed = point('ingress_first_observations',('content_fingerprint','learned_at','bundle_digest'),lambda:db.execute(
+    observed = point('ingress_first_observations',('content_fingerprint','learned_at','bundle_digest'),lambda:_artifact_receipt_sql_v1(db,
         "SELECT content_fingerprint,learned_at,bundle_digest FROM ingress_first_observations "
         "WHERE bot=? AND persona=? AND operation_id=?",namespace.as_tuple+(operation_id,)).fetchone())
-    committed = point('graph_bundle_operations',('digest',),lambda:db.execute(
+    committed = point('graph_bundle_operations',('digest',),lambda:_artifact_receipt_sql_v1(db,
         "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         namespace.as_tuple+(operation_id,)).fetchone())
     bound,intent=read_bound_authority_graph_attachment_v3(db,table='graph_first_ingress_intents_v2',
         columns=('identity_json',),key_columns=('bot','persona','operation_id'),key=namespace.as_tuple+(operation_id,))
     if not bound:
-        intent = point('graph_first_ingress_intents_v2',('identity_json',),lambda:db.execute(
+        intent = point('graph_first_ingress_intents_v2',('identity_json',),lambda:_artifact_receipt_sql_v1(db,
             "SELECT identity_json FROM graph_first_ingress_intents_v2 WHERE bot=? AND persona=? AND operation_id=?",
             namespace.as_tuple+(operation_id,)).fetchone())
     try:

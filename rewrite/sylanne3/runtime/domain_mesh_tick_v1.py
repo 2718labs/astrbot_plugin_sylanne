@@ -9,7 +9,6 @@ from ..domains.d01.production_operations_v1 import plain_v1
 from ..memory_types import access_key
 from ..domains.d06 import source_correction_head_key
 from .d01_production_operations_v1 import CurrentDomainReadV1
-from .domain_production_contracts_v1 import actual_frame_read_versions_v1
 from .domain_production_contracts_v1 import StagedDomainOperationV1, actual_frame_read_versions_v1
 from .d11_types import D11RuntimeProvider, D11_PROPOSAL_SCHEMA
 from .domain_mesh_contract_v1 import (

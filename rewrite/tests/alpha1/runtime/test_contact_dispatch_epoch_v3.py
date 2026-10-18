@@ -1,5 +1,6 @@
 """Finite dispatch epoch assembly; this does not issue installed material."""
 from dataclasses import replace
+import math
 
 import pytest
 from test_contact_deadline_v3 import envelope
@@ -9,7 +10,7 @@ from sylanne3.runtime.domain_production_contracts_v1 import (
 )
 from sylanne3.runtime.contact_qualification_evidence_v3 import CONTACT_FINAL_QUERY_TYPES_V3
 from sylanne3.runtime.contact_final_stage_v3 import _contact_dispatch_epoch_frame_v3
-from sylanne3.runtime_contracts import NamespaceId, QueryEpoch
+from sylanne3.runtime_contracts import NamespaceId, QueryEpoch, canonical_digest
 
 
 @pytest.mark.parametrize('drift', [None, 'missing', 'duplicate', 'partial', 'page_epoch', 'guard_namespace'])
@@ -37,6 +38,28 @@ def test_dispatch_epoch_keeps_all_cas_and_inventory_evidence(drift):
         assert actual.envelope.identity is env.identity
         assert actual.envelope.source_qualification is env.source_qualification
         assert actual.envelope.version_guard.read_versions == env.version_guard.read_versions
+
+        # Shared constructor unit only; no installed, provider or ledger proof.
+        original_envelope = actual.envelope
+        original_digest = canonical_digest(original_envelope)
+        deadline = original_envelope.deadline_utc
+        positive = replace(actual, now_utc=math.nextafter(deadline, -math.inf))
+        assert positive.envelope is original_envelope
+        assert positive.snapshot is actual.snapshot
+        assert positive.owner_guard is actual.owner_guard
+        assert positive.query_coverage is actual.query_coverage
+        assert canonical_digest(positive.envelope) == original_digest
+        for controlled_now in (deadline, math.nextafter(deadline, math.inf)):
+            with pytest.raises(ValueError, match='^production frame time is invalid or expired$') as denied:
+                replace(positive, now_utc=controlled_now)
+            current = denied.value.__traceback__
+            while current is not None and current.tb_frame.f_code is not CurrentOperationFrameV1.__post_init__.__code__:
+                current = current.tb_next
+            assert current is not None, 'the exact production frame constructor must reject'
+            refused_frame = current.tb_frame.f_locals['self']
+            assert refused_frame.now_utc == controlled_now
+            assert refused_frame.envelope is original_envelope
+            assert canonical_digest(refused_frame.envelope) == original_digest
     else:
         with pytest.raises(ValueError, match='complete actual query coverage'):
             _contact_dispatch_epoch_frame_v3(frame)

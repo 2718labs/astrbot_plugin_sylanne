@@ -23,6 +23,12 @@ from .foreground_call_plan_v1 import (
 )
 from .foreground_call_plan_v1 import (ForegroundReplyAllocationV1, foreground_reply_budget_ids_v1,
     prepare_foreground_reply_allocation_v1, apply_foreground_reply_allocation_v1)
+from .artifact_receipt_allocation_v3 import (
+    ForegroundArtifactReceiptAllocationV3, foreground_artifact_receipt_budget_ids_v3,
+    prepare_foreground_artifact_receipt_allocation_v3, apply_foreground_artifact_receipt_allocation_v3,
+    read_actual_artifact_receipt_allocation_v3, require_artifact_receipt_responsibility_binding_v3)
+from .foreground_artifact_observation_plan_v3 import (
+    ForegroundCallPlanV3, foreground_call_plan_from_wire_v3)
 from .ingress_observation import read_committed_ingress_identity
 from .jobs import (PersistentJob, create_job, get_job, wake_job,
     acquire_job, plan_job_acquire, _utc, _utc_text, _save_job, _record_operation, _job_from_dict, _job_dict)
@@ -225,7 +231,7 @@ class ForegroundCycleStageV1:
     request: object
     before_job: PersistentJob | None
     after_job: PersistentJob
-    reply_allocation: ForegroundReplyAllocationV1 | None = None
+    reply_allocation: ForegroundReplyAllocationV1 | ForegroundArtifactReceiptAllocationV3 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,7 +315,7 @@ def _validate_foreground_continuation_v1(self, expected_schema):
             or any(type(value) is not int or value < 0 for value in
                 (self.source_barrier_epoch, self.stage_cursor, self.cancel_generation))
             or self.stage_cursor > len(PHASES)
-            or type(self.call_plan) not in ({ForegroundCallPlanV1, ForegroundCallPlanV2}
+            or type(self.call_plan) not in ({ForegroundCallPlanV1, ForegroundCallPlanV2, ForegroundCallPlanV3}
                 if expected_schema == SCHEMA_V2 else {ForegroundCallPlanV1})):
         raise ValueError("foreground continuation identity/stage/version differs")
     for name in ("pending_effect_refs", "completed_operation_refs"):
@@ -359,9 +365,11 @@ def foreground_cycle_from_wire_v1(value):
     if variant is None or set(value) != set(variant.__dataclass_fields__):
         raise ValueError("foreground continuation fields differ from its exact retained version")
     raw = dict(value)
-    raw["call_plan"] = (foreground_call_plan_from_wire_v2(raw["call_plan"])
-        if type(raw["call_plan"]) is dict and raw["call_plan"].get("schema") == "d11.foreground-call-plan.v2"
-        else foreground_call_plan_from_wire_v1(raw["call_plan"]))
+    plan_schema = raw["call_plan"].get("schema") if type(raw["call_plan"]) is dict else None
+    plan_reader = (foreground_call_plan_from_wire_v3 if plan_schema == "d11.foreground-call-plan.v3"
+        else foreground_call_plan_from_wire_v2 if plan_schema == "d11.foreground-call-plan.v2"
+        else foreground_call_plan_from_wire_v1)
+    raw["call_plan"] = plan_reader(raw["call_plan"])
     for name in ("pending_effect_refs", "completed_operation_refs"):
         raw[name] = tuple(raw[name])
     if raw["wait"] is not None:
@@ -476,10 +484,12 @@ def prepare_foreground_cycle_in_transaction_v1(db, *, frame, c02_receipt, source
         if (atom.revision != version.revision or history != (c02_receipt.operation_id, canonical_serialize(atom.value), 1) or not linked):
             raise ValueError("foreground C02 member/source history differs")
     read.source_family(db, (source_ref,))
-    if type(reply_allocation) is not ForegroundReplyAllocationV1 or (
+    if type(reply_allocation) not in {ForegroundReplyAllocationV1, ForegroundArtifactReceiptAllocationV3} or (
             reply_allocation.namespace, reply_allocation.c02_operation_id, reply_allocation.parent_lease_ref,
             reply_allocation.child_lease_id) != (ns, c02_receipt.operation_id, call_plan.parent_budget_lease_ref, call_plan.protected_reply_lease_ref):
         raise ValueError("foreground create needs its pure actual installed reply allocation proposal")
+    if type(reply_allocation) is ForegroundArtifactReceiptAllocationV3:
+        require_artifact_receipt_responsibility_binding_v3(reply_allocation, responsibility)
     activity_id, job_id = foreground_cycle_ids_v1(ns, c02_receipt.operation_id)
     if frame.envelope.identity.activity_id != activity_id or frame.envelope.parent_budget_lease_ref != call_plan.parent_budget_lease_ref:
         raise ValueError("foreground creation changed its adopted origin or budget family")
@@ -539,6 +549,13 @@ def checkpoint_foreground_cycle_in_transaction_v1(db, *, frame, job_id, holder, 
             old.call_plan.parent_budget_lease_ref, old.call_plan.protected_reply_lease_ref):
         raise ValueError("foreground checkpoint cannot replace its actual budget family")
     require_foreground_phase_checkpoint_v2(old.call_plan, continuation.call_plan)
+    if type(continuation.call_plan) is ForegroundCallPlanV3:
+        _, allocation, _, _ = read_actual_artifact_receipt_allocation_v3(db,
+            namespace=frame.envelope.authority.namespace, c02_operation_id=continuation.c02_operation_id,
+            source_ref=continuation.source_ref, issuer=frame_issuer)
+        if (continuation.call_plan.observer_policy_ref, continuation.call_plan.observer_policy_digest) != (
+                allocation.observer_policy_ref, allocation.observer_policy_digest):
+            raise ValueError("V3 checkpoint changed its initial receipt allocation observer asset")
     attempts = {row.call_id: row for row in continuation.call_plan.attempts}
     for prior in old.call_plan.attempts:
         current = attempts.get(prior.call_id)
@@ -577,7 +594,7 @@ def checkpoint_foreground_cycle_in_transaction_v1(db, *, frame, job_id, holder, 
         from .d07_reflection_execution_v1 import require_no_pending_self_reflection_v3
         require_no_pending_self_reflection_v3(db,frame=frame,job=job,continuation=continuation,
             issuer=frame_issuer,installed_bundle=frame_bundle)
-        if type(continuation.call_plan) is ForegroundCallPlanV2:
+        if type(continuation.call_plan) in {ForegroundCallPlanV2, ForegroundCallPlanV3}:
             from ..model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
             group = continuation.call_plan.phase_group
             if len(group.completed_phase_originals) != len(artifact_draft_phase_sequence_v2(group.selector.method_ref)):
@@ -787,6 +804,7 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+    from ..host.model_workflows_v9 import AdminModelWorkflowsV9
     from ..domains.d03.self_perspective import self_mapping_key
     from ..graph_types import owner_grant_key
     from .budget import get_budget_lease, require_budget_family_admissible
@@ -797,7 +815,7 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     if (not db.in_transaction or type(request) is not CreateForegroundCycleRequestV2
             or type(installed_bundle) is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
+            or type(installed_bundle.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
             or type(installed_bundle.foreground) is not AdminForegroundPolicyV1
             or installed_bundle.installation_policy.namespace != namespace or type(issuer) is not D11BudgetJobIssuer
             or type(owner_guard) is not ProductionOwnerGuardV1):
@@ -889,6 +907,8 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
 
 def require_current_foreground_responsibility_v1(db, *, namespace, job, installed_bundle, issuer,
         owner_guard, purpose, audiences, now_utc):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from dataclasses import asdict
     if job.continuation.get("schema") == "d11.foreground-source-note-continuation.v1":
         from .source_note_foreground_v1 import require_current_source_note_responsibility_v1
@@ -908,13 +928,13 @@ def require_current_foreground_responsibility_v1(db, *, namespace, job, installe
         raise MissingProductionOriginalV1("actual_current_foreground_v4_policy")
     grant = issuer.current_budget_grant(db, job.budget_ref)
     require_budget_family_admissible(db, job.budget_ref)
-    source = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+    source = _artifact_receipt_sql_v1(db,"SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
         (responsibility.source_ref, *namespace.as_tuple)).fetchone()
-    mapping = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+    mapping = _artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
         (self_mapping_key(namespace).token, *namespace.as_tuple)).fetchone()
     if (responsibility.owner_guard != owner_guard or source is None or source[2] != 1
-            or (source[0], canonical_digest(json.loads(source[1]))) != (responsibility.source_revision, responsibility.source_digest)
-            or mapping is None or mapping[1] != 1 or canonical_digest(json.loads(mapping[0])) != responsibility.self_mapping_digest
+            or (source[0], background_json_digest_v3(source[1],background_json_loads_v3(source[1]))) != (responsibility.source_revision, responsibility.source_digest)
+            or mapping is None or mapping[1] != 1 or background_json_digest_v3(mapping[0],background_json_loads_v3(mapping[0])) != responsibility.self_mapping_digest
             or (grant.grant_id, grant.version, canonical_digest(grant)) !=
                (responsibility.parent_grant_id, responsibility.parent_grant_version, responsibility.parent_grant_digest)
             or canonical_digest(asdict(policy)) != responsibility.foreground_policy_digest
@@ -1016,6 +1036,8 @@ def _verify_pending_effect_changes_v1(db, namespace, old, current):
 
 def _require_actual_delivered_foreground_reply_v1(db, *, frame, continuation, completion_result_ref):
     """Completion means actual delivered outbound adoption for this exact original reply."""
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .natural_reply_job_v2 import read_original_preparation
     from .natural_dispatch_current_read_v2 import recover_natural_dispatch_candidate_in_transaction_v2
     from .d01_production_operations_v1 import table_exists_v1
@@ -1035,19 +1057,19 @@ def _require_actual_delivered_foreground_reply_v1(db, *, frame, continuation, co
             or recovered.evidence.review_original_operation_id != review.seal.original_operation_id
             or recovered.evidence.operation_id != plan.final_operation_id or recovered.evidence.effect_id != plan.final_effect_id):
         raise MissingProductionOriginalV1("actual_adopted_final_foreground_reply_batch")
-    actual = db.execute("SELECT activity_id,effect_id FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+    actual = _artifact_receipt_sql_v1(db,"SELECT activity_id,effect_id FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*ns.as_tuple, completion_result_ref)).fetchone()
     if actual != (plan.final_activity_id, plan.final_effect_id):
         raise ValueError("foreground adopted final reply belongs to another original activity/effect")
     if not table_exists_v1(db, "graph_d13_outbound_observations_v1"):
         raise MissingProductionOriginalV1("actual_delivered_foreground_outbound_adoption")
-    observations = db.execute("SELECT observation_digest,source_ref,slot_ref,batch_ref,observation_json,original_json,original_digest "
+    observations = _artifact_receipt_sql_v1(db,"SELECT observation_digest,source_ref,slot_ref,batch_ref,observation_json,original_json,original_digest "
         "FROM graph_d13_outbound_observations_v1 WHERE bot=? AND persona=? AND final_operation_id=? "
         "AND json_extract(observation_json,'$.pending.platform_observation.outcome')='delivered' LIMIT 2",
         (*ns.as_tuple, completion_result_ref)).fetchall()
     for digest, source_ref, slot_ref, batch_ref, encoded, original_json, original_digest in observations:
-        observed = from_wire(json.loads(encoded))
-        original = json.loads(original_json)
+        observed = from_wire(background_json_loads_v3(encoded))
+        original = background_json_loads_v3(original_json)
         if (canonical_serialize(to_wire(observed)) != encoded or canonical_digest(observed) != digest
                 or canonical_serialize(original) != original_json or canonical_digest(original) != original_digest):
             raise ValueError("foreground outbound adoption lost its actual immutable byte commitments")
@@ -1068,10 +1090,12 @@ def _require_actual_delivered_foreground_reply_v1(db, *, frame, continuation, co
 
 
 def _require_delivered_turn_history_v1(db, namespace, operation_id, source_ref, slot_ref):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..domains.d09.turn_order import validate_turn_completion_v1
-    rows = db.execute("SELECT token,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=? AND valid=1",
+    rows = _artifact_receipt_sql_v1(db,"SELECT token,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=? AND valid=1",
         (*namespace.as_tuple, operation_id)).fetchall()
-    completions = [json.loads(value) for token, value in rows if AtomKey.from_token(token).type_name == "d09.turn_completion.v1"]
+    completions = [background_json_loads_v3(value) for token, value in rows if AtomKey.from_token(token).type_name == "d09.turn_completion.v1"]
     if len(completions) != 1:
         raise MissingProductionOriginalV1("actual_adopted_delivered_reply_turn_completion")
     value = completions[0]
@@ -1081,6 +1105,11 @@ def _require_delivered_turn_history_v1(db, namespace, operation_id, source_ref, 
 
 
 def _current_attempt_original_v1(db, *, namespace, continuation, attempt, issuer):
+    from .foreground_artifact_observation_plan_v3 import ForegroundArtifactObservationAttemptV3
+    if type(attempt) is ForegroundArtifactObservationAttemptV3:
+        from .foreground_call_plan_v1 import read_current_named_c3_attempt_v2
+        return read_current_named_c3_attempt_v2(db, namespace=namespace,
+            continuation=continuation, attempt=attempt, issuer=issuer)
     if type(attempt) is ForegroundModelAttemptV2:
         from .d11_artifact_draft_model_v1 import read_current_artifact_draft_attempt_v2
         return read_current_artifact_draft_attempt_v2(db, namespace=namespace,
@@ -1187,18 +1216,19 @@ def _reply_event_version_rows_v3(encoded):
 
 def _read_reply_natural_metadata_v1(db, namespace, c02_operation_id, stage):
     """Authenticate the seal against its adopting receipt, without thawing inputs."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .natural_reply_job_v2 import _table, _seal, natural_job_ids_v2
     from .d01_production_operations_v1 import table_exists_v1
     from ..graph_store import GraphStore
     table = _table(stage)
     if not table_exists_v1(db, table):
         return None
-    row = model_reply_scope_point_v3(db,table=table,columns=('seal_json', 'state', 'terminal_receipt_digest'),key_columns=('bot', 'persona', 'parent_original_id'),key=(((*namespace.as_tuple, c02_operation_id))[0],((*namespace.as_tuple, c02_operation_id))[1],((*namespace.as_tuple, c02_operation_id))[2],),legacy_reader=lambda:db.execute("SELECT seal_json,state,terminal_receipt_digest FROM " + table +
+    row = model_reply_scope_point_v3(db,table=table,columns=('seal_json', 'state', 'terminal_receipt_digest'),key_columns=('bot', 'persona', 'parent_original_id'),key=(((*namespace.as_tuple, c02_operation_id))[0],((*namespace.as_tuple, c02_operation_id))[1],((*namespace.as_tuple, c02_operation_id))[2],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT seal_json,state,terminal_receipt_digest FROM " + table +
         " WHERE bot=? AND persona=? AND parent_original_id=?",
         (*namespace.as_tuple, c02_operation_id)).fetchone())
     ids = natural_job_ids_v2(namespace, c02_operation_id, stage)
     if row is None:
-        if model_reply_scope_point_v3(db,table='runtime_jobs',columns=('job_id',),key_columns=('job_id',),key=(((ids[0],))[0],),legacy_reader=lambda:db.execute("SELECT 1 FROM runtime_jobs WHERE job_id=?", (ids[0],)).fetchone()) is not None:
+        if model_reply_scope_point_v3(db,table='runtime_jobs',columns=('job_id',),key_columns=('job_id',),key=(((ids[0],))[0],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT 1 FROM runtime_jobs WHERE job_id=?", (ids[0],)).fetchone()) is not None:
             raise MissingProductionOriginalV1("actual_sealed_natural_reply_child")
         return None
     raw = background_json_loads_v3(row[0])
@@ -1210,7 +1240,7 @@ def _read_reply_natural_metadata_v1(db, namespace, c02_operation_id, stage):
             or (row[1] == "terminal") != (row[2] is not None)):
         raise ValueError("natural reply metadata changed its closed seal/state identity")
     job = get_job(db, seal.job_id)
-    committed = model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('activity_id', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, seal.original_operation_id))[0],((*namespace.as_tuple, seal.original_operation_id))[1],((*namespace.as_tuple, seal.original_operation_id))[2],),legacy_reader=lambda:db.execute("SELECT activity_id,receipt_json FROM graph_bundle_operations "
+    committed = model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('activity_id', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, seal.original_operation_id))[0],((*namespace.as_tuple, seal.original_operation_id))[1],((*namespace.as_tuple, seal.original_operation_id))[2],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT activity_id,receipt_json FROM graph_bundle_operations "
         "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, seal.original_operation_id)).fetchone())
     if committed is None:
         raise MissingProductionOriginalV1("actual_adopted_natural_reply_seal")
@@ -1231,10 +1261,10 @@ def _read_reply_natural_metadata_v1(db, namespace, c02_operation_id, stage):
                 or seal.generation_call_id != generation[0].call_id
                 or seal.parent_budget_lease_id != generation[0].parent_budget_lease_id):
             raise ValueError("review metadata changed its original generation lineage")
-    event = model_reply_scope_point_v3(db,table='graph_events',columns=('revisions',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[0],((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[1],((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[2],((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[3],),legacy_reader=lambda:db.execute("SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+    event = model_reply_scope_point_v3(db,table='graph_events',columns=('revisions',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[0],((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[1],((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[2],((*namespace.as_tuple, job.activity_id, seal.original_operation_id))[3],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*namespace.as_tuple, job.activity_id, seal.original_operation_id)).fetchone())
     versions = () if event is None else tuple(v for v in _reply_event_version_rows_v3(event[0]) if v.key == job_graph_write(job).key)
-    if len(versions) != 1 or model_reply_scope_point_v3(db,table='graph_history',columns=('token',),key_columns=('token', 'revision', 'valid', 'event_bot', 'event_persona', 'event_id'),key=(((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[0],((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[1],1,((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[2],((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[3],((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[4],),legacy_reader=lambda:db.execute("SELECT 1 FROM graph_history WHERE token=? AND revision=? AND valid=1 "
+    if len(versions) != 1 or model_reply_scope_point_v3(db,table='graph_history',columns=('token',),key_columns=('token', 'revision', 'valid', 'event_bot', 'event_persona', 'event_id'),key=(((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[0],((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[1],1,((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[2],((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[3],((versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id))[4],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT 1 FROM graph_history WHERE token=? AND revision=? AND valid=1 "
             "AND event_bot=? AND event_persona=? AND event_id=?",
             (versions[0].key.token, versions[0].revision, *namespace.as_tuple, seal.original_operation_id)).fetchone()) is None:
         raise MissingProductionOriginalV1("actual_natural_reply_initial_job_CAS_member")
@@ -1243,8 +1273,9 @@ def _read_reply_natural_metadata_v1(db, namespace, c02_operation_id, stage):
 
 def _read_reply_message_metadata_v1(db, *, namespace, generation_seal, review_seal):
     """Read adopted batch identity fields, never model output or message body."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..graph_store import GraphStore
-    rows = model_reply_scope_rows_v3(db,kind='message_history',parameters=(generation_seal.original_operation_id,review_seal.original_operation_id),legacy_reader=lambda:db.execute("SELECT token,revision,event_id,json_extract(value,'$.schema'),"
+    rows = model_reply_scope_rows_v3(db,kind='message_history',parameters=(generation_seal.original_operation_id,review_seal.original_operation_id),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT token,revision,event_id,json_extract(value,'$.schema'),"
         "json_extract(value,'$.activity_id'),json_extract(value,'$.operation_id'),"
         "json_extract(value,'$.effect_id'),json_extract(value,'$.batch_id'),"
         "json_extract(value,'$.paid_review.generation_call_id'),"
@@ -1266,7 +1297,7 @@ def _read_reply_message_metadata_v1(db, *, namespace, generation_seal, review_se
                 or operation in seen):
             raise ValueError("reply message metadata changed its adopted whole batch lineage")
         seen.add(operation)
-        committed = model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('activity_id', 'effect_id', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, operation))[0],((*namespace.as_tuple, operation))[1],((*namespace.as_tuple, operation))[2],),legacy_reader=lambda:db.execute("SELECT activity_id,effect_id,receipt_json FROM graph_bundle_operations "
+        committed = model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('activity_id', 'effect_id', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, operation))[0],((*namespace.as_tuple, operation))[1],((*namespace.as_tuple, operation))[2],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT activity_id,effect_id,receipt_json FROM graph_bundle_operations "
             "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation)).fetchone())
         if committed is None or committed[:2] != (activity, effect):
             raise MissingProductionOriginalV1("actual_reply_whole_batch_adopting_receipt")
@@ -1275,12 +1306,12 @@ def _read_reply_message_metadata_v1(db, *, namespace, generation_seal, review_se
                 or candidate["status"] != "natural_paid_review_current_hold"
                 or len(candidate["refs"]) != 4 or candidate["refs"][3] != [token, revision]):
             raise ValueError("reply whole batch metadata is not the actual closed final receipt")
-        event = model_reply_scope_point_v3(db,table='graph_events',columns=('revisions',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(((*namespace.as_tuple, activity, operation))[0],((*namespace.as_tuple, activity, operation))[1],((*namespace.as_tuple, activity, operation))[2],((*namespace.as_tuple, activity, operation))[3],),legacy_reader=lambda:db.execute("SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+        event = model_reply_scope_point_v3(db,table='graph_events',columns=('revisions',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(((*namespace.as_tuple, activity, operation))[0],((*namespace.as_tuple, activity, operation))[1],((*namespace.as_tuple, activity, operation))[2],((*namespace.as_tuple, activity, operation))[3],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
             (*namespace.as_tuple, activity, operation)).fetchone())
         versions = {} if event is None else {v.key.token: v.revision for v in _reply_event_version_rows_v3(event[0])}
         if any(versions.get(ref) != version for ref, version in candidate["refs"]):
             raise MissingProductionOriginalV1("actual_reply_final_action_schema_grant_batch_CAS_members")
-        jobs = model_reply_scope_rows_v3(db,kind='message_jobs',parameters=(operation,),legacy_reader=lambda:db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
+        jobs = model_reply_scope_rows_v3(db,kind='message_jobs',parameters=(operation,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
             "AND operation_id=? AND work_kind='message' LIMIT 2", (*namespace.as_tuple, operation)).fetchall())
         if len(jobs) != 1:
             raise MissingProductionOriginalV1("unique_actual_message_child_of_adopted_final")
@@ -1296,11 +1327,12 @@ def _read_reply_message_metadata_v1(db, *, namespace, generation_seal, review_se
 
 def _read_reply_life_binding_metadata_v1(db, *, namespace, prepared_original_ref, issuer):
     """Verify journal bytes and project only the signed execution binding."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     import hashlib
     from .d11_life_preparation_v1 import TABLE, SIGN_KIND
     from .d11_life_contract_v1 import D11LifeExecutionBindingV1, life_from_wire_v1
     from .domain_production_read_plans_v1 import _committed
-    from ..authority_service.model_reply_scope_observation_v3 import _active_observation_v3
+    from ..authority_service.model_reply_scope_observation_v3 import actual_reply_metadata_reader_v3 as _active_observation_v3
     observation = _active_observation_v3(db)
     if observation is not None and not observation.legacy:
         row = model_reply_scope_point_v3(db, table=TABLE,
@@ -1330,7 +1362,7 @@ def _read_reply_life_binding_metadata_v1(db, *, namespace, prepared_original_ref
                     (plan['activity_id'],plan['effect_id'],plan['operation_id'])):
             raise ValueError("reply Life binding metadata differs from its actual adopted plan")
         return binding,row[2]
-    row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature,"
+    row = _artifact_receipt_sql_v1(db,"SELECT producing_operation_id,payload_json,payload_digest,signature,"
         "json_extract(payload_json,'$.binding'),json_extract(payload_json,'$.prepare_operation_id'),"
         "json_extract(payload_json,'$.plan.activity_id'),json_extract(payload_json,'$.plan.effect_id'),"
         "json_extract(payload_json,'$.plan.operation_id'),json_type(payload_json,'$.requirements_json') "
@@ -1354,6 +1386,7 @@ def _read_reply_life_binding_metadata_v1(db, *, namespace, prepared_original_ref
 def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: PersistentJob,
         issuer: D11BudgetJobIssuer) -> tuple[tuple[PersistentJob, str, str], ...]:
     """Join existing reply work to immutable producers, without granting work."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d01_production_operations_v1 import table_exists_v1
     from .d11_life_preparation_v1 import TABLE, _read
     from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1, read_artifact_draft_prepared_v1
@@ -1374,7 +1407,7 @@ def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: Pers
                 or job.job_id == cycle.job_id or job.job_id in children):
             raise ValueError("reply child lost its exact immutable producer identity")
         projection = job_graph_write(job)
-        row = model_reply_scope_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token', 'bot', 'persona'),key=(((projection.key.token, *namespace.as_tuple))[0],((projection.key.token, *namespace.as_tuple))[1],((projection.key.token, *namespace.as_tuple))[2],),legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+        row = model_reply_scope_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token', 'bot', 'persona'),key=(((projection.key.token, *namespace.as_tuple))[0],((projection.key.token, *namespace.as_tuple))[1],((projection.key.token, *namespace.as_tuple))[2],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
             (projection.key.token, *namespace.as_tuple)).fetchone())
         if row is None or row[1]!=1 or not background_json_matches_v3(row[0],projection.value):
             raise MissingProductionOriginalV1("actual_reply_child_SQL_Graph_projection:" + job.job_id)
@@ -1386,7 +1419,7 @@ def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: Pers
         from .d04_appraisal_driver_v3 import read_current_d04_appraisal_original_v3
         from .domain_production_read_plans_v1 import _committed
         identity = ids(namespace, continuation.c02_operation_id)
-        from ..authority_service.model_reply_scope_observation_v3 import _active_observation_v3
+        from ..authority_service.model_reply_scope_observation_v3 import actual_reply_metadata_reader_v3 as _active_observation_v3
         observer=_active_observation_v3(db)
         if observer is not None and not observer.legacy:
             from ..authority_service.model_reply_parentage_v3 import read_appraisal_child_metadata_v3
@@ -1427,11 +1460,11 @@ def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: Pers
 
     if table_exists_v1(db, TABLE):
         # Enumerate only bounded metadata; the signed prepared selector proves scope.
-        rows = model_reply_scope_rows_v3(db,kind='life_c4',parameters=(job_graph_write(cycle).key.token,),legacy_reader=lambda:db.execute("SELECT original_ref FROM " + TABLE +
+        rows = model_reply_scope_rows_v3(db,kind='life_c4',parameters=(job_graph_write(cycle).key.token,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT original_ref FROM " + TABLE +
             " WHERE bot=? AND persona=? AND kind='c4_prepared' "
             "AND json_extract(payload_json,'$.selector.cycle_job_ref')=? ORDER BY original_ref LIMIT 129",
             (*namespace.as_tuple, job_graph_write(cycle).key.token)).fetchall())
-        life_rows = model_reply_scope_rows_v3(db,kind='life_binding',parameters=(cycle.activity_id,),legacy_reader=lambda:db.execute("SELECT original_ref FROM " + TABLE +
+        life_rows = model_reply_scope_rows_v3(db,kind='life_binding',parameters=(cycle.activity_id,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT original_ref FROM " + TABLE +
             " WHERE bot=? AND persona=? AND kind='prepared' "
             "AND json_extract(payload_json,'$.binding.activity_id')=? ORDER BY original_ref LIMIT 129",
             (*namespace.as_tuple, cycle.activity_id)).fetchall())
@@ -1459,7 +1492,53 @@ def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: Pers
             add(get_job(db, binding.job_id), ref, digest,
                 operation_id=binding.operation_id, activity_id=binding.activity_id, work_kind=life_work_kind_v1(binding))
 
-    sql_scope = model_reply_scope_rows_v3(db,kind='children',parameters=(cycle.activity_id,),legacy_reader=lambda:db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? AND activity_id=? "
+
+    # These are historical signed phase occurrences, independent of today's selector.
+    from .d11_artifact_draft_model_v1 import (
+        decode_artifact_draft_original_v2, read_artifact_draft_prepared_v2)
+    phase_rows = model_reply_scope_rows_v3(db, kind='life_c4_phase',
+        parameters=(job_graph_write(cycle).key.token,),
+        legacy_reader=lambda: _reply_phase_prepared_refs_v2(db, namespace, cycle, issuer))
+    if len(phase_rows) > 128:
+        raise MissingProductionOriginalV1("bounded_reply_phase_original_inventory")
+    for (ref,) in phase_rows:
+        row = _read(db, issuer=issuer, namespace=namespace, kind='c4_phase_prepared', ref=ref)
+        if row is None:
+            raise MissingProductionOriginalV1("actual_signed_reply_phase_preparation")
+        prepared = decode_artifact_draft_original_v2('c4_phase_prepared', row[0])
+        task = prepared.selector.task
+        root = _read(db, issuer=issuer, namespace=namespace, kind='draft_root_capability',
+            ref=task.root_registration_ref)
+        if (task.cycle_job_ref != job_graph_write(cycle).key.token
+                or task.c02_operation_id != continuation.c02_operation_id
+                or root is None or root[0]['source_ref'] != continuation.source_ref
+                or read_artifact_draft_prepared_v2(db, namespace=namespace, issuer=issuer,
+                    selector=prepared.selector) != prepared
+                or prepared.parent_budget_lease_ref != cycle.budget_ref):
+            raise ValueError("phase C4 child changed its signed immutable cycle/Source/Root")
+        add(get_job(db, prepared.job_id), ref, prepared.digest,
+            operation_id=prepared.operation_id, activity_id=cycle.activity_id,
+            work_kind='artifact_draft_v1')
+
+    observation_rows = model_reply_scope_rows_v3(db, kind='artifact_observation_jobs',
+        parameters=(cycle.activity_id,), legacy_reader=lambda: _artifact_receipt_sql_v1(db,
+            "SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? AND activity_id=? "
+            "AND work_kind='d07.concern' AND operation_id LIKE 'artifact-phase-observe:%' "
+            "ORDER BY job_id LIMIT 129", (*namespace.as_tuple, cycle.activity_id)).fetchall())
+    if len(observation_rows) > 128:
+        raise MissingProductionOriginalV1("bounded_reply_artifact_observation_inventory")
+    for (job_id,) in observation_rows:
+        metadata, descriptor = _read_reply_artifact_observation_metadata_v3(
+            db, namespace=namespace, cycle=cycle, job_id=job_id, issuer=issuer)
+        add(get_job(db, job_id), job_id, descriptor.prepared_digest,
+            operation_id=descriptor.operation_id, activity_id=cycle.activity_id, work_kind='d07.concern')
+
+    for child, locator, digest in _read_reply_artifact_receipt_message_metadata_v1(
+            db, namespace=namespace, cycle=cycle):
+        add(child, locator, digest, operation_id=child.operation_id,
+            activity_id=cycle.activity_id, work_kind='message')
+
+    sql_scope = model_reply_scope_rows_v3(db,kind='children',parameters=(cycle.activity_id,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? AND activity_id=? "
         "AND work_kind IN ('artifact_draft_v1','d10.life.source_note.v1','d10.life.artifact_draft.v1','d07.recall_need') "
         "ORDER BY job_id LIMIT 257", (*namespace.as_tuple, cycle.activity_id)).fetchall())
     if len(sql_scope) > 256 or {item[0] for item in sql_scope} != {
@@ -1494,13 +1573,14 @@ def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: Pers
 def _read_reply_model_cost_closed_v1(db, *, namespace, job, call_id, quote_id,
         reservation_digest, terminal_digest=None):
     """Read the existing seven-field cost receipt and its financial CAS members."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .model_cost_settlement import OriginalModelCostCommitV1, original_model_cost_operation_id_v1
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     from .d11_types import RuntimeCostSettlement
     from .budget import BudgetReceipt
     from ..graph_store import GraphStore
     operation_id = original_model_cost_operation_id_v1(namespace, call_id)
-    row = model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('activity_id', 'commit_seq', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, operation_id))[0],((*namespace.as_tuple, operation_id))[1],((*namespace.as_tuple, operation_id))[2],),legacy_reader=lambda:db.execute("SELECT activity_id,commit_seq,receipt_json FROM graph_bundle_operations "
+    row = model_reply_scope_point_v3(db,table='graph_bundle_operations',columns=('activity_id', 'commit_seq', 'receipt_json'),key_columns=('bot', 'persona', 'operation_id'),key=(((*namespace.as_tuple, operation_id))[0],((*namespace.as_tuple, operation_id))[1],((*namespace.as_tuple, operation_id))[2],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT activity_id,commit_seq,receipt_json FROM graph_bundle_operations "
         "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation_id)).fetchone())
     if row is None:
         if terminal_digest is not None:
@@ -1516,17 +1596,17 @@ def _read_reply_model_cost_closed_v1(db, *, namespace, job, call_id, quote_id,
             (operation_id, call_id, quote_id, row[1]) or paid.terminal_receipt_digest != raw["terminal_receipt_digest"]
             or (terminal_digest is not None and paid.terminal_receipt_digest != terminal_digest)):
         raise ValueError("reply model terminal differs from its actual original cost identity")
-    event = model_reply_scope_point_v3(db,table='graph_events',columns=('revisions',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(((*namespace.as_tuple, row[0], operation_id))[0],((*namespace.as_tuple, row[0], operation_id))[1],((*namespace.as_tuple, row[0], operation_id))[2],((*namespace.as_tuple, row[0], operation_id))[3],),legacy_reader=lambda:db.execute("SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+    event = model_reply_scope_point_v3(db,table='graph_events',columns=('revisions',),key_columns=('bot', 'persona', 'session', 'event_id'),key=(((*namespace.as_tuple, row[0], operation_id))[0],((*namespace.as_tuple, row[0], operation_id))[1],((*namespace.as_tuple, row[0], operation_id))[2],((*namespace.as_tuple, row[0], operation_id))[3],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*namespace.as_tuple, row[0], operation_id)).fetchone())
     versions = () if event is None else tuple(v for v in _reply_event_version_rows_v3(event[0]) if v.key.token == paid.cost_ref)
     if len(versions) != 1:
         raise MissingProductionOriginalV1("actual_reply_model_cost_Graph_member")
-    history = model_reply_scope_point_v3(db,table='graph_history',columns=('value', 'valid', 'event_id'),key_columns=('token', 'revision'),key=(((paid.cost_ref, versions[0].revision))[0],((paid.cost_ref, versions[0].revision))[1],),legacy_reader=lambda:db.execute("SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?",
+    history = model_reply_scope_point_v3(db,table='graph_history',columns=('value', 'valid', 'event_id'),key_columns=('token', 'revision'),key=(((paid.cost_ref, versions[0].revision))[0],((paid.cost_ref, versions[0].revision))[1],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?",
         (paid.cost_ref, versions[0].revision)).fetchone())
     if history is None or history[1:] != (1, operation_id):
         raise MissingProductionOriginalV1("actual_reply_model_cost_immutable_history")
     cost = decode_typed_production_value_v1(background_json_loads_v3(history[0]), RuntimeCostSettlement)
-    budget = model_reply_scope_point_v3(db,table='runtime_budget_operations',columns=('digest', 'receipt_json'),key_columns=('bot_id','persona_id','operation_id','phase','lease_id'),key=(*namespace.as_tuple,cost.cost_operation_id,'settle',job.budget_ref),legacy_reader=lambda:db.execute("SELECT digest,receipt_json FROM runtime_budget_operations "
+    budget = model_reply_scope_point_v3(db,table='runtime_budget_operations',columns=('digest', 'receipt_json'),key_columns=('bot_id','persona_id','operation_id','phase','lease_id'),key=(*namespace.as_tuple,cost.cost_operation_id,'settle',job.budget_ref),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT digest,receipt_json FROM runtime_budget_operations "
         "WHERE lease_id=? AND operation_id=? AND phase='settle'", (job.budget_ref, cost.cost_operation_id)).fetchone())
     if budget is None or budget[0] != reservation_digest:
         raise MissingProductionOriginalV1("actual_reply_model_terminal_budget_receipt")
@@ -1542,6 +1622,7 @@ def _read_reply_model_cost_closed_v1(db, *, namespace, job, call_id, quote_id,
 def read_original_reply_pending_effects_v1(db, *, namespace: NamespaceId, cycle: PersistentJob,
         children: tuple[PersistentJob, ...], issuer: D11BudgetJobIssuer) -> tuple[str, ...]:
     """Known terminal originals close effects; cancellation phases never do."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import _read
     from .d11_life_terminal_v1 import read_adopted_life_original_v1
     from .d11_life_contract_v1 import D11LifeTerminalV1, life_from_wire_v1
@@ -1568,7 +1649,7 @@ def read_original_reply_pending_effects_v1(db, *, namespace: NamespaceId, cycle:
                 unresolved = terminal.status == "unknown"
         elif job.work_kind == "message":
             rows = (() if not table_exists_v1(db, "graph_d13_outbound_observations_v1") else
-                model_reply_scope_rows_v3(db,kind='outbound',parameters=(job.operation_id,),legacy_reader=lambda:db.execute("SELECT observation_digest FROM graph_d13_outbound_observations_v1 "
+                model_reply_scope_rows_v3(db,kind='outbound',parameters=(job.operation_id,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT observation_digest FROM graph_d13_outbound_observations_v1 "
                     "WHERE bot=? AND persona=? AND final_operation_id=? ORDER BY observation_digest LIMIT 2",
                     (*namespace.as_tuple, job.operation_id)).fetchall()))
             if len(rows) > 1:
@@ -1586,7 +1667,7 @@ def read_original_reply_pending_effects_v1(db, *, namespace: NamespaceId, cycle:
             saved = _read_reply_natural_metadata_v1(db, namespace, continuation.c02_operation_id, stage)
             seal, state, terminal_digest = saved
             unresolved = state == "acquired"
-            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('state', 'digest'),key_columns=('lease_id', 'operation_id'),key=(((seal.parent_budget_lease_id, seal.reservation_operation_id))[0],((seal.parent_budget_lease_id, seal.reservation_operation_id))[1],),legacy_reader=lambda:db.execute("SELECT state,digest FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('state', 'digest'),key_columns=('lease_id', 'operation_id'),key=(((seal.parent_budget_lease_id, seal.reservation_operation_id))[0],((seal.parent_budget_lease_id, seal.reservation_operation_id))[1],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT state,digest FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
                 (seal.parent_budget_lease_id, seal.reservation_operation_id)).fetchone())
             if reservation is None:
                 raise MissingProductionOriginalV1("actual_natural_reply_reservation")
@@ -1607,40 +1688,82 @@ def read_original_reply_pending_effects_v1(db, *, namespace: NamespaceId, cycle:
             prepared = read_d07_accounting_prepared_v1(db, issuer, namespace, job.job_id)
             call = read_d07_original_v1(db, issuer, namespace, "call", job.job_id)
             paid = read_d07_original_v1(db, issuer, namespace, "paid_cost", job.job_id)
-            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('digest', 'state'),key_columns=('lease_id', 'operation_id'),key=(((job.budget_ref, prepared.operation_id))[0],((job.budget_ref, prepared.operation_id))[1],),legacy_reader=lambda:db.execute("SELECT digest,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('digest', 'state'),key_columns=('lease_id', 'operation_id'),key=(((job.budget_ref, prepared.operation_id))[0],((job.budget_ref, prepared.operation_id))[1],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT digest,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
                 (job.budget_ref, prepared.operation_id)).fetchone())
             if reservation is None or reservation[0] != prepared.reservation_digest:
                 raise MissingProductionOriginalV1("actual_self_c3_reply_reservation")
             if paid is not None:
                 cost = paid[0]
-                financial = model_reply_scope_point_v3(db,table='runtime_budget_operations',columns=('digest', 'receipt_json'),key_columns=('bot_id','persona_id','operation_id','phase','lease_id'),key=(*namespace.as_tuple,prepared.operation_id,'settle',job.budget_ref),legacy_reader=lambda:db.execute("SELECT digest,receipt_json FROM runtime_budget_operations "
+                financial = model_reply_scope_point_v3(db,table='runtime_budget_operations',columns=('digest', 'receipt_json'),key_columns=('bot_id','persona_id','operation_id','phase','lease_id'),key=(*namespace.as_tuple,prepared.operation_id,'settle',job.budget_ref),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT digest,receipt_json FROM runtime_budget_operations "
                     "WHERE lease_id=? AND operation_id=? AND phase='settle'",
                     (job.budget_ref, prepared.operation_id)).fetchone())
-                atom = model_reply_scope_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(((cost["cost_ref"],))[0],),legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (cost["cost_ref"],)).fetchone())
+                atom = model_reply_scope_point_v3(db,table='graph_atoms',columns=('value', 'valid'),key_columns=('token',),key=(((cost["cost_ref"],))[0],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_atoms WHERE token=?", (cost["cost_ref"],)).fetchone())
                 if (cost["prepared_digest"] != prepared.digest or cost["paid"] is not True or cost["unknown_dimensions"]
                         or financial is None or financial[0]!=prepared.reservation_digest or not background_json_matches_v3(financial[1],cost["budget_receipt"])
                         or atom is None or atom[1]!=1 or not background_json_matches_v3(atom[0],cost["cost_value"])):
                     raise ValueError("Self C3 paid metadata lacks its actual financial CAS/Graph cost")
             unresolved = (call is not None and paid is None) or reservation[1] in {"unknown", "partial_unknown", "unconfirmed"}
+        elif job.work_kind == "d07.concern":
+            from .d07_execution_v1 import read_d07_original_v1
+            raw,descriptor=_read_reply_artifact_observation_metadata_v3(db,namespace=namespace,
+                cycle=cycle,job_id=job.job_id,issuer=issuer)
+            call=read_d07_original_v1(db,issuer,namespace,'call',job.job_id)
+            paid=read_d07_original_v1(db,issuer,namespace,'paid_cost',job.job_id)
+            reservation=model_reply_scope_point_v3(db,table='runtime_budget_reservations',
+                columns=('digest','state'),key_columns=('lease_id','operation_id'),
+                key=(job.budget_ref,descriptor.operation_id),
+                legacy_reader=lambda:db.execute("SELECT digest,state FROM runtime_budget_reservations "
+                    "WHERE lease_id=? AND operation_id=?",(job.budget_ref,descriptor.operation_id)).fetchone())
+            if reservation is None or reservation[0]!=raw['reservation_digest']:
+                raise MissingProductionOriginalV1("actual_Artifact_D07_reply_reservation")
+            quote=issuer.resource_issuer.original_signed_quote(db,raw['quote_id'],raw['quote_version'])
+            if (quote.parent_budget_lease_ref!=cycle.budget_ref or quote.operation_id!=descriptor.operation_id
+                    or quote.graph_job_ref!=job_graph_write(job).key.token):
+                raise ValueError("Artifact D07 child borrowed another signed quote/Root")
+            if paid is not None:
+                cost=paid[0]
+                financial=model_reply_scope_point_v3(db,table='runtime_budget_operations',
+                    columns=('digest','receipt_json'),
+                    key_columns=('bot_id','persona_id','operation_id','phase','lease_id'),
+                    key=(*namespace.as_tuple,descriptor.operation_id,'settle',job.budget_ref),
+                    legacy_reader=lambda:db.execute("SELECT digest,receipt_json FROM runtime_budget_operations "
+                        "WHERE lease_id=? AND operation_id=? AND phase='settle'",
+                        (job.budget_ref,descriptor.operation_id)).fetchone())
+                if (cost['prepared_digest']!=descriptor.prepared_digest or cost['paid']is not True
+                        or cost['unknown_dimensions'] or financial is None
+                        or financial[0]!=raw['reservation_digest']
+                        or not background_json_matches_v3(financial[1],cost['budget_receipt'])):
+                    raise ValueError("Artifact D07 paid original lost its exact real settlement")
+            unresolved=(call is not None and paid is None)or reservation[1]in{'unknown','partial_unknown','unconfirmed'}
         elif job.work_kind == "artifact_draft_v1":
-            from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1
-            from ..model_broker.artifact_draft_v1 import artifact_draft_model_ids_v1
-            row = _read(db, issuer=issuer, namespace=namespace, kind="c4_prepared", ref=locator)
-            prepared = decode_artifact_draft_original_v1("c4_prepared", row[0])
-            ids = artifact_draft_model_ids_v1(prepared.selector)
-            call = _read(db, issuer=issuer, namespace=namespace, kind="c4_call", ref=ids["call"])
-            paid = _read(db, issuer=issuer, namespace=namespace, kind="c4_paid", ref=ids["paid"])
-            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('state',),key_columns=('lease_id', 'operation_id'),key=(((prepared.parent_budget_lease_ref, prepared.operation_id))[0],((prepared.parent_budget_lease_ref, prepared.operation_id))[1],),legacy_reader=lambda:db.execute("SELECT state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
-                (prepared.parent_budget_lease_ref, prepared.operation_id)).fetchone())
-            if reservation is None:
+            from .d11_artifact_draft_model_v1 import (
+                decode_artifact_draft_original_v1, decode_artifact_draft_original_v2)
+            from ..model_broker.artifact_draft_v1 import artifact_draft_model_ids_v1,artifact_draft_model_ids_v2
+            phase=_read(db,issuer=issuer,namespace=namespace,kind='c4_phase_prepared',ref=locator)
+            legacy=_read(db,issuer=issuer,namespace=namespace,kind='c4_prepared',ref=locator)
+            if (phase is None)==(legacy is None):
+                raise ValueError("C4 reply child needs one exact historical prepared schema")
+            if phase is not None:
+                prepared=decode_artifact_draft_original_v2('c4_phase_prepared',phase[0])
+                ids=artifact_draft_model_ids_v2(prepared.selector);prefix='c4_phase_'
+            else:
+                prepared=decode_artifact_draft_original_v1('c4_prepared',legacy[0])
+                ids=artifact_draft_model_ids_v1(prepared.selector);prefix='c4_'
+            call=_read(db,issuer=issuer,namespace=namespace,kind=prefix+'call',ref=ids['call'])
+            paid=_read(db,issuer=issuer,namespace=namespace,kind=prefix+'paid',ref=ids['paid'])
+            reservation=model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('state','digest'),
+                key_columns=('lease_id','operation_id'),key=(prepared.parent_budget_lease_ref,prepared.operation_id),
+                legacy_reader=lambda:db.execute("SELECT state,digest FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+                    (prepared.parent_budget_lease_ref,prepared.operation_id)).fetchone())
+            if reservation is None or reservation[1]!=prepared.reservation_digest:
                 raise MissingProductionOriginalV1("actual_C4_reply_reservation")
-            unresolved = (call is not None and paid is None) or reservation[0] in {"unknown", "partial_unknown", "unconfirmed"}
+            unresolved=(call is not None and paid is None)or reservation[0]in{'unknown','partial_unknown','unconfirmed'}
         elif job.work_kind == "d04.appraisal":
             from .d04_appraisal_driver_v3 import read_current_d04_appraisal_original_v3, read_d04_original_v3
             original = read_current_d04_appraisal_original_v3(db, namespace, job.job_id)
             call = read_d04_original_v3(db, namespace, "appraisal_call", job.job_id)
             paid = read_d04_original_v3(db, namespace, "appraisal_cost", job.job_id)
-            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('state',),key_columns=('lease_id', 'operation_id'),key=(((job.budget_ref, original.operation_id))[0],((job.budget_ref, original.operation_id))[1],),legacy_reader=lambda:db.execute("SELECT state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+            reservation = model_reply_scope_point_v3(db,table='runtime_budget_reservations',columns=('state',),key_columns=('lease_id', 'operation_id'),key=(((job.budget_ref, original.operation_id))[0],((job.budget_ref, original.operation_id))[1],),legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
                 (job.budget_ref, original.operation_id)).fetchone())
             if reservation is None:
                 raise MissingProductionOriginalV1("actual_C2_reply_reservation")
@@ -1659,6 +1782,8 @@ def read_original_reply_pending_effects_v1(db, *, namespace: NamespaceId, cycle:
 
 def _read_observed_foreground_base_attempts_v1(db, *, namespace, continuation, issuer):
     """Rebuild every configured original slot already present for this same C02."""
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .foreground_call_plan_v1 import ForegroundModelAttemptV1
     from .d01_production_operations_v1 import table_exists_v1
     result = [_original_encoding_attempt_v1(db, namespace=namespace, c02_operation_id=continuation.c02_operation_id,
@@ -1683,11 +1808,11 @@ def _read_observed_foreground_base_attempts_v1(db, *, namespace, continuation, i
                 observed.append(("C6", review))
         for slot, original in observed:
             seal = original.seal
-            row = db.execute("SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+            row = _artifact_receipt_sql_v1(db,"SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
                 (seal.parent_budget_lease_id, seal.reservation_operation_id)).fetchone()
             if row is None:
                 raise ValueError("actual natural slot has no original existing reservation")
-            ceiling = json.loads(row[1])
+            ceiling = background_json_loads_v3(row[1])
             selector = ForegroundModelAttemptV1(slot, seal.call_id, None, seal.reservation_operation_id,
                 row[0], seal.parent_budget_lease_id, ceiling["input_tokens"], ceiling["output_tokens"], "reserved")
             result.append(_current_attempt_original_v1(db, namespace=namespace, continuation=continuation, attempt=selector, issuer=issuer))
@@ -1696,7 +1821,7 @@ def _read_observed_foreground_base_attempts_v1(db, *, namespace, continuation, i
 
 def read_observed_foreground_call_plan_v1(db, *, namespace, continuation, issuer, installed_bundle=None, owner_guard=None):
     """Rebuild every configured original slot already present for this same C02."""
-    if type(continuation.call_plan) is ForegroundCallPlanV2:
+    if type(continuation.call_plan) in {ForegroundCallPlanV2, ForegroundCallPlanV3}:
         return read_observed_foreground_call_plan_v2(db, namespace=namespace, continuation=continuation, issuer=issuer,
             installed_bundle=installed_bundle, owner_guard=owner_guard)
     result = _read_observed_foreground_base_attempts_v1(db, namespace=namespace, continuation=continuation, issuer=issuer)
@@ -1710,7 +1835,7 @@ def read_observed_foreground_call_plan_v1(db, *, namespace, continuation, issuer
 def read_observed_foreground_call_plan_v2(db, *, namespace, continuation, issuer, installed_bundle=None, owner_guard=None):
     from .d11_artifact_draft_model_v1 import require_current_artifact_phase_group_v2
     plan = continuation.call_plan
-    if type(plan) is not ForegroundCallPlanV2:
+    if type(plan) not in {ForegroundCallPlanV2, ForegroundCallPlanV3}:
         raise TypeError("actual versioned phase call plan required")
     if require_current_artifact_phase_group_v2(db, namespace=namespace, group=plan.phase_group, issuer=issuer,
             installed_bundle=installed_bundle, owner_guard=owner_guard) != plan.phase_group:
@@ -1720,8 +1845,7 @@ def read_observed_foreground_call_plan_v2(db, *, namespace, continuation, issuer
         if attempt.slot in {"C3", "C4"}:
             result.append(_current_attempt_original_v1(db, namespace=namespace,
                 continuation=continuation, attempt=attempt, issuer=issuer))
-    return ForegroundCallPlanV2(plan.parent_budget_lease_ref, plan.protected_reply_lease_ref,
-        tuple(result), phase_group=plan.phase_group)
+    return replace(plan, attempts=tuple(result))
 
 
 def derive_actual_completed_artifact_phase_plan_v2(db, *, namespace, continuation, issuer):
@@ -1731,7 +1855,7 @@ def derive_actual_completed_artifact_phase_plan_v2(db, *, namespace, continuatio
     from .d11_artifact_draft_model_v1 import require_current_artifact_phase_group_v2
     from .foreground_call_plan_v1 import ForegroundArtifactPhaseGroupV2, require_foreground_phase_checkpoint_v2
     from ..model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2, artifact_draft_phase_original_ref_v2
-    if type(continuation) is not ForegroundCycleContinuationV2 or type(continuation.call_plan) is not ForegroundCallPlanV2:
+    if type(continuation) is not ForegroundCycleContinuationV2 or type(continuation.call_plan) not in {ForegroundCallPlanV2, ForegroundCallPlanV3}:
         raise TypeError("phase advancement requires the actual versioned foreground continuation")
     observed = read_observed_foreground_call_plan_v2(db, namespace=namespace, continuation=continuation, issuer=issuer)
     group = observed.phase_group; selector = group.selector
@@ -1777,13 +1901,26 @@ def stage_current_foreground_cycle_in_transaction_v1(db, *, frame, request, inst
                 audiences=frame.envelope.authority.audience, now_utc=frame.now_utc)
             if responsibility.deadline_utc != frame.envelope.deadline_utc:
                 raise ValueError("new foreground create changed its original responsibility window")
-        if request.protected_reply_lease_ref != foreground_reply_budget_ids_v1(ns, request.c02_operation_id)[0]:
+        artifact_receipt = (type(responsibility) is ForegroundResponsibilityV1
+            and responsibility.mode == "signed_scope_intersection_v1"
+            and installed_readers.installed_bundle.artifact_phase_observer is not None)
+        budget_ids = foreground_artifact_receipt_budget_ids_v3 if artifact_receipt else foreground_reply_budget_ids_v1
+        if request.protected_reply_lease_ref != budget_ids(ns, request.c02_operation_id)[0]:
             raise ValueError("foreground create cannot choose or reuse another reply child identity")
-        allocation = prepare_foreground_reply_allocation_v1(db, namespace=ns,
-            c02_operation_id=request.c02_operation_id, source_ref=request.source_ref,
-            parent_budget_lease_ref=frame.envelope.parent_budget_lease_ref, issuer=issuer,
-            installed_bundle=installed_readers.installed_bundle, now_utc=frame.now_utc,
-            deadline_utc=frame.envelope.deadline_utc)
+        if artifact_receipt:
+            allocation = prepare_foreground_artifact_receipt_allocation_v3(db, namespace=ns,
+                c02_operation_id=request.c02_operation_id, source_ref=request.source_ref,
+                parent_budget_lease_ref=frame.envelope.parent_budget_lease_ref,
+                responsibility=responsibility, purpose=frame.envelope.authority.purpose,
+                audiences=frame.envelope.authority.audience, issuer=issuer,
+                installed_bundle=installed_readers.installed_bundle, now_utc=frame.now_utc,
+                deadline_utc=frame.envelope.deadline_utc)
+        else:
+            allocation = prepare_foreground_reply_allocation_v1(db, namespace=ns,
+                c02_operation_id=request.c02_operation_id, source_ref=request.source_ref,
+                parent_budget_lease_ref=frame.envelope.parent_budget_lease_ref, issuer=issuer,
+                installed_bundle=installed_readers.installed_bundle, now_utc=frame.now_utc,
+                deadline_utc=frame.envelope.deadline_utc)
         receipt = _adopted_c02_v1(db, ns, request.c02_operation_id)
         attempt = _original_encoding_attempt_v1(db, namespace=ns, c02_operation_id=request.c02_operation_id,
             source_ref=request.source_ref, parent_budget_ref=frame.envelope.parent_budget_lease_ref, issuer=issuer)
@@ -1842,7 +1979,7 @@ def stage_current_foreground_cycle_in_transaction_v1(db, *, frame, request, inst
             from .d11_artifact_draft_content_v1 import artifact_method_settlement_operation_id_v2,read_current_completed_artifact_method_history_v2
             from .domain_production_originals_v1 import read_adopted_domain_operation_v1
             completed_history=None
-            if type(proposed.call_plan) is ForegroundCallPlanV2:
+            if type(proposed.call_plan) in {ForegroundCallPlanV2, ForegroundCallPlanV3}:
                 completed_original=read_adopted_domain_operation_v1(db,ns,artifact_method_settlement_operation_id_v2(proposed.call_plan.phase_group.selector))
                 if completed_original is not None:
                     completed_history,_=read_current_completed_artifact_method_history_v2(db,namespace=ns,selector=proposed.call_plan.phase_group.selector,
@@ -1857,8 +1994,7 @@ def stage_current_foreground_cycle_in_transaction_v1(db, *, frame, request, inst
                 for attempt in proposed.call_plan.attempts:
                     if attempt.slot in {'C3','C4'}:
                         attempts.append(_current_attempt_original_v1(db,namespace=ns,continuation=proposed,attempt=attempt,issuer=issuer))
-                observed=ForegroundCallPlanV2(proposed.call_plan.parent_budget_lease_ref,proposed.call_plan.protected_reply_lease_ref,
-                    tuple(attempts),phase_group=proposed.call_plan.phase_group)
+                observed=replace(proposed.call_plan,attempts=tuple(attempts))
             if observed != proposed.call_plan:
                 raise ValueError("foreground checkpoint model states differ from their actual adopted originals")
             after, primary = checkpoint_foreground_cycle_in_transaction_v1(db, frame=frame, job_id=before.job_id,
@@ -1907,7 +2043,10 @@ def apply_foreground_cycle_stage_v1(db, stage, installed_readers):
     if before is None:
         if stage.reply_allocation is None:
             raise ValueError("foreground new cycle lacks its actual pure reply allocation")
-        apply_foreground_reply_allocation_v1(db, allocation=stage.reply_allocation, issuer=installed_readers.issuer)
+        apply_allocation = (apply_foreground_artifact_receipt_allocation_v3
+            if type(stage.reply_allocation) is ForegroundArtifactReceiptAllocationV3
+            else apply_foreground_reply_allocation_v1)
+        apply_allocation(db, allocation=stage.reply_allocation, issuer=installed_readers.issuer)
         updated = create_job(db, after, stage.stage.operation_id, canonical_digest(after.continuation))
     elif type(request) is AcquireForegroundCycleRequestV1:
         from datetime import datetime, timezone
@@ -1956,6 +2095,11 @@ def read_plan_current_foreground_cycle_v1(db, *, namespace, request):
         keys.extend(AtomKey.from_token(row.ref) for row in request.continuation.wait.observed_versions)
     if current.wait is not None:
         keys.extend(AtomKey.from_token(row.ref) for row in current.wait.observed_versions)
+    if type(request)is CheckpointForegroundCycleRequestV2 and type(request.continuation.call_plan)in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
+        phase=request.continuation.call_plan.phase_group.selector
+        if phase.task.cycle_job_ref!=request.job_ref or phase.task.c02_operation_id!=current.c02_operation_id:
+            raise ValueError('phase checkpoint read plan cannot borrow another task/Decision')
+        keys.extend((AtomKey.from_token(phase.decision_ref),AtomKey.from_token(phase.plan_ref)))
     from .d07_reflection_execution_v1 import reflection_obligation_read_plan_inputs_v3
     extra_keys,extra_roots,extra_originals=reflection_obligation_read_plan_inputs_v3(db,namespace,job_graph_write(job).key.token)
     return production_read_plan_v1((),(*keys,*extra_keys),(current.source_ref,*extra_roots),extra_originals)
@@ -1991,7 +2135,7 @@ def wake_artifact_draft_cycle_in_transaction_v2(db, *, frame, request, issuer):
             or prepared.actor_ref != frame.envelope.authority.actor
             or current.wait.event_kind not in {"artifact_draft_phase_model_queued", "artifact_draft_phase_model_terminal"}):
         raise ValueError("C4 terminal wake changed its original task/self/wait")
-    if type(current.call_plan) is not ForegroundCallPlanV2 or current.call_plan.phase_group.selector != request.selector:
+    if type(current.call_plan) not in {ForegroundCallPlanV2, ForegroundCallPlanV3} or current.call_plan.phase_group.selector != request.selector:
         raise ValueError("phase wake changed its exact current method group")
     from .d11_artifact_draft_model_v1 import require_current_artifact_phase_group_v2
     if require_current_artifact_phase_group_v2(db, namespace=ns, group=current.call_plan.phase_group, issuer=issuer) != current.call_plan.phase_group:
@@ -2111,6 +2255,7 @@ def artifact_draft_phase_wake_operation_id_v2(selector):
 
 def require_actual_c02_cue_source_v1(db, *, namespace, c02_operation_id, source_version):
     """C02 consumes the already committed ingress Source through its frozen read qualification."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .c02_bundle_codec import c02_bundle_from_wire
     from .d01_production_operations_v1 import MissingProductionOriginalV1
     from ..graph_types import GraphVersion
@@ -2122,7 +2267,7 @@ def require_actual_c02_cue_source_v1(db, *, namespace, c02_operation_id, source_
     from ..authority_service.model_reply_scope_observation_v3 import require_model_reply_scope_c02_envelope_v3
     envelope=require_model_reply_scope_c02_envelope_v3(db,namespace,c02_operation_id)
     if envelope is None:
-        row = db.execute('SELECT bundle_json FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?',
+        row = _artifact_receipt_sql_v1(db,'SELECT bundle_json FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?',
             (*namespace.as_tuple,c02_operation_id)).fetchone()
         if row is None:
             raise MissingProductionOriginalV1('actual_committed_C02_cue_source_qualification')
@@ -2132,3 +2277,154 @@ def require_actual_c02_cue_source_v1(db, *, namespace, c02_operation_id, source_
             or source_version not in envelope.version_guard.read_versions):
         raise ValueError('C02 cue differs from its actual frozen Source qualification/read version')
     return receipt
+
+
+
+def _reply_phase_prepared_refs_v2(db, namespace, cycle, issuer):
+    """Legacy scalar cursor; each selected immutable phase is a bounded metadata DTO."""
+    from .d11_life_preparation_v1 import TABLE, _read
+    from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v2
+    refs=[]
+    for (ref,) in db.execute("SELECT original_ref FROM "+TABLE+
+            " WHERE bot=? AND persona=? AND kind='c4_phase_prepared' ORDER BY original_ref",
+            namespace.as_tuple):
+        original=_read(db, issuer=issuer, namespace=namespace, kind='c4_phase_prepared', ref=ref)
+        prepared=decode_artifact_draft_original_v2('c4_phase_prepared', original[0])
+        if prepared.selector.task.cycle_job_ref==job_graph_write(cycle).key.token:
+            refs.append((ref,))
+            if len(refs)==129:break
+    return tuple(refs)
+
+
+def _read_reply_artifact_observation_metadata_v3(db, *, namespace, cycle, job_id, issuer):
+    """Read signed metadata and its historical cycle; never thaw D07 frozen Source input."""
+    from dataclasses import fields
+    from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_canonical_digest_v3
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    from .domain_background_read_v3 import BackgroundJSONColumnV3
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    from .artifact_observation_parentage_v3 import artifact_observation_descriptor_from_metadata_v3
+    from .d07_execution_v1 import SIGN_KIND
+    from ..runtime_contracts import canonical_serialize
+    row=_producer_original_point_v3(db, table='graph_d07_execution_originals_v1',
+        columns=('payload_json','payload_digest','signature'),
+        key_columns=('bot','persona','kind','original_ref'),
+        key=(*namespace.as_tuple,'prepared',job_id),
+        legacy_reader=lambda: db.execute(
+            "SELECT payload_json,payload_digest,signature FROM graph_d07_execution_originals_v1 "
+            "WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
+            (*namespace.as_tuple,job_id)).fetchone())
+    if row is None:
+        raise MissingProductionOriginalV1("actual_signed_Artifact_D07_reply_child")
+    raw=background_json_loads_v3(row[0])
+    if type(row[0]) is BackgroundJSONColumnV3:
+        column=row[0];column._actual_v3()
+        actual_fields=set(column.owner.column_kinds.get(column,{}))
+        if not column.complete or column.sha256!=row[1]:
+            raise ValueError("Artifact D07 child lost its actual canonical metadata EOF")
+    else:
+        actual_fields=set(raw)
+        if canonical_digest(raw)!=row[1]:
+            raise ValueError("Artifact D07 child raw canonical commitment changed")
+    if actual_fields!={field.name for field in fields(D07ArtifactObservationPreparedV3)}:
+        raise ValueError("Artifact D07 child changed its closed prepared field set")
+    issuer._signer.verify(SIGN_KIND,
+        canonical_serialize((namespace,'prepared',job_id,row[1])),row[2])
+    descriptor=artifact_observation_descriptor_from_metadata_v3(raw,
+        namespace=namespace,prepared_digest=row[1])
+    continuation=foreground_cycle_from_wire_v1(cycle.continuation)
+    child=get_job(db,job_id)
+    if (NamespaceId(**raw['namespace'])!=namespace
+            or descriptor.cycle_ref.key!=job_graph_write(cycle).key
+            or descriptor.c02_operation_id!=continuation.c02_operation_id
+            or (child.job_id,child.operation_id,child.activity_id,child.work_kind,child.budget_ref)!=
+                (descriptor.job_id,descriptor.operation_id,cycle.activity_id,'d07.concern',cycle.budget_ref)):
+        raise ValueError("Artifact D07 child crossed its exact historical cycle")
+    history=model_reply_scope_point_v3(db,table='graph_history',columns=('value','valid'),
+        key_columns=('token','revision'),key=(descriptor.cycle_ref.key.token,descriptor.cycle_ref.revision),
+        legacy_reader=lambda:db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
+            (descriptor.cycle_ref.key.token,descriptor.cycle_ref.revision)).fetchone())
+    if history is None or history[1]!=1:
+        raise MissingProductionOriginalV1("actual_Artifact_D07_parent_cycle_history")
+    historical=background_json_loads_v3(history[0])
+    historical_job=decode_foreground_job_v1(historical,namespace=namespace)
+    historical_cycle=foreground_cycle_from_wire_v1(historical_job.continuation)
+    if (model_reply_scope_canonical_digest_v3(history[0],historical)!=descriptor.cycle_digest
+            or canonical_digest(historical_cycle.call_plan)!=descriptor.call_plan_digest
+            or historical_cycle.c02_operation_id!=descriptor.c02_operation_id
+            or historical_job.job_id!=cycle.job_id):
+        raise ValueError("Artifact D07 child borrowed today's phase digest for an old signed occurrence")
+    return raw,descriptor
+
+
+def _read_reply_artifact_receipt_message_metadata_v1(db, *, namespace, cycle):
+    """Fixed completion-message metadata derives from its actual D06 producer and W01 batch."""
+    from .artifact_completion_receipt_v1 import receipt_from_wire_v1, OPERATION
+    from .artifact_receipt_dispatch_v1 import artifact_receipt_dispatch_runtime_refs_v1
+    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from .d01_production_operations_v1 import table_exists_v1
+    if not table_exists_v1(db,'graph_domain_production_originals_v1'):
+        return ()
+    rows=model_reply_scope_rows_v3(db,kind='artifact_receipt_jobs',parameters=(cycle.activity_id,),
+        legacy_reader=lambda:db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
+            "AND activity_id=? AND work_kind='message' AND operation_id LIKE 'artifact-receipt-message:%' "
+            "ORDER BY job_id LIMIT 2",(*namespace.as_tuple,cycle.activity_id)).fetchall())
+    if len(rows)>1:
+        raise ValueError("one Artifact cycle cannot own multiple completion messages")
+    result=[]
+    continuation=foreground_cycle_from_wire_v1(cycle.continuation)
+    for (job_id,) in rows:
+        job=get_job(db,job_id)
+        operation=job.operation_id;prefix='artifact-receipt-message:'
+        marker=operation.removeprefix(prefix)
+        if not operation.startswith(prefix) or len(marker)!=48 or any(c not in '0123456789abcdef'for c in marker):
+            raise ValueError("Artifact receipt message changed its deterministic operation")
+        producer=read_adopted_domain_operation_v1(db,namespace,'artifact-completion-source:'+marker)
+        if producer is None or (producer['domain'],producer['operation_kind'])!=('d06',OPERATION):
+            raise MissingProductionOriginalV1("actual_D06_completion_message_producer")
+        receipt=receipt_from_wire_v1(producer['payload']['provenance']['artifact_completion_receipt'])
+        if (receipt.namespace!=namespace or receipt.selector.task.cycle_job_ref!=job_graph_write(cycle).key.token
+                or receipt.selector.task.c02_operation_id!=continuation.c02_operation_id
+                or receipt.message_operation_id!=operation or producer['receipt'].operation_id!=receipt.producer_operation_id
+                or producer['payload']['coverage']!='complete'
+                or producer['payload']['owner_guard']!=plain_v1(receipt.owner_guard)
+                or artifact_receipt_dispatch_runtime_refs_v1(receipt)[0]!=job_graph_write(job).key.token
+                or job.effect_id!=receipt.effect_id or job.activity_id!=cycle.activity_id
+                or job.budget_ref!=continuation.call_plan.protected_reply_lease_ref):
+            raise ValueError("Artifact message lost its historical same-cycle receipt/Owner/allocation")
+        committed=model_reply_scope_point_v3(db,table='graph_bundle_operations',
+            columns=('digest','activity_id','effect_id','commit_seq','receipt_json'),
+            key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation),
+            legacy_reader=lambda:db.execute("SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                "FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+                (*namespace.as_tuple,operation)).fetchone())
+        if committed is None or committed[1:3]!=(cycle.activity_id,receipt.effect_id):
+            raise MissingProductionOriginalV1("actual_Artifact_receipt_message_W01")
+        candidate=background_json_loads_v3(committed[4]).get('dispatch_candidate')
+        if (type(candidate)is not dict or candidate.get('schema')!='sylanne.d11.dispatch_candidate.v1'
+                or candidate.get('status')!='source_qualified' or len(candidate.get('refs',()))!=4
+                or candidate.get('source_refs')!=[receipt.source_ref]):
+            raise ValueError("Artifact message has no exact qualified generic dispatch candidate")
+        batch_ref,revision=candidate['refs'][3]
+        key=AtomKey.from_token(batch_ref)
+        if (key.type_name!='d09.verified_segment_batch.v1' or NamespaceId.from_key(key)!=namespace
+                or key.owner.subject!=cycle.activity_id):
+            raise ValueError("Artifact message cannot borrow a natural batch")
+        history=model_reply_scope_point_v3(db,table='graph_history',
+            columns=('value','valid','event_id'),key_columns=('token','revision'),key=(batch_ref,revision),
+            legacy_reader=lambda:db.execute("SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=?",
+                (batch_ref,revision)).fetchone())
+        if history is None or history[1:]!=(1,operation):
+            raise MissingProductionOriginalV1("actual_Artifact_receipt_message_batch_history")
+        batch=background_json_loads_v3(history[0])
+        from ..domains.d09 import D09ExpressionProvider
+        next(spec for spec in D09ExpressionProvider.register_types()
+            if spec.name=='d09.verified_segment_batch.v1').validator(batch)
+        segments=batch.get('segments',())
+        if (batch.get('schema')!='d09.verified_segment_batch.v1' or batch.get('batch_digest')!=candidate.get('batch_digest')
+                or len(segments)!=1 or segments[0].get('body')!=receipt.text
+                or segments[0].get('effect_id')!=receipt.effect_id
+                or segments[0].get('source_refs')!=[receipt.source_ref] or segments[0].get('media_refs')):
+            raise ValueError("Artifact completion message changed its fixed receipt payload")
+        result.append((job,batch_ref,canonical_digest(batch)))
+    return tuple(result)

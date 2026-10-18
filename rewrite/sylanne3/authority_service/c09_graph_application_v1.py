@@ -1,9 +1,10 @@
 """Installed cumulative Graph application and independent C09 ACK reader."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
 import json
+import sqlite3
 from pathlib import Path
 import time
 

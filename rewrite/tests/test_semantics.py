@@ -5,8 +5,8 @@ import math
 import unittest
 
 from sylanne3.contracts import Scope, canonical_json
-from sylanne3.delivery import ActionContract
-from sylanne3.semantics import (
+from rewrite.host_tests.legacy_fixture_v1.delivery import ActionContract
+from rewrite.host_tests.legacy_fixture_v1.semantics import (
     Envelope,
     Proposal,
     build_prompt,

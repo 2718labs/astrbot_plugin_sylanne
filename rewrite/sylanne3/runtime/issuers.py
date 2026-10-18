@@ -1373,7 +1373,8 @@ class D02ResourceIssuer:
         return signature
 
     def _load_d03_arrival_policy(self, db, policy_id: str) -> D03ArrivalQuotePolicy:
-        row = db.execute(
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+        row = _artifact_receipt_sql_v1(db,
             "SELECT policy_json,signature,status FROM runtime_d03_arrival_quote_policies "
             "WHERE policy_id=?", (policy_id,),
         ).fetchone()
@@ -1443,7 +1444,8 @@ class D02ResourceIssuer:
 
     def _load_d03_projection_policy(
             self, db, policy_id: str) -> D03SelfIdentityProjectionQuotePolicy:
-        row = db.execute(
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+        row = _artifact_receipt_sql_v1(db,
             "SELECT policy_json,signature,status FROM runtime_d03_self_projection_quote_policies "
             "WHERE policy_id=?", (policy_id,),
         ).fetchone()
@@ -1505,7 +1507,8 @@ class D02ResourceIssuer:
         return signature
 
     def _load_d04_baseline_policy(self, db, policy_id: str) -> D04BaselineQuotePolicy:
-        row = db.execute(
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+        row = _artifact_receipt_sql_v1(db,
             "SELECT policy_json,signature,status FROM runtime_d04_baseline_quote_policies "
             "WHERE policy_id=?", (policy_id,),
         ).fetchone()
@@ -1562,7 +1565,8 @@ class D02ResourceIssuer:
         return signature
 
     def _load_d06_c02_policy(self, db, policy_id: str) -> D06FirstIngressC02QuotePolicy:
-        row = db.execute(
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+        row = _artifact_receipt_sql_v1(db,
             "SELECT policy_json,signature,status FROM runtime_d06_c02_quote_policies "
             "WHERE policy_id=?", (policy_id,),
         ).fetchone()
@@ -1626,7 +1630,8 @@ class D02ResourceIssuer:
 
     def _load_d06_correction_policy(
             self, db, policy_id: str) -> D06SourceCorrectionQuotePolicy:
-        row = db.execute(
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+        row = _artifact_receipt_sql_v1(db,
             "SELECT policy_json,signature,status FROM runtime_d06_correction_quote_policies "
             "WHERE policy_id=?", (policy_id,),
         ).fetchone()
@@ -1789,13 +1794,14 @@ class D02ResourceIssuer:
 
     def _load_quote(self, db, quote_id: str,
                     version: int | None) -> ResourceQuote:
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
         if version is None:
-            row = db.execute(
+            row = _artifact_receipt_sql_v1(db,
                 "SELECT quote_json,signature,status FROM runtime_resource_quotes "
                 "WHERE quote_id=? ORDER BY version DESC LIMIT 1", (quote_id,),
             ).fetchone()
         else:
-            row = db.execute(
+            row = _artifact_receipt_sql_v1(db,
                 "SELECT quote_json,signature,status FROM runtime_resource_quotes "
                 "WHERE quote_id=? AND version=?", (quote_id, version),
             ).fetchone()
@@ -1986,6 +1992,7 @@ class D11BudgetGrantIssuer:
         return signature
 
     def _load_grant(self, db, lease_id: str) -> BudgetLeaseGrant:
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
         from ..authority_service.life_numeric_source_read_v3 import read_bound_numeric_model_budget_grant_v3
         numeric,actual=read_bound_numeric_model_budget_grant_v3(db,self,lease_id)
         if numeric:return actual[0]
@@ -2004,10 +2011,10 @@ class D11BudgetGrantIssuer:
         observed,actual=read_model_reply_latest_budget_grant_metadata_v3(db,lease_id)
         if observed or _active_v3(db)is not None:
             if not observed:
-                actual=db.execute("SELECT version,status FROM runtime_budget_grants WHERE lease_id=? ORDER BY version DESC LIMIT 1",(lease_id,)).fetchone()
+                actual=_artifact_receipt_sql_v1(db,"SELECT version,status FROM runtime_budget_grants WHERE lease_id=? ORDER BY version DESC LIMIT 1",(lease_id,)).fetchone()
             if actual is None or actual[1]!='active':raise IssuerAuthorityDenied('signed D11 budget lease grant is absent')
             return self.signed_budget_grant_at_version(db,lease_id,actual[0])[0]
-        row = db.execute(
+        row = _artifact_receipt_sql_v1(db,
             "SELECT grant_json,signature,status FROM runtime_budget_grants "
             "WHERE lease_id=? ORDER BY version DESC LIMIT 1", (lease_id,),
         ).fetchone()

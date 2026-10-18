@@ -69,13 +69,53 @@ def _atom(db, namespace, key):
     return GraphAtom(key, row[0], json.loads(row[1]), True)
 
 
+def _recover_outbound_dispatch_v1(db, namespace, final_operation_id):
+    if final_operation_id.startswith('artifact-receipt-message:'):
+        from .artifact_receipt_dispatch_v1 import recover_artifact_receipt_dispatch_candidate_in_transaction_v1
+        return recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,namespace,final_operation_id)
+    return recover_natural_dispatch_candidate_in_transaction_v2(db,namespace,final_operation_id)
+
+
+def _current_receipt_outbound_v1(graph,db,namespace,final_operation_id,now):
+    from ..graph_coordinator import GraphCoordinator
+    from .artifact_completion_receipt_v1 import (read_current_artifact_completion_receipt_by_operation_v1,
+        require_artifact_completion_receipt_history_v1)
+    from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
+    if type(graph) is not GraphCoordinator:raise TypeError('receipt outbound needs its actual installed Graph')
+    assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+    if assembly is None or assembly.installation_policy.namespace!=namespace:
+        raise ValueError('receipt outbound crossed its actual installation')
+    marker=final_operation_id.removeprefix('artifact-receipt-message:')
+    original=read_adopted_domain_operation_v1(db,namespace,'artifact-completion-source:'+marker)
+    if original is None:raise ValueError('receipt outbound lost actual D06 producer')
+    historical=require_artifact_completion_receipt_history_v1(db,namespace=namespace,original=original)
+    current=read_current_artifact_completion_receipt_by_operation_v1(db,namespace=namespace,operation_id=final_operation_id,
+        issuer=graph._GraphCoordinator__d11_issuer,installed_bundle=assembly.admin_bundle,
+        owner_guard=historical.owner_guard,now_utc=now,audiences=tuple(original['payload']['authority']['audience']))
+    family=_source_family_current_sql_v1(db,namespace=namespace,roots=(current.source_ref,),purpose='expression',
+        audiences=tuple(original['payload']['authority']['audience']))
+    return current,(*family,GraphVersion(AtomKey.from_token(current.owner_guard.grant_ref),current.owner_guard.grant_revision)),original['payload']['authority']['actor']
+
+
+def _outbound_route_v1(batch):
+    if batch.key.type_name=='d09.verified_segment_batch.v1':
+        audiences=batch.value['audiences']
+        if type(audiences) is not list or len(audiences)!=1:
+            raise ValueError('Artifact receipt outbound requires its one actual audience')
+        return batch.value['scene_ref'],audiences[0]
+    if batch.key.type_name in {'d09.natural_verified_segment_batch.v2','d09.natural_verified_segment_batch.v3'}:
+        return batch.value['scene_id'],batch.value['audience_id']
+    raise ValueError('unregistered actual outbound batch type')
+
+
 def reserve_natural_outbound_slot_at_claim_v1(db, namespace, final_operation_id):
     """Reserve order atomically with P2 Graph claim, before any Host send.
 
     Unknown/missing observations leave an explicit ordered gap. Recovery must
     not assign an old message a newer sequence after intervening user turns.
     """
-    recovered = recover_natural_dispatch_candidate_in_transaction_v2(db, namespace, final_operation_id)
+    recovered = _recover_outbound_dispatch_v1(db, namespace, final_operation_id)
     if recovered is None:
         return (), ()  # A non-natural dispatch has its own domain ordering.
     batch = _atom(db, namespace, AtomKey.from_token(recovered.evidence.batch_ref))
@@ -87,7 +127,7 @@ def reserve_natural_outbound_slot_at_claim_v1(db, namespace, final_operation_id)
     if db.execute("SELECT 1 FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d09.turn_slot.v1' "
             "AND json_extract(value,'$.origin_ref')=?", (*namespace.as_tuple, origin)).fetchone():
         raise ValueError("natural outbox turn was reserved without this original P2 claim")
-    scene, conversation = batch.value["scene_id"], batch.value["audience_id"]
+    scene, conversation = _outbound_route_v1(batch)
     key = turn_order_key(namespace, scene, conversation)
     row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
     order = None if row is None else GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
@@ -95,11 +135,11 @@ def reserve_natural_outbound_slot_at_claim_v1(db, namespace, final_operation_id)
     return result.writes, (GraphVersion(key, 0 if order is None else order.revision),
                           GraphVersion(result.absent_slot, 0), GraphVersion(batch.key, batch.revision))
 
-def _stage(db, namespace, final_operation_id, observed, now):
+def _stage(db, namespace, final_operation_id, observed, now, *, graph=None):
     if type(observed) is not MutationReceiptV2 or observed.durable_state != "committed":
         raise ValueError("actual durable outbound observation required")
     pending, observation = observed.pending, observed.pending.platform_observation
-    recovered = recover_natural_dispatch_candidate_in_transaction_v2(db, namespace, final_operation_id)
+    recovered = _recover_outbound_dispatch_v1(db, namespace, final_operation_id)
     if (recovered is None or pending.phase != "observed"
             or type(observation) is not PlatformObservationV2
             or observation.binding.origin.operation_id != final_operation_id
@@ -107,21 +147,28 @@ def _stage(db, namespace, final_operation_id, observed, now):
             or observation.outcome not in {"accepted", "unknown", "delivered"}):
         raise ValueError("outbound observation and original final differ")
     batch = _atom(db, namespace, AtomKey.from_token(recovered.evidence.batch_ref))
-    validate_natural_verified_batch_value(batch.value)
+    artifact_receipt=final_operation_id.startswith('artifact-receipt-message:')
+    if artifact_receipt:
+        from ..domains.d09 import D09ExpressionProvider
+        next(spec for spec in D09ExpressionProvider().register_types() if spec.name=='d09.verified_segment_batch.v1').validator(batch.value)
+        receipt_fact,receipt_reads,receipt_actor=_current_receipt_outbound_v1(graph,db,namespace,final_operation_id,now)
+    else:
+        validate_natural_verified_batch_value(batch.value)
     # The actual observation permits recording an event that happened, but it
     # does not permit substituting a newer authored batch or route original.
     for token, revision in recovered.write_versions:
         current = _atom(db, namespace, AtomKey.from_token(token))
         if current.revision != revision:
             raise ValueError("outbound committed D08/D09 original changed")
-    generation_rows = db.execute("SELECT parent_original_id FROM graph_natural_generation_preparations_v2 "
-        "WHERE bot=? AND persona=? AND original_operation_id=?",
-        (*namespace.as_tuple, recovered.evidence.generation_original_operation_id)).fetchall()
-    if len(generation_rows) != 1:
-        raise ValueError("outbound generation original is ambiguous")
-    generation = read_original_preparation(db, namespace, generation_rows[0][0], "generation")
-    assert_natural_scoped_query_current_v2(db,
-        read_original_scoped_query_proof_v2(db, generation), now_utc=now)
+    if not artifact_receipt:
+        generation_rows = db.execute("SELECT parent_original_id FROM graph_natural_generation_preparations_v2 "
+            "WHERE bot=? AND persona=? AND original_operation_id=?",
+            (*namespace.as_tuple, recovered.evidence.generation_original_operation_id)).fetchall()
+        if len(generation_rows) != 1:
+            raise ValueError("outbound generation original is ambiguous")
+        generation = read_original_preparation(db, namespace, generation_rows[0][0], "generation")
+        assert_natural_scoped_query_current_v2(db,
+            read_original_scoped_query_proof_v2(db, generation), now_utc=now)
     outboxes = db.execute("SELECT outbox_ref FROM graph_outbox_jobs WHERE bot=? AND persona=? AND operation_id=?",
                           (*namespace.as_tuple, final_operation_id)).fetchall()
     if len(outboxes) != 1:
@@ -138,7 +185,7 @@ def _stage(db, namespace, final_operation_id, observed, now):
     outbox_write = outbox_graph_write(replace(value, phase=phase), AtomKey.from_token(value.job_ref))
     reconcile_runtime_write(db, outbox_write)
     outbox_after = GraphAtom(outbox.key, outbox.revision + 1, outbox_write.value, True)
-    scene, conversation = batch.value["scene_id"], batch.value["audience_id"]
+    scene, conversation = _outbound_route_v1(batch)
     order_key = turn_order_key(namespace, scene, conversation)
     row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (order_key.token,)).fetchone()
     order = None if row is None else GraphAtom(order_key, row[0], json.loads(row[1]), bool(row[2]))
@@ -159,14 +206,16 @@ def _stage(db, namespace, final_operation_id, observed, now):
         slot_write = reservation.writes[1]
         slot = GraphAtom(slot_write.key, 1, slot_write.value, True)
         slot_writes = reservation.writes
+    from ..domains.d09.turn_order import _outbound_segment
+    segment,_=_outbound_segment(batch)
     sid = "outbound:" + canonical_digest((namespace, final_operation_id))[:48]
     parents = tuple(sorted({AtomKey.from_token(ref).owner.subject
         for claim in batch.value["claims"] for ref in claim["source_refs"]}))
     observed_time = datetime.fromisoformat(observation.observed_at_utc.replace("Z", "+00:00")).timestamp()
     admitted = D06DomainAdapter(namespace).admit_source(SourceAdmission(
-        sid, batch.value["segment"]["body"], "persona:" + namespace.persona_id,
+        sid, segment["body"], (receipt_actor if artifact_receipt else "persona:" + namespace.persona_id),
         "authored", "authored", "none", "committed", observed_time, now,
-        "natural-generation:" + recovered.evidence.generation_original_operation_id,
+        (receipt_fact.receipt_id if artifact_receipt else "natural-generation:" + recovered.evidence.generation_original_operation_id),
         (conversation,), ("context", "audit"), parents))
     source = GraphAtom(source_key(*namespace.as_tuple, sid), 1, admitted.source.to_dict(), True)
     access = GraphAtom(access_key(*namespace.as_tuple, sid), 1, {
@@ -177,7 +226,7 @@ def _stage(db, namespace, final_operation_id, observed, now):
     if existing_source is not None:
         source = _atom(db, namespace, source.key)
         access = _atom(db, namespace, access.key)
-        if SourceRecord.from_dict(source.value).text != batch.value["segment"]["body"]:
+        if SourceRecord.from_dict(source.value).text != segment["body"]:
             raise ValueError("outbound authored original text changed")
         source_writes = ()
     else:
@@ -209,7 +258,7 @@ def _stage(db, namespace, final_operation_id, observed, now):
     previous = getattr(turn, "expected_observation", None)
     if previous is not None:
         reads[previous.key] = previous.revision
-    for ref in recovered.evidence.current_read_versions:
+    for ref in (receipt_reads if artifact_receipt else recovered.evidence.current_read_versions):
         row = db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?", (ref.key.token,)).fetchone()
         if ((ref.revision == 0 and row is not None)
                 or (ref.revision > 0 and row != (ref.revision, 1))):
@@ -231,7 +280,7 @@ def commit_natural_outbound_observation_v1(graph, bootstrap, namespace, final_op
         db = store._db
         db.execute("BEGIN")
         try:
-            recovered = recover_natural_dispatch_candidate_in_transaction_v2(db, namespace, final_operation_id)
+            recovered = _recover_outbound_dispatch_v1(db, namespace, final_operation_id)
             db.commit()
         except BaseException:
             db.rollback()
@@ -281,7 +330,7 @@ def commit_natural_outbound_observation_v1(graph, bootstrap, namespace, final_op
         try:
             if graph._v2_graph_stamp(namespace) != (metadata, epoch):
                 raise ValueError("outbound graph changed before adoption")
-            source, slot, batch, writes, reads = _stage(db, namespace, final_operation_id, observed, now)
+            source, slot, batch, writes, reads = _stage(db, namespace, final_operation_id, observed, now, graph=graph)
             receipt = GraphStore._graph_commit_in_transaction(store, GraphCandidate(
                 Event(Scope(*namespace.as_tuple, "d13-outbound-observation"), op, now,
                     "d13.outbound_observation", {"observation_digest": canonical_digest(observed)}),

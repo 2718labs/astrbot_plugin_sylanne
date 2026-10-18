@@ -94,7 +94,7 @@ async def run_installed_post_c02_artifact_draft_v1(
                 c02_operation_id=c02_operation_id, source_ref=source_ref))
         if phase_progress is not None:
             return await _run_installed_artifact_phase_model_v2(model, phase_progress,
-                c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
+                c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint, runtime=runtime)
         progress = await read()
         if not progress["prepared"]:
             if not fresh_cause_hint:
@@ -145,7 +145,7 @@ async def run_installed_post_c02_artifact_draft_v1(
                     reason_code=type(exc).__name__)
 
 
-async def _run_installed_artifact_phase_model_v2(model, progress, *, c02_operation_id, source_ref, fresh_cause_hint):
+async def _run_installed_artifact_phase_model_v2(model, progress, *, c02_operation_id, source_ref, fresh_cause_hint, runtime):
     """Consume one real selected generation phase with its original once call."""
     from ..model_broker.artifact_draft_v1 import ArtifactDraftPhaseSelectorV2, artifact_draft_model_ids_v2
     from ..runtime.d11_artifact_draft_model_v1 import (installed_artifact_draft_workflow_v2,
@@ -180,6 +180,33 @@ async def _run_installed_artifact_phase_model_v2(model, progress, *, c02_operati
         if not progress["generation"]:
             if not progress["contract_registered"]:
                 return held("actual_preregistered_artifact_phase_contract")
+            if model.bundle.artifact_phase_observer is not None and not progress['assessment_registered']:
+                async def observation_state():
+                    return await model.worker.call(lambda graph:graph.read_current_artifact_phase_observation_progress_v3(
+                        model.bootstrap,model.bundle,**arguments))
+                observation=await observation_state()
+                if not observation['basis_prepared']:
+                    progress=await operate('prepare_artifact_phase_observation_v1')
+                    observation=await observation_state()
+                if not observation['basis_prepared']:
+                    return held('actual_committed_independent_observation_basis')
+                if observation['job'] is None:
+                    progress=await operate('serve_concern')
+                    observation=await observation_state()
+                job=observation['job']
+                if job is None:return held('actual_independent_observer_ticket_selected_and_prepared')
+                if not observation['observation_complete']:
+                    if job.phase not in {'queued','running'} or job.cancel_epoch:
+                        return held('actual_uncancelled_original_independent_observer_job')
+                    from ..runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+                    service=runtime._v2_d07_execution_service
+                    if (type(service)is not InstalledD07ExecutionServiceV1 or service.bundle is not model.bundle
+                            or service.graph is not model.graph or service.worker is not model.worker):
+                        return held('actual_installed_independent_observer_execution_service')
+                    await service.execute_current_d07_job_v1(job)
+                    observation=await observation_state()
+                if not observation['observation_complete']:
+                    return held('actual_independent_observer_terminal_settlement_and_all_adopted_findings')
             if not progress["assessment_registered"]:
                 progress = await operate("observe_artifact_phase_postconditions_v1")
             if not progress["assessment_registered"]:

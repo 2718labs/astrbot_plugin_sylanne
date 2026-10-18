@@ -498,6 +498,13 @@ def read_graph_rows_v3(db,columns,*,where,parameters=(),history=False,order_by=(
     predicate=_registered_graph_predicate_v3(where,allowed-{'value','value_cell_id'})
     if type(order_by) is not tuple or any(c not in allowed-{'value','value_cell_id'} for c in order_by):
         raise ValueError('registered Graph metadata ordering required')
+    from .runtime.artifact_receipt_original_read_v1 import _ACTIVE,artifact_receipt_sql_v1
+    receipt_task=_ACTIVE.get()
+    if receipt_task is not None:
+        sql='SELECT '+','.join(columns)+' FROM '+('graph_history'if history else'graph_atoms')+' WHERE '+predicate
+        if order_by:sql+=' ORDER BY '+','.join(order_by)
+        if limit is not None:sql+=' LIMIT '+str(limit)
+        return tuple(artifact_receipt_sql_v1(db,sql,parameters))
     if handle is None:
         sql='SELECT '+','.join(columns)+' FROM '+('graph_history' if history else 'graph_atoms')+' WHERE '+predicate
         if order_by:sql+=' ORDER BY '+','.join(order_by)

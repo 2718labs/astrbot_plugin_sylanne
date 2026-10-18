@@ -3,7 +3,7 @@ import asyncio
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import threading
-from .contracts import Scope, StepResult, CapacityExceeded
+from sylanne3.contracts import Scope, StepResult, CapacityExceeded
 
 @dataclass(eq=False)
 class _Work:

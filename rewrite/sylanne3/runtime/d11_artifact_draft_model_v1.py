@@ -1,4 +1,6 @@
 """C4 preparation and once worker on the existing Life originals/jobs/budget."""
+
+from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
 from dataclasses import asdict,dataclass, fields, field, replace
 from datetime import datetime, timezone
 import json
@@ -161,8 +163,9 @@ def installed_artifact_draft_workflow_v1(bundle):
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+    from ..host.model_workflows_v9 import AdminModelWorkflowsV9
     from ..host.authority_profile import AdminInstallationBundle, AdminModelWorkflowV2
-    if type(bundle) is not AdminInstallationBundle or type(bundle.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+    if type(bundle) is not AdminInstallationBundle or type(bundle.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
         raise MissingProductionOriginalV1("explicit_installed_artifact_draft_workflows_v4")
     workflow = bundle.model_workflows.artifact_draft
     if (type(workflow) is not AdminModelWorkflowV2
@@ -364,7 +367,7 @@ def _prepare_artifact_draft_model(db, *, frame, request, installed_readers, phas
     ids = model_ids(request.selector)
     if phase:
         plan = continuation.call_plan
-        if type(plan) is not ForegroundCallPlanV2 or plan.phase_group.selector != phase_selector:
+        if type(plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3} or plan.phase_group.selector != phase_selector:
             raise MissingProductionOriginalV1('actual_current_foreground_phase_group')
         require_current_artifact_phase_group_v2(db, namespace=selector.namespace, group=plan.phase_group, issuer=readers.issuer)
         if len(plan.phase_group.completed_phase_originals) != phase_selector.phase_index:
@@ -373,10 +376,10 @@ def _prepare_artifact_draft_model(db, *, frame, request, installed_readers, phas
         raise ValueError("C4 preparation must retain its fixed original operation/purpose")
     if any(row.slot == "C4" and (not phase or row.call_id == ids["call"]) for row in continuation.call_plan.attempts):
         raise ValueError("C4 preparation cannot replace an original draft model attempt")
-    from .d07_ingress_recall_preparation_v1 import read_current_ingress_recall_attempt_v1
+    from .foreground_cycle_v1 import _current_attempt_original_v1
     for attempt in continuation.call_plan.attempts:
         if attempt.slot == "C3":
-            actual = read_current_ingress_recall_attempt_v1(db, namespace=selector.namespace,
+            actual = _current_attempt_original_v1(db, namespace=selector.namespace,
                 continuation=continuation, attempt=attempt, issuer=readers.issuer)
             if actual.state != "completed" or actual != attempt:
                 raise ValueError("C4 requires the exact completed original C3; pending or unknown calls cannot be replaced")
@@ -461,10 +464,7 @@ def _prepare_artifact_draft_model(db, *, frame, request, installed_readers, phas
         ceiling["input_tokens"],ceiling["output_tokens"],"reserved",
         **({"phase_selector":phase_selector} if phase else {}))
     from .foreground_cycle_v1 import ForegroundWaitV1
-    plan_type = ForegroundCallPlanV2 if phase else ForegroundCallPlanV1
-    plan = plan_type(continuation.call_plan.parent_budget_lease_ref,continuation.call_plan.protected_reply_lease_ref,
-        (*continuation.call_plan.attempts,attempt),
-        **({"phase_group":continuation.call_plan.phase_group} if phase else {}))
+    plan = replace(continuation.call_plan,attempts=(*continuation.call_plan.attempts,attempt))
     wait = ForegroundWaitV1("d11","artifact_draft_phase_model_terminal" if phase else "artifact_draft_model_terminal",(),
         QueryEpoch(selector.namespace,"foreground:"+cycle.job_id,frame.snapshot.epochs[0].revision),
         continuation.wait.consume_cursor if continuation.wait is not None else 0,None)
@@ -675,6 +675,7 @@ def validate_artifact_draft_model_proposal_v1(proposal,snapshot,stage):
 
 
 def require_artifact_draft_inputs_current_v1(db, *, prepared, frozen, frame, readers):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d01_production_operations_v1 import CurrentDomainReadV1
     read = CurrentDomainReadV1(frame);read.check(db)
     policy = readers.installed_bundle.installation_policy
@@ -720,7 +721,7 @@ def require_artifact_draft_inputs_current_v1(db, *, prepared, frozen, frame, rea
     if canonical_digest(quote) != prepared.quote_digest or quote.work_kind != WORK_KIND:
         raise ValueError("C4 actual signed model quote changed")
     require_budget_family_admissible(db,prepared.parent_budget_lease_ref)
-    row = db.execute("SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+    row = _artifact_receipt_sql_v1(db,"SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
         (prepared.parent_budget_lease_ref,prepared.operation_id)).fetchone()
     if row != (prepared.reservation_digest,canonical_serialize(dict(quote.ceiling)),"reserved"):
         raise ValueError("C4 original once reservation is not current")
@@ -742,8 +743,9 @@ def read_artifact_draft_model_request_v1(db, *, prepared, issuer):
 
 def read_current_artifact_draft_attempt_v1(db,*,namespace,continuation,attempt,issuer):
     """Foreground slot reads real prepared/cost/result originals, never a flag."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import TABLE
-    rows=db.execute("SELECT original_ref FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_prepared' "
+    rows=_artifact_receipt_sql_v1(db,"SELECT original_ref FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_prepared' "
         "AND json_extract(payload_json,'$.call_id')=? LIMIT 2",(*namespace.as_tuple,attempt.call_id)).fetchall()
     if len(rows)!=1:raise MissingProductionOriginalV1("unique_actual_foreground_c4_prepared")
     original=_read(db,issuer=issuer,namespace=namespace,kind="c4_prepared",ref=rows[0][0])
@@ -754,7 +756,7 @@ def read_current_artifact_draft_attempt_v1(db,*,namespace,continuation,attempt,i
         raise ValueError("foreground C4 slot changed its original C02/root/reservation")
     quote=issuer.resource_issuer.original_signed_quote(db,p.quote_id,1)
     if quote.work_kind!=WORK_KIND or canonical_digest(quote)!=p.quote_digest:raise ValueError("C4 original finite quote changed")
-    reserved=db.execute("SELECT digest,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+    reserved=_artifact_receipt_sql_v1(db,"SELECT digest,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
         (p.parent_budget_lease_ref,p.operation_id)).fetchone()
     if reserved is None or reserved[0]!=p.reservation_digest:raise ValueError("C4 original reservation absent")
     ids=artifact_draft_model_ids_v1(p.selector)
@@ -901,11 +903,12 @@ class InstalledArtifactDraftModelRuntimeV1:
         return prepare_current_artifact_host_dispatch_read_v1(graph,self,selector)
 
     def _read_dispatch_original_v1(self,graph,job_id):
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
         graph._admin(self.bootstrap)
         db=graph._GraphCoordinator__store._db
         with graph._GraphCoordinator__store._lock:
             if db.in_transaction:raise ValueError("C4 execution read requires independent SQL snapshot")
-            db.execute("BEGIN")
+            _artifact_receipt_sql_v1(db,"BEGIN")
             try:
                 job=get_job(db,job_id)
                 schema = job.continuation['schema']
@@ -939,6 +942,7 @@ class InstalledArtifactDraftModelRuntimeV1:
 
     def _read_original_cost_task_v1(self, graph, *, c02_operation_id):
         """Read only original job/call commitments; withdrawn Sources confer no body eligibility."""
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
         graph._admin(self.bootstrap)
         from .foreground_cycle_v1 import foreground_cycle_ids_v1
         from ..model_broker.artifact_draft_v1 import artifact_draft_task_selector_v1
@@ -949,7 +953,7 @@ class InstalledArtifactDraftModelRuntimeV1:
         store = graph._GraphCoordinator__store
         with store._lock:
             db = store._db
-            db.execute("BEGIN")
+            _artifact_receipt_sql_v1(db,"BEGIN")
             try:
                 cycle = get_job(db, foreground_cycle_ids_v1(ns, c02_operation_id)[1])
                 responsibility = read_original_foreground_responsibility_for_c09_v1(db, namespace=ns,
@@ -973,6 +977,7 @@ class InstalledArtifactDraftModelRuntimeV1:
 
     def _read_original_phase_cost_tasks_v2(self, graph, *, c02_operation_id):
         """Original once costs remain collectible after Source/Owner withdrawal."""
+        from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
         from .d11_life_preparation_v1 import TABLE
         from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
         from ..authority_service.v2_model_egress_wire import from_wire
@@ -981,9 +986,9 @@ class InstalledArtifactDraftModelRuntimeV1:
         store = graph._GraphCoordinator__store
         with store._lock:
             db = store._db
-            db.execute('BEGIN')
+            _artifact_receipt_sql_v1(db,'BEGIN')
             try:
-                rows = db.execute('SELECT original_ref FROM ' + TABLE +
+                rows = _artifact_receipt_sql_v1(db,'SELECT original_ref FROM ' + TABLE +
                     " WHERE bot=? AND persona=? AND kind='c4_phase_prepared' "
                     "AND json_extract(payload_json,'$.selector.task.c02_operation_id')=? ORDER BY original_ref LIMIT 3",
                     (*namespace.as_tuple, c02_operation_id)).fetchall()
@@ -1342,20 +1347,21 @@ def read_artifact_draft_prepared_v2(db, *, namespace, issuer, selector):
     return prepared
 
 
-def require_artifact_phase_frozen_contract_history_v3(db, *, namespace, frozen):
+def require_artifact_phase_frozen_contract_history_v3(db, *, namespace, frozen, issuer=None, read_original=None):
     from .d11_life_preparation_v1 import TABLE
     from .artifact_phase_postconditions_v1 import CONTRACT_KIND, require_artifact_phase_postcondition_history_v1
     from .foreground_call_plan_v1 import foreground_artifact_phase_group_identity_v2
     if type(frozen) is not ArtifactDraftInputV3 or frozen.selector.task.namespace != namespace:
         raise MissingProductionOriginalV1('actual_frozen_preregistered_phase_contract_commitment')
-    row = db.execute('SELECT payload_json,payload_digest,producing_operation_id FROM ' + TABLE +
-        ' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
-        (*namespace.as_tuple, CONTRACT_KIND, frozen.postcondition_contract_ref)).fetchone()
+    from .artifact_phase_postconditions_v1 import _history_life_payload_point_v2
+    row = _history_life_payload_point_v2(db,('payload_json','payload_digest','producing_operation_id'),
+        namespace=namespace,kind=CONTRACT_KIND,ref=frozen.postcondition_contract_ref,
+        issuer=issuer,read_original=read_original)
     if row is None or row[1] != frozen.postcondition_contract_digest:
         raise MissingProductionOriginalV1('actual_preregistered_phase_contract_original')
     raw = json.loads(row[0])
     contract = require_artifact_phase_postcondition_history_v1(db, namespace=namespace, kind=CONTRACT_KIND,
-        original_ref=frozen.postcondition_contract_ref, producing_operation_id=row[2], raw=raw)
+        original_ref=frozen.postcondition_contract_ref, producing_operation_id=row[2], raw=raw, issuer=issuer, read_original=read_original)
     if (contract.digest != frozen.postcondition_contract_digest or
             foreground_artifact_phase_group_identity_v2(contract.selector) != foreground_artifact_phase_group_identity_v2(frozen.selector)):
         raise ValueError('phase frozen material changed its actual preregistered method contract')
@@ -1652,6 +1658,7 @@ def read_plan_artifact_draft_model_v2(db, *, namespace, operation_kind, request,
 
 
 def read_current_artifact_draft_attempt_v2(db, *, namespace, continuation, attempt, issuer):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if type(attempt) is not ForegroundModelAttemptV2:
         raise TypeError('actual generation phase physical attempt required')
     p = read_artifact_draft_prepared_v2(db, namespace=namespace, issuer=issuer, selector=attempt.phase_selector)
@@ -1664,7 +1671,7 @@ def read_current_artifact_draft_attempt_v2(db, *, namespace, continuation, attem
     quote = issuer.resource_issuer.original_signed_quote(db, p.quote_id, 1)
     if canonical_digest(quote) != p.quote_digest or quote.work_kind != WORK_KIND:
         raise ValueError('phase physical attempt changed its signed quote')
-    reserved = db.execute('SELECT digest,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
+    reserved = _artifact_receipt_sql_v1(db,'SELECT digest,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
         (p.parent_budget_lease_ref, p.operation_id)).fetchone()
     if reserved is None or reserved[0] != p.reservation_digest: raise ValueError('actual phase reservation absent')
     ids = artifact_draft_model_ids_v2(p.selector)
@@ -1718,6 +1725,8 @@ def validate_artifact_draft_model_proposal_v2(proposal, snapshot, stage):
 
 
 def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, owner_guard, audiences, installed_bundle, phase_state):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_current_type_versions_v3
     """Authenticate adopted finite proof and re-read all hard evidence in the pinned Graph.
 
@@ -1744,7 +1753,7 @@ def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, 
                     or NamespaceId.from_key(before.key) != namespace or after.revision <= before.revision):
                 raise ValueError('completed phase facts have no exact namespace once-version advance')
             history = artifact_model_graph_point_v3(db,('value', 'valid'),token=after.key.token,revision=after.revision)
-            if history is None or history[1] != 1 or canonical_digest(json.loads(history[0])) != digest:
+            if history is None or history[1] != 1 or background_json_digest_v3(history[0],background_json_loads_v3(history[0])) != digest:
                 raise ValueError('completed phase delta lost actual historical W01 bytes')
             transitions.setdefault(before.key.token, []).append((before.revision,after.revision))
     elif phase_state != 'selected':
@@ -1756,7 +1765,7 @@ def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, 
         before,after,digest,operation_id,original_digest,node=checkpoint_delta
         history=artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=after.key.token,revision=after.revision)
         if (before.key!=after.key or after.revision!=before.revision+1 or NamespaceId.from_key(before.key)!=namespace
-                or history is None or history[0]!=operation_id or history[2]!=1 or canonical_digest(json.loads(history[1]))!=digest):
+                or history is None or history[0]!=operation_id or history[2]!=1 or background_json_digest_v3(history[1],background_json_loads_v3(history[1]))!=digest):
             raise ValueError('selected checkpoint qualification lost its exact actual W01 successor')
         step=(before.revision,after.revision)
         if step not in transitions.setdefault(before.key.token,[]):transitions[before.key.token].append(step)
@@ -1775,7 +1784,7 @@ def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, 
             or now >= min(prepared.need.original_deadline_utc, chosen.future_identity.deadline_utc)
             or prepared.need.new_c3_required or prepared.need.meaningful_gaps or not prepared.need.complete):
         raise MissingProductionOriginalV1('actual_current_phase_owner_need_scope_deadline')
-    rights = db.execute('SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',
+    rights = _artifact_receipt_sql_v1(db,'SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?',
         namespace.as_tuple).fetchone()
     if rights != (prepared.access_epoch, prepared.delete_epoch):
         raise ValueError('phase Need/choice current Source rights changed')
@@ -1797,10 +1806,10 @@ def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, 
     cycle = get_job(db, AtomKey.from_token(selector.task.cycle_job_ref).name)
     cycle_atom = artifact_model_graph_point_v3(db,('value', 'valid'),token=selector.task.cycle_job_ref)
     continuation = foreground_cycle_from_wire_v1(cycle.continuation)
-    if (cycle_atom is None or cycle_atom[1] != 1 or json.loads(cycle_atom[0]) != job_graph_write(cycle).value
+    if (cycle_atom is None or cycle_atom[1] != 1 or background_json_loads_v3(cycle_atom[0]) != job_graph_write(cycle).value
             or cycle.cancel_epoch or continuation.cancel_generation
             or continuation.c02_operation_id != selector.task.c02_operation_id
-            or type(continuation.call_plan) is not ForegroundCallPlanV2
+            or type(continuation.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}
             or continuation.call_plan.phase_group.selector != selector):
         raise ValueError('phase mutable cycle is not its actual SQL/Graph once transition')
     phase_keys = {}
@@ -1822,7 +1831,7 @@ def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, 
             if phase_prepared is not None:
                 phase_job = get_job(db, phase_prepared.job_id)
                 atom = artifact_model_graph_point_v3(db,('value', 'valid'),token=version.key.token)
-                if (atom is None or atom[1] != 1 or json.loads(atom[0]) != job_graph_write(phase_job).value
+                if (atom is None or atom[1] != 1 or background_json_loads_v3(atom[0]) != job_graph_write(phase_job).value
                         or phase_job.operation_id != phase_prepared.operation_id or phase_job.cancel_epoch
                         or phase_job.continuation != {'schema':'d11.artifact-draft-phase-model-job.v2',
                             'selector':plain_v1(expected_phase), 'prepared_digest':phase_prepared.digest}):
@@ -1836,7 +1845,7 @@ def _require_artifact_phase_candidate_current_sql(db, *, selector, issuer, now, 
             raise MissingProductionOriginalV1('phase_current_original_positive_negative_evidence')
     current_owner = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=owner_guard.grant_ref)
     if (current_owner is None or current_owner[0] != owner_guard.grant_revision or current_owner[2] != 1
-            or canonical_digest(json.loads(current_owner[1])) != owner_guard.grant_digest):
+            or background_json_digest_v3(current_owner[1],background_json_loads_v3(current_owner[1])) != owner_guard.grant_digest):
         raise ValueError('phase current upstream Owner grant changed')
     _source_family_current_sql_v1(db, namespace=namespace, roots=prepared.source_refs,
         purpose='consolidation', audiences=audiences)
@@ -1974,6 +1983,7 @@ def freeze_actual_artifact_phase_count_stage_in_transaction_v2(db, *, frame, req
 
 def validate_frozen_artifact_phase_count_stage_in_transaction_v2(db, *, frozen_stage, count_pair, installed_readers, now_utc):
     """Verify real outside counts/current dependencies, retaining the original body."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d02_artifact_phase_price_v1 import ArtifactPhaseCountPairV1, verify_frozen_artifact_phase_count_pair_in_transaction_v1
     import math
     if (not db.in_transaction or type(frozen_stage) is not ArtifactDraftModelStageV2
@@ -2001,7 +2011,7 @@ def validate_frozen_artifact_phase_count_stage_in_transaction_v2(db, *, frozen_s
             or initial.candidate_parameter_digest != binding.digest or final.candidate_parameter_digest != binding.digest):
         raise ValueError('phase counts were not for this actual current phase binding/body')
     quote = installed_readers.resource_issuer.original_signed_quote(db, p.quote_id, 1)
-    reserved = db.execute('SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
+    reserved = _artifact_receipt_sql_v1(db,'SELECT digest,ceiling_json,state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?',
         (p.parent_budget_lease_ref, p.operation_id)).fetchone()
     grant = installed_readers.issuer.current_budget_grant(db, p.parent_budget_lease_ref)
     require_budget_family_admissible(db, p.parent_budget_lease_ref)
@@ -2045,7 +2055,7 @@ class ArtifactDraftPhaseCountProofV2:
         policy_raw = json.loads(self.counter_policy_json)
         if canonical_serialize(policy_raw) != self.counter_policy_json:
             raise ValueError('compact counter policy bytes changed')
-        policy = artifact_phase_counter_policy_from_payload_v1(policy_raw, allow_local_fixture=policy_raw.get('source_scope') == 'LOCAL_FIXTURE')
+        policy = artifact_phase_counter_policy_from_payload_v1(policy_raw)
         if common['policy_digest'] != policy.digest:
             raise ValueError('compact counter proof changed its actual installed policy commitment')
         if self.billing_policy_json is not None:
@@ -2080,7 +2090,7 @@ def _restore_actual_phase_count_proof_v2(proof, model_request, *, now_utc=None):
     from ..model_broker.provider_billing_receipt_v1 import provider_billing_policy_from_wire_v1
     from ..authority_service.artifact_phase_counter_v1 import require_independent_actual_phase_counts_v1
     policy_raw = json.loads(proof.counter_policy_json)
-    policy = artifact_phase_counter_policy_from_payload_v1(policy_raw, allow_local_fixture=policy_raw['source_scope'] == 'LOCAL_FIXTURE')
+    policy = artifact_phase_counter_policy_from_payload_v1(policy_raw)
     billing = None if proof.billing_policy_json is None else provider_billing_policy_from_wire_v1(json.loads(proof.billing_policy_json))
     body = canonical_serialize(artifact_phase_provider_request_v1(model_request, billing_policy=billing))
     common = json.loads(proof.common_request_json)
@@ -2091,7 +2101,7 @@ def _restore_actual_phase_count_proof_v2(proof, model_request, *, now_utc=None):
     envelopes = (json.loads(proof.initial_envelope_json), json.loads(proof.final_envelope_json))
     verification_now = max(envelope['payload']['counted_at_utc'] for envelope in envelopes) if now_utc is None else now_utc
     evidence = require_independent_actual_phase_counts_v1(policy, initial_request=initial, initial_envelope=envelopes[0],
-        final_request=final, final_envelope=envelopes[1], now_utc=verification_now, allow_local_fixture=policy.source_scope == 'LOCAL_FIXTURE')
+        final_request=final, final_envelope=envelopes[1], now_utc=verification_now)
     return policy, billing, initial, final, evidence
 
 
@@ -2235,6 +2245,7 @@ def derive_artifact_no_dispatch_cancellation_basis_v1(db, *, prepared, issuer, n
 
 
 def require_artifact_no_dispatch_cancellation_basis_v1(db, *, runtime, witness, basis, now):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .artifact_no_dispatch_metadata_read_v1 import require_bound_artifact_no_dispatch_financial_snapshot_v1
     from .d08_personal_plan_v1 import artifact_phase_action_keys_v2,artifact_draft_action_keys_v1
     originals=require_bound_artifact_no_dispatch_financial_snapshot_v1(db,runtime=runtime,witness=witness,basis=basis,now=now)
@@ -2244,7 +2255,7 @@ def require_artifact_no_dispatch_cancellation_basis_v1(db, *, runtime, witness, 
     if phase and not selector.generation:return prepared
     key=(artifact_phase_action_keys_v2(selector)[0] if phase else artifact_draft_action_keys_v1(basis.namespace,
         c02_operation_id=selector.c02_operation_id,root_registration_ref=selector.root_registration_ref)[0])
-    if db.execute("SELECT revision FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+    if _artifact_receipt_sql_v1(db,"SELECT revision FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
             (key.token,*basis.namespace.as_tuple)).fetchone() is not None:
         raise MissingProductionOriginalV1("pre_action_c4_no_dispatch_cannot_replace_an_actual_action")
     return prepared
@@ -2324,6 +2335,8 @@ def decode_artifact_model_no_dispatch_v1(raw):
 
 
 def read_artifact_model_no_dispatch_settlement_v1(db, *, prepared, issuer):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..authority_service.v2_model_egress_contract import ModelNoDispatchWitnessV1
     from ..authority_service.v2_model_egress_wire import from_wire
     from .d11_types import RuntimeCostSettlement, reconcile_runtime_write, job_graph_write
@@ -2334,7 +2347,7 @@ def read_artifact_model_no_dispatch_settlement_v1(db, *, prepared, issuer):
     saved = _read(db, issuer=issuer, namespace=prepared.namespace, kind=kind, ref=ref)
     if saved is None: return None
     value = decode_artifact_model_no_dispatch_v1(saved[0])
-    witness = from_wire(json.loads(value.witness_json), ModelNoDispatchWitnessV1)
+    witness = from_wire(background_json_loads_v3(value.witness_json), ModelNoDispatchWitnessV1)
     witness.require_signature_v1(issuer._signer)
     commit = value.cost_commit
     if (value.selector != prepared.selector or value.prepared_digest != prepared.digest
@@ -2344,7 +2357,7 @@ def read_artifact_model_no_dispatch_settlement_v1(db, *, prepared, issuer):
     from .natural_producer_qualification_v1 import _producer_original_point_v3
     receipt_row = _producer_original_point_v3(db, table="graph_bundle_operations", columns=("commit_seq", "receipt_json"),
         key_columns=("bot", "persona", "operation_id"), key=(*prepared.namespace.as_tuple, commit.operation_id),
-        legacy_reader=lambda: db.execute("SELECT commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+        legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
             (*prepared.namespace.as_tuple, commit.operation_id)).fetchone())
     from .domain_background_read_v3 import background_json_loads_v3
     receipt = None if receipt_row is None else background_json_loads_v3(receipt_row[1])
@@ -2358,7 +2371,7 @@ def read_artifact_model_no_dispatch_settlement_v1(db, *, prepared, issuer):
     cost_key = AtomKey.from_token(commit.cost_ref)
     cost_row = _producer_original_point_v3(db, table="graph_atoms", columns=("value", "valid"),
         key_columns=("token", "bot", "persona"), key=(cost_key.token, *prepared.namespace.as_tuple),
-        legacy_reader=lambda: db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+        legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
             (cost_key.token, *prepared.namespace.as_tuple)).fetchone())
     if cost_row is None or cost_row[1] != 1:
         raise ValueError("C4 no-dispatch cost graph member absent")

@@ -14,6 +14,7 @@ from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+from ..host.model_workflows_v9 import AdminModelWorkflowsV9
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -107,19 +108,19 @@ class InstalledNaturalModelAuthorityV2:
     """Administrator-installed model signing authority and exact mTLS reader."""
 
     d11_issuer: D11BudgetJobIssuer
-    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8
+    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9
     observer_peer: tuple[str, str]
     installation_bundle: object | None = None
 
     def __post_init__(self) -> None:
         if (type(self.d11_issuer) is not D11BudgetJobIssuer
-                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or self.workflows.natural_generation is None
                 or self.workflows.natural_review is None
                 or type(self.observer_peer) is not tuple
                 or len(self.observer_peer) != 2):
             raise AuthorityUnavailable("installed natural model authority is incomplete")
-        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
             from ..host.authority_profile import AdminInstallationBundle
             if (type(self.installation_bundle) is not AdminInstallationBundle
                     or self.installation_bundle.model_workflows is not self.workflows):
@@ -330,11 +331,11 @@ class AuthorityDeploymentConfig:
                                MappingProxyType(dict(c04_v3)))
         counter_assets = self.d13_counter_assets_v1
         if counter_assets is not None:
-            from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV1
+            from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV2
             if not isinstance(counter_assets, Mapping) or not counter_assets:
                 raise AuthorityUnavailable("installed D13 counter assets require exact namespace coverage")
             for namespace, item in counter_assets.items():
-                if (namespace not in namespaces or type(item) is not InstalledD13CounterAssetsV1
+                if (namespace not in namespaces or type(item) is not InstalledD13CounterAssetsV2
                         or not any(mapped == namespace and graph_ns == item.namespace
                             and self.installations_v2[(peer, profile)].installation_id == item.installation_id
                             and self.installations_v2[(peer, profile)].manifest_digest == item.package_manifest_sha256
@@ -506,16 +507,16 @@ def load_installed_asset_config_v1(
     counter_assets = None
     if "d13_counter_assets_v1" in manifest:
         from dataclasses import fields as dataclass_fields
-        from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV1
+        from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV2
         counter_assets = {}
-        required = {field.name for field in dataclass_fields(InstalledD13CounterAssetsV1)}
+        required = {field.name for field in dataclass_fields(InstalledD13CounterAssetsV2)}
         for raw in records("d13_counter_assets_v1"):
             row = _record(raw, required | {"authority_namespace"}, "D13 counter assets")
             namespace = row.pop("authority_namespace")
             graph_ns = _record(row["namespace"], {"bot_id", "persona_id"}, "D13 Graph namespace")
             if type(namespace) is not str or namespace in counter_assets:
                 raise AuthorityUnavailable("installed D13 counter namespace repeats")
-            counter_assets[namespace] = InstalledD13CounterAssetsV1(**{**row, "namespace": NamespaceId(**graph_ns)})
+            counter_assets[namespace] = InstalledD13CounterAssetsV2(**{**row, "namespace": NamespaceId(**graph_ns)})
     c09 = None
     c09_v2 = None
     if "c09_storage_v1" in manifest and "c09_storage_v2" in manifest:

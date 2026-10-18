@@ -47,6 +47,8 @@ class CurrentReplyEntityRouteBindingV2:
 
 
 def _current_atom(db, key: AtomKey, *, prepared_inventory=None) -> tuple[GraphVersion, dict]:
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if prepared_inventory is not None:
         proof=prepared_inventory
         proof.require_current(db,proof.namespace,proof.query)
@@ -57,13 +59,13 @@ def _current_atom(db, key: AtomKey, *, prepared_inventory=None) -> tuple[GraphVe
         if atom is None or atom.revision<1 or not atom.valid:
             raise ReplyEntityRouteHold('original reply account graph atom is absent')
         return GraphVersion(key,atom.revision),atom.value
-    row = db.execute(
+    row = _artifact_receipt_sql_v1(db,
         "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,),
     ).fetchone()
     if row is None or row[0] < 1 or row[2] != 1:
         raise ReplyEntityRouteHold("original reply account graph atom is absent")
     try:
-        value = json.loads(row[1])
+        value = background_json_loads_v3(row[1])
     except (TypeError, ValueError) as exc:
         raise ReplyEntityRouteHold("original reply account graph atom is invalid") from exc
     if type(value) is not dict:
@@ -76,13 +78,15 @@ def read_current_reply_entity_route_binding_v2(
     query: QueryEpoch, *, now_utc: float, prepared_inventory=None,
 ) -> CurrentReplyEntityRouteBindingV2:
     """Join a settled C02 route to one current D03 account, with full scan."""
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if (not db.in_transaction or type(namespace) is not NamespaceId
             or type(route) is not CurrentReplyRouteManifestV2
             or type(query) is not QueryEpoch or query.namespace != namespace
             or query.scope_ref != "all" or route.namespace != namespace
             or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
         raise ReplyEntityRouteHold("current transactional reply route is required")
-    epoch = db.execute(
+    epoch = _artifact_receipt_sql_v1(db,
         "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
         namespace.as_tuple,
     ).fetchone()
@@ -93,7 +97,7 @@ def read_current_reply_entity_route_binding_v2(
         original = read_committed_ingress_identity(db, namespace, source_id)
         if original is None:
             raise ReplyEntityRouteHold("original reply ingress identity is absent")
-        identity = json.loads(original.identity_json)
+        identity = background_json_loads_v3(original.identity_json)
         platform_ref = identity["platform_ref"]
         sender_ref = identity["sender_ref"]
         conversation_ref = identity["conversation_ref"]
@@ -105,12 +109,12 @@ def read_current_reply_entity_route_binding_v2(
                 or scene_ref_for_conversation(namespace, platform_ref,
                                               conversation_ref) != route.scene_ref):
             raise ReplyEntityRouteHold("original reply ingress route changed")
-        c02 = db.execute(
+        c02 = _artifact_receipt_sql_v1(db,
             "SELECT bundle_digest FROM graph_first_ingress_c02_committed_seals_v2 "
             "WHERE bot=? AND persona=? AND operation_id=?",
             namespace.as_tuple + (route.c02_operation_id,),
         ).fetchone()
-        c02_operation = db.execute(
+        c02_operation = _artifact_receipt_sql_v1(db,
             "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
             "AND operation_id=?", namespace.as_tuple + (route.c02_operation_id,),
         ).fetchone()
@@ -119,12 +123,12 @@ def read_current_reply_entity_route_binding_v2(
         arrival_operation_id = "d03-arrival-" + canonical_digest({
             "namespace": list(namespace.as_tuple), "source_ref": source_id,
         })[:40]
-        arrival = db.execute(
+        arrival = _artifact_receipt_sql_v1(db,
             "SELECT source_ref,bundle_digest FROM graph_d03_arrival_issuance_v2 "
             "WHERE bot=? AND persona=? AND operation_id=?",
             namespace.as_tuple + (arrival_operation_id,),
         ).fetchone()
-        arrival_operation = db.execute(
+        arrival_operation = _artifact_receipt_sql_v1(db,
             "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
             "AND operation_id=?", namespace.as_tuple + (arrival_operation_id,),
         ).fetchone()
@@ -224,7 +228,7 @@ def read_current_reply_entity_route_binding_v2(
                     (target_entity_ref, "sender_account"),)
                 or evidence.learned_at != binding.valid_from):
             raise ReplyEntityRouteHold("D03 binding verification event differs")
-        rows = (db.execute(
+        rows = (_artifact_receipt_sql_v1(db,
             "SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
             "AND type_name='d03.account_binding' AND valid=1 ORDER BY token",
             namespace.as_tuple,
@@ -234,7 +238,7 @@ def read_current_reply_entity_route_binding_v2(
         matches = []
         for token, revision, raw in rows:
             key = AtomKey.from_token(token)
-            value = AccountBinding(**(json.loads(raw)if prepared_inventory is None else raw))
+            value = AccountBinding(**(background_json_loads_v3(raw)if prepared_inventory is None else raw))
             scan.append(GraphVersion(key, revision))
             if (value.platform_namespace == platform_ref
                     and value.platform_identifier == sender_ref

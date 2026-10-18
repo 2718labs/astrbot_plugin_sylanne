@@ -534,9 +534,6 @@ class InstalledCurrentOwnerSourceNoteTaskV1:
             *epochs,now,current_job_digest,responsibility_ref,responsibility_digest,completion)
         return result
 
-    def current_mesh_v1(self, *, credential, subject, permit, request):
-        from .current_foreground_mesh_v1 import observe_current_personal_mesh_v1
-        return observe_current_personal_mesh_v1(self, credential=credential, subject=subject, permit=permit, request=request)
 
     def _require_body_policy(self, db, auth, now):
         # The signed Owner W01 original committed the verified Body policy; this

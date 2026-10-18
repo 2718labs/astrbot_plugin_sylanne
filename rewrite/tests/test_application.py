@@ -5,10 +5,10 @@ import tempfile
 import time
 import unittest
 
-from sylanne3.application import Application, Envelope
+from rewrite.host_tests.legacy_fixture_v1.application import Application, Envelope
 from sylanne3.contracts import EventConflict, Scope, StepResult
-from sylanne3.delivery import RecordingTransport
-from sylanne3.scheduler import BoundedScheduler
+from rewrite.host_tests.legacy_fixture_v1.delivery import RecordingTransport
+from rewrite.host_tests.legacy_fixture_v1.scheduler import BoundedScheduler
 from sylanne3.store import Store
 
 

@@ -187,7 +187,7 @@ class _FullReadWriteCaptureV3:
                         or valid and header[0]!='canonical-json.ascii.v1' or not valid and header[0] not in CODECS):
                     raise AuthorityUnavailable('actual FULL writer cell seal/codec is absent or differs')
                 origin=meter.read_fixed_row(db,'runtime_cell_origins_v3',_ORIGIN_COLUMNS,'origin_digest=?',(header[7],))
-                metadata_only=key.type_name in _AUXILIARY_METADATA_ONLY_TYPES_V3
+                metadata_only=key.type_name in _AUXILIARY_METADATA_ONLY_TYPES_V3 and key.type_name not in self.base.projection._types
                 payload=None
                 if valid:
                     authority=self.operation.handle.selected.basis.control

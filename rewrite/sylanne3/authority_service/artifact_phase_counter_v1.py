@@ -35,8 +35,8 @@ def artifact_phase_applicability_wire_v1(policy):
         "encoding_rule_sha256": policy.encoding_rule_sha256}
 
 
-def verify_artifact_phase_count_envelope_v1(policy, request, envelope, *, now_utc, allow_local_fixture=False):
-    require_phase_count_request_policy_v1(policy, request, allow_local_fixture=allow_local_fixture)
+def verify_artifact_phase_count_envelope_v1(policy, request, envelope, *, now_utc):
+    require_phase_count_request_policy_v1(policy, request)
     if type(envelope) is not dict or set(envelope) != {"payload", "signature_hex"}:
         raise ValueError("phase counter requires its distinct signed envelope")
     evidence = artifact_phase_count_evidence_from_wire_v1(envelope["payload"])
@@ -63,12 +63,12 @@ def verify_artifact_phase_count_envelope_v1(policy, request, envelope, *, now_ut
 
 
 def require_independent_actual_phase_counts_v1(policy, *, initial_request, initial_envelope,
-        final_request, final_envelope, now_utc, allow_local_fixture=False):
+        final_request, final_envelope, now_utc):
     """Both counts must be over independently reconstructed actual input."""
     initial = verify_artifact_phase_count_envelope_v1(policy, initial_request, initial_envelope,
-        now_utc=now_utc, allow_local_fixture=allow_local_fixture)
+        now_utc=now_utc)
     final = verify_artifact_phase_count_envelope_v1(policy, final_request, final_envelope,
-        now_utc=now_utc, allow_local_fixture=allow_local_fixture)
+        now_utc=now_utc)
     if (initial_request.input_kind != "actual" or final_request.input_kind != "actual"
             or initial_request.nonce == final_request.nonce
             or initial_request.provider_request_json != final_request.provider_request_json
@@ -102,11 +102,11 @@ class InstalledArtifactPhaseCounterCommandV1:
         if type(self.policy) is not ArtifactPhaseCountPolicyV1:
             raise TypeError("protected phase counter requires its exact installed policy")
 
-    def count_outside_graph_transaction_v1(self, *, db, request, now_utc, allow_local_fixture=False):
+    def count_outside_graph_transaction_v1(self, *, db, request, now_utc):
         if db.in_transaction:
             raise ValueError("artifact phase counting is forbidden inside a Graph transaction")
         policy = self.policy
-        require_phase_count_request_policy_v1(policy, request, allow_local_fixture=allow_local_fixture)
+        require_phase_count_request_policy_v1(policy, request)
         if not request.frozen_at_utc <= now_utc < request.original_deadline_utc:
             raise ValueError("phase counter request expired under its original deadline")
         started = time.monotonic()
@@ -177,8 +177,7 @@ class InstalledArtifactPhaseCounterCommandV1:
         # The caller supplies trusted now again at the short acceptance tx.
         # Elapsed monotonic time here cannot extend the signed original deadline.
         verified_now = now_utc + max(0, time.monotonic() - started)
-        verify_artifact_phase_count_envelope_v1(policy, request, envelope, now_utc=verified_now,
-            allow_local_fixture=allow_local_fixture)
+        verify_artifact_phase_count_envelope_v1(policy, request, envelope, now_utc=verified_now)
         return envelope
 
 def verify_installed_artifact_phase_counter_assets_v1(policy):

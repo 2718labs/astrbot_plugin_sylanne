@@ -20,8 +20,10 @@ CURRENT_DISPATCH_FAMILY_V3='current_dispatch_v3'
 NATURAL_PLAN_FAMILY_V3='natural_plan_v2'
 SOURCE_METADATA_FAMILY_V3='source_metadata_v3'
 RUNTIME_JOB_FAMILY_V3='runtime_job_v3'
+ARTIFACT_RECEIPT_CONTROL_FAMILY_V1='artifact_receipt_control_v1'
 _FAMILIES=MappingProxyType({CURRENT_DISPATCH_FAMILY_V3:_DISPATCH_TYPES,NATURAL_PLAN_FAMILY_V3:frozenset({NATURAL_PLAN_TYPE_V2}),
-    SOURCE_METADATA_FAMILY_V3:frozenset({'memory.source'}),RUNTIME_JOB_FAMILY_V3:frozenset({_RUNTIME_JOB_TYPE_V3})})
+    SOURCE_METADATA_FAMILY_V3:frozenset({'memory.source'}),RUNTIME_JOB_FAMILY_V3:frozenset({_RUNTIME_JOB_TYPE_V3}),
+    ARTIFACT_RECEIPT_CONTROL_FAMILY_V1:frozenset({'d09.verified_segment_batch.v1','d08.communication_intent_grant.v1'})})
 _ISSUER=object()
 _ISSUED=WeakKeyDictionary()
 _PREFINAL_ISSUED=WeakKeyDictionary()
@@ -37,13 +39,14 @@ class _FixedReadContractV3:
     owner_read:bool=False
     borrowed_scope:bool=False
 
-_ALL_FAMILIES=frozenset(_FAMILIES)
+_ALL_FAMILIES=frozenset(_FAMILIES)-frozenset({ARTIFACT_RECEIPT_CONTROL_FAMILY_V1})
 NATURAL_MODEL_FULL_READ_V3=_FixedReadContractV3('natural_model_full_read_v3',frozenset({'d11'}),_ALL_FAMILIES)
 NATURAL_ROUTE_FULL_READ_V3=_FixedReadContractV3('natural_route_full_read_v3',frozenset({'d08','d09','d11'}),_ALL_FAMILIES)
 PRIVATE_REPLY_ROUTE_FULL_READ_V3=_FixedReadContractV3('private_reply_route_full_read_v3',frozenset({'d08','d09','d11'}),_ALL_FAMILIES)
 NATURAL_ADMIN_PREPARE_FULL_V3=_FixedReadContractV3('natural_admin_prepare_full_v3',frozenset(),_ALL_FAMILIES,borrowed_scope=True)
+ARTIFACT_RECEIPT_FULL_READ_V1=_FixedReadContractV3('artifact_receipt_full_read_v1',frozenset({'d08','d09','d11'}),_ALL_FAMILIES|frozenset({ARTIFACT_RECEIPT_CONTROL_FAMILY_V1}))
 _CONTRACTS=MappingProxyType({entry.name:entry for entry in (NATURAL_MODEL_FULL_READ_V3,NATURAL_ROUTE_FULL_READ_V3,
-    PRIVATE_REPLY_ROUTE_FULL_READ_V3,NATURAL_ADMIN_PREPARE_FULL_V3)})
+    PRIVATE_REPLY_ROUTE_FULL_READ_V3,NATURAL_ADMIN_PREPARE_FULL_V3,ARTIFACT_RECEIPT_FULL_READ_V1)})
 
 
 def _contract_v3(value):
@@ -200,6 +203,8 @@ class PreparedCurrentGraphFullReadV3:
         self.authority_epochs,self.owner_head=reader.authority_epochs,reader.owner_head
         self.prepared_families=reader.contract.families
         self.coverage=_FullCensusCoverageV3(reader.namespace,reader.query,reader.count,reader.root,True)
+        self.artifact_receipt_originals=reader.artifact_receipt_originals
+        self.receipt_operation_id=reader.receipt_operation_id
         self.prefinal=reader.prefinal
         self.prepared_producer_members,self.producer_frame=reader.prepared_producer_members,reader.producer_frame
         if self.prepared_producer_members is not None:
@@ -217,7 +222,7 @@ class PreparedCurrentGraphFullReadV3:
     def _identity_v3(self):
         return (self.graph,self.db,self.namespace,self.work,self.ticket,self.operation,self.contract,self.scope,self.graph_stamp,
             self.query,self.selection_digest,self.catalogue_hash,self.authority_epochs,self.owner_head,self.prepared_families,
-            self.coverage,self.projection,(self.projection._types,self.projection._operation,self.projection._atoms,self.projection.epochs),self.sources,self.heads,self.prefinal,self.source_material,self.prepared_producer_members,self.producer_frame)
+            self.coverage,self.projection,(self.projection._types,self.projection._operation,self.projection._atoms,self.projection.epochs),self.sources,self.heads,self.prefinal,self.source_material,self.prepared_producer_members,self.producer_frame,self.artifact_receipt_originals,self.receipt_operation_id)
     def _actual(self):
         issued=_ISSUED.get(self)
         if issued is None:raise AuthorityUnavailable('ordinary full-read proof was not issued or has been released')
@@ -282,13 +287,21 @@ class _OrdinaryFullReadV3(_CurrentNamespaceInventoryKernelV3):
     def __init__(self,graph,operation,fence,contract,*,authority=None,lease=None,borrowed=None,source_locator=None,request_lifetime=None):
         self.contract,self.authority,self.lease,self.borrowed=contract,authority,lease,borrowed
         self.work,self.owner_head=None,None
+        self.artifact_receipt_task,self.artifact_receipt_originals=None,None
+        self.receipt_operation_id=None
         self.source_locator,self.request_lifetime=source_locator,request_lifetime
-        self.producer_phase=None if source_locator is None or contract is PRIVATE_REPLY_ROUTE_FULL_READ_V3 else('prepare'if borrowed is not None else'frozen')
+        self.producer_phase=None if source_locator is None or contract in (PRIVATE_REPLY_ROUTE_FULL_READ_V3,ARTIFACT_RECEIPT_FULL_READ_V1) else('prepare'if borrowed is not None else'frozen')
         self.prefinal,self.source_material=None,None
         self.producer_progress,self.prepared_producer_members,self.producer_frame=None,None,None
         types=frozenset().union(*(_FAMILIES[name]for name in contract.families))
         super().__init__(graph,operation,fence,projection_types=types,selected_tokens=frozenset(),
             census_schema='sylanne.current-graph-full-inventory.v3',leaf_schema='sylanne.current-graph-full-inventory-leaf.v3')
+    def _require_source_roots_v3(self,roots,purpose,audiences):
+        from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+        if self.contract is not ARTIFACT_RECEIPT_FULL_READ_V1:
+            raise AuthorityUnavailable('Artifact original family belongs to its dedicated full-read contract')
+        return _DispatchInventoryReadV3._require_source_roots_v3(self,roots,purpose,audiences)
+
     def _graph_eof_v3(self):pass
     def advance(self):
         candidate=None;producer_candidate=False
@@ -298,7 +311,17 @@ class _OrdinaryFullReadV3(_CurrentNamespaceInventoryKernelV3):
                 self.owner_head=meter.read_fixed_row(self.db,'graph_atoms',('revision','valid','value_cell_id'),
                     'bot=? AND persona=? AND token=?',(*self.namespace.as_tuple,owner_grant_key(*self.namespace.as_tuple).token))
             elif self.graph_eof:
-                if self.source_locator is not None and self.prefinal is None:
+                if self.contract is ARTIFACT_RECEIPT_FULL_READ_V1 and self.artifact_receipt_originals is None:
+                    from .artifact_receipt_original_read_v1 import ArtifactReceiptOriginalReadTaskV1
+                    if self.artifact_receipt_task is None:
+                        self.artifact_receipt_task=ArtifactReceiptOriginalReadTaskV1(self,self.receipt_now_utc)
+                    self.db.execute("BEGIN")
+                    try:
+                        done=self.artifact_receipt_task.advance_v1(meter)
+                    finally:self.db.rollback()
+                    if not done:return self
+                    self.artifact_receipt_originals=self.artifact_receipt_task.seal
+                elif self.source_locator is not None and self.prefinal is None:
                     self._reserve(self.reserved+65536)
                     self.prefinal=_PrefinalSourceInventoryV3(_ISSUER,self)
                     self.work.phase='producer_locator'if self.producer_phase is not None else 'source_material'
@@ -344,7 +367,7 @@ def _work_v3(graph,reader,deadline):
     return work
 
 
-def prepare_current_graph_full_read_v3(graph,authority,lease,*,read_contract,operation_id,deadline_utc,c02_operation_id=None,source_ref=None):
+def prepare_current_graph_full_read_v3(graph,authority,lease,*,read_contract,operation_id,deadline_utc,c02_operation_id=None,source_ref=None,artifact_receipt_operation_id=None,receipt_now_utc=None):
     require_graph_storage_work_admission_v3(graph)
     contract=_contract_v3(read_contract)
     if contract.borrowed_scope:raise AuthorityUnavailable('natural administrator preparation requires its actual existing scope')
@@ -355,10 +378,20 @@ def prepare_current_graph_full_read_v3(graph,authority,lease,*,read_contract,ope
     try:
         with bind_runtime_storage_operation_v3(operation,db):
             fence=graph._begin_read_fence_v3(authority,operation_id=operation_id)
-            locator=None if c02_operation_id is None and source_ref is None else _CurrentSourceEntryLocatorV3(c02_operation_id,source_ref)
+            if contract is ARTIFACT_RECEIPT_FULL_READ_V1:
+                if (type(artifact_receipt_operation_id)is not str or not artifact_receipt_operation_id.startswith('artifact-receipt-message:')
+                        or type(receipt_now_utc)not in(int,float)or not math.isfinite(receipt_now_utc)):
+                    raise AuthorityUnavailable('actual Artifact receipt operation and verified current clock required')
+                locator=None
+            else:
+                if artifact_receipt_operation_id is not None or receipt_now_utc is not None:
+                    raise AuthorityUnavailable('Artifact receipt locator cannot enter another full-read family')
+                locator=None if c02_operation_id is None and source_ref is None else _CurrentSourceEntryLocatorV3(c02_operation_id,source_ref)
             lifetime=ExitStack()if locator is not None and contract is not PRIVATE_REPLY_ROUTE_FULL_READ_V3 else None
             reader=_OrdinaryFullReadV3(graph,operation,fence,contract,authority=authority,lease=lease,
                 source_locator=locator,request_lifetime=lifetime)
+            reader.receipt_operation_id=artifact_receipt_operation_id
+            reader.receipt_now_utc=receipt_now_utc
         work=_work_v3(graph,reader,deadline)
         if lifetime is not None:work.adopt_request_lifetime_v3(lifetime)
         return work

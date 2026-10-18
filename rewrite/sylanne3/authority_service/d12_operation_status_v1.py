@@ -306,6 +306,29 @@ class InstalledD12OperationStatusServiceV1:
 
     def read_current_operation_original_v1(self, *, credential, actor, session_token,
                                            session_request, original_ref, refresh=False):
+        if refresh:
+            self.core._require(credential,"d12_operation_status",self.namespace)
+            with self.core._tx()as db:
+                row=db.execute("SELECT * FROM authority_d12_operation_originals_v1 WHERE "
+                    "authority_namespace=? AND original_ref=?",(self.namespace,original_ref)).fetchone()
+                if row is None:raise AuthorityUnavailable("exact D12 operation is not owned by this session")
+                original=self._authenticate_original_row_in_tx(db,row,actor=actor,
+                    token=session_token,request=session_request)
+                stop=(original.kind=="control"and json.loads(row[7]).get("schema")=="d12.registered_owner_stop_reply.v1")
+            if stop:
+                reader=self._stop_reply_status_readers.get(session_request.installation_id)
+                if reader is None:raise AuthorityUnavailable("reply stop status reader is unavailable")
+                with reader.prepare_owner_stop_status_metadata_v1(credential=credential,actor=actor,
+                        session_token=session_token,session_request=session_request,original_ref=original_ref):
+                    return self._read_current_operation_original_with_prepared_metadata_v1(
+                        credential=credential,actor=actor,session_token=session_token,
+                        session_request=session_request,original_ref=original_ref,refresh=True)
+        return self._read_current_operation_original_with_prepared_metadata_v1(
+            credential=credential,actor=actor,session_token=session_token,
+            session_request=session_request,original_ref=original_ref,refresh=refresh)
+
+    def _read_current_operation_original_with_prepared_metadata_v1(self, *, credential, actor, session_token,
+                                           session_request, original_ref, refresh=False):
         self.core._require(credential, "d12_operation_status", self.namespace)
         # A status read holds the same frozen current heads as migration. It
         # never opens source/target content or permits a new transfer identity.

@@ -274,10 +274,10 @@ class _ContactHistoryCellReadV3:
 class DispatchInitialSourceReadsV3:
     """Actual auxiliary producer originals; selected by the fixed trusted Host caller."""
     def __init__(self,owner,family,now_utc):
-        if family not in {'private_reply','natural_reply','contact'}:raise ValueError('fixed dispatch family required')
+        if family not in {'private_reply','natural_reply','contact','artifact_receipt'}:raise ValueError('fixed dispatch family required')
         self.owner,self.family,self.now_utc=owner,family,now_utc
         self.phase='initial';self.complete=False;self.descriptors=();self.birth=None;self.natural=None
-        self.original=None;self.history=None;self.history_cursor='';self.history_heads={};self.written_heads={};self.meta=None
+        self.artifact_task=None;self.original=None;self.history=None;self.history_cursor='';self.history_heads={};self.written_heads={};self.meta=None
         self.owner.operation.retain(65536)
     def _contact_initial(self,meter):
         from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
@@ -470,6 +470,16 @@ class DispatchInitialSourceReadsV3:
         elif self.phase=='natural_digests':self._natural_digest_step(meter)
         else:raise AuthorityUnavailable('actual initial Source original phase differs')
     def advance(self,meter):
+        if self.family=="artifact_receipt":
+            from .artifact_receipt_original_read_v1 import ArtifactReceiptOriginalReadTaskV1
+            if self.artifact_task is None:self.artifact_task=ArtifactReceiptOriginalReadTaskV1(self.owner,self.now_utc)
+            if self.artifact_task.advance_v1(meter):
+                value=self.artifact_task.receipt
+                self.prepared_receipt=self.artifact_task.seal
+                self.descriptors=(((value.source_ref,),"expression",self.owner.admission.admission.audience,
+                    ("artifact_completion_receipt",value.producer_operation_id,value.digest)),)
+                self.complete=True
+            return self.complete
         if self.phase=='initial':
             if self.family=='contact':self._contact_initial(meter)
             elif self.family=='private_reply':self._private_route(meter)
@@ -683,6 +693,12 @@ def require_dispatch_source_originals_current_v3(inventory,db):
             if (identity['source_ref']!=AtomKey.from_token(roots[0]).owner.subject
                     or (identity['platform_ref'],identity['conversation_ref'])!=(row[4],row[5])):
                 raise AuthorityUnavailable('actual private route ingress original changed after preparation')
+    elif inventory.family=="artifact_receipt":
+        from .artifact_receipt_original_read_v1 import PreparedArtifactReceiptOriginalsV1
+        sealed=inventory.artifact_receipt_originals
+        if type(sealed)is not PreparedArtifactReceiptOriginalsV1:
+            raise AuthorityUnavailable("Artifact dispatch has no actual complete receipt original proof")
+        sealed.require_for_v1(inventory,db,now_utc=sealed.task.now_utc)
     elif inventory.family=='contact':
         inventory.contact_birth.require_for_v3(db,inventory.namespace,inventory.binding.operation_id)
     elif inventory.family=='natural_reply':

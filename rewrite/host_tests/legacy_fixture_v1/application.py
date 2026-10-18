@@ -13,11 +13,11 @@ import hashlib
 import math
 import time
 
-from .contracts import Candidate, Event, EventConflict, Scope, Write
+from sylanne3.contracts import Candidate, Event, EventConflict, Scope, Write
 from .delivery import _finish
 from .engine import Engine
 from .semantics import Envelope, build_prompt, parse_proposal, to_event
-from .store import StaleRead
+from sylanne3.store import StaleRead
 
 
 _INGRESS = "ingress"

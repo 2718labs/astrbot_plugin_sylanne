@@ -5,11 +5,11 @@ import threading
 import unittest
 
 from sylanne3.contracts import CapacityExceeded, Event, Scope, StaleRead
-from sylanne3.graph_runtime import GraphRuntime
+from rewrite.host_tests.legacy_fixture_v1.graph_runtime import GraphRuntime
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry, TypeSpec
-from sylanne3.operators import OperatorSpec, compile_operators
-from sylanne3.scheduler import BoundedScheduler
+from rewrite.host_tests.legacy_fixture_v1.operators import OperatorSpec, compile_operators
+from rewrite.host_tests.legacy_fixture_v1.scheduler import BoundedScheduler
 
 
 class GraphRuntimeTests(unittest.IsolatedAsyncioTestCase):

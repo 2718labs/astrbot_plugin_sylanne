@@ -26,16 +26,18 @@ def configure_initial_v7_counter_v1(value,*,metric_source_path):
     """Actual protected fresh fixture assets, before any installation signing."""
     from pathlib import Path
     from dataclasses import asdict
-    import hashlib,json,os
+    import hashlib,json,os,sys
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding,PublicFormat,PrivateFormat,NoEncryption
     from sylanne3.authority_service.d13_core_counter_contract_v1 import InstalledD13WirePolicyV7
     from sylanne3.model_broker.natural_reply import NaturalReplyInstallationV2
     from sylanne3.model_broker.d13_provider_http_template_v1 import SERIALIZER_FINGERPRINT
-    from sylanne3.native_runtime import d13_local_mock_counter_v1 as counter
-    from sylanne3.runtime_contracts import canonical_digest
+    from rewrite.host_tests.alpha1 import d13_local_mock_counter_v1 as counter
+    from sylanne3.runtime_contracts import canonical_digest,canonical_serialize
     from scripts.alpha1.install_linux import write
     program_sha=hashlib.sha256(Path(counter.__file__).read_bytes()).hexdigest()
+    interpreter=Path(sys.executable).resolve(strict=True)
+    interpreter_sha=hashlib.sha256(interpreter.read_bytes()).hexdigest()
     metric_path=Path(metric_source_path)
     metric_sha=hashlib.sha256(metric_path.read_bytes()).hexdigest()
     config=json.loads(Path(value['provider_config_path']).read_bytes())
@@ -46,10 +48,14 @@ def configure_initial_v7_counter_v1(value,*,metric_source_path):
     private=Ed25519PrivateKey.generate()
     key_path=Path('/etc/sylanne-b04-fixture/d13-v7-counter-private.key')
     write(key_path,private.private_bytes(Encoding.Raw,PrivateFormat.Raw,NoEncryption()),mode=0o600)
-    descriptor=counter.local_mock_applicability_descriptor_v1(metric_source_sha256=metric_sha,
+    descriptor=counter.local_mock_applicability_descriptor_v2(metric_source_sha256=metric_sha,
+        program_sha256=program_sha,interpreter_sha256=interpreter_sha,
         provider_id=value['provider_id'],model_id=value['model_id'],provider_config_digest=config_digest,
         template_digest=__import__('sylanne3.model_broker.natural_reply_history_v7',fromlist=['TEMPLATE_DIGEST']).TEMPLATE_DIGEST,
         serializer_fingerprint=SERIALIZER_FINGERPRINT,tokenizer_fingerprint=tokenizer,wire_policy_fingerprint=wire)
+    applicability_path=Path('/etc/sylanne-b04-fixture/d13-v7-counter-applicability.json')
+    applicability_raw=canonical_serialize(descriptor).encode('utf-8')
+    write(applicability_path,applicability_raw,mode=0o600)
     policy=InstalledD13WirePolicyV7(
         installation=NaturalReplyInstallationV2('installation:initial-v7-placeholder',config_digest,
             value['provider_id'],value['model_id'],value['model_quote']['output_tokens']),
@@ -69,7 +75,10 @@ def configure_initial_v7_counter_v1(value,*,metric_source_path):
     if delegated.name.startswith('sylanne-owned-') is False:
         raise ValueError('V7 counter delegation is outside the actual owned run subtree')
     value.update(d13_wire_policy=raw_policy,d13_wire_counter=None,
-        d13_counter_installation_v1={'schema':'sylanne3.d13.initial-local-mock-counter.v1',
+        d13_counter_installation_v1={'schema':'sylanne3.d13.initial-counter.v2',
+            'metric_id':counter.METRIC_ID,'program_path':str(Path(counter.__file__).resolve()),'program_sha256':program_sha,
+            'interpreter_path':str(interpreter),'interpreter_sha256':interpreter_sha,
+            'applicability_path':str(applicability_path),'applicability_sha256':hashlib.sha256(applicability_raw).hexdigest(),
             'signing_key_path':str(key_path),'metric_source_path':str(metric_path),'metric_source_sha256':metric_sha,
             'delegated_cgroup_path':str(delegated),'memory_max_bytes':64*1024*1024,'pids_max':4,
             'cpu_policy_id':'cpu-policy:sdk-d13-v7-counter','cpu_policy_version':1,

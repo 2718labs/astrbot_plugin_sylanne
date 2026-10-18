@@ -1777,6 +1777,9 @@ _HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset({
 
 
 def _producer_original_point_v3(db,*,table,columns,key_columns,key,legacy_reader):
+    from ..authority_service.owner_stop_reply_metadata_v1 import read_bound_owner_stop_reply_metadata_point_v1
+    bound,row=read_bound_owner_stop_reply_metadata_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if bound:return row
     from ..authority_service.named_joint_binding_body_v1 import named_joint_core_point_v1
     named, row = named_joint_core_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if named:return row

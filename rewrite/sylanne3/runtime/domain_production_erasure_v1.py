@@ -129,6 +129,16 @@ def _exact(raw, names):
 
 
 def _json(encoded):
+    from .domain_background_read_v3 import BackgroundJSONColumnV3
+    if type(encoded)is BackgroundJSONColumnV3:
+        # The issued reader has already checked unique keys and complete
+        # canonical EOF. Retain the original v1 ASCII wire and size contract.
+        encoded._actual_v3()
+        if encoded.complete and encoded.byte_count>4_194_304:
+            raise DomainProductionErasureHold("domain production canonical JSON must be bounded")
+        if encoded.complete and encoded.semantic_sha256!=encoded.sha256:
+            raise DomainProductionErasureHold("domain production JSON is noncanonical")
+        return encoded.json_v3()
     if type(encoded) is not str or len(encoded.encode("utf-8")) > 4_194_304:
         raise DomainProductionErasureHold("domain production canonical JSON must be bounded")
     def unique(pairs):
@@ -1599,6 +1609,7 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
         from .d11_artifact_draft_model_v1 import ArtifactDraftModelPreparedV2, artifact_draft_model_from_wire_v2
         from .foreground_cycle_v1 import decode_foreground_job_v1, foreground_cycle_from_wire_v1
         from .foreground_call_plan_v1 import ForegroundCallPlanV2
+        from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
         from ..model_broker.artifact_draft_v1 import (ArtifactDraftPhaseSelectorV2,
             artifact_draft_from_wire_v2, artifact_draft_model_ids_v2)
         if domain != "d11":
@@ -1613,7 +1624,7 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
                     after.job_id, after.activity_id, after.deadline_utc, after.budget_ref)
                     or before.phase != "running" or after.phase != "waiting"
                     or (provenance["frozen_ref"], provenance["frozen_digest"]) != (prepared.frozen_ref, prepared.frozen_digest)
-                    or type(plan) is not ForegroundCallPlanV2 or plan.phase_group.selector != prepared.selector):
+                    or type(plan) not in {ForegroundCallPlanV2, ForegroundCallPlanV3} or plan.phase_group.selector != prepared.selector):
                 raise DomainProductionErasureHold("C4 phase preparation changed actual cycle/group/frozen seal")
         else:
             from .jobs import _job_from_dict
@@ -1768,8 +1779,14 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
                     or _utc(after.deadline_utc, "deadline_utc").timestamp() != responsibility.deadline_utc):
                 raise DomainProductionErasureHold("new foreground provenance lost its exact responsibility/job deadline binding")
         if "reply_allocation" in provenance:
-            from .foreground_call_plan_v1 import ForegroundReplyAllocationV1
-            allocation = decode_typed_production_value_v1(provenance["reply_allocation"], ForegroundReplyAllocationV1)
+            from .artifact_receipt_allocation_v3 import (
+                ForegroundArtifactReceiptAllocationV3, decode_foreground_reply_allocation_v3,
+                require_artifact_receipt_responsibility_binding_v3)
+            allocation = decode_foreground_reply_allocation_v3(provenance["reply_allocation"])
+            if type(allocation) is ForegroundArtifactReceiptAllocationV3:
+                if operation_kind != "create_foreground_cycle_v2" or "foreground_responsibility" not in provenance:
+                    raise DomainProductionErasureHold("Artifact receipt needs its initial exact signed responsibility")
+                require_artifact_receipt_responsibility_binding_v3(allocation, responsibility)
             current = foreground_cycle_from_wire_v1(after.continuation)
             from .jobs import _utc
             if (allocation.namespace != ns or allocation.c02_operation_id != current.c02_operation_id
@@ -2079,6 +2096,44 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
         from .artifact_task_observer_v1 import decode_artifact_task_milestone_v2
         decode_artifact_task_milestone_v2(provenance['artifact_task_milestone'])
         return tuple(sorted(ref for ref in _references(provenance) if AtomKey.from_token(ref).type_name == 'memory.source'))
+    if operation_kind=='finish_artifact_receipt_cycle_v1':
+        from .artifact_completion_receipt_v1 import receipt_from_wire_v1
+        from .foreground_cycle_v1 import foreground_cycle_from_wire_v1
+        if domain!='d11':raise DomainProductionErasureHold('receipt cycle completion requires its D11 writer')
+        if provenance=={}:return ()
+        _exact(provenance,{'artifact_receipt_completion','delivery_operation_id','continuation'})
+        receipt=receipt_from_wire_v1(provenance['artifact_receipt_completion'])
+        continuation=foreground_cycle_from_wire_v1(provenance['continuation'])
+        if (continuation.stage!='completed' or continuation.pending_effect_refs or continuation.wait is not None
+                or receipt.message_operation_id not in continuation.completed_operation_refs
+                or continuation.call_plan.phase_group.selector!=receipt.selector
+                or not provenance['delivery_operation_id'].startswith('d13-outbound:')):
+            raise DomainProductionErasureHold('receipt completion differs from actual task/turn/finished cycle')
+        return tuple(sorted({receipt.source_ref,continuation.source_ref,*(head.key.token for head,_ in receipt.parent_source_heads)}))
+    if operation_kind=="derive_artifact_completion_receipt_v1":
+        from .artifact_completion_receipt_v1 import receipt_from_wire_v1
+        from ..memory_types import SourceRecord,validate_access
+        if domain!='d06':raise DomainProductionErasureHold('completion Source requires its D06 writer')
+        if provenance=={}:return ()
+        _exact(provenance,{'artifact_completion_receipt','receipt_source','receipt_access'})
+        receipt=receipt_from_wire_v1(provenance['artifact_completion_receipt'])
+        source=SourceRecord.from_dict(provenance['receipt_source']);validate_access(provenance['receipt_access'])
+        if (source.text!=receipt.text or canonical_digest(source.to_dict())!=receipt.source_digest
+                or canonical_digest(provenance['receipt_access'])!=receipt.source_access_digest
+                or source.parent_source_ids!=tuple(head.key.owner.subject for head,_ in receipt.parent_source_heads)):
+            raise DomainProductionErasureHold('receipt Source/Access differs from typed completion producer')
+        return tuple(sorted({receipt.source_ref,*(head.key.token for head,_ in receipt.parent_source_heads)}))
+    if operation_kind=="prepare_artifact_phase_observation_v1":
+        from .artifact_phase_observation_v1 import observation_basis_from_wire_v1
+        from ..domains.d07 import AttentionTicket
+        if domain!='d07':raise DomainProductionErasureHold('observation preparation changed its actual writer')
+        if provenance=={}:return ()
+        _exact(provenance,{'artifact_observation_basis','artifact_observation_ticket'})
+        basis=observation_basis_from_wire_v1(provenance['artifact_observation_basis'])
+        ticket=decode_typed_production_value_v1(provenance['artifact_observation_ticket'],AttentionTicket)
+        if(ticket.ticket_id,ticket.question_key,ticket.source_refs)!=(basis.ids['ticket'],basis.question_scope,basis.source_refs):
+            raise DomainProductionErasureHold('observation ticket changed its signed Source/basis linkage')
+        return tuple(sorted(ref for ref in _references(provenance)if AtomKey.from_token(ref).type_name=='memory.source'))
     if operation_kind in {"input:register_artifact_phase_postcondition_policy_v1", "register_artifact_phase_postcondition_contract_v1", "observe_artifact_phase_postconditions_v1", "input:approve_artifact_standing_predecision_v2", "input:freeze_artifact_candidate_preparation_v1"}:
         from .artifact_phase_postconditions_v1 import (POLICY_KIND, CONTRACT_KIND, ASSESSMENT_KIND, APPROVAL_KIND_V2, PREPARATION_PARENT_KIND_V1,
             decode_artifact_phase_postcondition_original_v1)

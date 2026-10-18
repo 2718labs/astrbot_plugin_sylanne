@@ -135,9 +135,10 @@ def prepare_contact_model_in_transaction_v2(db, *, frame, contact_id, phase, ins
     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+    from ..host.model_workflows_v9 import AdminModelWorkflowsV9
     if (type(installed_bundle) is not AdminInstallationBundle
             or type(installed_bundle.model_workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
-                AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)):
+                AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)):
         raise ValueError("Contact V2 paid preparation requires an explicit installed workflow container V3-V7")
     ns, now = frame.envelope.authority.namespace, frame.now_utc
     plan, expression, plan_raw, plan_digest = read_adopted_contact_plan_v2(db, namespace=ns, contact_id=contact_id, issuer=issuer)

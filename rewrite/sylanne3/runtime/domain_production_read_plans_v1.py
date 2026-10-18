@@ -89,6 +89,14 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         from .domain_background_read_v3 import _active_v3
         return read_plan_register_general_growth_attention_v1(db, namespace=namespace, request=request,
             issuer=installed_readers.issuer if installed_readers is not None else _active_v3(db).graph._GraphCoordinator__d11_issuer)
+    if operation_kind=="finish_artifact_receipt_cycle_v1":
+        from .artifact_receipt_completion_v1 import read_plan_finish_artifact_receipt_cycle_v1
+        return read_plan_finish_artifact_receipt_cycle_v1(db,namespace=namespace,request=request,
+            installed_readers=installed_readers,now_utc=now_utc,audiences=audiences)
+    if operation_kind=="derive_artifact_completion_receipt_v1":
+        from .artifact_completion_receipt_v1 import read_plan_artifact_completion_receipt_v1
+        return read_plan_artifact_completion_receipt_v1(db,namespace=namespace,request=request,
+            installed_readers=installed_readers,now_utc=now_utc,audiences=audiences)
     from .domain_production_registry_v1 import _POSTCONDITION_OPERATIONS
     if operation_kind in _POSTCONDITION_OPERATIONS:
         from .artifact_phase_postconditions_v1 import read_plan_artifact_phase_postconditions_v1
@@ -460,7 +468,7 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
     if domain == "d07":
         from .d07_production_operations_v1 import read_plan_current_d07_operation_v1
         return read_plan_current_d07_operation_v1(db, namespace=namespace, activity_id=activity_id,
-            operation_kind=operation_kind, request=request)
+            operation_kind=operation_kind, request=request,installed_readers=installed_readers)
     if domain not in _READ_PLANNERS:
         raise ValueError("domain has no registered current production operations")
     plan = _READ_PLANNERS[domain](db, namespace=namespace, activity_id=activity_id,
@@ -946,7 +954,7 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
         return CurrentDomainCommandIdentityV1(activity, None, "consolidation", requested_audience_ref)
     if operation_kind in {"prepare_life_project_context", "focus_life_project", "focus_owner_source_note_task_v1", "prepare_personal_candidates_v1", "select_personal_step_v2",
             "input:register_artifact_phase_postcondition_policy_v1", "register_artifact_phase_postcondition_contract_v1",
-            "observe_artifact_phase_postconditions_v1"}:
+            "observe_artifact_phase_postconditions_v1", "prepare_artifact_phase_observation_v1", "derive_artifact_completion_receipt_v1", "finish_artifact_receipt_cycle_v1"}:
         purpose = "consolidation"
     elif operation_kind == "prepare_source_note_action":
         from .d08_source_note_action_v1 import source_note_effect_id_v1

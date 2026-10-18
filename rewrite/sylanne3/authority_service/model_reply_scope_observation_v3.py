@@ -58,7 +58,7 @@ _POINT_COLUMNS={
     'graph_domain_production_originals_v1':frozenset(('domain', 'operation_kind', 'request_digest', 'original_digest', 'original_payload_json', 'read_versions_json', 'bundle_digest', 'receipt_json', 'receipt_digest')),
     'graph_recovery_metadata_v2':frozenset(('graph_revision', 'requirements_json')),
     'graph_epochs':frozenset(('revision',)),
-    'graph_events':frozenset(('digest', 'epoch_revision', 'revisions')),
+    'graph_events':frozenset(('digest', 'epoch_revision', 'revisions', 'reads')),
     'graph_d11_life_originals_v1':frozenset(('bot', 'persona', 'kind', 'original_ref', 'producing_operation_id', 'payload_json', 'payload_digest', 'signature')),
     'graph_d07_execution_originals_v1':frozenset(('payload_json', 'payload_digest', 'signature')),
     'graph_d04_originals_v3':frozenset(('payload_json', 'payload_digest')),
@@ -95,18 +95,35 @@ class _ReplyScopeMetadataScanV3:
         self.owner,self.kind,self.parameters=owner,kind,parameters
         self.after=None;self.rows=[];self.pending=None;self.complete=False;self.candidate=None
     def advance(self,meter):
+        import json
         from ..runtime.domain_background_read_v3 import _BackgroundPointReadV3,background_json_loads_v3
         owner=self.owner;owner.require_data_current_v3(meter);ns=owner.namespace.as_tuple
         if self.pending is not None:
             if not self.pending.complete:self.pending.advance(meter);return
             row=self.pending.require_row_v3(meter)
-            if self.kind in('life_c4','life_c4_call','life_c4_call_original','life_binding'):
+            if self.kind in('life_c4','life_c4_phase','life_c4_call','life_c4_call_original','life_binding'):
                 value=background_json_loads_v3(row[0])
                 expected=self.parameters[0]
                 match=(value.get('call_id')==expected if self.kind in('life_c4_call','life_c4_call_original') else
-                    value.get('selector',{}).get('cycle_job_ref')==expected if self.kind=='life_c4'
+                    value.get('selector',{}).get('cycle_job_ref')==expected if self.kind=='life_c4' else
+                    value.get('selector',{}).get('task',{}).get('cycle_job_ref')==expected if self.kind=='life_c4_phase'
                     else value.get('binding',{}).get('activity_id')==expected)
                 if match:self.rows.append(self.candidate if self.kind=='life_c4_call_original' else (self.candidate[0],))
+            elif self.kind=='owner_control_targets':
+                value=background_json_loads_v3(row[0])
+                if value.get('schema')!='d11.owner-source-note-task-continuation.v2':
+                    job_id,phase,operation_id=self.candidate
+                    commit=meter.read_fixed_row(owner.db,'graph_bundle_operations',('commit_seq',),
+                        'bot=? AND persona=? AND operation_id=?',(*ns,operation_id))
+                    if commit is not None:
+                        rank=1 if phase in {'completed','failed','cancelled'} else 0
+                        cursor=self.parameters[0]
+                        after=None if cursor is None else json.loads(cursor)
+                        if after is None or rank>after[0]or(rank==after[0]and(
+                                commit[0]<after[1]or commit[0]==after[1]and job_id>after[2])):
+                            self.rows.append((rank,commit[0],job_id,value))
+                            self.rows.sort(key=lambda item:(item[0],-item[1],item[2]))
+                            if len(self.rows)>33:self.rows.pop()
             elif self.kind=='message_history':
                 value=background_json_loads_v3(row[0]);paid=value.get('paid_review',{})
                 if(paid.get('generation_original_operation_id'),paid.get('review_original_operation_id'))==self.parameters:
@@ -127,14 +144,26 @@ class _ReplyScopeMetadataScanV3:
             self.after=row;self.candidate=row
             request=(table,('payload_json',),('bot','persona','kind','original_ref'),(*ns,*row))
             self.pending=_BackgroundPointReadV3(owner,request);return
-        if self.kind in('life_c4','life_c4_call','life_binding'):
-            table='graph_d11_life_originals_v1';where='bot=? AND persona=? AND kind=?';args=(*ns,'c4_prepared'if self.kind in('life_c4','life_c4_call')else'prepared')
+        if self.kind in('life_c4','life_c4_phase','life_c4_call','life_binding'):
+            table='graph_d11_life_originals_v1';where='bot=? AND persona=? AND kind=?';args=(*ns,'c4_phase_prepared'if self.kind=='life_c4_phase'else'c4_prepared'if self.kind in('life_c4','life_c4_call')else'prepared')
             if self.after is not None:where+=' AND original_ref>?';args=(*args,self.after)
             row=meter.read_fixed_row(owner.db,table,('original_ref',),where+' ORDER BY original_ref LIMIT 1',args)
             if row is None:self.complete=True;return
             self.after=row[0];self.candidate=row
             request=(table,('payload_json',),('bot','persona','kind','original_ref'),(*ns,args[2],row[0]))
             self.pending=_BackgroundPointReadV3(owner,request);return
+        if self.kind=='owner_control_targets':
+            from .owner_stop_reply_metadata_v1 import require_owner_stop_reply_metadata_column_owner_v1
+            require_owner_stop_reply_metadata_column_owner_v1(owner,db=owner.db)
+            where="bot_id=? AND persona_id=? AND work_kind='d11.foreground_cycle.v1'"
+            args=ns
+            if self.after is not None:where+=' AND job_id>?';args=(*args,self.after)
+            row=meter.read_fixed_row(owner.db,'runtime_jobs',('job_id','phase','operation_id'),
+                where+' ORDER BY job_id LIMIT 1',args)
+            if row is None:self.complete=True;return
+            self.after=row[0];self.candidate=row
+            self.pending=_BackgroundPointReadV3(owner,('runtime_jobs',('continuation_json',),('job_id',),(row[0],)))
+            return
         if self.kind=='message_history':
             where='event_bot=? AND event_persona=? AND valid=1';args=ns
             if self.after is not None:where+=' AND (event_id,token,revision)>(?,?,?)';args=(*args,*self.after)
@@ -151,6 +180,8 @@ class _ReplyScopeMetadataScanV3:
         specs={
             'foreground_parents':('runtime_jobs',('job_id',),'bot_id=? AND persona_id=? AND work_kind=?',(*ns,'d11.foreground_cycle.v1'),'job_id',129),
             'children':('runtime_jobs',('job_id',),"bot_id=? AND persona_id=? AND activity_id=? AND work_kind IN ('artifact_draft_v1','d10.life.source_note.v1','d10.life.artifact_draft.v1','d07.recall_need')",(*ns,*self.parameters),'job_id',257),
+            'artifact_observation_jobs':('runtime_jobs',('job_id',),"bot_id=? AND persona_id=? AND activity_id=? AND work_kind='d07.concern' AND operation_id LIKE 'artifact-phase-observe:%'",(*ns,*self.parameters),'job_id',129),
+            'artifact_receipt_jobs':('runtime_jobs',('job_id',),"bot_id=? AND persona_id=? AND activity_id=? AND work_kind='message' AND operation_id LIKE 'artifact-receipt-message:%'",(*ns,*self.parameters),'job_id',2),
             'message_jobs':('runtime_jobs',('job_id',),"bot_id=? AND persona_id=? AND operation_id=? AND work_kind='message'",(*ns,*self.parameters),'job_id',2),
             'outbound':('graph_d13_outbound_observations_v1',('observation_digest',),'bot=? AND persona=? AND final_operation_id=?',(*ns,*self.parameters),'observation_digest',2),
         }
@@ -164,10 +195,17 @@ class _ReplyScopeMetadataScanV3:
     def require_rows_v3(self,meter):
         self.owner.require_data_current_v3(meter)
         if not self.complete:raise AuthorityUnavailable('model reply metadata selector requires actual complete EOF')
+        if self.kind=="owner_control_targets":
+            from ..runtime_contracts import canonical_serialize
+            selected=self.rows[:32]
+            cursor=(canonical_serialize([selected[-1][0],selected[-1][1],selected[-1][2]])
+                if len(self.rows)>32 else None)
+            return tuple((row[2],row[3])for row in selected),cursor
         return tuple(self.rows)
 
 
 class _ModelReplyScopeObservationV3:
+    kind='model_reply_scope'
     def __init__(self,verifier,*,model_service,credential,subject,holder,intent,expected_anchor,permit):
         from .current_authority_graph_read_v3 import require_authority_graph_read_controller_v3
         controller=require_authority_graph_read_controller_v3(verifier)
@@ -406,7 +444,8 @@ class _ModelReplyScopeObservationV3:
                 'reflection_request_ref','reflection_request_digest','reflection_continuation_ref',
                 'reflection_continuation_digest','parent_prepared_ref','parent_prepared_digest',
                 'parent_execution_ref','parent_execution_digest','checkpoint_ref','checkpoint_digest',
-                'parent_grant_digest','source_refs','ticket_id')
+                'parent_grant_digest','source_refs','ticket_id','observation_basis_ref','observation_basis_digest',
+                'quote_id','quote_version','reservation_digest')
             selected=tuple((name,)for name in fields)
         elif self.appraisal_parentage_column_v3(column):
             selected=tuple((name,)for name in('schema','namespace','operation_id','job_id','call_id','model_request_digest'))
@@ -445,6 +484,8 @@ class _ModelReplyScopeObservationV3:
                     {'token','value','valid','event_id','event_bot','event_persona'})
             elif atom.type_name=='runtime.cost_settlement':
                 allowed={'revision','value','valid','event_id'}
+            elif atom.type_name=='d09.verified_segment_batch.v1':
+                allowed={'value','valid','event_id'}if table=='graph_history'else set()
             elif atom.type_name in('d09.natural_verified_segment_batch.v2','d09.natural_verified_segment_batch.v3'):
                 allowed={'value'}if table=='graph_history'else set()
             elif table=='graph_history'and (atom.token,keys.get('revision'))in self.cause_history:
@@ -565,6 +606,12 @@ def read_bound_model_reply_scope_point_v3(db,*,table,columns,key_columns,key):
 
 
 def model_reply_scope_point_v3(db,*,table,columns,key_columns,key,legacy_reader):
+    from .owner_stop_reply_metadata_v1 import read_bound_owner_stop_reply_metadata_point_v1
+    bound,row=read_bound_owner_stop_reply_metadata_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if bound:return row
+    from ..runtime.artifact_receipt_original_read_v1 import read_bound_artifact_receipt_point_v1
+    receipt_bound,receipt_row=read_bound_artifact_receipt_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if receipt_bound:return receipt_row
     from .named_joint_binding_body_v1 import named_joint_core_point_v1
     named,row=named_joint_core_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if named:return row
@@ -577,11 +624,14 @@ def model_reply_scope_point_v3(db,*,table,columns,key_columns,key,legacy_reader)
 
 
 def model_reply_scope_rows_v3(db,*,kind,parameters,legacy_reader):
+    from .owner_stop_reply_metadata_v1 import read_bound_owner_stop_reply_metadata_rows_v1
+    bound,rows=read_bound_owner_stop_reply_metadata_rows_v1(db,kind=kind,parameters=parameters)
+    if bound:return rows
     owner=_active_observation_v3(db)
     if owner is None or owner.legacy:return legacy_reader()
-    if kind not in('life_c4','life_c4_call','life_c4_call_original','life_binding','message_history','foreground_parents','children','message_jobs','outbound'):
-        raise AuthorityUnavailable('unregistered model reply parentage metadata selector')
-    request=('scan',kind,tuple(parameters));task=owner.scans.get(request)
+    if kind not in _REPLY_METADATA_SCAN_KINDS_V3 or kind=="owner_control_targets":
+        raise AuthorityUnavailable("unregistered model reply parentage metadata selector")
+    request=("scan",kind,tuple(parameters));task=owner.scans.get(request)
     if task is None or not task.complete:raise ModelReplyScopeObservationNeededV3(request)
     with runtime_storage_quantum_v3(db)as meter:return task.require_rows_v3(meter)
 
@@ -591,7 +641,8 @@ def model_reply_scope_canonical_digest_v3(encoded,value):
     from ..runtime.domain_background_read_v3 import BackgroundJSONColumnV3
     if type(encoded)is BackgroundJSONColumnV3:
         encoded._actual_v3()
-        owner=require_actual_model_reply_scope_column_owner_v3(encoded.owner,db=encoded.db)
+        from ..runtime.domain_background_read_v3 import _require_json_column_owner_v3
+        owner=_require_json_column_owner_v3(encoded.owner,db=encoded.db)
         if not encoded.complete or owner.metadata_only_column_v3(encoded) or not encoded.matches_v3(value):
             raise AuthorityUnavailable('model parentage canonical digest needs actual full-value EOF')
         return encoded.semantic_sha256
@@ -832,3 +883,14 @@ def read_model_reply_latest_budget_grant_metadata_v3(db,lease_id):
         row=meter.read_fixed_row(db,'runtime_budget_grants',('version','status'),
             'lease_id=? ORDER BY version DESC LIMIT 1',(lease_id,))
         return True,row
+
+def actual_reply_metadata_reader_v3(db=None):
+    owner=_active_observation_v3(db)
+    if owner is not None:return owner
+    from .owner_stop_reply_metadata_v1 import active_owner_stop_reply_metadata_read_v1
+    return active_owner_stop_reply_metadata_read_v1(db)
+
+_REPLY_METADATA_SCAN_KINDS_V3=frozenset((
+    "life_c4","life_c4_phase","life_c4_call","life_c4_call_original","life_binding",
+    "message_history","foreground_parents","children","message_jobs","outbound",
+    "artifact_observation_jobs","artifact_receipt_jobs","owner_control_targets"))

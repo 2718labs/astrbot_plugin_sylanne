@@ -13,6 +13,7 @@ from pathlib import Path
 import socket
 import ssl
 
+from .contract import AuthorityUnavailable
 from .v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
     ExecutionBindingV2, MutationReceiptV2, OwnerDispatchWitnessV1,

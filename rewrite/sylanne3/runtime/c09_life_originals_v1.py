@@ -15,7 +15,7 @@ C4_KINDS=frozenset({"c4_frozen","c4_prepared","c4_request","c4_call","c4_result"
 C4_PHASE_KINDS = frozenset("c4_phase_" + part for part in
     ("frozen", "prepared", "request", "call", "result", "paid", "adopted", "verified", "no_dispatch"))
 FOREGROUND_CAUSE_KIND = "foreground_post_c02_cause"
-POSTCONDITION_KINDS = frozenset({"artifact_phase_postcondition_policy", "artifact_phase_postcondition_contract", "artifact_phase_assessment", "artifact_standing_predecision_approval", "artifact_candidate_preparation_parent"})
+POSTCONDITION_KINDS = frozenset({"artifact_phase_observation_basis_v1", "artifact_phase_postcondition_policy", "artifact_phase_postcondition_contract", "artifact_phase_assessment", "artifact_standing_predecision_approval", "artifact_candidate_preparation_parent"})
 
 
 def decode_life_original_content_v1(kind, encoded):
@@ -181,6 +181,7 @@ def validate_foreground_post_c02_cause_row_v1(*,namespace,original_ref,producing
 
 def require_foreground_post_c02_cause_history_v1(db,cause):
     """Passive occurrence proof; no clock sample or responsibility is reissued."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .foreground_cycle_v1 import ForegroundPostC02CauseV1,_adopted_c02_v1
     from ..graph_store import GraphStore
     from ..memory_types import SourceRecord,source_key,validate_episode,validate_subjective_trace_v2
@@ -212,7 +213,7 @@ def require_foreground_post_c02_cause_history_v1(db,cause):
         if cause.source_ref not in episode_sources or trace_episode!=episodes[0].key.token:
             raise DomainProductionErasureHold("foreground cause C02 episode/trace belongs to another original Source")
         return receipt
-    source_row=db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
+    source_row=_artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
         (cause.source_ref,cause.source_revision)).fetchone()
     if source_row is None or source_row[1]!=1 or canonical_digest(_json(source_row[0]))!=cause.source_digest:
         raise DomainProductionErasureHold("foreground cause lost its original immutable Source")
@@ -221,7 +222,7 @@ def require_foreground_post_c02_cause_history_v1(db,cause):
     if (source_key(*ns.as_tuple,source.source_id)!=source_key_value or ingress is None
             or _json(ingress.identity_json)["operation_id"]!=cause.ingress_operation_id):
         raise DomainProductionErasureHold("foreground cause has no same-Source actual ingress original")
-    event=db.execute("SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+    event=_artifact_receipt_sql_v1(db,"SELECT revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*ns.as_tuple,receipt.activity_id,cause.c02_operation_id)).fetchone()
     if event is None or GraphStore._version_rows(event[0])!=receipt.write_versions:
         raise DomainProductionErasureHold("foreground cause actual C02 Graph event differs from its receipt")
@@ -231,7 +232,7 @@ def require_foreground_post_c02_cause_history_v1(db,cause):
         raise DomainProductionErasureHold("foreground cause needs the real C02 episode/trace pair")
     values=[]
     for version,validator in ((episodes[0],validate_episode),(traces[0],validate_subjective_trace_v2)):
-        row=db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+        row=_artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
             (version.key.token,version.revision)).fetchone()
         if NamespaceId.from_key(version.key)!=ns or row is None or row[0]!=cause.c02_operation_id or row[2]!=1:
             raise DomainProductionErasureHold("foreground cause lost exact same-operation episode/trace history")
@@ -244,6 +245,7 @@ def require_foreground_post_c02_cause_history_v1(db,cause):
 
 def require_foreground_cause_outbox_original_v1(db,*,namespace,producer_operation_id,original_ref,original_digest,event_kind):
     """Require the real durable locator event, never a fresh scheduling cause."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     if event_kind not in {"foreground_post_c02_cause_available","artifact_draft_root_registered"}:
         raise DomainProductionErasureHold("unregistered foreground cause event kind")
     from .domain_production_contracts_v1 import ProductionOutboxStageV1,ProductionOriginalRefV1
@@ -254,7 +256,7 @@ def require_foreground_cause_outbox_original_v1(db,*,namespace,producer_operatio
     row=model_reply_scope_point_v3(db,table='graph_domain_production_outbox_v1',
         columns=('causal_operation_id','receiver_domain','event_kind','original_ref','original_digest','state'),
         key_columns=('bot','persona','dedupe_key'),key=(*namespace.as_tuple,event.dedupe_key),
-        legacy_reader=lambda:db.execute("SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state FROM "
+        legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state FROM "
             "graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?",
             (*namespace.as_tuple,event.dedupe_key)).fetchone())
     if (row is None or row[:5]!=(producer_operation_id,"d11",event_kind,original_ref,original_digest)
@@ -278,6 +280,7 @@ def read_foreground_post_c02_cause_original_v1(db,*,namespace,issuer,original_re
 
 def validate_foreground_responsibility_create_history_v1(db,*,namespace,job):
     """Read the exact create occurrence; V1 never acquires new responsibility."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .jobs import PersistentJob,_utc
     from .foreground_cycle_v1 import (ForegroundCycleContinuationV1,ForegroundCycleContinuationV2,
         ForegroundResponsibilityV1,foreground_cycle_from_wire_v1,foreground_responsibility_ref_v1,decode_foreground_job_v1)
@@ -324,7 +327,7 @@ def validate_foreground_responsibility_create_history_v1(db,*,namespace,job):
     from .domain_background_read_v3 import background_json_loads_v3,background_json_matches_v3
     history=_producer_original_point_v3(db,table='graph_history',columns=('event_id','value','valid'),
         key_columns=('token','revision'),key=(key.token,versions[0].revision),
-        legacy_reader=lambda:db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+        legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
             (key.token,versions[0].revision)).fetchone())
     if(history is None or history[0]!=created.operation_id or history[2]!=1
             or not background_json_matches_v3(history[1],job_graph_write(created).value)):
@@ -342,7 +345,7 @@ def validate_foreground_responsibility_create_history_v1(db,*,namespace,job):
                 raise DomainProductionErasureHold("foreground responsibility original Source/self/Owner bytes differ")
             original_value=commitment[2]
         else:
-            row=db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",(ref,reads[0].revision)).fetchone()
+            row=_artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_history WHERE token=? AND revision=?",(ref,reads[0].revision)).fetchone()
             if row is None or row[1]!=1 or canonical_digest(_json(row[0]))!=digest:
                 raise DomainProductionErasureHold("foreground responsibility original Source/self/Owner bytes differ")
             original_value=_json(row[0])
@@ -355,8 +358,12 @@ def validate_foreground_responsibility_create_history_v1(db,*,namespace,job):
             mapping=decode_typed_production_value_v1(original_value,SelfIdentityMapping)
             if original["payload"]["authority"]["actor"]!=mapping.self_entity_ref:
                 raise DomainProductionErasureHold("foreground responsibility actual create actor differs from original self")
-    from .foreground_call_plan_v1 import ForegroundReplyAllocationV1
-    allocation=decode_typed_production_value_v1(provenance["reply_allocation"],ForegroundReplyAllocationV1)
+    from .artifact_receipt_allocation_v3 import (
+        ForegroundArtifactReceiptAllocationV3, decode_foreground_reply_allocation_v3,
+        require_artifact_receipt_responsibility_binding_v3)
+    allocation=decode_foreground_reply_allocation_v3(provenance["reply_allocation"])
+    if type(allocation) is ForegroundArtifactReceiptAllocationV3:
+        require_artifact_receipt_responsibility_binding_v3(allocation, responsibility)
     if ((allocation.namespace,allocation.c02_operation_id,allocation.parent_lease_ref,allocation.child_lease_id)!=
             (namespace,responsibility.c02_operation_id,responsibility.parent_budget_lease_ref,born.call_plan.protected_reply_lease_ref)):
         raise DomainProductionErasureHold("foreground responsibility changed its actual original protected reply allocation")
@@ -364,11 +371,12 @@ def validate_foreground_responsibility_create_history_v1(db,*,namespace,job):
 
 
 def _read_archive_parent_grant_v1(db, lease_id, version):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .issuers import _decode_grant
     from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
     from .domain_background_read_v3 import background_json_matches_v3
     row=model_reply_scope_point_v3(db,table='runtime_budget_grants',columns=('grant_json','signature'),
-        key_columns=('lease_id','version'),key=(lease_id,version),legacy_reader=lambda:db.execute(
+        key_columns=('lease_id','version'),key=(lease_id,version),legacy_reader=lambda:_artifact_receipt_sql_v1(db,
             "SELECT grant_json,signature FROM runtime_budget_grants WHERE lease_id=? AND version=?",(lease_id,version)).fetchone())
     if row is None:
         raise DomainProductionErasureHold("foreground archive exact parent grant version is absent")
@@ -380,13 +388,14 @@ def _read_archive_parent_grant_v1(db, lease_id, version):
 
 
 def _read_archive_life_original_v1(db, namespace, kind, ref):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .domain_production_erasure_v1 import TABLE_COLUMNS,validate_domain_production_row_v1
     from .d11_life_preparation_v1 import TABLE
     from ..authority_service.model_reply_scope_observation_v3 import model_reply_scope_point_v3
     from .domain_background_read_v3 import background_json_loads_v3
     row=model_reply_scope_point_v3(db,table=TABLE,columns=TABLE_COLUMNS[TABLE],
         key_columns=('bot','persona','kind','original_ref'),key=(*namespace.as_tuple,kind,ref),
-        legacy_reader=lambda:db.execute("SELECT * FROM "+TABLE+" WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
+        legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT * FROM "+TABLE+" WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
             (*namespace.as_tuple,kind,ref)).fetchone())
     if row is None:
         raise DomainProductionErasureHold("foreground archive actual registered original is absent")
@@ -402,6 +411,7 @@ def _read_archive_life_original_v1(db, namespace, kind, ref):
 
 def validate_owner_task_responsibility_archive_closure_v2(db, *, namespace, job):
     """Verify the passive Owner Submit/Create lineage; never restore current rights."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..domains.d01.production_operations_v1 import plain_v1
     from .owner_source_note_task_contract_v1 import (
         OwnerSourceNoteTaskContinuationV2, OwnerSourceNoteTaskResponsibilityV2,
@@ -448,7 +458,7 @@ def validate_owner_task_responsibility_archive_closure_v2(db, *, namespace, job)
             or created["payload"]["authority"]["actor"] != responsibility.self_entity_ref
             or responsibility.self_mapping_head not in created["read_versions"]):
         raise DomainProductionErasureHold("Owner task archive initial job or actual Creator Self binding differs")
-    mapping = db.execute("SELECT value,valid,event_bot,event_persona FROM graph_history WHERE token=? AND revision=?",
+    mapping = _artifact_receipt_sql_v1(db,"SELECT value,valid,event_bot,event_persona FROM graph_history WHERE token=? AND revision=?",
         (responsibility.self_mapping_head.key.token, responsibility.self_mapping_head.revision)).fetchone()
     if (mapping is None or mapping[1:] != (1, *namespace.as_tuple)
             or canonical_digest(_json(mapping[0])) != responsibility.self_mapping_digest
@@ -465,7 +475,7 @@ def validate_owner_task_responsibility_archive_closure_v2(db, *, namespace, job)
                 raise DomainProductionErasureHold("Owner task archive Goal/Plan are not its actual Submit members")
             members.append((version.key.token, version.revision, digest, submit_id, submitted["receipt"].activity_id))
     for token, revision, digest, operation_id, activity_id in members:
-        row = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?", (token, revision)).fetchone()
+        row = _artifact_receipt_sql_v1(db,"SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?", (token, revision)).fetchone()
         if row is None or row[1:] != (1, *namespace.as_tuple, activity_id, operation_id) or canonical_digest(_json(row[0])) != digest:
             raise DomainProductionErasureHold("Owner task archive lost a genuine producing history member")
     grant = _read_archive_parent_grant_v1(db, auth.cause.parent_budget_lease_ref, auth.cause.parent_grant_version)
@@ -477,7 +487,7 @@ def validate_owner_task_responsibility_archive_closure_v2(db, *, namespace, job)
     original = ProductionOriginalRefV1("d08.current-submit_owner_source_note_task_v1",
         "d08-current:" + submitted["original_digest"][:48], submitted["original_digest"])
     event = ProductionOutboxStageV1(namespace, submit_id, "d11", "owner_source_note_task_submitted_v1", original)
-    row = db.execute("SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?",
+    row = _artifact_receipt_sql_v1(db,"SELECT causal_operation_id,receiver_domain,event_kind,original_ref,original_digest,state FROM graph_domain_production_outbox_v1 WHERE bot=? AND persona=? AND dedupe_key=?",
         (*namespace.as_tuple, event.dedupe_key)).fetchone()
     if row is None or row[:5] != (submit_id, "d11", event.event_kind, original.original_ref, original.original_digest) or row[5] not in {"pending", "consumed"}:
         raise DomainProductionErasureHold("Owner task archive lost its actual same-Submit durable locator event")
@@ -733,12 +743,13 @@ def _validate_c4_paid_member_v1(db,namespace,paid):
 
 def require_c4_model_cost_original_commit_v1(db,*,namespace,operation_id):
     """Recognize existing real model-cost receipt ABI, never generalize commits."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_types import RuntimeCostSettlement,runtime_cost_settlement_key
     from .d11_artifact_draft_model_v1 import decode_artifact_draft_original_v1
     from .model_cost_settlement import original_model_cost_operation_id_v1
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise DomainProductionErasureHold("C4 financial originals need the actual pinned namespace transaction")
-    row=db.execute("SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+    row=_artifact_receipt_sql_v1(db,"SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple,operation_id)).fetchone()
     if row is None:raise DomainProductionErasureHold("C4 actual model cost operation absent")
     raw=_json(row[3])
@@ -749,19 +760,19 @@ def require_c4_model_cost_original_commit_v1(db,*,namespace,operation_id):
     if (paid.operation_id!=operation_id or paid.commit_seq!=row[2] or paid.operation_id!=original_model_cost_operation_id_v1(namespace,paid.call_id)
             or (raw["terminal_receipt_digest"],raw["quote_id"],raw["quote_version"])!=(paid.terminal_receipt_digest,paid.quote_id,paid.quote_version)):
         raise DomainProductionErasureHold("C4 actual financial receipt changed original identity/terminal")
-    event=db.execute("SELECT revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+    event=_artifact_receipt_sql_v1(db,"SELECT revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*namespace.as_tuple,row[0],operation_id)).fetchone()
     if event is None:raise DomainProductionErasureHold("C4 actual model cost Graph event absent")
     from ..graph_store import GraphStore
     versions=tuple(v for v in GraphStore._version_rows(event[0]) if v.key.token==paid.cost_ref)
     if len(versions)!=1 or event[1]!=paid.graph_epoch:
         raise DomainProductionErasureHold("C4 paid original lost its actual financial CAS member")
-    history=db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+    history=_artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
         (paid.cost_ref,versions[0].revision)).fetchone()
     if history is None or history[0]!=paid.operation_id or history[2]!=1:
         raise DomainProductionErasureHold("C4 paid original lost immutable financial history")
     cost=decode_typed_production_value_v1(_json(history[1]),RuntimeCostSettlement)
-    budget=db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE lease_id=? AND operation_id=? AND phase='settle'",
+    budget=_artifact_receipt_sql_v1(db,"SELECT receipt_json FROM runtime_budget_operations WHERE lease_id=? AND operation_id=? AND phase='settle'",
         (cost.lease_id,cost.cost_operation_id)).fetchone()
     if (budget is None or canonical_digest(_json(budget[0]))!=paid.budget_receipt_digest
             or (cost.bot_id,cost.persona_id,cost.bundle_operation_id,cost.settlement_id,cost.activity_id,cost.effect_id)!=
@@ -779,6 +790,7 @@ def require_c4_model_cost_original_commit_v1(db,*,namespace,operation_id):
 
 def _validate_c4_prepared_history_v1(db, namespace, prepared, frozen, *, phase=False):
     """Passive prepared/job/R/quote/reservation lineage; no live budget or permit issuance."""
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .jobs import get_job, _job_from_dict, _utc
     from .d11_types import job_graph_write
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
@@ -809,7 +821,7 @@ def _validate_c4_prepared_history_v1(db, namespace, prepared, frozen, *, phase=F
         from .foreground_call_plan_v1 import ForegroundModelAttemptV2
         if type(attempts[0]) is not ForegroundModelAttemptV2 or attempts[0].phase_selector != prepared.selector:
             raise DomainProductionErasureHold("C4 phase prepared lost its actual typed physical attempt")
-    quote_row=db.execute("SELECT quote_json,signature FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
+    quote_row=_artifact_receipt_sql_v1(db,"SELECT quote_json,signature FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
         (prepared.quote_id,)).fetchone()
     if quote_row is None:
         raise DomainProductionErasureHold("C4 prepared actual original quote is absent")
@@ -823,11 +835,11 @@ def _validate_c4_prepared_history_v1(db, namespace, prepared, frozen, *, phase=F
             or quote.valid_until_utc!=_utc(prepared.deadline_utc,"deadline_utc").timestamp()
             or (attempts[0].input_ceiling,attempts[0].output_ceiling)!=(quote.ceiling["input_tokens"],quote.ceiling["output_tokens"])):
         raise DomainProductionErasureHold("C4 prepared original quote differs from its inherited slot/parent")
-    reservation=db.execute("SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+    reservation=_artifact_receipt_sql_v1(db,"SELECT digest,ceiling_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
         (prepared.parent_budget_lease_ref,prepared.operation_id)).fetchone()
     if reservation!=(prepared.reservation_digest,canonical_serialize(dict(quote.ceiling))):
         raise DomainProductionErasureHold("C4 prepared lost its original parent bucket reservation")
-    row=db.execute("SELECT digest,job_id,job_json FROM runtime_job_operations WHERE bot_id=? AND persona_id=? "
+    row=_artifact_receipt_sql_v1(db,"SELECT digest,job_id,job_json FROM runtime_job_operations WHERE bot_id=? AND persona_id=? "
         "AND operation_id=? AND phase='create'",(*namespace.as_tuple,"create:"+prepared.operation_id)).fetchone()
     if row is None or row[:2]!=(prepared.reservation_digest,prepared.job_id):
         raise DomainProductionErasureHold("C4 prepared actual original model job is absent")
@@ -840,7 +852,7 @@ def _validate_c4_prepared_history_v1(db, namespace, prepared, frozen, *, phase=F
                 (prepared.job_id,prepared.operation_id,prepared.activity_id,*namespace.as_tuple,prepared.parent_budget_lease_ref,prepared.deadline_utc)):
         raise DomainProductionErasureHold("C4 prepared model job changed its immutable parent/task occurrence")
     version=tuple(v for v in origin["receipt"].write_versions if v.key==job_graph_write(born).key)
-    if (len(version)!=1 or db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+    if (len(version)!=1 or _artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
             (version[0].key.token,version[0].revision)).fetchone()!=(prepared.operation_id,canonical_serialize(job_graph_write(born).value),1)):
         raise DomainProductionErasureHold("C4 prepared model job lost its actual original Graph CAS member")
     after_cycle=decode_foreground_job_v1(origin["payload"]["provenance"]["after_cycle"],namespace=namespace)
@@ -855,8 +867,9 @@ def _validate_c4_prepared_history_v1(db, namespace, prepared, frozen, *, phase=F
 
 
 def _require_c4_paid_parent_bucket_v1(db, namespace, prepared, paid):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_types import RuntimeCostSettlement
-    rows=db.execute("SELECT value FROM graph_history WHERE token=? AND event_id=? AND valid=1",
+    rows=_artifact_receipt_sql_v1(db,"SELECT value FROM graph_history WHERE token=? AND event_id=? AND valid=1",
         (paid.cost_ref,paid.operation_id)).fetchall()
     if len(rows)!=1:
         raise DomainProductionErasureHold("C4 paid original has no unique actual financial member")
@@ -960,6 +973,7 @@ def _validate_c4_phase_original_joins_v2(db, originals):
 
 
 def _validate_c4_phase_verified_joins_v2(db, *, namespace, original_ref, producing_operation_id, raw, originals):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_artifact_draft_content_v1 import require_artifact_draft_phase_verified_history_v2
     from .d11_life_contract_v1 import D11LifeTerminalV1, D11DraftTerminalV1, life_from_wire_v1
     from .d11_life_adoption_v1 import require_draft_terminal_readback_v1
@@ -1009,7 +1023,7 @@ def _validate_c4_phase_verified_joins_v2(db, *, namespace, original_ref, produci
     contract = None
     if type(frozen_row[1]) is ArtifactDraftInputV3:
         from .d11_artifact_draft_model_v1 import require_artifact_phase_frozen_contract_history_v3
-        contract = require_artifact_phase_frozen_contract_history_v3(db, namespace=namespace, frozen=frozen_row[1])
+        contract = require_artifact_phase_frozen_contract_history_v3(db, namespace=namespace, frozen=frozen_row[1], read_original=originals.get)
     if not value.selector.generation:
         from .artifact_phase_postconditions_v1 import (ASSESSMENT_KIND, artifact_phase_assessment_original_ref_v1,
             require_artifact_phase_assessment_history_v1)
@@ -1023,7 +1037,7 @@ def _validate_c4_phase_verified_joins_v2(db, *, namespace, original_ref, produci
         if assessment_row is None or assessment_row[3] != proof.original_digest:
             raise DomainProductionErasureHold('C4 method check lost actual signed assessment bytes')
         assessment = require_artifact_phase_assessment_history_v1(db, namespace=namespace, original_ref=proof.original_ref,
-            producing_operation_id=assessment_row[0], raw=assessment_row[2])
+            producing_operation_id=assessment_row[0], raw=assessment_row[2], read_original=originals.get)
         _require_actual_artifact_phase_assessment_v1(selector=value.selector, content_selector=value.content_selector,
             contract=contract, assessment=assessment, adoption=adoption, file_result_ref=value.readback_original_ref,
             file_result_digest=value.readback_original_digest, readback=readback)
@@ -1051,7 +1065,7 @@ def _validate_c4_phase_verified_joins_v2(db, *, namespace, original_ref, produci
     mapping_versions = tuple(version for version in actual["read_versions"] if version.key == self_mapping_key(namespace))
     if len(mapping_versions) != 1:
         raise DomainProductionErasureHold("C4 verified original lost its actual independent self-mapping read")
-    row = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
+    row = _artifact_receipt_sql_v1(db,"SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
         (mapping_versions[0].key.token, mapping_versions[0].revision)).fetchone()
     if row is None or row[1] != 1 or canonical_digest(_json(row[0])) != value.current_self_digest:
         raise DomainProductionErasureHold("C4 verified original changed its actual historical self-mapping bytes")
@@ -1159,15 +1173,16 @@ def life_stage_dispositions_v1(columns, rows, *, affected, affected_operations, 
 
 
 def validate_life_original_joins_v1(db):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import TABLE
     from .domain_production_erasure_v1 import TABLE_COLUMNS, validate_domain_production_row_v1
     from .d11_life_accounting_v1 import life_accounting_original_ref_v1
     from .d11_life_adoption_v1 import validate_life_adoption_composite_v1
     from .d11_life_historical_accounting_v1 import validate_life_historical_accounting_composite_v1
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone() is None:
+    if _artifact_receipt_sql_v1(db,"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone() is None:
         return
     originals={}
-    for row in db.execute("SELECT bot,persona,kind,original_ref,producing_operation_id,payload_json,payload_digest,signature FROM "+TABLE):
+    for row in _artifact_receipt_sql_v1(db,"SELECT bot,persona,kind,original_ref,producing_operation_id,payload_json,payload_digest,signature FROM "+TABLE):
         kind,ref,raw,digest=validate_domain_production_row_v1(TABLE,TABLE_COLUMNS[TABLE],row)
         originals[(NamespaceId(row[0],row[1]),kind,ref)]=(row[4],decode_life_original_content_v1(kind,row[5]),raw,digest)
     _validate_c4_original_joins_v1(db,originals)
@@ -1185,8 +1200,10 @@ class _LifeOriginalPointLookupV2:
     def get(self,key): return self.read_original(key)
 
 
-def validate_life_original_join_row_v2(db, *, ns, kind, ref, op, value, raw, digest, read_original):
+def validate_life_original_join_row_v2(db, *, ns, kind, ref, op, value, raw, digest, read_original, read_d07_original=None):
     """One actual Life original plus exact indexed historical joins; no namespace collection."""
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_matches_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import TABLE
     from .domain_production_erasure_v1 import TABLE_COLUMNS, validate_domain_production_row_v1
     from .d11_life_accounting_v1 import life_accounting_original_ref_v1
@@ -1206,7 +1223,7 @@ def validate_life_original_join_row_v2(db, *, ns, kind, ref, op, value, raw, dig
         return None
     if kind in POSTCONDITION_KINDS:
         from .artifact_phase_postconditions_v1 import require_artifact_phase_postcondition_history_v1
-        require_artifact_phase_postcondition_history_v1(db, namespace=ns, kind=kind, original_ref=ref, producing_operation_id=op, raw=raw)
+        require_artifact_phase_postcondition_history_v1(db, namespace=ns, kind=kind, original_ref=ref, producing_operation_id=op, raw=raw, read_original=read_original,read_d07_original=read_d07_original)
         return None
     if kind == 'artifact_task_text_extent':
         from .artifact_task_text_extent_v1 import require_artifact_task_text_extent_history_v1
@@ -1259,7 +1276,7 @@ def validate_life_original_join_row_v2(db, *, ns, kind, ref, op, value, raw, dig
         adopted = originals.get((ns, 'adopted_life', terminal.binding.artifact_ref))
         if adopted is None or adopted[0] != raw['adopted_operation_id'] or adopted[2]['terminal'] != raw['terminal']:
             raise DomainProductionErasureHold('Life internal experience lost its genuine terminal adoption')
-        history = db.execute('SELECT value,valid FROM graph_history WHERE token=? AND event_id=? LIMIT 2', (raw['source_ref'], op)).fetchmany(2)
+        history = _artifact_receipt_sql_v1(db,'SELECT value,valid FROM graph_history WHERE token=? AND event_id=? LIMIT 2', (raw['source_ref'], op)).fetchmany(2)
         if len(history) != 1 or history[0][1] != 1 or canonical_digest(_json(history[0][0])) != raw['source_digest']:
             raise DomainProductionErasureHold('Life internal experience lacks its real D10 source history')
         source = _json(history[0][0])
@@ -1281,13 +1298,13 @@ def validate_life_original_join_row_v2(db, *, ns, kind, ref, op, value, raw, dig
             if record.parent_source_ids != (parent.owner.subject,) or raw['source_ref'] != source_key(*ns.as_tuple, record.source_id).token:
                 raise DomainProductionErasureHold('Life historical source lost its exact typed parent')
             access = access_key(*ns.as_tuple, record.source_id)
-            access_row = db.execute('SELECT value,valid,event_id,dependencies FROM graph_history WHERE token=? AND revision=1', (access.token,)).fetchone()
+            access_row = _artifact_receipt_sql_v1(db,'SELECT value,valid,event_id,dependencies FROM graph_history WHERE token=? AND revision=1', (access.token,)).fetchone()
             dependencies = life_experience_access_dependencies_v1(prepared[1], AtomKey.from_token(raw['source_ref']))
             from .d11_life_fact_provenance_v1 import life_current_fact_reads_v1
             current_reads = life_current_fact_reads_v1(prepared[1])
             expected_deps = tuple(sorted(((key.token, 1 if key.type_name in {'memory.source', 'd11.life_fact_eligibility.v1'} and key.token not in {row.ref for row in current_reads} else next((row.revision for row in current_reads if row.ref == key.token))) for key in dependencies)))
             expected_access = canonical_serialize({'source_id': record.source_id, 'audiences': list(record.audiences), 'purposes': list(record.purposes), 'status': 'active', 'recorded_at': record.recorded_at})
-            if not any((v.key == access and v.revision == 1 for v in production['receipt'].write_versions)) or access_row is None or access_row[:3] != (expected_access, 1, op) or (tuple(sorted((tuple(pair) for pair in json.loads(access_row[3])))) != expected_deps) or (db.execute('SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?', (raw['source_ref'], op)).fetchone() != ('[]',)):
+            if not any((v.key == access and v.revision == 1 for v in production['receipt'].write_versions)) or access_row is None or (access_row[1:3] != (1, op) or not background_json_matches_v3(access_row[0],background_json_loads_v3(expected_access))) or (tuple(sorted((tuple(pair) for pair in background_json_loads_v3(access_row[3])))) != expected_deps) or (_artifact_receipt_sql_v1(db,'SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?', (raw['source_ref'], op)).fetchone() != ('[]',)):
                 raise DomainProductionErasureHold('Life historical experience source/access ownership differs')
         return None
     if kind not in {'adoption_bridge', 'adoption_receipt', 'historical_accounting_gate', 'historical_accounting_receipt'}:
@@ -1432,7 +1449,7 @@ def validate_c4_phase_original_join_row_v3(db, *, ns, kind, ref, op, value, raw,
         from ..model_broker.artifact_draft_v1 import ArtifactDraftInputV3
         if type(value) is ArtifactDraftInputV3:
             from .d11_artifact_draft_model_v1 import require_artifact_phase_frozen_contract_history_v3
-            require_artifact_phase_frozen_contract_history_v3(db, namespace=ns, frozen=value)
+            require_artifact_phase_frozen_contract_history_v3(db, namespace=ns, frozen=value, read_original=originals.get)
         parent = originals.get((ns, 'c4_phase_prepared', artifact_draft_model_ids_v2(value.selector)['job']))
         if parent is None or (parent[1].frozen_ref, parent[1].frozen_digest) != (ref, value.digest):
             raise DomainProductionErasureHold('C4 phase frozen body has no actual prepared seal')
@@ -1498,6 +1515,8 @@ def validate_c4_phase_original_join_row_v3(db, *, ns, kind, ref, op, value, raw,
 
 
 def validate_c4_no_dispatch_original_joins_v1(db, *, namespace, original_ref, producing_operation_id, raw, issuer=None):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..domains.d01.production_operations_v1 import plain_v1
     from .d11_artifact_draft_model_v1 import decode_artifact_model_no_dispatch_v1
     from ..authority_service.v2_model_egress_contract import ModelNoDispatchWitnessV1
@@ -1506,24 +1525,24 @@ def validate_c4_no_dispatch_original_joins_v1(db, *, namespace, original_ref, pr
     from .d11_types import RuntimeCostSettlement
     from ..graph_types import AtomKey
     value = decode_artifact_model_no_dispatch_v1(raw)
-    witness = from_wire(json.loads(value.witness_json), ModelNoDispatchWitnessV1)
+    witness = from_wire(background_json_loads_v3(value.witness_json), ModelNoDispatchWitnessV1)
     if issuer is not None: witness.require_signature_v1(issuer._signer)
     commit = value.cost_commit
     if (value.namespace != namespace or value.original_ref != original_ref or commit.operation_id != producing_operation_id
             or commit.operation_id != original_model_cost_operation_id_v1(namespace, commit.call_id)):
         raise ValueError("C09 no-dispatch record producer identity differs")
-    cost = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1", (commit.cost_ref,)).fetchone()
-    receipt = db.execute("SELECT commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+    cost = _artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=1", (commit.cost_ref,)).fetchone()
+    receipt = _artifact_receipt_sql_v1(db,"SELECT commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, producing_operation_id)).fetchone()
     if cost is None or cost[0] != producing_operation_id or cost[2] != 1 or receipt is None or receipt[0] != commit.commit_seq:
         raise ValueError("C09 no-dispatch record lacks its real cost/CAS history")
-    cost_value = RuntimeCostSettlement(**json.loads(cost[1]))
+    cost_value = RuntimeCostSettlement(**background_json_loads_v3(cost[1]))
     if (cost_value.status != "settled" or cost_value.actual != {unit: 0 for unit, _ in witness.request.intent.budget_ceiling}
             or cost_value.unconfirmed or cost_value.lease_id != witness.request.intent.budget_lease_id
             or cost_value.budget_receipt_digest != commit.budget_receipt_digest
-            or json.loads(receipt[1])["original_model_no_dispatch_cost"] != plain_v1(commit)):
+            or background_json_loads_v3(receipt[1])["original_model_no_dispatch_cost"] != plain_v1(commit)):
         raise ValueError("C09 no-dispatch record lost its original exact zero budget settlement")
-    history_rows = tuple(db.execute("SELECT token,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=?",
+    history_rows = tuple(_artifact_receipt_sql_v1(db,"SELECT token,value FROM graph_history WHERE event_bot=? AND event_persona=? AND event_id=?",
         (*namespace.as_tuple, producing_operation_id)))
     if len(history_rows) != 2:
         raise ValueError("C09 no-dispatch original cost/job bundle has another member set")
@@ -1531,7 +1550,7 @@ def validate_c4_no_dispatch_original_joins_v1(db, *, namespace, original_ref, pr
     if len(job_rows) != 1:
         raise ValueError("C09 no-dispatch cost lacks its one same-CAS cancelled job")
     from .d11_types import RuntimeJobValue
-    job_value = RuntimeJobValue(**json.loads(job_rows[0][0]))
+    job_value = RuntimeJobValue(**background_json_loads_v3(job_rows[0][0]))
     if (job_value.job_id != witness.request.intent.job_id or job_value.phase != "cancelled"
             or job_value.result_ref is not None or job_value.operation_id != witness.request.intent.budget_reservation_operation_id):
         raise ValueError("C09 no-dispatch cancelled job lineage differs")
@@ -1540,12 +1559,13 @@ def validate_c4_no_dispatch_original_joins_v1(db, *, namespace, original_ref, pr
 
 
 def require_c4_no_dispatch_cost_original_commit_v1(db, *, namespace, operation_id):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .model_cost_settlement import OriginalModelNoDispatchCostCommitV1, original_model_cost_operation_id_v1
     from .d11_types import RuntimeCostSettlement, runtime_cost_settlement_key
     from .budget import BudgetReceipt
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise DomainProductionErasureHold("no-dispatch financial original needs its actual pinned namespace transaction")
-    row = db.execute("SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
+    row = _artifact_receipt_sql_v1(db,"SELECT activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
         (*namespace.as_tuple, operation_id)).fetchone()
     if row is None: raise DomainProductionErasureHold("actual no-dispatch cost CAS absent")
     raw = _json(row[3])
@@ -1560,7 +1580,7 @@ def require_c4_no_dispatch_cost_original_commit_v1(db, *, namespace, operation_i
                 (raw["no_dispatch_witness_digest"], raw["quote_id"], raw["quote_version"])
             or paid.cost_ref != runtime_cost_settlement_key(*namespace.as_tuple, row[0], operation_id).token):
         raise DomainProductionErasureHold("no-dispatch financial original identity differs")
-    event = db.execute("SELECT revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+    event = _artifact_receipt_sql_v1(db,"SELECT revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*namespace.as_tuple, row[0], operation_id)).fetchone()
     from ..graph_store import GraphStore
     versions = () if event is None else GraphStore._version_rows(event[0])
@@ -1570,12 +1590,12 @@ def require_c4_no_dispatch_cost_original_commit_v1(db, *, namespace, operation_i
     job_versions = tuple(v for v in versions if v.key.type_name == "runtime.job")
     if len(cost_versions) != 1 or len(job_versions) != 1 or cost_versions[0].revision != 1:
         raise DomainProductionErasureHold("no-dispatch cost/job member set differs")
-    history = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
+    history = _artifact_receipt_sql_v1(db,"SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?",
         (paid.cost_ref, cost_versions[0].revision)).fetchone()
     if history is None or history[0] != operation_id or history[2] != 1:
         raise DomainProductionErasureHold("no-dispatch actual financial history absent")
     cost = decode_typed_production_value_v1(_json(history[1]), RuntimeCostSettlement)
-    receipt_row = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE lease_id=? AND operation_id=? AND phase='settle'",
+    receipt_row = _artifact_receipt_sql_v1(db,"SELECT receipt_json FROM runtime_budget_operations WHERE lease_id=? AND operation_id=? AND phase='settle'",
         (cost.lease_id, cost.cost_operation_id)).fetchone()
     if receipt_row is None: raise DomainProductionErasureHold("no-dispatch original settle receipt absent")
     receipt = decode_typed_production_value_v1(_json(receipt_row[0]), BudgetReceipt)

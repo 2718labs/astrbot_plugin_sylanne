@@ -2,7 +2,7 @@ import asyncio
 import threading
 import unittest
 from sylanne3.contracts import Scope, StepResult
-from sylanne3.scheduler import BoundedScheduler, CapacityExceeded
+from rewrite.host_tests.legacy_fixture_v1.scheduler import BoundedScheduler, CapacityExceeded
 
 S = Scope('b','p','s')
 T = Scope('b','p','other')

@@ -124,12 +124,13 @@ class CompletedD13PaidReadV3:
             from ..host.model_workflows_v6 import AdminModelWorkflowsV6
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+            from ..host.model_workflows_v9 import AdminModelWorkflowsV9
             from ..model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6
             from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7
             bundle=r.graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle
             wf=bundle.model_workflows
             self.derived=(type(wf)is AdminModelWorkflowsV6 and wf.natural_generation is not None and wf.natural_generation.template_version==V6
-                or type(wf)in {AdminModelWorkflowsV7,AdminModelWorkflowsV8} and wf.natural_generation is not None and wf.natural_generation.template_version==V7)
+                or type(wf)in {AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9} and wf.natural_generation is not None and wf.natural_generation.template_version==V7)
             typename="d13.derived_block_metadata.v2" if self.derived else "d13.compressed_turn_block.v2"
             self.block_key=AtomKey(Owner("persona",*r.namespace.as_tuple),typename,r.job[13])
             from .d11_types import runtime_job_key

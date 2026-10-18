@@ -21,7 +21,7 @@ _D07_MODEL_SOURCE_OBSERVER_PHASE_V3 = object()
 _D07_MODEL_SOURCE_POLICY_PHASE_V3 = object()
 _OWNER_CALLER_KINDS_V3 = frozenset(("host_artifact_borrowed_header", "host_artifact_model_dispatch_read", "host_named_joint_source_read", "host_named_joint_write_source", "host_conditioned_write_source", "host_habit_write_source", "host_habit_maintenance_write_source", "host_conditioned_source_read", "host_habit_source_read", "host_semantic_recovery_read", "host_d07_write", "host_d07_model_seal", "host_foreground_read",
     "host_d07_stage_read", "host_method_owner_read", "host_owner_lease_read",
-    "host_contact_dispatch_identity_read", "host_contact_dispatch_text_read", "host_beta1_fixture_evidence_read", "host_contact_owner_read", "host_contact_owner_write", "authority_model_header", "authority_model_seal",
+    "host_contact_dispatch_identity_read", "host_contact_dispatch_text_read", "host_contact_owner_read", "host_contact_owner_write", "authority_model_header", "authority_model_seal",
     "authority_internal_life_model_header", "authority_artifact_model_header", "authority_foreground_mesh_header",
     "authority_original_foreground_header", "authority_original_owner_task_header",
     "authority_numeric_model_header", "authority_habit_header", "authority_named_joint_header",
@@ -29,7 +29,7 @@ _OWNER_CALLER_KINDS_V3 = frozenset(("host_artifact_borrowed_header", "host_artif
     "authority_life_location", "authority_offline_location", "authority_source_fence_location",
     "authority_target_public_location", "authority_target_background_location",
     "authority_life_numeric_result", "authority_life_content_result", "authority_artifact_model_result",
-    "authority_natural_self_location", "authority_c04_self_location", "authority_conditioned_child_location", "goal_management_metadata", "authority_contact_location", "artifact_no_dispatch_metadata", "goal_projection_metadata"))
+    "authority_natural_self_location", "authority_c04_self_location", "authority_conditioned_child_location", "goal_management_metadata", "authority_contact_location", "artifact_no_dispatch_metadata", "goal_projection_metadata", "owner_stop_reply_metadata"))
 
 
 @dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
@@ -253,10 +253,31 @@ def require_owner_location_caller_proof_v3(proof, *, phase, graph_stamp=None):
             or proof.retained_operation.closed
             or proof.retained_operation.selection_digest != proof.selection_digest
             or (proof.retained_operation.deadline_utc != proof.deadline_utc
-                and (proof.kind not in ('authority_contact_location','host_contact_owner_read','host_contact_owner_write','host_beta1_fixture_evidence_read') or proof.deadline_utc is None
+                and (proof.kind not in ('authority_contact_location','host_contact_owner_read','host_contact_owner_write') or proof.deadline_utc is None
                     or proof.retained_operation.deadline_utc is None
                     or proof.retained_operation.deadline_utc>proof.deadline_utc))):
         raise AuthorityUnavailable("Owner location caller or original retained operation ended")
+    if proof.kind=="owner_stop_reply_metadata":
+        from .owner_stop_reply_metadata_v1 import (
+            OwnerStopReplyMetadataInvocationV1,require_owner_stop_reply_metadata_invocation_v1)
+        invocation=proof.request
+        if (type(invocation)is not OwnerStopReplyMetadataInvocationV1
+                or proof.scope is not invocation.original_permit
+                or proof.original_permit is not invocation.original_permit
+                or proof.graph is not None or proof.authority is not None or proof.current_owner_authority is not None
+                or proof.controller is not None or proof.port is not None or proof.bundle is not invocation.bundle
+                or proof.service is not invocation.service or proof.owner_service is not invocation.service
+                or proof.control is not invocation.control or proof.retained_operation is not invocation.retained_operation
+                or proof.selection_digest!=invocation.selection_digest or proof.current_owner_head!=invocation.current_owner_head
+                or proof.permission_anchor!=invocation.current_anchor or proof.graph_comparison_anchor!=invocation.current_anchor
+                or proof.principal!=invocation.principal or proof.subject!=invocation.subject
+                or proof.credential is not invocation.credential or proof.namespace!=invocation.namespace
+                or proof.installation_id!=invocation.installation_id or proof.holder!=invocation.holder
+                or proof.deadline_utc!=invocation.registered_deadline_utc):
+            raise AuthorityUnavailable("StopReply Owner metadata crossed its actual private caller")
+        require_owner_stop_reply_metadata_invocation_v1(invocation,phase=phase,graph_stamp=graph_stamp)
+        return proof
+
     if proof.kind in ('authority_original_foreground_header','authority_original_owner_task_header'):
         from .original_foreground_owner_location_v3 import require_original_foreground_owner_header_v3
         require_original_foreground_owner_header_v3(proof,graph_stamp)
@@ -271,8 +292,6 @@ def require_owner_location_caller_proof_v3(proof, *, phase, graph_stamp=None):
             require_artifact_borrowed_owner_caller_v3(proof,graph_stamp)
         elif proof.kind in _CONTACT_OWNER_SOURCE_KINDS_V3:
             _require_contact_owner_source_caller_v3(proof)
-        elif proof.kind == "host_beta1_fixture_evidence_read":
-            _require_host_beta1_fixture_owner_caller_v3(proof)
         elif proof.kind == "host_owner_lease_read":
             _require_host_owner_lease_caller_v3(proof)
         elif proof.kind in _CONTACT_DISPATCH_OWNER_KINDS_V1:
@@ -559,11 +578,6 @@ def _require_owner_permission_outside_graph_v3(proof):
             if current!=proof.current_owner_authority:
                 raise AuthorityUnavailable("Contact Owner original current Authority changed")
             return proof
-        elif proof.kind == "host_beta1_fixture_evidence_read":
-            current=_observe_host_beta1_fixture_owner_authority_v3(proof.request)
-            if current!=proof.current_owner_authority:
-                raise AuthorityUnavailable("Beta1 evidence original current Authority changed")
-            return proof
         elif proof.kind == "host_owner_lease_read":
             current=_observe_host_owner_lease_authority_v3(proof.request)
             if current!=proof.current_owner_authority:
@@ -652,6 +666,13 @@ def _require_owner_permission_outside_graph_v3(proof):
         require_goal_projection_metadata_invocation_v1(proof.request,phase='before')
         require_goal_projection_committed_bridge_v1(proof.request)
         return proof
+    elif proof.kind=="owner_stop_reply_metadata":
+        from .owner_stop_reply_metadata_v1 import require_owner_stop_reply_metadata_invocation_v1
+        if proof.request.actual_db.in_transaction:
+            raise AuthorityUnavailable("StopReply permission observation must precede Graph SQL")
+        require_owner_stop_reply_metadata_invocation_v1(proof.request,phase="before")
+        return proof
+
     elif proof.kind=='goal_management_metadata':
         from .owner_goal_cancellation_v1 import require_goal_management_invocation_v1
         if proof.request.actual_db.in_transaction:
@@ -785,7 +806,7 @@ def finish_owner_location_retained_growth_v3(proof):
 
 
 def _owner_graph_db_v3(proof):
-    if proof.kind in ('goal_management_metadata','artifact_no_dispatch_metadata','goal_projection_metadata'):return proof.request.actual_db
+    if proof.kind in ('goal_management_metadata','artifact_no_dispatch_metadata','goal_projection_metadata','owner_stop_reply_metadata'):return proof.request.actual_db
     return proof.graph._GraphCoordinator__store._db if proof.kind.startswith("host_") else proof.request.db
 
 
@@ -7121,180 +7142,6 @@ def prepare_current_host_owner_lease_read_entry_v3(reader):
         raise
 
 
-_BETA1_FIXTURE_OWNER_ENTRIES_V3 = WeakKeyDictionary()
-
-
-def _require_host_beta1_fixture_owner_reader_v3(reader):
-    from ..graph_worker import _require_beta1_engineering_metadata_provider_v3
-    from ..host.authority_profile import AdminInstallationBundle
-    provider=_require_beta1_engineering_metadata_provider_v3(reader.graph)
-    provider.require_current_beta1_fixture_evidence_reader_v3(reader)
-    graph=reader.graph;port=graph._GraphCoordinator__content_fence_v2;bundle=reader.bundle
-    from ..host.authority_profile import current_owner_metadata_installation_v3
-    actual_bundle,package_root,verified=current_owner_metadata_installation_v3(graph,expected_bundle=bundle)
-    namespace=reader.authority.namespace;scope=reader.read_scope;binding=reader.expected_owner_binding
-    record=graph._GraphCoordinator__leases.get(reader.lease)
-    if record is None:
-        raise AuthorityUnavailable('Beta1 evidence lacks its actual completed Owner lease')
-    graph._authorize(reader.lease,reader.authority,record[4],owner_read=True)
-    if (type(bundle)is not AdminInstallationBundle or actual_bundle is not bundle
-            or reader.runtime is not graph._GraphCoordinator__domain_production_runtime_v1
-            or reader.store is not graph._GraphCoordinator__store or reader.db is not reader.store._db
-            or reader.package_root!=package_root or reader.manifest_digest!=bundle.installation_policy.manifest_digest
-            or graph._GraphCoordinator__owner_leases.get(reader.lease)is not binding
-            or graph._GraphCoordinator__owner_session_proofs.get(reader.lease)is not reader.owner_session_proof
-            or reader.owner_principal!=binding.principal or binding.actor!=reader.authority.actor
-            or scope.operation!='read' or scope.namespace!=namespace or namespace!=bundle.installation_policy.namespace
-            or scope.authority_namespace!=bundle.installation_policy.authority_namespace
-            or scope.permit.holder!=bundle.installation_policy.administrator_holder
-            or port.installation_grant.installation_id!=bundle.installation_policy.installation_id
-            or reader.fence.authority is not reader.authority or reader.read_scope is not reader.fence.scope
-            or reader.graph_stamp!=(reader.fence.metadata,reader.fence.epoch)
-            or reader.fence.owner_binding is not None or reader.fence.owner_principal is not None
-            or reader.fence.fence_observer is not None
-            or reader.operation.deadline_utc is None
-            or reader.operation.deadline_utc>reader.original_deadline_utc
-            or reader.original_deadline_utc>bundle.installation_policy.root_grant.valid_until_utc):
-        raise AuthorityUnavailable('Beta1 evidence Owner metadata left its actual selected Reader/install/lease')
-    control=_require_owner_operation_v3(reader.operation,db=reader.db,namespace=namespace)
-    return graph,port,bundle,scope,control,reader.owner_principal
-
-
-def _observe_host_beta1_fixture_owner_authority_v3(reader):
-    from ..runtime.first_ingress_v2 import trusted_upper
-    from ..host.v2_fence_port import VerifiedIngressClockV2
-    graph,port,bundle,scope,control,principal=_require_host_beta1_fixture_owner_reader_v3(reader)
-    if reader.db.in_transaction:
-        raise AuthorityUnavailable('Beta1 evidence Owner admission must precede Graph SQL')
-    from ..host.authority_profile import require_current_owner_metadata_installation_v3
-    require_current_owner_metadata_installation_v3(graph,expected_bundle=bundle)
-    if port.validate_fence(scope)!=scope.permit:
-        raise AuthorityUnavailable('Beta1 evidence original READ permit changed')
-    token,request=reader.owner_session_proof
-    if request.principal!=principal or graph._current_owner_principal(reader.authority.actor,reader.authority.namespace)!=principal:
-        raise AuthorityUnavailable('Beta1 evidence current Owner pairing differs from its original session')
-    observed=port.get_current_owner_authority_for_fence_v1(namespace=scope.namespace,
-        authority_namespace=scope.authority_namespace,permit=scope.permit,
-        owner_actor_id=reader.authority.actor,owner_session_token=token,owner_session_request=request)
-    if (type(observed)is not tuple or len(observed)!=2 or type(observed[0])is not D12CurrentOwnerAuthorityV1
-            or observed[1]!=scope.permit):
-        raise AuthorityUnavailable('Beta1 evidence lacks its actual current signed-session Authority')
-    current=observed[0];guard=current.guard;binding=reader.expected_owner_binding
-    if (guard.authority_id!=scope.pinned_anchor.authority_id or guard.namespace!=reader.authority.namespace
-            or guard.authorization_revision!=binding.authorization_revision
-            or guard.authorization_head!=binding.authorization_head or guard.minimum_revocation_revision!=0
-            or guard.minimum_revocation_epoch!=binding.revocation_epoch or guard.pending_revoke_operation_id is not None
-            or (current.target_admission is None and current.storage_admission is None
-                and guard.installation_id!=port.installation_grant.installation_id)):
-        raise AuthorityUnavailable('Beta1 evidence original Owner guard/head/revocation/location changed')
-    clock=port.read_ingress_clock(bundle.ingress_clock);initial=reader.initial_clock
-    if (type(clock)is not VerifiedIngressClockV2 or type(initial)is not VerifiedIngressClockV2
-            or clock.sample.authority_id!=initial.sample.authority_id
-            or clock.sample.installation_id!=initial.sample.installation_id
-            or clock.sample.source_id!=initial.sample.source_id or clock.sample.epoch!=initial.sample.epoch
-            or clock.sample.monotonic_seconds<initial.sample.monotonic_seconds
-            or clock.monotonic_before_seconds<initial.monotonic_after_seconds
-            or clock.sample.source_id!=bundle.ingress_clock.source_id
-            or clock.sample.utc_error_seconds>bundle.ingress_clock.max_utc_error_seconds
-            or trusted_upper(clock)>=reader.operation.deadline_utc):
-        raise AuthorityUnavailable('Beta1 evidence actual clock/original deadline changed')
-    if port.validate_fence(scope)!=scope.permit:
-        raise AuthorityUnavailable('Beta1 evidence original READ changed after session observation')
-    return current
-
-
-def _require_host_beta1_fixture_owner_caller_v3(proof):
-    reader=proof.request
-    graph,port,bundle,scope,control,principal=_require_host_beta1_fixture_owner_reader_v3(reader)
-    if (proof.kind!='host_beta1_fixture_evidence_read' or proof.graph is not graph
-            or proof.service is not reader.runtime or proof.port is not port or proof.bundle is not bundle
-            or proof.scope is not scope or proof.authority is not reader.authority or proof.principal!=principal
-            or proof.retained_operation is not reader.operation or proof.control is not control
-            or proof.selection_digest!=reader.operation.selection_digest or proof.original_permit!=scope.permit
-            or proof.permission_anchor!=scope.pinned_anchor or proof.graph_comparison_anchor!=scope.pinned_anchor
-            or proof.namespace!=reader.authority.namespace
-            or proof.installation_id!=bundle.installation_policy.installation_id
-            or proof.holder!=bundle.installation_policy.administrator_holder):
-        raise AuthorityUnavailable('Beta1 evidence Owner proof crossed another private Reader/operation')
-
-
-def _host_beta1_fixture_owner_binding_from_facts_v3(proof,facts):
-    reader=proof.request;scope=proof.scope;current=proof.current_owner_authority;guard=current.guard
-    facts.require_for_v3(proof)
-    metadata=facts.metadata;req=metadata.requirements
-    if (req.namespace!=reader.authority.namespace or metadata.graph_revision!=scope.graph_revision
-            or facts.graph_epoch!=scope.graph_epoch or req.authority_namespace!=scope.authority_namespace
-            or not proof.graph._anchor_matches(req,scope.pinned_anchor)):
-        raise AuthorityUnavailable('Beta1 evidence fixed Owner EOF lost its original scope/location')
-    binding=proof.graph._owner_graph_binding_from_current_metadata_v3(reader.authority,proof.principal,
-        metadata=metadata,graph_epoch=facts.graph_epoch,atom=facts.atom,proof_row=facts.proof_row,
-        epochs=facts.epochs,target_admission=current.target_admission,
-        storage_admission=current.storage_admission,current_guard=guard)
-    if (binding!=reader.expected_owner_binding or guard.authorization_revision!=binding.authorization_revision
-            or guard.authorization_head!=binding.authorization_head or guard.minimum_revocation_revision!=0
-            or guard.minimum_revocation_epoch!=binding.revocation_epoch or guard.pending_revoke_operation_id is not None):
-        raise AuthorityUnavailable('Beta1 evidence full Owner binding differs from its actual lease/guard')
-    return binding
-
-
-@dataclass(frozen=True,slots=True,eq=False,weakref_slot=True)
-class _HostBeta1FixtureOwnerEntryV3:
-    issuer: InitVar[object]
-    def __post_init__(self,issuer):
-        if issuer is not _OWNER_CALLER_ISSUER_V3:
-            raise AuthorityUnavailable('Beta1 evidence Owner entry requires its actual private Reader')
-    def require_for_v3(self,reader):
-        registered=_BETA1_FIXTURE_OWNER_ENTRIES_V3.get(self)
-        if registered is None or registered[0].request is not reader:
-            raise AuthorityUnavailable('Beta1 evidence Owner entry left its original Reader')
-        proof,work,facts=registered
-        require_owner_location_caller_proof_v3(proof,phase='before',graph_stamp=reader.graph_stamp)
-        return _host_beta1_fixture_owner_binding_from_facts_v3(proof,facts)
-    def require_permission_v3(self,reader):
-        registered=_BETA1_FIXTURE_OWNER_ENTRIES_V3.get(self)
-        if registered is None or registered[0].request is not reader:
-            raise AuthorityUnavailable('Beta1 evidence Owner observation left its original Reader')
-        _require_owner_permission_outside_graph_v3(registered[0])
-        return self.require_for_v3(reader)
-    def release_v3(self):
-        registered=_BETA1_FIXTURE_OWNER_ENTRIES_V3.pop(self,None)
-        if registered is not None:
-            proof,work,_=registered
-            try:work.close_v3()
-            finally:proof.release_v3()
-
-
-def prepare_current_host_beta1_fixture_evidence_owner_entry_v3(reader):
-    graph,port,bundle,scope,control,principal=_require_host_beta1_fixture_owner_reader_v3(reader)
-    current=_observe_host_beta1_fixture_owner_authority_v3(reader);policy=bundle.installation_policy
-    proof=OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,
-        kind='host_beta1_fixture_evidence_read',graph=graph,service=reader.runtime,owner_service=None,controller=None,
-        port=port,bundle=bundle,scope=scope,authority=reader.authority,principal=principal,
-        current_owner_authority=current,current_owner_head=None,retained_operation=reader.operation,
-        control=control,selection_digest=reader.operation.selection_digest,namespace=reader.authority.namespace,
-        installation_id=policy.installation_id,holder=policy.administrator_holder,
-        permission_anchor=scope.pinned_anchor,graph_comparison_anchor=scope.pinned_anchor,credential=None,
-        subject=scope.permit.subject,original_permit=scope.permit,request=reader,
-        deadline_utc=reader.operation.deadline_utc,thread=get_ident())
-    work=None
-    try:
-        work=prepare_owner_location_read_work_v3(proof)
-        while not work.complete:
-            with owner_location_read_quantum_v3(proof)as meter:progress=work.advance(meter=meter)
-            if type(progress)is dict and progress.get('phase')=='owner_location_quantum_commit':
-                work.complete_reserved_quantum_v3(proof)
-        facts=work.result.require_for_v3(proof)
-        _host_beta1_fixture_owner_binding_from_facts_v3(proof,facts)
-        _require_owner_permission_outside_graph_v3(proof)
-        entry=_HostBeta1FixtureOwnerEntryV3(_OWNER_CALLER_ISSUER_V3)
-        _BETA1_FIXTURE_OWNER_ENTRIES_V3[entry]=(proof,work,facts)
-        return entry
-    except BaseException as exc:
-        if work is not None:work.cancel_v3(exc)
-        proof.release_v3()
-        raise
-
-
 def create_goal_projection_owner_caller_proof_v3(invocation):
     from .goal_projection_metadata_invocation_v1 import (
         GoalProjectionMetadataInvocationV1,require_goal_projection_metadata_invocation_v1,
@@ -7743,3 +7590,24 @@ def prepare_current_host_habit_maintenance_write_owner_read_entry_v3(reader, sco
     if _semantic_write_owner_kind_v3(issued) != 'host_habit_maintenance_write_source':
         raise AuthorityUnavailable('Habit maintenance Owner requires its own actual private current issuer')
     return _prepare_current_host_semantic_write_owner_read_entry_v3(reader, scope, issued)
+
+
+
+def create_owner_stop_reply_metadata_caller_proof_v1(invocation):
+    from .owner_stop_reply_metadata_v1 import (
+        OwnerStopReplyMetadataInvocationV1,require_owner_stop_reply_metadata_invocation_v1)
+    if type(invocation)is not OwnerStopReplyMetadataInvocationV1:
+        raise AuthorityUnavailable("StopReply Owner facts require their actual private caller")
+    require_owner_stop_reply_metadata_invocation_v1(invocation,phase="before")
+    _require_owner_operation_v3(invocation.retained_operation,db=invocation.actual_db,
+        namespace=invocation.namespace,control=invocation.control)
+    if (invocation.current_owner_head.guard!=invocation.current_owner_guard
+            or invocation.current_owner_head.issue_operation.principal!=invocation.principal):
+        raise AuthorityUnavailable("StopReply metadata changed its actual current Owner head/principal")
+    return OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,
+        "owner_stop_reply_metadata",None,invocation.service,invocation.service,None,None,
+        invocation.bundle,invocation.original_permit,None,invocation.principal,None,invocation.current_owner_head,
+        invocation.retained_operation,invocation.control,invocation.selection_digest,invocation.namespace,
+        invocation.installation_id,invocation.holder,invocation.current_anchor,invocation.current_anchor,
+        invocation.credential,invocation.subject,invocation.original_permit,invocation,
+        invocation.registered_deadline_utc,get_ident())

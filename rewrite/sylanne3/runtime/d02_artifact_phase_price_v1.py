@@ -331,8 +331,8 @@ def _installed_phase_count_policy_v1(installed_readers):
         raise MissingProductionOriginalV1("installed_actual_artifact_phase_serialized_input_counter")
     if type(policy) is not ArtifactPhaseCountPolicyV1:
         raise TypeError("phase prices reject unknown installed counter policies")
-    if policy.source_scope == "LOCAL_FIXTURE":
-        _phase_count_allows_fixture_v1(installed_readers)
+    if policy.source_scope != "production":
+        raise ValueError("phase prices require the actual installed production counter")
     if (policy.namespace, policy.installation_id, policy.manifest_digest, policy.profile_id,
             policy.provider_id, policy.model_id, policy.provider_config_digest, policy.template_version) != (
             bundle.installation_policy.namespace, bundle.installation_policy.installation_id,
@@ -402,8 +402,7 @@ def require_current_artifact_phase_count_in_transaction_v1(db, *, frame, binding
     from ..authority_service.artifact_phase_counter_v1 import verify_artifact_phase_count_envelope_v1
     read = CurrentDomainReadV1(frame); read.check(db)
     policy = _installed_phase_count_policy_v1(installed_readers)
-    evidence = verify_artifact_phase_count_envelope_v1(policy, count_request, envelope, now_utc=frame.now_utc,
-        allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+    evidence = verify_artifact_phase_count_envelope_v1(policy, count_request, envelope, now_utc=frame.now_utc)
     sources, reads, coverage = _phase_count_scope_v1(frame)
     from ..model_broker.artifact_draft_v1 import artifact_draft_input_from_wire_v2
     user = json.loads(json.loads(provider_request_json)["messages"][1]["content"])
@@ -478,7 +477,7 @@ def require_final_artifact_phase_counts_in_transaction_v1(db, *, frame, binding,
         original_deadline_utc=original_deadline_utc, input_kind="actual", installed_readers=installed_readers)
     initial, final = require_independent_actual_phase_counts_v1(counter, initial_request=initial_request,
         initial_envelope=initial_envelope, final_request=final_request, final_envelope=final_envelope,
-        now_utc=frame.now_utc, allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+        now_utc=frame.now_utc)
     price, _, _ = read_current_artifact_phase_price_policy_v1(db, frame=frame, installed_readers=installed_readers)
     ceiling = dict(quote_ceiling)
     limits = next({"input_tokens": inp, "output_tokens": out} for kind, inp, out in PHASE_TOKEN_CEILINGS_V2
@@ -554,8 +553,7 @@ def double_count_frozen_artifact_phase_stage_outside_transaction_v1(runtime, *, 
     command = InstalledArtifactPhaseCounterCommandV1(policy)
     from .first_ingress_v2 import trusted_upper
     clock = graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
-    initial = command.count_outside_graph_transaction_v1(db=store._db, request=initial_request, now_utc=trusted_upper(clock),
-        allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+    initial = command.count_outside_graph_transaction_v1(db=store._db, request=initial_request, now_utc=trusted_upper(clock))
     # Reconstruct from the same immutable actual stage, not the first program's output.
     rebuilt = canonical_serialize(artifact_phase_provider_request_v1(frozen_stage.model_request,
         billing_policy=bundle.provider_billing_policy_v1))
@@ -563,12 +561,10 @@ def double_count_frozen_artifact_phase_stage_outside_transaction_v1(runtime, *, 
         raise ValueError("independent actual phase body reconstruction changed its frozen stage")
     final_request = replace(initial_request, nonce=secrets.token_hex(16))
     clock = graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
-    final = command.count_outside_graph_transaction_v1(db=store._db, request=final_request, now_utc=trusted_upper(clock),
-        allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+    final = command.count_outside_graph_transaction_v1(db=store._db, request=final_request, now_utc=trusted_upper(clock))
     clock = graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
     require_independent_actual_phase_counts_v1(policy, initial_request=initial_request, initial_envelope=initial,
-        final_request=final_request, final_envelope=final, now_utc=trusted_upper(clock),
-        allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+        final_request=final_request, final_envelope=final, now_utc=trusted_upper(clock))
     return ArtifactPhaseCountPairV1(initial_request, canonical_serialize(initial), final_request,
         canonical_serialize(final), commitment)
 
@@ -589,8 +585,7 @@ def verify_frozen_artifact_phase_count_pair_in_transaction_v1(db, *, frozen_stag
         raise ValueError("final phase counter pair does not belong to the original exact acquisition stage")
     initial, final = require_independent_actual_phase_counts_v1(policy, initial_request=count_pair.initial_request,
         initial_envelope=json.loads(count_pair.initial_envelope_json), final_request=count_pair.final_request,
-        final_envelope=json.loads(count_pair.final_envelope_json), now_utc=now_utc,
-        allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+        final_envelope=json.loads(count_pair.final_envelope_json), now_utc=now_utc)
     # This temporary current view is never saved or written into a request/model.
     current_frame = replace(frozen_stage.frame, now_utc=now_utc)
     read = CurrentDomainReadV1(current_frame); read.check(db)
@@ -905,7 +900,7 @@ def personal_phase_counts_for_owner_fence_v1(runtime, *, authority, operation, r
         for count_request in requests:
             clock = graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
             envelope = command.count_outside_graph_transaction_v1(db=store._db, request=count_request,
-                now_utc=trusted_upper(clock), allow_local_fixture=_phase_count_allows_fixture_v1(readers))
+                now_utc=trusted_upper(clock))
             counted.append((count_request, canonical_serialize(envelope)))
         prior_price_reader = readers.phase_price_reader
         readers.phase_price_reader = install_artifact_phase_price_reader_v1(readers=readers, count_materials=tuple(counted))
@@ -995,8 +990,7 @@ def read_adopted_personal_phase_count_price_v1(db, *, frame, binding, prospectiv
         raise MissingProductionOriginalV1("actual_adopted_signed_historical_prospective_phase_count")
     request = artifact_phase_count_request_from_wire_v1(selected[0]["count_request"])
     counter = _installed_phase_count_policy_v1(installed_readers)
-    evidence = verify_artifact_phase_count_envelope_v1(counter, request, selected[0]["signed_envelope"], now_utc=frame.now_utc,
-        allow_local_fixture=_phase_count_allows_fixture_v1(installed_readers))
+    evidence = verify_artifact_phase_count_envelope_v1(counter, request, selected[0]["signed_envelope"], now_utc=frame.now_utc)
     policy, pin, original = read_current_artifact_phase_price_policy_v1(db, frame=frame, installed_readers=installed_readers)
     inp, out = next((i, o) for kind, i, o in PHASE_TOKEN_CEILINGS_V2 if kind == binding.phase_kind)
     ceiling = dict(policy.quote_ceiling)
@@ -1047,28 +1041,6 @@ def read_adopted_personal_phase_count_price_v1(db, *, frame, binding, prospectiv
         raise MissingProductionOriginalV1("current_installed_and_prior_actual_prospective_count_price_identity")
     return current
 
-def _phase_count_allows_fixture_v1(installed_readers):
-    """Derived private qualification only; callers cannot turn on a fixture flag."""
-    bundle, _ = _installed_bundle(installed_readers)
-    policy = getattr(bundle, "artifact_phase_counter", None)
-    if policy is None or policy.source_scope == "production":
-        return False
-    from ..host.authority_profile import require_artifact_phase_fixture_qualification_v1
-    from .d11_artifact_draft_model_v1 import InstalledArtifactDraftModelReadersV1
-    from .d08_personal_candidate_v1 import InstalledPersonalCandidateReadersV1
-    from .d02_production_operations_v1 import InstalledD02ProductionReadersV1
-    if type(installed_readers) is InstalledArtifactDraftModelReadersV1:
-        model_runtime = installed_readers.model_runtime
-    elif type(installed_readers) is InstalledPersonalCandidateReadersV1:
-        model_runtime = installed_readers.current().graph._GraphCoordinator__artifact_draft_model_runtime_v1
-    elif type(installed_readers) is InstalledD02ProductionReadersV1:
-        model_runtime = installed_readers.role_clock_reader.graph._GraphCoordinator__artifact_draft_model_runtime_v1
-    else:
-        raise TypeError("fixture counter requires its real installed reader identity")
-    if model_runtime is None or model_runtime.bundle is not bundle:
-        raise ValueError("fixture counter has no actual bound model runtime/client grant")
-    require_artifact_phase_fixture_qualification_v1(bundle, client_grant=model_runtime.client_grant)
-    return True
 
 def read_current_artifact_phase_reservation_ceiling_v1(db, *, frame, selector, chosen, installed_readers):
     """Fresh installed phase maximum for the existing once reservation.

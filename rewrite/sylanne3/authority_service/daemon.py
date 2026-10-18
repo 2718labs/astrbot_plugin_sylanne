@@ -533,8 +533,9 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
                 from .d13_natural_frame_verifier_v7 import build_authority_d13_natural_frame_verifier_v7
                 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
                 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+                from ..host.model_workflows_v9 import AdminModelWorkflowsV9
                 from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
-                actual_v7=(type(workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8} and workflows.natural_generation is not None
+                actual_v7=(type(workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and workflows.natural_generation is not None
                     and workflows.natural_generation.template_version==V7_TEMPLATE)
                 history_factory=(build_authority_d13_natural_frame_verifier_v7 if actual_v7 else
                     build_authority_d13_natural_frame_verifier_v6 if actual_v6 else build_authority_d13_natural_frame_verifier_v1)
@@ -987,7 +988,8 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                 server.install_current_foreground_activity_v1(namespace, foreground)
                 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
                 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
-                if type(offline_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}:
+                from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+                if type(offline_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
                     from .d13_installed_counter_factory_v1 import install_d13_core_counter_v1
                     from ..runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
                     from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
@@ -1058,7 +1060,8 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                     from ..host.model_workflows_v6 import AdminModelWorkflowsV6
                     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
                     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
-                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8):
+                    from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
                         from .contact_model_result_service_v2 import InstalledContactModelResultServiceV2 as InstalledContactModelResultServiceV1
                         install_contact_reader = server.install_contact_model_result_reader_v2
                     else:

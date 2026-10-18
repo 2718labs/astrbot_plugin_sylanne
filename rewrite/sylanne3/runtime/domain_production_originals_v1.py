@@ -93,6 +93,7 @@ def record_adopted_domain_operation_v1(db, stage, receipt):
 
 
 def read_adopted_domain_operation_v1(db, namespace, operation_id):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..authority_service.named_joint_binding_body_v1 import named_joint_adopted_operation_v1
     named,value=named_joint_adopted_operation_v1(db,namespace,operation_id)
     if named:return value
@@ -105,7 +106,7 @@ def read_adopted_domain_operation_v1(db, namespace, operation_id):
     background,row=read_bound_background_graph_attachment_v3(db,table=TABLE,columns=('domain','operation_kind','request_digest','original_digest','original_payload_json','read_versions_json','bundle_digest','receipt_json','receipt_digest'),
         key_columns=('bot','persona','operation_id'),key=(*namespace.as_tuple,operation_id))
     if not background:
-        row = _producer_original_point_v3(db, table='graph_domain_production_originals_v1', columns=('domain', 'operation_kind', 'request_digest', 'original_digest', 'original_payload_json', 'read_versions_json', 'bundle_digest', 'receipt_json', 'receipt_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, operation_id)), legacy_reader=lambda: db.execute(f"SELECT domain,operation_kind,request_digest,original_digest,original_payload_json,"
+        row = _producer_original_point_v3(db, table='graph_domain_production_originals_v1', columns=('domain', 'operation_kind', 'request_digest', 'original_digest', 'original_payload_json', 'read_versions_json', 'bundle_digest', 'receipt_json', 'receipt_digest'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, operation_id)), legacy_reader=lambda: _artifact_receipt_sql_v1(db,f"SELECT domain,operation_kind,request_digest,original_digest,original_payload_json,"
         f"read_versions_json,bundle_digest,receipt_json,receipt_digest FROM {TABLE} "
         "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation_id)).fetchone())
     if row is None:
@@ -139,7 +140,7 @@ def read_adopted_domain_operation_v1(db, namespace, operation_id):
         columns=('digest','activity_id','effect_id','commit_seq'),key_columns=('bot','persona','operation_id'),
         key=(*namespace.as_tuple,operation_id))
     if not background_actual:
-        actual = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'activity_id', 'effect_id', 'commit_seq'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, operation_id)), legacy_reader=lambda: db.execute("SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations "
+        actual = _producer_original_point_v3(db, table='graph_bundle_operations', columns=('digest', 'activity_id', 'effect_id', 'commit_seq'), key_columns=('bot', 'persona', 'operation_id'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2]))((*namespace.as_tuple, operation_id)), legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations "
         "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation_id)).fetchone())
     if actual != (receipt.operation_digest, receipt.activity_id, receipt.effect_id, receipt.commit_seq):
         raise ValueError("domain adopted original lost its actual W01 commit")
@@ -277,17 +278,19 @@ def _physical_original_row_v3(db,namespace,operation_id):
 
 
 def _validate_physical_original_metadata_v3(db,namespace,operation_id,row):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     domain,kind,request,digest,cell,prepared,reads_json,bundle_digest,receipt_json,receipt_digest=row
     if (domain,kind)!=('d06','admit_owner_material_source_v1'):
         raise ValueError('unregistered physical domain original kind')
-    read_rows=json.loads(reads_json);raw_receipt=json.loads(receipt_json);receipt=_receipt(raw_receipt)
+    read_rows=background_json_loads_v3(reads_json);raw_receipt=background_json_loads_v3(receipt_json);receipt=_receipt(raw_receipt)
     reads=tuple(GraphVersion(AtomKey.from_token(token),revision) for token,revision in read_rows)
     if (canonical_serialize(read_rows)!=reads_json or len(reads)>1024
             or any(NamespaceId.from_key(value.key)!=namespace for value in reads)
             or canonical_serialize(raw_receipt)!=receipt_json or canonical_digest(receipt)!=receipt_digest
             or receipt.operation_id!=operation_id or receipt.operation_digest!=bundle_digest):
         raise ValueError('physical domain original receipt/readset exact v1 wire differs')
-    actual=db.execute('SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations '
+    actual=_artifact_receipt_sql_v1(db,'SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations '
         'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation_id)).fetchone()
     if actual!=(bundle_digest,receipt.activity_id,receipt.effect_id,receipt.commit_seq):
         raise ValueError('physical domain original lost its actual W01 bundle')

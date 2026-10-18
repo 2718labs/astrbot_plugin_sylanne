@@ -1,4 +1,6 @@
 """Adopt paid C4 text as D06 authored/unknown Source in the actual W01 CAS."""
+
+from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
 from dataclasses import asdict,dataclass,fields
 import json
 
@@ -335,12 +337,14 @@ def read_current_adopted_artifact_draft_content_v2(db, *, frame, selector, insta
 
 
 def read_plan_artifact_draft_content_v1(db,*,namespace,c02_operation_id,root_registration_ref):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     selector=artifact_draft_task_selector_v1(namespace,c02_operation_id=c02_operation_id,root_registration_ref=root_registration_ref)
     ids=artifact_draft_model_ids_v1(selector)
-    row=db.execute("SELECT payload_json FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_adopted' AND original_ref=?",
+    row=_artifact_receipt_sql_v1(db,"SELECT payload_json FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_adopted' AND original_ref=?",
         (*namespace.as_tuple,ids["adopt"])).fetchone()
     if row is None:return (),(),(ids["adopt"],)
-    a=artifact_draft_content_from_wire_v1(json.loads(row[0]),ArtifactDraftContentAdoptionV1)
+    a=artifact_draft_content_from_wire_v1(background_json_loads_v3(row[0]),ArtifactDraftContentAdoptionV1)
     return ((AtomKey.from_token(a.content.content.ref),AtomKey.from_token(a.task_source.ref)),a.content.source_refs,
         (ids["job"],ids["frozen"],ids["adopt"],a.paid_original_ref,a.result_original_ref,a.activity_scope_ref,root_registration_ref))
 
@@ -611,6 +615,8 @@ def decode_artifact_draft_phase_content_original_v2(kind, raw):
 
 
 def _read_phase_content_adoption_original_v2(db, *, namespace, selector, issuer):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3, background_json_matches_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_event_point_v3,artifact_model_graph_point_v3
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .jobs import get_job
@@ -631,11 +637,12 @@ def _read_phase_content_adoption_original_v2(db, *, namespace, selector, issuer)
     source = artifact_model_graph_point_v3(db,('revision', 'value', 'valid'),token=value.content.content.ref)
     history = artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=value.content.content.ref,revision=value.content.content.revision)
     if (source is None or source[0] != value.content.content.revision or source[2] != 1
-            or canonical_digest(json.loads(source[1])) != value.content.content.digest
-            or history != (value.adoption_operation_id, source[1], 1)
+            or background_json_digest_v3(source[1],background_json_loads_v3(source[1])) != value.content.content.digest
+            or history is None or (history[0],history[2])!=(value.adoption_operation_id,1)
+            or background_json_digest_v3(history[1],background_json_loads_v3(history[1]))!=value.content.content.digest
             or GraphVersion(AtomKey.from_token(value.content.content.ref), source[0]) not in original['receipt'].write_versions):
         raise ValueError('phase authored Source is not its exact current adoption CAS member')
-    record = SourceRecord.from_dict(json.loads(source[1]))
+    record = SourceRecord.from_dict(background_json_loads_v3(source[1]))
     if (record.source_kind != 'authored' or record.assertion_status != 'unknown'
             or record.recorded_at != value.recorded_at_utc
             or (hashlib.sha256(record.text.encode()).hexdigest(), len(record.text.encode())) !=
@@ -669,9 +676,9 @@ def _read_phase_content_adoption_original_v2(db, *, namespace, selector, issuer)
     if (job.phase, job.result_ref, job.cancel_epoch, job.lease_holder, job.lease_expires_utc) != (
             'completed', ids['adopt'], 0, None, None):
         raise ValueError('phase paid content lost actual completed worker')
-    job_history = artifact_model_graph_event_point_v3(db,('value', 'valid'),token=job_graph_write(job).key.token,event_id=value.adoption_operation_id,legacy_reader=lambda:db.execute('SELECT value,valid FROM graph_history WHERE token=? AND event_id=? ORDER BY revision DESC LIMIT 1',
+    job_history = artifact_model_graph_event_point_v3(db,('value', 'valid'),token=job_graph_write(job).key.token,event_id=value.adoption_operation_id,legacy_reader=lambda:_artifact_receipt_sql_v1(db,'SELECT value,valid FROM graph_history WHERE token=? AND event_id=? ORDER BY revision DESC LIMIT 1',
         (job_graph_write(job).key.token, value.adoption_operation_id)).fetchone())
-    if job_history != (canonical_serialize(job_graph_write(job).value), 1):
+    if job_history is None or job_history[1]!=1 or not background_json_matches_v3(job_history[0],job_graph_write(job).value):
         raise ValueError('phase completed job is not in original authored Source CAS')
     return value, row, record, actual_scope
 
@@ -801,7 +808,7 @@ def read_current_artifact_phase_verified_v2(db, *, namespace, selector, issuer):
     prepared = read_artifact_draft_prepared_v2(db, namespace=namespace, selector=value.content_selector, issuer=issuer)
     if prepared is None: raise MissingProductionOriginalV1('actual_phase_frozen_material_predecessor')
     frozen = read_artifact_draft_frozen_v2(db, prepared=prepared, issuer=issuer)
-    contract = require_artifact_phase_frozen_contract_history_v3(db, namespace=namespace, frozen=frozen)
+    contract = require_artifact_phase_frozen_contract_history_v3(db, namespace=namespace, frozen=frozen, issuer=issuer)
     signed_contract = _read(db, issuer=issuer, namespace=namespace, kind=CONTRACT_KIND, ref=contract.original_ref)
     if signed_contract is None or canonical_digest(signed_contract[0]) != contract.digest:
         raise ValueError('phase verified lost its actual signed preregistered contract')
@@ -816,7 +823,7 @@ def read_current_artifact_phase_verified_v2(db, *, namespace, selector, issuer):
         if assessment_row is None or canonical_digest(assessment_row[0]) != proof.original_digest:
             raise MissingProductionOriginalV1('actual_signed_phase_assessment_original')
         assessment = require_artifact_phase_assessment_history_v1(db, namespace=namespace, original_ref=expected_ref,
-            producing_operation_id=assessment_row[1], raw=assessment_row[0])
+            producing_operation_id=assessment_row[1], raw=assessment_row[0], issuer=issuer)
         _require_actual_artifact_phase_assessment_v1(selector=selector, content_selector=value.content_selector,
             contract=contract, assessment=assessment, adoption=adoption, file_result_ref=value.readback_original_ref,
             file_result_digest=value.readback_original_digest, readback=readback)
@@ -850,6 +857,8 @@ def read_current_artifact_phase_verified_v2(db, *, namespace, selector, issuer):
 
 
 def _read_current_artifact_method_cycle_v2(db, *, namespace, selector, issuer, now_utc):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .foreground_cycle_v1 import foreground_cycle_ids_v1, foreground_cycle_from_wire_v1, ForegroundCycleContinuationV2
     from .foreground_call_plan_v1 import ForegroundCallPlanV2
     from .d11_artifact_draft_model_v1 import require_current_artifact_phase_group_v2
@@ -867,12 +876,12 @@ def _read_current_artifact_method_cycle_v2(db, *, namespace, selector, issuer, n
         raise MissingProductionOriginalV1('actual_current_artifact_method_cycle')
     actual = foreground_cycle_from_wire_v1(cycle.continuation)
     projection = job_graph_write(cycle)
-    row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+    row = _artifact_receipt_sql_v1(db,'SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
         (*namespace.as_tuple, projection.key.token)).fetchone()
-    if (type(actual) is not ForegroundCycleContinuationV2 or type(actual.call_plan) is not ForegroundCallPlanV2
+    if (type(actual) is not ForegroundCycleContinuationV2 or type(actual.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}
             or actual.call_plan.phase_group.selector != selector or selector.task.cycle_job_ref != projection.key.token
             or actual.c02_operation_id != selector.task.c02_operation_id
-            or row is None or row[2] != 1 or json.loads(row[1]) != projection.value
+            or row is None or row[2] != 1 or background_json_loads_v3(row[1]) != projection.value
             or cycle.cancel_epoch or cycle.phase not in {'running', 'queued', 'waiting'}
             or now_utc >= _utc(cycle.deadline_utc).timestamp()):
         raise MissingProductionOriginalV1('actual_uncancelled_current_method_cycle_and_original_deadline')
@@ -901,7 +910,9 @@ def read_current_artifact_phase_check_inputs_v2(db, *, namespace, selector, issu
     from .d11_offline_originals_v1 import _utc
     if now_utc >= min(_utc(verified.original_deadline_utc).timestamp(), contract.original_deadline_utc):
         raise MissingProductionOriginalV1('original_artifact_phase_check_deadline')
-    request = ObserveArtifactPhasePostconditionsRequestV1(selector, verified.readback_original_ref, contract.original_ref)
+    from .artifact_phase_postconditions_v1 import artifact_phase_expected_observer_refs_v1
+    request = ObserveArtifactPhasePostconditionsRequestV1(selector, verified.readback_original_ref, contract.original_ref,
+        artifact_phase_expected_observer_refs_v1(contract,selector))
     ref = artifact_phase_assessment_original_ref_v1(selector)
     original = _read(db, issuer=issuer, namespace=namespace, kind=ASSESSMENT_KIND, ref=ref)
     assessment = None if original is None else read_current_artifact_phase_assessment_v1(db, namespace=namespace,
@@ -930,7 +941,7 @@ def require_current_artifact_method_completion_v2(db, *, namespace, continuation
     from .foreground_call_plan_v1 import ForegroundCallPlanV2, ForegroundModelAttemptV2
     from .artifact_phase_postconditions_v1 import readonly_current_artifact_phase_postcondition_contract_v1
     from .d11_offline_originals_v1 import _utc
-    if type(continuation) is not ForegroundCycleContinuationV2 or type(continuation.call_plan) is not ForegroundCallPlanV2:
+    if type(continuation) is not ForegroundCycleContinuationV2 or type(continuation.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
         raise TypeError('method completion requires the actual adopted phase continuation')
     group = continuation.call_plan.phase_group; selector = group.selector
     _, actual = _read_current_artifact_method_cycle_v2(db, namespace=namespace, selector=selector, issuer=issuer, now_utc=now_utc)
@@ -1012,6 +1023,8 @@ def require_current_artifact_prior_content_v2(db, *, namespace, selector, prior,
 
 
 def read_plan_artifact_draft_phase_verification_v2(db, *, namespace, request, installed_readers=None):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d01_production_operations_v1 import production_read_plan_v1
     from .d11_artifact_draft_model_v1 import read_plan_artifact_draft_model_v2, AcquireArtifactDraftModelRequestV2
     from .d11_life_contract_v1 import D11LifeTerminalV1
@@ -1033,17 +1046,17 @@ def read_plan_artifact_draft_phase_verification_v2(db, *, namespace, request, in
         tuple(k for plan in plans for k in plan.required_original_refs))
     keys, roots = list(base.exact_keys), list(base.source_roots)
     originals = [*base.required_original_refs, ids['adopt'], ids['paid'], ids['result'], request.file_result_ref]
-    adoption_row = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='c4_phase_adopted' AND original_ref=?",
+    adoption_row = _artifact_receipt_sql_v1(db,"SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='c4_phase_adopted' AND original_ref=?",
         (*namespace.as_tuple, ids['adopt'])).fetchone()
     if adoption_row is not None:
-        adoption = artifact_draft_content_from_wire_v2(json.loads(adoption_row[0]), ArtifactDraftContentAdoptionV2)
+        adoption = artifact_draft_content_from_wire_v2(background_json_loads_v3(adoption_row[0]), ArtifactDraftContentAdoptionV2)
         keys.extend((AtomKey.from_token(adoption.content.content.ref), AtomKey.from_token(adoption.task_source.ref)))
         roots.extend(adoption.content.source_refs)
         originals.extend((adoption.activity_scope_ref, adoption.extent_original_ref))
-    file_row = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",
+    file_row = _artifact_receipt_sql_v1(db,"SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='adopted_life' AND original_ref=?",
         (*namespace.as_tuple, request.file_result_ref)).fetchone()
     if file_row is not None:
-        file_original = json.loads(file_row[0])
+        file_original = background_json_loads_v3(file_row[0])
         terminal = life_from_wire_v1(file_original['terminal'], D11LifeTerminalV1)
         originals.extend((terminal.binding.prepared_original_ref, terminal.original_ref))
         roots.extend(file_original['source_refs'])
@@ -1063,7 +1076,7 @@ def stage_verify_current_artifact_draft_phase_v2(db, *, frame, request, installe
     if frame.envelope.identity.operation_id != artifact_draft_phase_original_ref_v2(selector) + ':verify':
         raise ValueError('phase verification changed its deterministic original once operation')
     _, _, continuation, root, _, mapping_atom, _ = _current_task(db, frame=frame, selector=task, readers=readers)
-    if (type(continuation.call_plan) is not ForegroundCallPlanV2 or continuation.call_plan.phase_group.selector != selector
+    if (type(continuation.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3} or continuation.call_plan.phase_group.selector != selector
             or len(continuation.call_plan.phase_group.completed_phase_originals) != selector.phase_index):
         raise ValueError('phase verification cannot replace or skip an independently verified prefix')
     require_current_artifact_phase_group_v2(db, namespace=task.namespace, group=continuation.call_plan.phase_group, issuer=readers.issuer)
@@ -1078,7 +1091,7 @@ def stage_verify_current_artifact_draft_phase_v2(db, *, frame, request, installe
     prepared = read_artifact_draft_prepared_v2(db, namespace=task.namespace, selector=content_selector, issuer=readers.issuer)
     if prepared is None: raise MissingProductionOriginalV1('actual_phase_frozen_material_predecessor')
     frozen = read_artifact_draft_frozen_v2(db, prepared=prepared, issuer=readers.issuer)
-    if require_artifact_phase_frozen_contract_history_v3(db, namespace=task.namespace, frozen=frozen) != contract:
+    if require_artifact_phase_frozen_contract_history_v3(db, namespace=task.namespace, frozen=frozen, issuer=readers.issuer) != contract:
         raise ValueError('phase verification changed the contract committed before actual generation')
     if selector.phase_index:
         previous_row = _read(db, issuer=readers.issuer, namespace=task.namespace, kind='c4_phase_verified', ref=selector.prev_phase_original_ref)
@@ -1288,6 +1301,8 @@ def bind_artifact_method_settlement_stage_v2(db, *, frame, request, stage, issue
 
 
 def require_artifact_method_settlement_history_v2(db, *, namespace, original, raw):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .artifact_task_observer_v1 import require_artifact_task_milestone_history_v2
@@ -1316,15 +1331,15 @@ def require_artifact_method_settlement_history_v2(db, *, namespace, original, ra
     for member in value.members:
         if member.before not in original['read_versions']:
             raise ValueError('completed method Goal settlement omitted a before CAS read')
-        before=db.execute('SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(member.before.key.token,member.before.revision)).fetchone()
-        after=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',(member.after.key.token,member.after.revision)).fetchone()
-        if (before is None or before[1]!=1 or canonical_digest(json.loads(before[0]))!=member.before_value_digest
+        before=_artifact_receipt_sql_v1(db,'SELECT value,valid FROM graph_history WHERE token=? AND revision=?',(member.before.key.token,member.before.revision)).fetchone()
+        after=_artifact_receipt_sql_v1(db,'SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',(member.after.key.token,member.after.revision)).fetchone()
+        if (before is None or before[1]!=1 or background_json_digest_v3(before[0],background_json_loads_v3(before[0]))!=member.before_value_digest
                 or after is None or after[0]!=value.settlement_operation_id or after[2]!=1
-                or canonical_digest(json.loads(after[1]))!=member.after_value_digest):
+                or background_json_digest_v3(after[1],background_json_loads_v3(after[1]))!=member.after_value_digest):
             raise ValueError('completed method Goal settlement lost exact signed before-to-after history')
     for member in value.members:
-        row=db.execute('SELECT value FROM graph_history WHERE token=? AND revision=?',(member.after.key.token,member.after.revision)).fetchone()
-        after_value=json.loads(row[0])
+        row=_artifact_receipt_sql_v1(db,'SELECT value FROM graph_history WHERE token=? AND revision=?',(member.after.key.token,member.after.revision)).fetchone()
+        after_value=background_json_loads_v3(row[0])
         if member.after.key.token==value.goal_ref:
             expected_state='active' if value.state=='partial' else 'satisfied'
         elif member.after.key.token==value.plan_ref:
@@ -1333,12 +1348,12 @@ def require_artifact_method_settlement_history_v2(db, *, namespace, original, ra
             expected_state='waiting' if value.state=='partial' else 'completed'
         if after_value['state']!=expected_state:
             raise ValueError('completed method history changed actual partial/satisfied after-state semantics')
-    milestone_row=db.execute('SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
+    milestone_row=_artifact_receipt_sql_v1(db,'SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
         ' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',(*namespace.as_tuple,'artifact_task_milestone_v2',value.milestone_original_ref)).fetchone()
     if milestone_row is None or milestone_row[1]!=value.milestone_original_digest:
         raise MissingProductionOriginalV1('actual_completed_method_semantic_milestone_original')
     milestone=require_artifact_task_milestone_history_v2(db,namespace=namespace,original_ref=value.milestone_original_ref,
-        producing_operation_id=milestone_row[2],raw=json.loads(milestone_row[0]))
+        producing_operation_id=milestone_row[2],raw=background_json_loads_v3(milestone_row[0]))
     if ((milestone.selector,milestone.ordered_phase_originals,milestone.file_result_ref,milestone.file_result_digest,
             milestone.source_head,milestone.source_value_digest,milestone.owner_guard,milestone.original_deadline_utc)!=
             (value.selector,value.ordered_phase_originals,value.file_result_ref,value.file_result_digest,value.source_head,
@@ -1349,17 +1364,19 @@ def require_artifact_method_settlement_history_v2(db, *, namespace, original, ra
         producer=read_adopted_domain_operation_v1(db,namespace,op)
         if producer is None or producer['original_digest']!=digest or (producer['domain'],producer['operation_kind'])!=('d10',kind):
             raise ValueError('completed method Goal transition lost actual D10 progress/project settlement')
-    progress=db.execute('SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
+    progress=_artifact_receipt_sql_v1(db,'SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?',
         (value.progress_head.key.token,value.progress_head.revision)).fetchone()
     if (progress is None or progress[0]!=value.progress_operation_id or progress[2]!=1
-            or canonical_digest(json.loads(progress[1]))!=value.progress_value_digest
-            or json.loads(progress[1])['artifact_ref']!=value.file_result_ref):
+            or background_json_digest_v3(progress[1],background_json_loads_v3(progress[1]))!=value.progress_value_digest
+            or background_json_loads_v3(progress[1])['artifact_ref']!=value.file_result_ref):
         raise ValueError('completed method Goal transition changed its actual full-file D10 progress')
     return value
 
 
 def read_current_completed_artifact_method_history_v2(db, *, namespace, selector, issuer, owner_guard, installed_bundle):
     """Return disclosed completed history and its original receipt; never a live Contract."""
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .artifact_task_observer_v1 import read_current_artifact_task_milestone_v2
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
@@ -1385,34 +1402,35 @@ def read_current_completed_artifact_method_history_v2(db, *, namespace, selector
     if prepared is None or (root.installation_id,root.manifest_digest)!=pins or (prepared.installation_id,prepared.manifest_digest)!=pins:
         raise ValueError('completed method history mixed another installation Root or actual paid model')
     frozen=read_artifact_draft_frozen_v2(db,prepared=prepared,issuer=issuer)
-    contract=require_artifact_phase_frozen_contract_history_v3(db,namespace=namespace,frozen=frozen)
+    contract=require_artifact_phase_frozen_contract_history_v3(db,namespace=namespace,frozen=frozen, issuer=issuer)
     policy_row=_read(db,issuer=issuer,namespace=namespace,kind=POLICY_KIND,ref=contract.policy_ref)
     if policy_row is None or (policy_row[0]['installation_id'],policy_row[0]['manifest_digest'])!=pins:
         raise ValueError('completed method history mixed another preDecision policy installation')
     if value.selector!=selector or value.owner_guard!=owner_guard:
         raise ValueError('completed method history changed actual disclosed selector or current Owner')
-    owner=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+    owner=_artifact_receipt_sql_v1(db,'SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
         (*namespace.as_tuple,owner_guard.grant_ref)).fetchone()
-    if owner is None or owner[2]!=1 or (owner[0],canonical_digest(json.loads(owner[1])))!=(owner_guard.grant_revision,owner_guard.grant_digest):
+    if owner is None or owner[2]!=1 or (owner[0],background_json_digest_v3(owner[1],background_json_loads_v3(owner[1])))!=(owner_guard.grant_revision,owner_guard.grant_digest):
         raise MissingProductionOriginalV1('current_owner_access_to_completed_method_history')
     for member in value.members:
-        after=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+        after=_artifact_receipt_sql_v1(db,'SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
             (*namespace.as_tuple,member.after.key.token)).fetchone()
-        if after is None or after[2]!=1 or (after[0],canonical_digest(json.loads(after[1])))!=(member.after.revision,member.after_value_digest):
+        if after is None or after[2]!=1 or (after[0],background_json_digest_v3(after[1],background_json_loads_v3(after[1])))!=(member.after.revision,member.after_value_digest):
             raise MissingProductionOriginalV1('actual_completed_method_after_heads_without_foreign_successor')
     milestone=read_current_artifact_task_milestone_v2(db,namespace=namespace,original_ref=value.milestone_original_ref,issuer=issuer)
-    source=db.execute('SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+    source=_artifact_receipt_sql_v1(db,'SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
         (*namespace.as_tuple,value.source_head.key.token)).fetchone()
     if source is None or source[1]!=1:raise MissingProductionOriginalV1('current_source_access_to_completed_method_history')
     _source_family_current_sql_v1(db,namespace=namespace,roots=(value.source_head.key.token,),purpose='consolidation',
-        audiences=tuple(json.loads(source[0])['audiences']))
+        audiences=tuple(background_json_loads_v3(source[0])['audiences']))
     return value,original['receipt']
 
 
 def validate_artifact_method_settlement_joins_v2(db):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .domain_production_originals_v1 import TABLE,read_adopted_domain_operation_v1
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone() is None:return
-    for bot,persona,operation_id in db.execute("SELECT bot,persona,operation_id FROM "+TABLE+" WHERE domain='d08' AND operation_kind='settle_personal_goal'"):
+    if _artifact_receipt_sql_v1(db,"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone() is None:return
+    for bot,persona,operation_id in _artifact_receipt_sql_v1(db,"SELECT bot,persona,operation_id FROM "+TABLE+" WHERE domain='d08' AND operation_kind='settle_personal_goal'"):
         namespace=NamespaceId(bot,persona);original=read_adopted_domain_operation_v1(db,namespace,operation_id)
         raw=original['payload']['provenance'].get('artifact_method_completion')
         if raw is not None:require_artifact_method_settlement_history_v2(db,namespace=namespace,original=original,raw=raw)

@@ -7,10 +7,10 @@ from pathlib import Path
 
 from sylanne3.contracts import Scope, Event
 from sylanne3.store import Store
-from sylanne3.scheduler import BoundedScheduler
+from rewrite.host_tests.legacy_fixture_v1.scheduler import BoundedScheduler
 from sylanne3.native import NativeKernel
-from sylanne3.engine import Engine, SemanticConflict
-from sylanne3.delivery import RecordingTransport, DeliveryFailed, dispatch
+from rewrite.host_tests.legacy_fixture_v1.engine import Engine, SemanticConflict
+from rewrite.host_tests.legacy_fixture_v1.delivery import RecordingTransport, DeliveryFailed, dispatch
 
 
 REFERENCE_LIBRARY = Path(__file__).resolve().parents[1] / "native" / "target" / "release" / (

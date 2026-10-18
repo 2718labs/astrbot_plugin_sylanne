@@ -10,6 +10,14 @@ class ArtifactOriginalChildLocatorsV3:
 
 def artifact_original_child_locators_v3(*,kind,value):
     from .ingress_artifact_task_scope_v1 import IngressArtifactTaskScopeOriginalV1,IngressArtifactTaskScopeOriginalV2,IngressArtifactTaskScopeOriginalV3
+    if kind=='artifact_completion_receipt_v1':
+        from .artifact_completion_receipt_v1 import ArtifactCompletionReceiptOriginalV1
+        if type(value) is not ArtifactCompletionReceiptOriginalV1:raise TypeError('actual completion receipt required')
+        return ArtifactOriginalChildLocatorsV3((('artifact_task_milestone_v2',value.milestone_ref),
+            ('c4_phase_verified',value.full_check_ref),('adopted_life',value.file_result_ref),
+            ('draft_root_capability',value.selector.task.root_registration_ref)),(),
+            (value.producer_operation_id,value.completion_operation_id,value.selector.task.c02_operation_id),
+            (value.source_ref,*(head.key.token for head,_ in value.parent_source_heads)))
     if kind=="artifact_task_scope":
         if type(value)not in{IngressArtifactTaskScopeOriginalV1,IngressArtifactTaskScopeOriginalV2,IngressArtifactTaskScopeOriginalV3}:
             raise TypeError("actual typed Artifact TaskScope parent required")

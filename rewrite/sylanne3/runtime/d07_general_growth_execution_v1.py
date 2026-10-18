@@ -179,11 +179,12 @@ def require_current_general_growth_prepared_v1(db,*,issuer,prepared,installed_bu
     from .d07_general_growth_attention_v1 import read_current_general_growth_attention_v1,D07GeneralGrowthQuestionV1
     from .d07_execution_v1 import read_current_d07_semantic_question_v1
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+    from ..host.model_workflows_v9 import AdminModelWorkflowsV9
     from ..host.authority_profile import AdminInstallationBundle
     from ..model_broker.general_growth_cognition_v1 import thaw_general_growth_cognition_request_v1,TEMPLATE_VERSION,PURPOSE
     from .domain_background_read_v3 import background_json_loads_v3
     if (type(prepared)is not D07GeneralGrowthPreparedV1 or type(installed_bundle)is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows)is not AdminModelWorkflowsV8):
+            or type(installed_bundle.model_workflows) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9)):
         raise TypeError("General growth requires its exact current installed V8 prepared variant")
     from ..domains.d01.production_operations_v1 import plain_v1
     attention=read_current_general_growth_attention_v1(db,issuer,prepared.namespace,prepared.general_growth_attention_ref)

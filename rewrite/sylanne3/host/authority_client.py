@@ -123,7 +123,6 @@ class AuthorityTransport(Protocol):
                                            holder, expected_anchor, draft=None,
                                            close_prepared=False): ...
 
-    async def v2_get_content_fence_operation(self,request,handshake,*,namespace,operation_id): ...
 
     async def v2_current_anchor(self,request,handshake,namespace): ...
 
@@ -722,15 +721,17 @@ class AuthorityClient:
             host_incarnation=host_incarnation, _on_dispatch=_on_dispatch)
 
     async def bind_observed_d13_provider_http_v1(self,bundle,grant,*,intent,admission,content):
+        from ..runtime_contracts import canonical_digest
         from .model_workflows_v7 import AdminModelWorkflowsV7
         from .model_workflows_v8 import AdminModelWorkflowsV8
+        from .model_workflows_v9 import AdminModelWorkflowsV9
         from ..authority_service.v2_model_egress_wire import to_wire as model_to_wire
         from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
         from ..authority_service.d13_provider_http_admission_v1 import DOMAIN
         from ..runtime_contracts import canonical_serialize
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         import base64,hashlib
-        if (type(bundle.model_workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
+        if (type(bundle.model_workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
                 or type(content) is not bytes or not 0<len(content)<=65536):
             raise RuntimeError('actual installed bounded V7 SDK HTTP capture required')
         request,handshake,policy=await self._model_installation_context(bundle,grant)

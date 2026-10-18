@@ -131,6 +131,8 @@ _FOREGROUND_OPERATIONS = {
 }
 
 _ARTIFACT_OPERATIONS = {
+    "finish_artifact_receipt_cycle_v1": ("d11", ".artifact_receipt_completion_v1", "FinishArtifactReceiptCycleRequestV1", "stage_finish_artifact_receipt_cycle_v1", ""),
+    "derive_artifact_completion_receipt_v1": ("d06", ".artifact_completion_receipt_v1", "DeriveArtifactCompletionReceiptRequestV1", "stage_derive_artifact_completion_receipt_v1", ""),
     "revise_artifact_task_plan_v2": ("d08", ".d08_personal_plan_v1", "ReviseCurrentArtifactTaskPlanRequestV2", "stage_revise_current_artifact_task_plan_in_transaction_v2", ""),
     "activate_artifact_task_project_checkpoint_v2": ("d10", ".d10_project_checkpoint_v1", "ActivateCurrentArtifactTaskProjectCheckpointRequestV2", "stage_activate_current_artifact_task_project_checkpoint_v2", "verify_d10_project_checkpoint_stage_v1"),
     "register_artifact_task_milestone_v2": ("d08", ".artifact_task_observer_v1", "RegisterCurrentArtifactTaskMilestoneRequestV2", "stage_register_current_artifact_task_milestone_in_transaction_v2", ""),
@@ -157,6 +159,7 @@ _ARTIFACT_OPERATIONS = {
 
 
 _POSTCONDITION_OPERATIONS = {
+    "prepare_artifact_phase_observation_v1": ("d07", "PrepareArtifactPhaseObservationRequestV1", "stage_prepare_artifact_phase_observation_v1"),
     "input:freeze_artifact_candidate_preparation_v1": ("d08", "FreezeArtifactCandidatePreparationRequestV1", "stage_freeze_artifact_candidate_preparation_v1"),
     "input:approve_artifact_standing_predecision_v2": ("d08", "ApproveArtifactStandingPredecisionRequestV2", "stage_approve_artifact_standing_predecision_v2"),
     "input:register_artifact_phase_postcondition_policy_v1": ("d08", "RegisterArtifactPhasePostconditionPolicyRequestV1", "stage_register_artifact_phase_postcondition_policy_v1"),

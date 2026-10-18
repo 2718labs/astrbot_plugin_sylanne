@@ -422,6 +422,8 @@ def stage_register_current_artifact_task_milestone_in_transaction_v2(db, *, fram
 
 
 def require_artifact_task_milestone_history_v2(db, *, namespace, original_ref, producing_operation_id, raw):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .d11_life_preparation_v1 import TABLE
     from .d11_artifact_draft_content_v1 import require_artifact_draft_phase_verified_history_v2
@@ -447,10 +449,10 @@ def require_artifact_task_milestone_history_v2(db, *, namespace, original_ref, p
             or producer['payload']['now_utc']!=value.registered_at_utc):
         raise ValueError('task milestone has no exact empty-write actual signed W01 producer')
     def original(kind,ref,digest):
-        row=db.execute('SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
+        row=_artifact_receipt_sql_v1(db,'SELECT payload_json,payload_digest,producing_operation_id FROM '+TABLE+
             ' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',(*namespace.as_tuple,kind,ref)).fetchone()
         if row is None or row[1]!=digest: raise MissingProductionOriginalV1('actual_milestone_'+kind+'_original')
-        return json.loads(row[0]),row[2]
+        return background_json_loads_v3(row[0]),row[2]
     objective_raw,_=original('artifact_task_objective',value.objective_ref,value.objective_digest)
     from .ingress_artifact_task_scope_v1 import ArtifactTaskObjectiveV1,_decode
     objective=_decode(objective_raw,ArtifactTaskObjectiveV1)
@@ -491,6 +493,8 @@ def require_artifact_task_milestone_history_v2(db, *, namespace, original_ref, p
 
 
 def _require_milestone_file_history_v2(db, *, value, objective, previous, generation, original):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import TABLE,life_prepared_from_wire_v1
     from .d11_life_terminal_v1 import validate_adopted_life_member_history_v1
     from .d11_life_contract_v1 import D11LifeTerminalV1,life_from_wire_v1
@@ -500,10 +504,10 @@ def _require_milestone_file_history_v2(db, *, value, objective, previous, genera
         file_raw,file_op=original('adopted_life',verified.readback_original_ref,verified.readback_original_digest)
         validate_adopted_life_member_history_v1(db,value=file_raw,namespace=value.namespace,result_ref=verified.readback_original_ref,producing_operation_id=file_op)
         terminal=life_from_wire_v1(file_raw['terminal'],D11LifeTerminalV1)
-        row=db.execute('SELECT payload_json FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
+        row=_artifact_receipt_sql_v1(db,'SELECT payload_json FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
             (*value.namespace.as_tuple,'prepared',terminal.binding.prepared_original_ref)).fetchone()
         if row is None: raise MissingProductionOriginalV1('actual_milestone_file_preparation')
-        prepared=life_prepared_from_wire_v1(json.loads(row[0]));witness=require_draft_terminal_readback_v1(prepared=prepared,terminal=terminal)
+        prepared=life_prepared_from_wire_v1(background_json_loads_v3(row[0]));witness=require_draft_terminal_readback_v1(prepared=prepared,terminal=terminal)
         version+=1;target=prepared.plan.target
         if (witness.version!=version or witness.filename!=objective.filename or witness!=verified.readback
                 or (target.root_resource_id,target.root_identity)!=(objective.root_resource_id,objective.root_identity)
@@ -516,25 +520,29 @@ def _require_milestone_file_history_v2(db, *, value, objective, previous, genera
 
 
 def read_current_artifact_task_milestone_v2(db, *, namespace, original_ref, issuer):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import _read
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     raw=_read(db,issuer=issuer,namespace=namespace,kind=ARTIFACT_TASK_MILESTONE_KIND_V2,ref=original_ref)
     if raw is None: raise MissingProductionOriginalV1('actual_signed_task_semantic_milestone')
     value=require_artifact_task_milestone_history_v2(db,namespace=namespace,original_ref=original_ref,producing_operation_id=raw[1],raw=raw[0])
     guard=value.owner_guard
-    owner=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+    owner=_artifact_receipt_sql_v1(db,'SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
         (*namespace.as_tuple,guard.grant_ref)).fetchone()
-    if owner is None or owner[2]!=1 or (owner[0],canonical_digest(json.loads(owner[1])))!=(guard.grant_revision,guard.grant_digest):
+    if owner is None or owner[2]!=1 or (owner[0],background_json_digest_v3(owner[1],background_json_loads_v3(owner[1])))!=(guard.grant_revision,guard.grant_digest):
         raise MissingProductionOriginalV1('current_owner_access_to_completed_task_milestone')
-    source=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
+    source=_artifact_receipt_sql_v1(db,'SELECT revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',
         (*namespace.as_tuple,value.source_head.key.token)).fetchone()
-    if source is None or source[2]!=1 or (source[0],canonical_digest(json.loads(source[1])))!=(value.source_head.revision,value.source_value_digest):
+    if source is None or source[2]!=1 or (source[0],background_json_digest_v3(source[1],background_json_loads_v3(source[1])))!=(value.source_head.revision,value.source_value_digest):
         raise MissingProductionOriginalV1('current_source_access_to_completed_task_milestone')
-    _source_family_current_sql_v1(db,namespace=namespace,roots=(value.source_head.key.token,),purpose='consolidation',audiences=tuple(json.loads(source[1])['audiences']))
+    _source_family_current_sql_v1(db,namespace=namespace,roots=(value.source_head.key.token,),purpose='consolidation',audiences=tuple(background_json_loads_v3(source[1])['audiences']))
     return value
 
 
 def read_plan_current_artifact_task_milestone_v2(db, *, namespace, request, installed_readers):
+    from .domain_background_read_v3 import background_json_loads_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .artifact_phase_postconditions_v1 import _readers
     from .d11_artifact_draft_content_v1 import read_plan_artifact_draft_phase_verification_v2, VerifyArtifactDraftPhaseRequestV2
     from .d11_life_preparation_v1 import _read,TABLE
@@ -555,10 +563,10 @@ def read_plan_current_artifact_task_milestone_v2(db, *, namespace, request, inst
     objective,objective_ref,_=_artifact_task_milestone_basis_v2(db,selector=selector,issuer=readers.issuer)
     originals=[*base.required_original_refs,ref,objective_ref];keys=[*base.exact_keys,AtomKey.from_token(objective.goal_ref)]
     roots=[*base.source_roots,objective.source_ref,verified.source_head.key.token]
-    prior=db.execute('SELECT original_ref,payload_json FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? '
+    prior=_artifact_receipt_sql_v1(db,'SELECT original_ref,payload_json FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? '
         "AND json_extract(payload_json,'$.objective_ref')=?",(*namespace.as_tuple,ARTIFACT_TASK_MILESTONE_KIND_V2,objective_ref)).fetchall()
     for prior_ref,raw in prior:
-        value=decode_artifact_task_milestone_v2(json.loads(raw));originals.append(prior_ref)
+        value=decode_artifact_task_milestone_v2(background_json_loads_v3(raw));originals.append(prior_ref)
         originals.extend((value.full_check_original_ref,value.file_result_ref))
         keys.append(value.source_head.key);roots.append(value.source_head.key.token)
     if selector.task.c02_operation_id!=objective.initial_c02_operation_id:
@@ -586,9 +594,10 @@ def record_artifact_task_milestone_after_cas_v2(db, *, frame, stage, receipt, is
 
 
 def read_current_artifact_task_milestone_original_ref_v2(db, *, namespace, original_ref, issuer):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .domain_production_contracts_v1 import ProductionOriginalRefV1
     from .d11_life_preparation_v1 import TABLE
-    row=db.execute('SELECT 1 FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
+    row=_artifact_receipt_sql_v1(db,'SELECT 1 FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
         (*namespace.as_tuple,ARTIFACT_TASK_MILESTONE_KIND_V2,original_ref)).fetchone()
     if row is None: return None
     value=read_current_artifact_task_milestone_v2(db,namespace=namespace,original_ref=original_ref,issuer=issuer)

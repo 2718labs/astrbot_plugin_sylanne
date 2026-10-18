@@ -128,7 +128,7 @@ def verify_d07_production_stage_v1(stage):
     return stage
 
 
-def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_kind, request):
+def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_kind, request,installed_readers=None):
     from .current_d07_simulation_source_read_v3 import read_bound_current_d07_simulation_plan_v3
     handled,plan=read_bound_current_d07_simulation_plan_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
     if handled:return plan
@@ -149,6 +149,26 @@ def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_
             if row:
                 question = background_json_loads_v3(row[0])
                 roots.extend(question["source_refs"])
+                if question.get('schema')=='d07.artifact-phase-observation-question.v1':
+                    from .d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+                    from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1,read_artifact_phase_observation_basis_v1,read_plan_prepare_artifact_phase_observation_v1
+                    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+                    from .d11_artifact_draft_model_v1 import InstalledArtifactDraftModelReadersV1
+                    service=installed_readers.execution_reader if installed_readers is not None else None
+                    if type(service)is not InstalledD07ExecutionServiceV1:
+                        raise MissingProductionOriginalV1('actual_installed_independent_observation_readers')
+                    typed=decode_typed_production_value_v1(question,ArtifactPhaseObservationQuestionV1)
+                    basis=read_artifact_phase_observation_basis_v1(db,namespace=namespace,
+                        original_ref=typed.observation_basis_ref,issuer=service.d11_issuer)
+                    if basis is None or basis.question!=typed:
+                        raise ValueError('observation read plan changed its actual signed basis/question')
+                    model=InstalledArtifactDraftModelReadersV1(service.d11_issuer,service.bundle,
+                        service.graph._GraphCoordinator__artifact_draft_model_runtime_v1)
+                    phase=read_plan_prepare_artifact_phase_observation_v1(db,namespace=namespace,
+                        request=basis.request,installed_readers=model)
+                    types.extend(phase.fixed_type_ids);keys.extend(phase.exact_keys)
+                    roots.extend(phase.source_roots);originals.extend(phase.required_original_refs)
+                    originals.append(basis.original_ref)
                 if question.get("schema") == "d07.relationship-semantic-question.v2":
                     from .domain_production_erasure_v1 import decode_typed_production_value_v1
                     from .d07_execution_v1 import D07RelationshipSemanticQuestionV2

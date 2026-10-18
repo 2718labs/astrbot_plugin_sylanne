@@ -11721,7 +11721,7 @@ class _InstalledAuthorityRoleBuilderV2:
                '_pending_natural_core_required_v4','_pending_natural_core_obligations_v4',
                'paid_owner_final_retention_v3','_pending_paid_owner_final_retention_v3','paid_owner_final_retention_proof_v3',
                'graph_imported_wire_census_v3','_pending_graph_imported_wire_census_v3','_pending_graph_imported_wire_cold_v3',
-               '_pending_habit_read_v1')
+               '_pending_habit_read_v1','owner_stop_read_v3','_pending_owner_stop_read_v3')
 
     def __init__(self,token,session,pair,basis):
         if token is not _BUILDER_TOKEN: raise AuthorityUnavailable('installed authority role builder required')
@@ -11735,6 +11735,7 @@ class _InstalledAuthorityRoleBuilderV2:
                 completion.old_journal_id,completion.old_seq,completion.old_digest):
             raise C09PagedCaptureHold('stable build plan differs from current sealed originals')
         self.execution_pair=None;self.cold=None;self._pending_habit_read_v1=None
+        self.owner_stop_read_v3=None;self._pending_owner_stop_read_v3=None
         self.segmented_target_v3=None;self.segmented_census_v3=None;self.segmented_sweep_v3=None;self.segmented_finish_pending_v3=False;self.d13_source_capture_v3=None
         self.cold_position_v3=None;self._pending_cold_position_v3=None;self._pending_d13_capture_v3=None
         self.d13_projection_v3=None;self._pending_d13_projection_v3=None
@@ -12365,6 +12366,11 @@ def _row_phase(builder,budget,phase,position,meter):
             value=advance_habit_core_source_row_v1(builder,budget,position,meter)
             if value is not None:return value
             budget=replace(budget,max_records=1)
+        if transform.role=='core' and table=='authority_d12_operation_originals_v1':
+            from .c09_owner_reply_disposition_v3 import advance_owner_reply_stop_core_source_row_v3
+            value=advance_owner_reply_stop_core_source_row_v3(builder,budget,position,meter)
+            if value is not None:return value
+            budget=replace(budget,max_records=1)
         from ..segmented_sql_cell_v1 import CORE_REF_DDLS_V2
         if transform.role=='core' and table in CORE_REF_DDLS_V2:
             value=_advance_d13_core_source_row_v3(builder,budget,position,meter)
@@ -12850,6 +12856,9 @@ class _AuthorityColdSweepV2:
         from ..runtime.c09_paged_capture_contract_v2 import begin_c09_stream_v2
         self.builder=builder;self.reader=_open_candidate_readback(builder.pair);self.census_reader=_open_candidate_readback(builder.pair)
         builder.transform.habit_current_v1=None
+        builder.owner_stop_read_v3=None;builder._pending_owner_stop_read_v3=None
+        if builder.transform.role=='core':
+            builder.transform.facts._authority_basis()._owner_reply_stop_ready_v3=None
         self.after=None;self.active=None;self.verification=None;self.source=None;self.shape=None
         self.phase='schema_census';self.root=canonical_digest(('sylanne3.c09.authority-cold.v2',builder.scope.scope_digest,builder.transform.role))
         self.count=0;self.schema_after=None;self.schema_count=0
@@ -13020,6 +13029,11 @@ class _AuthorityColdSweepV2:
             if transform.role=='core'and self.active[0]in legacy._HABIT_CORE_TABLES and self.active[1]=='row_dispositions':
                 from .c09_habit_policy_rows_v1 import verify_habit_core_cold_record_v1
                 return verify_habit_core_cold_record_v1(builder,self.reader,stream,record,meter)
+            if (transform.role=='core' and self.active[0]=='authority_d12_operation_originals_v1'
+                    and self.active[1]=='row_dispositions'):
+                from .c09_owner_reply_disposition_v3 import verify_owner_reply_stop_core_cold_record_v3
+                ready=verify_owner_reply_stop_core_cold_record_v3(builder,self.reader,stream,record,meter)
+                if ready is not None:return ready
             if (transform.role=='core' and self.active[0] in {'authority_d13_counter_originals_v1','authority_d13_provider_http_bindings_v1'}
                     and self.active[1] in {'row_dispositions','source_originals_v3'}):
                 return _verify_d13_cold_record_v3(builder,self.reader,stream,self.active[1],record,budget,meter)
@@ -13255,9 +13269,14 @@ def advance_installed_authority_role_rebase_v2(builder):
     builder._pending_natural_core_required_v4=None;builder._pending_natural_core_obligations_v4=None
     builder._pending_paid_owner_final_retention_v3=None
     builder._pending_habit_read_v1=None
+    builder._pending_owner_stop_read_v3=None
     builder._pending_source_physical_reader_v3=None
     builder._pending_d13_disposition_v3=None;builder._pending_graph_imported_wire_census_v3=None;builder._pending_graph_imported_wire_cold_v3=None
     result=_advance_installed_authority_role_quantum_v2(builder)
+    if builder._pending_owner_stop_read_v3 is not None:
+        state=builder._pending_owner_stop_read_v3;state.quantum_completed=True
+        builder.owner_stop_read_v3=state;builder._pending_owner_stop_read_v3=None
+        state.basis._owner_reply_stop_ready_v3=state if state.complete else None
     if builder._pending_habit_read_v1 is not None:
         state=builder._pending_habit_read_v1;state.quantum_completed=True
         builder.transform.habit_current_v1=state;builder._pending_habit_read_v1=None

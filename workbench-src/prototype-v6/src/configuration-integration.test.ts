@@ -132,7 +132,7 @@ test('actual advanced Vue panel exposes all ten groups, V8 model observations an
   type Node={type:string;text:string;children:Node[];parent:Node|null;props:Record<string,any>;tagName:string;listeners:Record<string,Function>;readonly options:Node[];selectedIndex:number;value:unknown;getRootNode:()=>typeof events;addEventListener:(name:string,fn:Function)=>void;removeEventListener:(name:string)=>void;setAttribute:(name:string,value:unknown)=>void;removeAttribute:(name:string)=>void}
   const make=(type:string,text=''):Node=>({type,text,children:[],parent:null,props:{},tagName:type.toUpperCase(),listeners:{},get options(){return this.children.filter(child=>child.type==='option')},selectedIndex:-1,get value(){return this.props.value},set value(value){this.props.value=value},getRootNode:()=>events,addEventListener(name,fn){this.listeners[name]=fn},removeEventListener(name){delete this.listeners[name]},setAttribute(name,value){this.props[name]=value},removeAttribute(name){delete this.props[name]}})
   const renderer=createRenderer<Node,Node>({createElement:type=>make(type),createText:text=>make('text',text),createComment:text=>make('comment',text),setText:(node,text)=>{node.text=text},setElementText:(node,text)=>{node.text=text;node.children=[]},parentNode:node=>node.parent,nextSibling:node=>node.parent?.children[node.parent.children.indexOf(node)+1]??null,insert(node,parent,anchor=null){if(node.parent)this.remove(node);node.parent=parent;const index=anchor?parent.children.indexOf(anchor):-1;if(index<0)parent.children.push(node);else parent.children.splice(index,0,node)},remove(node){if(node.parent){const index=node.parent.children.indexOf(node);if(index>=0)node.parent.children.splice(index,1);node.parent=null}},patchProp(node,key,_old,value){node.props[key]=value}})
-  const configuration=wire(),named=(slot:string)=>({slot,selected_provider_id:null,model_id:null,provider_config_digest:null,installed:null,state:'pending',reason_code:'model_unselected'}),v8={...configuration,model_slots:[...configuration.model_slots,named('d07_relationship_cognition'),named('growth_cognition'),named('general_growth_cognition')],installed_policy:{...configuration.installed_policy,workflow_version:8}}
+  const configuration=wire(),named=(slot:string)=>({slot,selected_provider_id:null,model_id:null,provider_config_digest:null,installed:null,state:'pending',reason_code:'model_unselected'}),v8={...configuration,model_slots:[...configuration.model_slots,named('d07_relationship_cognition'),named('growth_cognition'),named('general_growth_cognition'),named('artifact_observation_cognition')],installed_policy:{...configuration.installed_policy,workflow_version:9}}
   const root=make('root');let backend!:BackendController,calls=0
   const app=renderer.createApp({setup(){backend=useBackend({enabled:true,origin,fetchImpl:async(url,init)=>{calls++;if(url.endsWith('/session'))return response(session);if(url.endsWith('/configuration/v1'))return response(v8);return response({status:'ready',projection:creator()})}});return()=>h(Panel,{backend})}})
   const renderErrors:unknown[]=[];app.config.errorHandler=error=>{renderErrors.push(error)}
@@ -141,7 +141,7 @@ test('actual advanced Vue panel exposes all ten groups, V8 model observations an
   const button=(label:string)=>{const node=find(root,node=>node.type==='button'&&text(node)===label);assert.ok(node,`missing ${label}`);return node}
   try{
     app.mount(root);await nextTick();assert.equal(calls,0);for(const label of ['基本','模型策略','角色与场景','世界与时间','习惯','长期计划','注意与表达','记忆与关系','Life 与联系','资源与安装'])assert.ok(button(label))
-    await button('读取当前配置').props.onClick();await nextTick();await button('模型策略').props.onClick();await nextTick();assert.match(text(root),/provider-a · model-a/);assert.match(text(root),/provider-b · model-b/);assert.match(text(root),/与已安装模型身份匹配/);assert.match(text(root),/model_unselected/);assert.match(text(root),/关系认知/);assert.match(text(root),/通用成长认知/);assert.match(text(root),/general_growth_cognition/)
+    await button('读取当前配置').props.onClick();await nextTick();await button('模型策略').props.onClick();await nextTick();assert.match(text(root),/provider-a · model-a/);assert.match(text(root),/provider-b · model-b/);assert.match(text(root),/与已安装模型身份匹配/);assert.match(text(root),/model_unselected/);assert.match(text(root),/关系认知/);assert.match(text(root),/通用成长认知/);assert.match(text(root),/general_growth_cognition/);assert.match(text(root),/Artifact 独立观察认知/);assert.match(text(root),/artifact_observation_cognition/)
     await backend.checkSession();backend.setScope(scope);await button('角色与场景').props.onClick();await nextTick();await backend.creator.read();await nextTick();assert.match(text(root),/人格方案|身体方案|场景方案/)
     const before=JSON.stringify(backend.creator.state.draft),readsBefore=calls;await button('建立空白方案表单').props.onClick();await nextTick();assert.equal(JSON.stringify(backend.creator.state.draft),before);assert.equal(calls,readsBefore);assert.equal(backend.creator.state.adopted,null);assert.match(text(root),/空白表单只生成待填写字段/);assert.match(text(root),/有 1 项表单修改尚未应用/);assert.equal(button('保存方案草稿并独立回读').props.disabled,true)
     await button('基本').props.onClick();await nextTick();assert.match(text(root),/不是 D01 人格名称/);assert.deepEqual(renderErrors,[])
@@ -206,4 +206,20 @@ test('configuration V8 consumes the exact general-growth installed slot without 
   assert.throws(()=>validateConfigurationWire({...current,model_slots:current.model_slots.slice(0,-1)}),{code:'invalid_response'})
   assert.throws(()=>validateConfigurationWire({...current,model_slots:[...current.model_slots.slice(0,-1),named('unknown_workflow')]}),{code:'invalid_response'})
   assert.throws(()=>validateConfigurationWire({...current,values:{...base.values,model_selection:{...base.values.model_selection,overrides:{...base.values.model_selection.overrides,general_growth_cognition:''}}}}),{code:'invalid_response'})
+})
+
+
+test('configuration V9 consumes the protected Artifact observer slot without permitting legacy upgrade or unknown slots',()=>{
+  const base=wire(),named=(slot:string)=>({slot,selected_provider_id:null,model_id:null,provider_config_digest:null,installed:null,state:'pending',reason_code:'model_unselected'})
+  const current={...base,model_slots:[...base.model_slots,named('d07_relationship_cognition'),named('growth_cognition'),named('general_growth_cognition'),named('artifact_observation_cognition')],
+    installed_policy:{...base.installed_policy,workflow_version:9,configured_model_slots:['artifact_observation_cognition'],limits:{artifact_observation_cognition:1000}}}
+  const decoded=validateConfigurationWire(current)
+  assert.equal(decoded.installed_policy.workflow_version,9)
+  assert.equal(decoded.model_slots.at(-1)?.slot,'artifact_observation_cognition')
+  assert.equal(Object.keys(decoded.values.model_selection.overrides).length,10)
+  assert.throws(()=>validateConfigurationWire({...current,installed_policy:{...current.installed_policy,workflow_version:8}}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,installed_policy:{...current.installed_policy,workflow_version:10}}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,model_slots:current.model_slots.slice(0,-1)}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,model_slots:[...current.model_slots.slice(0,-1),named('unknown_workflow')]}),{code:'invalid_response'})
+  assert.throws(()=>validateConfigurationWire({...current,values:{...base.values,model_selection:{...base.values.model_selection,overrides:{...base.values.model_selection.overrides,artifact_observation_cognition:''}}}}),{code:'invalid_response'})
 })

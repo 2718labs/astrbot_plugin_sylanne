@@ -961,3 +961,262 @@ def finish_current_beta1_fixture_evidence_read_v3(graph,work,error):
         if error is None:work.result_lease=work.operation
         else:
             reader.release_payload_v3();finish_runtime_storage_operation_v3(work.operation)
+
+
+def backup_artifact_v3_fixture_graph_v1(*, graph_path, target):
+    """Root-only forensic backup of a newly installed fixture, never an execution capability."""
+    import os, sqlite3
+    if os.name != "posix" or os.geteuid() != 0:
+        raise PermissionError("isolated fixture Root controller required")
+    graph_path, target = Path(graph_path), Path(target)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+    with sqlite3.connect(graph_path.as_uri() + "?mode=ro", uri=True) as source:
+        source.execute("PRAGMA query_only=ON")
+        with sqlite3.connect(target) as destination:
+            source.backup(destination)
+    os.chmod(target, 0o600)
+    return sha256(target.read_bytes()).hexdigest()
+
+
+def verify_artifact_v3_fixture_snapshot_v1(*, snapshot, setup, unknown=False, baseline=False):
+    """Authenticate actual signed originals on a read-only captured fixture DB."""
+    from collections import Counter
+    from sylanne3.host import authority_profile as profile
+    from sylanne3.host.model_workflows_v9 import AdminModelWorkflowsV9
+    from sylanne3.runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer, _decode_outcome
+    from sylanne3.runtime.budget import get_budget_lease, BudgetReceipt
+    from sylanne3.runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+    from sylanne3.runtime.jobs import get_job
+    from sylanne3.runtime.artifact_receipt_allocation_v3 import read_actual_artifact_receipt_allocation_v3
+    from sylanne3.runtime.artifact_phase_observation_v1 import read_artifact_phase_observation_basis_v1
+    from sylanne3.runtime.artifact_phase_observation_result_v1 import _actual_observation_v1
+    from sylanne3.runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from sylanne3.runtime.artifact_completion_receipt_v1 import receipt_ids_v1, require_artifact_completion_receipt_history_v1
+    from sylanne3.runtime.artifact_receipt_completion_v1 import require_delivered_artifact_receipt_v1, finish_operation_id_v1
+    from sylanne3.runtime_contracts import canonical_digest
+    from sylanne3.memory_types import SourceRecord
+    from artifact_phase_counter_fixture_v1 import MOCK_V3_PROVIDER, MOCK_V3_MODEL
+    bundle = profile._load_installation_bundle_from_root(setup["profile_id"],
+        Path("/etc/sylanne/client/profiles"), "Linux")
+    policy = bundle.installation_policy
+    if (type(bundle.model_workflows) is not AdminModelWorkflowsV9 or bundle.artifact_phase_observer is None
+            or bundle.artifact_phase_counter.source_scope != "production"
+            or (bundle.artifact_phase_counter.provider_id, bundle.artifact_phase_counter.model_id) !=
+               (MOCK_V3_PROVIDER, MOCK_V3_MODEL)
+            or (policy.installation_id, policy.manifest_digest, canonical_digest(policy.root_grant)) !=
+               (setup["installation_id"], setup["manifest_digest"], setup["root_grant_digest"])
+            or policy.root_grant.valid_until_utc != setup["original_deadline_utc"]
+            or dict(policy.root_lease.limits) != setup["approved_root_limits"]
+            or dict(policy.root_grant.max_ceiling) != setup["approved_root_max_ceiling"]):
+        raise ValueError("snapshot did not belong to the exact fresh approved V9 Mock installation")
+    issuer = D11BudgetJobIssuer(D02ResourceIssuer(bundle.d02_signing_key), bundle.d11_signing_key)
+    ns = policy.namespace
+    from rewrite.tests.alpha1.integration.artifact_forensic_graph_projection_v3 import forensic_artifact_snapshot_connection_v3
+    with forensic_artifact_snapshot_connection_v3(snapshot=snapshot, bundle=bundle) as db:
+        db.execute("PRAGMA query_only=ON")
+        db.execute("BEGIN")
+        grant = issuer.current_budget_grant(db, policy.root_lease.lease_id)
+        root = get_budget_lease(db, policy.root_lease.lease_id)
+        if grant != policy.root_grant or root.limits != policy.root_lease.limits or root.used.get("model_microusd", 0) != 0:
+            raise ValueError("fresh fixture changed original Root/grant/limits or added a model charge")
+        jobs = db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? AND work_kind='d11.foreground_cycle.v1'",
+            ns.as_tuple).fetchall()
+        if baseline:
+            if jobs:
+                raise ValueError("V3 fixture baseline is not a fresh pre-episode Root")
+            return {"scope": "signed fresh Root baseline only", "installation_id": policy.installation_id,
+                "root_grant_digest": canonical_digest(grant), "model_microusd": 0}
+        if len(jobs) != 1:
+            raise ValueError("V3 fixture requires one actual foreground episode")
+        job = get_job(db, jobs[0][0])
+        cycle = foreground_cycle_from_wire_v1(job.continuation)
+        _, allocation, child, child_grant = read_actual_artifact_receipt_allocation_v3(db, namespace=ns,
+            c02_operation_id=cycle.c02_operation_id, source_ref=cycle.source_ref, issuer=issuer)
+        row = db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND token=?",
+            (*ns.as_tuple, cycle.source_ref)).fetchone()
+        source = SourceRecord.from_dict(json.loads(row[0]))
+        if source.text != setup["task_text"] or child_grant.allowed_work_kinds != ("message",) or allocation.message_slots != 1:
+            raise ValueError("actual Source or message-only allocation differs")
+        plan = cycle.call_plan
+        expected = Counter({"C1": 1, "C2": 1, "C4": 1 if unknown else 2, "C3": 1 if unknown else 2})
+        if Counter(a.slot for a in plan.attempts) != expected or any(a.state != "completed" for a in plan.attempts):
+            return None
+        if sum(a.input_ceiling for a in plan.attempts) > 48000 or sum(a.output_ceiling for a in plan.attempts) > 8000:
+            raise ValueError("actual episode exceeded the original token caps")
+        call_evidence = []
+        for attempt in plan.attempts:
+            if attempt.budget_lease_ref != root.lease_id:
+                raise ValueError("actual model attempt borrowed a grant or message-only lease")
+            reservation = db.execute("SELECT digest,ceiling_json,state,actual_json FROM runtime_budget_reservations "
+                "WHERE lease_id=? AND operation_id=?", (attempt.budget_lease_ref, attempt.reservation_operation_id)).fetchone()
+            if reservation is None or reservation[0] != attempt.reservation_digest or reservation[2] != "settled":
+                raise ValueError("actual model lacks its exact settled reservation")
+            quotes = db.execute("SELECT quote_id,version FROM runtime_resource_quotes "
+                "WHERE json_extract(quote_json,'$.operation_id')=?",
+                (attempt.reservation_operation_id,)).fetchall()
+            if len(quotes) != 1:
+                raise ValueError("model reservation lacks one actual signed D02 quote")
+            quote = issuer.resource_issuer.original_signed_quote(db, *quotes[0])
+            if quote.parent_budget_lease_ref != root.lease_id or dict(quote.ceiling) != json.loads(reservation[1]):
+                raise ValueError("actual quote and reservation ceilings/parent differ")
+            outcomes = db.execute("SELECT outcome_json,signature FROM runtime_resource_outcomes WHERE quote_id=? AND operation_id=?",
+                (quote.quote_id, quote.operation_id)).fetchall()
+            if len(outcomes) != 1:
+                raise ValueError("actual signed model cost outcome is missing")
+            issuer.resource_issuer._signer.verify("resource-outcome.v1", outcomes[0][0], outcomes[0][1])
+            outcome = _decode_outcome(outcomes[0][0])
+            if ((outcome.quote_id, outcome.operation_id, outcome.bot_id, outcome.persona_id) !=
+                    (quote.quote_id, quote.operation_id, *ns.as_tuple)
+                    or outcome.actual is None or outcome.actual.get("model_microusd", 0) != 0):
+                raise ValueError("Mock model cost is unknown or nonzero")
+            costs = db.execute("SELECT phase,receipt_json FROM runtime_budget_operations "
+                "WHERE bot_id=? AND persona_id=? AND operation_id=?", (*ns.as_tuple, attempt.reservation_operation_id)).fetchall()
+            receipts = {phase: BudgetReceipt(**json.loads(body)) for phase, body in costs}
+            if set(receipts) != {"reserve", "settle"} or receipts["settle"].status != "settled":
+                raise ValueError("model actual reserve/settle W01 pair is incomplete")
+            call_evidence.append({"call_id": attempt.call_id, "slot": attempt.slot, "quote_id": quote.quote_id,
+                "reservation_digest": attempt.reservation_digest, "outcome_digest": canonical_digest(outcome)})
+        from sylanne3.runtime.d11_life_preparation_v1 import _read as read_life_original
+        signed_c4 = []
+        for kind, ref in db.execute("SELECT kind,original_ref FROM graph_d11_life_originals_v1 "
+                "WHERE bot=? AND persona=? AND kind LIKE 'c4_phase_%'", ns.as_tuple):
+            value = read_life_original(db, issuer=issuer, namespace=ns, kind=kind, ref=ref)
+            if value is None:
+                raise ValueError("actual C4 signed original disappeared")
+            signed_c4.append({"kind": kind, "ref": ref, "digest": canonical_digest(value[0])})
+        if not signed_c4:
+            raise ValueError("no actual signed C4 model/file history exists")
+        observations = []
+        for attempt in plan.attempts:
+            if attempt.slot != "C3":
+                continue
+            basis = read_artifact_phase_observation_basis_v1(db, namespace=ns,
+                original_ref=attempt.observation_basis_ref, issuer=issuer)
+            if basis is None or basis.digest != attempt.observation_basis_digest:
+                raise ValueError("D07 call lost its actual signed phase/Source/Owner basis")
+            observed = _actual_observation_v1(db, basis=basis, issuer=issuer)
+            observations.append({"basis_digest": basis.digest, "prepared_digest": observed.prepared_digest,
+                "terminal_ref": observed.terminal_ref, "status": observed.status})
+        if unknown:
+            if [o["status"] for o in observations] != ["unknown"] or job.phase == "completed":
+                raise ValueError("unknown independent observation was fabricated as satisfaction/completion")
+            message_count = db.execute("SELECT COUNT(*) FROM runtime_budget_reservations WHERE lease_id=?", (child.lease_id,)).fetchone()[0]
+            if message_count:
+                raise ValueError("unknown observation dispatched a completion receipt")
+            return {"scope": "actual signed unknown observation; no receipt", "calls": call_evidence,
+                "observations": observations, "c02_operation_id": cycle.c02_operation_id}
+        if [o["status"] for o in observations] != ["satisfied", "satisfied"]:
+            raise ValueError("actual independent observations are not both satisfied")
+        if job.phase != "completed":
+            return None
+        ids = receipt_ids_v1(plan.phase_group.selector)
+        original = read_adopted_domain_operation_v1(db, ns, ids["producer"])
+        if original is None:
+            raise ValueError("completed cycle lacks its actual D06 receipt producer W01")
+        receipt = require_artifact_completion_receipt_history_v1(db, namespace=ns, original=original)
+        delivered = require_delivered_artifact_receipt_v1(db, namespace=ns, receipt=receipt)
+        finished = read_adopted_domain_operation_v1(db, ns, finish_operation_id_v1(plan.phase_group.selector))
+        if finished is None or finished["operation_kind"] != "finish_artifact_receipt_cycle_v1":
+            raise ValueError("cycle completion lacks the actual delivered-receipt finish W01")
+        return {"scope": "snapshot actual signed model/cost/Source/Owner/receipt chain; grants no execution authority",
+            "calls": call_evidence, "observations": observations, "c02_operation_id": cycle.c02_operation_id,
+            "allocation_digest": allocation.digest, "receipt_digest": receipt.digest, "signed_c4_originals": signed_c4,
+            "producer_receipt_digest": canonical_digest(original["receipt"]),
+            "delivery_digest": canonical_digest(delivered), "finish_receipt_digest": canonical_digest(finished["receipt"]),
+            "root_grant_digest": canonical_digest(grant), "model_microusd": 0}
+
+
+
+def verify_artifact_v3_queued_cancel_snapshot_v1(*,snapshot,setup,job_id,stop_operation_id=None,before=None):
+    """Only the isolated Root's read-only snapshot; this grants no execution right."""
+    from sylanne3.host import authority_profile as profile
+    from sylanne3.runtime.issuers import D02ResourceIssuer,D11BudgetJobIssuer
+    from sylanne3.runtime.budget import get_budget_lease
+    from sylanne3.runtime.jobs import get_job
+    from sylanne3.runtime.d07_execution_v1 import read_d07_original_v1
+    from sylanne3.runtime.artifact_observation_parentage_v3 import artifact_observation_descriptor_from_metadata_v3
+    from sylanne3.runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+    from sylanne3.runtime.artifact_receipt_allocation_v3 import read_actual_artifact_receipt_allocation_v3
+    from sylanne3.runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+    from sylanne3.runtime_contracts import canonical_digest
+    from sylanne3.graph_types import AtomKey
+    from rewrite.tests.alpha1.integration.artifact_forensic_graph_projection_v3 import forensic_artifact_snapshot_connection_v3
+    bundle=profile._load_installation_bundle_from_root(setup["profile_id"],Path("/etc/sylanne/client/profiles"),"Linux")
+    policy=bundle.installation_policy
+    if((policy.installation_id,policy.manifest_digest,canonical_digest(policy.root_grant))!=
+            (setup["installation_id"],setup["manifest_digest"],setup["root_grant_digest"])
+            or policy.root_grant.valid_until_utc!=setup["original_deadline_utc"]
+            or dict(policy.root_lease.limits)!=setup["approved_root_limits"]
+            or dict(policy.root_grant.max_ceiling)!=setup["approved_root_max_ceiling"]):
+        raise ValueError("cancelled fixture changed its actual fresh installed Root/manifest/lifetime")
+    issuer=D11BudgetJobIssuer(D02ResourceIssuer(bundle.d02_signing_key),bundle.d11_signing_key)
+    ns=policy.namespace
+    with forensic_artifact_snapshot_connection_v3(snapshot=snapshot,bundle=bundle)as db:
+        db.execute("PRAGMA query_only=ON");db.execute("BEGIN")
+        grant=issuer.current_budget_grant(db,policy.root_lease.lease_id)
+        root=get_budget_lease(db,policy.root_lease.lease_id)
+        job=get_job(db,job_id)
+        original=read_d07_original_v1(db,issuer,ns,"prepared",job_id)
+        if original is None:raise ValueError("actual signed D07 prepared disappeared")
+        descriptor=artifact_observation_descriptor_from_metadata_v3(original[0],namespace=ns,prepared_digest=original[1])
+        cycle_job=get_job(db,descriptor.cycle_ref.key.name)
+        cycle=foreground_cycle_from_wire_v1(cycle_job.continuation)
+        from sylanne3.memory_types import SourceRecord
+        source_row=db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",(cycle.source_ref,)).fetchone()
+        if source_row is None or source_row[1]!=1:
+            raise ValueError("actual task Source is absent in the isolated fixture snapshot")
+        source=SourceRecord.from_dict(json.loads(source_row[0]))
+        if source.text!=setup["task_text"]:
+            raise ValueError("queued cancellation Source differs from its actual single SDK ingress")
+        _,allocation,child,child_grant=read_actual_artifact_receipt_allocation_v3(db,namespace=ns,
+            c02_operation_id=cycle.c02_operation_id,source_ref=cycle.source_ref,issuer=issuer)
+        if(grant!=policy.root_grant or root.limits!=policy.root_lease.limits
+                or root.used.get("model_microusd",0)!=0 or job.budget_ref!=root.lease_id
+                or cycle_job.budget_ref!=root.lease_id or descriptor.c02_operation_id!=cycle.c02_operation_id
+                or child_grant.allowed_work_kinds!=("message",)or allocation.message_slots!=1
+                or read_d07_original_v1(db,issuer,ns,"call",job_id)is not None):
+            raise ValueError("cancelled queued child lost its exact Source/Root/allocation/no-Core-call baseline")
+        reservation=db.execute("SELECT digest,ceiling_json,state,actual_json FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?",(root.lease_id,job.operation_id)).fetchone()
+        quote=issuer.resource_issuer.original_signed_quote(db,original[0]["quote_id"],original[0]["quote_version"])
+        if(reservation is None or reservation[0]!=original[0]["reservation_digest"]
+                or json.loads(reservation[1])!=dict(quote.ceiling)
+                or quote.operation_id!=job.operation_id or quote.parent_budget_lease_ref!=root.lease_id):
+            raise ValueError("queued child lacks its exact signed quote and real reservation")
+        costs=tuple(db.execute("SELECT quote_id,operation_id,outcome_json,signature FROM runtime_resource_outcomes "
+            "ORDER BY quote_id,operation_id,version"))
+        for _,_,encoded,signature in costs:
+            issuer.resource_issuer._signer.verify("resource-outcome.v1",encoded,signature)
+        financial=canonical_digest((root.used,root.unconfirmed,costs))
+        value={"namespace":dict(zip(("bot_id","persona_id"),ns.as_tuple)),
+            "job_id":job.job_id,"cycle_job_ref":descriptor.cycle_ref.key.token,
+            "c02_operation_id":descriptor.c02_operation_id,"prepared_digest":original[1],
+            "job_phase":job.phase,"lease_holder":job.lease_holder,"fence":job.fence,
+            "cancel_epoch":job.cancel_epoch,"reservation":reservation,"financial_digest":financial,
+            "root_grant_digest":canonical_digest(grant),"deadline_utc":job.deadline_utc}
+        if before is None:
+            if job.phase!="queued"or job.lease_holder is not None or job.cancel_epoch or job.fence:
+                raise ValueError("baseline must be the real never-acquired D07 queued job")
+            return value
+        if(job.phase!="cancelled"or job.lease_holder is not None or job.cancel_epoch!=before["cancel_epoch"]+1
+                or value["prepared_digest"]!=before["prepared_digest"]
+                or value["reservation"]!=before["reservation"]or financial!=before["financial_digest"]
+                or value["deadline_utc"]!=before["deadline_utc"]):
+            raise ValueError("actual queued child cancellation changed original cost, reservation or lifetime")
+        stopped=read_adopted_domain_operation_v1(db,ns,stop_operation_id)
+        if stopped is None or(stopped["domain"],stopped["operation_kind"])!=("d11","owner_stop_reply_v1"):
+            raise ValueError("actual Owner StopReply W01 cancellation is absent")
+        provenance=stopped["payload"]["provenance"]
+        afters=[item for item in provenance["after_jobs"]if item["job_id"]==job_id]
+        refs=[item for item in provenance["child_originals"]if AtomKey.from_token(item[0]).name==job_id]
+        operation="owner-stop-job:"+canonical_digest((stop_operation_id,job_id))[:48]
+        row=db.execute("SELECT digest,job_id FROM runtime_job_operations WHERE bot_id=? AND persona_id=? "
+            "AND operation_id=? AND phase='cancel'",(*ns.as_tuple,operation)).fetchone()
+        if(len(afters)!=1 or afters[0]["phase"]!="cancelled"or len(refs)!=1
+                or list(refs[0][1:])!=[job_id,original[1]]
+                or row!=(provenance["stop_original_digest"].removeprefix("sha256:"),job_id)):
+            raise ValueError("actual same-child signed carrier/cancel_persistent_job W01 receipt differs")
+        value["stop_original_ref"]=provenance["stop_original_ref"]
+        value["projection_receipt_digest"]=canonical_digest(stopped["receipt"])
+        return value

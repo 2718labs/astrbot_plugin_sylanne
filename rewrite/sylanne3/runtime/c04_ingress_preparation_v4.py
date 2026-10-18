@@ -376,6 +376,7 @@ def _freeze_after_cas(db,pure,resources,child,after_parent,receipt,graph,environ
 def commit_self_c04_prepare_v4(runtime,db,*,operation,request,frame,stage,readers,scope,metadata,epoch,process_lease,owner,guard,external_originals):
     from .domain_production_commit_v1 import foreground_domain_finish_digest_v1
     from ..authority_service.v2_contract import to_wire
+    from .c04_self_scope_v4 import export_self_c04_scope_original_v5
     graph=runtime.graph;store=graph._GraphCoordinator__store;cap=graph._GraphCoordinator__graph_capability
     environment=_environment(readers,request)
     if stage_self_c04_prepare_v4(db,frame=frame,request=request,installed_readers=readers)!=stage:

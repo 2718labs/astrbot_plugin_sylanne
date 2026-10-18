@@ -6,8 +6,8 @@ from dataclasses import asdict, dataclass
 import json
 from typing import Protocol
 
-from .contracts import Candidate, Event, Scope, Write
-from .store import StaleRead
+from sylanne3.contracts import Candidate, Event, Scope, Write
+from sylanne3.store import StaleRead
 
 
 @dataclass(frozen=True)

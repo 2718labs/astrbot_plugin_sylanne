@@ -126,9 +126,12 @@ def check_request(request):
         "budget_max_ceiling", "currency", "budget_valid_until_utc", "model_audiences", "onebot_account",
         "onebot_adapter_ref", "provider_cache", "host_lifecycle", "d04_semantic_drive", "d04_joint_numeric",
         "d13_wire_policy", "d13_wire_counter", "d13_precompression", "d13_paid_precompression", "d07_cognition"}
-    version5 = request.get("schema") == "sylanne3.linux-install-request.v5"
-    version4 = request.get("schema") in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
-    process = request.get("schema") in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
+    version5 = request.get("schema") in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}
+    version4 = request.get("schema") in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}
+    process = request.get("schema") in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}
+    version6 = request.get("schema") == "sylanne3.linux-install-request.v6"
+    if version6:
+        fields |= {"artifact_observation_cognition", "artifact_phase_observer", "artifact_phase_counter"}
     if process:
         fields = fields - {"host_systemd_unit"} | {"host_process_command"}
     if version4:
@@ -147,7 +150,7 @@ def check_request(request):
             fields.add("natural_template_pair_v1")
         if "d13_counter_installation_v1" in request:
             fields.add("d13_counter_installation_v1")
-    if set(request) != fields or request["schema"] not in {"sylanne3.linux-install-request.v2", "sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}:
+    if set(request) != fields or request["schema"] not in {"sylanne3.linux-install-request.v2", "sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}:
         raise ValueError("installation request fields differ; use the bundled request template")
     if "habit_runtime" in request and (not version5 or type(request["habit_runtime"]) is not bool):
         raise ValueError("Habit runtime is an explicit fresh v5 installation boolean")
@@ -274,6 +277,10 @@ def check_request(request):
                     draft.observation_policy.cpu_ceiling_ms > request["budget_limits"]["cpu_ms"]
                     or draft.observation_policy.cpu_ceiling_ms > request["budget_max_ceiling"]["cpu_ms"]):
                 raise ValueError("draft observation ceiling exceeds approved root budget")
+    if version6:
+        validate_artifact_v3_asset_descriptors_v1(request)
+        from sylanne3.host.model_workflows_v4 import model_workflow_v4_from_payload
+        model_workflow_v4_from_payload(request["artifact_observation_cognition"])
     return request
 
 
@@ -288,7 +295,7 @@ def natural_template_pair_v1(request):
     selected = request.get("natural_template_pair_v1")
     if selected is None:
         return legacy
-    if (request.get("schema") not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
+    if (request.get("schema") not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}
             or type(selected) is not dict
             or set(selected) != {"schema", "generation", "review"}
             or selected["schema"] != "sylanne3.initial-natural-template-pair.v1"):
@@ -381,6 +388,9 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
         if type(artifact_draft_policy_from_payload_v1(request["artifact_draft"])) is AdminArtifactDraftPolicyV2:
             from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
             encode_template=FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
+    if request["schema"] == "sylanne3.linux-install-request.v6":
+        from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION
+        encode_template = FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION
     workflows = {"version": 2}
     for name, kind, purpose, template in (("encode", "d06.encode_source", "consolidation", encode_template),
         ("reply", "reply", "proposal", REPLY_TEMPLATE_VERSION), ("natural_generation", "natural_generation", "proposal", generation_template),
@@ -391,7 +401,7 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
         if any(workflows['d07_cognition'].get(name) != common[name]
                for name in ('provider_id', 'model_id', 'provider_config_ref', 'provider_config_digest')):
             raise ValueError('D07 cognition must explicitly match the installed main provider configuration')
-    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5'}:
+    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5', 'sylanne3.linux-install-request.v6'}:
         workflows['version'] = 4
         workflows['artifact_draft'] = None
         if request['artifact_draft'] is not None:
@@ -408,7 +418,7 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
         workflows['version'] = 6
         workflows['d07_relationship_cognition'] = None
         workflows['growth_cognition'] = None
-    if request['schema'] == 'sylanne3.linux-install-request.v5':
+    if request['schema'] in {'sylanne3.linux-install-request.v5', 'sylanne3.linux-install-request.v6'}:
         if generation_template != NATURAL_GENERATION_V7:
             raise ValueError('V8 workflows require their exact inherited V7 natural wire')
         workflows['version'] = 8
@@ -420,6 +430,15 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
             if any(configured[name] != common[name] for name in ('provider_id', 'model_id', 'provider_config_ref', 'provider_config_digest')):
                 raise ValueError('General workflow must use the exact installed main provider configuration')
             workflows['general_growth_cognition'] = dict(configured)
+    artifact_v3 = None
+    if request["schema"] == "sylanne3.linux-install-request.v6":
+        observation, observer, counter = _artifact_v3_configuration_v1(request,
+            installation_id=installation_id, manifest_pin=manifest_pin, config_digest=config_digest,
+            installed_paths=True)
+        workflows["version"] = 9
+        from sylanne3.domains.d01.production_operations_v1 import plain_v1
+        workflows["artifact_observation_cognition"] = plain_v1(observation)
+        artifact_v3 = (observer, counter)
     local = dict(deadline_after_seconds=300.0, quote_ceiling=request["local_quote"],
         snapshot_ref="installed:snapshot:v1", resource_ref="installed:resource:v1")
     kinds = ["d06.encode_source", "reply", "natural_generation", "natural_review", APPRAISAL_KIND,
@@ -432,24 +451,26 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
                           ("d07_cognition", "d07.cognition")):
         if request[setting] is not None and kind not in kinds:
             kinds.append(kind)
-    if request["schema"] == "sylanne3.linux-install-request.v5":
+    if request["schema"] in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}:
         from sylanne3.authority_service.conditioned_child_contract_v1 import ROOT_WORK_KIND
         kinds.append(ROOT_WORK_KIND)
         if request.get("habit_runtime", False):
             kinds.extend(("habit_subscription_v1", "d10.life.source_note.v1"))
-    if request["schema"] == "sylanne3.linux-install-request.v5" and request["general_growth_cognition"] is not None:
+    if request["schema"] in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"} and request["general_growth_cognition"] is not None:
         if "d07.cognition" not in kinds:
             kinds.append("d07.cognition")
     if generation_template == NATURAL_GENERATION_V7:
         # Issue the distinct bounded counter CPU step only in this new Root.
         # The existing Root ceiling and expiry are unchanged.
         kinds.append('d13.full_http_counter.v1')
-    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5'}:
+    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5', 'sylanne3.linux-install-request.v6'}:
         kinds.append('d11.foreground_cycle.v1')
         if request['artifact_draft'] is not None:
             kinds.extend(('artifact_draft_v1', 'd10.life.artifact_draft.v1'))
             if request['artifact_draft']['observation_policy'] is not None:
                 kinds.append('d11.life.artifact_observation.v1')
+    if artifact_v3 is not None and "d07.cognition" not in kinds:
+        kinds.append("d07.cognition")
     budget_identity = dict(bot_id=namespace.bot_id, persona_id=namespace.persona_id, currency=request["currency"])
     policy = dict(namespace=asdict(namespace), authority_namespace=namespace_ref(namespace), installation_id=installation_id,
         manifest_digest=manifest_pin, administrator_holder="host:" + request["profile_id"], expected_authority_id=authority_id,
@@ -471,11 +492,18 @@ def make_profile(request, *, manifest_pin, authority_id, installation_id, regist
     for name in ("d04_semantic_drive", "d04_joint_numeric", "d13_precompression", "d13_paid_precompression", "d13_wire_counter"):
         if request[name] is not None:
             profile[name] = request[name]
-    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5'}:
+    if request['schema'] in {'sylanne3.linux-install-request.v4', 'sylanne3.linux-install-request.v5', 'sylanne3.linux-install-request.v6'}:
         if "astrbot_namespace_v1" in request:
             profile["astrbot_namespace_v1"] = request["astrbot_namespace_v1"]
         profile['foreground'] = request['foreground']
         profile['artifact_draft'] = request['artifact_draft']
+        if artifact_v3 is not None:
+            observer, counter = artifact_v3
+            profile["artifact_phase_observer"] = {
+                "schema": "sylanne.artifact-phase-observer-installation.v2", "observer_id": observer.observer_id,
+                "observer_version": observer.observer_version, "asset_ref": observer.asset_ref,
+                "asset_sha256": observer.asset_digest}
+            profile["artifact_phase_counter"] = asdict(counter)
         from sylanne3.host.authority_profile import _foreground_from_payload, _artifact_draft_from_payload
         _foreground_from_payload(profile)
         _artifact_draft_from_payload(profile)
@@ -520,7 +548,10 @@ def preflight_profile(args, request):
     """Validate real pinned assets and full policy before touching system paths."""
     from sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
     archive_manifest(args.package, args.package_sha256, args.manifest_sha256)
-    if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}:
+    if request["schema"] == "sylanne3.linux-install-request.v6":
+        _read_artifact_v3_assets_v1(request, installation_id="installation:preflight-only",
+            manifest_pin=args.manifest_sha256)
+    if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}:
         verify_host_process_command_v3(request["host_process_command"])
     with tempfile.TemporaryDirectory(prefix="sylanne-install-preflight-") as directory:
         with zipfile.ZipFile(args.package) as archive:
@@ -533,7 +564,7 @@ def preflight_profile(args, request):
 
 def configure_draft_inventory_v4(request, inventory, directories):
     """Declare the actual generated export surface; no live DraftRoot is issued."""
-    if request["schema"] != "sylanne3.linux-install-request.v4" or request["artifact_draft"] is None:
+    if request["schema"] not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v6"} or request["artifact_draft"] is None:
         return inventory
     from sylanne3.runtime_contracts import canonical_digest
     selected = [resource for resource in inventory.resources if resource.resource_id == "export"]
@@ -584,6 +615,9 @@ def install(args, request, manifest):
     installation_id = "installation:" + secrets.token_hex(16)
     make_profile(request, manifest_pin=args.manifest_sha256, authority_id="authority:pending-bootstrap",
         installation_id=installation_id, registry=affect.registry.type_registry, scheme=affect.scheme)
+    if request["schema"] == "sylanne3.linux-install-request.v6":
+        _stage_artifact_v3_assets_v1(request, profile_dir=profile_dir,
+            installation_id=installation_id, manifest_pin=args.manifest_sha256, gid=request["host_gid"])
     ca, authority, host = tls_material()
     cert_dir = config_dir / "certificates"
     cert_dir.mkdir(mode=0o700)
@@ -686,7 +720,7 @@ def install(args, request, manifest):
         host_lifecycle=request["host_lifecycle"],
         host_observation=dict(adapter_ref=request["onebot_adapter_ref"], account_ref=json.dumps(request["onebot_account"], separators=(",", ":")),
             clock_source_ref="linux:kernel-adjtimex:v1"))
-    process = request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
+    process = request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}
     if process:
         deployment["schema"] = "sylanne3.authority.linux-deployment.v2"
     else:
@@ -775,30 +809,34 @@ def request_template_v5():
 
 def configuration_plan_v4(request):
     """Review static scopes and exact budgets without issuing a responsibility."""
-    if request["schema"] not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}:
+    if request["schema"] not in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}:
         return None
     kinds = ["d11.foreground_cycle.v1"]
-    if request["schema"] == "sylanne3.linux-install-request.v5":
+    if request["schema"] in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}:
         from sylanne3.authority_service.conditioned_child_contract_v1 import ROOT_WORK_KIND
         kinds.append(ROOT_WORK_KIND)
         if request.get("habit_runtime", False):
             kinds.extend(("habit_subscription_v1", "d10.life.source_note.v1"))
     draft = request["artifact_draft"]
-    if request["schema"] == "sylanne3.linux-install-request.v5" and request["general_growth_cognition"] is not None:
+    if request["schema"] in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"} and request["general_growth_cognition"] is not None:
         kinds.append("d07.cognition")
     if draft is not None:
         kinds.extend(("artifact_draft_v1", "d10.life.artifact_draft.v1"))
         if draft["observation_policy"] is not None:
             kinds.append("d11.life.artifact_observation.v1")
+    if request["schema"] == "sylanne3.linux-install-request.v6" and "d07.cognition" not in kinds:
+        kinds.append("d07.cognition")
     return dict(foreground=request["foreground"], artifact_draft=draft,
+        **({name: request[name] for name in ("artifact_observation_cognition", "artifact_phase_observer", "artifact_phase_counter")}
+            if request["schema"] == "sylanne3.linux-install-request.v6" else {}),
         **({"habit_runtime": request.get("habit_runtime", False)}
-            if request["schema"] == "sylanne3.linux-install-request.v5" else {}),
+            if request["schema"] in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"} else {}),
         **({"astrbot_namespace_v1": request["astrbot_namespace_v1"]} if "astrbot_namespace_v1" in request else {}),
         **({"d06_recall": request["d06_recall"]} if "d06_recall" in request else {}),
         **({"natural_template_pair_v1": request["natural_template_pair_v1"]}
            if request.get("natural_template_pair_v1") is not None else {}),
         **({"general_growth_cognition": request["general_growth_cognition"]}
-           if request["schema"] == "sylanne3.linux-install-request.v5" else {}),
+           if request["schema"] in {"sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"} else {}),
         installed_export_path="/var/lib/sylanne/export" if draft is not None else None,
         added_work_kinds=kinds, root_budget_limits=request["budget_limits"],
         root_budget_max_ceiling=request["budget_max_ceiling"],
@@ -806,10 +844,152 @@ def configuration_plan_v4(request):
         dynamic_draft_scope="actual_current_owner_source_registration_required")
 
 
+
+ARTIFACT_V3_REQUEST_SCHEMA = "sylanne3.linux-install-request.v6"
+ARTIFACT_COUNTER_INITIAL_SCHEMA = "sylanne3.initial-artifact-phase-counter.v1"
+_ARTIFACT_COUNTER_FIELDS = frozenset({
+    "schema", "source_scope", "model_revision", "counter_policy_id", "counter_policy_version",
+    "executable", "program_sha256", "counter_public_key_hex", "tokenizer_path", "tokenizer_sha256",
+    "applicability_path", "applicability_sha256", "encoding_rule_id", "encoding_rule_sha256", "timeout_seconds"})
+
+
+
+def validate_artifact_v3_asset_descriptors_v1(request):
+    observer = request.get("artifact_phase_observer")
+    counter = request.get("artifact_phase_counter")
+    if (type(observer) is not dict
+            or set(observer) != {"schema", "observer_id", "observer_version", "asset_ref", "asset_sha256"}
+            or observer["schema"] != "sylanne.artifact-phase-observer-installation.v2"):
+        raise ValueError("exact protected observer descriptor required")
+    if (type(counter) is not dict or set(counter) != _ARTIFACT_COUNTER_FIELDS
+            or counter["schema"] != ARTIFACT_COUNTER_INITIAL_SCHEMA or counter["source_scope"] != "production"):
+        raise ValueError("exact production external-counter descriptor required")
+    for path in (observer["asset_ref"], counter["executable"], counter["tokenizer_path"], counter["applicability_path"]):
+        if type(path) is not str or not PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
+            raise ValueError("explicit absolute protected asset path required")
+    return request
+
+
+def _artifact_v3_configuration_v1(request, *, installation_id, manifest_pin, config_digest, installed_paths):
+    """Bind explicit assets to this fresh identity without editing any approved budget."""
+    from sylanne3.host.authority_profile import artifact_draft_policy_from_payload_v1, AdminArtifactDraftPolicyV3, installed_model_config_ref
+    from sylanne3.host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+    from sylanne3.host.model_workflows_v4 import model_workflow_v4_from_payload
+    from sylanne3.host.artifact_phase_observer_policy_v2 import ArtifactPhaseObserverPolicyV2, INSTALLATION_SCHEMA
+    from sylanne3.model_broker.artifact_phase_count_v1 import ArtifactPhaseCountPolicyV1
+    from sylanne3.runtime_contracts import NamespaceId, canonical_digest
+    from sylanne3.model_broker.d07_cognition_v1 import TEMPLATE_VERSION, WORK_KIND
+    validate_artifact_v3_asset_descriptors_v1(request)
+    draft = artifact_draft_policy_from_payload_v1(request["artifact_draft"])
+    if type(draft) not in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}:
+        raise ValueError("V6 requires an explicit installed phase-capable Artifact policy")
+    phase = draft.phase_model_workflow
+    observation = model_workflow_v4_from_payload(request["artifact_observation_cognition"])
+    if ((observation.work_kind, observation.purpose, observation.template_version) != (WORK_KIND, "proposal", TEMPLATE_VERSION)
+            or set(observation.quote_ceiling) != {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+            or observation.quote_ceiling["input_tokens"] > 6000 or observation.quote_ceiling["output_tokens"] > 1000
+            or observation.quote_ceiling["model_tokens"] > 7000 or observation.max_output_tokens > 1000):
+        raise ValueError("V6 independent D07 workflow differs from its fixed registered quote")
+    for workflow in (draft.model_workflow, phase, observation):
+        if (workflow.provider_id, workflow.model_id, workflow.provider_config_digest, workflow.provider_config_ref) != (
+                request["provider_id"], request["model_id"], config_digest,
+                installed_model_config_ref(request["provider_id"], request["model_id"], config_digest)):
+            raise ValueError("V6 workflows must retain the actual selected provider/model/configuration")
+        if any(amount > min(request["budget_limits"].get(name, 0), request["budget_max_ceiling"].get(name, 0))
+                for name, amount in workflow.quote_ceiling.items()):
+            raise ValueError("V6 workflow quote exceeds the original approved Root")
+    if (set(request["model_quote"]) != {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+            or set(phase.quote_ceiling) != {"input_tokens", "output_tokens", "model_tokens", "model_microusd"}
+            or request["model_quote"].get("input_tokens", 0) > 6000
+            or request["model_quote"].get("output_tokens", 0) > 800
+            or phase.quote_ceiling.get("input_tokens", 0) > 10000
+            or phase.quote_ceiling.get("output_tokens", 0) > 2000):
+        raise ValueError("V6 C1/C2/C4 quotes exceed their unchanged episode slots")
+    spec = request["artifact_phase_observer"]
+    if (type(spec) is not dict or set(spec) != {"schema", "observer_id", "observer_version", "asset_ref", "asset_sha256"}
+            or spec["schema"] != INSTALLATION_SCHEMA):
+        raise ValueError("V6 requires its exact protected independent observer specification")
+    directory = PurePosixPath("/etc/sylanne/client/profiles") / request["profile_id"] / "artifact-v3"
+    observer_ref = str(directory / "observer.json") if installed_paths else spec["asset_ref"]
+    observer = ArtifactPhaseObserverPolicyV2(spec["observer_id"], spec["observer_version"],
+        observer_ref, spec["asset_sha256"], canonical_digest(observation))
+    counter_spec = request["artifact_phase_counter"]
+    if (type(counter_spec) is not dict or set(counter_spec) != _ARTIFACT_COUNTER_FIELDS
+            or counter_spec["schema"] != ARTIFACT_COUNTER_INITIAL_SCHEMA or counter_spec["source_scope"] != "production"):
+        raise ValueError("V6 requires an explicit production external-counter contract; LOCAL_FIXTURE is not installable")
+    values = {name: value for name, value in counter_spec.items() if name != "schema"}
+    if installed_paths:
+        values.update(executable=str(directory / "counter"), tokenizer_path=str(directory / "tokenizer"),
+            applicability_path=str(directory / "applicability.json"))
+    counter = ArtifactPhaseCountPolicyV1(namespace=NamespaceId(request["bot_id"], request["persona_id"]),
+        installation_id=installation_id, manifest_digest=manifest_pin, profile_id=request["profile_id"],
+        provider_id=phase.provider_id, model_id=phase.model_id, provider_config_digest=phase.provider_config_digest,
+        template_version=phase.template_version, **values)
+    return observation, observer, counter
+
+
+def _read_artifact_v3_assets_v1(request, *, installation_id, manifest_pin):
+    """Read pinned administrator input; no counter program or model is executed."""
+    from sylanne3.authority_service.linux_installation_security_v1 import opened_installed_file_v1
+    from sylanne3.authority_service.artifact_phase_counter_v1 import artifact_phase_applicability_wire_v1, _unique_json
+    from sylanne3.host.artifact_phase_observer_policy_v2 import artifact_phase_observer_from_asset_v2
+    from sylanne3.runtime_contracts import canonical_digest
+    config = json.loads(Path(request["provider_config_path"]).read_bytes())
+    if type(config) is not dict or (config.get("id"), config.get("model")) != (request["provider_id"], request["model_id"]):
+        raise ValueError("V6 provider configuration differs from its declared selected identity")
+    workflow, observer, counter = _artifact_v3_configuration_v1(request,
+        installation_id=installation_id, manifest_pin=manifest_pin,
+        config_digest=canonical_digest(config), installed_paths=False)
+    assets = {}
+    for name, source, pin in (
+            ("observer.json", observer.asset_ref, observer.asset_digest),
+            ("counter", counter.executable, counter.program_sha256),
+            ("tokenizer", counter.tokenizer_path, counter.tokenizer_sha256),
+            ("applicability.json", counter.applicability_path, counter.applicability_sha256)):
+        with opened_installed_file_v1(source) as fd:
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                content = stream.read()
+        if hashlib.sha256(content).hexdigest() != pin:
+            raise ValueError("V6 declared asset bytes differ: " + name)
+        assets[name] = (source, pin, content)
+    actual = artifact_phase_observer_from_asset_v2(asset_ref=observer.asset_ref,
+        asset_bytes=assets["observer.json"][2], expected_digest=observer.asset_digest)
+    if actual != observer:
+        raise ValueError("V6 protected observer differs from its exact named workflow and completion policy")
+    if json.loads(assets["applicability.json"][2], object_pairs_hook=_unique_json) != artifact_phase_applicability_wire_v1(counter):
+        raise ValueError("V6 external-counter applicability differs from its actual model/rule/program")
+    if not os.access(counter.executable, os.X_OK):
+        raise ValueError("V6 declared external counter is not executable")
+    return assets
+
+
+def _stage_artifact_v3_assets_v1(request, *, profile_dir, installation_id, manifest_pin, gid):
+    assets = _read_artifact_v3_assets_v1(request, installation_id=installation_id, manifest_pin=manifest_pin)
+    directory = profile_dir / "artifact-v3"
+    directory.mkdir(mode=0o755)
+    pins = []
+    for name, (source, pin, content) in assets.items():
+        destination = directory / name
+        write(destination, content, mode=0o755 if name == "counter" else 0o644, gid=gid)
+        pins.append({"path": str(destination), "source": source, "sha256": pin, "bytes": len(content)})
+    write(directory / "asset-pins.json", canonical({
+        "schema": "sylanne3.initial-artifact-v3-assets.v1", "installation_id": installation_id,
+        "manifest_digest": manifest_pin, "profile_id": request["profile_id"], "files": pins}), mode=0o644, gid=gid)
+
+
+def request_template_v6():
+    """Intentionally incomplete fresh V9 request; supply real approved assets and quotes."""
+    value = request_template_v5()
+    value.update(schema=ARTIFACT_V3_REQUEST_SCHEMA, artifact_observation_cognition=None,
+        artifact_phase_observer=None, artifact_phase_counter=None)
+    return value
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", action="store_true", help="Print an intentionally non-installable template; every limit requires review")
-    parser.add_argument("--template-version", choices=(2, 3, 4, 5), type=int, default=2)
+    parser.add_argument("--template-version", choices=(2, 3, 4, 5, 6), type=int, default=2)
     parser.add_argument("--package", type=Path)
     parser.add_argument("--package-sha256")
     parser.add_argument("--manifest-sha256")
@@ -823,7 +1003,7 @@ def main():
     if args.template:
         if args.install:
             parser.error("--template cannot install")
-        template = {2: request_template_v2, 3: request_template_v3, 4: request_template_v4, 5: request_template_v5}[args.template_version]()
+        template = {2: request_template_v2, 3: request_template_v3, 4: request_template_v4, 5: request_template_v5, 6: request_template_v6}[args.template_version]()
         print(json.dumps(template, ensure_ascii=False, indent=2))
         return
     if any(value is None for value in (args.package, args.package_sha256, args.manifest_sha256, args.request)):
@@ -843,11 +1023,11 @@ def main():
         preflight_profile(args, request)
         print(json.dumps(dict(status="plan_only", package_sha256=args.package_sha256, manifest_sha256=args.manifest_sha256,
             model_selection=selection.to_dict() if selection is not None else None,
-            **({"foreground_configuration": configuration_plan_v4(request)} if request["schema"] in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"} else {}),
+            **({"foreground_configuration": configuration_plan_v4(request)} if request["schema"] in {"sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"} else {}),
             configuration_semantics="fresh_install_only; existing installations require the qualified package/configuration change protocol",
             changes=["new /opt/sylanne code", "new /etc/sylanne service/profile and local credentials", "new /var/lib/sylanne four-store cohort",
                      "AstrBot plugin link", ("fixed process supervisor specs staged; no process started"
-                          if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5"}
+                          if request["schema"] in {"sylanne3.linux-install-request.v3", "sylanne3.linux-install-request.v4", "sylanne3.linux-install-request.v5", "sylanne3.linux-install-request.v6"}
                          else "systemd unit staged, not enabled or started")], model_calls=0, platform_sends=0)))
         return
     install(args, request, manifest)

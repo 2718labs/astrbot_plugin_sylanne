@@ -183,7 +183,8 @@ def test_configuration_http_sdk_save_cas_safe_slots_and_unknown_outcome(sdk_mode
         asyncio.run(db.engine.dispose())
 
 
-def test_v4_configuration_reports_real_slots_and_mismatched_installed_config_stays_pending(sdk_models, tmp_path):
+@pytest.mark.parametrize("workflow_version", (4, 9))
+def test_v4_configuration_reports_real_slots_and_mismatched_installed_config_stays_pending(sdk_models, tmp_path, workflow_version):
     from dataclasses import fields, replace
     from sylanne3.host.model_workflows_v4 import AdminModelWorkflowsV4
     context, primary, _, calls = sdk_models
@@ -193,15 +194,33 @@ def test_v4_configuration_reports_real_slots_and_mismatched_installed_config_sta
     config = AstrBotConfig(str(tmp_path / "v4-plugin.json"), schema=schema)
     config.save_config(startup)
     base = model_cases.bundle_for(primary, tmp_path, version=3)
-    workflows = AdminModelWorkflowsV4(4, **{field.name: getattr(base.model_workflows, field.name)
-        for field in fields(base.model_workflows) if field.name != "version"})
+    from sylanne3.host.model_workflows_v9 import AdminModelWorkflowsV9
+    from sylanne3.model_broker.d07_cognition_v1 import WORK_KIND, TEMPLATE_VERSION
+    values = {field.name: getattr(base.model_workflows, field.name)
+        for field in fields(base.model_workflows) if field.name != "version"}
+    if workflow_version == 9:
+        observation = replace(base.model_workflows.reply, work_kind=WORK_KIND, purpose="proposal",
+            template_version=TEMPLATE_VERSION, max_output_tokens=1000,
+            quote_ceiling={"input_tokens": 6000, "output_tokens": 1000, "model_tokens": 7000, "model_microusd": 1})
+        from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as GENERATION_TEMPLATE
+        from sylanne3.runtime_contracts import NATURAL_REPLY_REVIEW_WORKFLOW_V2
+        values["natural_generation"] = replace(base.model_workflows.reply, work_kind="natural_generation",
+            purpose="proposal", template_version=GENERATION_TEMPLATE)
+        values["natural_review"] = replace(base.model_workflows.reply, work_kind="natural_review",
+            purpose="proposal", template_version=NATURAL_REPLY_REVIEW_WORKFLOW_V2)
+        workflows = AdminModelWorkflowsV9(9, **values, artifact_observation_cognition=observation)
+    else:
+        workflows = AdminModelWorkflowsV4(4, **values)
     bundle = replace(base, model_workflows=workflows)
     service = WebuiConfigurationV1(config, context, startup_values=startup, installation_bundle=bundle)
     try:
         dto = service._response("controlled-dashboard-session", startup)
         slots = {row["slot"]: row for row in dto["model_slots"]}
-        installed = [slot for slot in SLOTS if getattr(workflows, slot, None) is not None]
-        assert dto["installed_policy"]["workflow_version"] == 4
+        installed = [slot for slot in service._public_model_slots() if getattr(workflows, slot, None) is not None]
+        assert dto["installed_policy"]["workflow_version"] == workflow_version
+        if workflow_version == 9:
+            assert list(slots)[-1] == "artifact_observation_cognition"
+            assert "artifact_observation_cognition" not in dto["values"]["model_selection"]["overrides"]
         assert dto["installed_policy"]["configured_model_slots"] == installed
         for slot in installed:
             workflow = getattr(workflows, slot)

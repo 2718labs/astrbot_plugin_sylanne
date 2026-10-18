@@ -1005,6 +1005,12 @@ async def run_installed_artifact_predecision_mesh_v1(runtime, installation, *, c
     selected=runtime._consume_background_graph_result_v3(choice)
     if selected.get('coverage')!='complete'or selected.get('receipt',{}).get('status')not in {'committed','duplicate'}:
         raise MissingProductionOriginalV1('actual_complete_conditional_personal_choice')
+    if bundle.artifact_phase_observer is not None:
+        begun=await worker.call(lambda graph:graph.begin_current_artifact_method_group_v3(bootstrap,bundle,
+            prepared_candidates_operation_id=dict(material.ids)['prepare'],**args))
+        begun=runtime._consume_background_graph_result_v3(begun)
+        if begun.get('status')!='existing_original_method_group' and begun.get('receipt',{}).get('status')not in {'committed','duplicate'}:
+            raise MissingProductionOriginalV1('actual_initial_selected_method_group_checkpoint')
     phase = await worker.call(lambda graph: graph.read_current_post_c02_artifact_phase_resume_v2(
         bootstrap, bundle, **args))
     if phase is None: raise MissingProductionOriginalV1("actual_adopted_immutable_artifact_decision_phase_group")

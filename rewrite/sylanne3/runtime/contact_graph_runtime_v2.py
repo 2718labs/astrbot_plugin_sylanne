@@ -26,6 +26,7 @@ from ..host.model_workflows_v5 import AdminModelWorkflowsV5
 from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+from ..host.model_workflows_v9 import AdminModelWorkflowsV9
 from .contact_paid_original_v2 import record_contact_original_v2, require_contact_original_v2, read_contact_original_v2
 from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2, require_contact_inventory_current_v2
 from .contact_model_job_v2 import contact_model_ids_v2, read_contact_prepared_v2
@@ -62,7 +63,7 @@ class InstalledContactModelGraphRuntimeV2:
         assembly = graph._GraphCoordinator__d04_installed_joint_assembly
         if (not isinstance(store, ProductionGraphStore) or type(bundle) is not AdminInstallationBundle
                 or type(bundle.model_workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
-                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8)
+                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
                 or port is None or assembly is None or assembly.admin_bundle is not bundle
                 or graph._GraphCoordinator__model_terminal_cost_port is None):
             raise ValueError("contact stages require actual installed W01/Authority/model accounting")

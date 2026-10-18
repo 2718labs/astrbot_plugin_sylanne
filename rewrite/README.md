@@ -1,3 +1,5 @@
+> Legacy fixture reference: these examples are engineering-only and are not included in the AstrBot runtime package. Run module commands from the repository root with `rewrite` on PYTHONPATH.
+
 # Embodiment 3.0 development slice
 
 `rewrite/` contains the new 3.0 engineering foundation used by the sole root `main.py` entry point. It is an early implementation slice, not a complete 3.0 product or a production/platform acceptance package. The user explicitly retired the old interfaces and core. See the [heavyweight product architecture](../docs/architecture/embodiment-3-system.md) for the final system scope.
@@ -20,7 +22,7 @@ After the native library has been built (run `python rewrite/tools/verify.py` or
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path .\rewrite).Path
-python -m sylanne3.demo
+python -m rewrite.host_tests.legacy_fixture_v1.demo
 ```
 
 From the repository root, the one-command acceptance script is:

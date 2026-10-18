@@ -53,10 +53,12 @@ def require_d07_parentage_v3(db,*,intent,issuer):
     raw=background_json_loads_v3(column)
     from ..runtime.d07_execution_v1 import D07PreparedExecutionV1,D07RelationshipPreparedV2,D07IngressRecallPreparedV1,D07ReflectionPreparedV3
     from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2,PREPARED_SCHEMA,_head as growth_head,_deadline
+    from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
     variants={'d07.prepared-execution.v1':D07PreparedExecutionV1,
         'd07.relationship-prepared.v2':D07RelationshipPreparedV2,
         'd07.ingress-recall-prepared.v1':D07IngressRecallPreparedV1,
-        'd07.reflection-prepared.v3':D07ReflectionPreparedV3,PREPARED_SCHEMA:D07MethodGrowthPreparedV2}
+        'd07.reflection-prepared.v3':D07ReflectionPreparedV3,PREPARED_SCHEMA:D07MethodGrowthPreparedV2,
+        'd07.artifact-observation-prepared.v3':D07ArtifactObservationPreparedV3}
     variant=variants.get(raw.get('schema'))
     if variant is None or set(owner.column_kinds[column])!={field.name for field in fields(variant)}:
         raise AuthorityUnavailable('D07 parentage original closed field set differs')
@@ -71,7 +73,10 @@ def require_d07_parentage_v3(db,*,intent,issuer):
         return proof
     if raw['call_id']!=intent.call_id or row[1]!=intent.binding_digest:
         raise AuthorityUnavailable('model barrier signed C3 call/binding identity differs')
-    if variant is D07ReflectionPreparedV3:
+    if variant is D07ArtifactObservationPreparedV3:
+        from ..runtime.artifact_observation_parentage_v3 import artifact_observation_descriptor_from_metadata_v3
+        descriptor=artifact_observation_descriptor_from_metadata_v3(raw,namespace=owner.namespace,prepared_digest=row[1])
+    elif variant is D07ReflectionPreparedV3:
         from ..runtime.foreground_call_plan_v1 import NamedC3ParentageDescriptorV3
         if raw["work_kind"]!="reflection":
             raise ValueError("reflection parentage changed its exact work kind")
@@ -272,11 +277,15 @@ def require_appraisal_parent_v3(db,*,intent,job,issuer):
 
 
 def read_appraisal_child_metadata_v3(db,*,namespace,job_id,issuer):
-    """Read one actual C2 child original identity without a prepared-body DTO."""
-    owner=_active(db)
+    """Read the actual signed C2 identity through a registered metadata Work."""
+    from .model_reply_scope_observation_v3 import actual_reply_metadata_reader_v3
+    owner=actual_reply_metadata_reader_v3(db)
+    if owner is None or owner.legacy:
+        raise AuthorityUnavailable("actual selected parentage metadata Work required")
+    actual_issuer=owner.issuer if owner.kind=="owner_stop_reply_metadata"else owner.verifier._issuer
     if(type(namespace)is not NamespaceId or namespace!=owner.namespace
-            or issuer is not owner.verifier._issuer or type(job_id)is not str or not job_id):
-        raise AuthorityUnavailable('appraisal child metadata crossed its installed observer namespace/issuer/PK')
+            or issuer is not actual_issuer or type(job_id)is not str or not job_id):
+        raise AuthorityUnavailable("appraisal child metadata crossed its installed Work namespace/issuer/PK")
     row=_appraisal_original_row_v3(db,owner,job_id)
     if row is None:return None
     from ..runtime.jobs import get_job

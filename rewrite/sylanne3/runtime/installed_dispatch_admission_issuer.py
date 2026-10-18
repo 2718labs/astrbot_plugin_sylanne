@@ -455,7 +455,10 @@ def _inspect_post_c02_final_reissue_v2(
     from .reply_entity_route_v2 import read_current_reply_entity_route_binding_v2
     from .reply_model_job import CurrentReplyRouteManifestV2
 
-    if (type(detail) is not PostC02FinalReissueV2
+    from .artifact_receipt_graph_v1 import is_actual_artifact_receipt_final_reissue_v1,_receipt_route_binding_v1,_RECEIPT_BASE
+    artifact=is_actual_artifact_receipt_final_reissue_v1(detail,db,now_utc=now_utc,
+        scope=None if trusted_context is None else trusted_context.scope)
+    if (not(type(detail)is PostC02FinalReissueV2 or artifact)
             or type(context) is not ContextProvider
             or type(trusted_context) is not TrustedDispatchAdmissionContextV1
             or type(snapshot) is not GraphSnapshot
@@ -486,7 +489,7 @@ def _inspect_post_c02_final_reissue_v2(
                                                   detail.candidate.graph_epoch)
             or route_binding.target_entity_ref != action.target_ref
             or candidate.source_audience != (route_binding.conversation_ref,)
-            or candidate.source_refs != (route_binding.source_ref,)):
+            or candidate.source_refs != ((detail.receipt.source_ref,)if artifact else(route_binding.source_ref,))):
         raise DispatchAdmissionHold(("dispatch.post_c02_entity_route_scope",))
     receipts = detail.candidate.checks
     if (len(receipts) != 5
@@ -512,16 +515,20 @@ def _inspect_post_c02_final_reissue_v2(
             or detail.d08_scope.receipt != by_kind["commitment_conflict"]):
         raise DispatchAdmissionHold(("dispatch.post_c02_frozen_check_scope",))
     try:
-        current_route = read_current_reply_entity_route_binding_v2(
-            db, namespace, CurrentReplyRouteManifestV2(
-                namespace, route_binding.c02_operation_id,
-                route_binding.source_ref, route_binding.platform_ref,
-                route_binding.conversation_ref, route_binding.scene_ref,
-                canonical_digest({
-                    "account_ref": route_binding.platform_ref,
-                    "destination_ref": route_binding.conversation_ref,
-                    "scene_ref": route_binding.scene_ref,
-                })), route_binding.query, now_utc=now_utc)
+        if artifact:
+            original_route=_RECEIPT_BASE.get().artifact_receipt_originals.task.route
+            current_route=_receipt_route_binding_v1(_RECEIPT_BASE.get().graph,namespace,original_route,route_binding.query,now_utc)
+        else:
+            current_route = read_current_reply_entity_route_binding_v2(
+                db, namespace, CurrentReplyRouteManifestV2(
+                    namespace, route_binding.c02_operation_id,
+                    route_binding.source_ref, route_binding.platform_ref,
+                    route_binding.conversation_ref, route_binding.scene_ref,
+                    canonical_digest({
+                        "account_ref": route_binding.platform_ref,
+                        "destination_ref": route_binding.conversation_ref,
+                        "scene_ref": route_binding.scene_ref,
+                    })), route_binding.query, now_utc=now_utc)
         if current_route != route_binding:
             raise ValueError("current route binding changed")
         for item in detail.candidate.positive_reads:

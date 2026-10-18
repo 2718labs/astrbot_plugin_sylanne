@@ -444,7 +444,7 @@ def _freeze_foreground_counts(runtime, db, *, issued, operation, request, scope,
 def method_readiness_counts_for_foreground_fence_v1(runtime, *, issued, operation, request, scope, external_originals, now_utc):
     from .foreground_activity_issuance_v1 import require_foreground_activity_issuance_v1
     from .d02_artifact_phase_price_v1 import (_installed_phase_count_policy_v1,
-        _phase_count_allows_fixture_v1, install_artifact_phase_price_reader_v1)
+        install_artifact_phase_price_reader_v1)
     from ..authority_service.artifact_phase_counter_v1 import InstalledArtifactPhaseCounterCommandV1
     from ..runtime_contracts import canonical_serialize
     from .first_ingress_v2 import trusted_upper
@@ -473,8 +473,7 @@ def method_readiness_counts_for_foreground_fence_v1(runtime, *, issued, operatio
         counted = []
         for count_request in requests:
             now = trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
-            envelope = command.count_outside_graph_transaction_v1(db=store._db, request=count_request, now_utc=now,
-                allow_local_fixture=_phase_count_allows_fixture_v1(readers))
+            envelope = command.count_outside_graph_transaction_v1(db=store._db, request=count_request, now_utc=now)
             counted.append((count_request, canonical_serialize(envelope)))
         prior_price = readers.phase_price_reader
         readers.phase_price_reader = install_artifact_phase_price_reader_v1(readers=readers, count_materials=tuple(counted))

@@ -8,7 +8,8 @@ export const MODEL_SLOTS = ['reply',...OPTIONAL_MODEL_SLOTS] as const
 export const RELATIONSHIP_MODEL_SLOT = 'd07_relationship_cognition' as const
 export const GROWTH_MODEL_SLOT = 'growth_cognition' as const
 export const GENERAL_GROWTH_MODEL_SLOT = 'general_growth_cognition' as const
-export type ConfigurationSlot = typeof MODEL_SLOTS[number] | typeof RELATIONSHIP_MODEL_SLOT | typeof GROWTH_MODEL_SLOT | typeof GENERAL_GROWTH_MODEL_SLOT
+export const ARTIFACT_OBSERVATION_MODEL_SLOT = 'artifact_observation_cognition' as const
+export type ConfigurationSlot = typeof MODEL_SLOTS[number] | typeof RELATIONSHIP_MODEL_SLOT | typeof GROWTH_MODEL_SLOT | typeof GENERAL_GROWTH_MODEL_SLOT | typeof ARTIFACT_OBSERVATION_MODEL_SLOT
 export type OptionalModelSlot = typeof OPTIONAL_MODEL_SLOTS[number]
 export type ModelSlot = typeof MODEL_SLOTS[number]
 export interface ModelSelection { version: 1; auxiliary_provider_id: string; overrides: Record<OptionalModelSlot,string> }
@@ -16,7 +17,7 @@ export interface ConfigurationValues { enabled:boolean; authority_profile:string
 export interface ProviderOption { provider_id:string; model_id:string }
 export interface InstalledModel { provider_id:string; model_id:string; provider_config_digest:string; max_output_tokens:number }
 export interface ConfigurationModelSlot { slot:ConfigurationSlot; selected_provider_id:string|null; model_id:string|null; provider_config_digest:string|null; installed:InstalledModel|null; state:'selected'|'pending'|'installed'; reason_code:string }
-export interface InstalledPolicy { profile_id:string|null; installation_id:string|null; workflow_version:2|3|4|5|6|7|8|null; configured_model_slots:ConfigurationSlot[]; limits:Partial<Record<ConfigurationSlot,number>>; provider_options:ProviderOption[] }
+export interface InstalledPolicy { profile_id:string|null; installation_id:string|null; workflow_version:2|3|4|5|6|7|8|9|null; configured_model_slots:ConfigurationSlot[]; limits:Partial<Record<ConfigurationSlot,number>>; provider_options:ProviderOption[] }
 export interface ConfigurationSnapshot {
   schema_version:typeof CONFIGURATION_SCHEMA; revision:number; values:ConfigurationValues; startup_values:ConfigurationValues
   writable_fields:['enabled','authority_profile','llm_provider_id','model_selection']; model_slots:ConfigurationModelSlot[]
@@ -39,7 +40,7 @@ export function validateConfigurationWire(body:unknown):ConfigurationWire{
   if(!hasFields(body,['schema_version','revision','csrf_token','values','startup_values','writable_fields','model_slots','installed_policy','apply_semantics'])||body.schema_version!==CONFIGURATION_SCHEMA||!positive(body.revision)||!text(body.csrf_token,256)||body.apply_semantics!=='next_reload')invalid()
   validateConfigurationValues(body.values);validateConfigurationValues(body.startup_values)
   const policy=body.installed_policy
-  const expectedSlots=hasFields(policy,['profile_id','installation_id','workflow_version','configured_model_slots','limits','provider_options'])?(policy.workflow_version===8?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT,GROWTH_MODEL_SLOT,GENERAL_GROWTH_MODEL_SLOT]:[6,7].includes(policy.workflow_version as number)?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT,GROWTH_MODEL_SLOT]:policy.workflow_version===5?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT]:[...MODEL_SLOTS]):[...MODEL_SLOTS]
+  const expectedSlots=hasFields(policy,['profile_id','installation_id','workflow_version','configured_model_slots','limits','provider_options'])?(policy.workflow_version===9?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT,GROWTH_MODEL_SLOT,GENERAL_GROWTH_MODEL_SLOT,ARTIFACT_OBSERVATION_MODEL_SLOT]:policy.workflow_version===8?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT,GROWTH_MODEL_SLOT,GENERAL_GROWTH_MODEL_SLOT]:[6,7].includes(policy.workflow_version as number)?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT,GROWTH_MODEL_SLOT]:policy.workflow_version===5?[...MODEL_SLOTS,RELATIONSHIP_MODEL_SLOT]:[...MODEL_SLOTS]):[...MODEL_SLOTS]
   if(JSON.stringify(body.writable_fields)!==JSON.stringify(['enabled','authority_profile','llm_provider_id','model_selection'])||!Array.isArray(body.model_slots)||body.model_slots.length!==expectedSlots.length)invalid()
   for(const [index,row]of body.model_slots.entries()){
     if(!hasFields(row,['slot','selected_provider_id','model_id','provider_config_digest','installed','state','reason_code'])||row.slot!==expectedSlots[index]||!['selected','pending','installed'].includes(row.state as string)||!code(row.reason_code))invalid()
@@ -48,7 +49,7 @@ export function validateConfigurationWire(body:unknown):ConfigurationWire{
     if(row.installed!==null&&(!hasFields(row.installed,['provider_id','model_id','provider_config_digest','max_output_tokens'])||!text(row.installed.provider_id,256)||!text(row.installed.model_id,256)||!digest(row.installed.provider_config_digest)||!positive(row.installed.max_output_tokens)))invalid()
     if(row.state==='installed'&&(!row.installed||row.selected_provider_id!==row.installed.provider_id||row.model_id!==row.installed.model_id||row.provider_config_digest!==row.installed.provider_config_digest))invalid()
   }
-  if(!hasFields(policy,['profile_id','installation_id','workflow_version','configured_model_slots','limits','provider_options'])||policy.profile_id!==null&&!text(policy.profile_id,64)||policy.installation_id!==null&&!text(policy.installation_id,128)||![null,2,3,4,5,6,7,8].includes(policy.workflow_version as null|number)||!Array.isArray(policy.configured_model_slots)||policy.configured_model_slots.some(v=>!expectedSlots.includes(v as ConfigurationSlot))||new Set(policy.configured_model_slots).size!==policy.configured_model_slots.length||!hasFields(policy.limits,[],expectedSlots)||Object.values(policy.limits).some(v=>!positive(v))||!Array.isArray(policy.provider_options))invalid()
+  if(!hasFields(policy,['profile_id','installation_id','workflow_version','configured_model_slots','limits','provider_options'])||policy.profile_id!==null&&!text(policy.profile_id,64)||policy.installation_id!==null&&!text(policy.installation_id,128)||![null,2,3,4,5,6,7,8,9].includes(policy.workflow_version as null|number)||!Array.isArray(policy.configured_model_slots)||policy.configured_model_slots.some(v=>!expectedSlots.includes(v as ConfigurationSlot))||new Set(policy.configured_model_slots).size!==policy.configured_model_slots.length||!hasFields(policy.limits,[],expectedSlots)||Object.values(policy.limits).some(v=>!positive(v))||!Array.isArray(policy.provider_options))invalid()
   const providers=new Set<string>()
   for(const option of policy.provider_options){if(!hasFields(option,['provider_id','model_id'])||!text(option.provider_id,256)||!text(option.model_id,256)||providers.has(option.provider_id))invalid();providers.add(option.provider_id)}
   return body as unknown as ConfigurationWire

@@ -10,7 +10,7 @@ Beta1 候选已合入实际产品源码，包括普通 Foreground／OwnerTask、
 
 Beta1 需绑定当次独立工程源码清单、运行源码清单、manifest 与未变 native 原件。`beta1_source_closure` 与 `beta1_python_compile` 必须依据该清单的真实收据；`beta1_server_acceptance` 保持 `not_run`，不能由构包或旧快照结果自动改成通过。源码冻结后，使用同次 `build_plugin_package.py --beta1-candidate`；不要以历史 Alpha2 模式替代。
 
-隔离导入和完整进程重启的步骤相同，实际加载版本改核 `3.0.0-beta1`。HTTP 与 HTTPS 均可使用完整工作台；保持 Dashboard、Owner、Origin、CSRF、签名和正式安装来源检查。Beta1 的 Numeric 10 个场景与 D13 完整 5 个场景由同次工程附件的固定节点入口及正式 protected Root 准备工厂提供。每个场景使用独立新 Root／setup／数据与收据，预算和绝对期限由原正式模板明确给出；不按场景数增加预算、不复活或延长旧授权。具体实例与 pins 由服务器管理员创建，本机源码交付不能预造实例收据。
+隔离导入和完整进程重启的步骤相同，实际加载版本改核 `3.0.0-beta1`。HTTP 与 HTTPS 均可使用完整工作台；保持 Dashboard、Owner、Origin、CSRF、签名和正式安装来源检查。Numeric 与 D13 的历史完整节点、准备工厂和旧 PASS 只对各自冻结源码有效。当前运行时已移除旧 fixture gateway 与 LOCAL_FIXTURE 计数执行分支；仍依赖这些接口的历史工程节点不能直接标为新版可运行，更不能移植旧 PASS。新版 Numeric/D13 完整安装、native interval 与 trace adoption 在取得同次有效入口和真实原件前保持 NOT_RUN/HOLD。每个新版场景使用独立新 Root／setup／数据与收据，保留正式模板的预算和绝对期限；不复活旧授权，具体实例和 pins 由服务器管理员准备。
 
 下面保留 Alpha2 的安装协议、历史场景和资源要求作为参考。旧版文件名、builder 模式、授权及 PASS 只属于原快照；Beta1 运行时必须采用最终交付的相同版本入口、源码／工程 pins 和 Root 模板。Contact/C09 FULL、D04 FULL、生产 Host 独立身份以及未在 Beta1 新快照执行的其他完整节点，继续逐项记录实际资格。
 
@@ -21,6 +21,34 @@ Beta1 需绑定当次独立工程源码清单、运行源码清单、manifest �
 v5 模板新增 `habit_runtime: false`。只有管理员为这次新安装明确选择 `true`，安装计划才列出 `habit_subscription_v1` 和真实 SourceNote 执行种类 `d10.life.source_note.v1`，并在新 profile 中生成绑定实际 namespace、installation ID、manifest、Root lease、grant ID/version/完整摘要的 `HabitRuntimePolicyV1`。该值不是签发 standing policy，也不启动 occurrence；每个安排仍须由当前 Owner 正式签发，按实际 Source、cue、取消代际、预算和原期限逐步准入。安装器保持请求中原来的预算、单次上限和截止，不修改旧 grant，也不提供旧授权刷新。
 
 在 `--plan` 输出中核对 `added_work_kinds`、`habit_runtime`、`root_budget_limits` 和 `root_budget_max_ceiling`，再按原新安装流程执行。包体、manifest 和请求 pins 必须属于同一个最终 Beta1 快照；本段只说明已接入源码的安装选项，服务器运行结果仍为 `NOT_RUN`。
+
+## 当前 Artifact V3：独立观察与固定完成回执
+
+这条路线使用新安装请求模板 v6 与精确的 `AdminModelWorkflowsV9`；`--template --template-version 6` 只生成待填写的正式请求，不升级旧 profile、旧 Root 或旧 V2 call plan。真实安装须明确配置 `artifact_observation_cognition`、受保护 observer 资产和对应模型的真实计数规则。计数器的 `production` scope 表示经过正式安装核验，不能把 Mock 模型的规则用于冒充其他 provider 的计数结果。
+
+已确认的 tone_sample 调用顺序是 C1、C2、样本生成、样本独立观察、完整生成、最终独立观察，共六次；整轮原输入 48,000、输出 8,000 及单次上限不变。普通 full 方法是一轮生成和一轮观察。Artifact 路线不再调用 C5/C6：只有真实 `satisfied` 历史、文件 readback 和已登记检查原件齐全，才能由 D06 产生完成 Source，再经 D08/D09、实际 P2、D13 送达采用和正式完成 W01。固定文字只说明已登记工作已完成，并展示真实内容 SHA-256 和收据 ID，不保证生成内容的正确性。普通对话保留 C5/C6；`partial`、`accepted`、`unknown` 均不能替代 `satisfied` 或 `delivered`。
+
+高级配置能读取 V9 精确槽位，并显示受保护的“Artifact 独立观察认知”安装匹配。这个槽位不通过浏览器临时指定另一个 provider；修改安装模型仍按正式安装变更协议执行。
+
+包外工程节点位于 `rewrite/host_tests/alpha1/test_b04_installed_lifecycle_v1.py`：
+
+- `test_artifact_v3_installed_sdk_fresh_root_six_calls_and_delivered_receipt`：新 Root 的实际 SDK→六次有限 MockTransport→真实结算及 delivered 回执。
+- `test_artifact_v3_installed_sdk_unknown_observation_never_satisfies_or_sends`：独立观察返回 unknown 时不得满足任务或发送完成回执。
+- `test_artifact_v3_installed_sdk_live_core_binding_tamper_then_original_six_calls`：字段篡改的实际 Host/Core 拒绝；这不是有效跨 Root 原件测试，其 future/expired envelope 情况也不是已签发 frame 时间门的证明。
+- `test_artifact_v3_installed_sdk_two_fresh_roots_actual_foreign_objects_then_one_valid_admission`：两套真正独立安装的有效原件，分别替换 grant basis、lease、reservation 对、模型配置和安装 grant，保留首拒绝的具体层级。它验证原件身份绑定，不把早于领域语义的拒绝记成更深层授权证明。
+- `test_artifact_v3_installed_sdk_owner_stop_cancels_queued_d07_and_refuses_original_runner`：独立新 Root 在真实前三次调用之后，暂停实际 D07 async runner 的 acquire 之前入口；通过正式 Dashboard＋Owner 命令取消同一 queued 子任务，再恢复原 runner 一次，核对确切 job 拒绝、provider 零增量与无新增费用。父 cycle 仍可能是 draining；本节点不声明 Core admission、全部子任务停止或整轮 cancelled。
+
+这些节点及 Root 准备、计数程序、Mock 模型、诊断和只读分段取证工具均在工程附件中，不进入插件运行 ZIP。当前本机只有源码整合和明确列出的受影响回归，以上完整 Linux 安装节点均为 **NOT_RUN**。缺少 setup 而 SKIP 也不表示通过。
+
+单 Root 节点使用新的 `SYLANNE_ARTIFACT_V3_INSTALLED_SETUP`；双 Root 节点使用新的 `SYLANNE_ARTIFACT_V3_CROSS_ROOT_SETUP`。实际 Host helper 必须先由 Root 按工程清单 SHA 准备和保护；双 Root helper 路径及保护字段见同次 `artifact_v3_cross_root_witness_v1.py` 的文件头。需要具体内部拒绝原因的节点还要求 `SYLANNE_ARTIFACT_V3_AUTHORITY_DIAGNOSTIC_LOG` 指向现有 Core 诊断日志。检查器只记录安全异常类别、源码位置和哈希，不采集凭据或密钥；通用 RPC 错误本身不构成具体拒绝原因。
+
+每个节点使用全新数据和独占证据目录，串行单次执行。双 Root 节点内部仅将两次实际 ingress 并行，以在各自原期限内取得原件；负例仍逐项核对，再唯一转交 A 的原请求。B 保留原 prepared 未消费状态，不自动释放、清账、重放或延长期限。原件若在准备过程中过期，记录精确到期差值并失败，不能记为跨授权拒绝通过。只读 forensic snapshot 校验实际 cell 的完整分段、origin、EOF、哈希和签名，不注册业务读取 Work，也不提供新的 Source 权限。
+
+Owner StopReply 对 phase-C4、独立观察和固定回执的完整子任务清单、pending 状态、管理读取与实际 W01 投影已接入产品源码。Core/Host 使用实际 Owner 元数据读取 Work 和私有完成证明；C09 构建按原量子推进完整 EOF 后消费证明，fresh cold 从头独立核验，不重用构建期游标，也不扩大字节、时间或 arena 上限。D07 runner 收到原 acquire 拒绝时直接返回该拒绝，不再读取不存在的 acquired request。这些源码核对与局部回归不代表完整取消或冷恢复服务器节点已通过。
+
+取消节点另需 `SYLANNE_ARTIFACT_V3_OWNER_HTTP_SESSION` 指向 Root 保护的当前真实会话 descriptor。其 schema 是 `sylanne.test.actual-owner-http-session.v1`，精确字段为 `schema`、`base_url`、`cookie`、`csrf_token`、`installation_id`、`manifest_digest`。`base_url` 是这个独立 fixture 正式登记的 loopback HTTP origin，例如 `http://127.0.0.1:2718`，不带 workbench 路径；必须与该安装的 exact workbench_origin 相同。实际请求使用 `/api/v1/plugins/extensions/astrbot_plugin_sylanne/workbench/v1/commands`，并发送相同 Origin、当前 Dashboard＋Owner Cookie 和真实 CSRF。先通过正常后台登录和 Owner 配对取得这些原件；不可合成 session、挪用生产 Cookie 或改旧 profile 来源来满足测试。descriptor、Cookie 和 token 只留私有测试环境，不能贴入收据或交付包。
+
+五个完整 Artifact 节点当前均为 NOT_RUN；Owner StopReply/C09 的完整运行、Contact/C09 FULL、D04 FULL、生产 Host 独立身份及 Numeric/D13 新快照验证仍按各自真实证据记录，整体资格保持 HOLD。
 
 ## Alpha2 安装交付与冻结输入（历史协议参考）
 

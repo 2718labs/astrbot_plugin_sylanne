@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
 import type { BackendController } from './use-backend.ts'
-import { MODEL_SLOTS, RELATIONSHIP_MODEL_SLOT, GROWTH_MODEL_SLOT, GENERAL_GROWTH_MODEL_SLOT, type ModelSlot } from './api/configuration.ts'
+import { MODEL_SLOTS, RELATIONSHIP_MODEL_SLOT, GROWTH_MODEL_SLOT, GENERAL_GROWTH_MODEL_SLOT, ARTIFACT_OBSERVATION_MODEL_SLOT, type ModelSlot } from './api/configuration.ts'
 import { useDisplayAlias } from './ui-preferences.ts'
 import { useTheme } from './theme.ts'
 import { HTTPS_REQUIRED_MESSAGE } from './api/client.ts'
@@ -17,7 +17,7 @@ const configuration=props.backend.configuration,state=computed(()=>configuration
 const aliasDraft=ref(display.alias.value),group=ref('basic')
 const groups=[{id:'basic',label:'基本'},{id:'models',label:'模型策略'},{id:'persona',label:'角色与场景'},{id:'world',label:'世界与时间'},{id:'habit',label:'习惯'},{id:'long_window',label:'长期计划'},{id:'attention',label:'注意与表达'},{id:'memory',label:'记忆与关系'},{id:'life',label:'Life 与联系'},{id:'resources',label:'资源与安装'}]
 const labels:Record<ModelSlot,string>={reply:'主回复',encode:'记忆编码',context_reply:'上下文回复',natural_generation:'自然生成',natural_review:'自然复核',appraisal:'感受评估',d07_cognition:'认知',contact_generation:'联系生成',contact_review:'联系复核',life_content:'Life 内容',life_numeric:'Life Numeric'}
-const namedAuxiliarySlots=[{slot:RELATIONSHIP_MODEL_SLOT,label:'关系认知'},{slot:GROWTH_MODEL_SLOT,label:'成长认知'},{slot:GENERAL_GROWTH_MODEL_SLOT,label:'通用成长认知'}] as const
+const namedAuxiliarySlots=[{slot:RELATIONSHIP_MODEL_SLOT,label:'关系认知'},{slot:GROWTH_MODEL_SLOT,label:'成长认知'},{slot:GENERAL_GROWTH_MODEL_SLOT,label:'通用成长认知'},{slot:ARTIFACT_OBSERVATION_MODEL_SLOT,label:'Artifact 独立观察认知'}] as const
 const installedAuxiliarySlots=computed(()=>namedAuxiliarySlots.filter(item=>state.value.data?.model_slots.some(row=>row.slot===item.slot)))
 const modelStates={selected:'已选择，尚未安装匹配',pending:'待选择或安装匹配',installed:'与已安装模型身份匹配'}
 const options=computed(()=>state.value.data?.installed_policy.provider_options??[])

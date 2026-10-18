@@ -4,8 +4,8 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
-from .contracts import StepResult, json_object, nonempty
-from .graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphWrite
+from sylanne3.contracts import StepResult, json_object, nonempty
+from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphWrite
 
 
 def _keys(value, label):

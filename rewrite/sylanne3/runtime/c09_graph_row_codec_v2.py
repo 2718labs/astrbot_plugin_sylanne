@@ -342,7 +342,7 @@ def classify_c09_domain_row_v2(original,columns,row,*,closure,nested_hit,origin,
     return 'derived_removed'
 
 
-def verify_c09_life_domain_join_v2(db,original,columns,row,*,index):
+def verify_c09_life_domain_join_v2(db,original,columns,row,*,index,read_d07_original=None):
     """Actual full signed Life original and registered unique point parents."""
     if original.family!='graph_d11_life_originals_v1':raise C09PagedCaptureHold('actual Life family required')
     from ..runtime_contracts import NamespaceId
@@ -356,7 +356,7 @@ def verify_c09_life_domain_join_v2(db,original,columns,row,*,index):
         validate_c4_original_join_row_v2(db,**args,read_prepared_by_call=index.life_prepared_by_call)
     elif original.kind in C4_PHASE_KINDS:
         validate_c4_phase_original_join_row_v3(db,**args,read_prepared_by_call=index.life_prepared_by_call)
-    else:validate_life_original_join_row_v2(db,**args)
+    else:validate_life_original_join_row_v2(db,**args,read_d07_original=read_d07_original)
 
 
 def classify_c09_shared_original_row_v2(db,row,*,registry,closure,nested_hit):

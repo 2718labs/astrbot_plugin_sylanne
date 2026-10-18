@@ -192,6 +192,7 @@ class PreparedCurrentDispatchInventoryV3:
         self.qualified_sources = frozenset(reader.qualified_sources)
         self.family=reader.family
         self.source_descriptors=reader.auxiliary.descriptors
+        self.artifact_receipt_originals=getattr(reader.auxiliary,'prepared_receipt',None)
         self.contact_birth=getattr(reader.auxiliary,'prepared_birth',None)
         self.natural_originals=getattr(reader.auxiliary,'natural_values',None)
         self.natural_history=getattr(reader.auxiliary,'natural_history',None)
@@ -199,7 +200,7 @@ class PreparedCurrentDispatchInventoryV3:
         _ISSUED[self] = (self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,
             self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
             self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
-            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history)
+            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals)
 
     def release_payload_v3(self):
         """Invalidate the ephemeral proof and detach payloads after real dispatch ends."""
@@ -207,7 +208,7 @@ class PreparedCurrentDispatchInventoryV3:
         self._successors.clear()
         _ISSUED.pop(self,None)
         self.projection = self.sources = self.heads = None
-        self.contact_birth=self.natural_originals=self.natural_history=None
+        self.contact_birth=self.natural_originals=self.natural_history=self.artifact_receipt_originals=None
         self.qualified_sources = frozenset()
 
     def _actual(self):
@@ -215,7 +216,7 @@ class PreparedCurrentDispatchInventoryV3:
         actual = (self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,
             self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
             self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
-            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history)
+            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals)
         if expected is None or actual != expected or not self.full_eof or self.operation.closed:
             raise AuthorityUnavailable('actual dispatch inventory issuer/retention/EOF differs')
 
@@ -729,7 +730,7 @@ class PreparedCurrentDispatchSuccessorInventoryV3(PreparedCurrentDispatchInvento
         self.delta_heads,self.delta_seals=changed_heads,seals
         for name in ('graph','db','namespace','binding','admission','request','operation','selection_digest','scope',
                 'authority_epochs','catalogue_hash','leaf_count','ordered_root','full_eof','sources','qualified_sources',
-                'family','source_descriptors','contact_birth','natural_originals','natural_history'):
+                'family','source_descriptors','contact_birth','natural_originals','natural_history','artifact_receipt_originals'):
             setattr(self,name,getattr(base,name))
         self.base_leaf_count,self.base_ordered_root=base.leaf_count,base.ordered_root
         self.coverage_kind='actual_base_eof_plus_committed_delta'
@@ -747,7 +748,7 @@ class PreparedCurrentDispatchSuccessorInventoryV3(PreparedCurrentDispatchInvento
         _ISSUED[self]=(self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,
             self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
             self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
-            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history)
+            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals)
         _SUCCESSOR_ISSUED[self]=self._successor_identity_v3()
 
     def _successor_identity_v3(self):

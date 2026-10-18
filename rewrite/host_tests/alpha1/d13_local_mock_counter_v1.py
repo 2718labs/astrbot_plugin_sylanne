@@ -20,17 +20,18 @@ def canonical(value):
     return json.dumps(value,ensure_ascii=True,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')
 
 
-def local_mock_applicability_descriptor_v1(*,metric_source_sha256,provider_id,model_id,
-        provider_config_digest,template_digest,serializer_fingerprint,tokenizer_fingerprint,wire_policy_fingerprint):
-    return {'schema':'sylanne3.d13.counter-local-mock-applicability.v1','metric_id':METRIC_ID,
-        'metric_source_sha256':metric_source_sha256,'provider_id':provider_id,'model_id':model_id,
+def local_mock_applicability_descriptor_v2(*,metric_source_sha256,program_sha256,interpreter_sha256,
+        provider_id,model_id,provider_config_digest,template_digest,serializer_fingerprint,tokenizer_fingerprint,wire_policy_fingerprint):
+    """Exact isolated Mock binding, never a production tokenizer qualification."""
+    return {'schema':'sylanne3.d13.counter-applicability.v2','execution_abi':'python-isolated-self-contained.v1',
+        'measurement':'provider-metered-input-for-complete-http-request','metric_id':METRIC_ID,
+        'metric_source_sha256':metric_source_sha256,'program_sha256':program_sha256,
+        'interpreter_sha256':interpreter_sha256,'provider_id':provider_id,'model_id':model_id,
         'provider_config_digest':provider_config_digest,'template_digest':template_digest,
         'serializer_fingerprint':serializer_fingerprint,'tokenizer_fingerprint':tokenizer_fingerprint,
         'wire_policy_fingerprint':wire_policy_fingerprint,
-        'counted_bytes':'complete actual SDK HTTP request.content UTF-8 bytes',
-        'metric':'max(1,(byte_count+3)//4)',
-        'late_slot':{'path':['metadata','sylanne_request_digest'],'alphabet':'0123456789abcdef','characters':64},
-        'profile_scope':'isolated-local-sdk-mock-only','production_tokenizer_supported':False}
+        'late_slot':{'path':['metadata','sylanne_request_digest'],'alphabet':'0123456789abcdef','characters':64,
+            'coverage':'all-allowed-values','bound_evidence_sha256':metric_source_sha256}}
 
 
 def unique_object(pairs):

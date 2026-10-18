@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 
-from .contracts import Event, Scope, canonical_json
+from sylanne3.contracts import Event, Scope, canonical_json
 from .delivery import ActionContract
 
 

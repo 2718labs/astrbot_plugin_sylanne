@@ -318,7 +318,7 @@ class InstalledC09StorageReaderV1:
 
     def read_selected_installed_d13_policy_v3(self,namespace,*,meter):
         from .deployment_config import AuthorityDeploymentConfig,InstalledNaturalModelAuthorityV2
-        from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV1
+        from .d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV2
         from .d13_core_counter_contract_v1 import InstalledD13WirePolicyV7
         from ..host.authority_profile import AdminInstallationBundle
         from ..runtime_contracts import namespace_ref
@@ -334,7 +334,7 @@ class InstalledC09StorageReaderV1:
         model=(config.natural_model_authorities_v2 or {}).get(namespace)
         assets=(config.d13_counter_assets_v1 or {}).get(namespace)
         if model is None and assets is None:return None
-        if type(model) is not InstalledNaturalModelAuthorityV2 or type(assets) is not InstalledD13CounterAssetsV1:
+        if type(model) is not InstalledNaturalModelAuthorityV2 or type(assets) is not InstalledD13CounterAssetsV2:
             raise AuthorityUnavailable('actual selected D13 public policy installation is incomplete')
         bundle=model.installation_bundle
         if (type(bundle) is not AdminInstallationBundle or bundle.model_workflows is not model.workflows

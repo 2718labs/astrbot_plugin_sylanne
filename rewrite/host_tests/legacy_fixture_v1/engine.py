@@ -5,8 +5,8 @@ import asyncio
 from dataclasses import dataclass
 import math
 
-from .contracts import Candidate, Event, Write
-from .store import EventConflict, StaleRead
+from sylanne3.contracts import Candidate, Event, Write
+from sylanne3.store import EventConflict, StaleRead
 from .delivery import ActionContract, _finish, action_id, dispatch
 
 ATOM_NAMES = ('reaction', 'interpretations', 'actions', 'outbox')

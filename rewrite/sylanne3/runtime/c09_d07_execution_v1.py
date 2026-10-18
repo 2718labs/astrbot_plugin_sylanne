@@ -90,6 +90,12 @@ def validate_d07_original_payload_v1(kind, raw):
                     or frozen.input.need_digest != prepared.need_digest):
                 raise ValueError("D07 Self prepared input crosses its exact parent/Need original")
             authority_field = "self_authority_json"
+        elif raw.get("schema")=="d07.artifact-observation-prepared.v3":
+            from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3,artifact_observation_prepared_from_wire_v3
+            _fields(raw,(f.name for f in fields(D07ArtifactObservationPreparedV3)),"d07.artifact-observation-prepared.v3")
+            prepared=artifact_observation_prepared_from_wire_v3(raw)
+            thaw_d07_cognition_request_v1(_json(prepared.frozen_json))
+            authority_field="owner_authority_json"
         elif raw.get("schema") == "d07.relationship-prepared.v2":
             from .d07_execution_v1 import D07RelationshipPreparedV2
             _fields(raw, (f.name for f in fields(D07RelationshipPreparedV2)), "d07.relationship-prepared.v2")
@@ -225,10 +231,12 @@ def validate_d07_original_payload_v1(kind, raw):
         from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
         from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
         from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
-        question_type = (D07GeneralGrowthQuestionV1 if raw.get("schema")=="d07.general-growth-semantic-question.v1" else
+        from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+        question_type = (ArtifactPhaseObservationQuestionV1 if raw.get("schema")=="d07.artifact-phase-observation-question.v1" else
+            D07GeneralGrowthQuestionV1 if raw.get("schema")=="d07.general-growth-semantic-question.v1" else
             D07MethodGrowthSemanticQuestionV2 if raw.get("schema") == "d07.method-growth-semantic-question.v2" else
             D07RelationshipSemanticQuestionV2 if raw.get("schema") == "d07.relationship-semantic-question.v2" else D07SemanticQuestionV1)
-        if question_type in (D07SemanticQuestionV1,D07GeneralGrowthQuestionV1):
+        if question_type in (D07SemanticQuestionV1,D07GeneralGrowthQuestionV1,ArtifactPhaseObservationQuestionV1):
             decode_typed_production_value_v1(raw, question_type)
         else:
             from .d07_execution_v1 import decode_native_named_d07_value_v2

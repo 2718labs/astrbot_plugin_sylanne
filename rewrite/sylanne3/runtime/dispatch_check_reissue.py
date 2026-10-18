@@ -176,7 +176,9 @@ def reissue_and_require_identical_checks(
             or current_epoch != (provisional.graph_epoch,)):
         raise DispatchCheckReissueHold("final graph event or epoch is absent")
     detail = installed_reissuer(db, final_receipt, scope, now_utc)
-    final = (detail.candidate if type(detail) is PostC02FinalReissueV2
+    from .artifact_receipt_graph_v1 import is_actual_artifact_receipt_final_reissue_v1
+    artifact=is_actual_artifact_receipt_final_reissue_v1(detail,db,now_utc=now_utc,scope=scope)
+    final = (detail.candidate if (type(detail) is PostC02FinalReissueV2 or artifact)
              else detail)
     if type(final) is not ProvisionalCheckCandidateV1 or final != provisional:
         raise DispatchCheckReissueHold("final check/read closure differs")
@@ -197,7 +199,7 @@ def reissue_and_require_identical_checks(
             or any(item.coverage != "full" or item.result != "pass"
                    or item.valid_until < now_utc for item in final.checks)):
         raise DispatchCheckReissueHold("final negative coverage or check is incomplete")
-    if type(detail) is PostC02FinalReissueV2:
+    if (type(detail) is PostC02FinalReissueV2 or artifact):
         if detail.graph_receipt != final_receipt:
             raise DispatchCheckReissueHold("final post-C02 event receipt differs")
         return detail

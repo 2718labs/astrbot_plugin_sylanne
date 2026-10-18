@@ -51,7 +51,7 @@ class InstalledDomainOperationRuntimeV1:
             "adopt_current_task_no_search_v1", "quote_current_method_choices_v1",
             "observe_method_comparison_v1", "evaluate_values", "prepare_personal_candidate_eligibility_v1", "adopt_personal_candidate_eligibility_v1", "prepare_personal_candidates_v1",
             "select_personal_step_v2", "prepare_selected_source_note_action_v2",
-            "input:register_artifact_task_text_extent"} | METHOD_INPUT_OPERATIONS_V3
+            "finish_artifact_receipt_cycle_v1", "derive_artifact_completion_receipt_v1", "input:register_artifact_task_text_extent"} | METHOD_INPUT_OPERATIONS_V3
         from .current_beta1_source_read_v3 import beta1_source_operation_v3
         from .current_method_learning_read_v3 import _method_active
         source_reader_v3=_method_active(db)
@@ -329,11 +329,15 @@ class InstalledDomainOperationRuntimeV1:
             raise ValueError("Stop projection changed its actual privately observed Owner request")
         plan = ProductionReadPlanV1((), tuple(v.key for v in observed.read_versions), (),
             (observed.initial_original.original_ref,))
-        frame = freeze_owner_stop_projection_frame_v1(self.graph, db, envelope=envelope,
-            issued=issued, scope=scope, plan=plan, now_utc=now_utc)
+        from ..authority_service.owner_stop_reply_metadata_v1 import bind_host_owner_stop_reply_metadata_v1
+        with bind_host_owner_stop_reply_metadata_v1(issued,db):
+            frame = freeze_owner_stop_projection_frame_v1(self.graph, db, envelope=envelope,
+                issued=issued, scope=scope, plan=plan, now_utc=now_utc)
         readers = SimpleNamespace(issuer=self.graph._GraphCoordinator__d11_issuer)
-        stage = stage_owner_stop_reply_projection_v1(db, frame=frame, request=request,
-            original=observed.initial_original, installed_readers=readers)
+        from ..authority_service.owner_stop_reply_metadata_v1 import bind_host_owner_stop_reply_metadata_v1
+        with bind_host_owner_stop_reply_metadata_v1(issued,db):
+            stage = stage_owner_stop_reply_projection_v1(db, frame=frame, request=request,
+                original=observed.initial_original, installed_readers=readers)
         return frame, stage, readers
 
     def run_owner_source_note_task_current_v1(self, *, selector, operation_kind, request):
@@ -646,6 +650,17 @@ class InstalledDomainOperationRuntimeV1:
                     SourceQualification((), "derived", None, now_utc, "inference", "ineligible", None, "not_applicable"),
                     (), selector.parent_budget_lease_ref, deadline, time.monotonic() + deadline - now_utc,
                     "foreground-current:" + selector.operation_id, ())
+                if operation.operation_kind=='serve_concern':
+                    from .artifact_phase_observation_v1 import current_artifact_observation_concern_command_v1,read_artifact_phase_observation_basis_v1
+                    from .d07_execution_v1 import read_current_d07_semantic_question_v1
+                    question=read_current_d07_semantic_question_v1(db,issuer,selector.namespace,request.trigger_original_ref)
+                    basis,actual=current_artifact_observation_concern_command_v1(db,selector=question.selector,
+                        issuer=issuer,installed_bundle=self.graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle,
+                        owner_guard=evidence.owner_guard,now_utc=now_utc)
+                    if actual!=request or selector.operation_id!=basis.ids['operation']:
+                        raise ValueError('foreground observation compiler cannot redirect its admitted fixed question/task')
+                    envelope=replace(envelope,identity=replace(envelope.identity,
+                        effect_id='artifact-observation-effect:'+selector.operation_id.removeprefix('artifact-phase-observe:')))
                 if operation.operation_kind in {"prepare_ingress_c04_v1", "adopt_ingress_c04_v1"}:
                     from .c04_ingress_preparation_v4 import configure_self_c04_envelope_v4
                     envelope = configure_self_c04_envelope_v4(db, graph=self.graph, envelope=envelope,

@@ -372,8 +372,11 @@ def apply_foreground_cycle_before_graph_write_v1(witness, graph, db):
         require_owner_stop_projection_commit_v1(witness, graph, db)
         if id(witness) in _FOREGROUND_APPLIED:
             raise ValueError("Stop projection cannot apply twice in one CAS")
-        apply_owner_stop_reply_projection_once_v1(db, witness.stage,
-            SimpleNamespace(issuer=graph._GraphCoordinator__d11_issuer))
+        from ..authority_service.owner_stop_reply_metadata_v1 import bind_host_owner_stop_reply_metadata_v1
+        issued=graph._GraphCoordinator__domain_production_runtime_v1._active_owner_stop_projection_v1
+        with bind_host_owner_stop_reply_metadata_v1(issued,db):
+            apply_owner_stop_reply_projection_once_v1(db, witness.stage,
+                SimpleNamespace(issuer=graph._GraphCoordinator__d11_issuer))
         _FOREGROUND_APPLIED[id(witness)] = witness
         return True
     if type(getattr(witness, "stage", None)) not in {ForegroundCycleStageV1, ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2}:

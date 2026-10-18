@@ -74,7 +74,24 @@ class InstalledD07BehaviorPortV1:
             raise ValueError("D07 command lacks one independently read original: " + ref)
         return matches[0]
 
-    def _job(self, db, envelope):
+    def _job(self, db, envelope, request=None):
+        if envelope.identity.operation_id.startswith("artifact-phase-observe:"):
+            from ..runtime.artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1,read_artifact_phase_observation_basis_v1
+            from ..runtime.d07_execution_v1 import read_current_d07_semantic_question_v1
+            ns=envelope.authority.namespace
+            question=read_current_d07_semantic_question_v1(db,self.execution_reader.d11_issuer,ns,request.trigger_original_ref)
+            if type(question)is not ArtifactPhaseObservationQuestionV1:
+                raise ValueError("observation job requires its actual signed dedicated question")
+            basis=read_artifact_phase_observation_basis_v1(db,namespace=ns,original_ref=question.observation_basis_ref,issuer=self.execution_reader.d11_issuer)
+            if basis is None or basis.question!=question or basis.ids["operation"]!=envelope.identity.operation_id:
+                raise ValueError("observation job cannot borrow another phase/task question")
+            row=db.execute("SELECT job_id FROM runtime_jobs WHERE job_id=?",(basis.ids["job"],)).fetchone()
+            if row is None:return None
+            job=get_job(db,row[0])
+            if (job.bot_id,job.persona_id,job.activity_id,job.operation_id,job.budget_ref)!=(
+                    *ns.as_tuple,envelope.identity.activity_id,envelope.identity.operation_id,basis.parent_budget_lease_ref):
+                raise ValueError("observation job changed its actual task/operation/budget")
+            return job
         rows = db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
             "AND activity_id=? AND work_kind LIKE 'd07.%' ORDER BY job_id LIMIT 17",
             (*envelope.authority.namespace.as_tuple, envelope.identity.activity_id)).fetchall()
@@ -118,6 +135,13 @@ class InstalledD07BehaviorPortV1:
             next(spec for spec in D07DomainProvider.type_specs() if spec.name == atom.key.type_name).validator(value)
             ticket = AttentionTicket(**{**{k: v for k, v in value.items() if k != "schema"},
                 "cancel_refs": tuple(value["cancel_refs"]), "source_refs": tuple(value["source_refs"])})
+            if ticket.ticket_id.startswith('attention:artifact-observation:'):
+                from ..runtime.artifact_phase_observation_v1 import read_artifact_observation_ticket_original_v1
+                from ..runtime.d01_production_operations_v1 import CurrentDomainReadV1
+                original=read_artifact_observation_ticket_original_v1(db,read=CurrentDomainReadV1(self.frame),
+                    ticket=ticket,issuer=self.execution_reader.d11_issuer)
+                tickets.append(ticket);issuances.append(original.original_ref)
+                continue
             rows_issuance = db.execute("SELECT operation_id,c02_operation_id,bundle_digest FROM graph_d07_attention_issuance_v1 "
                 "WHERE bot=? AND persona=? AND source_ref=?", (*ns.as_tuple, ticket.causal_root)).fetchall()
             from .post_c02_attention_driver import post_c02_attention_operation_id
@@ -136,7 +160,7 @@ class InstalledD07BehaviorPortV1:
         focus = next((atom for atom in snapshot.atoms if atom.key.type_name == "d07.focus.v1" and atom.valid), None)
         if focus is None:
             raise ValueError("D07 current focus original is missing")
-        job = self._job(db, envelope)
+        job = self._job(db, envelope, request)
         execution = self._execution(job.result_ref, db, envelope) if job and job.result_ref else None
         choice = None
         if job and "choice" in job.continuation and job.continuation["choice"] is not None:

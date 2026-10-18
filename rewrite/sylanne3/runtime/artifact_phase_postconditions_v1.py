@@ -32,55 +32,10 @@ def _text(value):
         raise ValueError('postcondition requires a bounded selector or actual literal')
 
 
-@dataclass(frozen=True,slots=True)
-class ArtifactPhaseFixtureObserverCaseV1:
-    task_source_text_digest: str
-    phase_kind: str
-    condition_id: str
-    content_digest: str
-    status: str
-    evidence_literals: tuple[str,...]
-
-    def __post_init__(self):
-        _digest(self.task_source_text_digest);_digest(self.content_digest)
-        if (self.phase_kind not in {'sample_check','check'} or self.condition_id not in {'tone','task_semantics'}
-                or self.status not in STATUSES or type(self.evidence_literals) is not tuple
-                or len(self.evidence_literals)>16):
-            raise ValueError('finite observer case has another actual task/phase/condition scope')
-        for literal in self.evidence_literals:_text(literal)
 
 
-@dataclass(frozen=True,slots=True)
-class ArtifactPhaseFixtureObserverV1:
-    observer_id: str
-    observer_version: int
-    asset_ref: str
-    asset_digest: str
-    cases: tuple[ArtifactPhaseFixtureObserverCaseV1,...]
-    source_scope: str='LOCAL_FIXTURE'
-
-    def __post_init__(self):
-        _text(self.observer_id);_text(self.asset_ref);_digest(self.asset_digest)
-        if (type(self.observer_version) is not int or self.observer_version<1 or self.source_scope!='LOCAL_FIXTURE'
-                or not self.asset_ref.startswith('/') or type(self.cases) is not tuple or not 1<=len(self.cases)<=128
-                or any(type(case) is not ArtifactPhaseFixtureObserverCaseV1 for case in self.cases)
-                or len({(c.task_source_text_digest,c.phase_kind,c.condition_id,c.content_digest) for c in self.cases})!=len(self.cases)):
-            raise ValueError('finite observer is a protected installed finite fixture asset')
 
 
-def artifact_phase_fixture_observer_from_asset_v1(*,asset_ref,asset_bytes,expected_digest):
-    if type(asset_bytes) is not bytes or len(asset_bytes)>131072 or hashlib.sha256(asset_bytes).hexdigest()!=expected_digest:
-        raise ValueError('finite observer asset bytes differ from actual protected pin')
-    raw=json.loads(asset_bytes)
-    if (type(raw) is not dict or set(raw)!={'schema','observer_id','observer_version','source_scope','cases'}
-            or raw['schema']!='d11.artifact-phase-finite-observer-rules.v1' or type(raw['cases']) is not list):
-        raise ValueError('finite observer asset has another closed schema')
-    cases=[]
-    for row in raw['cases']:
-        if type(row) is not dict or set(row)!={f.name for f in fields(ArtifactPhaseFixtureObserverCaseV1)} or type(row['evidence_literals']) is not list:
-            raise ValueError('finite observer case has another closed schema')
-        cases.append(ArtifactPhaseFixtureObserverCaseV1(**{**row,'evidence_literals':tuple(row['evidence_literals'])}))
-    return ArtifactPhaseFixtureObserverV1(raw['observer_id'],raw['observer_version'],asset_ref,expected_digest,tuple(cases),raw['source_scope'])
 
 
 @dataclass(frozen=True,slots=True)
@@ -340,14 +295,9 @@ class InstalledArtifactPhasePostconditionReadersV1:
 
     def observer(self,ref):
         if ref is None:return None
-        from ..host.authority_profile import require_artifact_phase_fixture_observer_v1
-        try:
-            value=require_artifact_phase_fixture_observer_v1(self.bundle,client_grant=self.model_readers.model_runtime.client_grant)
-        except ValueError as error:
-            if str(error)=='actual protected fixture observer installation is unavailable':
-                raise MissingProductionOriginalV1('actual_registered_applicable_phase_observer') from error
-            raise
-        if type(value) is not ArtifactPhaseFixtureObserverV1 or value.asset_ref!=ref:
+        from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+        value=require_current_artifact_phase_observer_v2(self.bundle)
+        if value.asset_ref!=ref:
             raise ValueError('policy observer selector differs from actual protected installed asset')
         return value
 
@@ -396,19 +346,20 @@ def _original(db,*,namespace,kind,ref,issuer):
         PREPARATION_PARENT_KIND_V1:ArtifactCandidatePreparationParentOriginalV1}[kind]
     value=_decode(row[0],cls)
     require_artifact_phase_postcondition_history_v1(db,namespace=namespace,kind=kind,original_ref=ref,
-        producing_operation_id=row[1],raw=row[0])
+        producing_operation_id=row[1],raw=row[0], issuer=issuer)
     return value,row
 
 
 def _require_before_first_generation_v1(db,task,*,before_operation_id=None):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import TABLE
-    rows=db.execute("SELECT producing_operation_id FROM "+TABLE+" WHERE bot=? AND persona=? "
+    rows=_artifact_receipt_sql_v1(db,"SELECT producing_operation_id FROM "+TABLE+" WHERE bot=? AND persona=? "
         "AND kind IN ('c4_phase_prepared','c4_phase_frozen','c4_phase_paid','c4_prepared','c4_paid') "
         "AND (json_extract(payload_json,'$.selector.task.c02_operation_id')=? OR json_extract(payload_json,'$.selector.c02_operation_id')=?) LIMIT 1",
         (*task.namespace.as_tuple,task.c02_operation_id,task.c02_operation_id)).fetchall()
     if rows:raise MissingProductionOriginalV1('postcondition_contract_before_actual_first_prepare_reserve_paid')
     if before_operation_id is not None:
-        prior=db.execute("SELECT operation_id FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
+        prior=_artifact_receipt_sql_v1(db,"SELECT operation_id FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
             "AND operation_id=? AND phase='reserve' LIMIT 1",(*task.namespace.as_tuple,before_operation_id)).fetchone()
         if prior:raise MissingProductionOriginalV1('postcondition_contract_before_actual_first_reservation')
 
@@ -616,8 +567,8 @@ def _current_policy_sql_v1(db,*,policy,issuer,now_utc,owner_guard,installed_bund
     record=SourceRecord.from_dict(json.loads(artifact_model_graph_point_v3(db,('value',),token=policy.source_head.key.token)[0]))
     _source_family_current_sql_v1(db,namespace=policy.namespace,roots=(policy.source_head.key.token,),purpose='context',audiences=record.audiences)
     if policy.request.observer_policy_ref is not None:
-        from ..host.authority_profile import readonly_artifact_phase_fixture_observer_v1
-        observer=readonly_artifact_phase_fixture_observer_v1(installed_bundle)
+        from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+        observer=require_current_artifact_phase_observer_v2(installed_bundle)
         committed={(c.observer_id,c.observer_version,c.observer_asset_digest) for c in policy.conditions if c.observer_id is not None}
         if observer.asset_ref!=policy.request.observer_policy_ref or committed!={(observer.observer_id,observer.observer_version,observer.asset_digest)}:
             raise ValueError('current observer changed frozen rubric identity/version/asset')
@@ -699,7 +650,7 @@ def _assessment_inputs_v1(db,*,request,contract,issuer):
     return generation.selector,adoption,record,file_original,readback
 
 
-def _evaluate_conditions_v1(*,policy,contract,selector,text,readback,observer,task_text_digest):
+def _evaluate_conditions_v1(*,policy,contract,selector,text,readback,observer,semantic_observations):
     results=[]
     content_digest=hashlib.sha256(text.encode()).hexdigest()
     for condition in contract.conditions:
@@ -723,19 +674,12 @@ def _evaluate_conditions_v1(*,policy,contract,selector,text,readback,observer,ta
             if (condition.observer_id,condition.observer_version,condition.observer_asset_digest)!=(
                     observer.observer_id,observer.observer_version,observer.asset_digest):
                 raise ValueError('actual observer changed preregistered policy identity/version/rules')
-            cases=tuple(case for case in observer.cases if (case.task_source_text_digest,case.phase_kind,case.condition_id,case.content_digest)==
-                (task_text_digest,selector.phase_kind,condition.condition_id,content_digest))
+            actual=semantic_observations.get(condition.condition_id)
+            if actual is None:raise MissingProductionOriginalV1('actual_independent_semantic_observation')
             observer_id,observer_version=observer.observer_id,observer.observer_version
-            original_ref,original_digest=observer.asset_ref,observer.asset_digest
-            detail='LOCAL_FIXTURE finite observer exact task/content case'
-            if cases:
-                case=cases[0];status=case.status;found=[]
-                for literal in case.evidence_literals:
-                    offset=text.find(literal)
-                    if offset<0:status='conflicting';detail='finite case conflicts with actual content evidence';break
-                    found.append((offset,offset+len(literal)))
-                positions=tuple(found)
-            else:detail='LOCAL_FIXTURE observer has no applicable exact task/content case'
+            original_ref,original_digest=actual.terminal_ref,actual.terminal_digest
+            status=actual.status
+            detail='all actual independently paid D07 findings and adopted interpretation originals'
         if content_digest!=readback.content_digest:raise ValueError('assessment text differs from actual adopted file hash')
         results.append(ArtifactPhaseConditionResultV1(condition.condition_id,status,positions,observer_id,observer_version,original_ref,original_digest,detail))
     if not results:raise MissingProductionOriginalV1('registered_required_conditions_for_current_check_phase')
@@ -752,11 +696,15 @@ def stage_observe_artifact_phase_postconditions_v1(db,*,frame,request,installed_
         if request.contract_ref!=contract.original_ref:raise ValueError('assessment caller changed actual registered contract locator')
         policy,_=_original(db,namespace=contract.namespace,kind=POLICY_KIND,ref=contract.policy_ref,issuer=readers.issuer)
         content_selector,adoption,record,file_original,readback=_assessment_inputs_v1(db,request=request,contract=contract,issuer=readers.issuer)
-        # This policy declares only the installed finite fixture observer and
-        # explicit objective observations. It admits no unsolicited Owner review.
-        if request.observer_original_refs:raise ValueError('current policy does not authorize these independent observer identities')
         observer=readers.observer(policy.request.observer_policy_ref)
-        results=_evaluate_conditions_v1(policy=policy,contract=contract,selector=request.selector,text=record.text,readback=readback,observer=observer,task_text_digest=_task_text_digest_v1(db,policy))
+        from .artifact_phase_observation_result_v1 import read_artifact_phase_semantic_observations_v1
+        semantic=read_artifact_phase_semantic_observations_v1(db,namespace=contract.namespace,selector=request.selector,
+            contract=contract,observer_original_refs=request.observer_original_refs,issuer=readers.issuer,
+            frame=frame,installed_readers=readers) if observer is not None else {}
+        if observer is None and request.observer_original_refs:
+            raise ValueError('no undeclared independent observer original may substitute a registered condition')
+        results=_evaluate_conditions_v1(policy=policy,contract=contract,selector=request.selector,text=record.text,
+            readback=readback,observer=observer,semantic_observations=semantic)
         value=ArtifactPhaseAssessmentOriginalV1(request,content_selector,contract.digest,
             GraphVersion(AtomKey.from_token(adoption.content.content.ref),adoption.content.content.revision),adoption.content.content.digest,
             canonical_digest(file_original),readback,frame.owner_guard,results,frame.now_utc,contract.original_deadline_utc,frame.envelope.identity.operation_id)
@@ -783,9 +731,14 @@ def read_current_artifact_phase_assessment_v1(db,*,namespace,original_ref,issuer
     policy,_=_original(db,namespace=namespace,kind=POLICY_KIND,ref=contract.policy_ref,issuer=issuer)
     observer=None
     if policy.request.observer_policy_ref is not None:
-        from ..host.authority_profile import readonly_artifact_phase_fixture_observer_v1
-        observer=readonly_artifact_phase_fixture_observer_v1(installed_bundle)
-    expected=_evaluate_conditions_v1(policy=policy,contract=contract,selector=value.request.selector,text=record.text,readback=readback,observer=observer,task_text_digest=_task_text_digest_v1(db,policy))
+        from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+        observer=require_current_artifact_phase_observer_v2(installed_bundle)
+    from .artifact_phase_observation_result_v1 import read_artifact_phase_semantic_observations_v1
+    semantic=read_artifact_phase_semantic_observations_v1(db,namespace=namespace,selector=value.request.selector,
+        contract=contract,observer_original_refs=value.request.observer_original_refs,issuer=issuer,
+        now_utc=now_utc,owner_guard=owner_guard,installed_bundle=installed_bundle) if observer is not None else {}
+    expected=_evaluate_conditions_v1(policy=policy,contract=contract,selector=value.request.selector,text=record.text,
+        readback=readback,observer=observer,semantic_observations=semantic)
     if expected!=value.results or now_utc>=value.original_deadline_utc or value.assessed_at_utc>now_utc:
         raise ValueError('assessment observer/current evidence/deadline changed')
     return value
@@ -798,6 +751,8 @@ def artifact_phase_assessment_original_ref_v1(selector):
 
 
 def decode_artifact_phase_postcondition_original_v1(kind,raw):
+    from .artifact_phase_observation_v1 import KIND as OBSERVATION_KIND,observation_basis_from_wire_v1
+    if kind==OBSERVATION_KIND:return observation_basis_from_wire_v1(raw)
     if kind == PREPARATION_PARENT_KIND_V1:
         return _preparation_parent_from_wire_v1(raw)
     if kind == APPROVAL_KIND_V2:
@@ -810,7 +765,37 @@ def decode_artifact_phase_postcondition_original_v1(kind,raw):
     return value
 
 
-def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original_ref,producing_operation_id,raw):
+def _history_life_payload_point_v2(db,columns,*,namespace,kind,ref,issuer=None,read_original=None):
+    """Read through the actual issuer or the C09 caller's immutable join lookup.
+
+    A historical join lookup supplies facts for validation, never current Source
+    access or execution permission. Live paths retain their actual signed reader.
+    """
+    if issuer is not None:
+        if read_original is not None:
+            raise ValueError('historical lookup cannot replace the actual live issuer')
+        from ..authority_service.artifact_model_source_read_v3 import artifact_model_life_payload_point_v3
+        return artifact_model_life_payload_point_v3(db,columns,namespace=namespace,kind=kind,ref=ref,issuer=issuer)
+    if read_original is None:
+        raise MissingProductionOriginalV1('actual_signed_reader_or_C09_historical_join_lookup')
+    saved=read_original((namespace,kind,ref))
+    if saved is None:return None
+    operation_id,_value,raw,digest=saved
+    if canonical_digest(raw)!=digest:
+        raise ValueError('historical join lookup changed its exact canonical original')
+    from .domain_production_read_plans_v1 import _committed
+    _committed(db,namespace,operation_id)
+    data={'payload_json':canonical_serialize(raw),'payload_digest':digest,'producing_operation_id':operation_id}
+    return tuple(data[name]for name in columns)
+
+
+def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original_ref,producing_operation_id,raw,issuer=None,read_original=None,read_d07_original=None):
+    from .domain_background_read_v3 import background_json_loads_v3, background_json_digest_v3
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+    from .artifact_phase_observation_v1 import KIND as OBSERVATION_KIND,require_artifact_phase_observation_basis_history_v1
+    if kind==OBSERVATION_KIND:
+        return require_artifact_phase_observation_basis_history_v1(db,namespace=namespace,original_ref=original_ref,
+            producing_operation_id=producing_operation_id,raw=raw)
     from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_life_payload_point_v3,artifact_model_task_preparation_operations_v3
     if kind == PREPARATION_PARENT_KIND_V1:
         return _preparation_parent_history_v1(db, namespace=namespace, original_ref=original_ref,
@@ -834,32 +819,32 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
     if producing_operation_id!=fixed_id:raise ValueError('postcondition history producer changed its original fixed once ID')
     if kind==POLICY_KIND:
         if type(value) is ArtifactPhasePostconditionPolicyOriginalV2:
-            _require_amended_policy_history_v2(db,namespace=namespace,value=value,adopted=adopted)
+            _require_amended_policy_history_v2(db,namespace=namespace,value=value,adopted=adopted, issuer=issuer, read_original=read_original)
         if adopted['payload']['request']!=plain_v1(value.request):raise ValueError('policy registered caller rules instead of exact selectors')
         if not adopted['payload']['now_utc']<value.original_deadline_utc:
             raise ValueError('policy was not actually registered within its fixed original lifetime')
         from .d11_life_preparation_v1 import TABLE
-        root_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='draft_root_capability',ref=value.request.task.root_registration_ref,issuer=issuer)
-        objective_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='artifact_task_objective',ref=value.objective_ref,issuer=issuer)
+        root_row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest'),namespace=namespace,kind='draft_root_capability',ref=value.request.task.root_registration_ref,issuer=issuer, read_original=read_original)
+        objective_row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest'),namespace=namespace,kind='artifact_task_objective',ref=value.objective_ref,issuer=issuer, read_original=read_original)
         if root_row is None or objective_row is None or objective_row[1]!=value.objective_digest:
             raise ValueError('policy history lost fixed registered task/Root originals')
         from .d11_offline_originals_v1 import _utc
-        if value.original_deadline_utc>min(json.loads(objective_row[0])['valid_until_utc'],_utc(json.loads(root_row[0])['valid_until_utc']).timestamp()):
+        if value.original_deadline_utc>min(background_json_loads_v3(objective_row[0])['valid_until_utc'],_utc(background_json_loads_v3(root_row[0])['valid_until_utc']).timestamp()):
             raise ValueError('policy history exceeded fixed registered task/Root absolute lifetime')
     if kind==CONTRACT_KIND:
         if adopted['payload']['request']!=plain_v1(RegisterArtifactPhasePostconditionContractRequestV1(value.selector,value.policy_ref)):
             raise ValueError('contract actual registration request differs')
         from .d11_life_preparation_v1 import TABLE
-        policy_raw=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=POLICY_KIND,ref=value.policy_ref,issuer=issuer)
+        policy_raw=_history_life_payload_point_v2(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=POLICY_KIND,ref=value.policy_ref,issuer=issuer, read_original=read_original)
         if policy_raw is None or policy_raw[1]!=value.policy_digest:raise ValueError('contract has no original preDecision policy')
-        policy=decode_artifact_phase_postcondition_original_v1(POLICY_KIND,json.loads(policy_raw[0]))
+        policy=decode_artifact_phase_postcondition_original_v1(POLICY_KIND,background_json_loads_v3(policy_raw[0]))
         if ((value.conditions,value.owner_guard,value.goal_head,value.goal_digest,value.plan_head,value.plan_digest,value.source_head,value.source_value_digest)!=
                 (policy.conditions,policy.owner_guard,policy.goal_head,policy.goal_digest,policy.plan_head,policy.plan_digest,policy.source_head,policy.source_value_digest)
                 or (value.selector.task,value.selector.method_ref)!=(policy.request.task,policy.request.method_ref)
                 or value.original_deadline_utc>policy.original_deadline_utc):
             raise ValueError('contract changed frozen required conditions/Owner/deadline')
         from .domain_production_originals_v1 import TABLE as DOMAIN_TABLE
-        candidate_rows=db.execute("SELECT operation_id FROM "+DOMAIN_TABLE+" WHERE bot=? AND persona=? AND domain='d08' "
+        candidate_rows=_artifact_receipt_sql_v1(db,"SELECT operation_id FROM "+DOMAIN_TABLE+" WHERE bot=? AND persona=? AND domain='d08' "
             "AND operation_kind='prepare_personal_candidates_v1' AND original_digest=?",(*namespace.as_tuple,value.selected_preparation_digest)).fetchall()
         if len(candidate_rows)!=1:raise ValueError('contract lost actual selected preparation original')
         candidate=read_adopted_domain_operation_v1(db,namespace,candidate_rows[0][0])
@@ -876,32 +861,32 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
                 or value.selected_preparation_ref!='d08-current:'+value.selected_preparation_digest[:48]):
             raise ValueError('contract lost the policy committed by actual selected binding')
         decision=artifact_model_graph_point_v3(db,('event_id', 'value', 'valid'),token=value.selector.decision_ref,revision=value.selector.decision_revision)
-        if decision is None or decision[2]!=1 or canonical_digest(json.loads(decision[1]))!=value.selector.decision_digest:
+        if decision is None or decision[2]!=1 or background_json_digest_v3(decision[1],background_json_loads_v3(decision[1]))!=value.selector.decision_digest:
             raise ValueError('contract actual adopted Decision history differs')
         selection=read_adopted_domain_operation_v1(db,namespace,decision[0])
         if selection is None or (selection['domain'],selection['operation_kind'])!=('d08','select_personal_step_v2') or (
                 selection['payload']['provenance']['prepared_candidates_operation_id']!=prepared.preparation_operation_id
-                or json.loads(decision[1])['chosen_action_ref']!=chosen[0].future_identity.action_ref):
+                or background_json_loads_v3(decision[1])['chosen_action_ref']!=chosen[0].future_identity.action_ref):
             raise ValueError('contract has no actually adopted selection of its binding')
-        policy_seq=db.execute('SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',
+        policy_seq=_artifact_receipt_sql_v1(db,'SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',
             (*namespace.as_tuple,policy_raw[2])).fetchone()
         if policy_seq is None or not policy_seq[0]<candidate['receipt'].commit_seq<selection['receipt'].commit_seq<adopted['receipt'].commit_seq:
             raise ValueError('contract was not actually registered after preDecision policy and adopted Decision')
-        model_rows=artifact_model_task_preparation_operations_v3(db,namespace,value.selector.task.c02_operation_id,legacy_reader=lambda:db.execute("SELECT producing_operation_id FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_phase_prepared' "
+        model_rows=artifact_model_task_preparation_operations_v3(db,namespace,value.selector.task.c02_operation_id,legacy_reader=lambda:_artifact_receipt_sql_v1(db,"SELECT producing_operation_id FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='c4_phase_prepared' "
             "AND json_extract(payload_json,'$.selector.task.c02_operation_id')=?",(*namespace.as_tuple,value.selector.task.c02_operation_id)).fetchall())
         for (op,) in model_rows:
-            seq=db.execute('SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,op)).fetchone()
+            seq=_artifact_receipt_sql_v1(db,'SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,op)).fetchone()
             if seq is None or seq[0]<=adopted['receipt'].commit_seq:raise ValueError('contract was registered after generation preparation')
     if kind==ASSESSMENT_KIND:
         if adopted['payload']['request']!=plain_v1(value.request):raise ValueError('assessment actual selectors differ')
         from .d11_life_preparation_v1 import TABLE
-        contract_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=CONTRACT_KIND,ref=value.request.contract_ref,issuer=issuer)
+        contract_row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=CONTRACT_KIND,ref=value.request.contract_ref,issuer=issuer, read_original=read_original)
         if contract_row is None or contract_row[1]!=value.contract_digest:raise ValueError('assessment lost frozen contract original')
-        contract=decode_artifact_phase_postcondition_original_v1(CONTRACT_KIND,json.loads(contract_row[0]))
+        contract=decode_artifact_phase_postcondition_original_v1(CONTRACT_KIND,background_json_loads_v3(contract_row[0]))
         require_artifact_phase_postcondition_history_v1(db,namespace=namespace,kind=CONTRACT_KIND,original_ref=contract.original_ref,
-            producing_operation_id=contract_row[2],raw=json.loads(contract_row[0]))
-        policy_row=artifact_model_life_payload_point_v3(db,('payload_json',),namespace=namespace,kind=POLICY_KIND,ref=contract.policy_ref,issuer=issuer)
-        policy=decode_artifact_phase_postcondition_original_v1(POLICY_KIND,json.loads(policy_row[0]))
+            producing_operation_id=contract_row[2],raw=background_json_loads_v3(contract_row[0]), issuer=issuer, read_original=read_original)
+        policy_row=_history_life_payload_point_v2(db,('payload_json',),namespace=namespace,kind=POLICY_KIND,ref=contract.policy_ref,issuer=issuer, read_original=read_original)
+        policy=decode_artifact_phase_postcondition_original_v1(POLICY_KIND,background_json_loads_v3(policy_row[0]))
         from .foreground_call_plan_v1 import foreground_artifact_phase_group_identity_v2
         if (foreground_artifact_phase_group_identity_v2(value.content_selector)!=foreground_artifact_phase_group_identity_v2(value.request.selector)
                 or foreground_artifact_phase_group_identity_v2(contract.selector)!=foreground_artifact_phase_group_identity_v2(value.request.selector)
@@ -913,17 +898,17 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
         from .d11_life_adoption_v1 import require_draft_terminal_readback_v1
         # This history seam verifies bytes and actual CAS joins. Installed
         # current readers and C09 authenticate the corresponding signatures.
-        file_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind='adopted_life',ref=value.request.file_result_ref,issuer=issuer)
+        file_row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind='adopted_life',ref=value.request.file_result_ref,issuer=issuer, read_original=read_original)
         if file_row is None:raise ValueError('assessment lost actual adopted file original')
-        file_original=json.loads(file_row[0])
+        file_original=background_json_loads_v3(file_row[0])
         if canonical_digest(file_original)!=file_row[1] or canonical_serialize(file_original)!=file_row[0]:raise ValueError('assessment file original bytes changed')
         from .d11_life_terminal_v1 import validate_adopted_life_member_history_v1
         validate_adopted_life_member_history_v1(db,value=file_original,namespace=namespace,result_ref=value.request.file_result_ref,producing_operation_id=file_row[2])
         terminal=life_from_wire_v1(file_original['terminal'],D11LifeTerminalV1)
         from .d11_life_preparation_v1 import life_prepared_from_wire_v1
-        prepared_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='prepared',ref=terminal.binding.prepared_original_ref,issuer=issuer)
+        prepared_row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest'),namespace=namespace,kind='prepared',ref=terminal.binding.prepared_original_ref,issuer=issuer, read_original=read_original)
         if prepared_row is None:raise ValueError('assessment lost actual file preparation')
-        file_prepared=life_prepared_from_wire_v1(json.loads(prepared_row[0]))
+        file_prepared=life_prepared_from_wire_v1(background_json_loads_v3(prepared_row[0]))
         if file_prepared.digest!=prepared_row[1] or file_prepared.digest!=file_original['prepared_digest']:
             raise ValueError('assessment file preparation digest changed')
         readback=require_draft_terminal_readback_v1(prepared=file_prepared,terminal=terminal)
@@ -935,32 +920,43 @@ def require_artifact_phase_postcondition_history_v1(db,*,namespace,kind,original
             raise ValueError('assessment changed independently adopted actual file readback/phase once IDs')
         source=artifact_model_graph_point_v3(db,('value', 'valid'),token=value.source_head.key.token,revision=value.source_head.revision)
         from ..memory_types import SourceRecord
-        if source is None or source[1]!=1 or canonical_digest(json.loads(source[0]))!=value.source_value_digest:
+        if source is None or source[1]!=1 or background_json_digest_v3(source[0],background_json_loads_v3(source[0]))!=value.source_value_digest:
             raise ValueError('assessment actual content Source historical bytes differ')
-        text=SourceRecord.from_dict(json.loads(source[0])).text
+        text=SourceRecord.from_dict(background_json_loads_v3(source[0])).text
         from ..model_broker.artifact_draft_v1 import artifact_draft_model_ids_v2,artifact_draft_input_from_wire_v2,ArtifactDraftInputV3
         model_ids=artifact_draft_model_ids_v2(value.content_selector)
-        frozen_row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest'),namespace=namespace,kind='c4_phase_frozen',ref=model_ids['frozen'],issuer=issuer)
+        frozen_row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest'),namespace=namespace,kind='c4_phase_frozen',ref=model_ids['frozen'],issuer=issuer, read_original=read_original)
         if frozen_row is None:raise ValueError('assessment has no actual frozen generation contract commitment')
-        frozen=artifact_draft_input_from_wire_v2(json.loads(frozen_row[0]))
+        frozen=artifact_draft_input_from_wire_v2(background_json_loads_v3(frozen_row[0]))
         if (type(frozen) is not ArtifactDraftInputV3 or frozen.digest!=frozen_row[1]
                 or (frozen.selector,frozen.postcondition_contract_ref,frozen.postcondition_contract_digest)!=(value.content_selector,contract.original_ref,contract.digest)
                 or (file_prepared.plan.content.content.ref,file_prepared.plan.content.content.revision,file_prepared.plan.content.content.digest)!=
                     (value.source_head.key.token,value.source_head.revision,value.source_value_digest)):
             raise ValueError('assessment changed actual frozen generation/file/Source contract lineage')
         asset=adopted['payload']['provenance'].get('observer_asset')
-        observer=None if asset is None else _decode(asset,ArtifactPhaseFixtureObserverV1)
-        expected=_evaluate_conditions_v1(policy=policy,contract=contract,selector=value.request.selector,text=text,readback=readback,observer=observer,task_text_digest=_task_text_digest_v1(db,policy))
+        from ..host.artifact_phase_observer_policy_v2 import ArtifactPhaseObserverPolicyV2
+        observer=None if asset is None else _decode(asset,ArtifactPhaseObserverPolicyV2)
+        from .artifact_phase_observation_result_v1 import read_artifact_phase_semantic_observations_v1
+        semantic=read_artifact_phase_semantic_observations_v1(db,namespace=namespace,selector=value.request.selector,
+            contract=contract,observer_original_refs=value.request.observer_original_refs,issuer=issuer,
+            read_life_original=read_original,read_d07_original=read_d07_original) if observer is not None else {}
+        if observer is None and value.request.observer_original_refs:
+            raise ValueError('historical assessment has undeclared independent observer originals')
+        expected=_evaluate_conditions_v1(policy=policy,contract=contract,selector=value.request.selector,text=text,
+            readback=readback,observer=observer,semantic_observations=semantic)
         if expected!=value.results:raise ValueError('assessment did not actually observe each frozen required condition')
     return value
 
 
-def require_artifact_phase_assessment_history_v1(db,*,namespace,original_ref,producing_operation_id,raw):
+def require_artifact_phase_assessment_history_v1(db,*,namespace,original_ref,producing_operation_id,raw,issuer=None,read_original=None):
     return require_artifact_phase_postcondition_history_v1(db,namespace=namespace,kind=ASSESSMENT_KIND,
-        original_ref=original_ref,producing_operation_id=producing_operation_id,raw=raw)
+        original_ref=original_ref,producing_operation_id=producing_operation_id,raw=raw, issuer=issuer, read_original=read_original)
 
 
 def record_artifact_phase_postcondition_after_cas_v1(db,*,frame,stage,receipt,issuer):
+    from .artifact_phase_observation_v1 import OPERATION as OBSERVATION_OPERATION,record_artifact_phase_observation_after_cas_v1
+    if stage.operation_kind==OBSERVATION_OPERATION:
+        return record_artifact_phase_observation_after_cas_v1(db,frame=frame,stage=stage,receipt=receipt,issuer=issuer)
     operations={PREPARATION_PARENT_OPERATION_V1:(PREPARATION_PARENT_KIND_V1,'candidate_preparation_parent'),APPROVAL_OPERATION_V2:(APPROVAL_KIND_V2,'standing_predecision_approval'),POLICY_OPERATION:(POLICY_KIND,'postcondition_policy'),CONTRACT_OPERATION:(CONTRACT_KIND,'postcondition_contract'),
         ASSESSMENT_OPERATION:(ASSESSMENT_KIND,'phase_assessment')}
     if stage.operation_kind not in operations or stage.coverage!='complete':return None
@@ -973,11 +969,15 @@ def record_artifact_phase_postcondition_after_cas_v1(db,*,frame,stage,receipt,is
     raw=adopted['payload']['provenance'][field]
     value=decode_artifact_phase_postcondition_original_v1(kind,raw)
     require_artifact_phase_postcondition_history_v1(db,namespace=ns,kind=kind,original_ref=value.original_ref,
-        producing_operation_id=stage.operation_id,raw=raw)
+        producing_operation_id=stage.operation_id,raw=raw, issuer=issuer)
     return _record(db,issuer=issuer,namespace=ns,kind=kind,ref=value.original_ref,operation_id=stage.operation_id,value=value)
 
 
 def read_plan_artifact_phase_postconditions_v1(db,*,namespace,request,installed_readers):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
+    if type(request)is PrepareArtifactPhaseObservationRequestV1:
+        from .artifact_phase_observation_v1 import read_plan_prepare_artifact_phase_observation_v1
+        return read_plan_prepare_artifact_phase_observation_v1(db,namespace=namespace,request=request,installed_readers=installed_readers)
     if type(request) is FreezeArtifactCandidatePreparationRequestV1:
         return read_plan_artifact_candidate_preparation_parent_v1(db, namespace=namespace,
             request=request, installed_readers=installed_readers)
@@ -989,7 +989,7 @@ def read_plan_artifact_phase_postconditions_v1(db,*,namespace,request,installed_
     if type(request) is RegisterArtifactPhasePostconditionPolicyRequestV1:
         from .artifact_task_text_extent_v1 import read_plan_artifact_task_text_extent_v1,RegisterArtifactTaskTextExtentRequestV1
         goal=AtomKey.from_token(request.goal_ref)
-        row=db.execute('SELECT revision FROM graph_atoms WHERE token=? AND valid=1',(goal.token,)).fetchone()
+        row=_artifact_receipt_sql_v1(db,'SELECT revision FROM graph_atoms WHERE token=? AND valid=1',(goal.token,)).fetchone()
         keys.extend((goal,AtomKey.from_token(request.plan_ref),AtomKey.from_token(request.task.cycle_job_ref)))
         originals.extend((request.extent_original_ref,request.task.root_registration_ref))
         if row:
@@ -1018,6 +1018,17 @@ def read_plan_artifact_phase_postconditions_v1(db,*,namespace,request,installed_
                 phase_selector=generation.selector,installed_readers=readers.current())
             keys.extend(phase_plan.exact_keys);roots.extend(phase_plan.source_roots);originals.extend(phase_plan.required_original_refs)
             originals.extend(request.observer_original_refs)
+        if request.observer_original_refs:
+            from .artifact_phase_observation_result_v1 import read_artifact_phase_semantic_observations_v1
+            from .artifact_phase_observation_v1 import read_artifact_phase_observation_basis_v1
+            contract,_=_original(db,namespace=namespace,kind=CONTRACT_KIND,ref=request.contract_ref,issuer=readers.issuer)
+            observed=read_artifact_phase_semantic_observations_v1(db,namespace=namespace,selector=request.selector,
+                contract=contract,observer_original_refs=request.observer_original_refs,issuer=readers.issuer)
+            for actual in observed.values():
+                basis=read_artifact_phase_observation_basis_v1(db,namespace=namespace,original_ref=actual.basis_ref,issuer=readers.issuer)
+                keys.extend(head.key for head,_ in basis.source_heads);roots.extend(basis.source_refs)
+                keys.extend(AtomKey.from_token(ref)for ref in actual.interpretation_refs)
+                originals.extend((basis.original_ref,basis.ids['question'],*actual.interpretation_refs))
     else:raise TypeError('postcondition read plan accepts only registered closed selector requests')
     # Policy/contract original lookup exposes only exact registered current keys.
     refs=[request.policy_ref] if type(request) is RegisterArtifactPhasePostconditionContractRequestV1 else []
@@ -1061,25 +1072,17 @@ def read_plan_artifact_phase_assessment_v1(db,*,namespace,selector,installed_rea
 
 
 def read_current_artifact_phase_postcondition_original_ref_v1(db,*,namespace,original_ref,issuer):
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .d11_life_preparation_v1 import TABLE
     from .domain_production_contracts_v1 import ProductionOriginalRefV1
-    rows=db.execute("SELECT kind FROM "+TABLE+" WHERE bot=? AND persona=? AND original_ref=? AND kind IN (?,?,?,?,?)",
-        (*namespace.as_tuple,original_ref,POLICY_KIND,CONTRACT_KIND,ASSESSMENT_KIND,APPROVAL_KIND_V2,PREPARATION_PARENT_KIND_V1)).fetchall()
+    rows=_artifact_receipt_sql_v1(db,"SELECT kind FROM "+TABLE+" WHERE bot=? AND persona=? AND original_ref=? AND kind IN (?,?,?,?,?,?)",
+        (*namespace.as_tuple,original_ref,POLICY_KIND,CONTRACT_KIND,ASSESSMENT_KIND,APPROVAL_KIND_V2,PREPARATION_PARENT_KIND_V1,'artifact_phase_observation_basis_v1')).fetchall()
     if not rows:return None
     if len(rows)!=1:raise ValueError('postcondition original selector is ambiguous')
     value,_=_original(db,namespace=namespace,kind=rows[0][0],ref=original_ref,issuer=issuer)
     return ProductionOriginalRefV1('d11.life_'+rows[0][0],original_ref,value.digest)
 
 
-def _task_text_digest_v1(db,policy):
-    from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3
-    # Text hash chooses only finite fixture applicability. The policy/contract
-    # retain complete actual Source value/revision and independent current rights.
-    from ..memory_types import SourceRecord
-    row=artifact_model_graph_point_v3(db,('value', 'valid'),token=policy.source_head.key.token,revision=policy.source_head.revision)
-    if row is None or row[1]!=1 or canonical_digest(json.loads(row[0]))!=policy.source_value_digest:
-        raise ValueError('finite observer task text lost actual authorized Source original')
-    return hashlib.sha256(SourceRecord.from_dict(json.loads(row[0])).text.encode()).hexdigest()
 
 
 def _empty_postcondition_stage_v1(stage,frame,readers):
@@ -1416,16 +1419,12 @@ def _standing_profile_material_v2(bundle):
     for observer_ref in scope.observer_scope:
         if observer_ref == "d11.explicit-task-objective":
             continue
-        pins = payload.get("artifact_phase_fixture_observer")
-        if (type(pins) is not dict or pins.get("source_scope") != "LOCAL_FIXTURE"
-                or pins.get("asset_ref") != observer_ref):
-            raise MissingProductionOriginalV1("actual_protected_finite_observer_declaration")
-        with opened_installed_file_v1(observer_ref) as descriptor:
-            asset = _read_fd_bounded(descriptor, 131072)
-        spec = artifact_phase_fixture_observer_from_asset_v1(asset_ref=observer_ref,
-            asset_bytes=asset, expected_digest=pins["asset_sha256"])
-        if (spec.observer_id, spec.observer_version) != (pins["observer_id"], pins["observer_version"]):
-            raise ValueError("standing observer differs from the protected asset identity")
+        from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+        spec=require_current_artifact_phase_observer_v2(bundle)
+        pins=payload.get('artifact_phase_observer')
+        if (type(pins)is not dict or pins.get('asset_ref')!=observer_ref
+                or pins.get('asset_sha256')!=spec.asset_digest or spec.asset_ref!=observer_ref):
+            raise ValueError('standing observer differs from actual protected production declaration')
         bindings.append((observer_ref, spec.observer_version, spec.asset_digest))
     return scope, hashlib.sha256(raw).hexdigest(), tuple(bindings)
 
@@ -1618,11 +1617,10 @@ def authorize_current_task_predecision_v2(db, *, frame, task, operation, method_
         kind=SCOPE_KIND, ref=task_scope_ref_v1(task.root_registration_ref))[0]
     read.source_family(db, (scope["source_ref"],))
     if approval.observer_bindings:
-        from ..host.authority_profile import require_artifact_phase_fixture_observer_v1
-        observer = require_artifact_phase_fixture_observer_v1(readers.bundle,
-            client_grant=readers.model_readers.model_runtime.client_grant)
+        from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
+        observer = require_current_artifact_phase_observer_v2(readers.bundle)
         if (observer.asset_ref, observer.observer_version, observer.asset_digest) not in approval.observer_bindings:
-            raise ValueError("Self cannot borrow an unapproved fixture observer qualification")
+            raise ValueError("Self cannot borrow an unapproved independent observer policy")
     read.original(approval.original_ref, kind="d11.life_" + APPROVAL_KIND_V2, digest=approval.digest)
     return approval
 
@@ -1782,7 +1780,7 @@ def _readonly_artifact_phase_policy_basis_core_v1(db,*,namespace,request,issuer,
     from .jobs import get_job
     from .budget import get_budget_lease,require_budget_family_admissible
     from .issuers import D11BudgetJobIssuer
-    from ..host.authority_profile import readonly_artifact_phase_fixture_observer_v1
+    from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
     if (type(request) is not RegisterArtifactPhasePostconditionPolicyRequestV1 or request.task.namespace!=namespace
             or type(issuer) is not D11BudgetJobIssuer or type(owner_guard) is not ProductionOwnerGuardV1 or not db.in_transaction):
         raise TypeError('pure policy basis requires actual task, D11 issuer, Owner guard and SQL snapshot')
@@ -1865,7 +1863,7 @@ def _readonly_artifact_phase_policy_basis_core_v1(db,*,namespace,request,issuer,
         raise MissingProductionOriginalV1('current_original_postcondition_task_budget_deadline')
     observer=None
     if request.observer_policy_ref is not None:
-        observer=readonly_artifact_phase_fixture_observer_v1(bundle)
+        observer=require_current_artifact_phase_observer_v2(bundle)
         if observer.asset_ref!=request.observer_policy_ref:
             raise ValueError('policy observer selector differs from actual protected installed asset')
         if approval is not None and (observer.asset_ref,observer.observer_version,observer.asset_digest) not in approval.observer_bindings:
@@ -2296,7 +2294,7 @@ def _readonly_artifact_phase_policy_basis_core_v2(db,*,namespace,request,issuer,
     from .artifact_task_text_extent_v1 import (ArtifactTaskTextExtentOriginalV2,KIND as EXTENT_KIND,
         RegisterArtifactTaskTextExtentRequestV1,readonly_current_artifact_task_text_extent_basis_v2,
         require_artifact_task_text_extent_history_v1)
-    from ..host.authority_profile import readonly_artifact_phase_fixture_observer_v1
+    from ..host.artifact_phase_observer_policy_v2 import require_current_artifact_phase_observer_v2
     if type(request) is not RegisterArtifactPhasePostconditionPolicyRequestV1 or request.task.namespace!=namespace:
         raise TypeError('amended policy selects its exact current registered task')
     row=_read(db,issuer=issuer,namespace=namespace,kind=EXTENT_KIND,ref=request.extent_original_ref)
@@ -2324,7 +2322,7 @@ def _readonly_artifact_phase_policy_basis_core_v2(db,*,namespace,request,issuer,
         raise MissingProductionOriginalV1('original_amended_policy_deadline_without_renewal')
     observer_identity=None
     if request.observer_policy_ref is not None:
-        observer=readonly_artifact_phase_fixture_observer_v1(bundle)
+        observer=require_current_artifact_phase_observer_v2(bundle)
         if (observer.asset_ref!=request.observer_policy_ref
                 or (observer.asset_ref,observer.observer_version,observer.asset_digest) not in approval.observer_bindings):
             raise ValueError('amended policy changed its actual approved observer asset')
@@ -2386,12 +2384,12 @@ def _current_policy_sql_v2(db,*,policy,issuer,now_utc,owner_guard,installed_bund
     return policy
 
 
-def _require_amended_policy_history_v2(db,*,namespace,value,adopted):
+def _require_amended_policy_history_v2(db,*,namespace,value,adopted,issuer=None,read_original=None):
     from ..authority_service.artifact_model_source_read_v3 import artifact_model_graph_point_v3,artifact_model_life_payload_point_v3
     from .d11_life_preparation_v1 import TABLE
     from .artifact_task_text_extent_v1 import (KIND as EXTENT_KIND,ArtifactTaskTextExtentOriginalV2,
         require_artifact_task_text_extent_history_v1)
-    row=artifact_model_life_payload_point_v3(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=EXTENT_KIND,ref=value.request.extent_original_ref,issuer=issuer)
+    row=_history_life_payload_point_v2(db,('payload_json', 'payload_digest', 'producing_operation_id'),namespace=namespace,kind=EXTENT_KIND,ref=value.request.extent_original_ref,issuer=issuer, read_original=read_original)
     if row is None or row[1]!=value.extent_original_digest:
         raise ValueError('amended policy history lost its actual signed new extent')
     extent=require_artifact_task_text_extent_history_v1(db,namespace=namespace,original_ref=value.request.extent_original_ref,
@@ -2431,3 +2429,20 @@ def _require_amended_policy_history_v2(db,*,namespace,value,adopted):
     if value.conditions!=_amended_policy_conditions_v2(extent,value.request.method_ref,identity):
         raise ValueError('amended policy changed mandatory conditions derived from actual extent')
     return value
+
+
+from .artifact_phase_observation_v1 import (PrepareArtifactPhaseObservationRequestV1,
+    stage_prepare_artifact_phase_observation_v1)
+
+
+def artifact_phase_expected_observer_refs_v1(contract,selector):
+    """Deterministic complete observation selectors; existence is verified by the consumer."""
+    if type(contract)is not ArtifactPhasePostconditionContractV1 or type(selector)is not ArtifactDraftPhaseSelectorV2 or selector.generation:
+        raise TypeError('exact adopted phase contract and current check selector required')
+    from .foreground_call_plan_v1 import foreground_artifact_phase_group_identity_v2
+    from .foreground_artifact_observation_plan_v3 import artifact_observation_ids_v1
+    if foreground_artifact_phase_group_identity_v2(contract.selector)!=foreground_artifact_phase_group_identity_v2(selector):
+        raise ValueError('observation reference derivation crossed actual adopted task/Decision/method')
+    return tuple('d07-terminal:'+artifact_observation_ids_v1(selector,c.condition_id)['call']
+        for c in contract.conditions if c.phase_kind==selector.phase_kind
+        and c.kind in {'tone','task_semantics'} and c.observer_id is not None)

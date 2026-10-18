@@ -335,7 +335,8 @@ def acquire_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id, prepar
         extra = None
         from .d07_execution_v1 import D07RelationshipPreparedV2, D07ReflectionPreparedV3
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-        if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2} or (
+        from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+        if type(prepared) in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2,D07ArtifactObservationPreparedV3} or (
                 type(prepared) is D07ReflectionPreparedV3 and prepared.cycle_ref is not None):
             from .foreground_call_plan_v1 import register_current_named_c3_in_transaction_v2
             cycle_write, cycle_revision = register_current_named_c3_in_transaction_v2(db,
@@ -343,12 +344,15 @@ def acquire_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id, prepar
                 installed_bundle=bundle, owner_guard=guard)
             member_writes += (cycle_write,)
             reflection = type(prepared) is D07ReflectionPreparedV3
-            binding_kind = "reflection_c3" if reflection else "relationship_c3" if type(prepared) is D07RelationshipPreparedV2 else "method_growth_c3"
+            binding_kind = "artifact_observation_c3"if type(prepared)is D07ArtifactObservationPreparedV3 else "reflection_c3" if reflection else "relationship_c3" if type(prepared) is D07RelationshipPreparedV2 else "method_growth_c3"
             extra = {binding_kind: {"cycle_ref": prepared.cycle_ref.key.token,
                 "before_cycle_digest": prepared.cycle_digest, "before_call_plan_digest": prepared.call_plan_digest,
                 "call_id": prepared.call_id,
                 ("reflection_request_digest" if reflection else "semantic_question_digest"):
                     prepared.reflection_request_digest if reflection else prepared.semantic_question_digest}}
+        if type(prepared)is D07ArtifactObservationPreparedV3:
+            extra['artifact_observation_c3'].update(observation_basis_ref=prepared.observation_basis_ref,
+                observation_basis_digest=prepared.observation_basis_digest)
         reads = content_reads
         if len(member_writes) == 2:
             reads = tuple(v for v in reads if v.key != cycle_write.key) + (GraphVersion(cycle_write.key, cycle_revision + 1),)

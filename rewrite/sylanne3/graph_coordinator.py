@@ -5,6 +5,7 @@ The strings in CommandEnvelope are audit assertions, never authentication.
 """
 
 from __future__ import annotations
+from .runtime.foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
 
 from .runtime_contracts import namespace_ref
 
@@ -1940,9 +1941,6 @@ class GraphCoordinator:
         if work.kind == "domain_background_read_v3":
             from .runtime.domain_background_read_v3 import advance_domain_background_read_v3
             return advance_domain_background_read_v3(self, work)
-        if work.kind == "host_beta1_fixture_evidence_read":
-            from .graph_worker import _advance_beta1_engineering_metadata_work_v3
-            return _advance_beta1_engineering_metadata_work_v3(self, work)
         if work.kind == "d13_standby_read_v3":
             from .runtime.d13_standby_read_v3 import advance_d13_standby_read_v3
             return advance_d13_standby_read_v3(self, work)
@@ -2024,9 +2022,6 @@ class GraphCoordinator:
         if work.kind == "domain_background_read_v3":
             from .runtime.domain_background_read_v3 import finish_domain_background_read_v3
             return finish_domain_background_read_v3(self, work, error)
-        if work.kind == "host_beta1_fixture_evidence_read":
-            from .graph_worker import _finish_beta1_engineering_metadata_work_v3
-            return _finish_beta1_engineering_metadata_work_v3(self, work, error)
         if work.kind == "d13_standby_read_v3":
             from .runtime.d13_standby_read_v3 import finish_d13_standby_read_v3
             return finish_d13_standby_read_v3(self, work, error)
@@ -7435,9 +7430,9 @@ class GraphCoordinator:
                 or (assembly is not None and runtime.bundle is not assembly.admin_bundle)
                 or runtime.issuer is not self.__d11_issuer or self.__artifact_draft_model_runtime_v1 is not None):
             raise ValueError("artifact model runtime must be the unique actual installed worker/paired client")
-        if assembly is None:
-            from .host.authority_profile import require_beta1_fixture_runtime_installation_v3
-            require_beta1_fixture_runtime_installation_v3(self,bootstrap,runtime)
+        from .host.v2_installation import V2InstallationAssembly
+        if type(assembly)is not V2InstallationAssembly:
+            raise ValueError('artifact model runtime requires the actual installed assembly')
         self.__artifact_draft_model_runtime_v1 = runtime
 
     def _current_artifact_draft_runtime_v1(self, bootstrap, bundle):
@@ -7608,59 +7603,76 @@ class GraphCoordinator:
         with store._lock:
             store._db.execute("UPDATE graph_owner_domain_attempts_v3 SET permit_json=? WHERE bot=? AND persona=? "
                 "AND operation_id=? AND attempt_id=? AND permit_json IS NULL", (permit_json, *key, attempt_id))
-        with owner_stop_projection_for_fence_v1(self, scope=scope, original_ref=original_ref) as issued:
-            observed = reobserve_owner_stop_projection_v1(issued)
-            if observed.initial_original.operation_id != operation_id:
-                raise EventConflict("Stop projection actual accepted operation differs")
-            token, capability = self.grant(bootstrap, actor=observed.owner_actor_ref, issuer_domain="d11",
-                namespace=namespace, domains=("d11",), purposes=("workbench_user_action",), audiences=("owner",),
-                activation_generation=scope.generation, operation_id=operation_id)
-            runtime._active_owner_stop_projection_v1 = issued
-            try:
-                now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
-                with store._lock:
-                    db = store._db
-                    db.execute("BEGIN IMMEDIATE")
-                    try:
-                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
-                            raise StaleRead("Stop projection actual Graph changed before W01")
-                        cycle = get_job(db, AtomKey.from_token(observed.request.cycle_job_ref).name)
-                        deadline = datetime.fromisoformat(cycle.deadline_utc.replace("Z", "+00:00")).timestamp()
-                        versions = dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
-                            "AND ref='current' AND kind IN ('scheme','operator','policy')", namespace.as_tuple).fetchall())
-                        if set(versions) != {"scheme", "operator", "policy"}:
-                            raise UnavailableGuard("Stop projection current version heads are absent; HOLD")
-                        authority = AuthorityContext(observed.owner_actor_ref, "d11", capability, namespace,
-                            tuple(sorted(self.__leases[token][5])), "workbench_user_action", ("owner",),
-                            "owner-stop:" + operation_id, scope.generation)
-                        envelope = CommandEnvelope(RUNTIME_SCHEMA, OperationIdentity(cycle.activity_id, None,
-                            operation_id, "owner_stop_reply_v1", operation_id, canonical_digest({"input_refs": []})),
-                            authority, VersionGuard((), (QueryEpoch(namespace, "namespace", epoch.revision),), 0, 0,
-                                store._registry.catalogue_hash, versions["scheme"], versions["operator"], versions["policy"], (), (), ()),
-                            SourceQualification((), "derived", None, now, "inference", "ineligible", None, "not_applicable"),
-                            (), cycle.budget_ref, deadline, time.monotonic() + deadline - now, "owner-stop:" + operation_id, ())
-                        operation = installed_operation_v1("owner_stop_reply_v1")
-                        frame, stage, readers = runtime.compile_owner_stop_projection_in_transaction_v1(db,
-                            operation=operation, request=observed.request, envelope=envelope, scope=scope, now_utc=now)
-                        result = commit_installed_domain_operation_v1(runtime, db, operation=operation, request=observed.request,
-                            frame=frame, stage=stage, readers=readers, scope=scope, owner=None,
-                            guard=observed.owner_authorization, metadata=metadata, epoch=epoch, process_lease=token)
-                        db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? WHERE bot=? AND persona=? "
-                            "AND operation_id=? AND attempt_id=? AND receipt_json IS NULL", (canonical_json(result), *key, attempt_id))
-                        if db.execute("SELECT changes()").fetchone() != (1,):
-                            raise EventConflict("Stop projection original receipt raced")
-                        db.execute("COMMIT")
-                    except BaseException:
-                        if db.in_transaction:
-                            db.rollback()
-                        raise
-            finally:
-                runtime._active_owner_stop_projection_v1 = None
-                self.release_authority_lease(bootstrap, token)
-        port.finish_fence(scope, request_id="finish:" + attempt_id,
-            request_digest="sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
-                "operation_id": operation_id, "request_digest": request_digest, "permit_token": permit.token}))
-        return {"status": "projected", "operation_id": operation_id}
+        from contextlib import ExitStack
+        from .authority_service.owner_stop_reply_metadata_v1 import (
+            create_host_owner_stop_reply_metadata_work_v1,bind_host_owner_stop_reply_metadata_v1)
+        from .runtime.foreground_activity_issuance_v1 import require_owner_stop_projection_issuance_v1
+        lifetime=ExitStack()
+        try:
+            issued=lifetime.enter_context(owner_stop_projection_for_fence_v1(
+                self,scope=scope,original_ref=original_ref))
+            work=create_host_owner_stop_reply_metadata_work_v1(self,issued)
+            def commit_prepared(prepared):
+                observed = require_owner_stop_projection_issuance_v1(issued,self,scope)
+                if observed.initial_original.operation_id != operation_id:
+                    raise EventConflict("Stop projection actual accepted operation differs")
+                token, capability = self.grant(bootstrap, actor=observed.owner_actor_ref, issuer_domain="d11",
+                    namespace=namespace, domains=("d11",), purposes=("workbench_user_action",), audiences=("owner",),
+                    activation_generation=scope.generation, operation_id=operation_id)
+                runtime._active_owner_stop_projection_v1 = issued
+                try:
+                    now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+                    with store._lock:
+                        db = store._db
+                        db.execute("BEGIN IMMEDIATE")
+                        try:
+                            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                                raise StaleRead("Stop projection actual Graph changed before W01")
+                            with bind_host_owner_stop_reply_metadata_v1(issued,db):
+                                cycle = get_job(db, AtomKey.from_token(observed.request.cycle_job_ref).name)
+                            deadline = datetime.fromisoformat(cycle.deadline_utc.replace("Z", "+00:00")).timestamp()
+                            versions = dict(db.execute("SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
+                                "AND ref='current' AND kind IN ('scheme','operator','policy')", namespace.as_tuple).fetchall())
+                            if set(versions) != {"scheme", "operator", "policy"}:
+                                raise UnavailableGuard("Stop projection current version heads are absent; HOLD")
+                            authority = AuthorityContext(observed.owner_actor_ref, "d11", capability, namespace,
+                                tuple(sorted(self.__leases[token][5])), "workbench_user_action", ("owner",),
+                                "owner-stop:" + operation_id, scope.generation)
+                            envelope = CommandEnvelope(RUNTIME_SCHEMA, OperationIdentity(cycle.activity_id, None,
+                                operation_id, "owner_stop_reply_v1", operation_id, canonical_digest({"input_refs": []})),
+                                authority, VersionGuard((), (QueryEpoch(namespace, "namespace", epoch.revision),), 0, 0,
+                                    store._registry.catalogue_hash, versions["scheme"], versions["operator"], versions["policy"], (), (), ()),
+                                SourceQualification((), "derived", None, now, "inference", "ineligible", None, "not_applicable"),
+                                (), cycle.budget_ref, deadline, time.monotonic() + deadline - now, "owner-stop:" + operation_id, ())
+                            operation = installed_operation_v1("owner_stop_reply_v1")
+                            frame, stage, readers = runtime.compile_owner_stop_projection_in_transaction_v1(db,
+                                operation=operation, request=observed.request, envelope=envelope, scope=scope, now_utc=now)
+                            result = commit_installed_domain_operation_v1(runtime, db, operation=operation, request=observed.request,
+                                frame=frame, stage=stage, readers=readers, scope=scope, owner=None,
+                                guard=observed.owner_authorization, metadata=metadata, epoch=epoch, process_lease=token)
+                            db.execute("UPDATE graph_owner_domain_attempts_v3 SET receipt_json=? WHERE bot=? AND persona=? "
+                                "AND operation_id=? AND attempt_id=? AND receipt_json IS NULL", (canonical_json(result), *key, attempt_id))
+                            if db.execute("SELECT changes()").fetchone() != (1,):
+                                raise EventConflict("Stop projection original receipt raced")
+                            db.execute("COMMIT")
+                        except BaseException:
+                            if db.in_transaction:
+                                db.rollback()
+                            raise
+                finally:
+                    runtime._active_owner_stop_projection_v1 = None
+                    self.release_authority_lease(bootstrap, token)
+                port.finish_fence(scope, request_id="finish:" + attempt_id,
+                    request_digest="sha256:" + canonical_digest({"schema": "w01.owner-domain-write.v3",
+                        "operation_id": operation_id, "request_digest": request_digest, "permit_token": permit.token}))
+                return {"status": "projected", "operation_id": operation_id}
+            def failed(error):
+                raise error
+            work.map_terminal_v3("issuer",commit_prepared,failed)
+            return work.adopt_request_lifetime_v3(lifetime)
+        except BaseException:
+            lifetime.close()
+            raise
 
     def _personal_mesh_domain_write_v1(self, runtime, *, selector, operation, request):
         from .authority_service.foreground_mesh_contract_v1 import ForegroundMeshActivityRequestV1,OwnerTaskMeshActivityRequestV1
@@ -8349,6 +8361,26 @@ class GraphCoordinator:
                 elif operation_kind == "register_artifact_phase_postcondition_contract_v1":
                     from .runtime.artifact_phase_postconditions_v1 import artifact_phase_contract_registration_operation_id_v1
                     operation_id = artifact_phase_contract_registration_operation_id_v1(request.selector)
+                elif operation_kind=='serve_concern':
+                    from .runtime.artifact_phase_observation_v1 import read_artifact_phase_observation_basis_v1
+                    from .runtime.d07_execution_v1 import read_current_d07_semantic_question_v1
+                    from .runtime.artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
+                    question=read_current_d07_semantic_question_v1(db,self.__d11_issuer,ns,request.trigger_original_ref)
+                    if type(question)is not ArtifactPhaseObservationQuestionV1 or request.category!='background':
+                        raise UnavailableGuard('Self concern requires its actual producer-issued Artifact question; HOLD')
+                    basis=read_artifact_phase_observation_basis_v1(db,namespace=ns,original_ref=question.observation_basis_ref,issuer=self.__d11_issuer)
+                    if basis is None or basis.question!=question or basis.request.selector.task.c02_operation_id!=c02_operation_id:
+                        raise UnavailableGuard('Self concern lost its actual same-task observation basis; HOLD')
+                    operation_id=basis.ids['operation'];deadline=min(deadline,basis.original_deadline_utc);purpose='proposal'
+                elif operation_kind == "finish_artifact_receipt_cycle_v1":
+                    from .runtime.artifact_receipt_completion_v1 import finish_operation_id_v1
+                    operation_id=finish_operation_id_v1(request.selector)
+                elif operation_kind == "derive_artifact_completion_receipt_v1":
+                    from .runtime.artifact_completion_receipt_v1 import receipt_ids_v1
+                    operation_id=receipt_ids_v1(request.selector)['producer']
+                elif operation_kind == "prepare_artifact_phase_observation_v1":
+                    from .runtime.foreground_artifact_observation_plan_v3 import artifact_observation_ids_v1
+                    operation_id=artifact_observation_ids_v1(request.selector,request.condition_id)['prepare']
                 elif operation_kind == "observe_artifact_phase_postconditions_v1":
                     from .runtime.artifact_phase_postconditions_v1 import artifact_phase_assessment_operation_id_v1
                     operation_id = artifact_phase_assessment_operation_id_v1(request.selector)
@@ -8401,7 +8433,7 @@ class GraphCoordinator:
                     from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
                     from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
                     final_plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
-                    if type(final_plan) is ForegroundCallPlanV2:
+                    if type(final_plan) in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
                         from .runtime.d11_artifact_draft_content_v1 import artifact_method_final_operation_ids_v2
                         from .runtime.artifact_task_observer_v1 import artifact_task_milestone_original_ref_v2, read_current_artifact_task_milestone_v2
                         final_phase = final_plan.phase_group.selector
@@ -8446,6 +8478,15 @@ class GraphCoordinator:
                     selector = replace(selector, plan_ref=request.candidates.plan_ref)
                 elif operation_kind in {"prepare_personal_candidates_v1", "select_personal_step_v2"}:
                     selector = replace(selector, plan_ref=request.plan_ref)
+                else:
+                    from .authority_service.current_foreground_activity_v1 import _ARTIFACT_PHASE_OPERATIONS_V2,_ARTIFACT_PHASE_FILE_OPERATIONS_V2
+                    if operation_kind in _ARTIFACT_PHASE_OPERATIONS_V2|_ARTIFACT_PHASE_FILE_OPERATIONS_V2|{'finish_artifact_receipt_cycle_v1','derive_artifact_completion_receipt_v1'}:
+                        from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+                        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV2
+                        plan=foreground_cycle_from_wire_v1(job.continuation).call_plan
+                        if type(plan)not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
+                            raise UnavailableGuard('phase selector needs its actual selected method plan; HOLD')
+                        selector=replace(selector,plan_ref=plan.phase_group.selector.plan_ref)
                 db.rollback()
                 return selector
             except BaseException:
@@ -8490,10 +8531,9 @@ class GraphCoordinator:
     def prepare_post_c02_foreground_cycle_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
         """Live admitted C02 caller; the private actual self kernel grants the write."""
         from .runtime.foreground_cycle_v1 import CreateForegroundCycleRequestV2, foreground_post_c02_cause_ref_v1
-        from .runtime.foreground_call_plan_v1 import foreground_reply_budget_ids_v1
+        from .runtime.artifact_receipt_allocation_v3 import select_initial_foreground_reply_budget_ids_v3
         from .runtime.d11_life_preparation_v1 import TABLE, _read
         ns = installed_bundle.installation_policy.namespace
-        child_id = foreground_reply_budget_ids_v1(ns, c02_operation_id)[0]
         self.prepare_post_c02_artifact_task_scope_v1(bootstrap, installed_bundle,
             c02_operation_id=c02_operation_id, source_ref=source_ref)
         with self.__store._lock:
@@ -8510,6 +8550,8 @@ class GraphCoordinator:
                     _read(db, issuer=self.__d11_issuer, namespace=ns, kind="draft_root_capability", ref=root_ref)
             finally:
                 db.rollback()
+        child_id = select_initial_foreground_reply_budget_ids_v3(ns, c02_operation_id,
+            installed_bundle=installed_bundle, draft_root_registration_ref=root_ref)[0]
         request = CreateForegroundCycleRequestV2(c02_operation_id, source_ref, child_id,
             cause_original_ref=root_ref or foreground_post_c02_cause_ref_v1(ns, c02_operation_id), draft_root_registration_ref=root_ref)
         selector = self._post_c02_foreground_selector_v1(bootstrap, installed_bundle, c02_operation_id=c02_operation_id,
@@ -8589,6 +8631,12 @@ class GraphCoordinator:
     def _read_post_c02_foreground_cycle_v1(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
         """A current narrow read of the actual last cycle operation; no acquisition or creation."""
         self._admin(bootstrap)
+        if installed_bundle.artifact_phase_observer is not None:
+            if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+                raise UnavailableGuard("Artifact original recovery requires its actual installed bundle; HOLD")
+            from .runtime.artifact_receipt_graph_v1 import _recover_artifact_receipt_original_finish_v1
+            _recover_artifact_receipt_original_finish_v1(self,installed_bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref)
         from .runtime.foreground_cycle_v1 import foreground_cycle_ids_v1
         from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
         from .runtime.domain_production_registry_v1 import installed_operation_v1
@@ -9026,7 +9074,7 @@ class GraphCoordinator:
                 continuation = foreground_cycle_from_wire_v1(cycle.continuation)
                 if type(continuation.call_plan) is ForegroundCallPlanV1:
                     return None
-                if type(continuation.call_plan) is not ForegroundCallPlanV2:
+                if type(continuation.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
                     raise UnavailableGuard("unregistered artifact phase call plan; HOLD")
                 responsibility = read_original_foreground_responsibility_for_c09_v1(db,
                     namespace=ns, job=cycle, issuer=self.__d11_issuer)
@@ -9091,6 +9139,100 @@ class GraphCoordinator:
             finally:
                 db.rollback()
 
+    def discover_pending_artifact_receipt_cycles_v1(self,bootstrap,installed_bundle,*,after_job_id=None,limit=32):
+        """Bounded original locators; every resumed task still needs current admission."""
+        self._admin(bootstrap)
+        if (self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle
+                or installed_bundle.artifact_phase_observer is None):
+            raise UnavailableGuard('Artifact recovery needs its actual explicit V3 installation; HOLD')
+        if type(limit) is not int or not 1<=limit<=64 or after_job_id is not None and (type(after_job_id) is not str or not after_job_id):
+            raise ValueError('bounded Artifact recovery cursor required')
+        from .runtime.jobs import get_job
+        from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+        from .runtime.foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
+        ns=installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                rows=db.execute("SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? AND work_kind='d11.foreground_cycle.v1' "
+                    "AND phase NOT IN ('completed','failed','cancelled','draining','pending_confirmation') AND cancel_epoch=0 "
+                    "AND json_extract(continuation_json,'$.call_plan.schema')='d11.foreground-call-plan.v3' "
+                    "AND job_id>? ORDER BY job_id LIMIT ?",(*ns.as_tuple,after_job_id or '',limit+1)).fetchall()
+                items=[]
+                for (job_id,) in rows[:limit]:
+                    job=get_job(db,job_id);continuation=foreground_cycle_from_wire_v1(job.continuation)
+                    if type(continuation.call_plan) is not ForegroundCallPlanV3:
+                        raise ValueError('Artifact recovery locator changed its exact persisted plan type')
+                    items.append({'job_id':job_id,'c02_operation_id':continuation.c02_operation_id,'source_ref':continuation.source_ref})
+                return {'items':tuple(items),'next_after':rows[limit-1][0] if len(rows)>limit else None}
+            finally:db.rollback()
+
+    def finish_current_artifact_receipt_cycle_v1(self,bootstrap,installed_bundle,*,c02_operation_id,source_ref):
+        """Close only the real delivered V3 receipt, through a fresh formal Self W01."""
+        self._admin(bootstrap)
+        completed=self.read_current_completed_artifact_method_v2(bootstrap,installed_bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+        if completed is None or completed['history_state']!='satisfied':
+            raise UnavailableGuard('receipt completion lacks actual satisfied method history; HOLD')
+        from .runtime.artifact_receipt_completion_v1 import FinishArtifactReceiptCycleRequestV1,finish_operation_id_v1
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        body=FinishArtifactReceiptCycleRequestV1(completed['selector']);ns=installed_bundle.installation_policy.namespace
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:original=read_adopted_domain_operation_v1(db,ns,finish_operation_id_v1(body.selector))
+            finally:db.rollback()
+        if original is not None:return {'status':'duplicate','receipt':original['receipt']}
+        selector=self._post_c02_foreground_selector_v1(bootstrap,installed_bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref,operation_kind='finish_artifact_receipt_cycle_v1',request=body)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind='finish_artifact_receipt_cycle_v1',request=body)
+
+    def prepare_current_artifact_completion_source_v1(self,bootstrap,installed_bundle,*,c02_operation_id,source_ref):
+        """Produce or recover one real D06 completion Source before dispatch admission."""
+        self._admin(bootstrap)
+        completed=self.read_current_completed_artifact_method_v2(bootstrap,installed_bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+        if completed is None or completed['history_state']!='satisfied':
+            raise UnavailableGuard('receipt requires actual satisfied method history; HOLD')
+        from .runtime.artifact_completion_receipt_v1 import (DeriveArtifactCompletionReceiptRequestV1,
+            receipt_ids_v1,read_current_artifact_completion_receipt_v1)
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.ingress_observation import read_committed_ingress_identity
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .memory_types import SourceRecord
+        phase=completed['selector'];ns=installed_bundle.installation_policy.namespace
+        ids=receipt_ids_v1(phase)
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                existing=read_adopted_domain_operation_v1(db,ns,ids['producer'])
+            finally:db.rollback()
+        if existing is None:
+            body=DeriveArtifactCompletionReceiptRequestV1(phase)
+            selector=self._post_c02_foreground_selector_v1(bootstrap,installed_bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref,
+                operation_kind='derive_artifact_completion_receipt_v1',request=body)
+            adopted=self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+                operation_kind='derive_artifact_completion_receipt_v1',request=body)
+            if adopted.get('coverage')!='complete' or adopted.get('receipt',{}).get('status')!='committed':
+                return {'status':'held','missing_inputs':['actual_committed_D06_completion_Source'],'original':adopted}
+        now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                row=db.execute('SELECT value,valid FROM graph_atoms WHERE bot=? AND persona=? AND token=?',(*ns.as_tuple,source_ref)).fetchone()
+                if row is None or row[1]!=1:raise UnavailableGuard('receipt original ingress Source unavailable; HOLD')
+                source=SourceRecord.from_dict(json.loads(row[0]));ingress=read_committed_ingress_identity(db,ns,source.source_id)
+                if ingress is None:raise UnavailableGuard('receipt lacks actual ingress identity; HOLD')
+                identity=json.loads(ingress.identity_json)
+                if identity['visibility']!='private':raise UnavailableGuard('receipt route is not its original private audience; HOLD')
+                receipt=read_current_artifact_completion_receipt_v1(db,namespace=ns,selector=phase,issuer=self.__d11_issuer,
+                    installed_bundle=installed_bundle,owner_guard=completed['history'].owner_guard,now_utc=now,
+                    audiences=(identity['conversation_ref'],))
+                return {'status':'artifact_completion_source_current','receipt_original':receipt,
+                    'c02_operation_id':c02_operation_id,'source_ref':source_ref}
+            finally:db.rollback()
+
     def run_current_post_c02_artifact_phase_operation_v2(self, bootstrap, installed_bundle, *,
             c02_operation_id, source_ref, operation_kind):
         """Derive an exact phase command from its currently selected original."""
@@ -9107,7 +9249,9 @@ class GraphCoordinator:
         from .runtime.d10_project_checkpoint_v1 import (ActivateCurrentArtifactTaskProjectCheckpointRequestV1,
             ActivateCurrentArtifactTaskProjectCheckpointRequestV2)
         from .runtime.artifact_task_observer_v1 import RegisterCurrentArtifactTaskMilestoneRequestV2
-        constructors = {"register_artifact_task_milestone_v2": RegisterCurrentArtifactTaskMilestoneRequestV2,
+        from .runtime.artifact_completion_receipt_v1 import DeriveArtifactCompletionReceiptRequestV1
+        constructors = {"derive_artifact_completion_receipt_v1": DeriveArtifactCompletionReceiptRequestV1,
+            "register_artifact_task_milestone_v2": RegisterCurrentArtifactTaskMilestoneRequestV2,
             "activate_artifact_task_project_checkpoint_v1": ActivateCurrentArtifactTaskProjectCheckpointRequestV1,
             "activate_artifact_task_project_checkpoint_v2": ActivateCurrentArtifactTaskProjectCheckpointRequestV2,
             "prepare_artifact_draft_model_v2": PrepareArtifactDraftModelRequestV2,
@@ -9115,13 +9259,16 @@ class GraphCoordinator:
             "adopt_artifact_draft_content_v2": AdoptArtifactDraftContentRequestV2,
             "propose_artifact_draft_phase_action_v2": ProposeCurrentArtifactPhaseActionRequestV2,
             "input:register_artifact_phase_draft_plan_v2": RegisterCurrentPhaseDraftFilePlanInputRequestV2}
-        if operation_kind not in {*constructors, "wake_artifact_draft_cycle_v2", "prepare_artifact_draft_body", "prepare_life", "verify_artifact_draft_phase_v2", "register_artifact_phase_postcondition_contract_v1", "observe_artifact_phase_postconditions_v1"}:
+        if operation_kind not in {'serve_concern', "prepare_artifact_phase_observation_v1", *constructors, "wake_artifact_draft_cycle_v2", "prepare_artifact_draft_body", "prepare_life", "verify_artifact_draft_phase_v2", "register_artifact_phase_postcondition_contract_v1", "observe_artifact_phase_postconditions_v1"}:
             raise ValueError("unregistered installed artifact phase operation")
+        if operation_kind=='derive_artifact_completion_receipt_v1':
+            return self.prepare_current_artifact_completion_source_v1(bootstrap,installed_bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref)
         actual = self.read_current_post_c02_artifact_phase_resume_v2(bootstrap, installed_bundle,
             c02_operation_id=c02_operation_id, source_ref=source_ref)
         if actual is None:
             raise UnavailableGuard("actual current artifact phase is absent; HOLD")
-        if not actual["generation"] and operation_kind not in {"observe_artifact_phase_postconditions_v1", "verify_artifact_draft_phase_v2", "register_artifact_task_milestone_v2"}:
+        if not actual["generation"] and operation_kind not in {'derive_artifact_completion_receipt_v1', 'serve_concern', "prepare_artifact_phase_observation_v1", "observe_artifact_phase_postconditions_v1", "verify_artifact_draft_phase_v2", "register_artifact_task_milestone_v2"}:
             raise UnavailableGuard("actual check phase cannot perform a generation operation; HOLD")
         phase = actual["selector"]
         if operation_kind == "register_artifact_phase_postcondition_contract_v1":
@@ -9138,7 +9285,17 @@ class GraphCoordinator:
                     request = RegisterArtifactPhasePostconditionContractRequestV1(phase, chosen.binding.postcondition_policy_ref)
                 finally:
                     db.rollback()
-        elif operation_kind in {"observe_artifact_phase_postconditions_v1", "verify_artifact_draft_phase_v2"}:
+        elif operation_kind=='serve_concern':
+            from .runtime.d07_current_behavior_v1 import ServeCurrentConcernRequestV1
+            from .runtime.foreground_artifact_observation_plan_v3 import artifact_observation_ids_v1
+            condition='tone'if phase.phase_kind=='sample_check'else'task_semantics'
+            request=ServeCurrentConcernRequestV1('background',artifact_observation_ids_v1(phase,condition)['question'])
+        elif operation_kind=="prepare_artifact_phase_observation_v1":
+            from .runtime.artifact_phase_observation_v1 import PrepareArtifactPhaseObservationRequestV1
+            assessment=actual['assessment_request']
+            condition='tone'if phase.phase_kind=='sample_check'else'task_semantics'
+            request=PrepareArtifactPhaseObservationRequestV1(phase,assessment.contract_ref,assessment.file_result_ref,condition)
+        elif operation_kind in {'serve_concern', "prepare_artifact_phase_observation_v1", "observe_artifact_phase_postconditions_v1", "verify_artifact_draft_phase_v2"}:
             from .runtime.d11_life_contract_v1 import draft_artifact_ref_v1
             from .runtime.artifact_phase_postconditions_v1 import artifact_phase_assessment_original_ref_v1
             if operation_kind == "observe_artifact_phase_postconditions_v1":
@@ -9183,6 +9340,92 @@ class GraphCoordinator:
                 c02_operation_id=c02_operation_id, source_ref=source_ref)
             return {"wake": result, "acquisition": acquired}
         return result
+
+    def begin_current_artifact_method_group_v3(self,bootstrap,installed_bundle,*,c02_operation_id,source_ref,prepared_candidates_operation_id):
+        """Commit the actual selected first method via the existing current checkpoint protocol."""
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard('initial Artifact group requires the actual installed assembly; HOLD')
+        self._read_post_c02_foreground_cycle_v1(bootstrap,installed_bundle,c02_operation_id=c02_operation_id,source_ref=source_ref)
+        from .runtime.foreground_cycle_v1 import (foreground_cycle_ids_v1,foreground_cycle_from_wire_v1,
+            read_observed_foreground_call_plan_v1,CheckpointForegroundCycleRequestV2)
+        from .runtime.foreground_call_plan_v1 import ForegroundCallPlanV1
+        from .runtime.foreground_artifact_observation_plan_v3 import derive_initial_artifact_observation_plan_v3
+        from .runtime.d08_personal_candidate_v1 import ConsumePersonalDecisionRequestV1,_selected_candidate_phase_selector_from_originals_v2
+        from .runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
+        from .runtime.c09_life_originals_v1 import read_original_foreground_responsibility_for_c09_v1
+        from .runtime.jobs import get_job
+        from .runtime.first_ingress_v2 import trusted_upper
+        ns=installed_bundle.installation_policy.namespace
+        now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__scene_clock_policy))
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                job=get_job(db,foreground_cycle_ids_v1(ns,c02_operation_id)[1])
+                current=foreground_cycle_from_wire_v1(job.continuation)
+                if current.source_ref!=source_ref or job.cancel_epoch or job.phase!='running' or job.lease_holder is None:
+                    raise UnavailableGuard('initial Artifact group lost its current live task/worker; HOLD')
+                if type(current.call_plan)is not ForegroundCallPlanV1:
+                    return {'status':'existing_original_method_group','c02_operation_id':c02_operation_id}
+                origin=read_adopted_domain_operation_v1(db,ns,prepared_candidates_operation_id)
+                if origin is None or(origin['domain'],origin['operation_kind'])!=('d08','prepare_personal_candidates_v1'):
+                    raise UnavailableGuard('initial Artifact group needs its actual D08 preparation; HOLD')
+                decision_ref=origin['payload']['provenance']['prepared_candidates']['future_decision_ref']
+                selected=_selected_candidate_phase_selector_from_originals_v2(db,namespace=ns,
+                    request=ConsumePersonalDecisionRequestV1(decision_ref=decision_ref,prepared_candidates_operation_id=prepared_candidates_operation_id),issuer=self.__d11_issuer)
+                if selected is None:raise UnavailableGuard('initial Artifact group has no actual adopted eligible phase Decision; HOLD')
+                responsibility=read_original_foreground_responsibility_for_c09_v1(db,namespace=ns,job=job,issuer=self.__d11_issuer)
+                observed=read_observed_foreground_call_plan_v1(db,namespace=ns,continuation=current,issuer=self.__d11_issuer,
+                    installed_bundle=installed_bundle,owner_guard=responsibility.owner_guard)
+                proposed=derive_initial_artifact_observation_plan_v3(db,namespace=ns,
+                    continuation=replace(current,call_plan=observed),selector=selected,issuer=self.__d11_issuer,
+                    installed_bundle=installed_bundle,owner_guard=responsibility.owner_guard,now_utc=now)
+                request=CheckpointForegroundCycleRequestV2(selected.task.cycle_job_ref,job.lease_holder,job.fence,
+                    replace(current,call_plan=proposed))
+            finally:db.rollback()
+        selector=self._post_c02_foreground_selector_v1(bootstrap,installed_bundle,c02_operation_id=c02_operation_id,
+            source_ref=source_ref,operation_kind='checkpoint_foreground_cycle_v2',request=request)
+        return self.__domain_production_runtime_v1.run_foreground_current(selector=selector,
+            operation_kind='checkpoint_foreground_cycle_v2',request=request)
+
+    def read_current_artifact_phase_observation_progress_v3(self,bootstrap,installed_bundle,*,c02_operation_id,source_ref):
+        """Read actual basis/job/paid adoption originals, never infer execution from preparation."""
+        self._admin(bootstrap)
+        if self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle:
+            raise UnavailableGuard('Artifact observation progress needs its actual installation; HOLD')
+        current=self.read_current_post_c02_artifact_phase_resume_v2(bootstrap,installed_bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+        if current is None or current['generation']:
+            raise UnavailableGuard('observation progress requires its actual current check phase; HOLD')
+        from .runtime.artifact_phase_observation_v1 import read_artifact_phase_observation_basis_v1
+        from .runtime.foreground_artifact_observation_plan_v3 import artifact_observation_ids_v1
+        from .runtime.d07_execution_v1 import read_prepared_d07_execution_v1
+        from .runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+        from .runtime.artifact_phase_observation_result_v1 import read_artifact_phase_semantic_observations_v1
+        from .runtime.artifact_phase_postconditions_v1 import CONTRACT_KIND,_original
+        from .runtime.jobs import get_job
+        phase=current['selector'];ns=phase.task.namespace
+        condition='tone'if phase.phase_kind=='sample_check'else'task_semantics'
+        ids=artifact_observation_ids_v1(phase,condition)
+        with self.__store._lock:
+            db=self.__store._db;db.execute('BEGIN')
+            try:
+                basis=read_artifact_phase_observation_basis_v1(db,namespace=ns,original_ref=ids['basis'],issuer=self.__d11_issuer)
+                if basis is None:return {'basis_prepared':False,'job':None,'observation_complete':False}
+                prepared=read_prepared_d07_execution_v1(db,self.__d11_issuer,ns,ids['job'])
+                if prepared is None:return {'basis_prepared':True,'job':None,'observation_complete':False}
+                if type(prepared)is not D07ArtifactObservationPreparedV3 or prepared.observation_basis_digest!=basis.digest:
+                    raise UnavailableGuard('observation progress found another prepared producer/basis; HOLD')
+                job=get_job(db,prepared.job_id)
+                if job.cancel_epoch or job.phase in {'cancelled','failed','draining','pending_confirmation'}:
+                    return {'basis_prepared':True,'job':job,'observation_complete':False}
+                if job.phase!='completed':return {'basis_prepared':True,'job':job,'observation_complete':False}
+                contract,_=_original(db,namespace=ns,kind=CONTRACT_KIND,ref=basis.request.contract_ref,issuer=self.__d11_issuer)
+                observed=read_artifact_phase_semantic_observations_v1(db,namespace=ns,selector=phase,contract=contract,
+                    observer_original_refs=current['assessment_request'].observer_original_refs,issuer=self.__d11_issuer)
+                return {'basis_prepared':True,'job':job,'observation_complete':True,
+                    'statuses':tuple(item.status for item in observed.values())}
+            finally:db.rollback()
 
     def checkpoint_current_artifact_phase_v2(self, bootstrap, installed_bundle, *, c02_operation_id, source_ref):
         """Advance only one actual signed verification through the original checkpoint."""
@@ -9234,7 +9477,7 @@ class GraphCoordinator:
             try:
                 job = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
                 plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
-                if type(plan) is not ForegroundCallPlanV2:
+                if type(plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
                     return None
                 phase = plan.phase_group.selector
                 ids = artifact_method_final_operation_ids_v2(phase)
@@ -9293,7 +9536,7 @@ class GraphCoordinator:
             try:
                 cycle = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
                 continuation = foreground_cycle_from_wire_v1(cycle.continuation)
-                if type(continuation.call_plan) is not ForegroundCallPlanV2:
+                if type(continuation.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
                     raise UnavailableGuard("method finalization has no actual phase group; HOLD")
                 phase = continuation.call_plan.phase_group.selector
                 milestone = read_current_artifact_task_milestone_v2(db, namespace=namespace,
@@ -9378,7 +9621,7 @@ class GraphCoordinator:
             try:
                 job = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
                 plan = foreground_cycle_from_wire_v1(job.continuation).call_plan
-                if type(plan) is not ForegroundCallPlanV2:
+                if type(plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
                     return None
                 group = plan.phase_group
                 if len(group.completed_phase_originals) != len(artifact_draft_phase_sequence_v2(group.selector.method_ref)):
@@ -9427,7 +9670,7 @@ class GraphCoordinator:
             try:
                 cycle = get_job(db, foreground_cycle_ids_v1(namespace, c02_operation_id)[1])
                 continuation = foreground_cycle_from_wire_v1(cycle.continuation)
-                if type(continuation.call_plan) is not ForegroundCallPlanV2:
+                if type(continuation.call_plan) not in {ForegroundCallPlanV2,ForegroundCallPlanV3}:
                     return None
                 phase = continuation.call_plan.phase_group.selector
                 original = read_adopted_domain_operation_v1(db, namespace, artifact_method_settlement_operation_id_v2(phase))
@@ -11626,7 +11869,8 @@ class GraphCoordinator:
         assembly=self.__d04_installed_joint_assembly
         from .host.model_workflows_v7 import AdminModelWorkflowsV7
         from .host.model_workflows_v8 import AdminModelWorkflowsV8
-        if (assembly is None or type(assembly.admin_bundle.model_workflows) not in {AdminModelWorkflowsV7,AdminModelWorkflowsV8}
+        from .host.model_workflows_v9 import AdminModelWorkflowsV9
+        if (assembly is None or type(assembly.admin_bundle.model_workflows) not in {AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}
                 or policy.algorithm_ref != "d13.full_http_counter.v1"
                 or policy.valid_until_utc > assembly.installation_policy.root_grant.valid_until_utc
                 or policy.cpu_ms_ceiling > dict(assembly.installation_policy.root_grant.max_ceiling).get("cpu_ms",0)):
@@ -12821,6 +13065,11 @@ class GraphCoordinator:
             if NamespaceId.from_key(read.key) != namespace:
                 raise AuthorityDenied("cross-namespace read")
             store._validate_key(read.key)
+            from .runtime.artifact_receipt_graph_v1 import read_current_artifact_receipt_guard_atom_v1
+            handled,receipt_atom=read_current_artifact_receipt_guard_atom_v1(self,bundle,read)
+            if handled:
+                atoms.append(receipt_atom)
+                continue
             row = read_graph_head_v3(db, read.key.token)
             revision = row[0] if row else 0
             if revision != read.revision:
@@ -14955,6 +15204,75 @@ class GraphCoordinator:
         db.execute("""CREATE TRIGGER IF NOT EXISTS graph_d07_deferred_release_no_delete_v2
             BEFORE DELETE ON graph_d07_deferred_release_v2 BEGIN
               SELECT RAISE(ABORT,'D07 deferred release is immutable'); END""")
+
+    def read_committed_artifact_receipt_dispatch_v1(self,bootstrap,installed_bundle,*,operation_id,authority,lease):
+        """Recover actual receipt identities under the dedicated full-original read."""
+        self._admin(bootstrap)
+        self._authorize(lease,authority,frozenset({'d08','d09','d11'}))
+        if (self.__d04_installed_joint_assembly is None or self.__d04_installed_joint_assembly.admin_bundle is not installed_bundle
+                or authority.namespace!=installed_bundle.installation_policy.namespace
+                or installed_bundle.artifact_phase_observer is None):
+            raise UnavailableGuard('Artifact cold reader requires its actual installed explicit V3 bundle; HOLD')
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.artifact_receipt_graph_v1 import (prepare_artifact_receipt_full_read_then_call_v1,
+            _receipt_committed_operation_v1)
+        from .runtime.artifact_receipt_original_read_v1 import bind_artifact_receipt_assembly_points_v1
+        from .runtime.artifact_receipt_dispatch_v1 import recover_artifact_receipt_dispatch_candidate_in_transaction_v1
+        from .runtime.dispatch_admission import load_request
+        from .runtime.dispatch_candidate import dispatch_segment_payload_ref
+        from .runtime.artifact_completion_receipt_v1 import receipt_ids_v1
+        from .host.private_reply_dispatch_driver import OriginalPrivateReplyDispatchV1,_is_private_route
+        from .runtime.foreground_cycle_v1 import foreground_cycle_from_wire_v1
+        from .runtime.jobs import get_job
+        from .dispatch_runtime import DispatchRequest
+        now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__dispatch_clock_policy))
+        ns=authority.namespace
+        def read(proof):
+            current_now=trusted_upper(self.__content_fence_v2.read_ingress_clock(self.__dispatch_clock_policy))
+            with self.__store._lock:
+                db=self.__store._db;db.execute('BEGIN')
+                try:
+                    with bind_artifact_receipt_assembly_points_v1(proof,self,db,now_utc=current_now) as fact:
+                        actual=recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,ns,operation_id)
+                        if actual is None or actual.evidence.receipt_digest!=fact.digest or fact.message_operation_id!=operation_id:
+                            raise UnavailableGuard('Artifact cold candidate changed its actual D06 receipt; HOLD')
+                        ids=receipt_ids_v1(fact.selector)
+                        rows=db.execute('SELECT admission_ref FROM graph_dispatch_admissions WHERE bot=? AND persona=? AND operation_id=? AND effect_id=?',
+                            (*ns.as_tuple,operation_id,fact.effect_id)).fetchall()
+                        if len(rows)!=1:raise UnavailableGuard('Artifact cold receipt has no unique actual admission; HOLD')
+                        pair=load_request(db,ns,rows[0][0])
+                        if pair is None:raise UnavailableGuard('Artifact cold request unavailable; HOLD')
+                        admission,request=pair;frozen=admission.admission
+                        committed=_receipt_committed_operation_v1(self,proof,fact,current_now)
+                        if (committed is None or committed.status!='committed' or len(committed.outbox_refs)!=1
+                                or type(request) is not DispatchRequest or committed.activity_id!=ids['activity']
+                                or committed.effect_id!=fact.effect_id or frozen.candidate_digest!=actual.evidence.digest
+                                or frozen.batch_digest!=actual.evidence.batch_digest
+                                or frozen.payload_digest!=actual.evidence.payload_digest
+                                or frozen.request_digest!=canonical_digest(request)
+                                or (frozen.operation_id,frozen.effect_id,frozen.activity_id,frozen.attempt_id)!=
+                                    (operation_id,fact.effect_id,ids['activity'],request.attempt_id)
+                                or (request.operation_id,request.effect_id,request.activity_id,request.payload_digest)!=
+                                    (operation_id,fact.effect_id,ids['activity'],actual.evidence.payload_digest)
+                                or request.payload_ref!=dispatch_segment_payload_ref(actual.evidence.batch_ref,0)
+                                or request.proactive_contact or request.segment_index!=0 or request.segment_count!=1
+                                or frozen.segment_index!=0 or not _is_private_route(frozen.account_ref,frozen.destination_ref)):
+                            raise UnavailableGuard('Artifact cold single-segment/Source/effect/admission identity differs; HOLD')
+                        cycle=get_job(db,AtomKey.from_token(fact.selector.task.cycle_job_ref).name)
+                        continuation=foreground_cycle_from_wire_v1(cycle.continuation)
+                        if continuation.c02_operation_id!=fact.selector.task.c02_operation_id:
+                            raise UnavailableGuard('Artifact cold receipt crossed its actual cycle; HOLD')
+                        return OriginalPrivateReplyDispatchV1(ns,continuation.ingress_operation_id,operation_id,fact.effect_id,
+                            frozen.admission_ref,frozen.digest,committed.outbox_refs[0],request,admission)
+                finally:db.rollback()
+        return prepare_artifact_receipt_full_read_then_call_v1(self,authority,lease,operation_id=operation_id,
+            now_utc=now,deadline_utc=installed_bundle.installation_policy.root_grant.valid_until_utc,callback=read)
+
+    def record_artifact_receipt_outbound_observation_v1(self,bootstrap,namespace,operation_id):
+        from .runtime.d13_outbound_observation_v1 import commit_natural_outbound_observation_v1
+        if not operation_id.startswith('artifact-receipt-message:'):
+            raise ValueError('exact Artifact receipt operation required')
+        return commit_natural_outbound_observation_v1(self,bootstrap,namespace,operation_id)
 
     def record_natural_outbound_observation_v1(self, bootstrap, namespace, final_operation_id):
         from .runtime.d13_outbound_observation_v1 import commit_natural_outbound_observation_v1
@@ -32865,10 +33183,17 @@ class GraphCoordinator:
                     if len(actions) != 1:
                         raise UnavailableGuard("current D08 action is absent or ambiguous; HOLD")
                     current_reply_route = None
+                    artifact_receipt_lineage = None
                     if binding.operation_id.startswith("post-c02-reply:"):
                         current_reply_route = self._read_current_post_c02_final_route_locked(
                             namespace, admission_receipt.admission, actions[0],
                             segment, graph, query, now_utc=now_utc, prepared_inventory=prepared_inventory)
+                    if binding.operation_id.startswith("artifact-receipt-message:"):
+                        from .runtime.artifact_receipt_dispatch_v1 import read_current_artifact_receipt_dispatch_lineage_v1
+                        artifact_receipt_lineage=read_current_artifact_receipt_dispatch_lineage_v1(self,
+                            namespace=namespace,admission=admission_receipt.admission,action=actions[0],segment=segment,
+                            snapshot=graph,query=query,now_utc=now_utc,prepared_inventory=prepared_inventory)
+                        current_reply_route=(artifact_receipt_lineage.route_binding,artifact_receipt_lineage.source_closure)
                     action = read_current_d08_action_conflict_evidence(
                         db, namespace, graph, query, actions[0].action_id,
                         permit, effect, prepared_inventory=prepared_inventory)
@@ -32878,8 +33203,8 @@ class GraphCoordinator:
                             or projection.coverage != "full"
                             or projection.missing_sources):
                         raise UnavailableGuard("current D08/graph checks incomplete; HOLD")
-                    candidate = self._get_dispatch_candidate_evidence_locked(
-                        namespace, binding.operation_id)
+                    candidate = (artifact_receipt_lineage.candidate if artifact_receipt_lineage is not None else
+                        self._get_dispatch_candidate_evidence_locked(namespace, binding.operation_id))
                     if candidate is None:
                         raise UnavailableGuard("current D08 schema candidate absent; HOLD")
                     schema_ref, schema_revision = candidate.write_versions[1]
@@ -33004,6 +33329,7 @@ class GraphCoordinator:
                         "graph_epoch": query.revision,
                         "segment": segment,
                         "reply_account_route": current_reply_route,
+                        "artifact_completion_lineage":None if artifact_receipt_lineage is None else artifact_receipt_lineage.digest,
                         "route": live_route,
                         "projection": projection.digest,
                         "social": social,
@@ -33057,8 +33383,17 @@ class GraphCoordinator:
                 authority.namespace.as_tuple):
             raise ValueError("dispatch request namespace differs")
         self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}))
-        reader = lambda: self._get_dispatch_text_segment_locked(
-            authority.namespace, request)
+        def reader():
+            db=self.__store._db
+            if not request.operation_id.startswith("artifact-receipt-message:"):
+                return self._get_dispatch_text_segment_locked(authority.namespace,request)
+            if db.in_transaction:raise UnavailableGuard("Artifact payload needs its independent current read transaction")
+            db.execute("BEGIN")
+            try:
+                result=self._get_dispatch_text_segment_locked(authority.namespace,request)
+                db.execute("COMMIT");return result
+            except BaseException:
+                db.execute("ROLLBACK");raise
         if (isinstance(self.__store, ProductionGraphStore)
                 and self.__content_fence_v2 is not None):
             return self._read_v2(authority, reader)
@@ -33287,8 +33622,15 @@ class GraphCoordinator:
         if row is None:
             return None
         receipt = load_admission(db, namespace, row[0])
-        candidate = self._get_dispatch_candidate_evidence_locked(
-            namespace, request.operation_id)
+        artifact=request.operation_id.startswith("artifact-receipt-message:")
+        if artifact:
+            from .runtime.artifact_receipt_original_read_v1 import require_artifact_receipt_payload_inventory_v1
+            from .runtime.artifact_receipt_dispatch_v1 import recover_artifact_receipt_dispatch_candidate_in_transaction_v1
+            inventory,receipt_now=require_artifact_receipt_payload_inventory_v1(self,request)
+            candidate=recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,namespace,request.operation_id,
+                prepared_inventory=inventory)
+        else:
+            candidate = self._get_dispatch_candidate_evidence_locked(namespace, request.operation_id)
         if receipt is None or candidate is None:
             raise UnavailableGuard("dispatch admission or candidate is absent")
         admission = receipt.admission
@@ -33361,6 +33703,18 @@ class GraphCoordinator:
         uses = tuple(ClaimUse(item["claim_ref"], item["start"], item["end"],
                               ClaimKind(item["asserted_as"]))
                      for item in segment["claim_uses"])
+        if artifact:
+            from .runtime.artifact_receipt_dispatch_v1 import read_current_artifact_receipt_dispatch_lineage_v1
+            from .runtime.dispatch_current_segment import read_current_dispatch_segment
+            action_atom=inventory.projection.get(AtomKey.from_token(evidence.action_ref))
+            action_spec=next(spec for spec in self.__providers["d08"][0].register_types()if spec.name=="d08.action_intent.v1")
+            actual_action=action_spec.validator(action_atom.value)
+            current=read_current_dispatch_segment(db,namespace,admission.admission_ref,now_utc=receipt_now)
+            lineage=read_current_artifact_receipt_dispatch_lineage_v1(self,namespace=namespace,admission=admission,
+                action=actual_action,segment=current,snapshot=inventory.projection,query=inventory.query,
+                now_utc=receipt_now,prepared_inventory=inventory)
+            if segment["body"]!=lineage.receipt.text:
+                raise UnavailableGuard("Artifact payload differs from its actual fixed completion receipt")
         return GraphDispatchTextSegmentV1(
             segment["body"], tuple(segment["media_refs"]), uses,
             account[0], account[1], account[2], route[0], route[1],
@@ -33478,7 +33832,9 @@ class GraphCoordinator:
         if grant.route_binding_digest is not None:
             from .runtime.dispatch_check_reissue import PostC02FinalReissueV2
 
-            if (type(final_reissue) is not PostC02FinalReissueV2
+            from .runtime.artifact_receipt_graph_v1 import is_actual_artifact_receipt_final_reissue_v1
+            artifact_final=is_actual_artifact_receipt_final_reissue_v1(final_reissue,db,now_utc=now,scope=dispatch_scope)
+            if (not(type(final_reissue)is PostC02FinalReissueV2 or artifact_final)
                     or final_reissue.grant != grant
                     or final_reissue.action.intent != action
                     or final_reissue.candidate != provisional_check_candidate):
@@ -33492,9 +33848,12 @@ class GraphCoordinator:
             # The guard snapshot is pinned to E, before graph_commit writes.
             # K03's final checks were reissued from the actual sealed E+1
             # rows, so admission must inspect that same current SQL head.
-            issuer_snapshot, issuer_query = (
-                self._dispatch_full_graph_snapshot_locked(
-                    bundle.envelope.authority.namespace))
+            if artifact_final:
+                from .runtime.artifact_receipt_graph_v1 import _receipt_snapshot_v1
+                issuer_snapshot,issuer_query=_receipt_snapshot_v1(self,bundle.envelope.authority.namespace,now)
+            else:
+                issuer_snapshot, issuer_query = (
+                    self._dispatch_full_graph_snapshot_locked(bundle.envelope.authority.namespace))
             if (issuer_query.revision != graph_receipt.epoch.revision
                     or issuer_snapshot.epochs != (graph_receipt.epoch,)
                     or final_reissue.candidate.graph_epoch
@@ -39230,7 +39589,8 @@ class GraphCoordinator:
         from .host.model_workflows_v7 import AdminModelWorkflowsV7
         from .model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
         from .host.model_workflows_v8 import AdminModelWorkflowsV8
-        actual_v7=(bundle is not None and type(bundle.model_workflows) in {AdminModelWorkflowsV7,AdminModelWorkflowsV8}
+        from .host.model_workflows_v9 import AdminModelWorkflowsV9
+        actual_v7=(bundle is not None and type(bundle.model_workflows) in {AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}
             and bundle.model_workflows.natural_generation is not None
             and bundle.model_workflows.natural_generation.template_version==V7_TEMPLATE)
         # The persisted derived metadata/payload product has the same V1 contract.
@@ -43609,6 +43969,11 @@ class GraphCoordinator:
             finally:
                 port.finish_fence(scope,request_id="finish:"+operation_id,request_digest="sha256:"+canonical_digest((
                     "d08.owner-goal-projection-lookup-finish.v1",operation_id,permit.token)))
+
+    def prepare_current_artifact_receipt_dispatch_v1(self,bootstrap,installed_bundle,*,c02_operation_id,source_ref):
+        from .runtime.artifact_receipt_graph_v1 import prepare_current_artifact_receipt_dispatch_v1
+        return prepare_current_artifact_receipt_dispatch_v1(self,bootstrap,installed_bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
 
 
 

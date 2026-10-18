@@ -1441,7 +1441,7 @@ def begin_installed_c09_recovery_facts_v2(session, graph_pair):
 
 class InstalledC09AuthorityRoleBasisV2:
     __slots__ = ('_issuer', 'session', 'pair', 'scope', 'facts', 'pin_digest',
-                 'graph_issue_digest', 'accepted_receipt', 'new_core_path', '_completion')
+                 'graph_issue_digest', 'accepted_receipt', 'new_core_path', '_completion','_owner_reply_stop_ready_v3')
 
     def __init__(self, token, session, pair, facts, completion, accepted, new_core_path):
         if token is not _TOKEN:
@@ -1451,6 +1451,7 @@ class InstalledC09AuthorityRoleBasisV2:
         self.facts, self._completion = facts, completion
         self.pin_digest, self.graph_issue_digest = completion.facts_pin_digest, completion.graph_issue_digest
         self.accepted_receipt, self.new_core_path = accepted, new_core_path
+        self._owner_reply_stop_ready_v3=None
 
     def require_current(self):
         _require_session_pair(self.session, self.pair)
@@ -1664,6 +1665,7 @@ class InstalledC09AuthorityRoleBasisV2:
         from ..host.authority_profile import AdminInstallationBundle
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+        from ..host.model_workflows_v9 import AdminModelWorkflowsV9
         self.require_current();maintenance=self.session._control.maintenance
         config=getattr(maintenance,'_installed_deployment_config_v2',None)
         if type(config) is not AuthorityDeploymentConfig:
@@ -1672,7 +1674,7 @@ class InstalledC09AuthorityRoleBasisV2:
         if type(model) is not InstalledNaturalModelAuthorityV2:
             raise AuthorityUnavailable('actual C09 natural authority namespace installation absent')
         bundle=model.installation_bundle
-        if (type(bundle) is not AdminInstallationBundle or type(model.workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8}
+        if (type(bundle) is not AdminInstallationBundle or type(model.workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
                 or bundle.model_workflows is not model.workflows
                 or model.d11_issuer is not getattr(maintenance,'_installed_d11_budget_job_issuer_v2',None)
                 or model.d11_issuer.resource_issuer is not getattr(maintenance,'_installed_d02_resource_issuer_v2',None)):
@@ -2500,33 +2502,7 @@ class InstalledC09AuthorityRoleBasisV2:
         verified.require_current();self.require_current()
         return dict(zip(columns,row,strict=True)),proof
 
-    def _require_preserved_graph_atom_payload_v3(self,row,*,meter):
-        """Only the physical TEXT-to-ref migration may preserve this Stop carrier."""
-        from ..runtime.c09_paged_sql_v2 import (read_c09_table_shape_v2,legacy_cell_read_transaction_v2,
-            c09_sql_meter_quantum_v2)
-        from .c09_segmented_census_v3 import require_segmented_target_row_v3
-        verified=self.session.require_actual_post_mirror_graph_v3();point=_C09ReadonlyPointMeterV3(meter)
-        source=verified.pair.source;db=verified._read_db
-        with c09_sql_meter_quantum_v2(point),legacy_cell_read_transaction_v2(source),legacy_cell_read_transaction_v2(db):
-            shape=read_c09_table_shape_v2(source,'graph_atoms',meter=point)
-            original=dict(zip(shape.columns,row,strict=True))
-            target_shape=read_c09_table_shape_v2(db,'graph_atoms',meter=point)
-            target=point.read_row(db,target_shape,(original['token'],))
-            if target is None:raise AuthorityUnavailable('actual rebuilt Stop carrier is absent')
-            rebuilt=dict(zip(target_shape.columns,target,strict=True))
-            if {name:value for name,value in rebuilt.items() if name!='value_cell_id'}!={name:value for name,value in original.items() if name!='value'}:
-                raise AuthorityUnavailable('rebuilt Stop carrier changed original identity/revision/validity')
-            columns=('cell_id','codec_id','erasure_owner_ref','producer_operation_id','total_bytes',
-                'segment_count','payload_sha256','ordered_segment_root','origin_scope_digest')
-            header=point.read_fixed_row(db,'segmented_cells_v1',columns,'cell_id=?',(rebuilt['value_cell_id'],))
-            point.require_available(len(original['value']))
-            body=original['value'].encode('utf-8');point.charge_encode(len(body))
-            if (header is None or header[1]!='canonical-json.ascii.v1' or header[2]!=original['token']
-                    or header[3]!=self.scope.operation_id or header[4]!=len(body)
-                    or header[6]!=sha256(body).hexdigest() or header[8]!=self.scope.scope_digest):
-                raise AuthorityUnavailable('rebuilt Stop carrier did not preserve complete original payload bytes')
-            require_segmented_target_row_v3(verified.segmented_sweep_v3,'segmented_cells_v1',(header[0],),tuple(header),meter=point)
-        verified.require_current();self.require_current()
+    
 
     def foreground_fence(self, operation_id, row, *, meter):
         from ..runtime.c09_foreground_attempt_v1 import TABLE, require_foreground_core_finished_v1
@@ -2544,79 +2520,8 @@ class InstalledC09AuthorityRoleBasisV2:
             return actual, proof.disposition
 
     def owner_reply_stop(self, key, row, *, meter):
-        from .owner_stop_reply_v1 import (PLAN_SCHEMA, decode_owner_stop_reply_plan_v1,
-            validate_owner_stop_reply_core_row_v1, owner_reply_cycle_retirement_commitment_v1)
-        from ..runtime.owner_stop_reply_v1 import read_original_owner_reply_cycle_identity_v1
-        from ..runtime.domain_production_originals_v1 import read_adopted_domain_operation_v1
-        from ..runtime.domain_production_original_codec_v1 import decode_typed_production_value_v1
-        from ..runtime.foreground_cycle_v1 import ForegroundResponsibilityV1
-        from ..runtime.jobs import get_job
-        from ..runtime.d11_types import job_graph_write
-        from ..graph_types import AtomKey
-        from .c09_authority_storage_rebase import _owner_stop_reply_child_carrier_v1
-        from ..runtime.lifecycle_operations_v1 import decode_original
-        validate_owner_stop_reply_core_row_v1(row)
-        if tuple(row[:3]) != tuple(key) or row[0] != self.scope.authority_namespace:
-            raise AuthorityUnavailable('actual StopReply row belongs to another scope')
-        plan = json.loads(row[7])
-        if plan.get('schema') != PLAN_SCHEMA:
-            raise AuthorityUnavailable('actual StopReply original has another plan schema')
-        request, _ = decode_owner_stop_reply_plan_v1(plan)
-        if request.installation_id != self.scope.installation_id:
-            raise AuthorityUnavailable('actual StopReply request crossed installation')
-        with self._connections(meter) as (core, graph, target):
-            actual = core.execute('SELECT * FROM authority_d12_operation_originals_v1 WHERE authority_namespace=? AND operation_id=? AND original_ref=?', key).fetchone()
-            if actual != tuple(row):
-                raise AuthorityUnavailable('actual selected Core StopReply original changed')
-            identity, cycle = read_original_owner_reply_cycle_identity_v1(graph, namespace=request.namespace, request=request)
-            if asdict(identity) != plan['scope']:
-                raise AuthorityUnavailable('StopReply lost its actual historical C02/cycle/create identity')
-            removed = False
-            def observe(table, original_row):
-                nonlocal removed
-                proof = self._graph_disposition(graph, target, table, original_row, meter)
-                if proof.disposition=='rebuilt_from_surviving_sources' and table=='graph_atoms':
-                    self._require_preserved_graph_atom_payload_v3(original_row,meter=meter)
-                elif proof.disposition not in {'preserved_exact','derived_removed'}:
-                    raise AuthorityUnavailable('StopReply carrier has another certified disposition')
-                removed = removed or proof.disposition == 'derived_removed'
-            ns = request.namespace.as_tuple
-            observe('runtime_jobs', graph.execute('SELECT * FROM runtime_jobs WHERE job_id=?', (cycle.job_id,)).fetchone())
-            observe('graph_atoms', graph.execute('SELECT * FROM graph_atoms WHERE token=?', (request.cycle_job_ref,)).fetchone())
-            create = read_adopted_domain_operation_v1(graph, request.namespace, cycle.operation_id)
-            observe('graph_domain_production_originals_v1', graph.execute('SELECT * FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND operation_id=?', (*ns, cycle.operation_id)).fetchone())
-            for producer in (cycle.operation_id, request.c02_operation_id):
-                observe('graph_bundle_operations', graph.execute('SELECT * FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?', (*ns, producer)).fetchone())
-            if identity.responsibility_ref is not None:
-                responsibility = decode_typed_production_value_v1(create['payload']['provenance']['foreground_responsibility'], ForegroundResponsibilityV1)
-                kind = 'foreground_post_c02_cause' if responsibility.mode == 'bounded_causal_window_v1' else 'draft_root_capability'
-                observe('graph_d11_life_originals_v1', graph.execute('SELECT * FROM graph_d11_life_originals_v1 WHERE bot=? AND persona=? AND kind=? AND original_ref=?', (*ns, kind, responsibility.cause_original_ref)).fetchone())
-            for job_ref, original_ref, original_digest in plan['child_originals']:
-                child = get_job(graph, AtomKey.from_token(job_ref).name)
-                if job_graph_write(child).key.token != job_ref or (child.bot_id, child.persona_id) != ns:
-                    raise AuthorityUnavailable('StopReply child crossed its actual namespace/job')
-                observe('runtime_jobs', graph.execute('SELECT * FROM runtime_jobs WHERE job_id=?', (child.job_id,)).fetchone())
-                observe('graph_atoms', graph.execute('SELECT * FROM graph_atoms WHERE token=?', (job_ref,)).fetchone())
-                for table, carrier in _owner_stop_reply_child_carrier_v1(graph, request.namespace, cycle, child, original_ref, original_digest):
-                    observe(table, carrier)
-            # A group is read as a metered iterator. No namespace-sized selected
-            # list or dictionary can discard an initial/derived member.
-            for sibling in core.execute('SELECT * FROM authority_d12_operation_originals_v1 WHERE authority_namespace=? AND operation_id=?', row[:2]):
-                validate_owner_stop_reply_core_row_v1(sibling)
-                if sibling[4:] != row[4:] or json.loads(sibling[7]) != plan:
-                    raise AuthorityUnavailable('StopReply initial/derived group changed its original Owner scope')
-                original = decode_original(json.loads(sibling[3]))
-                for ref in original.result.domain_receipt_refs:
-                    matches = graph.execute("SELECT * FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND domain='d11' AND substr(original_digest,1,48)=? LIMIT 2",
-                        (*ns, ref.removeprefix('d11-current:'))).fetchall()
-                    if len(matches) != 1:
-                        raise AuthorityUnavailable('derived StopReply lost its unique actual Graph projection')
-                    projection = read_adopted_domain_operation_v1(graph, request.namespace, matches[0][2])
-                    if projection['operation_kind'] != 'owner_stop_reply_v1' or projection['payload']['provenance']['cycle_identity'] != plan['scope']:
-                        raise AuthorityUnavailable('derived StopReply projection crossed its actual historical scope')
-                    observe('graph_domain_production_originals_v1', matches[0])
-        retirement = owner_reply_cycle_retirement_commitment_v1(row[0], request.cycle_job_ref, row[1])
-        return tuple(row), 'derived_removed' if removed else 'preserved_exact', AtomKey.from_token(request.cycle_job_ref).name, retirement
+        from .c09_owner_reply_disposition_v3 import require_complete_owner_reply_stop_v3
+        return require_complete_owner_reply_stop_v3(self,key,row,meter)
 
     def current_singleton(self, table, *, meter):
         from .c09_originals_archive_v1 import SINGLETONS

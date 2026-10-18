@@ -232,12 +232,14 @@ def _read_actual_reply_allocation_v1(db, *, namespace, c02_operation_id, source_
             or continuation.c02_operation_id != c02_operation_id or continuation.source_ref != source_ref):
         raise ValueError("foreground protected budget lost its actual SQL/Graph C02/cycle/Source identity")
     original = read_adopted_domain_operation_v1(db, namespace, job.operation_id)
-    if (original is None or original["domain"] != "d11" or original["operation_kind"] != "create_foreground_cycle"
+    if (original is None or original["domain"] != "d11" or original["operation_kind"] not in {"create_foreground_cycle", "create_foreground_cycle_v2"}
             or original["payload"]["request"]["c02_operation_id"] != c02_operation_id
             or original["payload"]["request"]["source_ref"] != source_ref):
         raise ValueError("foreground reply budget has no actual Source-bound shared cycle creation original")
     provenance = original["payload"]["provenance"]
-    if set(provenance) != {"before_job", "after_job", "reply_allocation"} or provenance["before_job"] is not None:
+    if (set(provenance) not in ({"before_job", "after_job", "reply_allocation"},
+            {"before_job", "after_job", "reply_allocation", "foreground_responsibility"})
+            or provenance["before_job"] is not None):
         raise ValueError("legacy/missing foreground reply allocation cannot authorize new protected work")
     allocation = decode_typed_production_value_v1(provenance["reply_allocation"], ForegroundReplyAllocationV1)
     if (allocation.namespace != namespace or allocation.c02_operation_id != c02_operation_id
@@ -508,6 +510,10 @@ def foreground_call_plan_from_wire_v2(value):
 
 
 def require_foreground_phase_checkpoint_v2(before, after):
+    from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3, require_artifact_observation_checkpoint_v3
+    if type(before) is ForegroundCallPlanV3 or type(after) is ForegroundCallPlanV3:
+        require_artifact_observation_checkpoint_v3(before, after)
+        return
     if type(after) is not ForegroundCallPlanV2:
         if type(before) is ForegroundCallPlanV2:
             raise ValueError("checkpoint cannot erase its original phase group")
@@ -534,7 +540,10 @@ def require_foreground_phase_checkpoint_v2(before, after):
 
 
 def register_foreground_model_attempt_v2(db, *, namespace, plan, attempt, issuer, now_utc, installed_bundle=None, owner_guard=None):
-    if type(plan) is not ForegroundCallPlanV2 or type(attempt) not in {ForegroundModelAttemptV1, ForegroundModelAttemptV2}:
+    from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3, ForegroundArtifactObservationAttemptV3
+    if (type(plan) not in {ForegroundCallPlanV2, ForegroundCallPlanV3}
+            or type(attempt) not in {ForegroundModelAttemptV1, ForegroundModelAttemptV2, ForegroundArtifactObservationAttemptV3}
+            or type(attempt) is ForegroundArtifactObservationAttemptV3 and type(plan) is not ForegroundCallPlanV3):
         raise TypeError("registered phase plan and physical attempt required")
     if attempt.slot == "C4" and (type(attempt) is not ForegroundModelAttemptV2
             or attempt.phase_selector != plan.phase_group.selector):
@@ -568,9 +577,10 @@ def register_foreground_model_attempt_v2(db, *, namespace, plan, attempt, issuer
 
 def require_protected_reply_budget_v1(db, *, namespace, plan, issuer, now_utc, installed_bundle=None, owner_guard=None):
     """Read the real ancestor encumbrance; a planned cap is not an allocation."""
-    if type(namespace) is not NamespaceId or type(issuer) is not D11BudgetJobIssuer or type(plan) not in {ForegroundCallPlanV1, ForegroundCallPlanV2}:
+    from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
+    if type(namespace) is not NamespaceId or type(issuer) is not D11BudgetJobIssuer or type(plan) not in {ForegroundCallPlanV1, ForegroundCallPlanV2, ForegroundCallPlanV3}:
         raise TypeError("protected reply needs the actual installed budget reader")
-    if type(plan) is ForegroundCallPlanV2:
+    if type(plan) in {ForegroundCallPlanV2, ForegroundCallPlanV3}:
         from .d11_artifact_draft_model_v1 import require_current_artifact_phase_group_v2
         if require_current_artifact_phase_group_v2(db, namespace=namespace, group=plan.phase_group, issuer=issuer,
                 installed_bundle=installed_bundle, owner_guard=owner_guard) != plan.phase_group:
@@ -578,6 +588,12 @@ def require_protected_reply_budget_v1(db, *, namespace, plan, issuer, now_utc, i
     parent = get_budget_lease(db, plan.parent_budget_lease_ref)
     protected = get_budget_lease(db, plan.protected_reply_lease_ref)
     grant = issuer.current_budget_grant(db, protected.lease_id)
+    from .artifact_receipt_allocation_v3 import POLICY as ARTIFACT_RECEIPT_POLICY, require_protected_artifact_receipt_budget_v3
+    if grant.policy_ref == ARTIFACT_RECEIPT_POLICY:
+        return require_protected_artifact_receipt_budget_v3(db, namespace=namespace, plan=plan, issuer=issuer,
+            now_utc=now_utc, installed_bundle=installed_bundle, owner_guard=owner_guard)
+    if type(plan) is ForegroundCallPlanV3:
+        raise ValueError("V3 observation cannot upgrade a natural reply allocation")
     if (protected.parent_id != parent.lease_id or protected.state != "active"
             or (protected.bot_id, protected.persona_id) != namespace.as_tuple
             or grant.valid_until_utc <= now_utc
@@ -690,10 +706,12 @@ class NamedC3ParentageDescriptorV3:
     checkpoint_ref: GraphVersion | None = None
     checkpoint_digest: str | None = None
     parent_grant_digest: str | None = None
+    observation_basis_ref: str | None = None
+    observation_basis_digest: str | None = None
 
     def __post_init__(self):
         from math import isfinite
-        if (type(self.namespace) is not NamespaceId or self.kind not in ('relationship', 'growth', 'reflection')
+        if (type(self.namespace) is not NamespaceId or self.kind not in ('relationship', 'growth', 'reflection', 'artifact_observation_self')
                 or type(self.cycle_ref) is not GraphVersion or self.cycle_ref.revision < 1
                 or self.cycle_ref.key.type_name != 'runtime.job'
                 or NamespaceId.from_key(self.cycle_ref.key) != self.namespace
@@ -712,7 +730,13 @@ class NamedC3ParentageDescriptorV3:
         reflection_fields=(self.reflection_request_ref,self.reflection_request_digest,self.reflection_continuation_ref,
             self.reflection_continuation_digest,self.parent_prepared_ref,self.parent_prepared_digest,
             self.parent_execution_ref,self.parent_execution_digest,self.checkpoint_ref,self.checkpoint_digest,self.parent_grant_digest)
-        if self.kind == "reflection":
+        if self.kind=='artifact_observation_self':
+            if (any(value is not None for value in (*extras,*reflection_fields))
+                    or type(self.observation_basis_ref)is not str or not self.observation_basis_ref
+                    or self.cancel_generation!=0):
+                raise ValueError('Artifact observation cannot borrow another named parent lineage')
+            digests=(*digests,self.observation_basis_digest)
+        elif self.kind == "reflection":
             if (any(value is None for value in reflection_fields) or self.semantic_question_ref is not None
                     or self.semantic_question_digest is not None or any(value is not None for value in extras[:4])
                     or type(self.checkpoint_ref) is not GraphVersion or self.checkpoint_ref.revision<1
@@ -742,12 +766,19 @@ class NamedC3ParentageDescriptorV3:
                     or not isfinite(self.original_deadline_utc)):
                 raise ValueError('growth C3 relation lost its actual paying lease/original deadline')
             digests = (*digests, self.proposal_digest, self.source_digest)
+        if self.kind!='artifact_observation_self' and (self.observation_basis_ref is not None or self.observation_basis_digest is not None):
+            raise ValueError('existing named C3 cannot borrow Artifact observation identities')
         if any(type(value) is not str or len(value) != 64
                 or any(ch not in '0123456789abcdef' for ch in value) for value in digests):
             raise ValueError('named C3 relation lost an exact original commitment')
 
 
 def _named_c3_descriptor_from_prepared_v3(prepared, namespace):
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    if type(prepared)is D07ArtifactObservationPreparedV3:
+        from .artifact_observation_parentage_v3 import artifact_observation_descriptor_from_metadata_v3
+        from ..domains.d01.production_operations_v1 import plain_v1
+        return artifact_observation_descriptor_from_metadata_v3(plain_v1(prepared),namespace=namespace,prepared_digest=prepared.digest)
     from .d07_execution_v1 import D07RelationshipPreparedV2, D07ReflectionPreparedV3
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
     if type(prepared) is D07ReflectionPreparedV3:
@@ -821,7 +852,10 @@ def _require_current_named_c3_descriptor_v3(db, *, namespace, descriptor, issuer
             or job.cancel_epoch or cycle.call_plan.parent_budget_lease_ref != get_job(db, descriptor.job_id).budget_ref):
         raise ValueError('Relationship C3 lost its actual current parent/cancel/budget binding')
     _adopted_c02_v1(db, namespace, descriptor.c02_operation_id)
-    if descriptor.kind=="reflection":
+    if descriptor.kind=='artifact_observation_self':
+        from .artifact_observation_parentage_v3 import require_current_artifact_observation_descriptor_v3
+        require_current_artifact_observation_descriptor_v3(db,namespace=namespace,descriptor=descriptor,issuer=issuer)
+    elif descriptor.kind=="reflection":
         from .d07_reflection_execution_v1 import require_reflection_c3_descriptor_v3
         _,lineage=require_reflection_c3_descriptor_v3(db,namespace=namespace,descriptor=descriptor,issuer=issuer)
         if lineage[0]=="birth" and (job.phase not in {"queued","running","waiting"} or cycle.stage=="completed"):
@@ -836,7 +870,7 @@ def _require_current_named_c3_descriptor_v3(db, *, namespace, descriptor, issuer
     from .d07_execution_v1 import read_current_d07_semantic_question_v1, D07RelationshipSemanticQuestionV2
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     from ..domains.d05.relationship_revision_v2 import InstalledRelationshipPolicyV2
-    semantic = None if descriptor.kind=="reflection" else read_current_d07_semantic_question_v1(db, issuer, namespace, descriptor.semantic_question_ref)
+    semantic = None if descriptor.kind in {"reflection","artifact_observation_self"} else read_current_d07_semantic_question_v1(db, issuer, namespace, descriptor.semantic_question_ref)
     if descriptor.kind == 'relationship':
         if type(semantic) is not D07RelationshipSemanticQuestionV2:
             raise ValueError('Relationship C3 has another actual prepared semantic kind')
@@ -888,13 +922,17 @@ def _require_current_named_c3_descriptor_v3(db, *, namespace, descriptor, issuer
         if row is None:
             raise ValueError('Relationship C3 plan member lacks its actual pre-call Graph CAS')
         receipt = _producer_json_loads_v3(row[0])
-        binding = receipt.get({'relationship':'relationship_c3','growth':'method_growth_c3','reflection':'reflection_c3'}[descriptor.kind])
+        binding = receipt.get({'relationship':'relationship_c3','growth':'method_growth_c3','reflection':'reflection_c3','artifact_observation_self':'artifact_observation_c3'}[descriptor.kind])
+        expected_binding={'cycle_ref':descriptor.cycle_ref.key.token,
+            'before_cycle_digest':descriptor.cycle_digest,'before_call_plan_digest':descriptor.call_plan_digest,
+            'call_id':descriptor.call_id,
+            ('reflection_request_digest'if descriptor.kind=='reflection'else'semantic_question_digest'):
+                descriptor.reflection_request_digest if descriptor.kind=='reflection'else descriptor.semantic_question_digest}
+        if descriptor.kind=='artifact_observation_self':
+            expected_binding.update(observation_basis_ref=descriptor.observation_basis_ref,
+                observation_basis_digest=descriptor.observation_basis_digest)
         if (receipt.get('phase') != 'execution_acquired' or receipt.get('prepared_digest') != descriptor.prepared_digest
-                or binding is None or binding != {'cycle_ref': descriptor.cycle_ref.key.token,
-                    'before_cycle_digest': descriptor.cycle_digest, 'before_call_plan_digest': descriptor.call_plan_digest,
-                    'call_id': descriptor.call_id,
-                    ('reflection_request_digest' if descriptor.kind=='reflection' else 'semantic_question_digest'):
-                        descriptor.reflection_request_digest if descriptor.kind=='reflection' else descriptor.semantic_question_digest}):
+                or binding is None or binding != expected_binding):
             raise ValueError('Relationship C3 pre-call checkpoint differs from its actual signed preparation')
     return job, cycle, head[0]
 
@@ -914,7 +952,11 @@ def register_current_named_c3_in_transaction_v2(db, *, prepared, issuer, now_utc
     attempt = ForegroundModelAttemptV1("C3", prepared.call_id, None, prepared.operation_id,
         prepared.reservation_digest, quote.parent_budget_lease_ref,
         quote.ceiling["input_tokens"], quote.ceiling["output_tokens"], "reserved")
-    register = register_foreground_model_attempt_v2 if type(observed) is ForegroundCallPlanV2 else register_foreground_model_attempt_v1
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    from .foreground_artifact_observation_plan_v3 import ForegroundCallPlanV3
+    if type(prepared)is D07ArtifactObservationPreparedV3:
+        attempt=_artifact_observation_attempt_from_prepared_v3(db,prepared=prepared,quote=quote,issuer=issuer)
+    register = register_foreground_model_attempt_v2 if type(observed) in {ForegroundCallPlanV2,ForegroundCallPlanV3} else register_foreground_model_attempt_v1
     plan = register(db, namespace=prepared.namespace, plan=observed, attempt=attempt, issuer=issuer,
         now_utc=now_utc, installed_bundle=installed_bundle, owner_guard=owner_guard)
     return job_graph_write(replace(job, continuation=plain_v1(replace(cycle, call_plan=plan)))), revision
@@ -932,7 +974,8 @@ def read_current_named_c3_attempt_v2(db, *, namespace, continuation, attempt, is
         raise ValueError("C3 attempt lacks one exact signed D07 preparation")
     prepared = read_prepared_d07_execution_v1(db, issuer, namespace, rows[0][0])
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
-    if type(prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2, D07ReflectionPreparedV3}:
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    if type(prepared) not in {D07RelationshipPreparedV2, D07MethodGrowthPreparedV2, D07ReflectionPreparedV3,D07ArtifactObservationPreparedV3}:
         raise TypeError("C3 actual producer is not a registered named preparation")
     _, actual_cycle, _ = require_current_named_c3_cycle_v2(db, namespace=namespace, prepared=prepared, issuer=issuer)
     if actual_cycle.c02_operation_id != continuation.c02_operation_id:
@@ -945,6 +988,8 @@ def read_current_named_c3_attempt_v2(db, *, namespace, continuation, attempt, is
         (quote.parent_budget_lease_ref, prepared.operation_id)).fetchone()
     base = ForegroundModelAttemptV1("C3", prepared.call_id, None, prepared.operation_id, prepared.reservation_digest,
         quote.parent_budget_lease_ref, quote.ceiling["input_tokens"], quote.ceiling["output_tokens"], "reserved")
+    if type(prepared)is D07ArtifactObservationPreparedV3:
+        base=_artifact_observation_attempt_from_prepared_v3(db,prepared=prepared,quote=quote,issuer=issuer)
     if (replace(attempt, state="reserved", terminal_ref=None) != base or quote.work_kind != "d07.cognition"
             or canonical_digest(quote) != prepared.quote_digest or reservation is None
             or reservation[0] != prepared.reservation_digest):
@@ -1008,3 +1053,21 @@ def read_current_relationship_c3_attempt_v2(db, *, namespace, continuation, atte
     if len(rows) != 1 or type(read_prepared_d07_execution_v1(db, issuer, namespace, rows[0][0])) is not D07RelationshipPreparedV2:
         raise TypeError("actual Relationship C3 producer required")
     return read_current_named_c3_attempt_v2(db, namespace=namespace, continuation=continuation, attempt=attempt, issuer=issuer)
+
+
+def _artifact_observation_attempt_from_prepared_v3(db,*,prepared,quote,issuer):
+    from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+    from .artifact_phase_observation_v1 import read_artifact_phase_observation_basis_v1
+    from .foreground_artifact_observation_plan_v3 import ForegroundArtifactObservationAttemptV3
+    if type(prepared)is not D07ArtifactObservationPreparedV3:
+        raise TypeError('actual dedicated Artifact observer prepared original required')
+    basis=read_artifact_phase_observation_basis_v1(db,namespace=prepared.namespace,
+        original_ref=prepared.observation_basis_ref,issuer=issuer)
+    if (basis is None or basis.digest!=prepared.observation_basis_digest
+            or quote.parent_budget_lease_ref!=basis.parent_budget_lease_ref):
+        raise ValueError('Artifact attempt lost its original signed basis and exact parent lease')
+    return ForegroundArtifactObservationAttemptV3('C3',prepared.call_id,None,prepared.operation_id,
+        prepared.reservation_digest,quote.parent_budget_lease_ref,
+        quote.ceiling['input_tokens'],quote.ceiling['output_tokens'],'reserved',
+        phase_selector=basis.request.selector,condition_id=basis.request.condition_id,
+        observation_basis_ref=basis.original_ref,observation_basis_digest=basis.digest)

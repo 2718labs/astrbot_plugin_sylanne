@@ -1,15 +1,15 @@
-"""Run with python -m sylanne3.demo. No external messages are sent."""
+"""Run with python -m rewrite.host_tests.legacy_fixture_v1.demo. No external messages are sent."""
 import asyncio
 import json
 from pathlib import Path
 import tempfile
 
-from .contracts import Event, Scope
+from sylanne3.contracts import Event, Scope
 from .delivery import RecordingTransport
 from .engine import Engine
-from .native import NativeKernel
+from sylanne3.native import NativeKernel
 from .scheduler import BoundedScheduler
-from .store import Store
+from sylanne3.store import Store
 
 
 async def main():

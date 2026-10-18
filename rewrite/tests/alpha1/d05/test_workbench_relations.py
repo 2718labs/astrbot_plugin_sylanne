@@ -151,9 +151,9 @@ def test_schema_migration_preserves_invalid_legacy_head_and_consumption_alias():
     key = AtomKey(Owner("relation", *ns.as_tuple, "entity:alice"), "d05.contribution", prior.key)
     snapshot = GraphSnapshot((GraphAtom(key, 3, old, False),
         GraphAtom(source, 1, SourceRecord("one", "synthetic codec material", "alice", "observed", "confirmed",
-            1.0, 2.0, "family:one", ("owner",), ("workbench_user_action",)).to_dict()),
+            1.0, 2.0, "family:one", ("owner",), ("audit",)).to_dict()),
         GraphAtom(access_key(*ns.as_tuple, "one"), 1, {"source_id": "one", "audiences": ["owner"],
-            "purposes": ["workbench_user_action"], "status": "active", "recorded_at": 2.0}),
+            "purposes": ["audit"], "status": "active", "recorded_at": 2.0}),
         GraphAtom(source_correction_head_key(ns, "one"), 0, {}, False)), (NamespaceEpoch(*ns.as_tuple, 3),))
     args = {"legacy_consumed_keys": (key.token,),
         "source_catalogue_hash": "6a05fc901a3c45696faaab63746a6bf795db79282c6be7fdc8bffb6c228a71d1"}
@@ -165,3 +165,53 @@ def test_schema_migration_preserves_invalid_legacy_head_and_consumption_alias():
     assert plan == translate_d05_current_heads_v2(snapshot, ns, (key.token,), **args)
     with pytest.raises(ValueError, match="catalogue"):
         translate_d05_current_heads_v2(snapshot, ns, (key.token,), source_catalogue_hash="f" * 64)
+
+
+@pytest.mark.parametrize("now,status", [(None,"unknown"),(10.0,"available"),(20.0,"stale")])
+def test_current_v2_estimate_uses_scoped_context_digest_and_real_time_boundary(now,status):
+    from dataclasses import replace
+    from sylanne3.domains.d05.relationship_revision_v2 import (
+        RelationshipScopeV2, DimensionEstimateV2, ESTIMATE_TYPE,
+    )
+    from sylanne3.domains.d01.production_operations_v1 import plain_v1
+    from sylanne3.graph_types import GraphVersion
+    from sylanne3.runtime_contracts import canonical_digest
+
+    ctx=replace(context(),trusted_now_utc=now)
+    subject=AtomKey(Owner("persona","bot","persona"),"d03.entity_anchor","entity:alice")
+    scope=RelationshipScopeV2(ctx.authority.namespace,GraphVersion(subject,2),None,
+        "work","installed:private-work-context","trust","dimension-schema:1")
+    current=DimensionEstimateV2(scope,0.25,0.6,"partial",(),(),(),(),(),
+        "checkpoint:1",(),(),0.0,"policy:1","a"*64,(),1.0,20.0,(),"current")
+    key=scope.key(ESTIMATE_TYPE)
+    row={"key":key.token,"type":ESTIMATE_TYPE,"name":key.name,"revision":1,"value":plain_v1(current)}
+    result=RelationshipProvider.project_workbench("relations",(row,),context=ctx)
+    dimension=result["relations"][0]["dimensions"][0]
+    assert dimension["context_id"]==canonical_digest((scope.relationship_domain,scope.context_ref))[:32]
+    assert dimension["availability"]==status
+    assert dimension["estimate"]==(0.25 if status=="available" else"unknown")
+    assert scope.context_ref not in repr(result)
+
+
+@pytest.mark.parametrize("source_purposes,access_purposes,status,correction,expected",[
+    (("audit",),("audit",),"active",0,True),
+    (("consolidation",),("audit",),"active",0,False),
+    (("audit",),("context",),"active",0,False),
+    (("audit",),("audit",),"withdrawn",0,False),
+    (("audit",),("audit",),"active",1,False),
+])
+def test_catalogue_migration_requires_audit_on_source_and_access(source_purposes,access_purposes,status,correction,expected):
+    from sylanne3.domains.d05.relationship import _migration_source_qualification_v2
+    from sylanne3.graph_types import GraphAtom,GraphSnapshot
+    from sylanne3.memory_types import SourceRecord,source_key,access_key
+    from sylanne3.domains.d06 import source_correction_head_key
+    ns=NamespaceId("bot","persona");source=source_key(*ns.as_tuple,"one")
+    record=SourceRecord("one","audit-only fixture","alice","observed","confirmed",1.0,2.0,
+        "family:one",("owner",),source_purposes)
+    snapshot=GraphSnapshot((GraphAtom(source,1,record.to_dict()),
+        GraphAtom(access_key(*ns.as_tuple,"one"),1,{"source_id":"one","audiences":["owner"],
+            "purposes":list(access_purposes),"status":status,"recorded_at":2.0}),
+        GraphAtom(source_correction_head_key(ns,"one"),correction,{},False)),(NamespaceEpoch(*ns.as_tuple,3),))
+    qualified,reads=_migration_source_qualification_v2(snapshot,ns,(source.token,))
+    assert qualified is expected
+    assert set(reads)=={source,access_key(*ns.as_tuple,"one"),source_correction_head_key(ns,"one")}

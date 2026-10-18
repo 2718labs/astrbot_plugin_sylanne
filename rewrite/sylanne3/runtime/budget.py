@@ -261,6 +261,7 @@ def _lease_from_row(row) -> BudgetLease:
 
 
 def get_budget_lease(db, lease_id: str) -> BudgetLease:
+    from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     _identifier(lease_id, "lease_id")
     from ..authority_service.foreground_mesh_source_read_v3 import read_bound_foreground_mesh_budget_v3
     mesh, lease = read_bound_foreground_mesh_budget_v3(db,lease_id)
@@ -284,7 +285,7 @@ def get_budget_lease(db, lease_id: str) -> BudgetLease:
     row=model_reply_scope_point_v3(db,table='runtime_budget_leases',
         columns=('lease_id','parent_id','bot_id','persona_id','currency','limits_json','used_json',
             'reserved_json','unconfirmed_json','version','state'),
-        key_columns=('lease_id',),key=(lease_id,),legacy_reader=lambda:db.execute(
+        key_columns=('lease_id',),key=(lease_id,),legacy_reader=lambda:_artifact_receipt_sql_v1(db,
             "SELECT lease_id,parent_id,bot_id,persona_id,currency,limits_json,used_json,"
             "reserved_json,unconfirmed_json,version,state FROM runtime_budget_leases "
             "WHERE lease_id=?", (lease_id,)).fetchone())
