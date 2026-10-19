@@ -111,6 +111,7 @@ class PinnedCurrentModelEgressGraphVerifier:
                 raise TypeError("artifact draft verifier requires its actual installed bundle")
         self._artifact_draft_bundle = artifact_draft_bundle
         self._artifact_model_reader_v3 = None
+        self._d13_paid_reader_v3 = None
         self._owner_stop_reply_service_v1 = None
 
     def install_owner_stop_reply_service_v1(self, service):
@@ -373,6 +374,17 @@ class PinnedCurrentModelEgressGraphVerifier:
         if type(service) is not InstalledD10ContactPolicyServiceV1 or self._contact_policy_service is not None:
             raise ValueError("actual contact policy service must be installed exactly once")
         self._contact_policy_service = service
+
+    def install_d13_paid_reader_v3(self,reader):
+        from .d13_authority_model_source_v3 import InstalledD13AuthorityModelReaderV3
+        if (type(reader)is not InstalledD13AuthorityModelReaderV3 or self._d13_paid_reader_v3 is not None
+                or reader.issuer is not self._issuer or reader.bundle is not self._artifact_draft_bundle
+                or reader.owner_storage.graph_path!=self._path
+                or reader.model_service._graph_verifier is not self
+                or reader.worker_service._graph._d13_paid_reader_v3 is not None):
+            raise ValueError("D13 Source reader requires its actual installed same-Graph model/result services")
+        self._d13_paid_reader_v3=reader
+        reader.worker_service._graph._d13_paid_reader_v3=reader
 
     def install_artifact_model_reader_v3(self,reader):
         from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
@@ -689,11 +701,15 @@ class PinnedCurrentModelEgressGraphVerifier:
             freeze_d13_precompression_request_v1,
         )
         from .current_d13_paid_model_graph import _plan, _window, _canonical
-        frozen_data = _canonical(current.original.frozen_json)
-        frozen = freeze_d13_precompression_request_v1(
-            _window(frozen_data["window"]), _plan(frozen_data["plan"]),
-            D13PrecompressionInstallationV1(**frozen_data["installation"]),
-        )
+        from .d13_authority_model_source_v3 import require_d13_current_frozen_v3
+        frozen = require_d13_current_frozen_v3(db,current)
+        actual_frozen=frozen is not None
+        if frozen is None:
+            frozen_data = _canonical(current.original.frozen_json)
+            frozen = freeze_d13_precompression_request_v1(
+                _window(frozen_data["window"]), _plan(frozen_data["plan"]),
+                D13PrecompressionInstallationV1(**frozen_data["installation"]),
+            )
         request = current.request
         guard = request.envelope.version_guard
         read_versions = {item.key.token: item.revision
@@ -711,13 +727,18 @@ class PinnedCurrentModelEgressGraphVerifier:
                        for item in guard.query_epochs)):
             return False
         for token, revision in read_versions.items():
-            row = _authority_point_v3(db,table='graph_atoms',columns=('revision', 'valid'),key_columns=('token',),key=tuple((token,)),legacy_reader=lambda: db.execute(
-                "SELECT revision,valid FROM graph_atoms WHERE token=?",
-                (token,),
-            ).fetchone())
+            if actual_frozen:
+                from .current_authority_graph_read_v3 import _authority_attachment_owner_v3
+                head=_authority_attachment_owner_v3(db).heads.get(token)
+                row=None if head is None else tuple(head[:2])
+            else:
+                row = _authority_point_v3(db,table='graph_atoms',columns=('revision', 'valid'),key_columns=('token',),key=tuple((token,)),legacy_reader=lambda: db.execute(
+                    "SELECT revision,valid FROM graph_atoms WHERE token=?",
+                    (token,),
+                ).fetchone())
             if row != ((revision, 1) if revision else None):
                 return False
-        return (d13_model_request_shape_valid_v1(request, frozen)
+        return ((actual_frozen or d13_model_request_shape_valid_v1(request, frozen))
                 and request.digest == intent.request_digest
                 and request.call_id == binding.call_id
                 and request.identity.operation_id == binding.original_operation_id

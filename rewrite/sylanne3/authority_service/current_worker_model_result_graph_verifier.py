@@ -65,6 +65,7 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
             raise ValueError("pinned graph database is not a file")
         self._clock = trusted_now_utc
         self._issuer = d11_issuer
+        self._d13_paid_reader_v3 = None
 
     def current(self, request: WorkerModelResultReadRequestV1,
                 intent: ModelEgressIntentV1, permit: FencePermitV2) -> bool:
@@ -82,6 +83,10 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                     request.call_id, request.job_id, request.model_request_digest,
                     request.acquire_operation_id, request.original_operation_id)):
             return False
+        if request.purpose=='d13_precompress_paid':
+            from .d13_authority_result_source_v3 import d13_result_current_on_bound_source_v3
+            actual=d13_result_current_on_bound_source_v3(self,request,intent,permit)
+            if actual is not None:return actual
         try:
             now = self._clock()
             if type(now) not in (int, float) or not math.isfinite(now):

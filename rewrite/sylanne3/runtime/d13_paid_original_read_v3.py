@@ -746,7 +746,9 @@ def finish_d13_paid_original_read_v3(graph,work,error):
 
 @contextmanager
 def bind_d13_paid_window_reader_v3(reader):
-    if (type(reader)is not D13PaidOriginalReadWorkV3 or reader not in _READERS
+    from ..authority_service.d13_authority_model_source_v3 import require_d13_authority_window_reader_v3
+    authority=require_d13_authority_window_reader_v3(reader)
+    if not authority and (type(reader)is not D13PaidOriginalReadWorkV3 or reader not in _READERS
             or not reader.qualified or reader.phase!="window_body" or reader.window_body is None):
         raise AuthorityUnavailable("D13 window preparation needs its actual all-Source gated Work")
     reader.require_current_v3()

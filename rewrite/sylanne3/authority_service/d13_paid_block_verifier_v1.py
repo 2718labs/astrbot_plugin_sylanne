@@ -270,9 +270,12 @@ class PreparedD13PaidRequestEOFV3:
             raise ValueError('actual independently issued D13 Paid EOF reader required')
         work._actual()
         from ..runtime.installed_d13_natural_frame_v6 import require_authority_derived_blocks_reader_v6
-        reader=require_authority_derived_blocks_reader_v6(work)
-        if reader.verifier is not verifier or reader.active_plan is not plan or reader.collection.window is not window:
-            raise ValueError('D13 Paid original must be prepared for its actual current candidate')
+        from .d13_authority_model_source_v3 import require_d13_authority_paid_eof_v3
+        authority=require_d13_authority_paid_eof_v3(work,verifier,plan,window)
+        if not authority:
+            reader=require_authority_derived_blocks_reader_v6(work)
+            if reader.verifier is not verifier or reader.active_plan is not plan or reader.collection.window is not window:
+                raise ValueError('D13 Paid original must be prepared for its actual current candidate')
         self.work,self.verifier,self.plan,self.window=work,verifier,plan,window
         self.operation,self.scope=work.operation,work.scope
         self.phase='columns';self.complete=False;self.missing=False

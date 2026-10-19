@@ -237,7 +237,7 @@ class M1PhaseFixtureInstallationV2:
 
     @property
     def provider_configuration(self):
-        from sylanne3.model_broker.artifact_phase_count_v1 import FIXTURE_PROVIDER, FIXTURE_MODEL
+        from installed_mock_model_support_v4 import PROVIDER as FIXTURE_PROVIDER, MODEL as FIXTURE_MODEL
         return {"id": FIXTURE_PROVIDER, "type": "openai_chat_completion", "model": FIXTURE_MODEL}
 
     @property
@@ -1419,8 +1419,8 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             installed_provider.provider_config = provider_config
             installed_provider.model_name = provider_config["model"]
             installed_provider.client = sdk
-            from sylanne3.host.authority_profile import load_artifact_phase_local_fixture_bundle_v1
-            installed_bundle, phase_qualification = await load_artifact_phase_local_fixture_bundle_v1(
+            from installed_mock_model_support_v4 import load_installed_mock_bundle_v4
+            installed_bundle, phase_qualification = await load_installed_mock_bundle_v4(
                 phase_initial.profile_id, profile_root=phase_initial.profile_root,
                 package_root=phase_initial.package_root, data_dir=phase_initial.data_dir,
                 provider_client=sdk, mock_transport=model_http_client._transport)
@@ -1432,18 +1432,13 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             workflows = installed_bundle.model_workflows
             ingress_clock, encoding = installed_bundle.ingress_clock, installed_bundle.ingress_encoding
             authority_client, client_grant = phase_qualification.authority_client, phase_qualification.client_grant
-            # A dedicated fixture verifier/service is registered before C1.
-            # Its adapter invokes the original method in this authenticated task's scope.
+            # Compose the actual installed verifier/service before C1; no fixture scope adapter.
             original_model_service = model_service
             model_verifier = PinnedCurrentModelEgressGraphVerifier(
                 graph_path, d11_issuer=d11, trusted_now_utc=time.time,
                 trusted_paired_clock=paired_fixture_clock, artifact_draft_bundle=installed_bundle)
             model_service = AuthorityV2ModelEgressService(model_store, protected,
                 graph_verifier=model_verifier, admin_model_policy=workflows)
-            from m1_artifact_draft_acceptance_support_v1 import _bind_m1_phase_verifier_scope_v2
-            _bind_m1_phase_verifier_scope_v2(verifier=model_verifier, service=model_service, server=server,
-                namespace=authority_namespace, qualification=phase_qualification,
-                graph_db_path=graph_path, issuer=d11)
             assert_prebusiness_model_family_v1(server, namespace=authority_namespace,
                 original=original_model_service, selected=model_service)
             server._v2_model_egress[authority_namespace] = model_service
@@ -1470,14 +1465,14 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
         phase_model_runtime = None
         if phase_initial is not None:
             from sylanne3.runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
-            from sylanne3.host.authority_profile import bind_artifact_phase_local_fixture_components_v1
+            from installed_mock_model_support_v4 import check_installed_mock_components_v4
             phase_worker = await get_http_worker()
             phase_model_runtime = InstalledArtifactDraftModelRuntimeV1(graph=graph, bootstrap=bootstrap,
                 bundle=installed_bundle, worker=phase_worker, authority_client=authority_client,
                 client_grant=client_grant, context=model_context, owner_loop=asyncio.get_running_loop())
             await phase_worker.call(lambda current_graph:
                 current_graph.install_artifact_draft_model_runtime_v1(bootstrap, phase_model_runtime))
-            await bind_artifact_phase_local_fixture_components_v1(phase_qualification,
+            await check_installed_mock_components_v4(phase_qualification,
                 graph=graph, bootstrap=bootstrap, model_runtime=phase_model_runtime)
         if after_initial_self_registration is not None:
             # The actual Core Self registration and protected installed clients exist.
@@ -1783,8 +1778,8 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
                 assert previous_identity == current_identity
                 client_grant = current_grant
             else:
-                from sylanne3.host.authority_profile import require_artifact_phase_fixture_qualification_v1
-                current = require_artifact_phase_fixture_qualification_v1(installed_bundle, client_grant=client_grant)
+                from installed_mock_model_support_v4 import require_installed_mock_binding_v4
+                current = require_installed_mock_binding_v4(installed_bundle, client_grant=client_grant)
                 assert current is phase_qualification and client_grant is current.client_grant
             graph._GraphCoordinator__self_identity_port = InstalledCurrentSelfIdentityPort(
                 client=authority_client, bundle=installed_bundle, grant=client_grant,
@@ -2344,8 +2339,8 @@ async def test_paired_reply_assembly_uses_real_c02_and_reply_admission(
             reverse_listener.close()
             await reverse_listener.wait_closed()
         if phase_qualification is not None:
-            from sylanne3.host.authority_profile import revoke_artifact_phase_local_fixture_qualification_v1
-            revoke_artifact_phase_local_fixture_qualification_v1(phase_qualification)
+            from installed_mock_model_support_v4 import revoke_installed_mock_binding_v4
+            revoke_installed_mock_binding_v4(phase_qualification)
             await phase_qualification.authority_client._transport.close()
         if model_http_client is not None:
             await model_http_client.aclose()

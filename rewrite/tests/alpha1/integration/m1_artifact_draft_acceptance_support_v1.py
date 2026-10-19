@@ -92,10 +92,7 @@ def load_m1_phase_fixture_installation_v2(setup_file):
     import sylanne3.host.authority_profile as profile
     from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
     from sylanne3.authority_service.linux_installation_security_v1 import opened_installed_file_v1
-    from rewrite.host_tests.alpha1.artifact_phase_counter_fixture_v1 import RULE as FIXTURE_RULE
-    from sylanne3.model_broker.artifact_phase_count_v1 import (
-        artifact_phase_counter_policy_from_payload_v1, FIXTURE_PROVIDER, FIXTURE_MODEL,
-    )
+    from installed_mock_model_support_v4 import PROVIDER as FIXTURE_PROVIDER, MODEL as FIXTURE_MODEL
     from sylanne3.model_broker.first_ingress_encoding import (FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION,
         FIRST_INGRESS_DEPENDENCY_ENCODING_TEMPLATE_VERSION)
     from sylanne3.model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
@@ -116,35 +113,11 @@ def load_m1_phase_fixture_installation_v2(setup_file):
     if any(not path.is_absolute() or path.resolve(strict=True) != path for path in paths.values()):
         raise ValueError("phase fixture setup requires actual canonical installation paths")
     assert paths["authority_store"].parent == paths["data_dir"]
-    directory = paths["profile_root"] / setup["profile_id"]
-    with profile._opened_profile(directory, "Linux", signing_key=True) as files:
-        payload = profile._read_profile_json(files["profile.json"])
-        counter = artifact_phase_counter_policy_from_payload_v1(payload["artifact_phase_counter"], allow_local_fixture=True)
-        initial = {key: value for key, value in payload.items()
-            if key not in {"artifact_phase_counter", "artifact_phase_fixture_observer"}}
-        policy = profile._policy_from_payload(initial)
-        tls = profile._profile_from_payload(setup["profile_id"], directory, initial,
-            profile._prepared_ssl_context(files, "Linux"))
-        d11_key = profile._checked_signing_key(profile._read_fd_bounded(files["d11-signing.key"], 32), "D11")
-        d02_key = profile._checked_signing_key(profile._read_fd_bounded(files["d02-signing.key"], 32), "D02")
-    ordinary = {
-        "ingress_clock": "_ingress_clock_from_payload", "ingress_encoding": "_ingress_encoding_from_payload",
-        "model_workflows": "_model_workflows_from_payload", "foreground": "_foreground_from_payload",
-        "artifact_draft": "_artifact_draft_from_payload", "private_reply_dispatch": "_private_reply_dispatch_from_payload",
-        "provider_billing_policy_v1": "_provider_billing_policy_from_payload_v1",
-        "d03_arrival": "_d03_arrival_from_payload", "d04_encoding_baseline": "_d04_baseline_from_payload",
-        "d06_first_ingress_c02": "_d06_c02_from_payload", "d03_self_identity_projection": "_d03_projection_from_payload",
-        "d06_private_reply_source": "_d06_private_reply_source_from_payload", "d07_attention": "_d07_attention_from_payload",
-        "d06_recall": "_d06_recall_from_payload",
-    }
-    if initial.get("method_measurement_policy") is not None:
-        ordinary["method_measurement_policy"] = "_method_measurement_policy_from_payload_v1"
-    bundle = profile.AdminInstallationBundle(tls, policy, d11_key, d02_key,
-        **{name: getattr(profile, parser)(initial) for name, parser in ordinary.items()},
-        d13_paid_precompression=profile._d13_paid_precompression_from_payload(initial,policy),
-        d04_semantic_drive=profile._d04_semantic_drive_from_payload(initial,policy),
-        d04_joint_numeric=profile._d04_joint_numeric_from_payload(initial,policy),
-        life_d04_before_capture_policy=profile._life_d04_before_capture_policy_from_payload_v1(initial,policy))
+    bundle=profile._load_installation_bundle_from_root(setup["profile_id"],paths["profile_root"],"Linux")
+    policy=bundle.installation_policy
+    counter=bundle.artifact_phase_counter
+    if counter is None:
+        raise ValueError("current protected Mock installation requires its formal counter assets")
     with opened_installed_file_v1(paths["billing_signing_key"], private=True, allowed_gid=os.getegid()) as descriptor:
         key = Ed25519PrivateKey.from_private_bytes(profile._read_fd_bounded(descriptor, 32))
     for name in ("server_certificate", "server_private_key", "administrator_certificate", "administrator_private_key"):
@@ -159,7 +132,7 @@ def load_m1_phase_fixture_installation_v2(setup_file):
     from sylanne3.host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
     assert type(bundle.artifact_draft) in {profile.AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}
     assert type(bundle.artifact_draft.standing_scope) is profile.AdminArtifactStandingScopeV3
-    assert counter.source_scope == "LOCAL_FIXTURE"
+    assert counter.source_scope == "production"
     assert (counter.namespace, counter.installation_id, counter.manifest_digest, counter.profile_id) == (
         policy.namespace, policy.installation_id, policy.manifest_digest, setup["profile_id"])
     assert (counter.provider_id, counter.model_id, counter.provider_config_digest) == (
@@ -287,58 +260,13 @@ def initial_m1_configuration_builder_v1(namespace, authority_namespace,
     return M1InitialInstallationFixtureV1(selected, foreground, draft, dispatch, limits, maximum, billing, key)
 
 
-_M1_PHASE_VERIFIER_ISSUER_V2 = object()
 
 
-class _M1PhaseVerifierInvocationV2:
-    """Task-local scope around one independently composed original verifier."""
-    def __init__(self, token, *, verifier, service, server, namespace, qualification, graph_db_path, issuer):
-        from sylanne3.authority_service.current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
-        from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
-        assert token is _M1_PHASE_VERIFIER_ISSUER_V2
-        assert type(verifier) is PinnedCurrentModelEgressGraphVerifier
-        assert type(service) is AuthorityV2ModelEgressService and service._graph_verifier is verifier
-        original = verifier._current
-        assert original.__self__ is verifier and original.__func__ is PinnedCurrentModelEgressGraphVerifier._current
-        assert verifier._path == Path(graph_db_path).resolve(strict=True) and verifier._issuer is issuer
-        assert verifier._artifact_draft_bundle is qualification.bundle
-        self.verifier, self.service, self.server = verifier, service, server
-        self.namespace, self.qualification, self.original = namespace, qualification, original
-        self.path, self.issuer = verifier._path, issuer
-
-    def __call__(self, intent, *, include_binding, source_location=None, location_observation=None,
-            model_service=None, credential=None, subject=None, permit=None):
-        from sylanne3.authority_service.current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
-        from sylanne3.authority_service.v2_model_egress_contract import ModelEgressIntentV1
-        from sylanne3.host.authority_profile import (
-            require_artifact_phase_fixture_qualification_v1, artifact_phase_local_fixture_scope_v1,
-        )
-        q = self.qualification
-        require_artifact_phase_fixture_qualification_v1(q.bundle, client_grant=q.client_grant)
-        assert type(intent) is ModelEgressIntentV1
-        assert self.verifier._current is self and self.original.__self__ is self.verifier
-        assert self.original.__func__ is PinnedCurrentModelEgressGraphVerifier._current
-        assert self.verifier._path == self.path and self.verifier._issuer is self.issuer
-        assert self.verifier._artifact_draft_bundle is q.bundle
-        assert self.service._graph_verifier is self.verifier
-        assert self.server._v2_model_egress[self.namespace] is self.service
-        assert self.service._store._db is self.server._core._db and self.service._store._lock is self.server._core._lock
-        assert (intent.authority_id, intent.namespace, intent.subject) == (
-            q.client_grant.authority_id, self.namespace, q.client_grant.subject)
-        assert (intent.provider_id, intent.model_id, intent.provider_config_digest) == (
-            q.counter.provider_id, q.counter.model_id, q.counter.provider_config_digest)
-        with artifact_phase_local_fixture_scope_v1(q):
-            return self.original(intent, include_binding=include_binding, source_location=source_location,
-                location_observation=location_observation, model_service=model_service,
-                credential=credential, subject=subject, permit=permit)
 
 
-def _bind_m1_phase_verifier_scope_v2(*, verifier, service, server, namespace, qualification, graph_db_path, issuer):
-    adapter = _M1PhaseVerifierInvocationV2(_M1_PHASE_VERIFIER_ISSUER_V2, verifier=verifier,
-        service=service, server=server, namespace=namespace, qualification=qualification,
-        graph_db_path=graph_db_path, issuer=issuer)
-    verifier._current = adapter
-    return adapter
+
+
+
 
 
 def build_m1_phase_mock_client_v2(configuration,ingress_text,*,provider_cache=None,positive_recall=False):
@@ -347,6 +275,9 @@ def build_m1_phase_mock_client_v2(configuration,ingress_text,*,provider_cache=No
     from openai import AsyncOpenAI
     from sylanne3.model_broker.artifact_draft_v1 import INPUT_SCHEMA_V2, OUTPUT_SCHEMA_V2
     from sylanne3.model_broker.natural_reply_history_v4 import INPUT_SCHEMA_V5
+    from sylanne3.model_broker.natural_reply_history_v6 import INPUT_SCHEMA as NATURAL_INPUT_V6
+    from sylanne3.model_broker.natural_reply_history_v7 import INPUT_SCHEMA as NATURAL_INPUT_V7
+    from sylanne3.model_broker.d04_appraisal import INPUT_SCHEMA as APPRAISAL_INPUT,OUTPUT_SCHEMA as APPRAISAL_OUTPUT
     from sylanne3.model_broker.natural_review import INPUT_SCHEMA_V2 as REVIEW_INPUT_SCHEMA_V2
     from sylanne3.model_broker.d07_cognition_v1 import INPUT_SCHEMA as COGNITION_INPUT_SCHEMA, OUTPUT_SCHEMA as COGNITION_OUTPUT_SCHEMA
     calls = []
@@ -372,6 +303,12 @@ def build_m1_phase_mock_client_v2(configuration,ingress_text,*,provider_cache=No
             content=json.loads(mode['content'])
             assert content['schema']==LIFE_CONTENT_OUTPUT_SCHEMA and content['occurrence_digest']==payload['occurrence_digest']
             encoded=mode['content']
+        elif payload.get("schema")==APPRAISAL_INPUT:
+            candidate=json.loads(mode["content"])
+            assert candidate["schema"]==APPRAISAL_OUTPUT
+            # An explicitly selected untrusted response for actual C2 or Numeric;
+            # production parsing/admission retains every input and Source binding.
+            encoded=mode["content"]
         elif payload["schema"] == INPUT_SCHEMA_V2:
             frozen = payload["input"]
             kind = frozen["selector"]["phase_kind"]
@@ -424,7 +361,9 @@ def build_m1_phase_mock_client_v2(configuration,ingress_text,*,provider_cache=No
                     "qualification": "subjective", "stance": "support", "subjective_conviction": 0.5,
                     "evidence_status": "supported"}], "unknowns": [], "stop_reason": "bounded_segment_complete"},
                 ensure_ascii=False)
-        elif payload["schema"] == INPUT_SCHEMA_V5:
+        elif payload["schema"] in {INPUT_SCHEMA_V5,NATURAL_INPUT_V6,NATURAL_INPUT_V7}:
+            assert configuration.workflows.natural_generation is not None
+            assert payload["schema"]==configuration.workflows.natural_generation.template_version
             plan = payload["expression_plan"]
             basis = payload["qualified_units"][0]
             assert "statement" in plan["allowed_speech_acts"]
@@ -476,9 +415,11 @@ def build_m1_phase_mock_client_v2(configuration,ingress_text,*,provider_cache=No
                         "counter_spans": [], "meaningful_unknowns": []})
             encoded = json.dumps(current, ensure_ascii=False)
         # Explicit finite local endpoint accounting, never a vendor token claim.
-        prompt_tokens = sum(3 + len(message["content"]) for message in messages) + 3
-        assert all(all(ord(char) in (9, 10, 13) or 32 <= ord(char) <= 126
-            for char in message["content"]) for message in messages)
+        # This fresh declared Mock model uses UTF8/8 message-input units. It is
+        # not a vendor-token claim, and metadata is outside its model input.
+        assert 2<=len(messages)<=3 and messages[0]["role"]=="system"
+        assert all(m["role"]in{"system","user"}for m in messages)
+        prompt_tokens=3+sum(3+(len(m["content"].encode("utf8"))+7)//8 for m in messages)
         completion_tokens = 5
         calls.append((body["metadata"]["sylanne_call_id"], body["metadata"]["sylanne_request_digest"]))
         response = httpx.Response(200, json={"id": "finite-phase-response:" + str(len(calls)),
@@ -1511,17 +1452,18 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
     from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
     from sylanne3.domains.d01.production_operations_v1 import plain_v1
     from sylanne3.authority_service import AuthorityServiceCore
-    from rewrite.host_tests.alpha1.artifact_phase_counter_fixture_v1 import RULE as FIXTURE_RULE
+    from installed_mock_model_support_v4 import (RULE as FIXTURE_RULE, PROVIDER as FIXTURE_PROVIDER,
+        MODEL as FIXTURE_MODEL, RULE_ID as FIXTURE_RULE_ID, digest as fixture_rule_digest)
     from sylanne3.model_broker.artifact_phase_count_v1 import (
-        ArtifactPhaseCountPolicyV1, FIXTURE_PROVIDER, FIXTURE_MODEL,
-        FIXTURE_RULE_ID, FIXTURE_RULE_DIGEST)
+        ArtifactPhaseCountPolicyV1)
+    FIXTURE_RULE_DIGEST=fixture_rule_digest(FIXTURE_RULE)
     from sylanne3.authority_service.artifact_phase_counter_v1 import artifact_phase_applicability_wire_v1
     from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_TASK_ENCODING_TEMPLATE_VERSION
     from sylanne3.model_broker.reply_language import REPLY_TEMPLATE_VERSION
     from sylanne3.model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
     from sylanne3.model_broker.artifact_draft_v1 import TEMPLATE_VERSION_V2
     from m1_artifact_draft_acceptance_support_v1 import (
-        initial_m1_configuration_builder_v1, m1_phase_fixture_observer_asset_payload_v1,
+        initial_m1_configuration_builder_v1,
         M1_PHASE_TASK_TEXT_V2, M1_PHASE_FULL_TEXT_V2)
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -1701,7 +1643,7 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         method_refs=(FULL_DRAFT_METHOD_V1, TONE_SAMPLE_METHOD_V1)
             if paired_method_targets else (FULL_DRAFT_METHOD_V1,),
         rubric_scope=("length", "tone", "task_semantics"),
-        observer_scope=(profile.STANDING_OBJECTIVE_OBSERVER_V2, str(root / "observer.json")),
+        observer_scope=(profile.STANDING_OBJECTIVE_OBSERVER_V2,),
         self_actor_ref="entity:self-reply",
         approval_original_ref="artifact-standing-approval:initial-declaration")
     standing = replace(standing, approval_original_ref=profile.artifact_standing_scope_approval_ref_v2(
@@ -1793,18 +1735,18 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption()),0o640)
     source = engineering/"host_tests/alpha1/artifact_phase_counter_fixture_v1.py"
     program_text = source.read_text(encoding="utf-8")
-    old = 'PRIVATE_KEY = hashlib.sha256(b"sylanne.LOCAL_FIXTURE.phase-count-only.v1").digest()'
+    old = 'MOCK_V3_PRIVATE_KEY = hashlib.sha256(b"sylanne.test.mock.artifact-v3.counter-only.NOT_VENDOR").digest()'
     assert program_text.count(old) == 1
     program_text = "#!"+sys.executable+"\n"+program_text.split("\n",1)[1]
     program_text = program_text.replace(old,
-        "PRIVATE_KEY = __import__('pathlib').Path("+repr(str(counter_key_path))+").read_bytes()",1)
+        "MOCK_V3_PRIVATE_KEY = __import__('pathlib').Path("+repr(str(counter_key_path))+").read_bytes()",1)
     program = root/"counter"
     program_digest = protected(program,program_text.encode("utf-8"),0o755)
     tokenizer = root/"tokenizer.json"
     tokenizer_digest = protected(tokenizer,canonical_serialize(FIXTURE_RULE).encode("utf-8"))
     applicability = root/"applicability.json"
-    counter = ArtifactPhaseCountPolicyV1("LOCAL_FIXTURE",namespace,installation_id,manifest_digest,
-        "reply",FIXTURE_PROVIDER,FIXTURE_MODEL,"1",config_digest,TEMPLATE_VERSION_V2,
+    counter = ArtifactPhaseCountPolicyV1("production",namespace,installation_id,manifest_digest,
+        "reply",FIXTURE_PROVIDER,FIXTURE_MODEL,"mock-only-v1",config_digest,TEMPLATE_VERSION_V2,
         "fixture:m1-phase-counter",1,str(program),program_digest,
         counter_key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw).hex(),
         str(tokenizer),tokenizer_digest,str(applicability),"0"*64,FIXTURE_RULE_ID,FIXTURE_RULE_DIGEST,10)
@@ -1812,13 +1754,6 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         canonical_serialize(artifact_phase_applicability_wire_v1(counter)).encode("utf-8"))
     counter = replace(counter,applicability_sha256=applicability_digest)
     payload["artifact_phase_counter"] = plain_v1(counter)
-    observer_id = "fixture:m1-phase-observer"
-    observer = root/"observer.json"
-    observer_digest = protected(observer,canonical_serialize(
-        m1_phase_fixture_observer_asset_payload_v1(observer_id, method_dependency=method_dependency, paired_method_targets=paired_method_targets)).encode("utf-8"))
-    payload["artifact_phase_fixture_observer"] = {
-        "schema":"sylanne.artifact-phase-fixture-observer-installation.v1","source_scope":"LOCAL_FIXTURE",
-        "observer_id":observer_id,"observer_version":1,"asset_ref":str(observer),"asset_sha256":observer_digest}
     if beta1_node_template is not None:
         payload.update(beta1_profile_policies)
         payload["life_d04_before_capture_policy"]=dict(namespace=plain_v1(namespace),
@@ -1906,7 +1841,7 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
                 for name,value in beta1_profile_policies.items()):
             raise ValueError("post-create protected profile changed an original policy commitment")
         from sylanne3.model_broker.artifact_phase_count_v1 import artifact_phase_counter_policy_from_payload_v1
-        bound_counter=artifact_phase_counter_policy_from_payload_v1(bound_payload["artifact_phase_counter"],allow_local_fixture=True)
+        bound_counter=artifact_phase_counter_policy_from_payload_v1(bound_payload["artifact_phase_counter"])
         if bound_counter!=counter:raise ValueError("post-create protected counter commitment changed")
         phase=bound_bundle.artifact_draft.phase_model_workflow
         if (counter.namespace,counter.installation_id,counter.manifest_digest,counter.profile_id,
@@ -2192,7 +2127,7 @@ def _validate_beta1_profile_policy_sections_v3(payload,context):
         if any(amount>context.root_grant.max_ceiling.get(name,0)
                 or amount>context.root_lease.limits.get(name,0)for name,amount in phase.quote_ceiling.items()):
             raise ValueError("original phase workflow exceeds Root quote/total budget")
-    from sylanne3.model_broker.artifact_phase_count_v1 import FIXTURE_PROVIDER,FIXTURE_MODEL
+    from installed_mock_model_support_v4 import PROVIDER as FIXTURE_PROVIDER,MODEL as FIXTURE_MODEL
     configuration={"id":FIXTURE_PROVIDER,"type":"openai_chat_completion","model":FIXTURE_MODEL}
     expected_model=(FIXTURE_PROVIDER,FIXTURE_MODEL,canonical_digest(configuration))
     required=(workflows.encode,workflows.d07_cognition,workflows.artifact_draft,

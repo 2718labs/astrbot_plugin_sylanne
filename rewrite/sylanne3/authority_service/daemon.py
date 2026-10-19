@@ -953,6 +953,15 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                 server._current_named_joint_binding_v1[(namespace, control.installation_id)] = InstalledCurrentNamedJointBindingV1(
                     self_identity_service=self_identity, budget_issuer=offline_installation.d11_issuer,
                     clock_provider=config.clock_provider, installed_bundle=offline_bundle, package_root=offline_installation.package_root)
+            if offline_bundle is not None and offline_bundle.d13_paid_precompression is not None:
+                from .d13_authority_model_source_v3 import InstalledD13AuthorityModelReaderV3
+                model=server._v2_model_egress.get(namespace)
+                worker=server._v2_worker_model_result_reads.get(namespace)
+                if model is None or worker is None:
+                    raise AuthorityUnavailable("D13 Source reader lacks its actual paired model/result services")
+                d13_reader=InstalledD13AuthorityModelReaderV3(owner_storage=storage_owner,bundle=offline_bundle,
+                    issuer=offline_installation.d11_issuer,model_service=model,worker_service=worker)
+                model._graph_verifier.install_d13_paid_reader_v3(d13_reader)
             if offline_bundle is not None and offline_bundle.artifact_draft is not None:
                 from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
                 model=server._v2_model_egress.get(namespace)

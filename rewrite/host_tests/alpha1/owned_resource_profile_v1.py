@@ -207,7 +207,7 @@ METRICS = ("cgroup.events", "memory.current", "memory.peak", "memory.events",
            "cpu.stat", "cpu.pressure", "memory.pressure")
 
 
-BETA1_CURRENT_SUITE_KINDS=frozenset({"numeric","d13_full"})
+BETA1_CURRENT_SUITE_KINDS=frozenset({"numeric","numeric_positive","numeric_authorization_groups","numeric_registration","d13_full"})
 BETA1_PACKAGE_NAME="astrbot_plugin_sylanne-3.0.0-beta1-linux-x86_64-glibc-beta1-candidate.zip"
 
 

@@ -63,6 +63,25 @@ class _RootCensusChannelV3:
         raw=self.peer.recv(65537)
         _require(raw and len(raw)<=65536,'Root phase channel ended before release')
         request=json.loads(raw)
+        if request.get('schema')=='sylanne.test.beta1.root-forensic-request.v4':
+            _require(set(request)=={'schema','command','phase','setup_sha256','manifest_sha256','graph_path','selector'}
+                and request['command']=='snapshot_metadata','closed Root forensic request required')
+            from rewrite.tests.alpha1.integration.beta1_root_forensic_channel_v4 import observe_root_fixture_metadata_v4
+            try:
+                answer=observe_root_fixture_metadata_v4(self,request,raw)
+            except BaseException as error:
+                import traceback
+                target=Path(self.spec.evidence_directory)/'first-root-forensic-failure.json'
+                trace=[dict(file=frame.filename,line=frame.lineno,function=frame.name)
+                    for frame in traceback.extract_tb(error.__traceback__)]
+                self.profile['_private_json'](target,dict(schema='sylanne.test.beta1.root-forensic-first-failure.v4',
+                    phase=self.phase,exception_type=type(error).__name__,source_frames=trace,
+                    request_sha256=sha256(raw).hexdigest(),observed_at_utc=time.time(),automatic_replay=False))
+                raise
+            self.peer.sendall(answer);self.peer.close();self.peer=None
+            self.originals.append(dict(schema=request['schema'],phase=self.phase,request_sha256=sha256(raw).hexdigest(),
+                response_sha256=sha256(answer).hexdigest(),scope='forensic_only'))
+            return
         _require(request.get('schema')=='sylanne.root-controlled-sdk-census-request.v3','Root census request schema differs')
         if request.get('command')=='release':
             _require(self.held is not None and request==dict(schema=request['schema'],command='release',
@@ -284,7 +303,7 @@ _BETA1_PHASES=(*PHASES,"consumer_current_v3")
 
 def read_protected_beta1_fixture_suite_v3(spec,profile):
     """One independently pinned Root-prepared setup per fixed permanent node."""
-    _require(spec.fixture_kind in {"numeric","d13_full"},"closed full Beta1 fixture family required")
+    _require(spec.fixture_kind in profile["BETA1_CURRENT_SUITE_KINDS"],"closed current Beta1 fixture family required")
     path=Path(spec.phase_fixture_setup)
     profile['_validate_phase_fixture_setup'](str(path),spec.phase_fixture_setup_sha256,spec.phase_setup_root)
     raw=path.read_bytes();_require(len(raw)<=65536,"Beta1 suite descriptor exceeds its finite metadata bound")
@@ -314,12 +333,13 @@ def read_protected_beta1_fixture_suite_v3(spec,profile):
 
 
 def _verify_beta1_node_v3(outcomes,receipts,*,scenario,node,setup_sha256):
-    _require(len(outcomes)==len(receipts)==5
-        and tuple(item['phase']for item in outcomes)==_BETA1_PHASES,"complete actual Beta1 process sequence required")
-    business,switched,released,cold,consumer=outcomes
+    phases=(*_BETA1_PHASES,'paid_cold_current_v4')if scenario.startswith('d13-')else _BETA1_PHASES
+    _require(len(outcomes)==len(receipts)==len(phases)
+        and tuple(item['phase']for item in outcomes)==phases,"complete actual Beta1 process sequence required")
+    business,switched,released,cold,consumer=outcomes[:5]
     operation=business['operation_id'];continuation=business['continuation']
     checks=dict(same_scenario=all(item['scenario']==scenario for item in outcomes),
-        five_distinct_processes=len({item['pid']for item in outcomes})==5,
+        all_distinct_processes=len({item['pid']for item in outcomes})==len(phases),
         same_c09_operation=all(item['operation_id']==operation for item in outcomes),
         distinct_migration_source=business['scenario_source_ref']!=business['migration_source_ref'],
         same_continuation=all(item['continuation_digest']==continuation['continuation_digest']
@@ -341,6 +361,12 @@ def _verify_beta1_node_v3(outcomes,receipts,*,scenario,node,setup_sha256):
         fixed_consumer=consumer['node']==node and consumer['setup_sha256']==setup_sha256
             and consumer['exit_code']==0 and consumer['source_kind']=='current_selected_v3',
         current_owner=consumer['fresh_original_key_capped_login']is True)
+    if scenario.startswith('d13-'):
+        paid_cold=outcomes[5]
+        checks.update(paid_after_consumer_independent_process=paid_cold['pid']!=consumer['pid'],
+            paid_cold_same_original=paid_cold['paid_cold_original_sha256']==consumer['paid_cold_original']['sha256'],
+            paid_cold_current_generation=paid_cold['storage_generation']==consumer['storage_generation'],
+            paid_cold_original_checks=paid_cold['paid_cold_checks_passed']is True)
     for name,accepted in checks.items():_require(accepted,'actual Beta1 node assertion failed: '+name)
     return checks
 
@@ -350,7 +376,7 @@ def run_root_controlled_beta1_suite_v3(spec,*,app,run,environment,started,deadli
     from dataclasses import replace
     _require(os.geteuid()==0,"actual Root Beta1 suite observer required")
     manifest_entries=read_protected_beta1_fixture_suite_v3(spec,profile)
-    entries=tuple(item for item in manifest_entries if item['fixture_kind']==spec.fixture_kind)
+    entries=tuple(item for item in manifest_entries if item['node']in profile['FIXTURE_NODES'][spec.fixture_kind])
     metrics=os.open(Path(spec.evidence_directory)/'resources.private.jsonl',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     totals=dict(stdout=0,stderr=0,metrics=0,metrics_fd=metrics);observed=[];current_entry=None;current_phase=None;outcomes=[];receipts=[];failure=None
     try:
@@ -368,11 +394,13 @@ def run_root_controlled_beta1_suite_v3(spec,*,app,run,environment,started,deadli
                 spec.installed_root,spec.sdk_root)),PYTHONDONTWRITEBYTECODE='1',PYTHONNOUSERSITE='1',
                 PYTHONFAULTHANDLER='1',SYLANNE_D04_INSTALLED_ROOT=spec.installed_root,
                 SYLANNE_C09_IMPORT_EVIDENCE=str(guard),SYLANNE_C09_GUARD_SHA256=sha256(guard_file.read_bytes()).hexdigest(),
-                SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP=entry['setup_file'])
+                SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP=entry['setup_file'],
+                SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP_SHA256=entry['setup_sha256'])
             child_env.pop('PYTHONHOME',None)
             script=Path(spec.frozen_rewrite_root)/node.partition('::')[0]
             outcomes=[];receipts=[]
-            for phase_index,phase in enumerate(_BETA1_PHASES):
+            phases=(*_BETA1_PHASES,'paid_cold_current_v4')if scenario.startswith('d13-')else _BETA1_PHASES
+            for phase_index,phase in enumerate(phases):
                 current_phase=phase
                 child_env.update(SYLANNE_QUAL_ROOT_CENSUS_SOCKET=str(control/(str(phase_index)+'.socket')),
                     SYLANNE_QUAL_ROOT_CENSUS_PHASE=phase)
@@ -380,6 +408,9 @@ def run_root_controlled_beta1_suite_v3(spec,*,app,run,environment,started,deadli
                 command=[sys.executable,'-B',str(script),'--beta1-current-phase',phase,scenario,
                     entry['setup_file'],entry['setup_sha256'],str(fixture),node]
                 if phase_index:command.extend((continuation['path'],continuation['sha256']))
+                if phase=='paid_cold_current_v4':
+                    original=outcomes[4]['paid_cold_original']
+                    command.extend((original['path'],original['sha256']))
                 result,receipt=_phase(node_spec,phase,phase_index,command,child_env,app,run,control,
                     guard,started,deadline,totals,profile,node=node)
                 outcomes.append(result);receipts.append(receipt)
@@ -393,7 +424,7 @@ def run_root_controlled_beta1_suite_v3(spec,*,app,run,environment,started,deadli
             harness_kind='root_controlled_beta1_suite',fixture_kind=spec.fixture_kind,operation_id=spec.operation_id,
             suite_sha256=spec.phase_fixture_setup_sha256,package_sha256=spec.package_sha256,
             manifest_sha256=spec.manifest_sha256,node_count=len(observed),node_outcomes=observed,
-            full_manifest_node_count=15,requested_node_count=len(entries),node_manifest=_beta1_node_observation_manifest_v3(manifest_entries,spec.fixture_kind,observed),
+            full_manifest_node_count=15,requested_node_count=len(entries),node_manifest=_beta1_node_observation_manifest_v3(manifest_entries,spec.fixture_kind,observed,selected_nodes=profile['FIXTURE_NODES'][spec.fixture_kind]),
             observation_status='CURRENT_FAMILY_OBSERVED_OTHER_FAMILY_NOT_RUN',
             effective_exit_code=0,run_started_monotonic_ns=int(started*1_000_000_000),
             run_ended_monotonic_ns=time.monotonic_ns(),log_bytes={name:totals[name]for name in('stdout','stderr','metrics')}))
@@ -410,7 +441,7 @@ def run_root_controlled_beta1_suite_v3(spec,*,app,run,environment,started,deadli
             fixture_kind=spec.fixture_kind,operation_id=spec.operation_id,suite_sha256=spec.phase_fixture_setup_sha256,
             package_sha256=spec.package_sha256,manifest_sha256=spec.manifest_sha256,node_count=len(observed),node_outcomes=observed,
             full_manifest_node_count=15,requested_node_count=len(entries),node_manifest=_beta1_node_observation_manifest_v3(
-                manifest_entries,spec.fixture_kind,observed,failure=failure,partial_outcomes=outcomes,partial_processes=receipts),
+                manifest_entries,spec.fixture_kind,observed,selected_nodes=profile['FIXTURE_NODES'][spec.fixture_kind],failure=failure,partial_outcomes=outcomes,partial_processes=receipts),
             observation_status='HOLD_INCOMPLETE_CURRENT_OBSERVATION',first_failure=failure,effective_exit_code=2,
             run_started_monotonic_ns=int(started*1_000_000_000),run_ended_monotonic_ns=time.monotonic_ns(),
             log_bytes={name:totals[name]for name in('stdout','stderr','metrics')}))
@@ -418,10 +449,10 @@ def run_root_controlled_beta1_suite_v3(spec,*,app,run,environment,started,deadli
     finally:os.fsync(metrics);os.close(metrics)
 
 
-def _beta1_node_observation_manifest_v3(entries,requested_family,observed,*,failure=None,partial_outcomes=(),partial_processes=()):
+def _beta1_node_observation_manifest_v3(entries,requested_family,observed,*,selected_nodes,failure=None,partial_outcomes=(),partial_processes=()):
     completed={item['node']:item for item in observed};rows=[]
     for entry in entries:
-        item=completed.get(entry['node']);selected=entry['fixture_kind']==requested_family
+        item=completed.get(entry['node']);selected=entry['node']in selected_nodes
         failed=failure is not None and failure['node']==entry['node']
         status=('OBSERVED_CURRENT_V3_EXIT'if item is not None else'HOLD'if failed else'UNKNOWN'if selected else'NOT_RUN')
         rows.append(dict(node=entry['node'],scenario=entry['scenario'],fixture_kind=entry['fixture_kind'],

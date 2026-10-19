@@ -366,14 +366,14 @@ _ISSUED_CASES={}
 
 
 def register_current_beta1_fixture_case_v3(case):
-    from sylanne3.host.authority_profile import require_artifact_phase_fixture_qualification_v1
+    from installed_mock_model_support_v4 import require_installed_mock_binding_v4
     from sylanne3.runtime_storage_v3 import runtime_storage_v3
     control=case["c09_daemon"].c09_control
     current=control.read_verified_current_storage_v3();current.require_current("business")
     if (current.stage!="RELEASED" or current.storage_generation<1
             or runtime_storage_v3(case["store"]._db)is None):
         raise ValueError("actual selected cold Beta1 case required")
-    require_artifact_phase_fixture_qualification_v1(case["installed_bundle"],client_grant=case["client_grant"])
+    require_installed_mock_binding_v4(case["installed_bundle"],client_grant=case["client_grant"])
     _ISSUED_CASES[id(case)]=case
 
 
@@ -422,34 +422,10 @@ def current_beta1_scenario_selectors_v3(case,scenario):
 
 
 async def read_current_beta1_fixture_metadata_v3(case,*,versions,event_scopes,producing_operation_ids):
-    """The actual worker owns the Owner lease until the fixed metadata Work is terminal."""
-    from contextlib import ExitStack
-    from sylanne3.graph_worker import OwnedGraphStorageResultV3
-    from beta1_fixture_evidence_read_v3 import (Beta1FixtureEvidenceRequestV3,
-        prepare_current_beta1_fixture_evidence_read_v3)
-    worker=await case["get_http_worker"]()
-    def prepare(graph):
-        lifetime=ExitStack()
-        try:
-            authority,lease,_=graph.grant_current_owner(case["bootstrap"],actor="owner-actor-reply",
-                namespace=case["namespace"],domains=("d11",),purpose="context",
-                audience=case["ingress"].conversation_ref,activation_generation=1,
-                owner_session_token=case["owner_session_token"],owner_session_request=case["owner_session_request"])
-            lifetime.callback(graph.release_current_owner_lease,case["bootstrap"],lease)
-            request=Beta1FixtureEvidenceRequestV3(versions,producing_operation_ids,event_scopes,
-                case["beta1_original_deadline_utc"])
-            work=prepare_current_beta1_fixture_evidence_read_v3(graph,authority,lease,case["installed_bundle"],request)
-            def complete(reader):return tuple(reader.rows)
-            def failed(error):raise error
-            work.map_terminal_v3("issuer",complete,failed);work.adopt_request_lifetime_v3(lifetime)
-            return work
-        except BaseException:
-            lifetime.close();raise
-    owned=await worker.call(prepare)
-    if type(owned)is not OwnedGraphStorageResultV3:raise TypeError("actual metadata Work retention required")
-    rows,retention=owned.take_value_v3()
-    try:return rows
-    finally:retention.release()
+    from beta1_fixture_evidence_read_v3 import Beta1FixtureEvidenceRequestV3
+    from beta1_root_forensic_channel_v4 import read_root_fixture_metadata_v4
+    request=Beta1FixtureEvidenceRequestV3(versions,producing_operation_ids,event_scopes,case['beta1_original_deadline_utc'])
+    return await read_root_fixture_metadata_v4(case,request)
 
 
 async def call_current_beta1_numeric_v3(case,method,*,retain_result=False,**parameters):
@@ -538,18 +514,32 @@ async def run_current_beta1_consumer_phase_v3(*,scenario,node,setup_file,setup_s
         continuation=case["beta1_continuation"]
         if runtime_storage_v3(case["store"]._db)is None:
             raise ValueError("permanent consumer left actual selected V3 Graph")
+        paid_cold_original=None
+        if scenario.startswith("d13-"):
+            locators=case["beta1_d13_paid_cold_locators_v4"]
+            control=case["c09_daemon"].c09_control
+            payload=dict(schema="sylanne.test.beta1.d13-paid-cold-followup.v4",scenario=scenario,
+                setup_sha256=setup_sha256,manifest_digest=case["policy"].manifest_digest,
+                continuation_digest=continuation["continuation_digest"],
+                original_deadline_utc=continuation["original_deadline_utc"],consumer_pid=os.getpid(),locators=locators)
+            signed=control.sign_original_v1(payload["schema"],payload,"followup_digest")
+            from sylanne3.authority_service.c09_storage_control_v1 import canonical
+            from c09_life_provider_cache_acceptance_v1 import _write_new
+            target=control.key_path.parent/("beta1-d13-paid-cold-"+scenario+".json")
+            _write_new(target,canonical(signed).encode("utf8"))
+            paid_cold_original=dict(path=str(target),sha256=sha256(target.read_bytes()).hexdigest())
         return dict(phase="consumer_current_v3",pid=os.getpid(),scenario=scenario,node=node,
             setup_sha256=setup_sha256,operation_id=continuation["c09_operation_id"],
             continuation_digest=continuation["continuation_digest"],
             original_deadline_utc=continuation["original_deadline_utc"],
             storage_generation=current.storage_generation,manifest_digest=current.manifest_digest,
             source_kind="current_selected_v3",fresh_original_key_capped_login=case["beta1_fresh_original_key_login"],
-            exit_code=0)
+            exit_code=0,paid_cold_original=paid_cold_original)
 
 
 def run_current_beta1_node_main_v3(*,module_file,scenario_consumers,business):
     import asyncio,sys
-    if len(sys.argv) not in {8,10} or sys.argv[1]!="--beta1-current-phase":
+    if len(sys.argv) not in {8,10,12} or sys.argv[1]!="--beta1-current-phase":
         raise ValueError("closed protected Beta1 permanent node phase invocation required")
     _,_,phase,scenario,setup,pin,root,node,*continuation=sys.argv
     consumer,parameter=scenario_consumers[scenario]
@@ -563,7 +553,14 @@ def run_current_beta1_node_main_v3(*,module_file,scenario_consumers,business):
             if continuation:raise ValueError("first business phase cannot resume a consumed setup")
             return await business(scenario=scenario,setup_file=setup,setup_sha256=pin,
                 fixture_root=root,installed_root=installed)
-        continuation_file,continuation_sha256=continuation
+        continuation_file,continuation_sha256,*followup=continuation
+        if phase=="paid_cold_current_v4":
+            if not scenario.startswith("d13-")or len(followup)!=2:
+                raise ValueError("D13 paid cold needs its actual previous consumer's signed followup")
+            return await run_current_beta1_d13_paid_cold_phase_v4(scenario=scenario,node=node,
+                setup_file=setup,setup_sha256=pin,continuation_file=continuation_file,
+                continuation_sha256=continuation_sha256,followup_file=followup[0],followup_sha256=followup[1])
+        if followup:raise ValueError("extra followup arguments are exclusive to D13 paid cold")
         if phase=="consumer_current_v3":
             async def fixed(tmp,package):
                 if parameter is None:await consumer(tmp,package)
@@ -614,13 +611,10 @@ async def run_current_beta1_d13_business_phase_v3(*,scenario,setup_file,setup_sh
 
 
 async def _read_current_beta1_job_metadata_v3(case,job_id,request_type,*,audience):
-    from contextlib import ExitStack
-    from sylanne3.graph_worker import OwnedGraphStorageResultV3
     from beta1_fixture_evidence_read_v3 import (Beta1ExactNumericJobMetadataRequestV3,
-        Beta1ExactD13JobMetadataRequestV3,prepare_current_beta1_fixture_evidence_read_v3)
+        Beta1ExactD13JobMetadataRequestV3)
     if _ISSUED_CASES.get(id(case))is not case:
         raise ValueError("actual registered cold Numeric fixture required")
-    worker=await case["get_http_worker"]()
     donor=case["beta1_numeric_selectors"]["negative_donor"]if request_type is Beta1ExactNumericJobMetadataRequestV3 else None
     selector=(donor["reservation_operation_id"],donor["quote_id"],donor["quote_version"],donor["operation_digest"],donor["commit_seq"])if donor is not None and donor["kind"]=="internal_life_content"else None
     request=request_type(job_id,case["beta1_original_deadline_utc"],reservation_donor_selector=selector)
@@ -628,32 +622,9 @@ async def _read_current_beta1_job_metadata_v3(case,job_id,request_type,*,audienc
 
 
 async def _read_current_beta1_metadata_request_v3(case,request,*,audience):
-    from contextlib import ExitStack
-    from sylanne3.graph_worker import OwnedGraphStorageResultV3
-    from beta1_fixture_evidence_read_v3 import prepare_current_beta1_fixture_evidence_read_v3
-    if _ISSUED_CASES.get(id(case))is not case:raise ValueError("actual registered cold Beta1 metadata case required")
-    worker=await case["get_http_worker"]()
-    def begin(graph):
-        lifetime=ExitStack()
-        try:
-            authority,lease,_=graph.grant_current_owner(case["bootstrap"],actor="owner-actor-reply",
-                namespace=case["namespace"],domains=("d11",),purpose="context",audience=audience,
-                activation_generation=1,owner_session_token=case["owner_session_token"],
-                owner_session_request=case["owner_session_request"])
-            lifetime.callback(graph.release_current_owner_lease,case["bootstrap"],lease)
-            work=prepare_current_beta1_fixture_evidence_read_v3(graph,authority,lease,case["installed_bundle"],
-                request)
-            def complete(reader):return reader.snapshot.result_v3(tuple(reader.rows))
-            def failed(error):raise error
-            work.map_terminal_v3("issuer",complete,failed);work.adopt_request_lifetime_v3(lifetime)
-            return work
-        except BaseException:
-            lifetime.close();raise
-    owned=await worker.call(begin)
-    if type(owned)is not OwnedGraphStorageResultV3:raise TypeError("actual exact-job metadata Work retention required")
-    value,retention=owned.take_value_v3()
-    try:return value
-    finally:retention.release()
+    from beta1_root_forensic_channel_v4 import read_root_fixture_metadata_v4
+    if _ISSUED_CASES.get(id(case))is not case:raise ValueError('actual registered cold Beta1 fixture case required')
+    return await read_root_fixture_metadata_v4(case,request)
 
 
 async def call_current_beta1_d13_v3(case,method,*,retain_result=False,**parameters):
@@ -899,3 +870,34 @@ async def seal_current_beta1_numeric_model_v3(case,authority,lease,*,job_id,inte
     if type(value)is not ProductionOriginalRefV1:
         raise TypeError('actual Numeric MODEL seal Work metadata original required')
     return value
+
+
+async def run_current_beta1_d13_paid_cold_phase_v4(*,scenario,node,setup_file,setup_sha256,
+        continuation_file,continuation_sha256,followup_file,followup_sha256):
+    from beta1_resumed_case_support_v1 import resume_current_beta1_fixture_case_v3
+    from test_installed_d13_paid_v1 import verify_installed_d13_paid_cold_v4
+    path=Path(followup_file).resolve(strict=True)
+    raw=path.read_bytes()
+    if sha256(raw).hexdigest()!=followup_sha256:raise ValueError('D13 paid cold followup pin differs')
+    original=json.loads(raw)
+    async with resume_current_beta1_fixture_case_v3(setup_file=setup_file,setup_sha256=setup_sha256,
+            continuation_file=continuation_file,continuation_sha256=continuation_sha256,scenario=scenario)as case:
+        control=case['c09_daemon'].c09_control;continuation=case['beta1_continuation']
+        if path!=control.key_path.parent/('beta1-d13-paid-cold-'+scenario+'.json'):
+            raise ValueError('D13 paid cold followup left actual protected cohort')
+        control.verify_original_v1(original,'followup_digest')
+        if(original['schema']!='sylanne.test.beta1.d13-paid-cold-followup.v4'or original['scenario']!=scenario
+                or original['setup_sha256']!=setup_sha256 or original['manifest_digest']!=case['policy'].manifest_digest
+                or original['continuation_digest']!=continuation['continuation_digest']
+                or original['original_deadline_utc']!=continuation['original_deadline_utc']
+                or original['consumer_pid']==os.getpid()):
+            raise ValueError('D13 paid cold changed its original consumer/cohort/deadline')
+        with current_beta1_fixture_case_scope_v3(case):
+            checked=await verify_installed_d13_paid_cold_v4(case,original['locators'])
+        current=control.read_verified_current_storage_v3();current.require_current('business')
+        return dict(phase='paid_cold_current_v4',pid=os.getpid(),scenario=scenario,node=node,
+            setup_sha256=setup_sha256,operation_id=continuation['c09_operation_id'],
+            continuation_digest=continuation['continuation_digest'],original_deadline_utc=continuation['original_deadline_utc'],
+            storage_generation=current.storage_generation,manifest_digest=current.manifest_digest,
+            source_kind='current_selected_v3',fresh_original_key_capped_login=case['beta1_fresh_original_key_login'],
+            paid_cold_original_sha256=followup_sha256,paid_cold_checks_passed=True,paid_cold_evidence=checked,exit_code=0)

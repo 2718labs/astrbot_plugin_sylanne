@@ -25,6 +25,8 @@ def require_life_model_body_request_v3(work, request):
         return
     from .artifact_model_source_read_v3 import require_artifact_model_body_request_v3
     if request[0]==GRAPH_BODY and require_artifact_model_body_request_v3(work,request):return
+    from .d13_authority_model_source_v3 import require_d13_body_request_v3
+    if request[0]==GRAPH_BODY and require_d13_body_request_v3(work,request[1:]):return
     raise AuthorityUnavailable("Life model body IO has no actual independent caller capability")
 
 

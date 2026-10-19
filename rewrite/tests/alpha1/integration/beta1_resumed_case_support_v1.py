@@ -102,14 +102,13 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
     from sylanne3.host.model_terminal_cost_port import InstalledModelTerminalCostPort
     from sylanne3.host.worker_result_read_fact_port import InstalledWorkerResultReadFactPort
     from sylanne3.host.original_c02_cost_intent_port import InstalledOriginalC02CostIntentPort
-    from sylanne3.host.authority_profile import (load_artifact_phase_local_fixture_bundle_v1,
-        bind_artifact_phase_local_fixture_components_v1,artifact_phase_local_fixture_scope_v1,
-        require_artifact_phase_fixture_qualification_v1,revoke_artifact_phase_local_fixture_qualification_v1)
+    from installed_mock_model_support_v4 import (load_installed_mock_bundle_v4,
+        check_installed_mock_components_v4,require_installed_mock_binding_v4,revoke_installed_mock_binding_v4)
     from sylanne3.runtime.c04_cpu_quote_policy import C04InternalCpuQuotePolicyAuthorityV1
     from sylanne3.runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1
     from sylanne3.runtime.first_ingress_v2 import trusted_upper
     from sylanne3.host.installation_grant_identity import same_installed_grant_identity_v2
-    from m1_artifact_draft_acceptance_support_v1 import build_m1_phase_mock_client_v2,_bind_m1_phase_verifier_scope_v2
+    from m1_artifact_draft_acceptance_support_v1 import build_m1_phase_mock_client_v2
     from d11_offline_authority_acceptance_support_v1 import FreshOfflineStorageCaseV1,OuterOwnedProtectedRootV1
     initial,continuation,envelope,config,cache=read_current_beta1_resume_configuration_v3(
         setup_file=setup_file,setup_sha256=setup_sha256,continuation_file=continuation_file,
@@ -209,7 +208,7 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
         provider.provider_config=initial.provider_configuration;provider.model_name=initial.provider_configuration["model"]
         provider.client=sdk
         context=Context(asyncio.Queue(),{},None,Manager(provider),None,None,None,None,None,None,None)
-        bundle,qualification=await load_artifact_phase_local_fixture_bundle_v1(initial.profile_id,
+        bundle,qualification=await load_installed_mock_bundle_v4(initial.profile_id,
             profile_root=initial.profile_root,package_root=initial.package_root,data_dir=initial.data_dir,
             provider_client=sdk,mock_transport=mock._transport)
         if (bundle.installation_policy!=policy or bundle.model_workflows!=base_bundle.model_workflows
@@ -234,10 +233,9 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
             worker=worker,authority_client=client,client_grant=actual_grant,context=context,
             owner_loop=asyncio.get_running_loop())
         def install_runtime(actual_graph):
-            with artifact_phase_local_fixture_scope_v1(qualification):
-                actual_graph.install_artifact_draft_model_runtime_v1(graph_bootstrap,runtime)
+            actual_graph.install_artifact_draft_model_runtime_v1(graph_bootstrap,runtime)
         await worker.call(install_runtime)
-        await bind_artifact_phase_local_fixture_components_v1(qualification,graph=graph,
+        await check_installed_mock_components_v4(qualification,graph=graph,
             bootstrap=graph_bootstrap,model_runtime=runtime)
         def paired_clock():
             reading=daemon.config.clock_provider()
@@ -246,8 +244,6 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
             graph_verifier=PinnedCurrentModelEgressGraphVerifier(graph_path,d11_issuer=d11,
                 trusted_now_utc=time.time,trusted_paired_clock=paired_clock,
                 artifact_draft_bundle=bundle),admin_model_policy=bundle.model_workflows)
-        _bind_m1_phase_verifier_scope_v2(verifier=model._graph_verifier,service=model,server=daemon.server,
-            namespace=ans,qualification=qualification,graph_db_path=graph_path,issuer=d11)
         model.install_current_source_location_v1(daemon.c09_maintenance.current_source_location)
         daemon.server._v2_model_egress[ans]=model
         case.update(installed_bundle=bundle,policy=bundle.installation_policy,authority_client=client,
@@ -258,7 +254,7 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
             await asyncio.to_thread(install_actual_numeric_authority_case_v3,case,owner_loop=asyncio.get_running_loop())
         async def get_http_worker():return worker
         case["get_http_worker"]=get_http_worker
-        require_artifact_phase_fixture_qualification_v1(bundle,client_grant=actual_grant)
+        require_installed_mock_binding_v4(bundle,client_grant=actual_grant)
         await login_current_beta1_owner_after_cold_v3(case,continuation=continuation)
         def current_owner(actual_graph):
             authority,lease,binding=actual_graph.grant_current_owner(graph_bootstrap,actor="owner-actor-reply",
@@ -276,12 +272,6 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
         from sylanne3.runtime.d12_installed_services_v1 import install_d12_services_v1
         case["beta1_workbench_lifecycle"]=await worker.call(lambda actual_graph:
             install_d12_services_v1(actual_graph,bootstrap=graph_bootstrap))
-        import os
-        from sylanne3.graph_worker import _register_beta1_engineering_metadata_provider_v3
-        await worker.call(lambda actual_graph:_register_beta1_engineering_metadata_provider_v3(
-            actual_graph,worker,engineering_root=os.environ['SYLANNE_C09_TEST_ROOT'],
-            engineering_inventory_sha256=os.environ['SYLANNE_C09_ENGINEERING_INVENTORY_SHA256'],
-            guard_sha256=os.environ['SYLANNE_C09_GUARD_SHA256']))
         register_current_beta1_fixture_case_v3(case);issued_case=case
         yield case
     finally:
@@ -297,14 +287,11 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
         if worker is not None:
             # Accepted continuations must finish with their original provider still present.
             await finish_cleanup(worker.close())
-            from sylanne3.graph_worker import _unregister_beta1_engineering_metadata_provider_v3
-            try:_unregister_beta1_engineering_metadata_provider_v3(graph,worker)
-            except BaseException as failure:cleanup_failures.append(failure)
         elif store is not None:
             try:store.close()
             except BaseException as failure:cleanup_failures.append(failure)
         if qualification is not None:
-            try:revoke_artifact_phase_local_fixture_qualification_v1(qualification)
+            try:revoke_installed_mock_binding_v4(qualification)
             except BaseException as failure:cleanup_failures.append(failure)
             await finish_cleanup(qualification.authority_client._transport.close())
         if mock is not None:await finish_cleanup(mock.aclose())

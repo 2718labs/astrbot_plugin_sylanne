@@ -175,10 +175,7 @@ def run(args):
         raise ValueError("explicit delivery/fixture roots and the real delegated cgroup parent are required")
     if args.node not in {"sdk-v7", "sdk-real-elapsed"} and args.installed_stage_root is None:
         raise ValueError("explicit separately verified installed-stage root is required")
-    beta1_suite=identity==("3.0.0-beta1","beta1-candidate") and args.node in {"numeric-full","d13"}
-    if identity==("3.0.0-beta1","beta1-candidate") and args.node in {
-            "numeric-positive","numeric-authorization","numeric-registration"}:
-        raise ValueError("Beta1 Numeric requires its complete ten-node protected phase suite; subset fallback HOLD")
+    beta1_suite=identity==("3.0.0-beta1","beta1-candidate") and args.node in {"numeric-full","numeric-positive","numeric-authorization","numeric-registration","d13"}
     setup = setup_pin = None
     setup_values = (args.phase_fixture_setup, args.phase_fixture_setup_sha256, args.phase_setup_root, args.engineering_inventory_sha256)
     if args.node == "c09-current" or beta1_suite:
@@ -275,10 +272,10 @@ def run(args):
             and outcomes["node_count"]==len(outcomes["node_outcomes"])==len(selected)
             and tuple(item["node"]for item in outcomes["node_outcomes"])==selected
             and outcomes["effective_exit_code"]==0
-            and all(len(item["outcomes"])==len(item["processes"])==5 and item["checks"]
+            and all(len(item["outcomes"])==len(item["processes"])==(6 if item["scenario"].startswith("d13-")else 5) and item["checks"]
                 and all(item["checks"].values())for item in outcomes["node_outcomes"])
             and summary.get("actual_phase_outcomes_path")==str(outcomes_path)
-            and all(row["status"]==("OBSERVED_CURRENT_V3_EXIT"if row["fixture_kind"]==family else"NOT_RUN")for row in outcomes["node_manifest"]))
+            and all(row["status"]==("OBSERVED_CURRENT_V3_EXIT"if row["node"]in selected else"NOT_RUN")for row in outcomes["node_manifest"]))
     elif family == "c09_current":
         outcomes_path=output/"resource/actualphase-outcomes.json"
         outcomes=json.loads(outcomes_path.read_bytes())if outcomes_path.is_file()else None

@@ -99,6 +99,9 @@ def read_current_d13_paid_model_graph(
     issuer: D11BudgetJobIssuer, now: float,
 ) -> CurrentD13PaidModelGraph:
     """Rebuild current job, source, rights and signed budget from Graph DB."""
+    from .d13_authority_model_source_v3 import read_bound_d13_current_model_v3
+    actual=read_bound_d13_current_model_v3(db,intent,issuer,now)
+    if actual is not None:return actual
     if not db.in_transaction:
         raise ValueError("D13 paid proof requires one pinned Graph transaction")
     from ..runtime.d13_paid_intent_original_v1 import (

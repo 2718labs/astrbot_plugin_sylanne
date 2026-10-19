@@ -24,7 +24,7 @@ _OWNER_CALLER_KINDS_V3 = frozenset(("host_artifact_borrowed_header", "host_artif
     "host_contact_dispatch_identity_read", "host_contact_dispatch_text_read", "host_contact_owner_read", "host_contact_owner_write", "authority_model_header", "authority_model_seal",
     "authority_internal_life_model_header", "authority_artifact_model_header", "authority_foreground_mesh_header",
     "authority_original_foreground_header", "authority_original_owner_task_header",
-    "authority_numeric_model_header", "authority_habit_header", "authority_named_joint_header",
+    "authority_numeric_model_header", "authority_d13_paid_header", "authority_habit_header", "authority_named_joint_header",
     "authority_numeric_location", "authority_root_location", "authority_series_location",
     "authority_life_location", "authority_offline_location", "authority_source_fence_location",
     "authority_target_public_location", "authority_target_background_location",
@@ -80,6 +80,9 @@ class OwnerLocationCallerProofV3:
         elif self.kind == "authority_artifact_model_header":
             from .artifact_model_source_read_v3 import require_artifact_model_owner_header_v3
             require_artifact_model_owner_header_v3(self)
+        elif self.kind == "authority_d13_paid_header":
+            from .d13_authority_model_source_v3 import require_d13_owner_header_v3
+            require_d13_owner_header_v3(self)
         elif self.kind == "authority_numeric_model_header":
             if self.model_source_phase not in ("numeric_model_seal_observer", "numeric_model_policy"):
                 raise AuthorityUnavailable("Numeric model Source requires its private actual caller phase")
@@ -410,6 +413,9 @@ def require_owner_location_caller_proof_v3(proof, *, phase, graph_stamp=None):
                 raise AuthorityUnavailable('Owner metadata lost its authenticated exact comparison anchor')
     else:
         proof.controller.require_installed_v3()
+        if proof.kind == "authority_d13_paid_header":
+            from .d13_authority_model_source_v3 import require_d13_owner_header_v3
+            require_d13_owner_header_v3(proof)
         if proof.kind == "authority_numeric_model_header":
             from .life_numeric_source_read_v3 import require_authority_numeric_model_phase_v3
             if proof.model_source_phase != require_authority_numeric_model_phase_v3(proof.request,proof.controller.verifier._life_numeric_reader_v1):
@@ -4371,19 +4377,21 @@ def prepare_owner_location_for_model_graph_work_v3(work, *, installed_reader, ow
     from .current_life_numeric_v1 import InstalledLifeNumericModelGraphReaderV1
     from .internal_life_model_graph_v2 import InstalledInternalLifeModelGraphReaderV2
     from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
+    from .d13_authority_model_source_v3 import InstalledD13AuthorityModelReaderV3
     from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
     from ..graph_types import validate_owner_grant_v1
     if (type(work) is not AuthorityGraphReadWorkV3
             or type(owner_service) is not InstalledD12OwnerStorageAdmissionServiceV1
             or type(installed_reader) not in (InstalledLifeNumericModelGraphReaderV1,
-                InstalledInternalLifeModelGraphReaderV2,InstalledArtifactDraftModelGraphReaderV3)
+                InstalledInternalLifeModelGraphReaderV2,InstalledArtifactDraftModelGraphReaderV3,InstalledD13AuthorityModelReaderV3)
             or installed_reader.owner_storage is not owner_service
             or work.db.in_transaction):
         raise AuthorityUnavailable('model Owner location requires its actual installed reader before Graph SQL')
     require_actual_authority_graph_attachment_owner_v3(work)
     controller = work.controller.require_installed_v3()
     verifier = controller.verifier
-    actual = (verifier._life_numeric_reader_v1 if type(installed_reader) is InstalledLifeNumericModelGraphReaderV1
+    actual = (verifier._d13_paid_reader_v3 if type(installed_reader)is InstalledD13AuthorityModelReaderV3
+        else verifier._life_numeric_reader_v1 if type(installed_reader) is InstalledLifeNumericModelGraphReaderV1
         else verifier._artifact_model_reader_v3 if type(installed_reader)is InstalledArtifactDraftModelGraphReaderV3
         else verifier._internal_life_reader_v2)
     if (controller.kind != 'model' or actual is not installed_reader
@@ -4414,7 +4422,11 @@ def prepare_owner_location_for_model_graph_work_v3(work, *, installed_reader, ow
     if bundle is not verifier._artifact_draft_bundle:
         raise AuthorityUnavailable('Life model Owner reader crossed the installed bundle identity')
     caller_kind, model_source_phase = 'authority_model_header', None
-    if type(installed_reader) is InstalledLifeNumericModelGraphReaderV1:
+    if type(installed_reader)is InstalledD13AuthorityModelReaderV3:
+        from .d13_authority_model_source_v3 import require_d13_authority_model_phase_v3
+        caller_kind='authority_d13_paid_header'
+        model_source_phase=require_d13_authority_model_phase_v3(work,installed_reader)
+    elif type(installed_reader) is InstalledLifeNumericModelGraphReaderV1:
         from .life_numeric_source_read_v3 import require_authority_numeric_model_phase_v3
         model_source_phase = require_authority_numeric_model_phase_v3(work, installed_reader)
         caller_kind = 'authority_numeric_model_header'
@@ -4630,6 +4642,8 @@ def prepare_owner_location_for_model_quantum_v3(work):
         reader = verifier._internal_life_reader_v2
     elif kind == 'artifact_draft_v1':
         reader=verifier._artifact_model_reader_v3
+    elif kind=='d13.precompress.paid.v1':
+        reader=verifier._d13_paid_reader_v3
     else:
         return
     if reader is None:
@@ -4637,6 +4651,9 @@ def prepare_owner_location_for_model_quantum_v3(work):
     entry = prepare_owner_location_for_model_graph_work_v3(work, installed_reader=reader,
         owner_service=reader.owner_storage)
     state = _OWNER_MODEL_LOCATION_ENTRIES_V3[work]
+    if kind=='d13.precompress.paid.v1':
+        from .d13_authority_model_source_v3 import prepare_d13_authority_source_v3
+        prepare_d13_authority_source_v3(work,reader,entry)
     if kind=='artifact_draft_v1':
         from .artifact_model_graph_v3 import observe_artifact_model_core_state_v3
         observe_artifact_model_core_state_v3(work,reader)

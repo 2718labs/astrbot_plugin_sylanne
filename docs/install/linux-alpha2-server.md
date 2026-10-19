@@ -290,3 +290,36 @@ rewrite/host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_a06_actual_in
 在既有完整 D13／256 槽节点的 fresh fixture 中，同时核对以下实际原件：大于单片容量的 draft 确有多个有序 segment；原 Core PK 指向该 cell，origin 的 namespace／phase／source-location 与原件相符；完整 hash、字节数、segment count/root 和双 EOF 一致；相同操作的 prior 回放读取实际原件而不替换它。取消、失效授权、错误身份、改动 PK／origin／segment、提交失败时应拒绝，provider 与计费变化分别按原节点断言。失败立即保存首次日志、数据库及附属文件；不要循环重跑、改 TTL 或直接修账。这些情况目前没有服务器 PASS。
 
 服务器安装后，手动确认插件真实版本、完整进程重启、`0.0.0.0:2718` 实际监听与宿主映射、所选 HTTP／HTTPS 协议（选择 HTTPS 时核对实际证书）、Dashboard 登录、Owner 解锁、配置写入/读回、十三项模块许可和两层 enabled 状态，再检查原 logo/GLB、键盘焦点、主题与退出。首次完整 Authority/Host 初始化、普通 SDK 消息、暂停/恢复、冷重启与 C09 原件分别保存；安装或UI可访问不代替这些业务验收。
+
+
+## Beta1 当前 Numeric/D13 验证入口与包外准备器
+
+当前入口使用同次冻结源码的 `scripts/alpha1/prepare_numeric_d13_validation.py` 和 `scripts/alpha1/verify_server_installation.py`。两者属于工程附件，均不在 AstrBot 运行 ZIP 中。Numeric 的 full、positive、authorization、registration 选择与 D13 full 选择都使用当前受保护 suite，不回退历史 pytest gateway；缺少原件或 setup 时保持拒绝，不自动改跑旧节点。
+
+先在工程根生成未批准模板；这个命令只输出十五个固定节点的声明结构，不生成 Authority、凭据、数据库、预算或期限：
+
+```bash
+python -B "$SYLANNE_TEST_SOURCE_ROOT/scripts/alpha1/prepare_numeric_d13_validation.py"   --template --source-root "$SYLANNE_TEST_SOURCE_ROOT" > reviewed-suite-declarations.json
+```
+
+管理员必须明确填写并审核 package/manifest/engineering pins、实际 recall 配置，以及每个节点自己的原始预算、单次 ceiling、work kinds、绝对 UTC 截止和 `profile_policies`。空字典、null 期限和不完整策略无法执行准备。策略采用该隔离 Mock 的明确 provider/model/configuration 与实际 Numeric/D13 模板；不能借用生产 provider、现有 Root 的剩余额度或已失效授权。计数资产的 `production` 标签表示经过正式安装校验；本套工程模型仍是 `sylanne.test.mock.artifact-v3` / `mock-utf8-eight-octets-v1`，输入使用明确 UTF8/8 规则，费用收据标记 fixture_simulated_charge，不代表供应商 tokenizer 或真实付款。所有预算和期限按原声明核验，准备器不会补足、延长或刷新。
+
+确认新声明后，对文件计算外部 SHA256，使用同次已核对的独立提取安装执行一次准备：
+
+```bash
+sudo python -B "$SYLANNE_TEST_SOURCE_ROOT/scripts/alpha1/prepare_numeric_d13_validation.py"   --source-root "$SYLANNE_TEST_SOURCE_ROOT"   --package "$SYLANNE_PACKAGE" --package-sha256 "$SYLANNE_PACKAGE_SHA256"   --installed-root "$SYLANNE_INSTALLED_ROOT" --manifest-sha256 "$SYLANNE_MANIFEST_SHA256"   --sdk-root "$SYLANNE_SDK_ROOT"   --engineering-inventory-sha256 "$SYLANNE_ENGINEERING_INVENTORY_SHA256"   --setup-root "$SYLANNE_FRESH_PROTECTED_SUITE_ROOT"   --approved-declarations reviewed-suite-declarations.json   --approved-declarations-sha256 "$SYLANNE_REVIEWED_DECLARATIONS_SHA256"   --runner-user ubuntu
+```
+
+`--runner-user` 必须是此隔离 fixture 中既有的 UID/GID 1000 账号；不改变生产 Host 的运行身份。所有输入和祖先目录保持 Root 保护；setup root 必须尚不存在。准备器先核验全部十五项原始声明和源码/安装成员，再沿真实 Root 工厂创建彼此独立的 Authority、TLS、签名密钥和安装原件，输出 `suite.json` 与 SHA。它不执行业务或调用模型。首次准备失败保留所有已创建原件，不删除目录重签；不能把准备成功记为验证 PASS。
+
+将上述 `suite.json`、其 SHA、setup root 和工程清单 canonical pin 传给同次 `verify_server_installation.py` 的 `--phase-fixture-setup`、`--phase-fixture-setup-sha256`、`--phase-setup-root`、`--engineering-inventory-sha256`；共同参数、外部 dependency/request pins 和真实 cgroup parent 仍按既有完整命令提供。可选 `--node numeric-positive` 只执行一个新 Root 正例；`numeric-authorization` 执行六个固定授权组；`numeric-registration` 只执行注册/取消节点；`numeric-full` 执行十个固定 Numeric 节点。全部使用完整十五项独立准备清单，但未选节点明确 NOT_RUN，不消费它们的业务授权。
+
+Numeric 的每个选定节点依次完成真实 business、C09 prepare/switch、release、fresh cold 和 consumer 五个独立进程阶段。身份、draft、候选资格、joint/native 和 trace 使用现有正式生产 Work，retention 持续到真实 consumer 完成；不能把快照数据反序列化成当前授权证明。job/费用/历史/absence 等纯断言由既有 Root phase channel 通过 SO_PEERCRED 和实际进程 birth 核对后，对当前进程实际持有的 Graph 取 Root 私有只读快照；核完整 cell/签名/receipt/history 原件后只返回有限元数据，不注册工程 Work 或权限。
+
+D13 的五个完整节点在前述五阶段之后，增加第六个 `paid_cold_current_v4` 独立进程。原 paid consumer 结束并达到真实 pidfd/cgroup 退休 EOF 后，才可重新打开当前安装和存储，沿相同 job/call/operation/完成原件做 fresh 生产读取与零 provider/零新增费用重放。后续 Owner revoke 负例或 named derived expiry/retirement/lost-ack 检查在此冷阶段按原顺序完成；不会提前撤销 Owner 或删除 payload 后再把旧内存读当 cold 成功。expired 场景仅冷核实际拒绝原件与未调度状态，不生成不存在的 paid block。冷阶段仍使用原签名 Root、当前 Owner、原绝对期限和原资源监管上限，不获得额外窗口。
+
+D13 的 Source/frame/job、Owner、Source/Access/correction 闭包、quote/grant/lease/reservation 与 Core terminal/result READ 须分别沿正式当前读取路径核验。不能用旧 physical `value` 列或工程 alias 代替业务读，不借 Numeric service/旧 READ permit，也不把预检 candidate permit 当真实已签发 permit。时间组中的纯边界单元与实际安装拒绝分开记录；没有到达的深层拒绝保持未验证。
+
+所有当前服务器场景仍为 NOT_RUN；只有实际完整阶段原件、首次内部拒绝、安全日志、结算、native interval 与 trace adoption 足够时，才可更新对应资格。任何首次失败、过期、跳过、超时或资源不足都保持 HOLD，停止后续阶段并保存 DB/WAL/SHM，不循环重跑、不延长 TTL、不 SQL 修账。Contact/C09 FULL、D04 FULL 和生产 Host 独立身份继续单列，不能由本套 Mock 结果自动通过。
+
+本轮本地针对性检查的限制：worker-result 服务与 reply 契约共 8 项已在 Windows 运行通过；旧 first-ingress Graph 回归的 6 项在有效请求前置断言失败。一次定点诊断定位到 `get_job → d13_completed_paid_read_v3 → d13_paid_original_read_v3 → C09/D12 package files → import fcntl`，Windows 无此 Linux 模块；首次失败、数据库副本和诊断已保留。未伪造 fcntl、未修改生产权限检查、未循环重跑。这六项及完整 Numeric/D13 节点需在 Linux 运行，不能据此声称新版安装验收通过。

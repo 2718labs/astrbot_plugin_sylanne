@@ -142,6 +142,9 @@ class AuthorityV2WorkerModelResultReadService:
             if anchor.authority_id != request.authority_id:
                 raise AuthorityUnavailable("worker read Authority anchor unavailable")
             intent, _, _ = self._terminal_locked(db, request, anchor, content=False)
+        if (type(request)is WorkerModelResultReadRequestV1 and request.purpose=="d13_precompress_paid"
+                and self._graph._d13_paid_reader_v3 is not None):
+            return anchor,intent
         candidate = FencePermitV2(
             anchor.authority_id, anchor.namespace, self._read_subject,
             self._holder, anchor.activation_generation, "read",
@@ -242,26 +245,42 @@ class AuthorityV2WorkerModelResultReadService:
                 operation="read", current_anchor=anchor,
                 operation_id=request.read_attempt_id)
             self._attempts.begin_locked(db, request, permit=permit)
-        graph = (self._reply_graph if type(request) is ReplyWorkerModelResultReadRequestV1
-                 else self._graph)
-        if graph.current(request, original_intent, permit) is not True:
-            raise AuthorityUnavailable("current worker graph changed; read fence retained")
-        with fences._frozen() as (db, deletion_head, execution_head, history):
-            anchor = fences._current_locked(
-                db, deletion_head, execution_head, holder=self._holder,
-                generation=permit.generation)
-            if anchor != permit.pinned_anchor:
-                raise AuthorityUnavailable("worker read anchor changed")
-            fences.fences.validate_fence_locked(
-                db, permit, subject=self._read_subject, current_anchor=anchor)
-            intent, _, result = self._terminal_locked(db, request, anchor, content=True)
-            if intent != original_intent:
-                raise AuthorityUnavailable("original model intent changed")
-        if graph.current(request, original_intent, permit) is not True:
-            raise AuthorityUnavailable("current worker graph changed after result copy")
-        fences.validate_fence(
-            credential=credential, subject=self._read_subject, permit=permit)
-        return WorkerResultDeliveryV1(result, permit)
+        d13_work=None
+        if (type(request)is WorkerModelResultReadRequestV1 and request.purpose=="d13_precompress_paid"
+                and self._graph._d13_paid_reader_v3 is not None):
+            with self._delivery_lock:
+                if request.read_attempt_id not in self._inflight_deliveries or self._inflight_deliveries[request.read_attempt_id]is not None:
+                    raise AuthorityUnavailable("D13 result preparation lost its actual pending transport handoff")
+                self._inflight_deliveries[request.read_attempt_id]=permit
+            from .d13_authority_result_source_v3 import prepare_d13_worker_result_source_v3
+            d13_work=prepare_d13_worker_result_source_v3(self,credential=credential,request=request,
+                intent=original_intent,permit=permit)
+        try:
+            from .d13_authority_result_source_v3 import read_d13_worker_result_source_v3
+            graph = (self._reply_graph if type(request) is ReplyWorkerModelResultReadRequestV1
+                     else self._graph)
+            if (read_d13_worker_result_source_v3(d13_work) if d13_work is not None else graph.current(request, original_intent, permit)) is not True:
+                raise AuthorityUnavailable("current worker graph changed; read fence retained")
+            with fences._frozen() as (db, deletion_head, execution_head, history):
+                anchor = fences._current_locked(
+                    db, deletion_head, execution_head, holder=self._holder,
+                    generation=permit.generation)
+                if anchor != permit.pinned_anchor:
+                    raise AuthorityUnavailable("worker read anchor changed")
+                fences.fences.validate_fence_locked(
+                    db, permit, subject=self._read_subject, current_anchor=anchor)
+                intent, _, result = self._terminal_locked(db, request, anchor, content=True)
+                if intent != original_intent:
+                    raise AuthorityUnavailable("original model intent changed")
+            if (read_d13_worker_result_source_v3(d13_work) if d13_work is not None else graph.current(request, original_intent, permit)) is not True:
+                raise AuthorityUnavailable("current worker graph changed after result copy")
+            fences.validate_fence(
+                credential=credential, subject=self._read_subject, permit=permit)
+            return WorkerResultDeliveryV1(result, permit)
+        finally:
+            if d13_work is not None:
+                from .d13_authority_result_source_v3 import finish_d13_worker_result_source_v3
+                finish_d13_worker_result_source_v3(d13_work)
 
     @staticmethod
     def _finish_identity(request, permit):

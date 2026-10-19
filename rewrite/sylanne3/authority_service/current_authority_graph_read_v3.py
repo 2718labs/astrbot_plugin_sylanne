@@ -164,31 +164,39 @@ class AuthorityGraphReadWorkV3:
         self._check_permission_v3()
         control=controller.control
         from .daemon import _bootstrap_control_quantum_v3
-        with _bootstrap_control_quantum_v3(control)as initial_meter:
-            context=control.read_verified_current_storage_v3()
-            context.require_current('business')
-            core_handle=controller.fences.core._runtime_storage_v3
-            if (core_handle is None or core_handle.context._reader is not control
-                    or (core_handle.context.manifest_digest,core_handle.context.pointer_version)!=
-                       (context.manifest_digest,context.pointer_version)):
-                raise AuthorityUnavailable('Authority Core and current selected Graph differ')
-            member=next(item for item in context.manifest['members']if item['role']=='graph')
-            path=Path(member['resolved_path']).resolve(strict=True)
-            if path!=controller.location._graph_db_path:
-                raise AuthorityUnavailable('Authority reader path differs from its actual selected member')
-            self.db=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
-            self.db.execute('PRAGMA query_only=ON')
-            try:self.handle=bind_runtime_database_from_control_v3(self.db,control=control,role='graph')
-            except BaseException:self.db.close();self.db=None;raise
-            if controller.kind=='model'and self.deadline_utc is None:
-                from datetime import datetime
-                row=initial_meter.read_fixed_row(self.db,'runtime_jobs',
-                    ('bot_id','persona_id','deadline_utc','lease_expires_utc','work_kind'),'job_id=?',(request.job_id,))
-                if row is None or row[:2]!=namespace.as_tuple or row[3]is None:
-                    self.handle.close();self.db.close();self.db=None
-                    raise AuthorityUnavailable('Authority model read has no actual current original worker/job deadline')
-                self.owner_model_work_kind=row[4]
-                self.deadline_utc=min(datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()for value in row[2:4])
+        try:
+            with _bootstrap_control_quantum_v3(control)as initial_meter:
+                context=control.read_verified_current_storage_v3()
+                context.require_current('business')
+                core_handle=controller.fences.core._runtime_storage_v3
+                if (core_handle is None or core_handle.context._reader is not control
+                        or (core_handle.context.manifest_digest,core_handle.context.pointer_version)!=
+                           (context.manifest_digest,context.pointer_version)):
+                    raise AuthorityUnavailable('Authority Core and current selected Graph differ')
+                member=next(item for item in context.manifest['members']if item['role']=='graph')
+                path=Path(member['resolved_path']).resolve(strict=True)
+                if path!=controller.location._graph_db_path:
+                    raise AuthorityUnavailable('Authority reader path differs from its actual selected member')
+                self.db=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
+                self.db.execute('PRAGMA query_only=ON')
+                try:self.handle=bind_runtime_database_from_control_v3(self.db,control=control,role='graph')
+                except BaseException:self.db.close();self.db=None;raise
+                if controller.kind=='model'and self.deadline_utc is None:
+                    from datetime import datetime
+                    row=initial_meter.read_fixed_row(self.db,'runtime_jobs',
+                        ('bot_id','persona_id','deadline_utc','lease_expires_utc','work_kind'),'job_id=?',(request.job_id,))
+                    if row is None or row[:2]!=namespace.as_tuple or row[3]is None:
+                        self.handle.close();self.db.close();self.db=None
+                        raise AuthorityUnavailable('Authority model read has no actual current original worker/job deadline')
+                    self.owner_model_work_kind=row[4]
+                    self.deadline_utc=min(datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()for value in row[2:4])
+        except BaseException:
+            if self.db is not None:
+                try:
+                    if self.handle is not None:self.handle.close()
+                finally:
+                    self.db.close();self.db=None
+            raise
         if self.handle is None:
             self.db.close();self.db=None
             raise AuthorityUnavailable('Authority V3 Work requires its actual selected segmented Graph')
@@ -215,6 +223,9 @@ class AuthorityGraphReadWorkV3:
         require_numeric_result_source_bridge_v3(self)
         from .artifact_model_result_source_v3 import require_artifact_result_source_bridge_v3
         require_artifact_result_source_bridge_v3(self)
+        from .d13_authority_model_source_v3 import require_d13_result_bridge_v3,observe_d13_source_clock_v3
+        require_d13_result_bridge_v3(self,observe=True)
+        observe_d13_source_clock_v3(self)
         if self.deadline_utc is not None:
             reading=controller.clock()
             now=reading.utc_seconds+reading.utc_error_seconds if controller.kind in ('counter','habit','named_joint','foreground_mesh','owner_task_mesh') else reading
@@ -281,6 +292,8 @@ class AuthorityGraphReadWorkV3:
         release_internal_life_model_source_v3(self)
         from .artifact_model_source_read_v3 import release_artifact_model_source_v3
         release_artifact_model_source_v3(self)
+        from .d13_authority_model_source_v3 import release_d13_authority_source_v3
+        release_d13_authority_source_v3(self)
         self.closed=True;_WORKS.discard(self);_DEADLINES.pop(self,None)
         for registry,original in self.issued_capabilities:registry.pop(original,None)
         self.issued_capabilities.clear()
@@ -383,6 +396,9 @@ def read_bound_authority_graph_attachment_v3(db,*,table,columns,key_columns,key)
     if named:return True,row
     owner=_authority_attachment_owner_v3(db)
     if owner is None:return False,None
+    from .d13_authority_model_source_v3 import d13_authority_source_reader_v3,read_bound_d13_authority_point_v3
+    if d13_authority_source_reader_v3(owner)is not None:
+        return read_bound_d13_authority_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
     from ..runtime.natural_producer_qualification_v1 import _HOST_ATTACHMENT_SHAPES_V3
     from ..graph_types import AtomKey
     original_columns=tuple(columns);original_keys=dict(zip(key_columns,key))
@@ -871,6 +887,7 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
         self.internal_life_metadata_column=None
         self.habit_metadata_column=None
         self.artifact_model_metadata_column=None
+        self.d13_metadata_column=None
     def _next(self,meter):
         from ..graph_types import AtomKey
         from ..runtime_storage_v3 import begin_runtime_cell_read_v3
@@ -888,6 +905,10 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
             raise AuthorityUnavailable('Authority graph head differs from actual complete catalogue/namespace')
         self.cursor=token;self.pending=(key,revision,valid,type_name,cell)
         self.heads[token]=(revision,valid,cell)
+        from .d13_authority_model_source_v3 import d13_namespace_metadata_column_v3
+        handled,column=d13_namespace_metadata_column_v3(self.work,key,revision,valid,cell)
+        if handled:
+            self.d13_metadata_column=column;self.pending=None;return
         from .artifact_model_source_read_v3 import (artifact_model_namespace_recipe_v3,
             artifact_model_namespace_retains_type_v3,artifact_model_namespace_metadata_column_v3,
             record_artifact_namespace_header_v3)
@@ -983,6 +1004,15 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
         self.work.heads=dict(self.heads)
     def advance_v3(self,meter):
         self.work.require_current(meter=meter)
+        if self.d13_metadata_column is not None:
+            from ..runtime_contracts import canonical_digest
+            column=self.d13_metadata_column
+            if column.advance(meter):
+                atom=column.finish_metadata_v3();self.work.members[atom.key]=atom
+                self.root=canonical_digest((self.leaf_schema,self.root,column.key.token,column.revision,
+                    column.valid,column.key.type_name,column.sha256,column.cell_id,tuple(column.cell.header)))
+                self.count+=1;self.d13_metadata_column=None
+            return
         if self.artifact_model_metadata_column is not None:
             column=self.artifact_model_metadata_column
             if column.advance(meter):
@@ -1429,6 +1459,14 @@ def begin_authority_graph_read_work_v3(verifier,*,credential,subject,permit,name
 
 
 def _prepare_authority_attachment_v3(work,request):
+    from .d13_authority_model_source_v3 import d13_authority_source_reader_v3,require_d13_body_request_v3
+    if d13_authority_source_reader_v3(work)is not None:
+        require_d13_body_request_v3(work,request)
+        if request[0]in('graph_atoms','graph_history'):
+            from .life_model_original_family_read_v3 import prepare_life_model_graph_body_attachment_v3
+            return prepare_life_model_graph_body_attachment_v3(work,request)
+        from ..runtime.natural_producer_qualification_v1 import _HostProducerAttachmentV3
+        return _HostProducerAttachmentV3(work,request)
     from .original_foreground_source_read_v3 import original_foreground_work_v3,prepare_original_foreground_attachment_v3
     if original_foreground_work_v3(work)is not None:
         return prepare_original_foreground_attachment_v3(work,request)
@@ -1511,6 +1549,11 @@ def _advance_authority_local_materials_v3(work,meter):
             from .foreground_mesh_source_read_v3 import advance_foreground_mesh_materials_v3
             advance_foreground_mesh_materials_v3(work,meter)
         return
+    if work.phase=='d13_paid_source':
+        from .d13_authority_model_source_v3 import d13_authority_source_reader_v3
+        reader=d13_authority_source_reader_v3(work)
+        if reader is None:raise AuthorityUnavailable('D13 actual independent Source recipe is absent')
+        reader.advance_v3(meter);return
     if work.phase in ('numeric_model_source','numeric_result_source'):
         from .life_numeric_source_read_v3 import advance_authority_numeric_graph_materials_v3
         advance_authority_numeric_graph_materials_v3(work,meter);return
@@ -2404,6 +2447,9 @@ def begin_authority_model_graph_read_work_v3(verifier,*,model_service,credential
     work.phase='numeric_model_source' if work.owner_model_work_kind=='d06.encode_internal_life_numeric' else 'model_entry'
     from .life_numeric_source_read_v3 import register_authority_numeric_model_policy_v3
     register_authority_numeric_model_policy_v3(work)
+    if work.owner_model_work_kind=='d13.precompress.paid.v1':
+        from .d13_authority_model_source_v3 import register_d13_authority_model_phase_v3
+        register_d13_authority_model_phase_v3(work);work.phase='d13_paid_source'
     return work
 
 

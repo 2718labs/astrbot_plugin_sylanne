@@ -1,8 +1,8 @@
 """Installed D13 paid standby from real confirmed C02 turns and finite HTTP.
 
 This node assembles RuntimeContext around the donor's actual installation.
-It does not start the whole Host or enable a platform sender. The independent
-read connection below is a cold reader, not a full process restart.
+It does not start the whole Host or enable a platform sender. Selected paid
+locators are consumed by a separate process through its own formal Source Work.
 """
 import asyncio
 from dataclasses import replace
@@ -278,18 +278,33 @@ async def _run_installed_d13_paid_case(tmp_path, installed_d04_root, *, expired=
                         continue
                     if type(candidate) is dict and candidate.get("schema") == INPUT_SCHEMA:
                         inputs.append(candidate)
-            response = original_handler(request)
             if not inputs:
-                return response
+                return original_handler(request)
             assert len(inputs) == 1 and len(calls) == 0
-            calls.append(data)
+            model = bundle.model_workflows.reply
+            assert data["model"] == model.model_id
             output = {"schema": "d13.extractive_model_output.v1", "turns": [
                 {"sequence": turn["sequence"], "beat": "Keep this exact detail.", "details": []}
                 for turn in inputs[0]["turns"]]}
             assert all("Keep this exact detail." in turn["text"] for turn in inputs[0]["turns"])
-            result = response.json()
-            result["choices"][0]["message"]["content"] = json.dumps(output)
-            return httpx.Response(response.status_code, json=result)
+            calls.append(data)
+            # This endpoint declares the finite Mock usage contract, not a
+            # native or vendor tokenizer result.
+            prompt_tokens = 3 + sum(3 + (len(message["content"].encode("utf8")) + 7) // 8 for message in data["messages"])
+            completion_tokens = 5
+            response = httpx.Response(200, request=request, json={
+                "id": "finite-d13-response:1", "object": "chat.completion", "created": 1,
+                "model": model.model_id, "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": json.dumps(output)}}],
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens}})
+            if bundle.provider_billing_policy_v1 is not None:
+                from m1_artifact_draft_acceptance_support_v1 import simulated_provider_response_v1
+                configuration = case["m1_initial_configuration"]
+                assert configuration.provider_billing_policy == bundle.provider_billing_policy_v1
+                return simulated_provider_response_v1(configuration, request, response)
+            assert not selected
+            return response
 
         transport.handler = finite_response
         envelope = case["ingress"]
@@ -489,7 +504,7 @@ async def _run_installed_d13_paid_case(tmp_path, installed_d04_root, *, expired=
             if admission_only:
                 assert len(decisions) == 1 and decisions[0]["terminal_returned"], decisions
                 assert authority_checks and len(calls) == 1
-                return
+                if not selected:return
             saved, costs, block = await saved_state()
             assert saved.job.phase == "completed" and saved.next_action == "terminal"
             assert saved.evidence is not None and saved.settlement.receipt.status == "settled"
@@ -553,6 +568,18 @@ async def _run_installed_d13_paid_case(tmp_path, installed_d04_root, *, expired=
             replayed, replay_costs, replay_block = await saved_state()
             assert replayed == saved and replay_costs == costs and replay_block == block
             assert len(calls) == 1
+            if selected:
+                from beta1_fixture_phase_controller_v1 import read_current_beta1_d13_metadata_v3
+                from sylanne3.runtime_contracts import canonical_digest
+                metadata = await read_current_beta1_d13_metadata_v3(case, paid_job_id)
+                case["beta1_d13_paid_cold_locators_v4"] = dict(
+                    schema="sylanne.beta1.d13-paid-cold-locators.v4", kind="completed_paid",
+                    namespace=list(policy.namespace.as_tuple), job_id=paid_job_id,
+                    derived=derived_v6, reclaim_after_expiry=reclaim_after_expiry,
+                    original_root_deadline_utc=case["beta1_original_deadline_utc"],
+                    completed=_paid_cold_identity_v4(saved,costs,block),
+                    metadata_digest=canonical_digest(metadata))
+                return
             if reclaim_after_expiry:
                 assert derived_v6
                 from sylanne3.domains.d13.derived_block_metadata_v2 import decode_derived_block_metadata_v2
@@ -818,6 +845,16 @@ async def _expired_original(case, runtime, installation, worker, envelope, calls
         assert type(prepared) is D13PaidPreparedCallV1
         deadline = datetime.fromisoformat(saved.job.deadline_utc.replace("Z", "+00:00")).timestamp()
         assert prepared.envelope.deadline_utc == deadline
+        core_prepared = request = None
+        if selected:
+            from sylanne3.model_broker.d13_precompression import issue_unadmitted_d13_model_request_v1
+            request = issue_unadmitted_d13_model_request_v1(prepared.envelope, prepared.frozen,
+                call_id=prepared.original.binding.call_id, timeout_seconds=model.timeout_seconds,
+                privacy_tier=model.privacy_tier)
+            assert (await adapter.preflight_d13_precompression_v1(prepared.frozen)).status == 'ready'
+            core_prepared, core_permit = await executor.prepare_once(draft=prepared.draft,
+                expected_anchor=prepared.expected_anchor, request=request)
+            assert core_prepared.state == "prepared" and core_prepared.intent.request_digest == request.digest
         before = await graph_call("recover_d13_paid_precompression_v1", job_id=saved.job.job_id)
         if selected:
             from beta1_fixture_phase_controller_v1 import read_current_beta1_d13_metadata_v3
@@ -860,21 +897,43 @@ async def _expired_original(case, runtime, installation, worker, envelope, calls
                 refusals.append((type(exc).__name__, str(exc)))
                 raise
         case["model_service"]._graph_verifier._check_d13_paid = diagnosed_check
+        from sylanne3.authority_service.current_authority_graph_read_v3 import AuthorityGraphReadWorkV3
+        actual_permission = AuthorityGraphReadWorkV3._check_permission_v3
+        def diagnosed_permission(current):
+            try:
+                return actual_permission(current)
+            except Exception as exc:
+                if current.request.job_id == prepared.original.binding.job_ref:
+                    refusals.append((type(exc).__name__, str(exc)))
+                raise
+        if selected:AuthorityGraphReadWorkV3._check_permission_v3 = diagnosed_permission
         try:
-            result = await executor.execute_frozen_d13_once(
+            if selected:
+                from types import SimpleNamespace
+                terminal = await executor.execute_once(intent=core_prepared.intent,
+                    expected_anchor=prepared.expected_anchor, request=request)
+                result = SimpleNamespace(intent=core_prepared.intent, terminal=terminal)
+            else:
+                result = await executor.execute_frozen_d13_once(
                 original=prepared.original, call_original=prepared.call_original,
                 frozen=prepared.frozen, envelope=prepared.envelope, draft=prepared.draft,
                 expected_anchor=prepared.expected_anchor)
         finally:
             case["model_service"]._graph_verifier._check_d13_paid = actual_check
+            AuthorityGraphReadWorkV3._check_permission_v3 = actual_permission
         assert result is not None and result.terminal is None and calls == []
         assert result.intent.call_id == prepared.original.binding.call_id
-        replay = await executor.execute_frozen_d13_once(
-            original=prepared.original, call_original=prepared.call_original,
-            frozen=prepared.frozen, envelope=prepared.envelope, draft=prepared.draft,
-            expected_anchor=prepared.expected_anchor)
+        if selected:
+            replay = await executor.execute_once(intent=core_prepared.intent,
+                expected_anchor=prepared.expected_anchor, request=request)
+        else:
+            replay = await executor.execute_frozen_d13_once(
+                original=prepared.original, call_original=prepared.call_original,
+                frozen=prepared.frozen, envelope=prepared.envelope, draft=prepared.draft,
+                expected_anchor=prepared.expected_anchor)
         assert replay is None and calls == []
-        assert any("job is no longer current" in message for _kind, message in refusals), refusals
+        assert any(message == "Authority read exceeded its original contract deadline" or
+            "job is no longer current" in message for _kind, message in refusals), refusals
         if selected:
             after_metadata=await read_current_beta1_d13_metadata_v3(case,saved.job.job_id)
             assert after_metadata==before_metadata
@@ -898,6 +957,19 @@ async def _expired_original(case, runtime, installation, worker, envelope, calls
                 observed_trusted_utc=now,deadline_bounds=deadline_evidence,capacity=capacity,
                 d13_http_calls=len(calls),budget=after_metadata['budget'],reservation=after_metadata['reservation'])
             (tmp_path/'d13-expired-residual.json').write_text(json.dumps(evidence,indent=2)+'\n')
+            from sylanne3.runtime_contracts import canonical_digest
+            original = prepared.original
+            case["beta1_d13_paid_cold_locators_v4"] = dict(
+                schema="sylanne.beta1.d13-paid-cold-locators.v4", kind="expired_refusal",
+                namespace=list(policy.namespace.as_tuple), job_id=saved.job.job_id,
+                derived=False, reclaim_after_expiry=False,
+                original_root_deadline_utc=case["beta1_original_deadline_utc"],
+                metadata_digest=canonical_digest(after_metadata),
+                core_intent_digest=canonical_digest(core_prepared.intent), capacity=capacity,
+                original_lookup=dict(job_id=saved.job.job_id, original_operation_id=original.budget_operation_id,
+                    acquire_operation_id=original.binding.original_operation_id, call_id=original.binding.call_id,
+                    binding_digest=original.binding.binding_digest, model_request_digest=prepared.call_original.request_digest,
+                    consumer_operation_id="d13-adopt:"+original.binding.binding_digest))
             return
         after = await graph_call("recover_d13_paid_precompression_v1", job_id=saved.job.job_id)
         assert after == before
@@ -954,6 +1026,218 @@ async def _expired_original(case, runtime, installation, worker, envelope, calls
     finally:
         for retention in reversed(source_retentions):retention.release()
         await transport.close()
+
+
+def _paid_cold_identity_v4(saved, costs, block):
+    """Non-authorizing comparison locators from actual completed originals."""
+    from sylanne3.runtime_contracts import canonical_digest
+    assert saved.evidence is not None and saved.settlement.receipt.status == "settled"
+    return dict(job_id=saved.job.job_id, operation_id=saved.original.binding.original_operation_id,
+        call_id=saved.original.binding.call_id, request_digest=saved.call_original.request_digest,
+        budget_operation_id=saved.original.budget_operation_id, binding_digest=saved.original.binding.binding_digest,
+        original_digest=saved.original.original_digest, call_original_digest=saved.call_original.original_digest,
+        completed_job_digest=canonical_digest(saved.job), settlement_digest=canonical_digest(saved.settlement),
+        result_read_digest=canonical_digest(saved.evidence), costs_digest=canonical_digest(costs),
+        block_ref=saved.job.result_ref, block_digest=canonical_digest(block))
+
+
+async def verify_installed_d13_paid_cold_v4(case, locators):
+    """Run in a fresh selected consumer; locators never grant read authority."""
+    from sylanne3.runtime_contracts import canonical_digest
+    from sylanne3.runtime_storage_v3 import runtime_storage_v3
+    from beta1_fixture_phase_controller_v1 import call_current_beta1_d13_v3, read_current_beta1_d13_metadata_v3
+    assert type(locators) is dict and locators["schema"] == "sylanne.beta1.d13-paid-cold-locators.v4"
+    graph, store, bundle = case["graph"], case["store"], case["installed_bundle"]
+    policy, grant = bundle.installation_policy, case["client_grant"]
+    assert runtime_storage_v3(store._db) is not None
+    assert locators["namespace"] == list(policy.namespace.as_tuple)
+    assert locators["original_root_deadline_utc"] == case["beta1_original_deadline_utc"]
+    paid_job_id = locators["job_id"]
+    tmp_path = Path(case["m1_initial_configuration"].data_dir)
+    worker = case["phase_worker"]
+    envelope = case["ingress"]
+    configured = bundle.d13_paid_precompression
+    derived_v6, reclaim_after_expiry = locators["derived"], locators["reclaim_after_expiry"]
+    retained_reads, calls = [], []
+    transport = case["model_http_client"]._transport
+    assert type(transport) is httpx.MockTransport
+    original_handler = transport.handler
+    def no_provider(request):
+        calls.append(dict(url=str(request.url), body_digest=hashlib.sha256(request.content).hexdigest()))
+        raise AssertionError("cold D13 original recovery must not call a provider")
+    transport.handler = no_provider
+    runtime = RuntimeContext(tmp_path, package_root=case["package_root"], dependencies=None)
+    runtime._worker, runtime._v2_bootstrap, runtime._v2_port = worker, case["bootstrap"], case["port"]
+    runtime._v2_namespace_provisioned, runtime._v2_namespace = True, case["namespace"]
+    runtime._v2_model_bundle, runtime._v2_policy, runtime._v2_installation_grant = bundle, policy, grant
+    installation = V2InstallationAssembly(policy, grant, bundle.d11_signing_key, bundle.d02_signing_key,
+        lambda: case["port"], case["package_root"], tmp_path,
+        ingress_clock=bundle.ingress_clock, ingress_encoding=bundle.ingress_encoding, admin_bundle=bundle)
+    async def current(method, **kwargs):
+        value, retention = await call_current_beta1_d13_v3(case, method, retain_result=True, **kwargs)
+        retained_reads.append(retention)
+        return value
+    async def completed_state():
+        value = await current("read_current_d13_completed_paid_block_v3", job_id=paid_job_id)
+        assert value.verified is True and value.saved.job.job_id == paid_job_id
+        return value
+    async def drive():
+        return await run_installed_d13_paid_precompression_v1(runtime, installation,
+            context=case["model_context"], trusted_umo=json.loads(envelope.conversation_ref)[0],
+            envelope=envelope, ingress_operation_id=ingress_ids(envelope.lineage.source_ref)[2])
+    async def fresh_upper():
+        reading = await asyncio.to_thread(case["port"].read_ingress_clock, bundle.ingress_clock)
+        now = reading.sample.utc_seconds + reading.sample.utc_error_seconds
+        if now >= locators["original_root_deadline_utc"]:
+            raise ValueError("original Root deadline ended before independent D13 cold verification; HOLD")
+        return now
+    try:
+        cold_started_utc = await fresh_upper()
+        metadata_before = await read_current_beta1_d13_metadata_v3(case, paid_job_id)
+        assert canonical_digest(metadata_before) == locators["metadata_digest"]
+        if locators["kind"] == "expired_refusal":
+            return await _verify_expired_d13_cold_v4(case, locators, metadata_before, calls)
+        assert locators["kind"] == "completed_paid"
+        recovery = await current("recover_d13_paid_precompression_v1", job_id=paid_job_id)
+        assert recovery.job.phase == "completed" and recovery.next_action == "terminal"
+        first = await completed_state()
+        saved, costs, block = first.saved, first.costs, first.block
+        assert _paid_cold_identity_v4(saved, costs, block) == locators["completed"]
+        assert recovery == saved
+        second = await completed_state()
+        assert (second.saved, second.costs, second.block) == (saved, costs, block)
+        await drive()
+        third = await completed_state()
+        assert (third.saved, third.costs, third.block) == (saved, costs, block)
+        assert calls == []
+        assert await read_current_beta1_d13_metadata_v3(case, paid_job_id) == metadata_before
+        await fresh_upper()
+        if reclaim_after_expiry:
+            assert derived_v6
+            from sylanne3.domains.d13.derived_block_metadata_v2 import decode_derived_block_metadata_v2
+            from beta1_fixture_phase_controller_v1 import read_current_beta1_d13_metadata_v3
+            original_evidence = await read_current_beta1_d13_metadata_v3(case, paid_job_id)
+            original_metadata = original_evidence['block_metadata']
+            fields = dict(original_metadata['current_fields'])
+            token, original_revision = (original_metadata['token'], original_metadata['revision'])
+            assert fields['status'] == 'standby' and fields['job_ref'] == paid_job_id
+            assert fields['expires_at_utc'] <= block.expires_at_utc
+            block_ref, effective_expiry = (fields['block_ref'], fields['expires_at_utc'])
+            if effective_expiry >= case['beta1_original_deadline_utc']:
+                raise ValueError('signed derived expiry cannot precede original Root authority expiry; HOLD_PREPARATION')
+
+            async def lower_now():
+                reading = await asyncio.to_thread(case['port'].read_ingress_clock, bundle.ingress_clock)
+                return reading.sample.utc_seconds - reading.sample.utc_error_seconds
+            observed = await lower_now()
+            wait_path = tmp_path / 'd13-derived-original-expiry-wait.json'
+            wait_original = dict(schema='sylanne.beta1.original-expiry-wait.v3', job_id=paid_job_id, derived_block_ref=block_ref, derived_revision=original_revision, original_derived_deadline_utc=effective_expiry, original_root_deadline_utc=case['beta1_original_deadline_utc'], actual_paired_lower_utc=observed, status='WAITING_ORIGINAL_DEADLINE')
+            wait_path.write_text(json.dumps(wait_original, indent=2) + '\n')
+            while observed <= effective_expiry:
+                await asyncio.sleep(min(45.0, effective_expiry - observed + 0.05))
+                observed = await lower_now()
+            wait_original.update(actual_paired_lower_utc=observed, status='ORIGINAL_DEADLINE_OBSERVED')
+            wait_path.write_text(json.dumps(wait_original, indent=2) + '\n')
+
+            async def retire_original():
+                from beta1_fixture_phase_controller_v1 import call_current_beta1_d13_v3
+                return await call_current_beta1_d13_v3(case, 'retire_due_d13_derived_cache_v6', block_ref=block_ref, expected_revision=original_revision)
+            first_retirement = await retire_original()
+            recovered_retirement = await retire_original()
+            assert recovered_retirement == first_retirement
+            assert first_retirement['reclaim']['rows_deleted'] == 1
+            assert first_retirement['reclaim']['payload_absent'] is True
+            assert first_retirement['reclaim']['derived_cache_payload_reclaimed'] is True
+            assert first_retirement['reclaim']['scope'] == 'named_derived_store_logical_payload_only'
+            after_retirement = await read_current_beta1_d13_metadata_v3(case, paid_job_id)
+            retired_metadata = after_retirement['block_metadata']
+            retired_fields = dict(retired_metadata['current_fields'])
+            assert retired_metadata['revision'] == original_revision + 1
+            assert retired_fields['status'] == 'retired' and retired_metadata['payload_presence'] is None
+            assert len(retired_metadata['histories']) == 2
+            assert all(('timeline' not in row[-1] and 'detail_slots' not in row[-1] for row in retired_metadata['histories']))
+            assert {k: v for k, v in retired_fields.items() if k != 'status'} == {k: v for k, v in fields.items() if k != 'status'}
+            for name in ('paid_metadata', 'job_digest', 'budget', 'reservation', 'accounting_inventory'):
+                assert after_retirement[name] == original_evidence[name]
+            assert await retire_original() == first_retirement
+            assert await read_current_beta1_d13_metadata_v3(case, paid_job_id) == after_retirement
+            assert len(calls) == 0
+            (tmp_path / 'd13-v6-retirement-original.json').write_text(json.dumps({'first': first_retirement, 'recovered': recovered_retirement}, indent=2) + '\n')
+        if not reclaim_after_expiry:
+            positive_owner = None
+            positive_owner = await completed_state()
+            assert positive_owner.verified is True and positive_owner.saved.job.job_id == paid_job_id
+            assert (positive_owner.saved, positive_owner.costs, positive_owner.block) == (saved, costs, block)
+            paired = await asyncio.to_thread(case['port'].read_ingress_clock, bundle.ingress_clock)
+            positive_now = paired.sample.utc_seconds + paired.sample.utc_error_seconds
+            if positive_now >= case['beta1_original_deadline_utc']:
+                raise ValueError('original Root deadline ended before actual D13 Owner-revoke stage; HOLD')
+            revoked = await installed_owner_revoke_orchestrator_v2(graph=graph, bootstrap=case['bootstrap'], namespace=policy.namespace, graph_worker=worker, revoke_port=case['port']).revoke(operation_id='owner-revoke-d13-paid', owner_session_token=case['owner_session_token'], owner_session_request=case['owner_session_request'])
+            assert revoked.phase == 'committed' and revoked.operation.action == 'revoke'
+            from sylanne3.authority_service.contract import AuthorityUnavailable
+            from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationReceiptV1
+            fresh = await worker.call(lambda current_graph: case['port'].get_committed_owner_revoke(namespace=policy.namespace, authority_namespace=policy.authority_namespace, operation_id='owner-revoke-d13-paid'))
+            assert type(fresh) is OwnerAuthorizationReceiptV1 and fresh == revoked
+            guard = fresh.guard
+            assert fresh.phase == 'committed' and fresh.operation.action == 'revoke'
+            assert fresh.grant_revision == guard.authorization_revision == guard.minimum_revocation_revision == 2
+            assert guard.minimum_revocation_epoch == fresh.graph_access_epoch and fresh.graph_access_epoch >= 2
+            assert guard.pending_revoke_operation_id is None
+            assert guard.authorization_head != fresh.operation.expected_guard.authorization_head
+            assert (guard.authority_id, guard.installation_id, guard.namespace) == (policy.expected_authority_id, policy.installation_id, policy.namespace)
+            denials = []
+            for name, action in (('completed_paid_getter', completed_state), ('actual_d13_driver', drive)):
+                with pytest.raises(AuthorityUnavailable) as denied:
+                    await action()
+                assert type(denied.value) is AuthorityUnavailable
+                assert str(denied.value) == 'D13 original Owner authorization is unavailable'
+                denials.append(dict(entry=name, stage='current_d13_owner_guard_before_body', reason_code=type(denied.value).__name__, reason=str(denied.value)))
+            assert len(calls) == 0
+            evidence = dict(schema='sylanne.beta1.d13-owner-revoke-observations.v3', observation_status='OBSERVED_SPECIFIC_CURRENT_OWNER_REFUSAL', job_id=paid_job_id, positive_verified=positive_owner.verified, positive_paired_upper_utc=positive_now, original_root_deadline_utc=case['beta1_original_deadline_utc'], operation_id=fresh.operation.operation_id, receipt_ref=fresh.receipt_ref, authorization_head=guard.authorization_head, authorization_revision=guard.authorization_revision, minimum_revocation_revision=guard.minimum_revocation_revision, minimum_revocation_epoch=guard.minimum_revocation_epoch, grant_revision=fresh.grant_revision, graph_access_epoch=fresh.graph_access_epoch, pending_revoke_operation_id=guard.pending_revoke_operation_id, refusals=denials, mock_http_calls=len(calls))
+            (tmp_path / 'd13-owner-revoke-v3.json').write_text(json.dumps(evidence, indent=2) + '\n')
+
+        assert calls == []
+        final_metadata = await read_current_beta1_d13_metadata_v3(case, paid_job_id)
+        financial_names = ("paid_metadata", "job_digest", "budget", "reservation", "accounting_inventory")
+        for name in financial_names:
+            assert final_metadata[name] == metadata_before[name]
+        return dict(schema="sylanne.beta1.d13-paid-cold-result.v4", kind=locators["kind"],
+            job_id=paid_job_id, actual_original_match=True, completed=_paid_cold_identity_v4(saved,costs,block),
+            provider_calls=0, pre_post_costs_equal=True,
+            financial_digest=canonical_digest({name:final_metadata[name] for name in financial_names}),
+            cold_started_utc=cold_started_utc,
+            original_root_deadline_utc=locators["original_root_deadline_utc"],
+            postcondition="named_derived_expiry_lost_ack" if reclaim_after_expiry else "actual_owner_revoke")
+    finally:
+        transport.handler = original_handler
+        for retention in reversed(retained_reads):
+            retention.release()
+
+
+async def _verify_expired_d13_cold_v4(case, locators, metadata_before, calls):
+    """Read the same durable refused Core original; never prepare/admit it."""
+    from sylanne3.runtime.c02_cost_settlement import C02OriginalIntentLookupV1
+    from sylanne3.authority_service.v2_model_egress_contract import ModelEgressDraftV1
+    from sylanne3.runtime_contracts import canonical_digest
+    from beta1_fixture_phase_controller_v1 import read_current_beta1_d13_metadata_v3
+    bundle, client = case["installed_bundle"], case["authority_client"]
+    policy, grant = bundle.installation_policy, case["client_grant"]
+    lookup = C02OriginalIntentLookupV1(namespace=policy.namespace,
+        authority_id=grant.authority_id, authority_namespace=policy.authority_namespace,
+        installation_id=policy.installation_id, **locators["original_lookup"])
+    intent = await client.model_original_intent_lookup_v1(bundle, grant, lookup=lookup)
+    assert canonical_digest(intent) == locators["core_intent_digest"]
+    anchor = await asyncio.to_thread(case["port"].current_anchor,
+        namespace=policy.namespace, authority_namespace=policy.authority_namespace)
+    capacity = await client.model_capacity_reconcile_v1(bundle, grant,
+        expected_anchor=anchor, draft=ModelEgressDraftV1.from_intent(intent), close_prepared=False)
+    assert capacity["status"] == "not_dispatched"
+    assert capacity["selected_admission_count"] == capacity["selected_observation_count"] == 0
+    assert canonical_digest(capacity) == canonical_digest(locators["capacity"])
+    assert calls == [] and await read_current_beta1_d13_metadata_v3(case, locators["job_id"]) == metadata_before
+    return dict(schema="sylanne.beta1.d13-paid-cold-result.v4", kind="expired_refusal",
+        job_id=locators["job_id"], core_intent_digest=canonical_digest(intent),
+        durable_not_dispatched=True, capacity=capacity, provider_calls=0, pre_post_costs_equal=True)
 
 
 @pytest.mark.asyncio
