@@ -1591,7 +1591,7 @@ class _CommandIngressMetadataV3:
          or provenance['initiating_self']!=r.evidence.current_self.self_entity_ref):raise AuthorityUnavailable('Ingress C04 native prepared/Root/C03 bridge differs')
         self.c04=p;self._versions(tuple(GraphVersion(AtomKey.from_token(ref),revision)for ref,revision in p.read_versions))
         self.tasks.append(('c04_quote',_CommandIngressRowV3(self,'quote','runtime_resource_quotes','quote',(binding.resource_quote_ref,binding.resource_quote_version))))
-    
+
 def _finish(self):
     s=self.state;m=s.metadata
     for ref in self.roots:
