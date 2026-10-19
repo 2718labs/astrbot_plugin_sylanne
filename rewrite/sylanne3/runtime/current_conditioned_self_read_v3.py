@@ -116,6 +116,9 @@ from .conditioned_producer_source_metadata_v3 import(
 
 
 def retain_conditioned_metadata_path_v3(task,path):
+    from .current_conditioned_personal_choice_v3 import choice_metadata_retain_v3
+    retained=choice_metadata_retain_v3(task,path)
+    if retained is not None:return retained
     from .conditioned_producer_source_metadata_v3 import retain_conditioned_business_locator_path_v3
     return retain_conditioned_business_locator_path_v3(task.identity,path)
 
@@ -123,6 +126,11 @@ def conditioned_metadata_spec_v3(reader,identity):
     state=require_conditioned_self_work_v3(reader)
     if identity not in state.selectors:raise AuthorityUnavailable('conditioned locator was not selected by its actual recipe')
     kind,value=identity
+    if kind in {'personal_choice_life','personal_choice_policy'}:
+        from .current_conditioned_personal_choice_v3 import choice_signed_metadata_spec_v3
+        spec=choice_signed_metadata_spec_v3(reader,identity)
+        if spec is None:raise AuthorityUnavailable('personal choice signed metadata has no actual locator')
+        return spec
     if kind=='root_grant':
         lease_id,version=value
         policy=reader.graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle.installation_policy
@@ -199,6 +207,9 @@ def finish_conditioned_metadata_v3(task,value):
     from .dispatch_current_inventory_v3 import _freeze_value_v3
     state=require_conditioned_self_work_v3(task.reader);reader=task.reader
     kind,selected=task.identity
+    if kind in {'personal_choice_life','personal_choice_policy'}:
+        from .current_conditioned_personal_choice_v3 import finish_choice_signed_metadata_v3
+        return finish_choice_signed_metadata_v3(task,value)
     if kind=='root_grant':
         from .issuers import BudgetLeaseGrant
         raw=dict(value);raw['allowed_work_kinds']=tuple(raw['allowed_work_kinds']);grant=BudgetLeaseGrant(**raw)
@@ -371,6 +382,8 @@ def require_conditioned_body_v3(reader,table,key):
     cap=state.source_permission
     if cap is None:raise AuthorityUnavailable('conditioned protected body requires complete current all-parent Source EOF')
     cap.require_for_v3(reader)
+    from .current_conditioned_personal_choice_v3 import require_personal_choice_c1_body_v3
+    if require_personal_choice_c1_body_v3(reader,table,key):return
     if table in {'graph_atoms','graph_history'}:
         atom=AtomKey.from_token(key[0])
         if table=='graph_history':selected=(atom.token,key[1])in state.allowed_history
@@ -386,6 +399,8 @@ def require_conditioned_point_v3(reader,request):
     state=require_conditioned_self_work_v3(reader)
     table,columns,key_columns,key=request
     if len(key)!=len(key_columns):raise AuthorityUnavailable('conditioned attachment requires its full registered point key')
+    from .current_conditioned_personal_choice_v3 import require_personal_choice_c1_point_v3
+    if require_personal_choice_c1_point_v3(reader,request):return
     if table in {'graph_atoms','graph_history'}:
         atom=AtomKey.from_token(key[0])
         if NamespaceId.from_key(atom)!=reader.namespace:raise AuthorityUnavailable('conditioned point crossed namespace')
@@ -449,6 +464,8 @@ def require_prediction_original_sequence_v3(db,read,prediction,prediction_origin
 
 
 def release_conditioned_self_work_v3(reader):
+    from .current_conditioned_personal_choice_v3 import release_personal_choice_reader_v3
+    release_personal_choice_reader_v3(reader)
     _WRITES.pop(reader,None)
     _CONDITIONED_CHILD_TARGETS_V3.pop(reader,None)
     _CONDITIONED_CHILD_SELECTORS_V3.pop(reader,None)
@@ -464,6 +481,8 @@ def release_conditioned_self_work_v3(reader):
         locator=reader.conditioned_cause_locator
         _CONDITIONED_LOCATOR_READERS_V3.pop(locator,None);_CONDITIONED_CHILD_LOCATORS_V3.pop(locator,None)
         _CONDITIONED_SCOPE_TRANSITIONS_V3.pop(locator,None)
+        from .current_conditioned_personal_choice_v3 import release_personal_choice_locator_v3
+        release_personal_choice_locator_v3(locator)
 
 
 class InstalledConditionedSelfReadersV1:
@@ -638,6 +657,8 @@ def read_plan_current_conditioned_self_v1(db,namespace,activity_id,operation_kin
             or not reader.graph_eof):
         raise AuthorityUnavailable('conditioned plan requires its actual completed header census and own installed reader')
     state=require_conditioned_owner_ready_v3(reader)
+    from .current_conditioned_personal_choice_v3 import personal_choice_locator_for_reader_v3,seed_personal_choice_plan_v3
+    personal_choice=personal_choice_locator_for_reader_v3(reader)
     types=_READ_FAMILIES_V3[operation_kind]
     if operation_kind==CONDITIONED_SELF_READ_KIND_V4:
         types=tuple(name for name in types if name not in {'d01.conditioned_capability_revision.v1',
@@ -648,6 +669,7 @@ def read_plan_current_conditioned_self_v1(db,namespace,activity_id,operation_kin
         state.required_domain_producers.add(request.prepared_candidates_operation_id)
         producer=conditioned_metadata_v3(db,namespace,('producer',request.prepared_candidates_operation_id))
         if producer is None:raise MissingProductionOriginalV1('actual_conditioned_personal_prepared_producer')
+        types=seed_personal_choice_plan_v3(reader,types)
     if reader.session_proof is None and type(reader.conditioned_cause_locator)is _ConditionedChildLocatorReaderV3:
         prepared=reader.conditioned_cause_locator.prepared_targets
         prepared.require_for_v3(reader.graph,prepared.bootstrap,prepared.bundle)
@@ -655,7 +677,7 @@ def read_plan_current_conditioned_self_v1(db,namespace,activity_id,operation_kin
         for version in _metadata_versions_v3(prepared.target_census['read_versions']):
             state.selected_keys.add(version.key)
             if version.revision:state.allowed_history.add((version.key.token,version.revision))
-    if reader.session_proof is None:
+    if reader.session_proof is None and personal_choice is None:
         disposition=prepare_current_conditioned_disposition_metadata_v3(reader)
         if disposition is not None:
             state.adoption_operations.add(disposition['first_child_operation_id'])
@@ -984,6 +1006,8 @@ class _ConditionedReadResultV3:
 
 
 def advance_current_conditioned_self_read_v3(graph,work):
+    from .current_conditioned_personal_choice_v3 import is_personal_choice_locator_v3,advance_personal_choice_locator_v3
+    if is_personal_choice_locator_v3(work.state):return advance_personal_choice_locator_v3(graph,work)
     if type(work.state)in {_ConditionedFollowupLocatorReaderV3,_ConditionedChildLocatorReaderV3}:return _advance_conditioned_locator_work_v3(graph,work)
     from .current_method_learning_read_v3 import(advance_current_method_learning_read_v3,_READING,
         bind_prepared_method_learning_read_v3,MethodInputNeededV3,_MethodPointReadV3,_MethodInventoryReadV3,
@@ -1006,6 +1030,8 @@ def advance_current_conditioned_self_read_v3(graph,work):
         require_current_conditioned_self_read_identity_v3(reader)
         graph._validate_read_fence_v3(reader.fence)
         if reader.operation_kind not in {CONDITIONED_SELF_READ_KIND_V4,_CONDITIONED_FOLLOWUP_READ_KIND_V3}:
+            from .current_conditioned_personal_choice_v3 import personal_choice_locator_for_reader_v3,advance_personal_choice_source_v3
+            if personal_choice_locator_for_reader_v3(reader)is not None:return advance_personal_choice_source_v3(graph,work)
             return advance_current_method_learning_read_v3(graph,work)
         if not reader.inventory_sealed:
             with reader.store._lock:reader.advance()
@@ -1064,6 +1090,8 @@ def advance_current_conditioned_self_read_v3(graph,work):
 
 
 def finish_current_conditioned_self_read_v3(graph,work,error):
+    from .current_conditioned_personal_choice_v3 import is_personal_choice_locator_v3,finish_personal_choice_locator_v3
+    if is_personal_choice_locator_v3(work.state):return finish_personal_choice_locator_v3(graph,work,error)
     reader=work.state
     if type(reader)in {_ConditionedFollowupLocatorReaderV3,_ConditionedChildLocatorReaderV3}:
         from ..runtime_storage_v3 import finish_runtime_storage_operation_v3
@@ -2119,7 +2147,9 @@ def _conditioned_inline_choice_original_v3(reader):
     from ..domains.d08.personal_candidate_v1 import PreparedPersonalCandidateSetV1
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     state=require_conditioned_owner_ready_v3(reader)
-    if(reader.operation_kind!='select_current_conditioned_personal_step_v1'or reader.session_proof is None
+    from .current_conditioned_personal_choice_v3 import personal_choice_locator_for_reader_v3,require_personal_choice_original_v3
+    personal_choice=personal_choice_locator_for_reader_v3(reader)
+    if(reader.operation_kind!='select_current_conditioned_personal_step_v1'or reader.session_proof is None and personal_choice is None
             or reader.read_finished or reader.inputs_sealed or state.output_phase!='complete'):
         raise AuthorityUnavailable('conditioned inline choice needs its actual unsealed completed prepared-candidate Source Work')
     require_conditioned_sources_v3(reader,reader.selected_plan.source_roots)
@@ -2131,6 +2161,7 @@ def _conditioned_inline_choice_original_v3(reader):
             or prepared.parent_budget_lease_ref!=reader.parent_budget_lease_ref
             or prepared.plan_head.key.token!=reader.request.plan_ref or prepared.goal_head.key.token!=reader.request.goal_ref):
         raise AuthorityUnavailable('conditioned inline choice changed its frozen prepared namespace, selection or original Root')
+    require_personal_choice_original_v3(reader,original,prepared)
     return original,prepared
 
 
@@ -2148,6 +2179,8 @@ def _finalize_conditioned_inline_choice_v3(reader):
     if reader in _CONDITIONED_CHILD_SELECTORS_V3:
         prepare_current_conditioned_attempt_metadata_v3(reader);return
     original,prepared=_conditioned_inline_choice_original_v3(reader)
+    from .current_conditioned_personal_choice_v3 import restore_personal_choice_selector_v3
+    if restore_personal_choice_selector_v3(reader):return
     root_lease,grant_id,grant_version,grant_digest,deadline=conditioned_current_root_locator_v3(reader)
     cap=require_conditioned_sources_v3(reader,reader.selected_plan.source_roots)
     selector=ConditionedChildSelectorV1(namespace=reader.namespace,
@@ -2171,7 +2204,8 @@ def finalize_current_conditioned_source_inputs_v3(reader):
     state=require_conditioned_owner_ready_v3(reader)
     locator=reader.conditioned_cause_locator if reader.session_proof is None else None
     if type(locator)is not _ConditionedChildLocatorReaderV3:
-        if reader.operation_kind=='select_current_conditioned_personal_step_v1'and reader.session_proof is not None:
+        from .current_conditioned_personal_choice_v3 import personal_choice_locator_for_reader_v3
+        if reader.operation_kind=='select_current_conditioned_personal_step_v1'and(reader.session_proof is not None or personal_choice_locator_for_reader_v3(reader)is not None):
             return _finalize_conditioned_inline_choice_v3(reader)
         return
     if reader in _CONDITIONED_CHILD_SELECTORS_V3:

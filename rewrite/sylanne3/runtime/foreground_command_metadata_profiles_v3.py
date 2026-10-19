@@ -1,0 +1,70 @@
+"""Explicit metadata census contracts for installed foreground commands.
+
+These profiles name the registered planners' bounded query families. They grant
+no Body access; the actual reader still completes its own Owner, producer and
+Source ALL. Verified preparation coverage can add its own declared families.
+"""
+
+_FAMILIES_V3 = {
+    'acquire_foreground_cycle': (),
+    'acquire_ingress_recall_model_v1': (),
+    'activate_artifact_task_project_checkpoint_v1': ('d10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),
+    'activate_artifact_task_project_checkpoint_v2': (),
+    'adopt_artifact_draft_content': ('d08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd10.life_project.v1', 'd10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),
+    'adopt_artifact_draft_content_v2': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd10.project_checkpoint.v1', 'runtime.job'),
+    'adopt_current_task_no_search_v1': ('d03.account_binding', 'd03.entity_anchor', 'd05.boundary_rule', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'adopt_ingress_c04_v1': (),
+    'adopt_ingress_recall_model_v1': (),
+    'adopt_personal_candidate_eligibility_v1': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'advance_life': ('d01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd02.settlement.v1', 'd03.entity_anchor', 'd03.role_binding', 'd03.self_identity_mapping.v1', 'd05.boundary_rule', 'd07.attention_ticket.v1', 'd07.focus.v1', 'd08.action_cancellation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.action_schema.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd12.active_scheme_head.v1'),
+    'await_existing_artifact_revision_v1': ('d08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd10.life_project.v1', 'd10.project_checkpoint.v1', 'd10.project_work_version.v1'),
+    'checkpoint_foreground_cycle': (),
+    'checkpoint_foreground_cycle_v2': (),
+    'checkpoint_source_note_foreground_cycle_v1': (),
+    'compose_artifact_goal_plan': ('d01.method_scoped_trial.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'create_artifact_project': ('d01.method_scoped_trial.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'create_artifact_task_plan_v1': (),
+    'create_artifact_task_project_v1': (),
+    'create_foreground_cycle': (),
+    'create_foreground_cycle_v2': (),
+    'create_source_note_foreground_cycle_v1': (),
+    'derive_artifact_completion_receipt_v1': (),
+    'derive_ingress_artifact_task_scope_v1': (),
+    'evaluate_values': ('d01.growth_contribution.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd01.persona_revision.v1', 'd02.settlement.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'runtime.cost_settlement'),
+    'finish_artifact_receipt_cycle_v1': (),
+    'initialize_artifact_task_project_checkpoint_v1': ('d10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),
+    'initialize_project_checkpoint': ('d10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),
+    'input:freeze_artifact_candidate_preparation_v1': (),
+    'input:freeze_values': ('d01.persona_activation.v1', 'd01.persona_plan.v1', 'd03.role_binding', 'd03.world_event', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.goal.v1', 'd08.personal_plan.v1'),
+    'input:register_artifact_draft_plan_v3': ('d01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd02.settlement.v1', 'd03.entity_anchor', 'd03.role_binding', 'd03.self_identity_mapping.v1', 'd05.boundary_rule', 'd07.attention_ticket.v1', 'd07.focus.v1', 'd08.action_cancellation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.action_schema.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd12.active_scheme_head.v1'),
+    'input:register_artifact_phase_postcondition_policy_v1': (),
+    'input:register_artifact_task_text_extent': (),
+    'input:register_life_outcome_v2': ('d01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd02.settlement.v1', 'd03.entity_anchor', 'd03.role_binding', 'd03.self_identity_mapping.v1', 'd05.boundary_rule', 'd07.attention_ticket.v1', 'd07.focus.v1', 'd08.action_cancellation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.action_schema.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd12.active_scheme_head.v1'),
+    'observe_artifact_phase_postconditions_v1': (),
+    'prepare_artifact_draft_project_context': ('d12.active_scheme_head.v1',),
+    'prepare_artifact_phase_observation_v1': (),
+    'prepare_ingress_c04_v1': (),
+    'prepare_ingress_recall_model_v1': ('d02.reservation.v1',),
+    'prepare_ingress_recall_need_v1': ('d03.account_binding', 'd03.entity_anchor', 'd05.boundary_rule', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'prepare_personal_candidate_eligibility_v1': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'prepare_personal_candidates_v1': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'prepare_selected_source_note_action_v2': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd07.focus.v1', 'd08.action_cancellation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.action_schema.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd12.active_scheme_head.v1'),
+    'propose_artifact_draft_action': ('d01.method_scoped_trial.v1', 'd03.entity_anchor', 'd03.role_binding', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.action_schema.v1', 'd08.commitment.v1', 'd12.active_scheme_head.v1'),
+    'register_artifact_phase_postcondition_contract_v1': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'register_artifact_task_milestone_v2': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd10.project_checkpoint.v1', 'runtime.job'),
+    'revise_artifact_task_plan_v2': (),
+    'revise_existing_artifact_v1': ('d08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd10.life_project.v1', 'd10.project_work_version.v1'),
+    'select_existing_artifact_continuation_v1': ('d08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd10.life_project.v1', 'd10.project_work_version.v1'),
+    'select_ingress_recall_seed_v1': (),
+    'select_personal_step_v2': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'serve_concern': ('d02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd07.attention_ticket.v1', 'd07.concern_round.v1', 'd07.focus.v1', 'd07.reflection_checkpoint.v1', 'd07.working_set.v1'),
+    'settle_personal_goal': ('d01.method_scoped_trial.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1'),
+    'settle_project_checkpoint': ('d10.project_checkpoint.v1', 'd10.project_work_version.v1'),
+    'verify_artifact_draft_phase_v2': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd10.project_checkpoint.v1', 'runtime.job'),
+    'wake_artifact_draft_cycle_v1': ('d08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd08.goal.v1', 'd10.life_project.v1', 'd10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),
+    'wake_artifact_draft_cycle_v2': ('d01.method_experiment_plan.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.body_profile.v1', 'd02.body_state.v1', 'd02.reservation.v1', 'd03.account_binding', 'd03.entity_anchor', 'd03.role_binding', 'd05.boundary_rule', 'd05.dimension_estimate.v2', 'd07.attention_ticket.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'd08.action_outcome.v1', 'd08.commitment.v1', 'd10.project_checkpoint.v1', 'runtime.job'),
+}
+
+
+def foreground_command_metadata_families_v3(operation_kind):
+    return frozenset(_FAMILIES_V3[operation_kind])

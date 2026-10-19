@@ -24,7 +24,9 @@ def _actual_v3(reader):
     from ..host.authority_profile import AdminInstallationBundle
     from ..host.v2_fence_port import V2FencePort
     from .owner_location_read_v3 import _require_owner_operation_v3
-    state=require_artifact_borrowed_owner_reader_v3(reader)
+    from ..runtime.foreground_command_source_v3 import is_foreground_command_source_reader_v3,require_foreground_command_owner_reader_v3
+    state=(require_foreground_command_owner_reader_v3(reader)if is_foreground_command_source_reader_v3(reader)
+        else require_artifact_borrowed_owner_reader_v3(reader))
     if type(reader)is not BorrowedMethodLearningReadV3 or type(reader.issued)is not _IssuedForegroundActivityV1:
         raise AuthorityUnavailable('Artifact Owner17 requires actual private Borrowed Foreground input')
     graph=reader.graph;scope=reader.issued.scope

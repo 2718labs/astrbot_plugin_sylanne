@@ -418,47 +418,39 @@ def stage_derive_ingress_artifact_task_scope_v1(db,*,frame,request,installed_rea
     return IngressArtifactTaskScopeStageV1(primary,goals,amendment_stage)
 
 
-def record_task_scope_after_commit_v1(db,*,graph,issued,frame,receipt,issuer):
+def record_task_scope_after_commit_v1(db, *, graph, issued, frame, receipt, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from .domain_production_contracts_v1 import ProductionOutboxStageV1
-    request=DeriveIngressArtifactTaskScopeRequestV1(issued.request.c02_operation_id,issued.request.cue_source_ref)
-    # The initial Goal has now been committed. Reuse the exact before-CAS candidate
-    # retained in the W01 original, never rerun current active-task selection after writing it.
-    original=read_adopted_domain_operation_v1(db,frame.envelope.authority.namespace,receipt.operation_id)
-    if original is None or (original["domain"],original["operation_kind"])!=("d10",OPERATION):
-        raise ValueError("task scope lacks the actual same-transaction W01 producer")
-    p=original["payload"]["provenance"]
-    scope=_decode(p["artifact_task_scope"],IngressArtifactTaskScopeOriginalV1)
-    objective=None if p["artifact_task_objective"] is None else _decode(p["artifact_task_objective"],ArtifactTaskObjectiveV1)
-    if (scope.root!=issued.evidence.root_capability or scope.c02_operation_id!=request.c02_operation_id
-            or scope.source_ref!=request.source_ref or scope.namespace!=frame.envelope.authority.namespace):
-        raise ValueError("task producer differs from its actual private scope issuance")
-    values=[("draft_root_capability",scope.root.registration_ref,scope.root),
-        (SCOPE_KIND,task_scope_ref_v1(scope.root.registration_ref),scope)]
-    if scope.task_kind=="draft_then_corrected_revision":
-        values.append((OBJECTIVE_KIND,task_objective_ref_v1(objective),objective))
+    request = DeriveIngressArtifactTaskScopeRequestV1(issued.request.c02_operation_id, issued.request.cue_source_ref)
+    original = read_adopted_domain_operation_v1(db, frame.envelope.authority.namespace, receipt.operation_id)
+    if original is None or (original['domain'], original['operation_kind']) != ('d10', OPERATION):
+        raise ValueError('task scope lacks the actual same-transaction W01 producer')
+    p = original['payload']['provenance']
+    scope = _decode(p['artifact_task_scope'], IngressArtifactTaskScopeOriginalV1)
+    objective = None if p['artifact_task_objective'] is None else _decode(p['artifact_task_objective'], ArtifactTaskObjectiveV1)
+    if scope.root != issued.evidence.root_capability or scope.c02_operation_id != request.c02_operation_id or scope.source_ref != request.source_ref or (scope.namespace != frame.envelope.authority.namespace):
+        raise ValueError('task producer differs from its actual private scope issuance')
+    values = [('draft_root_capability', scope.root.registration_ref, scope.root), (SCOPE_KIND, task_scope_ref_v1(scope.root.registration_ref), scope)]
+    if scope.task_kind == 'draft_then_corrected_revision':
+        values.append((OBJECTIVE_KIND, task_objective_ref_v1(objective), objective))
     if type(scope) is IngressArtifactTaskScopeOriginalV3:
         from .artifact_task_continuation_authorization_v2 import KIND as CONTINUATION_KIND
-        values.append((CONTINUATION_KIND,scope.continuation_authorization.original_ref,scope.continuation_authorization))
-    if scope.task_kind=="continue":
-        from .artifact_task_amendment_v1 import amendment_from_scope_v1,amendment_original_ref_v1,require_amendment_history_v1,KIND
-        amendment=amendment_from_scope_v1(scope,objective)
-        require_amendment_history_v1(db,value=amendment,producer=original,scope=scope,objective=objective)
-        values.append((KIND,amendment_original_ref_v1(amendment),amendment))
-    result=tuple(_record(db,issuer=issuer,namespace=scope.namespace,kind=kind,ref=ref,
-        operation_id=receipt.operation_id,value=value) for kind,ref,value in values)
-    root=result[0]
-    event=ProductionOutboxStageV1(scope.namespace,receipt.operation_id,"d11","artifact_draft_root_registered",root)
-    db.execute("INSERT INTO graph_domain_production_outbox_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (*scope.namespace.as_tuple,event.dedupe_key,receipt.operation_id,"d11",event.event_kind,
-            root.original_ref,root.original_digest,"pending",None,None))
-    if scope.task_kind=="continue":
+        values.append((CONTINUATION_KIND, scope.continuation_authorization.original_ref, scope.continuation_authorization))
+    if scope.task_kind == 'continue':
+        from .artifact_task_amendment_v1 import amendment_from_scope_v1, amendment_original_ref_v1, require_amendment_history_v1, KIND
+        amendment = amendment_from_scope_v1(scope, objective)
+        require_amendment_history_v1(db, value=amendment, producer=original, scope=scope, objective=objective)
+        values.append((KIND, amendment_original_ref_v1(amendment), amendment))
+    result = tuple((record_foreground_writer_life_v3(db, issuer=issuer, namespace=scope.namespace, kind=kind, ref=ref, operation_id=receipt.operation_id, value=value, recorder=record_task_scope_after_commit_v1, frame=frame, actual_receipt=receipt) for kind, ref, value in values))
+    root = result[0]
+    event = ProductionOutboxStageV1(scope.namespace, receipt.operation_id, 'd11', 'artifact_draft_root_registered', root)
+    db.execute('INSERT INTO graph_domain_production_outbox_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)', (*scope.namespace.as_tuple, event.dedupe_key, receipt.operation_id, 'd11', event.event_kind, root.original_ref, root.original_digest, 'pending', None, None))
+    if scope.task_kind == 'continue':
         from .artifact_task_wait_consumer_v1 import consume_task_wait_after_scope_cas_v1
-        consume_task_wait_after_scope_cas_v1(db,scope=scope,objective=objective,receipt=receipt)
-        amendment_original=result[-1]
-        event=ProductionOutboxStageV1(scope.namespace,receipt.operation_id,"d10","artifact_task_amendment_adopted",amendment_original)
-        db.execute("INSERT INTO graph_domain_production_outbox_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (*scope.namespace.as_tuple,event.dedupe_key,receipt.operation_id,"d10",event.event_kind,
-                amendment_original.original_ref,amendment_original.original_digest,"pending",None,None))
+        consume_task_wait_after_scope_cas_v1(db, scope=scope, objective=objective, receipt=receipt)
+        amendment_original = result[-1]
+        event = ProductionOutboxStageV1(scope.namespace, receipt.operation_id, 'd10', 'artifact_task_amendment_adopted', amendment_original)
+        db.execute('INSERT INTO graph_domain_production_outbox_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)', (*scope.namespace.as_tuple, event.dedupe_key, receipt.operation_id, 'd10', event.event_kind, amendment_original.original_ref, amendment_original.original_digest, 'pending', None, None))
     return result
 
 

@@ -239,12 +239,15 @@ def read_plan_artifact_draft_content_adoption_v1(db,*,namespace,request):
         access_key(*namespace.as_tuple,ids["source"])),base.source_roots,(*base.required_original_refs,ids["paid"],ids["result"]))
 
 
-def record_artifact_draft_content_after_cas_v1(db,*,stage,receipt,installed_readers):
+def record_artifact_draft_content_after_cas_v1(db, *, stage, receipt, installed_readers):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from ..host.installed_d11_life_build_v1 import read_installed_d11_life_build_v1
-    if type(stage) not in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2} or receipt.operation_id!=stage.frame.envelope.identity.operation_id:
-        raise TypeError("C4 content original requires the actual same-transaction CAS receipt")
-    read=CurrentDomainReadV1(stage.frame);read.committed_operation(db,receipt.operation_id)
-    p,f=stage.prepared,stage.frozen;ids=_artifact_model_ids(p)
+    if type(stage) not in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2} or receipt.operation_id != stage.frame.envelope.identity.operation_id:
+        raise TypeError('C4 content original requires the actual same-transaction CAS receipt')
+    read = CurrentDomainReadV1(stage.frame)
+    read.committed_operation(db, receipt.operation_id)
+    p, f = (stage.prepared, stage.frozen)
+    ids = _artifact_model_ids(p)
     phase = _artifact_model_phase_v2(p)
     task_selector = p.selector.task if phase else p.selector
     adoption_type = ArtifactDraftContentAdoptionV2 if phase else ArtifactDraftContentAdoptionV1
@@ -254,38 +257,40 @@ def record_artifact_draft_content_after_cas_v1(db,*,stage,receipt,installed_read
         _, chosen, _ = _read_artifact_phase_selected_originals_v2(db, selector=p.selector, issuer=installed_readers.issuer)
         if type(chosen.binding) not in {ArtifactPhaseCandidateBindingV2, ArtifactPhaseCandidateBindingV3}:
             raise MissingProductionOriginalV1('actual_registered_whole_method_extent')
-        metadata = dict(extent=f.extent, full_extent=chosen.binding.full_extent,
-            extent_original_ref=chosen.binding.extent_original_ref, extent_original_digest=chosen.binding.extent_original_digest)
-    sk=source_key(*p.namespace.as_tuple,stage.source.source_id)
-    revisions={v.key.token:v.revision for v in receipt.write_versions}
-    actual=db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",(sk.token,)).fetchone()
-    if actual!=(revisions.get(sk.token),canonical_serialize(stage.source.to_dict()),1):
-        raise ValueError("C4 authored Source is not a real member of this adoption CAS")
+        metadata = dict(extent=f.extent, full_extent=chosen.binding.full_extent, extent_original_ref=chosen.binding.extent_original_ref, extent_original_digest=chosen.binding.extent_original_digest)
+    sk = source_key(*p.namespace.as_tuple, stage.source.source_id)
+    revisions = {v.key.token: v.revision for v in receipt.write_versions}
+    from .foreground_command_writer_outputs_v3 import read_bound_foreground_writer_point_v3,read_foreground_writer_life_output_refs_v3
+    own,actual=read_bound_foreground_writer_point_v3(db,table='graph_atoms',columns=('revision','value','valid'),
+        key_columns=('token',),key=(sk.token,))
+    if not own:
+        actual = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?', (sk.token,)).fetchone()
+    if actual != (revisions.get(sk.token), canonical_serialize(stage.source.to_dict()), 1):
+        raise ValueError('C4 authored Source is not a real member of this adoption CAS')
     from .d11_types import job_graph_write
-    jw=job_graph_write(stage.after_job)
-    if db.execute("SELECT value,valid FROM graph_atoms WHERE token=?",(jw.key.token,)).fetchone()!= (canonical_serialize(jw.value),1):
-        raise ValueError("C4 completed job is not in the same actual authored Source CAS")
-    scope_rows=db.execute("SELECT original_ref FROM "+TABLE+" WHERE bot=? AND persona=? AND kind='activity_scope' AND producing_operation_id=? LIMIT 2",
-        (*p.namespace.as_tuple,receipt.operation_id)).fetchall()
-    if len(scope_rows)!=1:raise MissingProductionOriginalV1("actual_self_foreground_scope_recorded_in_c4_adoption_CAS")
-    scope_raw=_read(db,issuer=installed_readers.issuer,namespace=p.namespace,kind="activity_scope",ref=scope_rows[0][0])
-    scope=draft_from_wire_v1(scope_raw[0],DraftActivityScopeV1)
-    task=next(s for s in f.sources if s.ref==f.task_source_ref)
-    if (scope.actor_ref,scope.source.ref,scope.c02_original_ref,scope.root_registration_ref,scope.parent_budget_lease_ref)!= (
-            p.actor_ref,f.task_source_ref,task_selector.c02_operation_id,f.target.root_registration_ref,p.parent_budget_lease_ref):
-        raise ValueError("C4 adopted activity scope belongs to another actual task/root/self")
-    paid=_read(db,issuer=installed_readers.issuer,namespace=p.namespace,kind=_artifact_model_original_kind(p,"paid"),ref=ids["paid"])
-    runtime=installed_readers.model_runtime
-    build=read_installed_d11_life_build_v1(runtime.authority_client._package_root,p.manifest_digest,recipe_id="artifact_draft_v1")
-    content_ref=LifeInputRefV1(sk.token,actual[0],canonical_digest(stage.source.to_dict()))
-    content=FrozenDraftContentV1(content_ref,stage.output.content_digest,len(stage.source.text.encode()),
-        (sk.token,*(s.ref for s in f.sources)))
-    adopted=adoption_type(p.selector,p.digest,content,f.target,
-        LifeInputRefV1(task.ref,task.revision,task.value_digest),stage.source.recorded_at,
-        ids["paid"],canonical_digest(paid[0]),ids["result"],stage.result_digest,stage.terminal_digest,
-        scope_rows[0][0],canonical_digest(scope_raw[0]),p.deadline_utc,build["algorithm_build_digest"],
-        build["postcondition_build_digest"],receipt.operation_id, **metadata)
-    return _record(db,issuer=installed_readers.issuer,namespace=p.namespace,kind=_artifact_model_original_kind(p,"adopted"),ref=ids["adopt"],operation_id=receipt.operation_id,value=adopted)
+    jw = job_graph_write(stage.after_job)
+    own,job_row=read_bound_foreground_writer_point_v3(db,table='graph_atoms',columns=('value','valid'),
+        key_columns=('token',),key=(jw.key.token,))
+    if not own:job_row=db.execute('SELECT value,valid FROM graph_atoms WHERE token=?', (jw.key.token,)).fetchone()
+    if job_row != (canonical_serialize(jw.value), 1):
+        raise ValueError('C4 completed job is not in the same actual authored Source CAS')
+    own,scope_rows=read_foreground_writer_life_output_refs_v3(db,kind='activity_scope',operation_id=receipt.operation_id)
+    if not own:
+        scope_rows = db.execute('SELECT original_ref FROM ' + TABLE + " WHERE bot=? AND persona=? AND kind='activity_scope' AND producing_operation_id=? LIMIT 2", (*p.namespace.as_tuple, receipt.operation_id)).fetchall()
+    if len(scope_rows) != 1:
+        raise MissingProductionOriginalV1('actual_self_foreground_scope_recorded_in_c4_adoption_CAS')
+    scope_raw = _read(db, issuer=installed_readers.issuer, namespace=p.namespace, kind='activity_scope', ref=scope_rows[0][0])
+    scope = draft_from_wire_v1(scope_raw[0], DraftActivityScopeV1)
+    task = next((s for s in f.sources if s.ref == f.task_source_ref))
+    if (scope.actor_ref, scope.source.ref, scope.c02_original_ref, scope.root_registration_ref, scope.parent_budget_lease_ref) != (p.actor_ref, f.task_source_ref, task_selector.c02_operation_id, f.target.root_registration_ref, p.parent_budget_lease_ref):
+        raise ValueError('C4 adopted activity scope belongs to another actual task/root/self')
+    paid = _read(db, issuer=installed_readers.issuer, namespace=p.namespace, kind=_artifact_model_original_kind(p, 'paid'), ref=ids['paid'])
+    runtime = installed_readers.model_runtime
+    build = read_installed_d11_life_build_v1(runtime.authority_client._package_root, p.manifest_digest, recipe_id='artifact_draft_v1')
+    content_ref = LifeInputRefV1(sk.token, actual[0], canonical_digest(stage.source.to_dict()))
+    content = FrozenDraftContentV1(content_ref, stage.output.content_digest, len(stage.source.text.encode()), (sk.token, *(s.ref for s in f.sources)))
+    adopted = adoption_type(p.selector, p.digest, content, f.target, LifeInputRefV1(task.ref, task.revision, task.value_digest), stage.source.recorded_at, ids['paid'], canonical_digest(paid[0]), ids['result'], stage.result_digest, stage.terminal_digest, scope_rows[0][0], canonical_digest(scope_raw[0]), p.deadline_utc, build['algorithm_build_digest'], build['postcondition_build_digest'], receipt.operation_id, **metadata)
+    return record_foreground_writer_life_v3(db, issuer=installed_readers.issuer, namespace=p.namespace, kind=_artifact_model_original_kind(p, 'adopted'), ref=ids['adopt'], operation_id=receipt.operation_id, value=adopted, recorder=record_artifact_draft_content_after_cas_v1, frame=stage.frame, actual_receipt=receipt)
 
 
 def _read_current_adopted_artifact_draft_content(db, *, frame, selector, installed_readers, phase):
@@ -1156,6 +1161,7 @@ def apply_artifact_draft_phase_verification_stage_v2(witness, graph, db, install
 
 
 def record_artifact_draft_phase_verified_after_cas_v2(db, *, stage, receipt, installed_readers):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     if type(stage) is not ArtifactDraftPhaseVerificationStageV2 or receipt.status != 'committed' or receipt.operation_id != stage.verified.producing_operation_id:
         raise TypeError('phase verified signature requires actual same-transaction W01 CAS')
@@ -1163,10 +1169,8 @@ def record_artifact_draft_phase_verified_after_cas_v2(db, *, stage, receipt, ins
     original = read_adopted_domain_operation_v1(db, value.namespace, receipt.operation_id)
     if original is None or original['receipt'] != receipt or original['original_digest'] != stage.stage.original_digest:
         raise ValueError('phase verifier original is not its actual W01 adopted receipt')
-    require_artifact_draft_phase_verified_history_v2(db, namespace=value.namespace, original_ref=value.original_ref,
-        producing_operation_id=value.producing_operation_id, raw=plain_v1(value))
-    recorded = _record(db, issuer=installed_readers.issuer, namespace=value.namespace, kind='c4_phase_verified',
-        ref=value.original_ref, operation_id=receipt.operation_id, value=value)
+    require_artifact_draft_phase_verified_history_v2(db, namespace=value.namespace, original_ref=value.original_ref, producing_operation_id=value.producing_operation_id, raw=plain_v1(value))
+    recorded = record_foreground_writer_life_v3(db, issuer=installed_readers.issuer, namespace=value.namespace, kind='c4_phase_verified', ref=value.original_ref, operation_id=receipt.operation_id, value=value, recorder=record_artifact_draft_phase_verified_after_cas_v2, frame=stage.frame, actual_receipt=receipt)
     if read_current_artifact_phase_verified_v2(db, namespace=value.namespace, selector=value.selector, issuer=installed_readers.issuer) != value:
         raise ValueError('recorded phase verified original differs from actual current file/Source proof')
     return recorded

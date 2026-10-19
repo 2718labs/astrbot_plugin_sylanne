@@ -34,6 +34,7 @@ _NUMERIC_METADATA_OPERATIONS_V3=_NUMERIC_OWNER_OPERATIONS_V1 | _NUMERIC_READ_ONL
 _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3=frozenset({"cancel_current_owner_job_v3"})
 _NUMERIC_PAID_WRITE_OPERATIONS_V3=frozenset({"prepare_current_life_numeric_result_read_v3","record_current_life_numeric_paid_result_v3"})
 METHOD_INPUT_OPERATIONS_V3 = _NUMERIC_OWNER_OPERATIONS_V1 | frozenset({
+    "input:freeze_artifact_candidate_preparation_v1", "input:freeze_values",
     "freeze_general_growth_intent_v1","register_general_growth_trial_start_v1",
     "derive_general_growth_trial_v1","adopt_general_growth_v1",
     'prepare_personal_candidate_eligibility_v1', 'adopt_personal_candidate_eligibility_v1',
@@ -182,7 +183,7 @@ class _MethodLearningReadV3(_CurrentNamespaceInventoryKernelV3):
             from .current_life_numeric_paid_write_v3 import require_numeric_paid_write_work_v3
             require_numeric_paid_write_work_v3(self)
         from .current_beta1_source_read_v3 import beta1_source_operation_v3,beta1_source_work_kind_v3,beta1_source_reader_work_kind_v3,require_current_beta1_source_work_v3
-        own_source=self.work.kind=='current_habit_source_read_v3' or beta1_source_operation_v3(self.operation_kind)
+        own_source=self.work.kind=='current_habit_source_read_v3' or(type(self)is not BorrowedMethodLearningReadV3 and beta1_source_operation_v3(self.operation_kind))
         if own_source:require_current_beta1_source_work_v3(self)
         if self.source_pending_owner is not None and self.owner_binding is None:
             from .current_beta1_source_read_v3 import require_pending_beta1_owner_reader_current_v3
@@ -677,6 +678,12 @@ def _bound_proof(db, namespace):
 def require_bound_method_learning_rows_v3(db, namespace, type_name, columns=("token", "revision", "value", "valid"), *, valid_only=True):
     if type_name not in METHOD_LEARNING_TYPES_V3 or not columns or any(name not in {"token", "revision", "value", "valid"} for name in columns):
         raise AuthorityUnavailable("fixed method projection columns/type required")
+    from .foreground_command_source_v3 import is_foreground_command_source_reader_v3
+    owner=_method_active(db)
+    if owner is not None and is_foreground_command_source_reader_v3(owner):
+        handled,rows=read_bound_method_type_rows_v3(db,namespace,type_name,columns,valid_only=valid_only)
+        if not handled:raise AuthorityUnavailable('Foreground method rows lost their actual Body binder')
+        return rows
     proof = _bound_proof(db, namespace)
     proof.operation.retain(256 + len(proof.atoms) * (64 + len(columns) * 16))
     rows = []
@@ -690,6 +697,11 @@ def require_bound_method_learning_rows_v3(db, namespace, type_name, columns=("to
 def require_bound_method_learning_head_v3(db, namespace, key):
     if NamespaceId.from_key(key) != namespace or key.type_name not in METHOD_LEARNING_TYPES_V3:
         raise AuthorityUnavailable("fixed method head namespace/type required")
+    from .foreground_command_source_v3 import is_foreground_command_source_reader_v3
+    owner=_method_active(db)
+    if owner is not None and is_foreground_command_source_reader_v3(owner):
+        handled,row=read_bound_method_graph_point_v3(db,columns=('revision','value','valid'),key_columns=('token',),key=(key.token,))
+        return row
     proof = _bound_proof(db, namespace)
     atom = next((atom for atom in proof.atoms if atom.key == key), None)
     return None if atom is None else (atom.revision, proof.wires[key.token], int(atom.valid))
@@ -697,6 +709,10 @@ def require_bound_method_learning_head_v3(db, namespace, key):
 
 def require_bound_method_learning_atom_v3(db, namespace, key):
     from ..graph_types import GraphAtom
+    from .foreground_command_source_v3 import is_foreground_command_source_reader_v3
+    owner=_method_active(db)
+    if owner is not None and is_foreground_command_source_reader_v3(owner):
+        return method_graph_head_v3(db,namespace,key)
     proof = _bound_proof(db, namespace)
     if NamespaceId.from_key(key) != namespace or key.type_name not in METHOD_LEARNING_TYPES_V3:
         raise AuthorityUnavailable("fixed method atom namespace/type required")
@@ -716,6 +732,9 @@ def require_bound_method_learning_history_v3(db, namespace, key, revision):
 
 
 def read_bound_method_learning_attachment_v3(db, *, table, columns, key_columns, key):
+    from .foreground_command_writer_outputs_v3 import read_bound_foreground_writer_point_v3
+    handled,row=read_bound_foreground_writer_point_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
+    if handled:return True,row
     from .world_owner_read_v3 import read_bound_world_attachment_v3
     handled,row=read_bound_world_attachment_v3(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if handled:return True,row
@@ -1096,6 +1115,8 @@ def _method_active(db):
 
 
 def _require_input_request(owner, request):
+    from .foreground_command_source_v3 import require_foreground_command_point_v3
+    if require_foreground_command_point_v3(owner,request):return
     from .artifact_borrowed_source_v3 import require_artifact_borrowed_point_v3
     if require_artifact_borrowed_point_v3(owner,request):return
     from .natural_producer_qualification_v1 import _HOST_ATTACHMENT_SHAPES_V3
@@ -1146,12 +1167,16 @@ def _need_method_input(owner, request):
 
 
 def method_graph_head_v3(db, namespace, key):
+    from .foreground_command_writer_outputs_v3 import read_foreground_writer_head_v3
+    handled,atom=read_foreground_writer_head_v3(db,namespace,key)
+    if handled:return atom
     post = _method_post_commit_active_v3(db)
     if post is not None:
         if namespace != post.namespace: raise AuthorityUnavailable("successor head crossed namespace")
         return post.head_v3(key)
     from ..graph_types import GraphAtom
     from .current_beta1_source_read_v3 import beta1_source_operation_v3
+    from .foreground_command_source_v3 import is_foreground_command_source_reader_v3
     owner = _method_active(db)
     if owner is None: raise AuthorityUnavailable("actual method selected-input family is unavailable")
     if NamespaceId.from_key(key) != namespace or namespace != owner.namespace:
@@ -1166,7 +1191,7 @@ def method_graph_head_v3(db, namespace, key):
     if (key.type_name in METHOD_LEARNING_TYPES_V3 and owner.inventory_sealed
             and owner.operation_kind not in (_GENERAL_OWNER_OPERATIONS_V1 | _NUMERIC_METADATA_OPERATIONS_V3 | _OWNER_JOB_CANCEL_METADATA_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OPERATIONS_V3)
             and owner.work.kind!='current_habit_source_read_v3' and not beta1_source_operation_v3(owner.operation_kind)
-            and not _artifact_borrowed_reader_v3(owner)
+            and not _artifact_borrowed_reader_v3(owner) and not is_foreground_command_source_reader_v3(owner)
             and key.token not in owner.census_columns):
         owner.require_current()
         return GraphAtom(key, 0, {}, False)
@@ -1205,13 +1230,14 @@ def method_domain_inventory_v3(db, namespace, type_id):
     owner = _method_active(db)
     if owner is None or namespace != owner.namespace: raise AuthorityUnavailable("actual method inventory Binder required")
     from .current_beta1_source_read_v3 import beta1_source_operation_v3
-    if type_id in METHOD_LEARNING_TYPES_V3 and owner.operation_kind not in _NUMERIC_METADATA_OPERATIONS_V3 and owner.work.kind!='current_habit_source_read_v3' and not beta1_source_operation_v3(owner.operation_kind) and not _artifact_borrowed_reader_v3(owner):
+    from .foreground_command_source_v3 import is_foreground_command_source_reader_v3,foreground_command_inventory_types_v3
+    if type_id in METHOD_LEARNING_TYPES_V3 and owner.operation_kind not in _NUMERIC_METADATA_OPERATIONS_V3 and owner.work.kind!='current_habit_source_read_v3' and not beta1_source_operation_v3(owner.operation_kind) and not _artifact_borrowed_reader_v3(owner) and not is_foreground_command_source_reader_v3(owner):
         return tuple(method_graph_head_v3(db, namespace, atom.key) for atom in owner.inventory.atoms if atom.key.type_name == type_id)
     if type_id == owner.preference_type and owner.preferences_from_census:
         owner.preference_inventory.require_current_v3()
         return tuple(method_graph_head_v3(db, namespace, atom.key) for atom in owner.preference_inventory.atoms)
     from .artifact_borrowed_source_v3 import artifact_borrowed_inventory_types_v3
-    allowed = set(owner.preplan_families)|set(artifact_borrowed_inventory_types_v3(owner))
+    allowed = set(owner.preplan_families)|set(artifact_borrowed_inventory_types_v3(owner))|set(foreground_command_inventory_types_v3(owner))
     if owner.selected_plan is not None: allowed.update(owner.selected_plan.fixed_type_ids)
     if owner.preference_origin is not None: allowed.add(owner.preference_type)
     if type_id not in allowed:
@@ -1390,6 +1416,10 @@ def require_method_signature_column_v3(original, *, signer, kind, signature=None
     if type(original) is not MethodJSONColumnV3:
         raise AuthorityUnavailable("actual method signed-column original required")
     original._actual(); o = original.owner
+    from .foreground_command_source_v3 import require_foreground_command_signature_column_v3
+    handled,value=require_foreground_command_signature_column_v3(original,signer=signer,kind=kind,
+        signature=signature,verifier=verifier,complete=complete)
+    if handled:return value
     if original.beta1_metadata_task is not None:
         from .current_beta1_source_read_v3 import require_beta1_metadata_signature_v3
         return require_beta1_metadata_signature_v3(original,signer=signer,kind=kind,signature=signature,
@@ -1600,7 +1630,11 @@ class BorrowedMethodLearningReadV3(_MethodLearningReadV3):
         self.action_schema_locator = None
         self.observed_originals, self.installed_policy_refs, self.installed_readers = (), (), None
         self.budget_task, self.policy_tasks = None, {}
-        self.preplan_families = _method_preplan_families_v3(operation_kind)
+        from .foreground_command_contract_v3 import foreground_command_source_spec_v3
+        from .artifact_borrowed_source_v3 import ARTIFACT_BORROWED_OPERATIONS_V3
+        source_spec=foreground_command_source_spec_v3(operation_kind,request,selector)
+        artifact_source=(type(issued)is _IssuedForegroundActivityV1 and operation_kind in ARTIFACT_BORROWED_OPERATIONS_V3)
+        self.preplan_families=(frozenset()if source_spec is not None or artifact_source else _method_preplan_families_v3(operation_kind))
         self.preference_type = self.preference_origin = self.preference_inventory = None
         self.preferences_from_census = False
         from ..domains.d08.personal_candidate_v1 import PrepareCurrentPersonalCandidatesRequestV1, SourceNoteCandidateBindingV1
@@ -1612,12 +1646,14 @@ class BorrowedMethodLearningReadV3(_MethodLearningReadV3):
         self.prefinal = self
         context = _BorrowedMaterialScopeV3(_ISSUER, issued.scope, metadata, epoch)
         _CurrentNamespaceInventoryKernelV3.__init__(self, graph, operation, context,
-            projection_types=METHOD_LEARNING_TYPES_V3 | (frozenset({self.preference_type}) if self.preference_type else frozenset()),
+            projection_types=(frozenset()if source_spec is not None else METHOD_LEARNING_TYPES_V3 | (frozenset({self.preference_type}) if self.preference_type else frozenset())),
             selected_tokens=frozenset(), census_schema="sylanne.method-learning-census.v3",
             leaf_schema="sylanne.method-learning-census-leaf.v3")
         _READERS.add(self)
-        from .artifact_borrowed_source_v3 import register_artifact_borrowed_constructor_v3
-        register_artifact_borrowed_constructor_v3(self)
+        from .foreground_command_source_v3 import register_foreground_command_constructor_v3
+        if not register_foreground_command_constructor_v3(self):
+            from .artifact_borrowed_source_v3 import register_artifact_borrowed_constructor_v3
+            register_artifact_borrowed_constructor_v3(self)
 
     def seal_plan_v3(self, plan, *, installed_readers=None, observed_originals=(), installed_policy_refs=()):
         from .domain_production_contracts_v1 import ProductionReadPlanV1
@@ -1627,7 +1663,13 @@ class BorrowedMethodLearningReadV3(_MethodLearningReadV3):
         if not set(plan.source_roots) <= roots:
             raise AuthorityUnavailable("borrowed plan added Source outside its actual qualified issuance")
         from .artifact_borrowed_source_v3 import require_artifact_borrowed_seal_plan_v3
-        if _artifact_borrowed_reader_v3(self):
+        from .foreground_command_source_v3 import is_foreground_command_source_reader_v3,require_foreground_command_seal_plan_v3
+        if is_foreground_command_source_reader_v3(self):
+            combined=ProductionReadPlanV1(plan.fixed_type_ids,
+                tuple(sorted(set((*plan.exact_keys,*(v.key for v in self.evidence.read_versions))),key=lambda k:k.token)),
+                plan.source_roots,plan.required_original_refs)
+            require_foreground_command_seal_plan_v3(self,combined)
+        elif _artifact_borrowed_reader_v3(self):
             require_artifact_borrowed_seal_plan_v3(self,plan)
             combined=plan
         else:
@@ -1659,7 +1701,10 @@ class PreparedBorrowedMethodDomainInputsV3:
         if (_BORROWED_INPUTS.get(self) != (o, self.plan, self.issued, o.graph_stamp, o.expected_rights)
                 or not o.inputs_sealed or self.plan != o.selected_plan):
             raise AuthorityUnavailable("actual sealed borrowed method inputs required")
-        o.inventory._actual(); return self
+        o.inventory._actual()
+        from .foreground_command_source_v3 import is_foreground_command_source_reader_v3,_body_state_v3
+        if is_foreground_command_source_reader_v3(o):_body_state_v3(o)
+        return self
     def head_v3(self, key): return method_graph_head_v3(self.owner.db, self.owner.namespace, key)
     def inventory_v3(self, type_id):
         if type_id not in self.plan.fixed_type_ids: raise AuthorityUnavailable("borrowed frame family is outside actual plan")
@@ -1671,7 +1716,10 @@ class PreparedBorrowedMethodDomainInputsV3:
             raise AuthorityUnavailable("borrowed frame lost its actual original issuance/scope")
         current = _require_borrowed_issuance_v3(issued, o.graph)
         if current != o.evidence: raise AuthorityUnavailable("borrowed frame original evidence changed")
-        o.require_current(); return self
+        o.require_current()
+        from .foreground_command_source_v3 import is_foreground_command_source_reader_v3,_body_state_v3
+        if is_foreground_command_source_reader_v3(o):_body_state_v3(o)
+        return self
     def require_business_result_v3(self, work):
         self._actual_v3(); o = self.owner
         if (work is not o.work or work.state is not o or work.operation is not o.operation
@@ -1711,7 +1759,8 @@ def _start_borrowed_method_input_v3(reader, needed):
         if task is None: task = _MethodPointReadV3(reader, actual); reader.points[actual] = task
     elif kind == "inventory":
         from .artifact_borrowed_source_v3 import artifact_borrowed_inventory_types_v3
-        allowed = set(reader.preplan_families)|set(artifact_borrowed_inventory_types_v3(reader))
+        from .foreground_command_source_v3 import foreground_command_inventory_types_v3
+        allowed = set(reader.preplan_families)|set(artifact_borrowed_inventory_types_v3(reader))|set(foreground_command_inventory_types_v3(reader))
         if reader.selected_plan is not None: allowed.update(reader.selected_plan.fixed_type_ids)
         if reader.preference_origin is not None: allowed.add(reader.preference_type)
         if actual not in allowed: raise AuthorityUnavailable("borrowed inventory has no actual fixed recipe/dependency")
@@ -1720,6 +1769,9 @@ def _start_borrowed_method_input_v3(reader, needed):
     elif kind == "artifact_body_dependencies":
         from .artifact_borrowed_source_v3 import start_artifact_borrowed_dependencies_v3
         task=start_artifact_borrowed_dependencies_v3(reader,actual)
+    elif kind == "task_choice_catalogue":
+        from .artifact_task_choice_lookup_v3 import start_task_choice_catalogue_v3
+        task=start_task_choice_catalogue_v3(reader,actual)
     elif kind == "budget_grant":
         if actual != reader.parent_budget_lease_ref: raise AuthorityUnavailable("borrowed budget locator changed original parent")
         if reader.budget_task is None: reader.budget_task = _MethodBudgetGrantReadV3(reader, actual)
@@ -1792,6 +1844,8 @@ def _advance_borrowed_method_learning_read_v3(graph, work):
                                 set((*r.selected_plan.exact_keys, r.action_schema_locator.key)), key=lambda k:k.token)))
                             from .artifact_borrowed_source_v3 import artifact_borrowed_action_schema_complete_v3
                             artifact_borrowed_action_schema_complete_v3(r)
+                            from .foreground_command_source_v3 import foreground_command_action_schema_complete_v3
+                            foreground_command_action_schema_complete_v3(r)
                             work.phase = "selected_inputs_final"
                         return GraphStorageStepV3("progress")
                     if r.selected_plan is None:
@@ -1810,6 +1864,10 @@ def _advance_borrowed_method_learning_read_v3(graph, work):
                                         _ISSUER, r, r.selected_plan))
                                 from .ordinary_source_note_habit_classification_v3 import prepare_current_ordinary_source_note_habit_classification_v3
                                 prepare_current_ordinary_source_note_habit_classification_v3(r)
+                                from .artifact_preparation_parent_work_v3 import prepare_borrowed_artifact_preparation_parent_v3
+                                prepare_borrowed_artifact_preparation_parent_v3(r)
+                                from .foreground_command_post_frame_v3 import prepare_foreground_input_successor_histories_v3
+                                prepare_foreground_input_successor_histories_v3(r)
                             finally: r.db.rollback()
                         if r.operation_kind in ACTION_SCHEMA_LOCATOR_OPERATIONS_V3 and r.action_schema_locator is None:
                             r.action_schema_locator = begin_current_borrowed_action_schema_locator_v3(r, r.frame_fields, r.selected_plan)
@@ -2055,7 +2113,15 @@ def read_bound_method_borrowed_plan_v3(db, *, graph, issued, plan):
 
 def _release_method_registered_payloads_v3(owner):
     """Invalidate this Work's actual partial/final registrations without scope reads."""
+    from .artifact_task_choice_lookup_v3 import release_task_choice_catalogue_v3
+    release_task_choice_catalogue_v3(owner)
+    from .foreground_command_source_v3 import release_foreground_command_source_v3
+    release_foreground_command_source_v3(owner)
     if type(owner)is BorrowedMethodLearningReadV3:
+        from .personal_candidate_eligibility_v1 import release_borrowed_personal_eligibility_results_v3
+        release_borrowed_personal_eligibility_results_v3(owner)
+        from .artifact_preparation_parent_work_v3 import release_borrowed_artifact_preparation_parent_v3
+        release_borrowed_artifact_preparation_parent_v3(owner)
         from .borrowed_habit_classification_v3 import release_borrowed_habit_metadata_v3
         from .ordinary_source_note_habit_classification_v3 import release_ordinary_source_note_habit_classification_v3
         from .artifact_frame_control_reads_v3 import release_artifact_model_source_frames_v3
@@ -2129,23 +2195,30 @@ class PreparedMethodPostCommitV3:
         from .domain_production_contracts_v1 import CurrentOperationFrameV1, StagedDomainOperationV1
         from .foreground_activity_issuance_v1 import _IssuedForegroundActivityV1
         from ..runtime_contracts import CommitReceipt
+        from .foreground_command_post_frame_v3 import EMPTY_INPUT_DOMAINS_V3,require_foreground_input_post_witness_v3
         owner = _method_active(db)
         if (issuer is not _ISSUER or type(owner) is not BorrowedMethodLearningReadV3
                 or owner.graph is not graph or not owner.inputs_sealed or not owner.business_started
-                or owner.business_completed or owner.operation_kind not in _METHOD_ARTIFACT_POST_OPERATIONS_V3
+                or owner.business_completed or owner.operation_kind not in (_METHOD_ARTIFACT_POST_OPERATIONS_V3 | frozenset(EMPTY_INPUT_DOMAINS_V3))
                 or type(prior_frame) is not CurrentOperationFrameV1 or type(stage) is not StagedDomainOperationV1
                 or type(actual_receipt) is not CommitReceipt or type(issued) is not _IssuedForegroundActivityV1
                 or issued is not owner.issued or scope is not issued.scope or not db.in_transaction
                 or not owner.store._lock._is_owned()):
             raise AuthorityUnavailable("actual same-transaction borrowed Artifact CAS successor required")
-        owner.inventory._actual(); owner.result._actual_v3(); owner.work._require_invocation(graph)
+        writer = require_foreground_input_post_witness_v3(owner,db,graph,prior_frame,stage,actual_receipt,scope,issued,process_lease)
+        empty_input = stage.operation_kind in EMPTY_INPUT_DOMAINS_V3
+        if empty_input and writer is None:
+            raise AuthorityUnavailable('Input successor requires its actual captured W01 writer')
+        owner.inventory._actual()
+        if writer is None:owner.result._actual_v3()
+        owner.work._require_invocation(graph)
         identity = prior_frame.envelope.identity
-        if (stage.coverage != "complete" or stage.domain != "d08" or stage.operation_kind != owner.operation_kind
+        if (stage.coverage != "complete" or stage.domain != (EMPTY_INPUT_DOMAINS_V3[stage.operation_kind] if empty_input else "d08") or stage.operation_kind != owner.operation_kind
                 or stage.operation_id != owner.operation_id or stage.namespace != owner.namespace
                 or identity.operation_id != owner.operation_id or stage.activity_id != identity.activity_id
                 or actual_receipt.status != "committed" or actual_receipt.operation_id != stage.operation_id
                 or (actual_receipt.activity_id, actual_receipt.effect_id) != (identity.activity_id, identity.effect_id)
-                or stage.read_versions != prior_frame.snapshot.versions
+                or stage.read_versions != (prior_frame.envelope.version_guard.read_versions if writer is not None else prior_frame.snapshot.versions)
                 or actual_receipt.read_versions != prior_frame.envelope.version_guard.read_versions
                 or prior_frame.owner_guard != owner.material_owner_guard
                 or (prior_frame.envelope.version_guard.access_epoch, prior_frame.envelope.version_guard.delete_epoch)
@@ -2153,6 +2226,7 @@ class PreparedMethodPostCommitV3:
                 or owner.runtime._active_foreground_issuance_v1 is not issued
                 or owner.runtime._active_foreground_process_lease_v1 is not process_lease):
             raise AuthorityUnavailable("Artifact successor changed the actual stage/receipt/Owner/process lease")
+        self.writer_capture = writer
         self.owner, self.db, self.graph, self.namespace = owner, db, graph, owner.namespace
         self.prior_frame, self.stage, self.receipt = prior_frame, stage, actual_receipt
         self.scope, self.issued, self.process_lease = scope, issued, process_lease
@@ -2169,7 +2243,7 @@ class PreparedMethodPostCommitV3:
         _POST_COMMIT_PROOFS[self] = self._identity_v3()
 
     def _identity_v3(self):
-        return (self.owner, self.db, self.graph, self.namespace, self.prior_frame, self.stage, self.receipt,
+        return (self.writer_capture,self.guard_versions,self.owner, self.db, self.graph, self.namespace, self.prior_frame, self.stage, self.receipt,
             self.scope, self.issued, self.process_lease, self.after_stamp, self.snapshot, self.coverage,
             self.atoms, self.digests, self.wires, self.head_metadata, self.histories, self.point_rows, self.frozen_values, self.complete)
 
@@ -2217,7 +2291,9 @@ class PreparedMethodPostCommitV3:
         from .domain_production_contracts_v1 import ProductionQueryCoverageV1
         from ..runtime_storage_v3 import begin_runtime_cell_read_v3, read_runtime_cell_origin_v3
         from ..segmented_sql_cell_v1 import MAX_SEGMENT_BYTES
+        from .foreground_command_post_frame_v3 import EMPTY_INPUT_DOMAINS_V3,source_bound_successor_guard_v3
         receipt, frame, owner = self.receipt, self.prior_frame, self.owner
+        empty_input = self.stage.operation_kind in EMPTY_INPUT_DOMAINS_V3
         self.after_stamp = self.graph._v2_graph_stamp(self.namespace)
         if (self.after_stamp[0].graph_revision != owner.graph_stamp[0].graph_revision + 1
                 or len(receipt.invalidated_epochs) != 1 or receipt.invalidated_epochs[0] != self.after_stamp[1]
@@ -2250,7 +2326,10 @@ class PreparedMethodPostCommitV3:
                 or event[5] != self.after_stamp[1].revision):
             raise AuthorityUnavailable("Artifact successor lost the exact committed Graph event")
         writes = {write.key: write for proposal in self.stage.proposals for write in proposal.typed_writes}
-        if (len(writes) != 3 or len(writes) != sum(len(proposal.typed_writes) for proposal in self.stage.proposals)
+        if empty_input:
+            if writes or receipt.write_versions or json.loads(event[3]) != [] or json.loads(event[4]) != []:
+                raise AuthorityUnavailable('Input successor cannot own a Graph write or invalidate any prior input')
+        elif (len(writes) != 3 or len(writes) != sum(len(proposal.typed_writes) for proposal in self.stage.proposals)
                 or {key.type_name for key in writes} != {"d08.action_intent.v1", "d08.action_schema.v1", "d08.action_cancellation.v1"}
                 or len(writes) != len(receipt.write_versions) or set(writes) != {v.key for v in receipt.write_versions}):
             raise AuthorityUnavailable("Artifact successor write versions differ from the actual stage")
@@ -2313,7 +2392,8 @@ class PreparedMethodPostCommitV3:
         self.coverage = tuple(pages)
         self.snapshot = GraphSnapshot(tuple(self.atoms[atom.key] for atom in frame.snapshot.atoms),
             (self.after_stamp[1],), frame.snapshot.ingress_receipts, frame.snapshot.scene_proofs)
-        owner.operation.retain(_heap((self.head_metadata, self.histories, self.point_rows, self.coverage)) + 4096)
+        self.guard_versions = (source_bound_successor_guard_v3(self) if self.writer_capture is not None else self.snapshot.versions)
+        owner.operation.retain(_heap((self.head_metadata, self.histories, self.point_rows, self.coverage,self.guard_versions)) + 4096)
 
     def _seal_history_v3(self, atom, cell_id, expected_event):
         row = self._small_v3("graph_history", ("valid", "value_cell_id", "event_bot", "event_persona", "event_session", "event_id"),
@@ -2329,8 +2409,10 @@ class PreparedMethodPostCommitV3:
             valid=int(atom.valid), value=self.wires[atom.key], event_bot=row[2], event_persona=row[3], event_session=row[4], event_id=row[5])))
 
     def _seal_points_v3(self):
+        from .foreground_command_writer_outputs_v3 import foreground_writer_owns_output_point_v3
         changed = {version.key.token for version in self.receipt.write_versions}
         for request, task in (*self.owner.points.items(), *self.owner.attachments.items()):
+            if self.writer_capture is not None and foreground_writer_owns_output_point_v3(self.db,request):continue
             if not task.complete: raise AuthorityUnavailable("Artifact successor has unfinished selected originals")
             if task.table == "graph_atoms" and task.key[0] in changed: continue
             if task.table == "graph_history" and task.key[:2] in {(v.key.token, v.revision) for v in self.receipt.write_versions}: continue
@@ -2447,7 +2529,10 @@ class PreparedMethodPostCommitV3:
         return self.point_rows[request]
 
     def release_payload_v3(self):
+        from .foreground_command_post_frame_v3 import release_foreground_command_post_frames_v3
+        release_foreground_command_post_frames_v3(self)
         _POST_COMMIT_PROOFS.pop(self, None)
+        self.writer_capture=self.guard_versions=None
         self.atoms = self.digests = self.wires = self.head_metadata = self.histories = self.point_rows = self.frozen_values = None
         self.snapshot = self.coverage = None; self.complete = False
 
@@ -2491,6 +2576,9 @@ def read_bound_method_post_commit_adoption_v3(db, atom):
 
 def method_post_commit_atom_digest_v3(db, atom):
     from ..runtime_contracts import canonical_digest
+    from .foreground_command_writer_outputs_v3 import foreground_writer_atom_digest_v3
+    handled,digest=foreground_writer_atom_digest_v3(db,atom)
+    if handled:return digest
     proof = _method_post_commit_active_v3(db)
     if proof is not None: return proof.atom_digest_v3(atom)
     owner = _method_active(db)
@@ -3386,6 +3474,8 @@ def require_current_general_method_sources_v1(reader,roots):
     return proof.require_for_v1(reader,roots)
 
 def _require_current_general_method_body_v1(reader,table,key):
+    from .foreground_command_source_v3 import require_foreground_command_body_column_v3
+    if require_foreground_command_body_column_v3(reader,table,key):return
     from .artifact_borrowed_source_v3 import require_artifact_borrowed_body_column_v3
     if require_artifact_borrowed_body_column_v3(reader,table,key):return
     from .current_beta1_source_read_v3 import beta1_source_operation_v3

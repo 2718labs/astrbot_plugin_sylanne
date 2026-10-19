@@ -3532,24 +3532,47 @@ class RuntimeContext:
         if self._artifact_no_dispatch_deadline_handle_v1 is not None:
             self._artifact_no_dispatch_deadline_handle_v1.cancel()
             self._artifact_no_dispatch_deadline_handle_v1 = None
+        def first_refusal(value):
+            if getattr(self,"_last_artifact_resume_refusal_v1",None) is None:
+                self._last_artifact_resume_refusal_v1=value
         async def resume():
             try:
+                from .graph_worker import OwnedGraphStorageResultV3
                 from .runtime.d11_artifact_draft_model_v1 import resume_original_artifact_no_dispatch_v1
                 delay = await resume_original_artifact_no_dispatch_v1(self._v2_artifact_draft_model_runtime_v1)
                 if delay is not None and not self._artifact_draft_stopping_v1:
                     self._artifact_no_dispatch_deadline_handle_v1 = asyncio.get_running_loop().call_later(
                         delay, self.resume_pending_artifact_drafts_v1, installation)
                 await self.resume_pending_owner_goal_cancellation_projections_v1(installation)
-                items = await self._worker.call(lambda graph: graph.discover_current_artifact_draft_resumes_v1(
-                    self._v2_bootstrap, installation.admin_bundle))
-                for item in items:
-                    if self._artifact_draft_stopping_v1:
-                        break
-                    await self.run_post_c02_artifact_draft_v1(installation, **item)
+                after=through=None
+                while not self._artifact_draft_stopping_v1:
+                    owned=await self._worker.call(lambda graph:graph.discover_current_artifact_draft_resumes_v1(
+                        self._v2_bootstrap,installation.admin_bundle,after_job_id=after,through_job_id=through))
+                    if type(owned)is not OwnedGraphStorageResultV3:
+                        raise TypeError("Artifact discovery requires its actual owned metadata Work result")
+                    page,retention=owned.take_value_v3()
+                    try:
+                        if page["schema"]!="d11.artifact-discovery-page.v3":
+                            raise ValueError("Artifact discovery has another result schema")
+                        for refusal in page["refusals"]:first_refusal(dict(refusal))
+                        for item in page["items"]:
+                            if self._artifact_draft_stopping_v1:break
+                            try:
+                                await self.run_post_c02_artifact_draft_v1(installation,
+                                    c02_operation_id=item["c02_operation_id"],source_ref=item["source_ref"])
+                            except asyncio.CancelledError:raise
+                            except Exception as exc:
+                                first_refusal({"job_id":item["job_id"],"reason_code":"resume_"+type(exc).__name__})
+                        eof=page["eof"];next_after=page["after_job_id"];next_through=page["through_job_id"]
+                        if not eof and(next_after is None or next_after==after):
+                            raise ValueError("Artifact discovery did not advance its actual scanned keyset")
+                    finally:retention.release()
+                    if eof:break
+                    after,through=next_after,next_through
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._last_artifact_resume_refusal_v1 = type(exc).__name__
+                first_refusal({"reason_code":"discovery_"+type(exc).__name__})
             finally:
                 self._artifact_draft_resume_task_v1 = None
                 if self._artifact_draft_rescan_requested_v1 and not self._artifact_draft_stopping_v1:
@@ -3558,241 +3581,251 @@ class RuntimeContext:
 
     async def run_installed_artifact_completion_receipt_v1(self,installation,*,c02_operation_id,source_ref,context,server,listener,candidates):
         """Continue the message-only Artifact allocation through the real P2 sender."""
-        from .host.artifact_receipt_dispatch_driver_v1 import ArtifactReceiptDispatchDriverV1,InstalledArtifactReceiptContinuationV1
-        from .host.private_reply_dispatch_driver import PrivateReplyDispatchResultV1
-        from .host.installed_dispatch_route import InstalledDispatchRoutePort
-        from .runtime.artifact_completion_receipt_v1 import ArtifactCompletionReceiptOriginalV1
-        if (not self.natural_reply_product_ready_v2(installation,server=server,listener=listener,
-                candidates=candidates,context=context) or installation.admin_bundle.artifact_phase_observer is None):
-            return PrivateReplyDispatchResultV1('hold','actual installed Artifact receipt P2 path unavailable')
-        worker,bootstrap,port=self._worker,self._v2_bootstrap,self._v2_port
-        bundle,policy,grant=installation.admin_bundle,installation.installation_policy,installation.installation_grant
-        source=await worker.call(lambda graph:graph.prepare_current_artifact_completion_source_v1(bootstrap,bundle,
-            c02_operation_id=c02_operation_id,source_ref=source_ref))
-        if source['status']!='artifact_completion_source_current':
-            return PrivateReplyDispatchResultV1('hold','actual satisfied Artifact completion Source not committed')
-        receipt=source['receipt_original']
-        if type(receipt) is not ArtifactCompletionReceiptOriginalV1:
-            raise TypeError('Artifact dispatch requires its real typed D06 completion original')
-        host_loop=asyncio.get_running_loop()
-        def install_original(graph):
-            anchor=port.current_anchor(namespace=policy.namespace,authority_namespace=policy.authority_namespace)
-            lease,capability=graph.grant(bootstrap,actor=grant.administrator_holder,issuer_domain='d11',
-                namespace=policy.namespace,domains=('d08','d09','d11'),activation_generation=anchor.activation_generation,
-                operation_id=receipt.message_operation_id)
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            from .host.artifact_receipt_dispatch_driver_v1 import ArtifactReceiptDispatchDriverV1,InstalledArtifactReceiptContinuationV1
+            from .host.private_reply_dispatch_driver import PrivateReplyDispatchResultV1
+            from .host.installed_dispatch_route import InstalledDispatchRoutePort
+            from .runtime.artifact_completion_receipt_v1 import ArtifactCompletionReceiptOriginalV1
+            if (not self.natural_reply_product_ready_v2(installation,server=server,listener=listener,
+                    candidates=candidates,context=context) or installation.admin_bundle.artifact_phase_observer is None):
+                return PrivateReplyDispatchResultV1('hold','actual installed Artifact receipt P2 path unavailable')
+            worker,bootstrap,port=self._worker,self._v2_bootstrap,self._v2_port
+            bundle,policy,grant=installation.admin_bundle,installation.installation_policy,installation.installation_grant
+            source=await artifact_call(lambda graph:graph.prepare_current_artifact_completion_source_v1(bootstrap,bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref), slot='source')
+            if source['status']!='artifact_completion_source_current':
+                return PrivateReplyDispatchResultV1('hold','actual satisfied Artifact completion Source not committed')
+            receipt=source['receipt_original']
+            if type(receipt) is not ArtifactCompletionReceiptOriginalV1:
+                raise TypeError('Artifact dispatch requires its real typed D06 completion original')
+            host_loop=asyncio.get_running_loop()
+            def install_original(graph):
+                anchor=port.current_anchor(namespace=policy.namespace,authority_namespace=policy.authority_namespace)
+                lease,capability=graph.grant(bootstrap,actor=grant.administrator_holder,issuer_domain='d11',
+                    namespace=policy.namespace,domains=('d08','d09','d11'),activation_generation=anchor.activation_generation,
+                    operation_id=receipt.message_operation_id)
+                try:
+                    authority=AuthorityContext(grant.administrator_holder,'d11',capability,policy.namespace,
+                        ('activity',),'expression',('internal',),policy.root_grant.policy_ref,anchor.activation_generation)
+                    route=InstalledDispatchRoutePort(context=context,host_loop=host_loop,candidates=candidates,
+                        coordinator=graph,authority=authority,lease=lease,policy=policy,grant=grant)
+                    writer=graph.register_dispatch_final_claim_writer_v1(bootstrap,route_port=route,
+                        issuer_id=self._final_claim_writer.issuer_id)
+                    return authority,lease,writer
+                except BaseException:
+                    graph.release_authority_lease(bootstrap,lease)
+                    raise
+            authority,lease,writer=await worker.call(install_original)
             try:
-                authority=AuthorityContext(grant.administrator_holder,'d11',capability,policy.namespace,
-                    ('activity',),'expression',('internal',),policy.root_grant.policy_ref,anchor.activation_generation)
-                route=InstalledDispatchRoutePort(context=context,host_loop=host_loop,candidates=candidates,
-                    coordinator=graph,authority=authority,lease=lease,policy=policy,grant=grant)
-                writer=graph.register_dispatch_final_claim_writer_v1(bootstrap,route_port=route,
-                    issuer_id=self._final_claim_writer.issuer_id)
-                return authority,lease,writer
-            except BaseException:
-                graph.release_authority_lease(bootstrap,lease)
-                raise
-        authority,lease,writer=await worker.call(install_original)
-        try:
-            continuation=InstalledArtifactReceiptContinuationV1(worker=worker,authority=authority,lease=lease,
-                local_module_admission=self.local_module_admission,fence_port=port,policy=policy,grant=grant,
-                server=server,claim_writer=writer,context=context,candidates=candidates,
-                clock_policy=bundle.ingress_clock,adapter_ref='astrbot:onebot:call_action')
-            driver=ArtifactReceiptDispatchDriverV1(worker,bootstrap,bundle,continuation)
-            result=await driver.dispatch(c02_operation_id=c02_operation_id,source_ref=source_ref)
-            if result.original is not None and result.status in {'accepted','delivered','observed'}:
-                adoption=await worker.call(lambda graph:graph.record_artifact_receipt_outbound_observation_v1(
-                    bootstrap,policy.namespace,result.original.operation_id))
-                if adoption.get('observation_outcome')=='delivered':
-                    await worker.call(lambda graph:graph.finish_current_artifact_receipt_cycle_v1(bootstrap,bundle,
-                        c02_operation_id=c02_operation_id,source_ref=source_ref))
-            return result
-        finally:
-            await worker.call(lambda graph:graph.release_authority_lease(bootstrap,lease))
+                continuation=InstalledArtifactReceiptContinuationV1(worker=worker,authority=authority,lease=lease,
+                    local_module_admission=self.local_module_admission,fence_port=port,policy=policy,grant=grant,
+                    server=server,claim_writer=writer,context=context,candidates=candidates,
+                    clock_policy=bundle.ingress_clock,adapter_ref='astrbot:onebot:call_action')
+                driver=ArtifactReceiptDispatchDriverV1(worker,bootstrap,bundle,continuation)
+                result=await driver.dispatch(c02_operation_id=c02_operation_id,source_ref=source_ref)
+                if result.original is not None and result.status in {'accepted','delivered','observed'}:
+                    adoption=await artifact_call(lambda graph:graph.record_artifact_receipt_outbound_observation_v1(
+                        bootstrap,policy.namespace,result.original.operation_id), slot='adoption')
+                    if adoption.get('observation_outcome')=='delivered':
+                        await artifact_call(lambda graph:graph.finish_current_artifact_receipt_cycle_v1(bootstrap,bundle,
+                            c02_operation_id=c02_operation_id,source_ref=source_ref), slot='finish_current_artifact_receipt_cycle_v1')
+                return result
+            finally:
+                await worker.call(lambda graph:graph.release_authority_lease(bootstrap,lease))
 
     async def run_post_c02_artifact_draft_v1(self, installation, *, c02_operation_id, source_ref, fresh_cause_hint=False):
-        if self._artifact_draft_stopping_v1:
-            return {"status": "held", "missing_inputs": ["actual_running_host"]}
-        if c02_operation_id in self._artifact_draft_active_cycles_v1:
-            return {"status": "original_continuation_scheduled", "c02_operation_id": c02_operation_id}
-        self._artifact_draft_active_cycles_v1.add(c02_operation_id)
-        try:
-            completed = await self._worker.call(lambda graph:
-                graph.read_current_completed_artifact_method_v2(self._v2_bootstrap, installation.admin_bundle,
-                    c02_operation_id=c02_operation_id, source_ref=source_ref))
-            if completed is not None:
-                return completed
-            progress = await self._worker.call(lambda graph:
-                graph.read_current_artifact_method_finalization_progress_v2(self._v2_bootstrap, installation.admin_bundle,
-                    c02_operation_id=c02_operation_id, source_ref=source_ref))
-            if progress is not None:
-                return await self._finalize_current_artifact_method_v2(installation, progress)
-            from .host.authority_profile import AdminArtifactDraftPolicyV3, AdminArtifactStandingScopeV3
-            from .host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
-            declared = installation.admin_bundle.artifact_draft
-            if (fresh_cause_hint and type(declared) in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}
-                    and type(declared.standing_scope) is AdminArtifactStandingScopeV3):
-                selected = await self._worker.call(lambda graph:
-                    graph.read_current_post_c02_artifact_phase_resume_v2(self._v2_bootstrap, installation.admin_bundle,
-                        c02_operation_id=c02_operation_id, source_ref=source_ref))
-                if selected is None:
-                    structure = await self._worker.call(lambda graph:
-                        graph.prepare_current_post_c02_artifact_task_structure_v3(self._v2_bootstrap, installation.admin_bundle,
-                            c02_operation_id=c02_operation_id, source_ref=source_ref))
-                    if structure["status"] == "held":
-                        return structure
-                    if structure["status"] == "task_structure_prepared":
-                        from .runtime.personal_candidate_eligibility_v1 import run_installed_artifact_predecision_mesh_v1
-                        await run_installed_artifact_predecision_mesh_v1(self, installation,
-                            c02_operation_id=c02_operation_id, source_ref=source_ref)
-            result = await self._run_post_c02_artifact_draft_once_v1(installation,
-                c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
-            if result["status"] not in {"artifact_phase_file_structurally_verified", "artifact_phase_check_verified"}:
-                return result
-            from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
-            completed_selector = result["selector"]
-            sequence = artifact_draft_phase_sequence_v2(completed_selector.method_ref)
-            for _ in range(completed_selector.phase_index + 1, len(sequence)):
-                progress = await self._worker.call(lambda graph:
-                    graph.read_current_post_c02_artifact_phase_resume_v2(self._v2_bootstrap,
-                        installation.admin_bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-                selected = progress["selector"]
-                if (selected.task != completed_selector.task or selected.method_ref != completed_selector.method_ref
-                        or selected.phase_index != completed_selector.phase_index + 1
-                        or not result["checkpoint"]):
-                    raise ValueError("phase continuation lacks its actual committed next-phase checkpoint")
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            if self._artifact_draft_stopping_v1:
+                return {"status": "held", "missing_inputs": ["actual_running_host"]}
+            if c02_operation_id in self._artifact_draft_active_cycles_v1:
+                return {"status": "original_continuation_scheduled", "c02_operation_id": c02_operation_id}
+            self._artifact_draft_active_cycles_v1.add(c02_operation_id)
+            try:
+                completed = await artifact_call(lambda graph:
+                    graph.read_current_completed_artifact_method_v2(self._v2_bootstrap, installation.admin_bundle,
+                        c02_operation_id=c02_operation_id, source_ref=source_ref), slot='completed')
+                if completed is not None:
+                    return completed
+                progress = await artifact_call(lambda graph:
+                    graph.read_current_artifact_method_finalization_progress_v2(self._v2_bootstrap, installation.admin_bundle,
+                        c02_operation_id=c02_operation_id, source_ref=source_ref), slot='progress')
+                if progress is not None:
+                    return await self._finalize_current_artifact_method_v2(installation, progress)
+                from .host.authority_profile import AdminArtifactDraftPolicyV3, AdminArtifactStandingScopeV3
+                from .host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4
+                declared = installation.admin_bundle.artifact_draft
+                if (fresh_cause_hint and type(declared) in {AdminArtifactDraftPolicyV3, AdminArtifactDraftPairedPolicyV4}
+                        and type(declared.standing_scope) is AdminArtifactStandingScopeV3):
+                    selected = await artifact_call(lambda graph:
+                        graph.read_current_post_c02_artifact_phase_resume_v2(self._v2_bootstrap, installation.admin_bundle,
+                            c02_operation_id=c02_operation_id, source_ref=source_ref), slot='selected')
+                    if selected is None:
+                        structure = await artifact_call(lambda graph:
+                            graph.prepare_current_post_c02_artifact_task_structure_v3(self._v2_bootstrap, installation.admin_bundle,
+                                c02_operation_id=c02_operation_id, source_ref=source_ref), slot='structure')
+                        if structure["status"] == "held":
+                            return structure
+                        if structure["status"] == "task_structure_prepared":
+                            from .runtime.personal_candidate_eligibility_v1 import run_installed_artifact_predecision_mesh_v1
+                            await run_installed_artifact_predecision_mesh_v1(self, installation,
+                                c02_operation_id=c02_operation_id, source_ref=source_ref)
                 result = await self._run_post_c02_artifact_draft_once_v1(installation,
-                    c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=True)
+                    c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
                 if result["status"] not in {"artifact_phase_file_structurally_verified", "artifact_phase_check_verified"}:
                     return result
+                from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
                 completed_selector = result["selector"]
-            return await self._finalize_current_artifact_method_v2(installation, result)
-        finally:
-            self._artifact_draft_active_cycles_v1.remove(c02_operation_id)
+                sequence = artifact_draft_phase_sequence_v2(completed_selector.method_ref)
+                for _ in range(completed_selector.phase_index + 1, len(sequence)):
+                    progress = await artifact_call(lambda graph:
+                        graph.read_current_post_c02_artifact_phase_resume_v2(self._v2_bootstrap,
+                            installation.admin_bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='progress')
+                    selected = progress["selector"]
+                    if (selected.task != completed_selector.task or selected.method_ref != completed_selector.method_ref
+                            or selected.phase_index != completed_selector.phase_index + 1
+                            or not result["checkpoint"]):
+                        raise ValueError("phase continuation lacks its actual committed next-phase checkpoint")
+                    result = await self._run_post_c02_artifact_draft_once_v1(installation,
+                        c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=True)
+                    if result["status"] not in {"artifact_phase_file_structurally_verified", "artifact_phase_check_verified"}:
+                        return result
+                    completed_selector = result["selector"]
+                return await self._finalize_current_artifact_method_v2(installation, result)
+            finally:
+                self._artifact_draft_active_cycles_v1.remove(c02_operation_id)
 
     async def _run_post_c02_artifact_draft_once_v1(self, installation, *, c02_operation_id, source_ref, fresh_cause_hint=False):
-        from .host.installed_foreground_artifact_driver_v1 import run_installed_post_c02_artifact_draft_v1
-        if not fresh_cause_hint:
-            await self.reconcile_original_artifact_draft_cost_v1(installation, c02_operation_id=c02_operation_id)
-        result = await run_installed_post_c02_artifact_draft_v1(self, installation,
-            c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
-        if result["status"] == "artifact_draft_phase_content_adopted":
-            return await self._run_current_artifact_phase_file_v2(installation, result)
-        if result["status"] != "artifact_draft_content_adopted":
-            return result
-        bundle = installation.admin_bundle
-        if result["target_mode"] == "replace":
-            operations = ("revise_existing_artifact_v1", "propose_artifact_draft_action",
-                "prepare_artifact_draft_body", "input:register_artifact_draft_plan_v3", "prepare_life")
-        elif result["target_mode"] == "create":
-            operations = ("compose_artifact_goal_plan", "create_artifact_project",
-                "propose_artifact_draft_action", "prepare_artifact_draft_body", "initialize_project_checkpoint",
-                "input:register_artifact_draft_plan_v3", "prepare_life")
-        else:
-            raise ValueError("artifact task lost its actual frozen create/replace variant")
-        for operation in operations:
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            from .host.installed_foreground_artifact_driver_v1 import run_installed_post_c02_artifact_draft_v1
+            if not fresh_cause_hint:
+                await self.reconcile_original_artifact_draft_cost_v1(installation, c02_operation_id=c02_operation_id)
+            result = await run_installed_post_c02_artifact_draft_v1(self, installation,
+                c02_operation_id=c02_operation_id, source_ref=source_ref, fresh_cause_hint=fresh_cause_hint)
+            if result["status"] == "artifact_draft_phase_content_adopted":
+                return await self._run_current_artifact_phase_file_v2(installation, result)
+            if result["status"] != "artifact_draft_content_adopted":
+                return result
+            bundle = installation.admin_bundle
+            if result["target_mode"] == "replace":
+                operations = ("revise_existing_artifact_v1", "propose_artifact_draft_action",
+                    "prepare_artifact_draft_body", "input:register_artifact_draft_plan_v3", "prepare_life")
+            elif result["target_mode"] == "create":
+                operations = ("compose_artifact_goal_plan", "create_artifact_project",
+                    "propose_artifact_draft_action", "prepare_artifact_draft_body", "initialize_project_checkpoint",
+                    "input:register_artifact_draft_plan_v3", "prepare_life")
+            else:
+                raise ValueError("artifact task lost its actual frozen create/replace variant")
+            for operation in operations:
+                try:
+                    adopted = await artifact_call(lambda graph: graph.run_current_post_c02_artifact_draft_operation_v1(
+                        self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id,
+                        source_ref=source_ref, operation_kind=operation), slot='adopted')
+                except Exception as exc:
+                    return {"status": "held", "reason_code": type(exc).__name__,
+                        "operation_kind": operation, "missing_inputs": ["actual_current_artifact_stage_original"]}
+                if ((operation != "prepare_life" and adopted.get("coverage") != "complete")
+                        or adopted.get("receipt", {}).get("status") != "committed"):
+                    return {"status": "held", "operation_kind": operation, "original": adopted}
+            prepared = tuple(item for item in adopted["produced_originals"] if item["kind"] == "d11.life_prepared")
+            if len(prepared) != 1:
+                return {"status": "held", "missing_inputs": ["actual_committed_draft_life_preparation"]}
             try:
-                adopted = await self._worker.call(lambda graph: graph.run_current_post_c02_artifact_draft_operation_v1(
-                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id,
-                    source_ref=source_ref, operation_kind=operation))
+                progress = await self._worker.call(lambda graph: graph.run_prepared_source_note_v1(self._v2_bootstrap,
+                    namespace=bundle.installation_policy.namespace, prepared_original_ref=prepared[0]["original_ref"]))
             except Exception as exc:
                 return {"status": "held", "reason_code": type(exc).__name__,
-                    "operation_kind": operation, "missing_inputs": ["actual_current_artifact_stage_original"]}
-            if ((operation != "prepare_life" and adopted.get("coverage") != "complete")
-                    or adopted.get("receipt", {}).get("status") != "committed"):
-                return {"status": "held", "operation_kind": operation, "original": adopted}
-        prepared = tuple(item for item in adopted["produced_originals"] if item["kind"] == "d11.life_prepared")
-        if len(prepared) != 1:
-            return {"status": "held", "missing_inputs": ["actual_committed_draft_life_preparation"]}
-        try:
-            progress = await self._worker.call(lambda graph: graph.run_prepared_source_note_v1(self._v2_bootstrap,
-                namespace=bundle.installation_policy.namespace, prepared_original_ref=prepared[0]["original_ref"]))
-        except Exception as exc:
-            return {"status": "held", "reason_code": type(exc).__name__,
-                "missing_inputs": ["original_draft_execution_readback_and_self_adoption"]}
-        if progress.state != "adopted_completed":
-            return {"status": progress.state, "prepared_original_ref": progress.prepared_original_ref}
-        for operation in ("input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"):
-            try:
-                adopted = await self._worker.call(lambda graph: graph.run_current_post_c02_artifact_draft_operation_v1(
-                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation))
-            except Exception as exc:
-                return {"status": "held", "reason_code": type(exc).__name__, "operation_kind": operation,
-                    "missing_inputs": ["actual_draft_outcome_progress_and_checkpoint"]}
-            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
-                return {"status": "held", "operation_kind": operation, "original": adopted}
-        return {"status": "artifact_completed_verified", "selector": result["selector"],
-            "c02_operation_id": c02_operation_id, "source_ref": source_ref,
-            "prepared_original_ref": progress.prepared_original_ref, "adoption": progress.adoption,
-            "checkpoint": adopted}
+                    "missing_inputs": ["original_draft_execution_readback_and_self_adoption"]}
+            if progress.state != "adopted_completed":
+                return {"status": progress.state, "prepared_original_ref": progress.prepared_original_ref}
+            for operation in ("input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"):
+                try:
+                    adopted = await artifact_call(lambda graph: graph.run_current_post_c02_artifact_draft_operation_v1(
+                        self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=operation), slot='adopted')
+                except Exception as exc:
+                    return {"status": "held", "reason_code": type(exc).__name__, "operation_kind": operation,
+                        "missing_inputs": ["actual_draft_outcome_progress_and_checkpoint"]}
+                if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
+                    return {"status": "held", "operation_kind": operation, "original": adopted}
+            return {"status": "artifact_completed_verified", "selector": result["selector"],
+                "c02_operation_id": c02_operation_id, "source_ref": source_ref,
+                "prepared_original_ref": progress.prepared_original_ref, "adoption": progress.adoption,
+                "checkpoint": adopted}
 
     async def _run_current_artifact_phase_file_v2(self, installation, model_result):
         """Complete one real phase file without settling the whole method early."""
-        from .model_broker.artifact_draft_v1 import ArtifactDraftPhaseSelectorV2
-        phase = model_result["selector"]
-        if type(phase) is not ArtifactDraftPhaseSelectorV2 or not phase.generation:
-            raise ValueError("phase file driver requires actual adopted generation content")
-        bundle = installation.admin_bundle
-        arguments = {"c02_operation_id": phase.task.c02_operation_id, "source_ref": model_result["source_ref"]}
-        operations = ("propose_artifact_draft_phase_action_v2", "prepare_artifact_draft_body",
-            "input:register_artifact_phase_draft_plan_v2", "prepare_life")
-        for operation in operations:
-            try:
-                adopted = await self._worker.call(lambda graph:
-                    graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
-                        operation_kind=operation, **arguments))
-            except (RuntimeError, ValueError) as exc:
-                return {"status": "held", "selector": phase, "operation_kind": operation,
-                    "reason_code": type(exc).__name__, "missing_inputs": ["actual_current_phase_file_stage_original"]}
-            if ((operation != "prepare_life" and adopted.get("coverage") != "complete")
-                    or adopted.get("receipt", {}).get("status") != "committed"):
-                return {"status": "held", "selector": phase, "operation_kind": operation, "original": adopted}
-        prepared = tuple(value for value in adopted["produced_originals"] if value["kind"] == "d11.life_prepared")
-        if len(prepared) != 1:
-            return {"status": "held", "selector": phase,
-                "missing_inputs": ["actual_committed_phase_file_preparation"]}
-        progress = await self._worker.call(lambda graph: graph.run_prepared_source_note_v1(self._v2_bootstrap,
-            namespace=phase.task.namespace, prepared_original_ref=prepared[0]["original_ref"]))
-        if progress.state != "adopted_completed":
-            return {"status": progress.state, "selector": phase,
-                "prepared_original_ref": progress.prepared_original_ref}
-        verified = await self._worker.call(lambda graph:
-            graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
-                operation_kind="verify_artifact_draft_phase_v2", **arguments))
-        if verified.get("coverage") != "complete" or verified.get("receipt", {}).get("status") != "committed":
-            return {"status": "held", "selector": phase, "operation_kind": "verify_artifact_draft_phase_v2",
-                "original": verified, "prepared_original_ref": progress.prepared_original_ref}
-        checkpoint = await self._worker.call(lambda graph:
-            graph.checkpoint_current_artifact_phase_v2(self._v2_bootstrap, bundle, **arguments))
-        return {"status": "artifact_phase_file_structurally_verified",
-            "selector": phase, **arguments, "prepared_original_ref": progress.prepared_original_ref,
-            "adoption": progress.adoption, "verification": verified, "checkpoint": checkpoint}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            from .model_broker.artifact_draft_v1 import ArtifactDraftPhaseSelectorV2
+            phase = model_result["selector"]
+            if type(phase) is not ArtifactDraftPhaseSelectorV2 or not phase.generation:
+                raise ValueError("phase file driver requires actual adopted generation content")
+            bundle = installation.admin_bundle
+            arguments = {"c02_operation_id": phase.task.c02_operation_id, "source_ref": model_result["source_ref"]}
+            operations = ("propose_artifact_draft_phase_action_v2", "prepare_artifact_draft_body",
+                "input:register_artifact_phase_draft_plan_v2", "prepare_life")
+            for operation in operations:
+                try:
+                    adopted = await artifact_call(lambda graph:
+                        graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
+                            operation_kind=operation, **arguments), slot='adopted')
+                except (RuntimeError, ValueError) as exc:
+                    return {"status": "held", "selector": phase, "operation_kind": operation,
+                        "reason_code": type(exc).__name__, "missing_inputs": ["actual_current_phase_file_stage_original"]}
+                if ((operation != "prepare_life" and adopted.get("coverage") != "complete")
+                        or adopted.get("receipt", {}).get("status") != "committed"):
+                    return {"status": "held", "selector": phase, "operation_kind": operation, "original": adopted}
+            prepared = tuple(value for value in adopted["produced_originals"] if value["kind"] == "d11.life_prepared")
+            if len(prepared) != 1:
+                return {"status": "held", "selector": phase,
+                    "missing_inputs": ["actual_committed_phase_file_preparation"]}
+            progress = await self._worker.call(lambda graph: graph.run_prepared_source_note_v1(self._v2_bootstrap,
+                namespace=phase.task.namespace, prepared_original_ref=prepared[0]["original_ref"]))
+            if progress.state != "adopted_completed":
+                return {"status": progress.state, "selector": phase,
+                    "prepared_original_ref": progress.prepared_original_ref}
+            verified = await artifact_call(lambda graph:
+                graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
+                    operation_kind="verify_artifact_draft_phase_v2", **arguments), slot='verified')
+            if verified.get("coverage") != "complete" or verified.get("receipt", {}).get("status") != "committed":
+                return {"status": "held", "selector": phase, "operation_kind": "verify_artifact_draft_phase_v2",
+                    "original": verified, "prepared_original_ref": progress.prepared_original_ref}
+            checkpoint = await artifact_call(lambda graph:
+                graph.checkpoint_current_artifact_phase_v2(self._v2_bootstrap, bundle, **arguments), slot='checkpoint')
+            return {"status": "artifact_phase_file_structurally_verified",
+                "selector": phase, **arguments, "prepared_original_ref": progress.prepared_original_ref,
+                "adoption": progress.adoption, "verification": verified, "checkpoint": checkpoint}
 
     async def _finalize_current_artifact_method_v2(self, installation, result):
-        phase = result["selector"]
-        from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
-        if phase.phase_kind != "check" or phase.phase_index != len(artifact_draft_phase_sequence_v2(phase.method_ref)) - 1:
-            raise ValueError("method finalization requires its actual last check phase")
-        bundle = installation.admin_bundle
-        arguments = {"c02_operation_id": result["c02_operation_id"], "source_ref": result["source_ref"]}
-        progress = await self._worker.call(lambda graph:
-            graph.read_current_artifact_method_finalization_progress_v2(self._v2_bootstrap, bundle, **arguments))
-        if progress is None or progress["selector"] != phase:
-            raise ValueError("method finalization lost its actual complete checkpoint")
-        registered = progress["registered_milestone"]
-        if registered is None:
-            registered = await self._worker.call(lambda graph:
-                graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
-                    operation_kind="register_artifact_task_milestone_v2", **arguments))
-        if registered.get("coverage") != "complete" or registered.get("receipt", {}).get("status") != "committed":
-            return {"status": "held", "operation_kind": "register_artifact_task_milestone_v2", "original": registered, **arguments}
-        for operation in ("input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"):
-            adopted = await self._worker.call(lambda graph:
-                graph.run_current_post_c02_artifact_method_final_operation_v2(self._v2_bootstrap, bundle,
-                    operation_kind=operation, **arguments))
-            if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
-                return {"status": "held", "operation_kind": operation, "original": adopted, **arguments}
-        return {"status": "artifact_method_settled", "selector": phase, "milestone": registered,
-            "settlement": adopted, **arguments}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            phase = result["selector"]
+            from .model_broker.artifact_draft_v1 import artifact_draft_phase_sequence_v2
+            if phase.phase_kind != "check" or phase.phase_index != len(artifact_draft_phase_sequence_v2(phase.method_ref)) - 1:
+                raise ValueError("method finalization requires its actual last check phase")
+            bundle = installation.admin_bundle
+            arguments = {"c02_operation_id": result["c02_operation_id"], "source_ref": result["source_ref"]}
+            progress = await artifact_call(lambda graph:
+                graph.read_current_artifact_method_finalization_progress_v2(self._v2_bootstrap, bundle, **arguments), slot='progress')
+            if progress is None or progress["selector"] != phase:
+                raise ValueError("method finalization lost its actual complete checkpoint")
+            registered = progress["registered_milestone"]
+            if registered is None:
+                registered = await artifact_call(lambda graph:
+                    graph.run_current_post_c02_artifact_phase_operation_v2(self._v2_bootstrap, bundle,
+                        operation_kind="register_artifact_task_milestone_v2", **arguments), slot='registered')
+            if registered.get("coverage") != "complete" or registered.get("receipt", {}).get("status") != "committed":
+                return {"status": "held", "operation_kind": "register_artifact_task_milestone_v2", "original": registered, **arguments}
+            for operation in ("input:register_life_outcome_v2", "advance_life", "settle_project_checkpoint", "settle_personal_goal"):
+                adopted = await artifact_call(lambda graph:
+                    graph.run_current_post_c02_artifact_method_final_operation_v2(self._v2_bootstrap, bundle,
+                        operation_kind=operation, **arguments), slot='adopted')
+                if adopted.get("coverage") != "complete" or adopted.get("receipt", {}).get("status") != "committed":
+                    return {"status": "held", "operation_kind": operation, "original": adopted, **arguments}
+            return {"status": "artifact_method_settled", "selector": phase, "milestone": registered,
+                "settlement": adopted, **arguments}
 
     async def reconcile_original_artifact_draft_cost_v1(self, installation, *, c02_operation_id):
         from .runtime.d11_artifact_draft_model_v1 import InstalledArtifactDraftModelRuntimeV1, recover_original_artifact_draft_model_cost_v1
@@ -3807,173 +3840,180 @@ class RuntimeContext:
                 "missing_inputs": ["original_artifact_terminal_financial_fact"]}
 
     async def prepare_post_c02_recall_need_v1(self, installation, *, c02_operation_id, source_ref):
-        if installation.admin_bundle.d06_recall is None:
-            return {"status": "not_configured"}
-        async with asyncio.timeout(installation.admin_bundle.d06_recall.read_timeout_seconds):
-            result = await self._worker.call(lambda graph: graph.prepare_current_post_c02_recall_need_v1(
-                self._v2_bootstrap, installation.admin_bundle,
-                c02_operation_id=c02_operation_id, source_ref=source_ref))
-        return {"status": result["need"]["routing"], **result}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            if installation.admin_bundle.d06_recall is None:
+                return {"status": "not_configured"}
+            async with asyncio.timeout(installation.admin_bundle.d06_recall.read_timeout_seconds):
+                result = await artifact_call(lambda graph: graph.prepare_current_post_c02_recall_need_v1(
+                    self._v2_bootstrap, installation.admin_bundle,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref), slot='result')
+            return {"status": result["need"]["routing"], **result}
 
     async def resume_original_post_c02_recall_v1(self, installation, *, c02_operation_id, source_ref):
         """Consume only old C3 identities; each following operation is freshly admitted."""
-        from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
-        bundle, service = self._v2_model_bundle, self._v2_d07_execution_service
-        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
-                or type(service) is not InstalledD07ExecutionServiceV1 or service.bundle is not bundle):
-            return {"status": "held", "missing_inputs": ["actual_installed_original_recall_service"]}
-        async def read():
-            return await self._worker.call(lambda graph: graph.read_current_ingress_recall_resume_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-        current = await read()
-        if current["routing"] is None:
-            child = await service.execute_current_d07_job_v1(current["c3_job"])
-            if child.get("status") != "adopted":
-                return {"status": child.get("status", "original_c3_pending"), "c3": child}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+            bundle, service = self._v2_model_bundle, self._v2_d07_execution_service
+            if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                    or type(service) is not InstalledD07ExecutionServiceV1 or service.bundle is not bundle):
+                return {"status": "held", "missing_inputs": ["actual_installed_original_recall_service"]}
+            async def read():
+                return await self._worker.call(lambda graph: graph.read_current_ingress_recall_resume_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
             current = await read()
-        routing = current["routing"]
-        if routing is None:
-            raise RuntimeError("original C3 completion has no actual adopted routing")
-        if routing["stop_reason"] != "search_required":
-            if routing["stop_reason"] == "no_history_needed":
+            if current["routing"] is None:
+                child = await service.execute_current_d07_job_v1(current["c3_job"])
+                if child.get("status") != "adopted":
+                    return {"status": child.get("status", "original_c3_pending"), "c3": child}
+                current = await read()
+            routing = current["routing"]
+            if routing is None:
+                raise RuntimeError("original C3 completion has no actual adopted routing")
+            if routing["stop_reason"] != "search_required":
+                if routing["stop_reason"] == "no_history_needed":
+                    if current["parent_phase"] not in {"queued", "running"}:
+                        return {"status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
+                    await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                        self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquire_post_c02_foreground_cycle_v1')
+                return {"status": routing["stop_reason"], "routing": routing}
+            if current["c04_prepared"] is None:
                 if current["parent_phase"] not in {"queued", "running"}:
                     return {"status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
-                await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            return {"status": routing["stop_reason"], "routing": routing}
-        if current["c04_prepared"] is None:
-            if current["parent_phase"] not in {"queued", "running"}:
-                return {"status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
-            await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            if current["selection"] is None:
-                await self._worker.call(lambda graph: graph.select_current_post_c02_ingress_recall_seed_v1(
-                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+                await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquire_post_c02_foreground_cycle_v1')
+                if current["selection"] is None:
+                    await artifact_call(lambda graph: graph.select_current_post_c02_ingress_recall_seed_v1(
+                        self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='select_current_post_c02_ingress_recall_seed_v1')
+                    current = await read()
+                if current["selection"][0].selected_source_ref is None:
+                    return {"status": "c03_no_eligible_source", "routing": routing}
+                from .runtime.c04_self_scope_v4 import PREPARE_OPERATION
+                await artifact_call(lambda graph: graph.run_current_post_c02_ingress_c04_operation_v4(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id,
+                    source_ref=source_ref, operation_kind=PREPARE_OPERATION), slot='run_current_post_c02_ingress_c04_operation_v4')
+            result = await self._advance_installed_ingress_c04_v3(installation,c02_operation_id=c02_operation_id,source_ref=source_ref)
+            if result["status"] == "recollection_adopted":
                 current = await read()
-            if current["selection"][0].selected_source_ref is None:
-                return {"status": "c03_no_eligible_source", "routing": routing}
-            from .runtime.c04_self_scope_v4 import PREPARE_OPERATION
-            await self._worker.call(lambda graph: graph.run_current_post_c02_ingress_c04_operation_v4(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id,
-                source_ref=source_ref, operation_kind=PREPARE_OPERATION))
-        result = await self._worker.call(lambda graph: graph.advance_current_post_c02_ingress_c04_v4(
-            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-        if result["status"] == "recollection_adopted":
-            current = await read()
-            if current["parent_phase"] not in {"queued", "running"}:
-                return {"status": "held", "missing_inputs": ["actual_c04_adopted_parent_queue_transition"]}
-            await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-        return result
+                if current["parent_phase"] not in {"queued", "running"}:
+                    return {"status": "held", "missing_inputs": ["actual_c04_adopted_parent_queue_transition"]}
+                await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquire_post_c02_foreground_cycle_v1')
+            return result
 
     async def run_post_c02_recall_v1(self, installation, *, c02_operation_id, source_ref):
         """Ordinary ingress consumes actual C3/C03 originals before any C04 activity."""
-        result = await self.prepare_post_c02_recall_need_v1(installation,
-            c02_operation_id=c02_operation_id, source_ref=source_ref)
-        if result["status"] in {"not_configured", "no_search"}:
-            return result
-        if result["status"] == "semantic_route_required":
-            history = await self._worker.call(lambda graph: graph.run_current_post_c02_task_no_search_v1(
-                self._v2_bootstrap, installation.admin_bundle,c02_operation_id=c02_operation_id,source_ref=source_ref))
-            if history["status"] == "no_search":
-                return {**result,"status":"no_search","need":history["need"],"task_no_search":history}
-            if history["status"] != "not_applicable":
-                return {**result,"status":"held","task_no_search":history}
-            result = {**result,"task_no_search":history}
-        bundle, service = self._v2_model_bundle, self._v2_d07_execution_service
-        from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
-        from .runtime.d07_ingress_recall_preparation_v1 import OPERATION
-        from .runtime.d07_ingress_recall_result_v1 import read_adopted_ingress_recall_routing_v1
-        from .runtime.jobs import get_job
-        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
-                or type(service) is not InstalledD07ExecutionServiceV1 or service.bundle is not bundle):
-            return {**result, "status": "unconfigured_c3", "missing_inputs": ["actual_installed_self_c3_execution_service"]}
-        prepared = await self._worker.call(lambda graph: graph.run_current_post_c02_ingress_recall_model_operation_v1(
-            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=OPERATION))
-        job = await self._worker.call(lambda graph: get_job(
-            graph._GraphCoordinator__store._db, prepared["continuation_ref"]))
-        execution = await service.execute_current_d07_job_v1(job)
-        if execution.get("status") != "adopted":
-            return {**result, "status": execution.get("status", "actual_c3_pending"), "c3": execution}
-        def read_routing(graph):
-            store = graph._GraphCoordinator__store
-            with store._lock:
-                db = store._db
-                db.execute("BEGIN")
-                try:
-                    return read_adopted_ingress_recall_routing_v1(db, namespace=bundle.installation_policy.namespace,
-                        c02_operation_id=c02_operation_id, issuer=graph._GraphCoordinator__d11_issuer)
-                finally:
-                    db.rollback()
-        routing = await self._worker.call(read_routing)
-        if routing is None:
-            raise RuntimeError("C3 reported adoption without its actual W01 routing original")
-        if routing["stop_reason"] != "search_required":
-            if routing["stop_reason"] == "no_history_needed":
-                current = await self._worker.call(lambda graph: graph.read_current_ingress_recall_resume_v1(
-                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-                if current["parent_phase"] not in {"queued", "running"}:
-                    return {**result, "status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
-                await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            return {**result, "status": routing["stop_reason"], "c3": execution, "routing": routing}
-        await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-        selection = await self._worker.call(lambda graph: graph.select_current_post_c02_ingress_recall_seed_v1(
-            self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-        if selection["selection"]["selected_source_ref"] is None:
-            return {**result, "status": "c03_no_eligible_source", "c3": execution,
-                "routing": routing, "c03": selection}
-        from .runtime.c04_self_scope_v4 import PREPARE_OPERATION
-        preparation = await self._worker.call(lambda graph:
-            graph.run_current_post_c02_ingress_c04_operation_v4(self._v2_bootstrap, bundle,
-                c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=PREPARE_OPERATION))
-        native = await self._worker.call(lambda graph:
-            graph.advance_current_post_c02_ingress_c04_v4(self._v2_bootstrap, bundle,
-                c02_operation_id=c02_operation_id, source_ref=source_ref))
-        if native["status"] == "recollection_adopted":
-            await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-        return {**result, "status": native["status"], "c3": execution,
-            "routing": routing, "c03": selection, "c04_preparation": preparation, "c04": native}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            result = await self.prepare_post_c02_recall_need_v1(installation,
+                c02_operation_id=c02_operation_id, source_ref=source_ref)
+            if result["status"] in {"not_configured", "no_search"}:
+                return result
+            if result["status"] == "semantic_route_required":
+                history = await artifact_call(lambda graph: graph.run_current_post_c02_task_no_search_v1(
+                    self._v2_bootstrap, installation.admin_bundle,c02_operation_id=c02_operation_id,source_ref=source_ref), slot='history')
+                if history["status"] == "no_search":
+                    return {**result,"status":"no_search","need":history["need"],"task_no_search":history}
+                if history["status"] != "not_applicable":
+                    return {**result,"status":"held","task_no_search":history}
+                result = {**result,"task_no_search":history}
+            bundle, service = self._v2_model_bundle, self._v2_d07_execution_service
+            from .runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+            from .runtime.d07_ingress_recall_preparation_v1 import OPERATION
+            from .runtime.d07_ingress_recall_result_v1 import read_adopted_ingress_recall_routing_v1
+            from .runtime.jobs import get_job
+            if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                    or type(service) is not InstalledD07ExecutionServiceV1 or service.bundle is not bundle):
+                return {**result, "status": "unconfigured_c3", "missing_inputs": ["actual_installed_self_c3_execution_service"]}
+            prepared = await artifact_call(lambda graph: graph.run_current_post_c02_ingress_recall_model_operation_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=OPERATION), slot='prepared')
+            job = await self._worker.call(lambda graph: get_job(
+                graph._GraphCoordinator__store._db, prepared["continuation_ref"]))
+            execution = await service.execute_current_d07_job_v1(job)
+            if execution.get("status") != "adopted":
+                return {**result, "status": execution.get("status", "actual_c3_pending"), "c3": execution}
+            def read_routing(graph):
+                store = graph._GraphCoordinator__store
+                with store._lock:
+                    db = store._db
+                    db.execute("BEGIN")
+                    try:
+                        return read_adopted_ingress_recall_routing_v1(db, namespace=bundle.installation_policy.namespace,
+                            c02_operation_id=c02_operation_id, issuer=graph._GraphCoordinator__d11_issuer)
+                    finally:
+                        db.rollback()
+            routing = await self._worker.call(read_routing)
+            if routing is None:
+                raise RuntimeError("C3 reported adoption without its actual W01 routing original")
+            if routing["stop_reason"] != "search_required":
+                if routing["stop_reason"] == "no_history_needed":
+                    current = await self._worker.call(lambda graph: graph.read_current_ingress_recall_resume_v1(
+                        self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
+                    if current["parent_phase"] not in {"queued", "running"}:
+                        return {**result, "status": "held", "missing_inputs": ["actual_adopted_child_parent_queue_transition"]}
+                    await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                        self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquire_post_c02_foreground_cycle_v1')
+                return {**result, "status": routing["stop_reason"], "c3": execution, "routing": routing}
+            await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquire_post_c02_foreground_cycle_v1')
+            selection = await artifact_call(lambda graph: graph.select_current_post_c02_ingress_recall_seed_v1(
+                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='selection')
+            if selection["selection"]["selected_source_ref"] is None:
+                return {**result, "status": "c03_no_eligible_source", "c3": execution,
+                    "routing": routing, "c03": selection}
+            from .runtime.c04_self_scope_v4 import PREPARE_OPERATION
+            preparation = await artifact_call(lambda graph:
+                graph.run_current_post_c02_ingress_c04_operation_v4(self._v2_bootstrap, bundle,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=PREPARE_OPERATION), slot='preparation')
+            native = await self._advance_installed_ingress_c04_v3(installation,c02_operation_id=c02_operation_id,source_ref=source_ref)
+            if native["status"] == "recollection_adopted":
+                await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquire_post_c02_foreground_cycle_v1')
+            return {**result, "status": native["status"], "c3": execution,
+                "routing": routing, "c03": selection, "c04_preparation": preparation, "c04": native}
 
     async def begin_post_c02_foreground_cycle_v1(self, *, installation, c02_operation_id, source_ref):
         """Only the live committed-input path asks W01 to create its actual cycle."""
-        bundle, policy = self._v2_model_bundle, self._v2_policy
-        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
-                or type(bundle) is not AdminInstallationBundle or bundle.installation_policy is not policy
-                or self._worker is None or self._v2_bootstrap is None or not self._v2_namespace_provisioned):
-            return {"status": "held", "missing_inputs": ["actual_installed_foreground_worker"]}
-        if "d11.foreground_cycle.v1" not in policy.root_grant.allowed_work_kinds:
-            return {"status": "legacy", "coverage": "not_configured"}
-        try:
-            created = await self._worker.call(lambda graph: graph.prepare_post_c02_foreground_cycle_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            if created.get("coverage") != "complete" or created.get("receipt", {}).get("status") != "committed":
-                return {"status": "held", "original": created}
-            acquired = await self._worker.call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            mode = await self._worker.call(lambda graph: graph.read_current_post_c02_foreground_mode_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            return {"status": "current", "creation": created, "acquisition": acquired, "mode": mode["mode"],
-                "coverage": "actual_cycle_current_source_and_protected_reply_budget"}
-        except Exception as exc:
-            return {"status": "held", "reason_code": type(exc).__name__, "missing_inputs": ["actual_foreground_cycle_qualification"]}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            bundle, policy = self._v2_model_bundle, self._v2_policy
+            if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                    or type(bundle) is not AdminInstallationBundle or bundle.installation_policy is not policy
+                    or self._worker is None or self._v2_bootstrap is None or not self._v2_namespace_provisioned):
+                return {"status": "held", "missing_inputs": ["actual_installed_foreground_worker"]}
+            if "d11.foreground_cycle.v1" not in policy.root_grant.allowed_work_kinds:
+                return {"status": "legacy", "coverage": "not_configured"}
+            try:
+                created = await artifact_call(lambda graph: graph.prepare_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='created')
+                if created.get("coverage") != "complete" or created.get("receipt", {}).get("status") != "committed":
+                    return {"status": "held", "original": created}
+                acquired = await artifact_call(lambda graph: graph.acquire_post_c02_foreground_cycle_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='acquired')
+                mode = await artifact_call(lambda graph: graph.read_current_post_c02_foreground_mode_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='mode')
+                return {"status": "current", "creation": created, "acquisition": acquired, "mode": mode["mode"],
+                    "coverage": "actual_cycle_current_source_and_protected_reply_budget"}
+            except Exception as exc:
+                return {"status": "held", "reason_code": type(exc).__name__, "missing_inputs": ["actual_foreground_cycle_qualification"]}
 
     async def checkpoint_post_c02_foreground_wait_v1(self, *, installation, c02_operation_id, source_ref):
-        bundle = self._v2_model_bundle
-        if type(bundle) is not AdminInstallationBundle or "d11.foreground_cycle.v1" not in bundle.installation_policy.root_grant.allowed_work_kinds:
-            return {"status": "legacy", "coverage": "not_configured"}
-        if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
-                or self._worker is None or self._v2_bootstrap is None):
-            return {"status": "held", "missing_inputs": ["actual_installed_foreground_worker"]}
-        try:
-            result = await self._worker.call(lambda graph: graph.checkpoint_post_c02_foreground_wait_v1(
-                self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-            return {"status": "waiting", "original": result,
-                "missing_inputs": ["next_registered_personal_step_original"]}
-        except Exception as exc:
-            return {"status": "held", "reason_code": type(exc).__name__, "missing_inputs": ["actual_foreground_checkpoint_qualification"]}
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        with _retained_artifact_graph_calls_v3(self._worker)as artifact_call:
+            bundle = self._v2_model_bundle
+            if type(bundle) is not AdminInstallationBundle or "d11.foreground_cycle.v1" not in bundle.installation_policy.root_grant.allowed_work_kinds:
+                return {"status": "legacy", "coverage": "not_configured"}
+            if (type(installation) is not V2InstallationAssembly or installation.admin_bundle is not bundle
+                    or self._worker is None or self._v2_bootstrap is None):
+                return {"status": "held", "missing_inputs": ["actual_installed_foreground_worker"]}
+            try:
+                result = await artifact_call(lambda graph: graph.checkpoint_post_c02_foreground_wait_v1(
+                    self._v2_bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref), slot='result')
+                return {"status": "waiting", "original": result,
+                    "missing_inputs": ["next_registered_personal_step_original"]}
+            except Exception as exc:
+                return {"status": "held", "reason_code": type(exc).__name__, "missing_inputs": ["actual_foreground_checkpoint_qualification"]}
 
     async def prepare_post_c02_natural_generation_v2(
         self, *, installation: V2InstallationAssembly,
@@ -5808,6 +5848,24 @@ class RuntimeContext:
                     graph.consume_current_domain_followup_v1(self._v2_bootstrap, installation.admin_bundle, dedupe_key=key))
                 self._consume_background_graph_result_v3(raw)
                 self.resume_pending_contact_background_v1(installation)
+
+    async def _advance_installed_ingress_c04_v3(self,installation,*,c02_operation_id,source_ref):
+        from .host.installed_foreground_artifact_driver_v1 import _retained_artifact_graph_calls_v3
+        from .runtime.c04_ingress_preparation_v4 import ADOPT_OPERATION
+        bundle=installation.admin_bundle;bootstrap=self._v2_bootstrap
+        with _retained_artifact_graph_calls_v3(self._worker)as call:
+            current=await call(lambda graph:graph.advance_current_post_c02_ingress_c04_v4(bootstrap,bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref),slot='source')
+            if current['status']!='native_ready':return current
+            stage=await call(lambda graph:graph._execute_current_ingress_c04_native_v3(bootstrap,bundle,
+                locator=current['locator']),slot='native')
+            if stage['status']!='native_ready_for_adoption':return stage
+            adopted=await call(lambda graph:graph.run_current_post_c02_ingress_c04_operation_v4(bootstrap,bundle,
+                c02_operation_id=c02_operation_id,source_ref=source_ref,operation_kind=ADOPT_OPERATION),slot='adoption')
+            if adopted.get('coverage')!='complete'or adopted.get('receipt',{}).get('status')!='committed':
+                return {'status':'held','native':stage,'adoption':adopted}
+            return {'status':'recollection_adopted','operation_id':stage['operation_id'],
+                'binding_digest':stage['binding_digest'],'cost':stage['cost'],'adoption':adopted}
 
 
 

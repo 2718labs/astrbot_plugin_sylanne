@@ -55,8 +55,10 @@ class InstalledDomainOperationRuntimeV1:
         from .current_beta1_source_read_v3 import beta1_source_operation_v3
         from .current_method_learning_read_v3 import _method_active
         source_reader_v3=_method_active(db)
+        from .foreground_command_source_v3 import is_foreground_command_source_reader_v3
         own_source_plan_v3=(beta1_source_operation_v3(operation.operation_kind)
-            and (operation.operation_kind!="serve_concern"or source_reader_v3 is not None))
+            and (operation.operation_kind!="serve_concern"or source_reader_v3 is not None)
+            and not(source_reader_v3 is not None and is_foreground_command_source_reader_v3(source_reader_v3)))
         if own_source_plan_v3:
             from .current_beta1_source_read_v3 import require_beta1_source_plan_metadata_v3
             require_beta1_source_plan_metadata_v3(source_reader_v3)
@@ -720,75 +722,78 @@ class InstalledDomainOperationRuntimeV1:
                 self.graph._GraphCoordinator__artifact_draft_model_runtime_v1._active_artifact_phase_count_stage_v2 = (
                     count_material.stage, count_material.count_pair, now_utc)
             from .domain_production_commit_v1 import commit_installed_domain_operation_v1
-            result = commit_installed_domain_operation_v1(self, db, operation=operation, request=request,
-                frame=frame, stage=stage, readers=readers, scope=scope, owner=None, guard=evidence.owner_guard,
-                metadata=metadata, epoch=epoch, process_lease=token, external_originals=external_originals)
-            from .domain_production_originals_v1 import _receipt
-            from contextlib import ExitStack
-            with ExitStack() as post_commit_stack:
-                successor = None
-                if (operation.operation_kind in {
-                        "propose_artifact_draft_action", "propose_artifact_draft_phase_action_v2"}
-                        and result["coverage"] == "complete"):
-                    from .current_method_learning_read_v3 import bind_method_post_commit_v3
-                    successor = post_commit_stack.enter_context(bind_method_post_commit_v3(
-                        db, graph=self.graph, prior_frame=frame, stage=stage,
-                        actual_receipt=_receipt(result["receipt"]), scope=scope,
-                        issued=issued, process_lease=token))
-                if operation.operation_kind in {
-                        "prepare_artifact_draft_model_v2", "acquire_artifact_draft_model_v2"}:
-                    from .current_method_learning_read_v3 import bind_method_foreground_scope_post_commit_v3
-                    with bind_method_foreground_scope_post_commit_v3(
+            from .foreground_command_writer_outputs_v3 import bind_foreground_command_writer_v3
+            with bind_foreground_command_writer_v3(db,graph=self.graph,prior_frame=frame,stage=stage,
+                    issued=issued,scope=scope,process_lease=token,request=request):
+                result = commit_installed_domain_operation_v1(self, db, operation=operation, request=request,
+                    frame=frame, stage=stage, readers=readers, scope=scope, owner=None, guard=evidence.owner_guard,
+                    metadata=metadata, epoch=epoch, process_lease=token, external_originals=external_originals)
+                from .domain_production_originals_v1 import _receipt
+                from contextlib import ExitStack
+                with ExitStack() as post_commit_stack:
+                    successor = None
+                    if (operation.operation_kind in {
+                            "propose_artifact_draft_action", "propose_artifact_draft_phase_action_v2"}
+                            and result["coverage"] == "complete"):
+                        from .current_method_learning_read_v3 import bind_method_post_commit_v3
+                        successor = post_commit_stack.enter_context(bind_method_post_commit_v3(
                             db, graph=self.graph, prior_frame=frame, stage=stage,
                             actual_receipt=_receipt(result["receipt"]), scope=scope,
-                            issued=issued, process_lease=token):
+                            issued=issued, process_lease=token))
+                    if operation.operation_kind in {
+                            "prepare_artifact_draft_model_v2", "acquire_artifact_draft_model_v2"}:
+                        from .current_method_learning_read_v3 import bind_method_foreground_scope_post_commit_v3
+                        with bind_method_foreground_scope_post_commit_v3(
+                                db, graph=self.graph, prior_frame=frame, stage=stage,
+                                actual_receipt=_receipt(result["receipt"]), scope=scope,
+                                issued=issued, process_lease=token):
+                            originals = record_foreground_life_scope_after_commit_v1(
+                                db, graph=self.graph, issued=issued, frame=frame,
+                                receipt=_receipt(result["receipt"]), issuer=issuer)
+                    else:
                         originals = record_foreground_life_scope_after_commit_v1(
                             db, graph=self.graph, issued=issued, frame=frame,
                             receipt=_receipt(result["receipt"]), issuer=issuer)
-                else:
-                    originals = record_foreground_life_scope_after_commit_v1(
-                        db, graph=self.graph, issued=issued, frame=frame,
-                        receipt=_receipt(result["receipt"]), issuer=issuer)
-                result["produced_originals"].extend({"kind": item.kind, "original_ref": item.original_ref,
-                    "original_digest": item.original_digest} for item in originals)
-                from .d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1, record_ingress_recall_result_after_cas_v1
-                if type(stage) is D07IngressRecallResultStageV1:
-                    produced = record_ingress_recall_result_after_cas_v1(db, stage=stage,
-                        receipt=_receipt(result["receipt"]), issuer=issuer)
-                    if produced is not None:
-                        result["produced_originals"].append(produced)
-                from .d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, record_artifact_draft_content_after_cas_v1
-                if type(stage) in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}:
-                    produced = record_artifact_draft_content_after_cas_v1(db, stage=stage,
-                        receipt=_receipt(result["receipt"]), installed_readers=readers)
-                    result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
-                        "original_digest": produced.original_digest})
-                from .d11_artifact_draft_content_v1 import ArtifactDraftPhaseVerificationStageV2, record_artifact_draft_phase_verified_after_cas_v2
-                if type(stage) is ArtifactDraftPhaseVerificationStageV2:
-                    produced = record_artifact_draft_phase_verified_after_cas_v2(db, stage=stage,
-                        receipt=_receipt(result["receipt"]), installed_readers=readers)
-                    result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
-                        "original_digest": produced.original_digest})
-                if operation.operation_kind == "propose_artifact_draft_action" and result["coverage"] == "complete":
-                    from .domain_production_inputs_v1 import _post_commit_frame
-                    from .d08_personal_plan_v1 import read_current_artifact_action_root_skeleton_v1
-                    from .d08_life_admission_v1 import record_draft_action_root_v1
-                    post = _post_commit_frame(db, frame, request, _successor_v3=successor)
-                    skeleton = read_current_artifact_action_root_skeleton_v1(db, frame=post, request=request, installed_readers=readers)
-                    produced = record_draft_action_root_v1(db, frame=post, plan=skeleton, issuer=issuer)
-                    result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
-                        "original_digest": produced.original_digest})
-                if operation.operation_kind == "propose_artifact_draft_phase_action_v2" and result["coverage"] == "complete":
-                    from .domain_production_inputs_v1 import _post_commit_frame
-                    from .d08_personal_plan_v1 import read_current_artifact_phase_action_root_skeleton_v2
-                    from .d08_life_admission_v1 import record_draft_action_root_v1
-                    post = _post_commit_frame(db, frame, request, _successor_v3=successor)
-                    skeleton = read_current_artifact_phase_action_root_skeleton_v2(db,
-                        frame=post, request=request, installed_readers=readers)
-                    produced = record_draft_action_root_v1(db, frame=post, plan=skeleton, issuer=issuer)
-                    result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
-                        "original_digest": produced.original_digest})
-            return result
+                    result["produced_originals"].extend({"kind": item.kind, "original_ref": item.original_ref,
+                        "original_digest": item.original_digest} for item in originals)
+                    from .d07_ingress_recall_result_v1 import D07IngressRecallResultStageV1, record_ingress_recall_result_after_cas_v1
+                    if type(stage) is D07IngressRecallResultStageV1:
+                        produced = record_ingress_recall_result_after_cas_v1(db, stage=stage,
+                            receipt=_receipt(result["receipt"]), issuer=issuer)
+                        if produced is not None:
+                            result["produced_originals"].append(produced)
+                    from .d11_artifact_draft_content_v1 import ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, record_artifact_draft_content_after_cas_v1
+                    if type(stage) in {ArtifactDraftContentStageV1, ArtifactDraftContentStageV2}:
+                        produced = record_artifact_draft_content_after_cas_v1(db, stage=stage,
+                            receipt=_receipt(result["receipt"]), installed_readers=readers)
+                        result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
+                            "original_digest": produced.original_digest})
+                    from .d11_artifact_draft_content_v1 import ArtifactDraftPhaseVerificationStageV2, record_artifact_draft_phase_verified_after_cas_v2
+                    if type(stage) is ArtifactDraftPhaseVerificationStageV2:
+                        produced = record_artifact_draft_phase_verified_after_cas_v2(db, stage=stage,
+                            receipt=_receipt(result["receipt"]), installed_readers=readers)
+                        result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
+                            "original_digest": produced.original_digest})
+                    if operation.operation_kind == "propose_artifact_draft_action" and result["coverage"] == "complete":
+                        from .domain_production_inputs_v1 import _post_commit_frame
+                        from .d08_personal_plan_v1 import read_current_artifact_action_root_skeleton_v1
+                        from .d08_life_admission_v1 import record_draft_action_root_v1
+                        post = _post_commit_frame(db, frame, request, _successor_v3=successor)
+                        skeleton = read_current_artifact_action_root_skeleton_v1(db, frame=post, request=request, installed_readers=readers)
+                        produced = record_draft_action_root_v1(db, frame=post, plan=skeleton, issuer=issuer)
+                        result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
+                            "original_digest": produced.original_digest})
+                    if operation.operation_kind == "propose_artifact_draft_phase_action_v2" and result["coverage"] == "complete":
+                        from .domain_production_inputs_v1 import _post_commit_frame
+                        from .d08_personal_plan_v1 import read_current_artifact_phase_action_root_skeleton_v2
+                        from .d08_life_admission_v1 import record_draft_action_root_v1
+                        post = _post_commit_frame(db, frame, request, _successor_v3=successor)
+                        skeleton = read_current_artifact_phase_action_root_skeleton_v2(db,
+                            frame=post, request=request, installed_readers=readers)
+                        produced = record_draft_action_root_v1(db, frame=post, plan=skeleton, issuer=issuer)
+                        result["produced_originals"].append({"kind": produced.kind, "original_ref": produced.original_ref,
+                            "original_digest": produced.original_digest})
+                return result
         finally:
             self._active_foreground_issuance_v1 = None
             self._active_foreground_process_lease_v1 = None
@@ -888,9 +893,7 @@ class InstalledDomainOperationRuntimeV1:
             request_digest = require_owner_material_command_digest_v3(_owner_material_command_v3,
                 self, authority, lease, request=request, operation_id=operation_id, activity_id=activity_id,
                 audience_ref=audience_ref, parent_budget_lease_ref=parent_budget_lease_ref,
-                storage_work=_owner_material_work_v3,
-                contact_plan_prepare=prepare_contact_plan if _contact_plan_parent_v3 is not None else None,
-                contact_plan_parent=_contact_plan_parent_v3)
+                storage_work=_owner_material_work_v3)
         else:
             if _owner_material_command_v3 is not None or _owner_material_work_v3 is not None:
                 raise ValueError("material Source command witness cannot alter another operation")

@@ -42,6 +42,9 @@ def _identity_v3(r):
 
 
 def _state_v3(r):
+    from .artifact_host_control_metadata_v3 import control_state_for_dispatch_v3
+    control=control_state_for_dispatch_v3(r)
+    if control is not None:return control
     from .artifact_host_result_archive_source_v3 import archive_state_for_dispatch_v3
     archive=archive_state_for_dispatch_v3(r)
     if archive is not None:return archive
@@ -611,6 +614,8 @@ def _budget_metadata_v3(s,meter):
 
 
 def require_artifact_host_dispatch_owner_identity_v3(r):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,require_artifact_control_owner_identity_v3
+    if has_artifact_host_control_work_v3(r):return require_artifact_control_owner_identity_v3(r)
     s=_state_v3(r)
     if(not s.metadata_complete or s.prepared is None or s.model_envelope is None
             or s.phase not in {'owner','sources','algorithm','validate','complete'}
@@ -622,6 +627,8 @@ def require_artifact_host_dispatch_owner_identity_v3(r):
 
 
 def artifact_host_dispatch_owner_cause_v3(r):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,artifact_control_owner_cause_v3
+    if has_artifact_host_control_work_v3(r):return artifact_control_owner_cause_v3(r)
     s=require_artifact_host_dispatch_owner_identity_v3(r)
     return(r.selector,s.job_header,s.prepared.digest,s.prepared_task.header,s.frozen_task.header,s.request_task.header,
         tuple((op,task.header)for op,task in sorted(s.producers.items())),s.eligibility_deadline,
@@ -708,6 +715,8 @@ def _bound_state_v3(db):
 
 
 def require_artifact_host_dispatch_body_v3(r,table,key):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,require_artifact_control_body_v3
+    if has_artifact_host_control_work_v3(r):return require_artifact_control_body_v3(r,table,key)
     s=_state_v3(r)
     if not s.source_complete or s.phase not in {'algorithm','validate'}or s.owner_entry is None:
         raise AuthorityUnavailable('Artifact dispatch Body cannot precede its real Owner17 and independent B/C ALL')
@@ -729,6 +738,8 @@ def require_artifact_host_dispatch_body_v3(r,table,key):
 
 
 def require_artifact_host_dispatch_request_v3(r,request):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,require_artifact_control_request_v3
+    if has_artifact_host_control_work_v3(r):return require_artifact_control_request_v3(r,request)
     s=require_artifact_host_dispatch_body_v3(r,request[0],request[3])
     table,columns,key_columns,key=request
     from .domain_background_read_v3 import _POINT_KEYS,_D07_POINT_COLUMNS
@@ -785,6 +796,9 @@ def require_artifact_host_dispatch_request_v3(r,request):
 
 
 def read_bound_artifact_host_dispatch_job_v3(db,job_id):
+    from .artifact_host_control_metadata_v3 import read_artifact_control_job_v3
+    control,job=read_artifact_control_job_v3(db,job_id)
+    if control:return True,job
     s=_bound_state_v3(db)
     if s is None:return False,None
     r=s.reader
@@ -808,6 +822,9 @@ def read_bound_artifact_host_dispatch_job_v3(db,job_id):
 
 
 def read_bound_artifact_host_dispatch_quote_v3(db,issuer,quote_id,version):
+    from .artifact_host_control_metadata_v3 import read_artifact_control_quote_v3
+    control,quote=read_artifact_control_quote_v3(db,issuer,quote_id,version)
+    if control:return True,quote
     s=_bound_state_v3(db)
     if s is None:return False,None
     r=s.reader
@@ -1021,6 +1038,8 @@ class _ArtifactHostDispatchResultV3:
 
 
 def require_artifact_host_dispatch_family_v3(r,type_id):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,require_artifact_control_family_v3
+    if has_artifact_host_control_work_v3(r):return require_artifact_control_family_v3(r,type_id)
     s=_state_v3(r)
     if not s.source_complete:
         raise AuthorityUnavailable('Artifact Host inventory precedes its actual independent Source ALL')
@@ -1035,6 +1054,8 @@ def require_artifact_host_dispatch_family_v3(r,type_id):
 
 
 def advance_artifact_host_dispatch_read_v3(graph,work):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,advance_artifact_host_control_v3
+    if has_artifact_host_control_work_v3(work.state):return advance_artifact_host_control_v3(graph,work)
     from .artifact_host_result_archive_source_v3 import has_artifact_host_result_archive_work_v3,advance_artifact_host_result_archive_v3
     if has_artifact_host_result_archive_work_v3(work.state):return advance_artifact_host_result_archive_v3(graph,work)
     r=work.state;s=_state_v3(r)
@@ -1109,6 +1130,8 @@ def _close_artifact_host_dispatch_scopes_v3(r,s):
 
 
 def finish_artifact_host_dispatch_read_v3(graph,work,error):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,finish_artifact_host_control_v3
+    if has_artifact_host_control_work_v3(work.state):return finish_artifact_host_control_v3(graph,work,error)
     from .artifact_host_result_archive_source_v3 import has_artifact_host_result_archive_work_v3,finish_artifact_host_result_archive_v3
     if has_artifact_host_result_archive_work_v3(work.state):return finish_artifact_host_result_archive_v3(graph,work,error)
     r=work.state;s=_STATES.get(r)
@@ -1126,6 +1149,8 @@ def finish_artifact_host_dispatch_read_v3(graph,work,error):
 
 
 def release_artifact_host_dispatch_payload_v3(r):
+    from .artifact_host_control_metadata_v3 import release_artifact_host_control_payload_v3
+    if release_artifact_host_control_payload_v3(r):return
     from .artifact_host_result_archive_source_v3 import release_artifact_host_result_archive_payload_v3
     if release_artifact_host_result_archive_payload_v3(r):return
     s=_STATES.pop(r,None)
@@ -1519,6 +1544,8 @@ def require_artifact_host_goal_projection_absent_v3(db,*,namespace,goal_ref,root
 
 
 def require_artifact_host_dispatch_rows_v3(r,request):
+    from .artifact_host_control_metadata_v3 import has_artifact_host_control_work_v3,require_artifact_control_rows_v3
+    if has_artifact_host_control_work_v3(r):return require_artifact_control_rows_v3(r,request)
     s=require_artifact_host_dispatch_body_v3(r,'artifact_signed_metadata_census',())
     table,columns,groups,group,order,limit=request
     if(table!='graph_d08_joint_node_originals_v1'or columns!=('original_ref',)

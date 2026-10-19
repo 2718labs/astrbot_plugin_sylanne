@@ -19,7 +19,7 @@ from ..runtime_storage_v3 import (begin_runtime_storage_operation_v3, bind_runti
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
 from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3, C09MemoryAccessJSONStreamV3
 from .c09_paged_sql_v2 import read_legacy_sql_cell_fragment_v2
-from ..authority_service.c09_authority_storage_rebase_v2 import _D13PaidIdentityStreamV3
+from .d13_paid_identity_stream_v3 import _D13PaidIdentityStreamV3
 from .dispatch_current_inventory_v3 import _heap
 
 KIND = "d13_paid_original_read_v3"
@@ -76,7 +76,7 @@ class _FrozenMetadataV3:
 class _IntentMetadataV3(_D13PaidIdentityStreamV3):
     def __init__(self):
         super().__init__("intent",ensure_ascii=True)
-        from ..authority_service.c09_authority_storage_rebase_v2 import _D13PaidEncodedStringStreamV3
+        from .d13_paid_identity_stream_v3 import _D13PaidEncodedStringStreamV3
         self.decoder=_D13PaidEncodedStringStreamV3(ensure_ascii=True)
         self.frozen_parser=C09CanonicalJSONStreamV2(ensure_ascii=True)
         self.frozen=_FrozenMetadataV3()

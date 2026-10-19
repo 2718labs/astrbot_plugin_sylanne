@@ -60,7 +60,7 @@ def original_owner_header_kind_v3(work):
 def _reserve(work,value,extra=0):
     metadata=work.original_metadata
     amount=_heap((metadata.rows,metadata.heads,metadata.families,metadata.roots,metadata.pending,metadata.originals,
-        metadata.history_heads,metadata.c02_history_heads,metadata.historical_pending,metadata.required_originals,metadata.required_matches,value))+extra+65536
+        metadata.history_heads,metadata.c02_history_heads,metadata.historical_pending,getattr(metadata,'catalogue_history_pending',()),metadata.required_originals,metadata.required_matches,value))+extra+65536
     if amount>work.original_reserved:
         work.operation.retain(amount-work.original_reserved);work.original_reserved=amount
 
@@ -316,7 +316,9 @@ _LOCATOR_FIELDS=frozenset({'schema','namespace','kind','original_ref','original_
     'extent_original_ref','postcondition_policy_ref','approval_original_ref','contract_ref','preparation_parent_original_ref','prev_phase_original_ref',
     'quote_ref','quote_digest','quote_id','quote_version','job_id','call_id','effect_id','reservation_operation_id',
     'fact_versions','protocol_ref','gp1_interpretation_ref','deadline_ref','counterparty_ref','subject_ref','entity_id',
-    'target_ref','source_head','plan_head','goal_head','body_policy_id','body_policy_version','effect_policy_ref'})
+    'target_ref','source_head','plan_head','goal_head','body_policy_id','body_policy_version','effect_policy_ref',
+    'c1_intent_ref','source_revision','source_digest','c02_bundle_digest','c02_receipt_digest','c02_commit_seq',
+    'installation_id','manifest_digest'})
 _CONTROL_TYPES=frozenset({'d11.owner_grant.v1','d01.persona_activation.v1','d01.persona_plan.v1','runtime.role_resources.v1'})
 _FIXED_FAMILIES=frozenset({'d02.body_state.v1','d02.body_profile.v1','d02.reservation.v1',
     'd03.role_binding','d03.entity_anchor','d03.account_binding','d05.boundary_rule','d05.relationship_projection',
@@ -401,7 +403,11 @@ class _OriginalMetadataV3:
             from ..runtime.d11_life_preparation_v1 import SIGN_KIND
             if digest!=header[1]:raise AuthorityUnavailable('Original signed locator did not reach exact canonical whole EOF')
             w.service.issuer._signer.verify(SIGN_KIND,canonical_serialize((w.namespace,identity[1],identity[2],digest)),header[2])
-            self.producers.add(header[0]);self.originals[identity]=raw;self.roots.update(_locator_sources_v3(raw))
+            if identity[1]=='c1_task_intent':
+                from .artifact_task_choice_catalogue_v3 import bind_original_signed_c1_metadata_v3
+                bind_original_signed_c1_metadata_v3(self,identity,header,raw)
+            else:self.producers.add(header[0])
+            self.originals[identity]=raw;self.roots.update(_locator_sources_v3(raw))
             if identity[1]=='owner_source_note_task_authorization_v2':
                 cause=raw['cause']
                 expected=w.request.authorization_original_digest if w.original_profile=='original-owner-task-source.v1'else self.job_authorization_digest
@@ -426,7 +432,7 @@ class _OriginalMetadataV3:
                 self._all_candidate_plan(prepared,header[2])
                 for candidate in prepared['candidates']:
                     if candidate.get('quote_ref')is not None:self.quote_keys.add((candidate['quote_ref'],1))
-        elif kind=='history':
+        elif kind in{'history','catalogue_history'}:
             if len(identity)==4 and digest!=identity[3]:raise AuthorityUnavailable('Original signed historical control changed its exact whole EOF digest')
             self.roots.update(_locator_sources_v3(raw))
         elif kind=='job_continuation':
@@ -475,6 +481,9 @@ class _OriginalMetadataV3:
             'postcondition_policy_ref':'artifact_phase_postcondition_policy','approval_original_ref':APPROVAL_KIND_V2,
             'contract_ref':'artifact_phase_postcondition_contract','preparation_parent_original_ref':PREPARATION_PARENT_KIND_V1,
             'prev_phase_original_ref':'c4_phase_verified'}
+        if raw.get('schema')in{'d11.ingress-artifact-task-scope.v1','d11.ingress-artifact-task-scope.v2','d11.ingress-artifact-task-scope.v3'}:
+            from .artifact_task_choice_catalogue_v3 import bind_original_task_scope_c1_v3
+            bind_original_task_scope_c1_v3(self,raw)
         for field,kind in edges.items():
             ref=raw.get(field)
             if ref is not None:self.signed.add((kind,ref))
@@ -524,6 +533,14 @@ class _OriginalMetadataV3:
                 self.history_heads[row[0],row[1]]=row[2:];self.c02_history_heads.add((row[0],row[1]));self.exact.add(row[0]);self.pending.append(row[0])
                 self._column('graph_history','value',('token','revision'),(row[0],row[1]),('history',row[0]),row,row[3])
             return
+        catalogue_history=getattr(self,'catalogue_history_pending',None)
+        if catalogue_history:
+            ref,revision=catalogue_history.pop()
+            row=meter.read_fixed_row(w.db,'graph_history',('valid','value_cell_id','event_bot','event_persona'),'token=? AND revision=?',(ref,revision))
+            if row is None or row[0]!=1 or row[2:]!=w.namespace.as_tuple:
+                raise AuthorityUnavailable('Task catalogue declared producer version lacks actual namespace history')
+            self.history_heads[ref,revision]=row[:2]
+            self._column('graph_history','value',('token','revision'),(ref,revision),('catalogue_history',ref,revision),row,row[1]);return
         if self.historical_pending:
             ref,revision,digest=self.historical_pending.pop()
             row=meter.read_fixed_row(w.db,'graph_history',('valid','value_cell_id','event_bot','event_persona'),'token=? AND revision=?',(ref,revision))
@@ -685,7 +702,13 @@ def advance_original_foreground_materials_v3(work,meter):
         grant=owner.grant
         purposes={purpose for values in work.original_root_purposes.values()for purpose in values}
         if 'workbench.create'not in grant['capabilities']or not purposes<=set(grant['purposes'])or not set(work.original_audiences)<=set(grant['audiences']):raise AuthorityUnavailable('Original current Owner does not cover exact Source purpose/audience groups')
+        from .artifact_task_choice_catalogue_v3 import begin_original_task_choice_catalogue_v3
+        if begin_original_task_choice_catalogue_v3(work):
+            work.phase='original_catalogue';return
         work.original_rights=_OriginalRightsV3(work);work.phase='original_rights';return
+    if work.phase in{'original_catalogue','original_catalogue_metadata'}:
+        from .artifact_task_choice_catalogue_v3 import advance_original_task_choice_catalogue_v3
+        advance_original_task_choice_catalogue_v3(work,meter);return
     if work.phase=='original_rights':
         work.original_rights.advance(meter)
         if work.original_rights.complete:
@@ -711,6 +734,8 @@ def require_original_foreground_attachment_v3(work,request):
         elif request[:3]not in _ORIGINAL_SELF_POINTS:raise AuthorityUnavailable('Original Self point has no fixed installed shape')
         return True
     proof=require_original_foreground_body_v3(work);metadata=work.original_metadata
+    from .artifact_task_choice_catalogue_v3 import require_original_task_c1_point_v3
+    if require_original_task_c1_point_v3(work,request):return True
     if table in {'graph_atoms','graph_history'}:
         atom=AtomKey.from_token(key[0])
         if NamespaceId.from_key(atom)!=work.namespace:raise AuthorityUnavailable('Original Body crossed actual namespace')
@@ -748,7 +773,9 @@ def prepare_original_foreground_attachment_v3(work,request):
         from .current_authority_graph_read_v3 import _AuthoritySignedQuoteReadV3
         return _AuthoritySignedQuoteReadV3(work,request)
     c02_shape=request[:3]==('graph_bundle_operations',('digest','receipt_json'),('bot','persona','operation_id'))
-    if request[:3]not in _HOST_ATTACHMENT_SHAPES_V3 and request[:3]not in _ORIGINAL_SELF_POINTS and not c02_shape and not(request[0]=='graph_history'and set(request[1])<={'token','revision','event_id','value','valid','event_bot','event_persona'}):
+    from .artifact_task_choice_catalogue_v3 import original_task_c1_attachment_shape_v3
+    task_c1=original_task_c1_attachment_shape_v3(request)
+    if not task_c1 and request[:3]not in _HOST_ATTACHMENT_SHAPES_V3 and request[:3]not in _ORIGINAL_SELF_POINTS and not c02_shape and not(request[0]=='graph_history'and set(request[1])<={'token','revision','event_id','value','valid','event_bot','event_persona'}):
         raise AuthorityUnavailable('Original point has no installed fixed full-key materialization shape')
     return _HostProducerAttachmentV3(work,request)
 
@@ -840,6 +867,8 @@ def read_original_foreground_self_v3(work):
 
 
 def release_original_foreground_source_v3(work):
+    from .artifact_task_choice_catalogue_v3 import release_original_task_choice_catalogue_v3
+    release_original_task_choice_catalogue_v3(work)
     _SOURCE_PROOFS.pop(work,None)
     from .original_artifact_recipe_metadata_v3 import release_original_artifact_recipe_metadata_v3
     release_original_artifact_recipe_metadata_v3(work)
@@ -926,26 +955,26 @@ def complete_original_current_readset_v3(work,evidence):
     from dataclasses import replace
     require_original_foreground_body_v3(work)
     plan=work.original_metadata.candidate_evidence_plan
-    if plan is None:return evidence
     versions={version.key:version.revision for version in evidence.read_versions}
     proof=require_original_foreground_body_v3(work)
     for key,revision in proof.versions.items():
         if versions.get(key,revision)!=revision:raise AuthorityUnavailable('Original Source ALL head differs from unchanged current predicate')
         versions[key]=revision
-    for key in plan.exact_keys:
-        head=work.original_metadata.heads.get(key.token)
-        if head is None:raise AuthorityUnavailable('Original ALL evidence exact locator has no completed current metadata head')
-        revision=head[0]
-        prior=versions.get(key,revision)
-        if prior!=revision:raise AuthorityUnavailable('Original ALL evidence current head differs from unchanged predicate')
-        versions[key]=revision
-    for kind in plan.fixed_type_ids:
-        rows=work.original_metadata.families.get(kind)
-        if rows is None:raise AuthorityUnavailable('Original ALL evidence requested an unclosed exact recipe family')
-        for version in rows:
-            prior=versions.get(version.key,version.revision)
-            if prior!=version.revision:raise AuthorityUnavailable('Original ALL evidence family changed its actual current head')
-            versions[version.key]=version.revision
+    if plan is not None:
+        for key in plan.exact_keys:
+            head=work.original_metadata.heads.get(key.token)
+            if head is None:raise AuthorityUnavailable('Original ALL evidence exact locator has no completed current metadata head')
+            revision=head[0]
+            prior=versions.get(key,revision)
+            if prior!=revision:raise AuthorityUnavailable('Original ALL evidence current head differs from unchanged predicate')
+            versions[key]=revision
+        for kind in plan.fixed_type_ids:
+            rows=work.original_metadata.families.get(kind)
+            if rows is None:raise AuthorityUnavailable('Original ALL evidence requested an unclosed exact recipe family')
+            for version in rows:
+                prior=versions.get(version.key,version.revision)
+                if prior!=version.revision:raise AuthorityUnavailable('Original ALL evidence family changed its actual current head')
+                versions[version.key]=version.revision
     if len(versions)>128:raise AuthorityUnavailable('Original ALL evidence exceeds the existing original evidence 128-version bound')
     return replace(evidence,read_versions=tuple(GraphVersion(key,revision)for key,revision in sorted(versions.items(),key=lambda item:item[0].token)))
 

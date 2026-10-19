@@ -304,6 +304,9 @@ class BackgroundJSONColumnV3:
     def _reserve_v3(self,extra=0):
         self.owner.reserve_heap_v3(extra=extra+65536)
     def retain_path_v3(self,path):
+        from .artifact_host_control_metadata_v3 import control_metadata_column_retains_v3
+        control=control_metadata_column_retains_v3(self,path)
+        if control is not None:return control
         if type(self.owner)is BackgroundReadWorkV3 and self.owner.kind=='artifact_model_dispatch':
             from .artifact_host_signed_input_metadata_v3 import metadata_column_retains_v3
             retained=metadata_column_retains_v3(self,path)

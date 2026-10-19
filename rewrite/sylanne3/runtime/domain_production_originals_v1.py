@@ -80,14 +80,18 @@ def record_adopted_domain_operation_v1(db, stage, receipt):
     reads = canonical_serialize([[v.key.token, v.revision] for v in stage.read_versions])
     content = (stage.domain, stage.operation_kind, stage.request_digest, stage.original_digest,
         stage.original_payload_json, reads, receipt.operation_digest, wire, canonical_digest(receipt))
-    old = db.execute(f"SELECT domain,operation_kind,request_digest,original_digest,original_payload_json,"
-        f"read_versions_json,bundle_digest,receipt_json,receipt_digest FROM {TABLE} "
-        "WHERE bot=? AND persona=? AND operation_id=?", (*stage.namespace.as_tuple, stage.operation_id)).fetchone()
+    from .foreground_command_writer_outputs_v3 import read_foreground_writer_domain_prior_v3,register_foreground_writer_domain_original_v3
+    own,old=read_foreground_writer_domain_prior_v3(db,stage,receipt,content)
+    if not own:
+        old = db.execute(f"SELECT domain,operation_kind,request_digest,original_digest,original_payload_json,"
+            f"read_versions_json,bundle_digest,receipt_json,receipt_digest FROM {TABLE} "
+            "WHERE bot=? AND persona=? AND operation_id=?", (*stage.namespace.as_tuple, stage.operation_id)).fetchone()
     if old is not None and old != content:
         raise ValueError("domain operation changed its adopted original")
     if old is None:
         db.execute(f"INSERT INTO {TABLE} VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (*stage.namespace.as_tuple, stage.operation_id, *content))
+    register_foreground_writer_domain_original_v3(db,stage,receipt,content)
     return ProductionOriginalRefV1(stage.domain + ".current-" + stage.operation_kind,
         stage.domain + "-current:" + stage.original_digest[:48], stage.original_digest, stage.read_versions)
 

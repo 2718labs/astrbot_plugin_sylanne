@@ -548,3 +548,58 @@ def validate_self_c04_provenance_v4(domain,operation_kind,value):
             raise ValueError("Self C04 prepared parent wait differs")
     elif before.phase!="waiting" or after.phase!="queued" or current.stage!="revise_plan" or current.wait is not None:
         raise ValueError("Self C04 adopted parent continuation differs")
+
+
+# A locator issued by a real Source Work; the Authority still independently
+# inspects/executes the immutable C04 binding and accounts for its actual cost.
+from weakref import WeakKeyDictionary as _NativeLocatorRegistryV3
+_NATIVE_LOCATORS_V3=_NativeLocatorRegistryV3()
+
+@dataclass(frozen=True,slots=True,eq=False,weakref_slot=True)
+class CurrentIngressC04NativeLocatorV3:
+    prepared:object
+    c02_operation_id:str
+    source_ref:str
+    selection_original_digest:str
+    adopt_operation_id:str
+    original_deadline_utc:float
+
+
+def issue_current_ingress_c04_native_locator_v3(graph,bundle,*,prepared,c02_operation_id,source_ref,
+        selection_original_digest,adopt_operation_id,original_deadline_utc):
+    from .domain_background_read_v3 import _active_v3
+    from .artifact_host_control_metadata_v3 import control_state_for_dispatch_v3
+    from ..authority_service.contract import AuthorityUnavailable
+    reader=_active_v3(graph._GraphCoordinator__store._db)
+    state=None if reader is None else control_state_for_dispatch_v3(reader)
+    if (state is None or not state.source_complete or reader.graph is not graph or reader.bundle is not bundle
+            or reader.selector.entry_kind!='advance_current_post_c02_ingress_c04_v4'
+            or reader.selector.c02_operation_id!=c02_operation_id or reader.selector.source_ref!=source_ref
+            or type(prepared)is not C04InternalWorkPreparedV1
+            or original_deadline_utc!=state.seed.business_deadline_v3()):
+        raise AuthorityUnavailable('Native locator requires its exact current Source Work and original deadline')
+    value=CurrentIngressC04NativeLocatorV3(prepared,c02_operation_id,source_ref,selection_original_digest,
+        adopt_operation_id,original_deadline_utc)
+    _NATIVE_LOCATORS_V3[value]=[graph,bundle,graph._v2_graph_stamp(bundle.installation_policy.namespace),
+        prepared.prepared_digest,prepared.binding.binding_digest,False]
+    return value
+
+
+def consume_current_ingress_c04_native_locator_v3(graph,bundle,value):
+    from ..authority_service.contract import AuthorityUnavailable
+    from .first_ingress_v2 import trusted_upper
+    saved=_NATIVE_LOCATORS_V3.get(value)
+    if (type(value)is not CurrentIngressC04NativeLocatorV3 or saved is None or saved[0]is not graph
+            or saved[1]is not bundle or saved[2]!=graph._v2_graph_stamp(bundle.installation_policy.namespace)
+            or saved[3]!=value.prepared.prepared_digest or saved[4]!=value.prepared.binding.binding_digest
+            or saved[5]):
+        raise AuthorityUnavailable('C04 native stage lost its exact once-only same-installation Source locator')
+    now=trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+    if now>=value.original_deadline_utc:raise AuthorityUnavailable('C04 original business deadline expired before native stage')
+    db=graph._GraphCoordinator__store._db;ns=bundle.installation_policy.namespace
+    with graph._GraphCoordinator__store._lock:
+        row=db.execute('SELECT binding_digest,prepared_digest FROM graph_c04_internal_work_prepared_v1 '
+            'WHERE bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,value.prepared.binding.operation_id)).fetchone()
+    if row!=(saved[4],saved[3]):raise AuthorityUnavailable('C04 native locator changed its actual immutable preparation')
+    saved[5]=True
+    return value.prepared

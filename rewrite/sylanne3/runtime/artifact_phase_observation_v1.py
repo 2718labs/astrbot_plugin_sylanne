@@ -284,15 +284,18 @@ def stage_prepare_artifact_phase_observation_v1(db,*,frame,request,installed_rea
         return waiting_stage_v1(frame,'d07',OPERATION,request,missing)
 
 
-def record_artifact_phase_observation_after_cas_v1(db,*,frame,stage,receipt,issuer):
-    if stage.operation_kind!=OPERATION or stage.coverage!='complete':return None
+def record_artifact_phase_observation_after_cas_v1(db, *, frame, stage, receipt, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
+    if stage.operation_kind != OPERATION or stage.coverage != 'complete':
+        return None
     from .d07_execution_v1 import record_d07_original_in_transaction_v1
-    basis=observation_basis_from_wire_v1(json.loads(stage.original_payload_json)['provenance']['artifact_observation_basis'])
-    require_artifact_phase_observation_basis_history_v1(db,namespace=basis.namespace,original_ref=basis.original_ref,
-        producing_operation_id=stage.operation_id,raw=plain_v1(basis))
-    record_d07_original_in_transaction_v1(db,issuer,basis.namespace,'semantic_question',basis.ids['question'],plain_v1(basis.question))
-    return _record(db,issuer=issuer,namespace=basis.namespace,kind=KIND,ref=basis.original_ref,
-        operation_id=stage.operation_id,value=basis)
+    basis = observation_basis_from_wire_v1(json.loads(stage.original_payload_json)['provenance']['artifact_observation_basis'])
+    require_artifact_phase_observation_basis_history_v1(db, namespace=basis.namespace, original_ref=basis.original_ref, producing_operation_id=stage.operation_id, raw=plain_v1(basis))
+    from .foreground_command_writer_outputs_v3 import declare_foreground_writer_d07_v3
+    declare_foreground_writer_d07_v3(db,issuer=issuer,namespace=basis.namespace,kind='semantic_question',
+        ref=basis.ids['question'],payload=plain_v1(basis.question),stage=stage,receipt=receipt)
+    record_d07_original_in_transaction_v1(db, issuer, basis.namespace, 'semantic_question', basis.ids['question'], plain_v1(basis.question))
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=basis.namespace, kind=KIND, ref=basis.original_ref, operation_id=stage.operation_id, value=basis, recorder=record_artifact_phase_observation_after_cas_v1, frame=frame, actual_receipt=receipt)
 
 
 def read_plan_prepare_artifact_phase_observation_v1(db,*,namespace,request,installed_readers):

@@ -104,25 +104,22 @@ class DraftActionRootSkeletonV1:
 
 
 def record_draft_action_root_v1(db, *, frame, plan, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
     from .d11_life_preparation_v1 import _record, _draft_plan_current_v1
     from .d04_root_original_store_v1 import _receipt
     from .d08_personal_plan_v1 import DraftActionRootSkeletonV2
-    if type(plan) not in {RegisteredDraftFilePlanV3,DraftActionRootSkeletonV1,DraftActionRootSkeletonV2}:
-        raise TypeError("actual final draft plan or adopted Action-only skeleton required")
+    if type(plan) not in {RegisteredDraftFilePlanV3, DraftActionRootSkeletonV1, DraftActionRootSkeletonV2}:
+        raise TypeError('actual final draft plan or adopted Action-only skeleton required')
     read = CurrentDomainReadV1(frame)
     action, _ = _draft_plan_current_v1(db, read, plan)
-    entities = tuple(atom for atom in read.complete_inventory(db, "d03.entity_anchor")
-        if atom.valid and atom.value["entity_id"] == action.target_ref)
+    entities = tuple((atom for atom in read.complete_inventory(db, 'd03.entity_anchor') if atom.valid and atom.value['entity_id'] == action.target_ref))
     if len(entities) != 1:
-        raise MissingProductionOriginalV1("actual_draft_project_entity")
+        raise MissingProductionOriginalV1('actual_draft_project_entity')
     entity = entities[0]
-    roles = tuple(atom for atom in read.complete_inventory(db, "d03.role_binding")
-        if atom.valid and atom.value["target_entity_ref"] == action.target_ref
-        and atom.value["subject_persona_ref"] == "persona:" + frame.envelope.authority.namespace.persona_id
-        and atom.value["group_ref"] is None and atom.value["scene_ref"] is None)
+    roles = tuple((atom for atom in read.complete_inventory(db, 'd03.role_binding') if atom.valid and atom.value['target_entity_ref'] == action.target_ref and (atom.value['subject_persona_ref'] == 'persona:' + frame.envelope.authority.namespace.persona_id) and (atom.value['group_ref'] is None) and (atom.value['scene_ref'] is None)))
     if len(roles) != 1:
-        raise MissingProductionOriginalV1("actual_unambiguous_draft_project_role")
+        raise MissingProductionOriginalV1('actual_unambiguous_draft_project_role')
     context = []
     for atom in (entity, roles[0], read.head(db, plan.project.ref, required=True)):
         operation = _adopted(db, read, atom)
@@ -133,22 +130,15 @@ def record_draft_action_root_v1(db, *, frame, plan, issuer):
     from .current_method_learning_read_v3 import method_post_commit_atom_digest_v3
     writes = []
     for version in receipt.write_versions:
-        row = read_graph_history_v3(
-            db, version.key.token, version.revision,
-            columns=("event_id", "value", "valid"),
-            namespace=frame.envelope.authority.namespace.as_tuple)
+        row = read_graph_history_v3(db, version.key.token, version.revision, columns=('event_id', 'value', 'valid'), namespace=frame.envelope.authority.namespace.as_tuple)
         if row is None or row[0] != plan.operation_id or row[2] != 1:
-            raise ValueError("draft action actual producing member history differs")
+            raise ValueError('draft action actual producing member history differs')
         atom = read.head(db, version.key, required=True)
         if atom.revision != version.revision or _adopted(db, read, atom) != plan.operation_id:
-            raise ValueError("draft action producing member revision or value differs")
-        writes.append((version.key.token, version.revision,
-            method_post_commit_atom_digest_v3(db, atom)))
-    root = DraftActionRootV1(plan.action_intent.ref, plan.action_intent.digest, plan.operation_id,
-        plan.activity_id, plan.effect_id, plan.project.ref, plan.recipe.ref, plan.input_source.ref, plan.audiences,
-        entity.key.token, roles[0].key.token, tuple(context), tuple(writes), canonical_digest(receipt))
-    return _record(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind="draft_action",
-        ref="life-draft-root:" + plan.operation_id, operation_id=plan.operation_id, value=root)
+            raise ValueError('draft action producing member revision or value differs')
+        writes.append((version.key.token, version.revision, method_post_commit_atom_digest_v3(db, atom)))
+    root = DraftActionRootV1(plan.action_intent.ref, plan.action_intent.digest, plan.operation_id, plan.activity_id, plan.effect_id, plan.project.ref, plan.recipe.ref, plan.input_source.ref, plan.audiences, entity.key.token, roles[0].key.token, tuple(context), tuple(writes), canonical_digest(receipt))
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind='draft_action', ref='life-draft-root:' + plan.operation_id, operation_id=plan.operation_id, value=root, recorder=record_draft_action_root_v1, frame=frame, actual_receipt=None)
 
 
 def require_draft_action_root_v1(db, *, namespace, action_intent_ref, issuer):

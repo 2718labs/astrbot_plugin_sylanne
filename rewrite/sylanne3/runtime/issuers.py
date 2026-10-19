@@ -1172,7 +1172,10 @@ class _Signer:
         from ..authority_service.current_authority_graph_read_v3 import AuthoritySignedJSONColumnV3, require_authority_signature_column_v3
         from ..authority_service.original_artifact_recipe_metadata_v3 import _OriginalArtifactColumnV3,require_original_artifact_signature_column_v3
         from .artifact_borrowed_source_v3 import _ArtifactBorrowedColumnV3,require_artifact_borrowed_signature_column_v3
-        if type(original)is _ArtifactBorrowedColumnV3:
+        from .foreground_command_source_v3 import _CommandInputColumnV3,require_foreground_command_metadata_signature_v3
+        if type(original)is _CommandInputColumnV3:
+            require_foreground_command_metadata_signature_v3(original,signer=self,kind=kind)
+        elif type(original)is _ArtifactBorrowedColumnV3:
             require_artifact_borrowed_signature_column_v3(original,signer=self,kind=kind)
         elif type(original)is _OriginalArtifactColumnV3:
             require_original_artifact_signature_column_v3(original,signer=self,kind=kind)
@@ -1192,7 +1195,10 @@ class _Signer:
         from ..authority_service.current_authority_graph_read_v3 import AuthoritySignedJSONColumnV3, require_authority_signature_column_v3
         from ..authority_service.original_artifact_recipe_metadata_v3 import _OriginalArtifactColumnV3,require_original_artifact_signature_column_v3
         from .artifact_borrowed_source_v3 import _ArtifactBorrowedColumnV3,require_artifact_borrowed_signature_column_v3
-        if type(original)is _ArtifactBorrowedColumnV3:
+        from .foreground_command_source_v3 import _CommandInputColumnV3,require_foreground_command_metadata_signature_v3
+        if type(original)is _CommandInputColumnV3:
+            require_foreground_command_metadata_signature_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
+        elif type(original)is _ArtifactBorrowedColumnV3:
             require_artifact_borrowed_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
         elif type(original)is _OriginalArtifactColumnV3:
             require_original_artifact_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)

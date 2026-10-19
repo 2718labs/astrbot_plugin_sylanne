@@ -67,7 +67,9 @@ def record_d07_original_in_transaction_v1(db, issuer, namespace, kind, ref, payl
     digest = canonical_digest(background_json_loads_v3(wire))
     signature = issuer._signer.sign(SIGN_KIND, canonical_serialize((namespace, kind, ref, digest)))
     from .d07_graph_stages_v1 import read_d07_actual_writer_prior_v3
-    actual_writer,prior=read_d07_actual_writer_prior_v3(db,namespace,kind,ref,issuer)
+    from .foreground_command_writer_outputs_v3 import read_foreground_writer_d07_prior_v3,register_foreground_writer_d07_original_v3
+    actual_writer,prior=read_foreground_writer_d07_prior_v3(db,issuer,namespace,kind,ref)
+    if not actual_writer:actual_writer,prior=read_d07_actual_writer_prior_v3(db,namespace,kind,ref,issuer)
     if not actual_writer:
         prior = read_d07_original_v1(db, issuer, namespace, kind, ref)
     if prior is not None:
@@ -75,6 +77,7 @@ def record_d07_original_in_transaction_v1(db, issuer, namespace, kind, ref, payl
             raise ValueError("D07 original identity reused with different bytes")
         return digest
     db.execute(f"INSERT INTO {TABLE} VALUES(?,?,?,?,?,?,?)", (*namespace.as_tuple, kind, ref, wire, digest, signature))
+    register_foreground_writer_d07_original_v3(db,issuer,namespace,kind,ref,wire,digest,signature)
     from .d07_graph_stages_v1 import _record_d07_actual_written_original_v3
     _record_d07_actual_written_original_v3(db,namespace,kind,ref,wire,digest,signature)
     from .d07_source_preparation_members_v3 import register_d07_source_preparation_original_v3

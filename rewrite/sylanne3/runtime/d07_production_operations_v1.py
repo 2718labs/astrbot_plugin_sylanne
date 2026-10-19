@@ -129,6 +129,10 @@ def verify_d07_production_stage_v1(stage):
 
 
 def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_kind, request,installed_readers=None):
+    from .foreground_command_source_v3 import read_bound_foreground_command_concern_plan_v3
+    handled,plan=read_bound_foreground_command_concern_plan_v3(db,namespace=namespace,activity_id=activity_id,
+        operation_kind=operation_kind,request=request)
+    if handled:return plan
     from .current_d07_simulation_source_read_v3 import read_bound_current_d07_simulation_plan_v3
     handled,plan=read_bound_current_d07_simulation_plan_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
     if handled:return plan

@@ -19,7 +19,7 @@ _OWNER_CALLER_RETAINED_V3 = WeakKeyDictionary()
 _D07_MODEL_SOURCE_OWNER_SERVICES_V3 = WeakKeyDictionary()
 _D07_MODEL_SOURCE_OBSERVER_PHASE_V3 = object()
 _D07_MODEL_SOURCE_POLICY_PHASE_V3 = object()
-_OWNER_CALLER_KINDS_V3 = frozenset(("host_artifact_borrowed_header", "host_artifact_model_dispatch_read", "host_named_joint_source_read", "host_named_joint_write_source", "host_conditioned_write_source", "host_habit_write_source", "host_habit_maintenance_write_source", "host_conditioned_source_read", "host_habit_source_read", "host_semantic_recovery_read", "host_d07_write", "host_d07_model_seal", "host_foreground_read",
+_OWNER_CALLER_KINDS_V3 = frozenset(("host_artifact_borrowed_header", "host_artifact_model_dispatch_read", "host_named_joint_source_read", "host_named_joint_write_source", "host_conditioned_write_source", "host_habit_write_source", "host_habit_maintenance_write_source", "host_conditioned_source_read", "host_conditioned_personal_choice_read", "host_habit_source_read", "host_semantic_recovery_read", "host_d07_write", "host_d07_model_seal", "host_foreground_read",
     "host_d07_stage_read", "host_method_owner_read", "host_owner_lease_read",
     "host_contact_dispatch_identity_read", "host_contact_dispatch_text_read", "host_contact_owner_read", "host_contact_owner_write", "authority_model_header", "authority_model_seal",
     "authority_internal_life_model_header", "authority_artifact_model_header", "authority_foreground_mesh_header",
@@ -110,7 +110,7 @@ class OwnerLocationCallerProofV3:
 
     @property
     def clock_policy_digest(self):
-        if self.kind in ('host_artifact_borrowed_header','host_artifact_model_dispatch_read','host_named_joint_source_read','host_named_joint_write_source','host_conditioned_write_source','host_habit_write_source','host_habit_maintenance_write_source','host_conditioned_source_read','host_habit_source_read','host_semantic_recovery_read','host_method_owner_read','host_owner_lease_read','host_contact_dispatch_identity_read','host_contact_dispatch_text_read'):
+        if self.kind in ('host_artifact_borrowed_header','host_artifact_model_dispatch_read','host_named_joint_source_read','host_named_joint_write_source','host_conditioned_write_source','host_habit_write_source','host_habit_maintenance_write_source','host_conditioned_source_read','host_conditioned_personal_choice_read','host_habit_source_read','host_semantic_recovery_read','host_method_owner_read','host_owner_lease_read','host_contact_dispatch_identity_read','host_contact_dispatch_text_read'):
             return canonical_digest(asdict(self.graph._GraphCoordinator__scene_clock_policy))
         return canonical_digest(asdict(self.bundle.ingress_clock))
 
@@ -6247,10 +6247,14 @@ _SEMANTIC_BACKGROUND_OWNER_ENTRIES_V3 = WeakKeyDictionary()
 _SEMANTIC_BACKGROUND_OWNER_IDENTITIES_V3 = WeakKeyDictionary()
 _SEMANTIC_BACKGROUND_OWNER_ACLS_V3 = WeakKeyDictionary()
 _SEMANTIC_BACKGROUND_OWNER_KINDS_V3 = frozenset((
-    'host_artifact_model_dispatch_read','host_named_joint_source_read', 'host_conditioned_source_read', 'host_habit_source_read', 'host_semantic_recovery_read'))
+    'host_artifact_model_dispatch_read','host_named_joint_source_read', 'host_conditioned_source_read','host_conditioned_personal_choice_read', 'host_habit_source_read', 'host_semantic_recovery_read'))
 
 
 def _semantic_background_owner_identity_v3(reader):
+    from ..runtime.current_conditioned_personal_choice_v3 import is_personal_choice_locator_v3,personal_choice_owner_identity_v3
+    if is_personal_choice_locator_v3(reader):
+        state,cause_digest=personal_choice_owner_identity_v3(reader)
+        return 'host_conditioned_personal_choice_read',state,cause_digest
     kind = reader.work.kind
     if kind == 'current_world_source_read_v3':
         from ..runtime.named_joint_source_work_v3 import named_joint_background_owner_identity_v3

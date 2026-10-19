@@ -66,6 +66,8 @@ def _active(db):
     from .current_method_learning_read_v3 import _method_active
     r=_method_active(db)
     if r is None or r.operation_kind not in D07_SOURCE_OPERATIONS_V3:return None
+    from .foreground_command_source_v3 import is_foreground_command_source_reader_v3
+    if is_foreground_command_source_reader_v3(r):return None
     require_d07_source_work_v3(r)
     return r
 

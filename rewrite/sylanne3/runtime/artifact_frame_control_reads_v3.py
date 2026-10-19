@@ -63,6 +63,9 @@ def _coverage_v3(business,control):
 
 def compose_artifact_model_frame_fields_v3(prepared,snapshot,pages):
     """Combine genuine selected bodies and metadata CAS facts in the same Work."""
+    from .foreground_command_source_v3 import compose_foreground_command_frame_fields_v3
+    snapshot,pages,foreground_versions=compose_foreground_command_frame_fields_v3(prepared,snapshot,pages)
+    if foreground_versions is not None:return snapshot,pages,foreground_versions
     actual=_prepared_v3(prepared)
     if actual is None:return snapshot,tuple(pages),None
     r,control=actual
@@ -92,6 +95,8 @@ def compose_artifact_model_frame_fields_v3(prepared,snapshot,pages):
 
 
 def register_artifact_model_source_frame_v3(db,frame,scope,prepared):
+    from .foreground_command_source_v3 import register_foreground_command_frame_v3
+    frame=register_foreground_command_frame_v3(db,frame,scope,prepared)
     actual=_prepared_v3(prepared)
     if actual is None:return frame
     r,control=actual
@@ -190,18 +195,24 @@ def append_artifact_model_control_originals_v3(prepared,observed_originals):
     return tuple(selected[ref]for ref in sorted(selected))
 
 def artifact_model_frame_deadline_v3(prepared,deadline):
+    from .foreground_command_source_v3 import foreground_command_frame_deadline_v3
+    deadline=foreground_command_frame_deadline_v3(prepared,deadline)
     actual=_prepared_v3(prepared)
     if actual is None:return deadline
     from .artifact_borrowed_source_v3 import artifact_borrowed_frame_deadline_v3
     return artifact_borrowed_frame_deadline_v3(prepared,deadline)
 
 def artifact_model_frame_monotonic_deadline_v3(prepared,deadline):
+    from .foreground_command_source_v3 import foreground_command_frame_deadline_v3
+    deadline=foreground_command_frame_deadline_v3(prepared,deadline,True)
     actual=_prepared_v3(prepared)
     if actual is None:return deadline
     from .artifact_borrowed_source_v3 import artifact_borrowed_frame_monotonic_deadline_v3
     return artifact_borrowed_frame_monotonic_deadline_v3(prepared,deadline)
 
 def require_artifact_borrowed_frame_source_family_v3(frame,db,roots,*,purpose=None,audience=None):
+    from .foreground_command_source_v3 import require_foreground_command_source_family_v3
+    if require_foreground_command_source_family_v3(frame,db,roots,purpose=purpose,audience=audience):return True
     record=_record_v3(frame,current=True)
     if record is None:return False
     r=record[1]

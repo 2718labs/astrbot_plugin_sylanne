@@ -212,18 +212,14 @@ def issue_life_body_quotes_before_cas_v1(db, *, frame, staged, installed_readers
 
 
 def record_life_body_preparation_after_cas_v1(db, *, frame, staged, receipt, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from .d11_life_preparation_v1 import _record
     write = staged.stage.proposals[0].typed_writes[0]
     if len(receipt.write_versions) != 1 or receipt.write_versions[0].key != write.key:
-        raise ValueError("Life Body preparation must adopt exactly its actual reservation")
-    root, body, quote, policy = staged.root, staged.body, staged.quote, staged.effect_policy
-    original = LifeBodyPreparationOriginalV1(root.action_intent_ref, root.action_intent_digest, root.action_operation_id,
-        frame.envelope.identity.operation_id, root.activity_id, root.effect_id, body.quote_id, 1, canonical_digest(body),
-        quote.quote_id, quote.version, canonical_digest(quote), write.key.token, receipt.write_versions[0].revision,
-        canonical_digest(write.value), quote.d02_settlement_refs[0], policy.component_id, policy.policy_ref,
-        policy.revision, canonical_digest(plain_v1(policy)), canonical_digest(receipt))
-    return _record(db, issuer=issuer, namespace=staged.stage.namespace, kind="life_body_preparation",
-        ref="life-body:" + original.body_prepare_operation_id, operation_id=original.body_prepare_operation_id, value=original)
+        raise ValueError('Life Body preparation must adopt exactly its actual reservation')
+    root, body, quote, policy = (staged.root, staged.body, staged.quote, staged.effect_policy)
+    original = LifeBodyPreparationOriginalV1(root.action_intent_ref, root.action_intent_digest, root.action_operation_id, frame.envelope.identity.operation_id, root.activity_id, root.effect_id, body.quote_id, 1, canonical_digest(body), quote.quote_id, quote.version, canonical_digest(quote), write.key.token, receipt.write_versions[0].revision, canonical_digest(write.value), quote.d02_settlement_refs[0], policy.component_id, policy.policy_ref, policy.revision, canonical_digest(plain_v1(policy)), canonical_digest(receipt))
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=staged.stage.namespace, kind='life_body_preparation', ref='life-body:' + original.body_prepare_operation_id, operation_id=original.body_prepare_operation_id, value=original, recorder=record_life_body_preparation_after_cas_v1, frame=frame, actual_receipt=receipt)
 
 
 def require_life_body_preparation_v1(db, *, prepared, issuer, resource_issuer, body_quote_authority):

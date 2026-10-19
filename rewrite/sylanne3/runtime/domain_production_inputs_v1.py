@@ -728,11 +728,15 @@ def _post_commit_frame(db, frame, request, *, _successor_v3=None):
         policies = [item for item in policies if not (item.policy_ref == policy.policy_ref and item.revision == policy.revision)]
         policies.append(ProductionPolicyRefV1(policy.policy_ref, policy.revision, canonical_digest(plain_v1(policy))))
     envelope = replace(frame.envelope, version_guard=replace(frame.envelope.version_guard,
-        read_versions=snapshot.versions, query_epochs=(QueryEpoch(ns, "namespace", epoch.revision),)))
-    return replace(frame, envelope=envelope, snapshot=snapshot, query_coverage=tuple(coverage), installed_policy_refs=tuple(policies))
+        read_versions=(snapshot.versions if _successor_v3 is None else _successor_v3.guard_versions), query_epochs=(QueryEpoch(ns, "namespace", epoch.revision),)))
+    result = replace(frame, envelope=envelope, snapshot=snapshot, query_coverage=tuple(coverage), installed_policy_refs=tuple(policies))
+    if _successor_v3 is not None:
+        from .foreground_command_post_frame_v3 import register_foreground_command_post_frame_v3
+        register_foreground_command_post_frame_v3(db,frame,result,_successor_v3)
+    return result
 
 
-def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actual_receipt, installed_readers):
+def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actual_receipt, installed_readers, _successor_v3=None):
     if type(staged_input) is not StagedDomainInputV1 or type(actual_receipt) is not CommitReceipt:
         raise TypeError("fixed internal input descriptor required")
     registration, request, stage = staged_input.registration, staged_input.request, staged_input.stage
@@ -753,8 +757,10 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
         return record_prevalidated_joint_input_after_commit_v1(db,frame=frame,staged_input=staged_input,
             actual_receipt=actual_receipt,readers=installed_readers)
     CurrentDomainReadV1(frame).committed_operation(db, actual_receipt.operation_id)
-    frame = _post_commit_frame(db, frame, request)
     kind, operation = registration.producer_kind, actual_receipt.operation_id
+    if kind == "register_artifact_task_text_extent":
+        return ()  # Its signed original follows actual generic adoption below.
+    frame = _post_commit_frame(db, frame, request, _successor_v3=_successor_v3)
     if kind in {"register_identity_plasticity_policy_v3","register_identity_trial_observer_policy_v3"}:
         return (installed_readers.register_identity_policy_after_commit_v3(db,frame=frame,
             producing_operation_id=operation,policy=request.policy),)
@@ -774,8 +780,6 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
         return (installed_readers.derive_current_growth_trial_from_adopted_progress_v1(db,
             frame=frame, producing_operation_id=operation, original_ref=request.original_ref,
             growth_proposal_ref=request.growth_proposal_ref, settled_progress_ref=request.settled_progress_ref),)
-    if kind == "register_artifact_task_text_extent":
-        return ()  # Its signed original follows actual generic adoption below.
     if kind == "register_artifact_phase_price_policy":
         from .d02_artifact_phase_price_v1 import record_current_artifact_phase_price_policy_after_commit_v1
         return record_current_artifact_phase_price_policy_after_commit_v1(db, frame=frame,

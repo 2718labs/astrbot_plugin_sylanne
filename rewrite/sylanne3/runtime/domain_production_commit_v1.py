@@ -1128,6 +1128,8 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         receipt = graph._commit_domain_bundle_fenced(bundle, process_lease, in_transaction=True,
             v2_write=(metadata, epoch, finish_id, finish_digest, canonical_json(to_wire(scope.permit))),
             now_utc=frame.now_utc, domain_production_issuance_v1=witness)
+        from .foreground_command_writer_outputs_v3 import activate_foreground_command_writer_commit_v3
+        activate_foreground_command_writer_commit_v3(db,witness=witness,actual_receipt=receipt)
         if type(stage) in {CancelOwnerSourceNoteTaskStageV1, OwnerSourceNoteTaskStageV1, ForegroundCycleStageV1, D07IngressRecallAcquisitionStageV1, D07IngressRecallResultStageV1, ArtifactDraftModelStageV1, ArtifactDraftModelStageV2, ArtifactDraftContentStageV1, ArtifactDraftContentStageV2, ArtifactDraftPhaseVerificationStageV2, OwnerStopReplyProjectionStageV1} and _FOREGROUND_APPLIED.get(id(witness)) is not witness:
             raise ValueError("foreground actual W01 guard did not apply its frozen job stage")
         from .habit_schedule_driver_v1 import HabitScheduleStageV1
@@ -1199,9 +1201,16 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     if type(stage) is HostLifecycleStageV1:
         produced = (record_host_lifecycle_after_cas_v1(db, frame=frame,
             staged=stage, graph_receipt=receipt, issuer=readers.issuer),)
+    input_original = None
     if type(stage) is StagedDomainInputV1:
-        produced = record_current_domain_input_after_commit_v1(db, frame=frame, staged_input=stage,
-            actual_receipt=receipt, installed_readers=readers)
+        from .foreground_command_post_frame_v3 import record_foreground_empty_input_after_cas_v3
+        handled,input_original,input_produced=record_foreground_empty_input_after_cas_v3(db,
+            runtime=runtime,frame=frame,stage=stage,primary=primary,receipt=receipt,scope=scope,
+            issued=runtime._active_foreground_issuance_v1,process_lease=process_lease,readers=readers)
+        if handled:produced=input_produced
+        else:
+            produced = record_current_domain_input_after_commit_v1(db, frame=frame, staged_input=stage,
+                actual_receipt=receipt, installed_readers=readers)
     from .d06_life_numeric_context_v1 import LifeNumericContextStageV1, record_life_numeric_context_after_cas_v1
     if type(stage) is LifeNumericContextStageV1:
         payload = json.loads(primary.original_payload_json)
@@ -1232,7 +1241,8 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         root_original = record_draft_root_registration_after_commit_v1(db, graph=graph,
             issued=runtime._active_draft_root_registration_v1, frame=frame, receipt=receipt, issuer=readers.issuer)
         produced = (*produced, root_original)
-    original=(general_original if general_original is not None else record_adopted_domain_operation_v1(db,primary,receipt))
+    original=(general_original if general_original is not None else input_original if input_original is not None
+        else record_adopted_domain_operation_v1(db,primary,receipt))
     if operation.operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"}:
         from .d03_world_history_v1 import record_world_assertion_after_commit_v1
         produced=(*produced,record_world_assertion_after_commit_v1(db,stage=primary,receipt=receipt,installed_readers=readers))

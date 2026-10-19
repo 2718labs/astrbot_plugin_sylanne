@@ -467,8 +467,8 @@ class _ModelReplyScopeObservationV3:
             raise AuthorityUnavailable('unregistered model parentage original columns')
         keys=dict(zip(key_columns,key))
         if any(name in keys and keys[name]!=value for name,value in
-                (('bot',self.namespace.bot),('persona',self.namespace.persona),
-                 ('bot_id',self.namespace.bot),('persona_id',self.namespace.persona))):
+                (('bot',self.namespace.bot_id),('persona',self.namespace.persona_id),
+                 ('bot_id',self.namespace.bot_id),('persona_id',self.namespace.persona_id))):
             raise AuthorityUnavailable('model parentage fixed original crossed namespace')
         if table in('graph_atoms','graph_history'):
             from ..graph_types import AtomKey

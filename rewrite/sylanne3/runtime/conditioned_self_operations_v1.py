@@ -1831,8 +1831,13 @@ def plan_current_conditioned_output_keys_v3(db,*,frame,operation_kind,request,re
     if operation_kind=='select_current_conditioned_personal_step_v1':
         from .d08_personal_plan_v1 import personal_decision_key_v1
         from .d08_personal_candidate_v1 import require_current_personal_candidates_v1
+        from .current_conditioned_personal_choice_v3 import personal_choice_selected_replay_v3
+        from .current_conditioned_self_read_v3 import _active
+        reader=_active(db)
+        selected_replay=reader is not None and personal_choice_selected_replay_v3(reader)
         prepared,_=require_current_personal_candidates_v1(db,frame=frame,
-            preparation_operation_id=request.prepared_candidates_operation_id,installed_readers=readers.personal)
+            preparation_operation_id=request.prepared_candidates_operation_id,installed_readers=readers.personal,
+            for_selected_decision=selected_replay)
         key=personal_decision_key_v1(frame,request.plan_ref)
         if (key.token!=prepared.future_decision_ref or frame.envelope.identity.operation_id!=prepared.selection_operation_id
                 or request.plan_ref!=prepared.plan_head.key.token or request.goal_ref!=prepared.goal_head.key.token):

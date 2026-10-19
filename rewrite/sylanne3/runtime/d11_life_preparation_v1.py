@@ -226,10 +226,15 @@ def _record(db, *, issuer, namespace, kind, ref, operation_id, value):
     signature = issuer._signer.sign(SIGN_KIND, canonical_serialize((namespace, kind, ref, digest)))
     expected = (operation_id, wire, digest, signature)
     from .artifact_host_result_archive_source_v3 import read_bound_artifact_archive_record_v3
-    archive,old=read_bound_artifact_archive_record_v3(db,issuer=issuer,namespace=namespace,kind=kind,ref=ref,
+    from .foreground_command_writer_outputs_v3 import read_foreground_writer_life_prior_v3,register_foreground_writer_life_original_v3
+    writer,old=read_foreground_writer_life_prior_v3(db,issuer=issuer,namespace=namespace,kind=kind,ref=ref,
         operation_id=operation_id,value=value)
+    archive=False
+    if not writer:
+        archive,old=read_bound_artifact_archive_record_v3(db,issuer=issuer,namespace=namespace,kind=kind,ref=ref,
+            operation_id=operation_id,value=value)
     from .current_life_numeric_paid_write_v3 import read_bound_numeric_paid_point_v3,read_bound_numeric_seal_point_v3
-    handled=archive
+    handled=writer or archive
     if not handled:handled,old=read_bound_numeric_seal_point_v3(db,table=TABLE,columns=("producing_operation_id","payload_json","payload_digest","signature"),
         key_columns=("bot","persona","kind","original_ref"),key=(*namespace.as_tuple,kind,ref))
     if not handled:handled,old=read_bound_numeric_paid_point_v3(db,table=TABLE,columns=("producing_operation_id","payload_json","payload_digest","signature"),
@@ -241,6 +246,8 @@ def _record(db, *, issuer, namespace, kind, ref, operation_id, value):
         raise ValueError("Life immutable original replay differs")
     if old is None:
         db.execute("INSERT INTO " + TABLE + " VALUES(?,?,?,?,?,?,?,?)", (*namespace.as_tuple, kind, ref, *expected))
+    register_foreground_writer_life_original_v3(db,issuer=issuer,namespace=namespace,kind=kind,ref=ref,
+        operation_id=operation_id,wire=wire,digest=digest,signature=signature)
     from .domain_production_contracts_v1 import ProductionOriginalRefV1
     return ProductionOriginalRefV1("d11.life_" + kind, ref, digest)
 
@@ -515,10 +522,10 @@ def record_registered_draft_observation_admission_v1(db, *, frame, issuer, origi
         kind="draft_observation_admission", ref=original_ref, operation_id=frame.envelope.identity.operation_id, value=admission)
 
 
-def record_registered_life_plan_v2(db, *, frame, issuer, original_ref, producing_operation_id, plan, installed_build,
-        body_quote_authority=None):
+def record_registered_life_plan_v2(db, *, frame, issuer, original_ref, producing_operation_id, plan, installed_build, body_quote_authority=None):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     if type(plan) not in {RegisteredLifePlanV2, RegisteredDraftFilePlanV3}:
-        raise TypeError("actual RegisteredLifePlanV2 required")
+        raise TypeError('actual RegisteredLifePlanV2 required')
     read = CurrentDomainReadV1(frame)
     read.check(db)
     _plan_current(db, read, plan)
@@ -529,19 +536,17 @@ def record_registered_life_plan_v2(db, *, frame, issuer, original_ref, producing
         from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
         from .d02_life_body_preparation_v1 import read_current_draft_body_component_contract_v1
         if type(body_quote_authority) is not D02BodyQuoteAuthority or plan.body_effect_request_json is None:
-            raise MissingProductionOriginalV1("actual_draft_body_B_before_final_plan_C")
-        actual_body=read_current_draft_body_component_contract_v1(db,frame=frame,action_intent_ref=plan.action_intent.ref,
-            issuer=issuer,resource_issuer=issuer.resource_issuer,body_quote_authority=body_quote_authority)
-        if canonical_serialize(plain_v1(actual_body))!=plan.body_effect_request_json:
-            raise ValueError("draft final plan body contract differs from actual adopted B")
-        quote=issuer.resource_issuer.original_signed_quote(db,actual_body.resource_quote_ref,actual_body.resource_quote_version)
-        if plan.cpu_ceiling_ms>quote.ceiling.get("cpu_ms",0) or _utc(plan.deadline_utc).timestamp()>quote.valid_until_utc:
-            raise ValueError("draft final plan CPU/deadline exceeds its actual Body B quote")
-    if any(getattr(plan, name) != installed_build[name] for name in ("algorithm_build_digest", "postcondition_build_digest")):
-        raise ValueError("Life plan build differs from actual installed file closure")
+            raise MissingProductionOriginalV1('actual_draft_body_B_before_final_plan_C')
+        actual_body = read_current_draft_body_component_contract_v1(db, frame=frame, action_intent_ref=plan.action_intent.ref, issuer=issuer, resource_issuer=issuer.resource_issuer, body_quote_authority=body_quote_authority)
+        if canonical_serialize(plain_v1(actual_body)) != plan.body_effect_request_json:
+            raise ValueError('draft final plan body contract differs from actual adopted B')
+        quote = issuer.resource_issuer.original_signed_quote(db, actual_body.resource_quote_ref, actual_body.resource_quote_version)
+        if plan.cpu_ceiling_ms > quote.ceiling.get('cpu_ms', 0) or _utc(plan.deadline_utc).timestamp() > quote.valid_until_utc:
+            raise ValueError('draft final plan CPU/deadline exceeds its actual Body B quote')
+    if any((getattr(plan, name) != installed_build[name] for name in ('algorithm_build_digest', 'postcondition_build_digest'))):
+        raise ValueError('Life plan build differs from actual installed file closure')
     read.committed_operation(db, producing_operation_id)
-    return _record(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind="plan", ref=original_ref,
-        operation_id=producing_operation_id, value=plan)
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind='plan', ref=original_ref, operation_id=producing_operation_id, value=plan, recorder=record_registered_life_plan_v2, frame=frame, actual_receipt=None)
 
 
 def read_registered_life_plan_v2(db, *, namespace, issuer, original_ref):

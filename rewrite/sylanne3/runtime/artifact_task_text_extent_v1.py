@@ -227,21 +227,20 @@ def require_artifact_task_text_extent_history_v1(db, *, namespace, original_ref,
 
 
 def record_artifact_task_text_extent_after_cas_v1(db, *, frame, stage, receipt, issuer):
-    if (stage.domain, stage.operation_kind, stage.coverage) != ("d08", OPERATION_KIND, "complete"):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
+    if (stage.domain, stage.operation_kind, stage.coverage) != ('d08', OPERATION_KIND, 'complete'):
         return None
-    if receipt.status != "committed" or receipt.operation_id != stage.operation_id:
-        raise ValueError("task text extent requires its actual same-transaction Owner CAS receipt")
+    if receipt.status != 'committed' or receipt.operation_id != stage.operation_id:
+        raise ValueError('task text extent requires its actual same-transaction Owner CAS receipt')
     adopted = read_adopted_domain_operation_v1(db, frame.envelope.authority.namespace, stage.operation_id)
-    if adopted is None or adopted["original_digest"] != stage.original_digest or adopted["receipt"] != receipt:
-        raise ValueError("task text extent producer was not adopted by its actual W01 event")
-    raw = adopted["payload"]["provenance"]["artifact_task_text_extent"]
+    if adopted is None or adopted['original_digest'] != stage.original_digest or adopted['receipt'] != receipt:
+        raise ValueError('task text extent producer was not adopted by its actual W01 event')
+    raw = adopted['payload']['provenance']['artifact_task_text_extent']
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     value = decode_artifact_task_text_extent_original_v1(raw)
     ref = artifact_task_text_extent_ref_v1(value)
-    require_artifact_task_text_extent_history_v1(db, namespace=value.namespace, original_ref=ref,
-        producing_operation_id=receipt.operation_id, raw=raw)
-    return _record(db, issuer=issuer, namespace=value.namespace, kind=KIND, ref=ref,
-        operation_id=receipt.operation_id, value=value)
+    require_artifact_task_text_extent_history_v1(db, namespace=value.namespace, original_ref=ref, producing_operation_id=receipt.operation_id, raw=raw)
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=value.namespace, kind=KIND, ref=ref, operation_id=receipt.operation_id, value=value, recorder=record_artifact_task_text_extent_after_cas_v1, frame=frame, actual_receipt=receipt)
 
 
 def read_plan_personal_candidate_text_extents_v1(db, *, namespace, request, installed_readers):

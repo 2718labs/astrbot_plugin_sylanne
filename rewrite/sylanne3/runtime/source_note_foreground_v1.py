@@ -178,12 +178,12 @@ def stage_create_source_note_foreground_cycle_v1(db, *, frame, request, installe
 
 
 def record_source_note_responsibility_after_cas_v1(db, *, frame, stage, receipt, installed_readers):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     import json
-    value = decode_typed_production_value_v1(json.loads(stage.original_payload_json)["provenance"]["responsibility"], ForegroundSourceNoteResponsibilityV1)
-    if receipt.status != "committed" or receipt.operation_id != frame.envelope.identity.operation_id:
-        raise ValueError("SourceNote responsibility requires its actual Self creation W01 receipt")
-    return _record(db, issuer=installed_readers.issuer, namespace=value.namespace, kind=RESPONSIBILITY_KIND,
-        ref=foreground_responsibility_ref_v1(value.namespace, value.c02_operation_id), operation_id=receipt.operation_id, value=value)
+    value = decode_typed_production_value_v1(json.loads(stage.original_payload_json)['provenance']['responsibility'], ForegroundSourceNoteResponsibilityV1)
+    if receipt.status != 'committed' or receipt.operation_id != frame.envelope.identity.operation_id:
+        raise ValueError('SourceNote responsibility requires its actual Self creation W01 receipt')
+    return record_foreground_writer_life_v3(db, issuer=installed_readers.issuer, namespace=value.namespace, kind=RESPONSIBILITY_KIND, ref=foreground_responsibility_ref_v1(value.namespace, value.c02_operation_id), operation_id=receipt.operation_id, value=value, recorder=record_source_note_responsibility_after_cas_v1, frame=frame, actual_receipt=receipt)
 
 
 def require_current_source_note_responsibility_v1(db, *, namespace, job, installed_bundle, issuer,

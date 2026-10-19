@@ -50,6 +50,9 @@ def _fixed_ids(r):
     return d07_execution_ids_v1(r.namespace,r.operation_id,kind)
 
 def read_bound_d07_source_preparation_original_v3(db,issuer,namespace,kind,ref):
+    from .foreground_command_source_v3 import read_foreground_command_d07_output_v3
+    handled,value=read_foreground_command_d07_output_v3(db,issuer,namespace,kind,ref)
+    if handled:return True,value
     r=_source_reader(db)
     if r is None:return False,None
     ids=_fixed_ids(r)
@@ -72,6 +75,8 @@ def read_bound_d07_source_preparation_original_v3(db,issuer,namespace,kind,ref):
     return True,(_detach_value_v3(issued[2]),current[0])
 
 def register_d07_source_preparation_original_v3(db,issuer,namespace,kind,ref,wire,digest,signature):
+    from .foreground_command_source_v3 import register_foreground_command_d07_output_v3
+    if register_foreground_command_d07_output_v3(db,issuer,namespace,kind,ref,wire,digest,signature):return
     r=_source_reader(db)
     if r is None or kind not in{"prepared","accounting_prepared"}:return
     if(namespace!=r.namespace or ref!=_fixed_ids(r)["job"]or issuer is not r.graph._GraphCoordinator__d11_issuer):

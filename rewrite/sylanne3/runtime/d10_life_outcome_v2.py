@@ -94,14 +94,14 @@ def _actual_outcome(db, read, issuer, outcome):
 
 
 def record_current_life_outcome_v2(db, *, frame, issuer, original_ref, producing_operation_id, outcome):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     if type(outcome) is not RegisteredLifeOutcomeV2:
-        raise TypeError("actual RegisteredLifeOutcomeV2 required")
+        raise TypeError('actual RegisteredLifeOutcomeV2 required')
     read = CurrentDomainReadV1(frame)
     read.check(db)
     _actual_outcome(db, read, issuer, outcome)
     read.committed_operation(db, producing_operation_id)
-    return _record(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind="outcome", ref=original_ref,
-        operation_id=producing_operation_id, value=outcome)
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind='outcome', ref=original_ref, operation_id=producing_operation_id, value=outcome, recorder=record_current_life_outcome_v2, frame=frame, actual_receipt=None)
 
 
 def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_readers):

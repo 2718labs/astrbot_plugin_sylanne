@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from contextvars import ContextVar
+from weakref import WeakKeyDictionary
 from ..domains.d02 import BodyDomain, BodyState, BodyProfile, BodyReservation, WorkComponent
 from ..domains.d02.body_quote_original import FixedBodyPolicyV1
 from ..domains.d03.context import RoleBinding, RoleBindingRequest, ContextProvider, _tuple_payload
@@ -814,8 +815,7 @@ def require_issued_personal_eligibility_v1(graph, bundle, issued):
 
 
 def consume_completed_personal_eligibility_v1(graph, bootstrap, bundle, *, issued, results, candidates,
-        c02_operation_id=None, source_ref=None):
-    from contextlib import ExitStack
+        c02_operation_id=None, source_ref=None, selector=None):
     from ..graph_worker import GraphStorageWorkV3
     require_personal_mesh_route_v1(PERSONAL_MESH_ROUTES_V1[-1])
     wave = require_issued_personal_eligibility_v1(graph, bundle, issued)
@@ -824,31 +824,23 @@ def consume_completed_personal_eligibility_v1(graph, bootstrap, bundle, *, issue
         raise ValueError("eligibility adoption changed its original candidate request")
     request = PersonalEligibilityRequestV1(candidates)
     if issued.authorization_original_ref is None:
-        selector = graph._post_c02_foreground_selector_v1(bootstrap, bundle,
-            c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=ADOPT, request=request)
+        _require_personal_foreground_selector_v3(selector,bundle,ADOPT,request,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+        if selector.operation_id!=personal_eligibility_operation_id_v1(wave.namespace,candidates,
+                need_digest=wave.need_original.original_digest):
+            raise ValueError("eligibility adoption selector changed its original fixed operation")
     else:
+        if selector is not None:raise ValueError("Owner SourceNote eligibility retains its actual Owner selector factory")
         selector = graph._owner_source_note_task_selector_v1(bootstrap, bundle,
             authorization_original_ref=issued.authorization_original_ref, operation_kind=ADOPT, request=request,
             operation_id=personal_eligibility_operation_id_v1(wave.namespace, candidates,
                 need_digest=wave.need_original.original_digest))
-    lifetime = ExitStack()
-    lifetime.enter_context(bind_completed_personal_eligibility_v1(graph, wave, results))
     runtime = graph._GraphCoordinator__domain_production_runtime_v1
-    _ACTIVE_RESULT_LIFETIMES[runtime]=lifetime
-    try:
-        runtime = graph._GraphCoordinator__domain_production_runtime_v1
-        result = runtime.run_personal_mesh_current_v1(selector=personal_mesh_request_v1(selector,request), operation_kind=ADOPT, request=request)
-        if type(result) is GraphStorageWorkV3:
-            if runtime in _ACTIVE_RESULT_LIFETIMES:
-                raise ValueError("actual borrowed adoption did not take its completed-results lifetime")
-            lifetime.close()
-            return result
-    except BaseException:
-        _ACTIVE_RESULT_LIFETIMES.pop(runtime,None)
-        lifetime.close()
-        raise
-    _ACTIVE_RESULT_LIFETIMES.pop(runtime,None)
-    lifetime.close()
+    with bind_completed_personal_eligibility_v1(graph,wave,results):
+        result=runtime.run_personal_mesh_current_v1(selector=personal_mesh_request_v1(selector,request),
+            operation_kind=ADOPT,request=request)
+        if type(result)is GraphStorageWorkV3 and not has_borrowed_personal_eligibility_results_v3(result.state):
+            raise ValueError("actual borrowed adoption did not retain its completed projection materials")
     return result
 
 
@@ -860,12 +852,28 @@ async def run_installed_personal_eligibility_wave_v1(runtime, installation, *, c
     from ..graph_worker import OwnedGraphStorageResultV3
     worker, bootstrap, bundle = runtime._worker, runtime._v2_bootstrap, installation.admin_bundle
     request = PersonalEligibilityRequestV1(candidates)
+
+    async def foreground_selector(kind):
+        from .artifact_host_control_metadata_v3 import (ArtifactForegroundMetadataSelectorV3,
+            prepare_current_artifact_foreground_metadata_v3)
+        policy=bundle.installation_policy
+        locator=ArtifactForegroundMetadataSelectorV3(policy.namespace,policy.installation_id,
+            c02_operation_id,source_ref,kind,request)
+        raw=await worker.call(lambda graph:prepare_current_artifact_foreground_metadata_v3(
+            graph,bootstrap,bundle,selector=locator))
+        selector=runtime._consume_background_graph_result_v3(raw)
+        _require_personal_foreground_selector_v3(selector,bundle,kind,request,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+        return selector
+
+    prepare_selector=await foreground_selector(PREPARE)if authorization_original_ref is None else None
     def prepare(graph):
         from ..graph_worker import GraphStorageWorkV3
         actual = graph._GraphCoordinator__domain_production_runtime_v1
         if authorization_original_ref is None:
-            selector = graph._post_c02_foreground_selector_v1(bootstrap, bundle,
-                c02_operation_id=c02_operation_id, source_ref=source_ref, operation_kind=PREPARE, request=request)
+            selector=prepare_selector
+            _require_personal_foreground_selector_v3(selector,bundle,PREPARE,request,
+                c02_operation_id=c02_operation_id,source_ref=source_ref)
             work = actual.run_personal_mesh_current_v1(selector=personal_mesh_request_v1(selector,request), operation_kind=PREPARE, request=request)
         else:
             store = graph._GraphCoordinator__store
@@ -929,9 +937,10 @@ async def run_installed_personal_eligibility_wave_v1(runtime, installation, *, c
         issued.execution_limit.require_current_v1()
         results = CompletedPersonalEligibilityWaveV1(canonical_digest(wave), tuple(message.result for message in projected))
         projected = None
+        adopt_selector=await foreground_selector(ADOPT)if authorization_original_ref is None else None
         adoption = asyncio.create_task(worker.call(lambda graph: consume_completed_personal_eligibility_v1(
             graph, bootstrap, bundle, issued=issued, results=results, candidates=candidates,
-            c02_operation_id=c02_operation_id, source_ref=source_ref)))
+            c02_operation_id=c02_operation_id, source_ref=source_ref, selector=adopt_selector)))
         try:
             adopted = await asyncio.shield(adoption)
         except asyncio.CancelledError:
@@ -968,8 +977,24 @@ async def run_installed_personal_eligibility_wave_v1(runtime, installation, *, c
 
 async def run_installed_artifact_predecision_mesh_v1(runtime, installation, *, c02_operation_id, source_ref):
     """Follow the actual finite dependency order; only qualified projections fan out."""
+    from contextlib import asynccontextmanager
+    from ..graph_worker import OwnedGraphStorageResultV3
     worker, bootstrap, bundle = runtime._worker, runtime._v2_bootstrap, installation.admin_bundle
     args = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
+
+    @asynccontextmanager
+    async def read(callback):
+        result = await worker.call(callback)
+        if type(result) is not OwnedGraphStorageResultV3:
+            yield result
+            return
+        value, retention = result.take_value_v3()
+        try:
+            yield value
+        finally:
+            value = None
+            retention.release()
+
     async def commit(kind, request):
         raw = await worker.call(lambda graph: graph.run_current_post_c02_artifact_preparation_step_v1(
             bootstrap, bundle, operation_kind=kind, request=request, **args))
@@ -977,44 +1002,48 @@ async def run_installed_artifact_predecision_mesh_v1(runtime, installation, *, c
         if result.get("coverage") != "complete" or result.get("receipt", {}).get("status") not in {"committed", "duplicate"}:
             raise MissingProductionOriginalV1("actual_complete_artifact_preparation:" + kind)
         return result
-    pre = await worker.call(lambda graph: graph.read_current_post_c02_artifact_task_choice_material_v3(
-        bootstrap, bundle, **args))
-    await commit("input:register_artifact_task_text_extent", pre.extent_request)
-    pre = await worker.call(lambda graph: graph.read_current_post_c02_artifact_task_choice_material_v3(
-        bootstrap, bundle, **args))
-    for request in pre.policy_requests:
-        await commit("input:register_artifact_phase_postcondition_policy_v1", request)
-    material = await worker.call(lambda graph: graph.read_current_post_c02_artifact_task_choice_material_v3(
-        bootstrap, bundle, complete=True, **args))
-    methods = await worker.call(lambda graph: graph.read_current_post_c02_artifact_method_prerequisites_v1(
-        bootstrap, bundle, material=material, **args))
-    for kind, request in methods:
-        await commit(kind, request)
-    from .artifact_phase_postconditions_v1 import FreezeArtifactCandidatePreparationRequestV1
-    await commit("input:freeze_artifact_candidate_preparation_v1", FreezeArtifactCandidatePreparationRequestV1(material.selector))
-    await commit("input:freeze_values", material.freeze_request)
-    await commit("evaluate_values", material.evaluate_request)
-    await runtime.run_personal_candidate_eligibility_wave_v1(installation,
-        candidates=material.prepare_request, **args)
-    prepared = await commit("prepare_personal_candidates_v1", material.prepare_request)
-    from .current_conditioned_self_read_v3 import prepare_current_conditioned_personal_choice_v3
-    choice=await worker.call(lambda graph:prepare_current_conditioned_personal_choice_v3(graph,bootstrap,bundle,
-        c02_operation_id=c02_operation_id,source_ref=source_ref,
-        prepared_candidates_operation_id=dict(material.ids)['prepare'],plan_ref=material.plan_head.key.token,
-        goal_ref=material.goal_head.key.token))
-    selected=runtime._consume_background_graph_result_v3(choice)
-    if selected.get('coverage')!='complete'or selected.get('receipt',{}).get('status')not in {'committed','duplicate'}:
-        raise MissingProductionOriginalV1('actual_complete_conditional_personal_choice')
-    if bundle.artifact_phase_observer is not None:
-        begun=await worker.call(lambda graph:graph.begin_current_artifact_method_group_v3(bootstrap,bundle,
-            prepared_candidates_operation_id=dict(material.ids)['prepare'],**args))
-        begun=runtime._consume_background_graph_result_v3(begun)
-        if begun.get('status')!='existing_original_method_group' and begun.get('receipt',{}).get('status')not in {'committed','duplicate'}:
-            raise MissingProductionOriginalV1('actual_initial_selected_method_group_checkpoint')
-    phase = await worker.call(lambda graph: graph.read_current_post_c02_artifact_phase_resume_v2(
-        bootstrap, bundle, **args))
-    if phase is None: raise MissingProductionOriginalV1("actual_adopted_immutable_artifact_decision_phase_group")
-    return {"status": "selected", "selector": phase["selector"], "preparation": prepared, "selection": selected}
+
+    async with read(lambda graph: graph.read_current_post_c02_artifact_task_choice_material_v3(
+            bootstrap, bundle, **args)) as pre:
+        await commit("input:register_artifact_task_text_extent", pre.extent_request)
+        pre = None
+    async with read(lambda graph: graph.read_current_post_c02_artifact_task_choice_material_v3(
+            bootstrap, bundle, **args)) as pre:
+        for request in pre.policy_requests:
+            await commit("input:register_artifact_phase_postcondition_policy_v1", request)
+        pre = request = None
+    async with read(lambda graph: graph.read_current_post_c02_artifact_task_choice_material_v3(
+            bootstrap, bundle, complete=True, **args)) as material:
+        async with read(lambda graph: graph.read_current_post_c02_artifact_method_prerequisites_v1(
+                bootstrap, bundle, material=material, **args)) as methods:
+            for kind, request in methods:
+                await commit(kind, request)
+            methods = kind = request = None
+        from .artifact_phase_postconditions_v1 import FreezeArtifactCandidatePreparationRequestV1
+        await commit("input:freeze_artifact_candidate_preparation_v1", FreezeArtifactCandidatePreparationRequestV1(material.selector))
+        await commit("input:freeze_values", material.freeze_request)
+        await commit("evaluate_values", material.evaluate_request)
+        await runtime.run_personal_candidate_eligibility_wave_v1(installation,
+            candidates=material.prepare_request, **args)
+        prepared = await commit("prepare_personal_candidates_v1", material.prepare_request)
+        from .current_conditioned_personal_choice_v3 import prepare_current_conditioned_personal_choice_v3
+        choice=await worker.call(lambda graph:prepare_current_conditioned_personal_choice_v3(graph,bootstrap,bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref,
+            prepared_candidates_operation_id=dict(material.ids)['prepare'],plan_ref=material.plan_head.key.token,
+            goal_ref=material.goal_head.key.token))
+        selected=runtime._consume_background_graph_result_v3(choice)
+        if selected.get('coverage')!='complete'or selected.get('receipt',{}).get('status')not in {'committed','duplicate'}:
+            raise MissingProductionOriginalV1('actual_complete_conditional_personal_choice')
+        if bundle.artifact_phase_observer is not None:
+            begun=await worker.call(lambda graph:graph.begin_current_artifact_method_group_v3(bootstrap,bundle,
+                prepared_candidates_operation_id=dict(material.ids)['prepare'],**args))
+            begun=runtime._consume_background_graph_result_v3(begun)
+            if begun.get('status')!='existing_original_method_group' and begun.get('receipt',{}).get('status')not in {'committed','duplicate'}:
+                raise MissingProductionOriginalV1('actual_initial_selected_method_group_checkpoint')
+        async with read(lambda graph: graph.read_current_post_c02_artifact_phase_resume_v2(
+                bootstrap, bundle, **args)) as phase:
+            if phase is None: raise MissingProductionOriginalV1("actual_adopted_immutable_artifact_decision_phase_group")
+            return {"status": "selected", "selector": phase["selector"], "preparation": prepared, "selection": selected}
 
 
 
@@ -1654,16 +1683,6 @@ def _personal_recovery_original_v1(db,operation,namespace,operation_id,locator,r
     return dict(domain=locator[0],operation_kind=locator[1],request_digest=locator[2],original_digest=locator[3],
         payload=payload,read_versions=read_versions,receipt=receipt)
 
-_ACTIVE_RESULT_LIFETIMES = {}
-def transfer_personal_eligibility_adoption_lifetime_v1(runtime,operation,request,private_reads):
-    from contextlib import ExitStack
-    if operation.operation_kind != ADOPT or type(private_reads) is not ExitStack:
-        raise TypeError("exact actual adopted eligibility request stack required")
-    lifetime=_ACTIVE_RESULT_LIFETIMES.pop(runtime)
-    wave,results=_ACTIVE_RESULTS[runtime]
-    if type(lifetime) is not ExitStack or wave.request_digest!=canonical_digest(request.candidates) or results.input_digest!=canonical_digest(wave):
-        raise ValueError("actual completed eligibility request lifetime differs")
-    private_reads.enter_context(lifetime.pop_all())
 
 def _personal_recovery_read_versions_v1(db,operation,namespace,operation_id,*,graph,fence,issued,entry):
     from .c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2
@@ -1779,3 +1798,104 @@ def personal_mesh_request_v1(original,command):
     if type(original) is OwnerTaskActivityRequestV1:
         return OwnerTaskMeshActivityRequestV1(original,companion)
     raise TypeError('Personal mesh requires its exact registered original selector version')
+
+def _require_personal_foreground_selector_v3(selector,bundle,kind,request,*,c02_operation_id,source_ref):
+    from ..authority_service.current_foreground_activity_v1 import (ForegroundActivityRequestV1,
+        foreground_typed_command_digest_v1)
+    from .domain_production_registry_v1 import installed_operation_v1
+    policy=bundle.installation_policy
+    if(type(selector)is not ForegroundActivityRequestV1 or kind not in{PREPARE,ADOPT}
+            or type(request)is not PersonalEligibilityRequestV1
+            or selector.namespace!=policy.namespace or selector.installation_id!=policy.installation_id
+            or selector.c02_operation_id!=c02_operation_id or selector.cue_source_ref!=source_ref
+            or selector.operation_kind!=kind
+            or selector.request_digest!=foreground_typed_command_digest_v1(installed_operation_v1(kind),request)):
+        raise ValueError("personal eligibility requires this exact Source-prepared foreground selector")
+    return selector
+
+
+_BORROWED_RESULTS_V3=WeakKeyDictionary()
+
+
+class _BorrowedPersonalEligibilityResultsV3:
+    def __init__(self,reader,wave,results):
+        from weakref import ref
+        self.reader=ref(reader)
+        self.identity=_borrowed_personal_results_identity_v3(reader)
+        self.wave,self.results=wave,results
+        self.digest=canonical_digest((wave,results))
+        self.operation=reader.operation
+
+    def _runtime_retained_heap_bytes_v3(self):
+        import sys
+        return sys.getsizeof(self)+sys.getsizeof(self.__dict__)+_personal_input_heap_v1((
+            self.identity,self.wave,self.results,self.digest))
+
+    def require_v3(self,reader):
+        if(self.reader()is not reader or self.identity!=_borrowed_personal_results_identity_v3(reader)
+                or self.operation is not reader.operation or self.wave is None or self.results is None
+                or canonical_digest((self.wave,self.results))!=self.digest):
+            raise ValueError("personal projection results changed their actual borrowed Work/scope/material")
+        return self
+
+
+def _borrowed_personal_results_identity_v3(reader):
+    return(id(reader.work),id(reader.runtime),id(reader.issued),id(reader.issued.scope),reader.selector,
+        reader.operation,reader.selection_digest,reader.request_digest,reader.graph_stamp)
+
+
+def capture_borrowed_personal_eligibility_results_v3(reader):
+    """Copy only factory-local handoff ownership into this actual retained Work."""
+    from weakref import ref
+    from .current_method_learning_read_v3 import BorrowedMethodLearningReadV3,_READERS
+    if reader.operation_kind!=ADOPT:return
+    if(type(reader)is not BorrowedMethodLearningReadV3 or reader not in _READERS
+            or reader.work is None or reader.work.state is not reader or reader.work.operation is not reader.operation
+            or reader.work.coordinator is not reader.graph or reader.operation.closed
+            or reader.runtime is not reader.graph._GraphCoordinator__domain_production_runtime_v1
+            or reader in _BORROWED_RESULTS_V3):
+        raise ValueError("actual fresh borrowed eligibility Work required for its synchronous handoff")
+    active=_ACTIVE_RESULTS.get(reader.runtime)
+    if active is None:raise MissingProductionOriginalV1("actual_installed_terminal_personal_projection_wave")
+    wave,results=active
+    if(type(wave)is not PreparedPersonalEligibilityWaveV1 or type(results)is not CompletedPersonalEligibilityWaveV1
+            or wave.namespace!=reader.namespace or wave.request_digest!=canonical_digest(reader.request.candidates)
+            or results.input_digest!=canonical_digest(wave)or reader.initial_now_utc>=wave.original_deadline_utc):
+        raise ValueError("borrowed personal results changed their actual wave/request/original deadline")
+    retained=_BorrowedPersonalEligibilityResultsV3(reader,wave,results)
+    reader.operation.register_retained_state_v3(retained)
+    _BORROWED_RESULTS_V3[reader]=ref(retained)
+
+
+def has_borrowed_personal_eligibility_results_v3(reader):
+    pending_ref=_BORROWED_RESULTS_V3.get(reader)
+    pending=None if pending_ref is None else pending_ref()
+    if pending is None:return False
+    pending.require_v3(reader)
+    return True
+
+
+@contextmanager
+def activate_borrowed_personal_eligibility_results_v3(reader):
+    from .current_method_learning_read_v3 import BorrowedMethodLearningReadV3,_READERS,_BOUND
+    if reader.operation_kind!=ADOPT:yield;return
+    if(type(reader)is not BorrowedMethodLearningReadV3 or reader not in _READERS
+            or not reader.inputs_sealed or not reader.business_started or reader.business_completed
+            or reader.work.state is not reader or reader.work.operation is not reader.operation
+            or reader.operation.closed or _BOUND.get()!=(reader.inventory,reader.graph,reader.db)):
+        raise ValueError("personal projection results activate only in their actual sealed borrowed compiler")
+    reader.inventory._actual()
+    pending_ref=_BORROWED_RESULTS_V3.get(reader)
+    pending=None if pending_ref is None else pending_ref()
+    if pending is None:raise MissingProductionOriginalV1("actual_borrowed_terminal_personal_projection_wave")
+    pending.require_v3(reader)
+    with bind_completed_personal_eligibility_v1(reader.graph,pending.wave,pending.results):
+        yield
+
+
+def release_borrowed_personal_eligibility_results_v3(reader):
+    pending_ref=_BORROWED_RESULTS_V3.pop(reader,None)
+    pending=None if pending_ref is None else pending_ref()
+    if pending is not None:
+        pending.operation.unregister_retained_state_v3(pending)
+        pending.wave=pending.results=None

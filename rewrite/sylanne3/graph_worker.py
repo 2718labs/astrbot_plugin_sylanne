@@ -20,7 +20,7 @@ _WINDOW_END = object()
 _WORK_ISSUER_V3 = object()
 _RESULT_ISSUER_V3 = object()
 _STORAGE_INVOCATION_V3 = ContextVar("sylanne_graph_storage_invocation_v3", default=None)
-_STORAGE_KINDS_V3 = frozenset({"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3", "current_life_numeric_model_seal_v3", "current_owner_job_cancel_v3", "source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "current_graph_full_read_v3", "d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3", "current_method_learning_read_v3", "current_life_numeric_read_v3", "domain_background_read_v3", "contact_host_stage_read_v3", "contact_cost_metadata_v3", "contact_effect_accounting_v1"})
+_STORAGE_KINDS_V3 = frozenset({"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3", "current_life_numeric_model_seal_v3", "current_owner_job_cancel_v3", "source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "current_graph_full_read_v3", "d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3", "current_method_learning_read_v3", "current_life_numeric_read_v3", "domain_background_read_v3", "contact_host_stage_read_v3", "contact_cost_metadata_v3", "contact_effect_accounting_v1", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"})
 
 
 def _clear_storage_error_frames_v3(error):
@@ -181,9 +181,9 @@ class GraphStorageWorkV3:
             from .runtime.d07_source_dispatch_read_v3 import _D07DispatchHandoffV3,finish_d07_dispatch_handoff_v3
             if type(value)is _D07DispatchHandoffV3:
                 return finish_d07_dispatch_handoff_v3(value,self)
-        storage_payload = self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3","current_life_numeric_model_seal_v3","current_owner_job_cancel_v3","owner_material_source_write_v3","dispatch_inventory_prepare_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3"}
+        storage_payload = self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3","current_life_numeric_model_seal_v3","current_owner_job_cancel_v3","owner_material_source_write_v3","dispatch_inventory_prepare_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"}
         release_payload = (value.release_payload_v3
-            if self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_paid_write_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3"} and error is None else None)
+            if self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_paid_write_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"} and error is None else None)
         if storage_payload and error is not None:_clear_storage_error_frames_v3(error)
         try:
             if self.kind == "current_graph_full_read_v3":
@@ -198,7 +198,7 @@ class GraphStorageWorkV3:
             if storage_payload:_clear_storage_error_frames_v3(error)
         self.terminal = True
         self.phase = "failed" if error is not None else "complete"
-        if error is None and self.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3"}:
+        if error is None and self.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"}:
             try:
                 from .runtime.current_beta1_source_read_v3 import require_beta1_source_terminal_value_v3
                 value=require_beta1_source_terminal_value_v3(value,self)
@@ -233,10 +233,12 @@ class GraphStorageWorkV3:
                 _clear_storage_error_frames_v3(error)
         mappers, self._mappers = self._mappers, []
         try:
-            for _, success, failed in mappers:
+            for mapper_index, (_, success, failed) in enumerate(mappers):
                 try:
                     value = success(value) if error is None else failed(error)
                     error = None
+                    from .graph_storage_handoff_v3 import suspend_graph_storage_mappers_v3
+                    if suspend_graph_storage_mappers_v3(value,self,mappers[mapper_index+1:]):break
                 except BaseException as mapped_error:
                     value, error = None, mapped_error
                     if storage_payload:_clear_storage_error_frames_v3(error)
@@ -244,6 +246,8 @@ class GraphStorageWorkV3:
             mappers.clear()
             if self.kind == "owner_material_source_write_v3":
                 self.state.input_witness = None
+        from .graph_storage_handoff_v3 import transfer_graph_storage_lifetime_v3
+        if error is None:transfer_graph_storage_lifetime_v3(value,self)
         if self._request_lifetime is not None:
             lifetime, self._request_lifetime = self._request_lifetime, None
             try:
@@ -277,13 +281,14 @@ def create_graph_storage_work_v3(coordinator, *, kind, operation_id,
 class _GraphCallV3:
     __slots__ = ("function", "args", "outcome", "is_callback", "ticket", "context",
                  "started", "deliver", "work", "terminal", "delivery_abandoned",
-                 "delivered_result")
+                 "delivered_result", "final_mappers", "handoff_deadline", "pending_handoff_result")
 
     def __init__(self, function, args, outcome, *, is_callback, ticket):
         self.function, self.args, self.outcome = function, args, outcome
         self.is_callback, self.ticket, self.context = is_callback, ticket, copy_context()
         self.started = self.deliver = self.terminal = self.delivery_abandoned = False
         self.work = self.delivered_result = None
+        self.final_mappers=[];self.handoff_deadline=None;self.pending_handoff_result=None
 
 
 class _ExclusiveCallbackWindow:
@@ -396,6 +401,12 @@ class GraphWorker:
         return worker
 
     def _complete_call(self, call, value, error):
+        pending,call.pending_handoff_result=call.pending_handoff_result,None
+        if pending is not None:
+            try:pending.release_v3()
+            except BaseException as cleanup_error:
+                if error is None:error=cleanup_error
+                else:error.add_note('pending terminal cleanup also failed: '+type(cleanup_error).__name__)
         abandoned = None
         with self._lock:
             call.terminal = True
@@ -416,6 +427,7 @@ class GraphWorker:
                 error = release_error
         # No completed queue cell may cache request Context or producer state.
         call.function, call.args, call.context, call.work = None, (), None, None
+        call.final_mappers=[]
         if call.deliver:
             if error is None:
                 call.outcome.set_result(value)
@@ -430,9 +442,12 @@ class GraphWorker:
         token = _STORAGE_INVOCATION_V3.set(_GraphStorageInvocationV3(
             coordinator, call.ticket, "callback" if call.is_callback else "ordinary", initial))
         value = error = None
+        immediate = call.pending_handoff_result is not None
         try:
             try:
-                if call.work is None:
+                if immediate:
+                    value,call.pending_handoff_result=call.pending_handoff_result,None
+                elif call.work is None:
                     value = call.function(coordinator, *call.args)
                     if type(value) is GraphStorageWorkV3:
                         if call.is_callback:
@@ -454,12 +469,22 @@ class GraphWorker:
 
             except BaseException as call_error:
                 value, error = None, call_error
-            if call.work is not None:
+            if call.work is not None and not immediate:
                 try:
                     value = call.work._finish_and_map(coordinator, value, error)
                     error = None
                 except BaseException as terminal_error:
                     value, error = None, terminal_error
+            from .graph_storage_handoff_v3 import (advance_graph_storage_handoff_v3,
+                apply_graph_storage_final_mappers_v3)
+            while error is None:
+                try:continued,value=advance_graph_storage_handoff_v3(self,call,coordinator,value)
+                except BaseException as handoff_error:value,error=None,handoff_error;break
+                if continued:return
+                if not call.final_mappers:break
+                value,error=apply_graph_storage_final_mappers_v3(call,value,error)
+            if error is not None and call.final_mappers:
+                value,error=apply_graph_storage_final_mappers_v3(call,value,error)
             self._complete_call(call, value, error)
         finally:
             _STORAGE_INVOCATION_V3.reset(token)

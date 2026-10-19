@@ -953,24 +953,25 @@ def require_artifact_phase_assessment_history_v1(db,*,namespace,original_ref,pro
         original_ref=original_ref,producing_operation_id=producing_operation_id,raw=raw, issuer=issuer, read_original=read_original)
 
 
-def record_artifact_phase_postcondition_after_cas_v1(db,*,frame,stage,receipt,issuer):
-    from .artifact_phase_observation_v1 import OPERATION as OBSERVATION_OPERATION,record_artifact_phase_observation_after_cas_v1
-    if stage.operation_kind==OBSERVATION_OPERATION:
-        return record_artifact_phase_observation_after_cas_v1(db,frame=frame,stage=stage,receipt=receipt,issuer=issuer)
-    operations={PREPARATION_PARENT_OPERATION_V1:(PREPARATION_PARENT_KIND_V1,'candidate_preparation_parent'),APPROVAL_OPERATION_V2:(APPROVAL_KIND_V2,'standing_predecision_approval'),POLICY_OPERATION:(POLICY_KIND,'postcondition_policy'),CONTRACT_OPERATION:(CONTRACT_KIND,'postcondition_contract'),
-        ASSESSMENT_OPERATION:(ASSESSMENT_KIND,'phase_assessment')}
-    if stage.operation_kind not in operations or stage.coverage!='complete':return None
-    kind,field=operations[stage.operation_kind]
-    if receipt.status!='committed' or receipt.operation_id!=stage.operation_id:raise ValueError('postconditions require actual same-transaction W01 receipt')
-    ns=frame.envelope.authority.namespace
-    adopted=read_adopted_domain_operation_v1(db,ns,stage.operation_id)
-    if adopted is None or adopted['original_digest']!=stage.original_digest or adopted['receipt']!=receipt:
+def record_artifact_phase_postcondition_after_cas_v1(db, *, frame, stage, receipt, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
+    from .artifact_phase_observation_v1 import OPERATION as OBSERVATION_OPERATION, record_artifact_phase_observation_after_cas_v1
+    if stage.operation_kind == OBSERVATION_OPERATION:
+        return record_artifact_phase_observation_after_cas_v1(db, frame=frame, stage=stage, receipt=receipt, issuer=issuer)
+    operations = {PREPARATION_PARENT_OPERATION_V1: (PREPARATION_PARENT_KIND_V1, 'candidate_preparation_parent'), APPROVAL_OPERATION_V2: (APPROVAL_KIND_V2, 'standing_predecision_approval'), POLICY_OPERATION: (POLICY_KIND, 'postcondition_policy'), CONTRACT_OPERATION: (CONTRACT_KIND, 'postcondition_contract'), ASSESSMENT_OPERATION: (ASSESSMENT_KIND, 'phase_assessment')}
+    if stage.operation_kind not in operations or stage.coverage != 'complete':
+        return None
+    kind, field = operations[stage.operation_kind]
+    if receipt.status != 'committed' or receipt.operation_id != stage.operation_id:
+        raise ValueError('postconditions require actual same-transaction W01 receipt')
+    ns = frame.envelope.authority.namespace
+    adopted = read_adopted_domain_operation_v1(db, ns, stage.operation_id)
+    if adopted is None or adopted['original_digest'] != stage.original_digest or adopted['receipt'] != receipt:
         raise ValueError('postcondition producer was not adopted by actual W01 CAS')
-    raw=adopted['payload']['provenance'][field]
-    value=decode_artifact_phase_postcondition_original_v1(kind,raw)
-    require_artifact_phase_postcondition_history_v1(db,namespace=ns,kind=kind,original_ref=value.original_ref,
-        producing_operation_id=stage.operation_id,raw=raw, issuer=issuer)
-    return _record(db,issuer=issuer,namespace=ns,kind=kind,ref=value.original_ref,operation_id=stage.operation_id,value=value)
+    raw = adopted['payload']['provenance'][field]
+    value = decode_artifact_phase_postcondition_original_v1(kind, raw)
+    require_artifact_phase_postcondition_history_v1(db, namespace=ns, kind=kind, original_ref=value.original_ref, producing_operation_id=stage.operation_id, raw=raw, issuer=issuer)
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=ns, kind=kind, ref=value.original_ref, operation_id=stage.operation_id, value=value, recorder=record_artifact_phase_postcondition_after_cas_v1, frame=frame, actual_receipt=receipt)
 
 
 def read_plan_artifact_phase_postconditions_v1(db,*,namespace,request,installed_readers):
@@ -2106,8 +2107,7 @@ class _IssuedCandidatePreparationParentV1:
         object.__setattr__(self,"candidates_digest",canonical_digest(plain_v1(material.prepare_request.bindings)))
 
 
-def candidate_preparation_parent_for_graph_v1(graph,*,request,installed_readers):
-    from contextlib import contextmanager
+def prepare_candidate_preparation_parent_for_graph_v3(graph,*,request,installed_readers):
     from .d08_personal_candidate_v1 import CurrentArtifactTaskChoiceRequestV2,readonly_current_artifact_task_choice_material_v2
     readers=_readers(installed_readers)
     if readers.graph is not graph or type(request) is not CurrentArtifactTaskChoiceRequestV2:
@@ -2117,7 +2117,13 @@ def candidate_preparation_parent_for_graph_v1(graph,*,request,installed_readers)
         raise ValueError("parent handle freezes material in the actual Graph readonly transaction")
     material=readonly_current_artifact_task_choice_material_v2(store._db,namespace=request.task.namespace,
         request=request,issuer=readers.issuer)
-    handle=_IssuedCandidatePreparationParentV1(_PREPARATION_PARENT_KEY_V1,graph,material)
+    return _IssuedCandidatePreparationParentV1(_PREPARATION_PARENT_KEY_V1,graph,material),material
+
+
+def activate_candidate_preparation_parent_for_graph_v3(graph,*,handle):
+    from contextlib import contextmanager
+    if type(handle) is not _IssuedCandidatePreparationParentV1 or handle.graph is not graph:
+        raise TypeError("actual preparation parent belongs to its installed Graph")
     @contextmanager
     def activate():
         runtime=graph._GraphCoordinator__domain_production_runtime_v1
@@ -2130,6 +2136,12 @@ def candidate_preparation_parent_for_graph_v1(graph,*,request,installed_readers)
             runtime._active_candidate_preparation_parent_v1=previous
             del _ACTIVE_PREPARATION_PARENTS_V1[id(handle)]
     return activate()
+
+
+def candidate_preparation_parent_for_graph_v1(graph,*,request,installed_readers):
+    handle,_=prepare_candidate_preparation_parent_for_graph_v3(graph,request=request,
+        installed_readers=installed_readers)
+    return activate_candidate_preparation_parent_for_graph_v3(graph,handle=handle)
 
 
 def require_candidate_preparation_parent_handle_v1(graph,*,task=None,material_digest=None):

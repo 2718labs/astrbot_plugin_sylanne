@@ -2586,12 +2586,16 @@ def _readonly_current_artifact_task_choice_basis_v2(db, *, namespace, request, i
                 keys[0].token, keys[1].token):
             raise ValueError("task choice changed its actual initial Goal/Plan/root")
     atoms = []
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    from .domain_background_read_v3 import background_json_loads_v3
     for key in keys[:2]:
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-            (key.token, *namespace.as_tuple)).fetchone()
+        row = _producer_original_point_v3(db, table='graph_atoms', columns=('revision','value','valid'),
+            key_columns=('token','bot','persona'), key=(key.token,*namespace.as_tuple),
+            legacy_reader=lambda:db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?',
+                (key.token,*namespace.as_tuple)).fetchone())
         if row is None or row[2] != 1:
             raise MissingProductionOriginalV1("actual_active_task_choice_Goal_Plan")
-        atoms.append((GraphVersion(key, row[0]), json.loads(row[1])))
+        atoms.append((GraphVersion(key, row[0]), background_json_loads_v3(row[1])))
     goal_head, goal_value = atoms[0]; plan_head, plan_value = atoms[1]
     goal = _decode_goal(goal_value); plan = decode_personal_plan_type_v1(PLAN_TYPE, plan_value)
     candidates = artifact_task_initial_plan_candidates_v1(task)
@@ -2616,10 +2620,9 @@ def _artifact_task_predecision_requests_from_basis_v2(db, *, namespace, request,
     from .artifact_phase_postconditions_v1 import RegisterArtifactPhasePostconditionPolicyRequestV1
     from .d11_life_preparation_v1 import _read
     scope, objective, approval, goal_head, plan_head, candidates = basis
-    rows = db.execute("SELECT original_ref FROM graph_d11_life_originals_v1 WHERE bot=? AND persona=? AND kind=? "
-        "AND json_extract(payload_json,'$.goal_head.key')=? AND json_extract(payload_json,'$.goal_head.revision')=? "
-        "AND json_extract(payload_json,'$.task_c02_operation_id')=? LIMIT 2",
-        (*namespace.as_tuple, EXTENT_KIND, goal_head.key.token, goal_head.revision,request.task.c02_operation_id)).fetchall()
+    from .artifact_task_choice_lookup_v3 import read_task_choice_original_refs_v3
+    rows=tuple((ref,)for ref in read_task_choice_original_refs_v3(db,kind=EXTENT_KIND,task=request.task,
+        goal_head=goal_head,plan_head=plan_head))
     policies = ()
     if rows:
         if len(rows) != 1:
@@ -2696,13 +2699,9 @@ def _artifact_task_choice_material_from_basis_v2(db, *, namespace, request, issu
             actual.source_value_digest,actual.original_ref,actual.digest,readback)
     bindings = []
     for policy_request, (method, candidate_ref, node_id) in zip(pre.policy_requests, candidates):
-        rows = db.execute("SELECT original_ref FROM graph_d11_life_originals_v1 WHERE bot=? AND persona=? AND kind=? "
-            "AND json_extract(payload_json,'$.request.task.c02_operation_id')=? "
-            "AND json_extract(payload_json,'$.request.task.root_registration_ref')=? "
-            "AND json_extract(payload_json,'$.request.plan_ref')=? AND json_extract(payload_json,'$.request.method_ref')=? "
-            "AND json_extract(payload_json,'$.plan_head.revision')=? LIMIT 2",
-            (*namespace.as_tuple, POLICY_KIND, request.task.c02_operation_id, request.task.root_registration_ref,
-             plan_head.key.token, method, plan_head.revision)).fetchall()
+        from .artifact_task_choice_lookup_v3 import read_task_choice_original_refs_v3
+        rows=tuple((ref,)for ref in read_task_choice_original_refs_v3(db,kind=POLICY_KIND,task=request.task,
+            goal_head=goal_head,plan_head=plan_head,method_ref=method))
         if len(rows) != 1:
             raise MissingProductionOriginalV1("actual_unique_registered_task_choice_method_policy")
         policy, _ = _original(db, namespace=namespace, kind=POLICY_KIND, ref=rows[0][0], issuer=issuer)

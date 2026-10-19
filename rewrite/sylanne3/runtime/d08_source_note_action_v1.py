@@ -285,19 +285,20 @@ def _build_source_note_action_in_transaction_v1(db, *, frame, request, installed
 
 
 def record_source_note_action_after_cas_v1(db, *, frame, staged, receipt, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from .d11_life_preparation_v1 import _record
     primary = staged.stage
-    if primary.operation_kind=="prepare_current_habit_source_note_action_v1":
+    if primary.operation_kind == 'prepare_current_habit_source_note_action_v1':
         from .d10_habit_v1 import record_habit_source_note_action_after_cas_v1
-        return record_habit_source_note_action_after_cas_v1(db,frame=frame,staged=staged,receipt=receipt,issuer=issuer)
+        return record_habit_source_note_action_after_cas_v1(db, frame=frame, staged=staged, receipt=receipt, issuer=issuer)
     payload = json.loads(primary.original_payload_json)
-    selected = primary.operation_kind == "prepare_selected_source_note_action_v2"
-    request = PrepareSourceNoteActionRequestV1(**(payload["provenance"]["derived_request"] if selected else payload["request"]))
+    selected = primary.operation_kind == 'prepare_selected_source_note_action_v2'
+    request = PrepareSourceNoteActionRequestV1(**payload['provenance']['derived_request'] if selected else payload['request'])
     writes = primary.proposals[0].typed_writes
     versions = {v.key: v.revision for v in receipt.write_versions}
     if set(versions) != {w.key for w in writes}:
-        raise ValueError("source-note root receipt does not contain exactly its three actual writes")
-    action_write = next(w for w in writes if w.key.type_name == "d08.action_intent.v1")
+        raise ValueError('source-note root receipt does not contain exactly its three actual writes')
+    action_write = next((w for w in writes if w.key.type_name == 'd08.action_intent.v1'))
     identity = frame.envelope.identity
     read = CurrentDomainReadV1(frame)
     context_commitments = []
@@ -305,24 +306,13 @@ def record_source_note_action_after_cas_v1(db, *, frame, staged, receipt, issuer
     for ref in (request.target_entity_ref, request.role_binding_ref, request.project_ref):
         atom = read.head(db, ref, required=True)
         operation = _adopted(db, read, atom)
-        context_commitments.append((ref, atom.revision, canonical_digest(atom.value), operation,
-            canonical_digest(_receipt(db, primary.namespace, operation))))
-    original = SourceNoteActionOriginalV1(action_write.key.token, canonical_digest(action_write.value), identity.operation_id,
-        identity.activity_id, identity.effect_id, request.project_ref, request.recipe_ref, request.source_ref,
-        request.goal_ref, frame.envelope.authority.audience, request.target_entity_ref, request.role_binding_ref,
-        tuple(context_commitments),
-        tuple((w.key.token, versions[w.key], canonical_digest(w.value)) for w in writes), canonical_digest(receipt))
+        context_commitments.append((ref, atom.revision, canonical_digest(atom.value), operation, canonical_digest(_receipt(db, primary.namespace, operation))))
+    original = SourceNoteActionOriginalV1(action_write.key.token, canonical_digest(action_write.value), identity.operation_id, identity.activity_id, identity.effect_id, request.project_ref, request.recipe_ref, request.source_ref, request.goal_ref, frame.envelope.authority.audience, request.target_entity_ref, request.role_binding_ref, tuple(context_commitments), tuple(((w.key.token, versions[w.key], canonical_digest(w.value)) for w in writes)), canonical_digest(receipt))
     if selected:
-        proof = payload["provenance"]
+        proof = payload['provenance']
         from dataclasses import asdict
-        original = SelectedSourceNoteActionOriginalV2(**{**asdict(original),
-            "audiences": original.audiences, "context_commitments": original.context_commitments,
-            "write_commitments": original.write_commitments, "schema": "d08.selected-source-note-action-original.v2",
-            "decision_ref": proof["selected_decision_ref"], "decision_digest": proof["selected_decision_digest"],
-            "preparation_original_ref": proof["preparation_original_ref"],
-            "preparation_original_digest": proof["preparation_original_digest"]})
-    return _record(db, issuer=issuer, namespace=primary.namespace, kind="source_note_action",
-        ref="life-root:" + identity.operation_id, operation_id=identity.operation_id, value=original)
+        original = SelectedSourceNoteActionOriginalV2(**{**asdict(original), 'audiences': original.audiences, 'context_commitments': original.context_commitments, 'write_commitments': original.write_commitments, 'schema': 'd08.selected-source-note-action-original.v2', 'decision_ref': proof['selected_decision_ref'], 'decision_digest': proof['selected_decision_digest'], 'preparation_original_ref': proof['preparation_original_ref'], 'preparation_original_digest': proof['preparation_original_digest']})
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=primary.namespace, kind='source_note_action', ref='life-root:' + identity.operation_id, operation_id=identity.operation_id, value=original, recorder=record_source_note_action_after_cas_v1, frame=frame, actual_receipt=receipt)
 
 
 def require_source_note_action_original_v1(db, *, namespace, action_intent_ref, issuer,

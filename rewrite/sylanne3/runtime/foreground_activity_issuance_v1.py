@@ -159,43 +159,34 @@ def reobserve_foreground_activity_v1(value, graph, scope):
 
 
 def record_foreground_life_scope_after_commit_v1(db, *, graph, issued, frame, receipt, issuer):
-    """Actual same-transaction original only; signing audit data grants no permission."""
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
+    'Actual same-transaction original only; signing audit data grants no permission.'
     if type(receipt) is not CommitReceipt or type(issuer) is not D11BudgetJobIssuer:
-        raise TypeError("foreground original needs the actual installed issuer and Graph receipt")
+        raise TypeError('foreground original needs the actual installed issuer and Graph receipt')
     evidence = require_foreground_activity_issuance_v1(issued, graph, issued.scope)
     read = CurrentDomainReadV1(frame)
-    if (receipt.status != "committed" or receipt.operation_id != frame.envelope.identity.operation_id
-            or receipt.activity_id != evidence.request.activity_id
-            or frame.envelope.authority.actor != evidence.current_self.self_entity_ref
-            or frame.owner_guard != evidence.owner_guard):
-        raise ValueError("foreground receipt/actor/upstream Owner differs from its issued operation")
-    actual = db.execute("SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-        (*frame.envelope.authority.namespace.as_tuple, receipt.operation_id)).fetchone()
+    if receipt.status != 'committed' or receipt.operation_id != frame.envelope.identity.operation_id or receipt.activity_id != evidence.request.activity_id or (frame.envelope.authority.actor != evidence.current_self.self_entity_ref) or (frame.owner_guard != evidence.owner_guard):
+        raise ValueError('foreground receipt/actor/upstream Owner differs from its issued operation')
+    actual = db.execute('SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?', (*frame.envelope.authority.namespace.as_tuple, receipt.operation_id)).fetchone()
     if actual != (receipt.operation_digest, receipt.activity_id, receipt.effect_id, receipt.commit_seq):
-        raise ValueError("foreground original was not committed by the actual W01 transaction")
-    if evidence.request.operation_kind == "derive_ingress_artifact_task_scope_v1":
+        raise ValueError('foreground original was not committed by the actual W01 transaction')
+    if evidence.request.operation_kind == 'derive_ingress_artifact_task_scope_v1':
         from .ingress_artifact_task_scope_v1 import record_task_scope_after_commit_v1
-        return record_task_scope_after_commit_v1(db,graph=graph,issued=issued,frame=frame,receipt=receipt,issuer=issuer)
+        return record_task_scope_after_commit_v1(db, graph=graph, issued=issued, frame=frame, receipt=receipt, issuer=issuer)
     root = evidence.root_capability
     if root is None:
         return ()
     source = read.head(db, evidence.request.plan_source_ref, required=True)
     from .current_method_learning_read_v3 import method_post_commit_atom_digest_v3
     source_digest = method_post_commit_atom_digest_v3(db, source)
-    scope = DraftActivityScopeV1(receipt.activity_id, evidence.current_self.self_entity_ref,
-        evidence.request.ingress_operation_id, evidence.request.c02_operation_id,
-        LifeInputRefV1(source.key.token, source.revision, source_digest),
-        evidence.request.parent_budget_lease_ref, root.registration_ref, canonical_digest(plain_v1(root)),
-        evidence.valid_until_utc, frame.owner_guard.grant_ref, frame.owner_guard.grant_revision, frame.owner_guard.grant_digest)
-    ref = "foreground-scope:" + canonical_digest((frame.envelope.authority.namespace, scope))[:48]
-    originals = [_record(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind="activity_scope",
-        ref=ref, operation_id=receipt.operation_id, value=scope)]
-    old = _read(db, issuer=issuer, namespace=frame.envelope.authority.namespace,
-        kind="draft_root_capability", ref=root.registration_ref)
+    scope = DraftActivityScopeV1(receipt.activity_id, evidence.current_self.self_entity_ref, evidence.request.ingress_operation_id, evidence.request.c02_operation_id, LifeInputRefV1(source.key.token, source.revision, source_digest), evidence.request.parent_budget_lease_ref, root.registration_ref, canonical_digest(plain_v1(root)), evidence.valid_until_utc, frame.owner_guard.grant_ref, frame.owner_guard.grant_revision, frame.owner_guard.grant_digest)
+    ref = 'foreground-scope:' + canonical_digest((frame.envelope.authority.namespace, scope))[:48]
+    originals = [record_foreground_writer_life_v3(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind='activity_scope', ref=ref, operation_id=receipt.operation_id, value=scope, recorder=record_foreground_life_scope_after_commit_v1, frame=frame, actual_receipt=receipt)]
+    old = _read(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind='draft_root_capability', ref=root.registration_ref)
     if old is None:
-        raise ValueError("ordinary activity cannot create a missing root permission original")
+        raise ValueError('ordinary activity cannot create a missing root permission original')
     elif canonical_digest(old[0]) != canonical_digest(plain_v1(root)):
-        raise ValueError("foreground root registration changed its original capability")
+        raise ValueError('foreground root registration changed its original capability')
     return tuple(originals)
 
 

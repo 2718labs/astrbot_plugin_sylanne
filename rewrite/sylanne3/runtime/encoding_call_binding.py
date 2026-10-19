@@ -315,15 +315,19 @@ def prepare_binding(
 def load_binding(db, namespace: NamespaceId, job_id: str) -> EncodingCallBinding | None:
     from ..runtime_contracts import canonical_digest
 
-    row = db.execute(
-        "SELECT source_id,source_revision,access_revision,budget_lease_id,"
-        "budget_reservation_operation_id,binding_digest,model_request_digest,"
-        "call_id,request_json "
-        "FROM runtime_encoding_call_bindings_v1 WHERE bot=? AND persona=? AND job_id=?",
-        namespace.as_tuple + (job_id,),
-    ).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    from .domain_background_read_v3 import background_json_loads_v3
+    from ..runtime_contracts import canonical_serialize
+    columns=('source_id','source_revision','access_revision','budget_lease_id',
+        'budget_reservation_operation_id','binding_digest','model_request_digest','call_id','request_json')
+    row = _producer_original_point_v3(db,table='runtime_encoding_call_bindings_v1',columns=columns,
+        key_columns=('bot','persona','job_id'),key=namespace.as_tuple+(job_id,),legacy_reader=lambda:db.execute(
+            'SELECT '+','.join(columns)+' FROM runtime_encoding_call_bindings_v1 WHERE bot=? AND persona=? AND job_id=?',
+            namespace.as_tuple+(job_id,)).fetchone())
     if row is None:
         return None
+    if type(row[-1]) is not str:
+        row=(*row[:-1],canonical_serialize(background_json_loads_v3(row[-1])))
     binding = EncodingCallBinding(namespace, job_id, *row)
     _validate_binding_content(binding)
     return binding

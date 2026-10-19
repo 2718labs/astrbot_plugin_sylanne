@@ -83,11 +83,18 @@ class C1ArtifactTaskIntentOriginalV1:
 def _c02_task_material_v1(db,namespace,c02_operation_id):
     from .encoding_call_binding import load_binding
     from .foreground_cycle_v1 import _adopted_c02_v1
-    row=db.execute("SELECT evidence_json,bundle_digest FROM graph_first_ingress_c02_committed_seals_v2 "
-        "WHERE bot=? AND persona=? AND operation_id=?",(*namespace.as_tuple,c02_operation_id)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    from .domain_background_read_v3 import background_json_loads_v3
+    row=_producer_original_point_v3(db,table='graph_first_ingress_c02_committed_seals_v2',
+        columns=('evidence_json','bundle_digest'),key_columns=('bot','persona','operation_id'),
+        key=(*namespace.as_tuple,c02_operation_id),legacy_reader=lambda:db.execute(
+            'SELECT evidence_json,bundle_digest FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?',
+            (*namespace.as_tuple,c02_operation_id)).fetchone())
     if row is None:raise ValueError("actual committed C02 task evidence is absent")
-    evidence=json.loads(row[0]);read=validate_c1_task_result_evidence_v1(evidence)
+    evidence=background_json_loads_v3(row[0]);read=validate_c1_task_result_evidence_v1(evidence)
     if read is None:return None
+    from ..authority_service.artifact_task_choice_catalogue_v3 import register_task_c1_binding_material_v3
+    register_task_c1_binding_material_v3(db,c02_operation_id=c02_operation_id,read=read)
     binding=load_binding(db,namespace,read.request.job_id)
     if (binding is None or binding.binding_digest!=read.request.binding_digest
             or binding.model_request_digest!=read.request.model_request_digest
@@ -96,10 +103,11 @@ def _c02_task_material_v1(db,namespace,c02_operation_id):
             or binding.request["prompt_template_version"] != evidence[EMBEDDED_FIELD]["template_version"]):
         raise ValueError("C1 task result lost its exact version-2 encoding binding")
     key=source_key(*namespace.as_tuple,binding.source_id)
-    source_row=db.execute("SELECT value FROM graph_history WHERE token=? AND revision=?",
-        (key.token,binding.source_revision)).fetchone()
+    source_row=_producer_original_point_v3(db,table='graph_history',columns=('value',),
+        key_columns=('token','revision'),key=(key.token,binding.source_revision),legacy_reader=lambda:db.execute(
+            'SELECT value FROM graph_history WHERE token=? AND revision=?',(key.token,binding.source_revision)).fetchone())
     if source_row is None:raise ValueError("C1 task result lost its actual original Source version")
-    source=SourceRecord.from_dict(json.loads(source_row[0]))
+    source=SourceRecord.from_dict(background_json_loads_v3(source_row[0]))
     payload,digest=build_first_ingress_encoding_payload(source,
         template_version=binding.request["prompt_template_version"])
     if binding.request["payload"]!=payload or binding.request["prompt_template_digest"]!=digest:

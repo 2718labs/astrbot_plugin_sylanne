@@ -182,6 +182,11 @@ class CurrentDomainReadV1:
         return records
 
     def committed_operation(self, db, operation_id):
+        from .foreground_command_writer_outputs_v3 import read_bound_foreground_writer_point_v3
+        handled,row=read_bound_foreground_writer_point_v3(db,table='graph_bundle_operations',
+            columns=('digest','receipt_json','commit_seq'),key_columns=('bot','persona','operation_id'),
+            key=(*self.frame.envelope.authority.namespace.as_tuple,operation_id))
+        if handled:return row
         from ..authority_service.artifact_model_graph_v3 import artifact_model_frame_committed_operation_v3
         artifact,row=artifact_model_frame_committed_operation_v3(self.frame,db,operation_id)
         if artifact:return row
@@ -553,15 +558,21 @@ class InstalledD01ProductionReadersV1:
                 raise ValueError("growth counterevidence must retain actual current query coverage")
         encoded, digest = canonical_serialize(raw), canonical_digest(raw)
         expected = (kind, producing_operation_id, encoded, digest, self.issuer._signer.sign(SIGN_KIND, encoded))
-        row = db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM "
-            "graph_d01_production_inputs_v1 WHERE bot=? AND persona=? AND original_ref=?",
-            (*frame.envelope.authority.namespace.as_tuple, original_ref)).fetchone()
+        from .foreground_command_writer_outputs_v3 import read_foreground_writer_d01_prior_v3,register_foreground_writer_d01_original_v3
+        own,row=read_foreground_writer_d01_prior_v3(db,recorder=self,frame=frame,original_ref=original_ref,
+            producing_operation_id=producing_operation_id,kind=kind,value=value,expected=expected)
+        if not own:
+            row = db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM "
+                "graph_d01_production_inputs_v1 WHERE bot=? AND persona=? AND original_ref=?",
+                (*frame.envelope.authority.namespace.as_tuple, original_ref)).fetchone()
         if row is not None and row != expected:
             raise ValueError("D01 original identity replay conflicts")
         if row is None:
             db.execute("INSERT INTO graph_d01_production_inputs_v1 VALUES(?,?,?,?,?,?,?,?,?)",
                 (*frame.envelope.authority.namespace.as_tuple, original_ref, *expected,
                  canonical_serialize(roots)))
+        register_foreground_writer_d01_original_v3(db,recorder=self,frame=frame,original_ref=original_ref,
+            producing_operation_id=producing_operation_id,kind=kind,value=value,expected=expected,roots=roots)
         return ProductionOriginalRefV1("d01." + kind, original_ref, digest, frame.snapshot.versions)
 
     def read_values(self, db, frame, request):
@@ -796,6 +807,9 @@ class InstalledD01ProductionReadersV1:
             condition_heads, condition_epoch)
         # Only the specific D03 RequiredCheck service may establish a resolved
         # social role. An inventory of bindings alone leaves strategy unknown.
+        from .foreground_command_writer_outputs_v3 import declare_foreground_writer_values_v3
+        declare_foreground_writer_values_v3(db,recorder=self,frame=frame,producing_operation_id=producing_operation_id,
+            candidate_set_ref=candidate_set_ref,context_ref=context_ref,candidates=frozen,context=context)
         a = self.record_input(db, frame=frame, original_ref=candidate_set_ref,
             producing_operation_id=producing_operation_id, kind="values_candidates", value=frozen)
         b = self.record_input(db, frame=frame, original_ref=context_ref,

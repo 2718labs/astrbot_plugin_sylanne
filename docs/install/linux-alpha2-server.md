@@ -322,4 +322,9 @@ D13 的 Source/frame/job、Owner、Source/Access/correction 闭包、quote/grant
 
 所有当前服务器场景仍为 NOT_RUN；只有实际完整阶段原件、首次内部拒绝、安全日志、结算、native interval 与 trace adoption 足够时，才可更新对应资格。任何首次失败、过期、跳过、超时或资源不足都保持 HOLD，停止后续阶段并保存 DB/WAL/SHM，不循环重跑、不延长 TTL、不 SQL 修账。Contact/C09 FULL、D04 FULL 和生产 Host 独立身份继续单列，不能由本套 Mock 结果自动通过。
 
-本轮本地针对性检查的限制：worker-result 服务与 reply 契约共 8 项已在 Windows 运行通过；旧 first-ingress Graph 回归的 6 项在有效请求前置断言失败。一次定点诊断定位到 `get_job → d13_completed_paid_read_v3 → d13_paid_original_read_v3 → C09/D12 package files → import fcntl`，Windows 无此 Linux 模块；首次失败、数据库副本和诊断已保留。未伪造 fcntl、未修改生产权限检查、未循环重跑。这六项及完整 Numeric/D13 节点需在 Linux 运行，不能据此声称新版安装验收通过。
+2026-10-19 更新：旧 first-ingress Graph 回归 6 项和本轮 D13 expiry queued/running 2 项首次均在 `get_job → d13_completed_paid_read_v3 → d13_paid_original_read_v3 → C09/D12 package files → import fcntl` 被意外依赖阻断，原日志与 fixture 保留。纯 JSON 解析器已移入独立 runtime 模块，两个正式消费者共用相同实现，Linux 锁和身份检查不变；源码修正后在全新 fixture 中分别单次复验，6 项与 2 项均通过。Artifact 签名历史、续作与独立观察契约另有 26 项通过。它们是受控时钟或契约级回归；完整新快照 Numeric/D13、native interval、trace adoption 和实际安装身份仍需 Linux 独立完整验证，不能移植旧快照 PASS。
+
+
+本次生产链补丁的专项服务器检查：Artifact 使用显式 V3 的 tone_sample，核两次生成与两次独立观察的真实 call/terminal/采用原件，整轮仍最多六次，完成后用真实完成收据回复；普通对话的 C5/C6 沿原路径。随后用新普通入站和正式 current 授权继续已有作品，核同一次 W01 记录的 amendment 引用、签名、producer、receipt 和 effect，冷重启后沿当前 Source 权限读取同一原件，不能重建一个替代 effect。Owner 材料 Source intake 应完成同次 canonical-command Work 的重入与原件采用。首次异常保留日志/DB，不更换旧授权或延长 TTL。
+
+纯 AstrBot 运行 ZIP 不含上述准备器、pytest、测试/host_tests/tools、fixture、日志或数据库。独立工程 companion 才含必要验证入口；不能将工程 ZIP 上传 AstrBot。HTTP WebUI 仍采用已明确批准的原 HTTP 模式和 `0.0.0.0:2718`，运行模式未因本次后端修复更改。安装新包后完整重启 AstrBot 进程，再依次核对监听、Dashboard 会话、Owner 解锁、配置保存/读回和 D01–D13 开关；这些可访问性结果单列，不代替业务链验证。

@@ -577,20 +577,18 @@ def read_plan_current_artifact_task_milestone_v2(db, *, namespace, request, inst
 
 
 def record_artifact_task_milestone_after_cas_v2(db, *, frame, stage, receipt, issuer):
+    from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
     from .domain_production_originals_v1 import read_adopted_domain_operation_v1
     from .d11_life_preparation_v1 import _record
-    if receipt.status!='committed' or receipt.operation_id!=frame.envelope.identity.operation_id:
+    if receipt.status != 'committed' or receipt.operation_id != frame.envelope.identity.operation_id:
         raise ValueError('task milestone signature requires its actual same-transaction CAS')
-    actual=read_adopted_domain_operation_v1(db,frame.envelope.authority.namespace,receipt.operation_id)
-    if actual is None or actual['receipt']!=receipt or actual['original_digest']!=stage.original_digest:
+    actual = read_adopted_domain_operation_v1(db, frame.envelope.authority.namespace, receipt.operation_id)
+    if actual is None or actual['receipt'] != receipt or actual['original_digest'] != stage.original_digest:
         raise ValueError('task milestone cannot be signed before its real W01 adoption')
-    raw=actual['payload']['provenance']['artifact_task_milestone']
-    decoded=decode_artifact_task_milestone_v2(raw)
-    value=require_artifact_task_milestone_history_v2(db,namespace=frame.envelope.authority.namespace,
-        original_ref=decoded.original_ref,
-        producing_operation_id=receipt.operation_id,raw=raw)
-    return _record(db,issuer=issuer,namespace=value.namespace,kind=ARTIFACT_TASK_MILESTONE_KIND_V2,
-        ref=value.original_ref,operation_id=receipt.operation_id,value=value)
+    raw = actual['payload']['provenance']['artifact_task_milestone']
+    decoded = decode_artifact_task_milestone_v2(raw)
+    value = require_artifact_task_milestone_history_v2(db, namespace=frame.envelope.authority.namespace, original_ref=decoded.original_ref, producing_operation_id=receipt.operation_id, raw=raw)
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=value.namespace, kind=ARTIFACT_TASK_MILESTONE_KIND_V2, ref=value.original_ref, operation_id=receipt.operation_id, value=value, recorder=record_artifact_task_milestone_after_cas_v2, frame=frame, actual_receipt=receipt)
 
 
 def read_current_artifact_task_milestone_original_ref_v2(db, *, namespace, original_ref, issuer):

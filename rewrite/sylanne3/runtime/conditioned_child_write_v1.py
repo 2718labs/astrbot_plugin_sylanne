@@ -54,9 +54,10 @@ def run_conditioned_child_business_v1(graph,runtime,*,reader,inputs,selector,ope
             db.execute('BEGIN')
             try:
                 original=read_adopted_domain_operation_v1(db,selector.namespace,selector.operation_id)
+                from ..authority_service.conditioned_child_contract_v1 import conditioned_child_from_wire_v1
                 if(original is None or original['operation_kind']!=selector.operation_kind
                         or original['payload']['request']!=json.loads(selector.typed_request_json)
-                        or original['payload']['provenance']['conditioned_child_execution_v1']['payload']!=json.loads(canonical_serialize(selector))
+                        or conditioned_child_from_wire_v1(original['payload']['provenance']['conditioned_child_execution_v1'],ConditionedChildSelectorV1)!=selector
                         or canonical_digest(original['receipt'])!=json.loads(saved[6])['receipt_digest']):
                     raise AuthorityUnavailable('conditioned replay receipt changed its exact actual semantic original')
             finally:db.rollback()
